@@ -218,6 +218,7 @@ impl SourceManager {
             plugin_id,
             key,
             config.verbose,
+            config.benchmark,
             producer,
             encoder,
             transforms,

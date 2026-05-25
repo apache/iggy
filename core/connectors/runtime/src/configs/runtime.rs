@@ -142,6 +142,89 @@ pub struct ConnectorsRuntimeConfig {
     pub connectors: ConnectorsConfig,
     pub state: StateConfig,
     pub telemetry: TelemetryConfig,
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ConfigEnv)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub format: LogFormat,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl Display for LogFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogFormat::Text => write!(f, "text"),
+            LogFormat::Json => write!(f, "json"),
+        }
+    }
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            other => Err(format!("Invalid log format: {other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_format_tests {
+    use super::*;
+
+    #[test]
+    fn given_no_explicit_value_when_defaulted_should_be_text() {
+        assert_eq!(LogFormat::default(), LogFormat::Text);
+    }
+
+    #[test]
+    fn given_text_string_when_parsed_should_return_text_variant() {
+        assert_eq!(LogFormat::from_str("text").unwrap(), LogFormat::Text);
+        assert_eq!(LogFormat::from_str("TEXT").unwrap(), LogFormat::Text);
+    }
+
+    #[test]
+    fn given_json_string_when_parsed_should_return_json_variant() {
+        assert_eq!(LogFormat::from_str("json").unwrap(), LogFormat::Json);
+        assert_eq!(LogFormat::from_str("Json").unwrap(), LogFormat::Json);
+    }
+
+    #[test]
+    fn given_invalid_string_when_parsed_should_return_err() {
+        assert!(LogFormat::from_str("yaml").is_err());
+        assert!(LogFormat::from_str("").is_err());
+    }
+
+    #[test]
+    fn given_log_format_when_displayed_should_match_lowercase_variant_name() {
+        assert_eq!(LogFormat::Text.to_string(), "text");
+        assert_eq!(LogFormat::Json.to_string(), "json");
+    }
+
+    #[test]
+    fn given_toml_with_logging_section_when_deserialized_should_use_format() {
+        let toml = r#"format = "json""#;
+        let parsed: LoggingConfig = toml::from_str(toml).expect("parse logging");
+        assert_eq!(parsed.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn given_toml_without_format_field_when_deserialized_should_default_to_text() {
+        let parsed: LoggingConfig = toml::from_str("").expect("parse empty logging");
+        assert_eq!(parsed.format, LogFormat::Text);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigEnv)]

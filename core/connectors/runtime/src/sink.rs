@@ -17,10 +17,11 @@
  * under the License.
  */
 
+use crate::benchmark;
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, SinkLabels};
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer,
     SinkConnectorPlugin, SinkConnectorWrapper, resolve_plugin_path, transform,
@@ -147,6 +148,7 @@ pub async fn init(
             consumers: vec![],
             error: init_error.clone(),
             verbose: config.verbose,
+            benchmark: config.benchmark,
         });
 
         if let Some(error) = init_error {
@@ -228,6 +230,7 @@ pub fn consume(
                 consumers,
                 sink.callback,
                 plugin.verbose,
+                plugin.benchmark,
                 &context.metrics,
                 context.clone(),
             );
@@ -237,7 +240,7 @@ pub fn consume(
     handles
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn spawn_consume_tasks(
     plugin_id: u32,
     plugin_key: &str,
@@ -249,16 +252,25 @@ pub(crate) fn spawn_consume_tasks(
     )>,
     callback: ConsumeCallback,
     verbose: bool,
+    benchmark: bool,
     metrics: &Arc<Metrics>,
     context: Arc<RuntimeContext>,
 ) -> (watch::Sender<()>, Vec<JoinHandle<()>>) {
+    if benchmark {
+        info!(
+            "Benchmark mode enabled for sink connector with ID: {plugin_id}, key: {plugin_key}. \
+             Per-batch events on target 'iggy_connectors::benchmark'."
+        );
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let mut task_handles = Vec::new();
+    let labels = Arc::new(SinkLabels::new(plugin_key));
     for (consumer, decoder, batch_size, transforms) in consumers {
         let plugin_key = plugin_key.to_string();
         let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
         let context = context.clone();
+        let labels = labels.clone();
         let handle = tokio::spawn(async move {
             if let Err(error) = consume_messages(
                 plugin_id,
@@ -268,8 +280,10 @@ pub(crate) fn spawn_consume_tasks(
                 transforms,
                 consumer,
                 verbose,
+                benchmark,
                 &plugin_key,
                 &metrics,
+                &labels,
                 shutdown_rx,
             )
             .await
@@ -277,6 +291,7 @@ pub(crate) fn spawn_consume_tasks(
                 error!(
                     "Failed to consume messages for sink connector with ID: {plugin_id}: {error}"
                 );
+                metrics.inc_errors_with_labels(&labels.counter);
                 context
                     .sinks
                     .set_error(&plugin_key, &error.to_string())
@@ -297,8 +312,10 @@ pub(crate) async fn consume_messages(
     transforms: Vec<Arc<dyn Transform>>,
     mut consumer: IggyConsumer,
     verbose: bool,
+    benchmark: bool,
     plugin_key: &str,
     metrics: &Arc<Metrics>,
+    labels: &SinkLabels,
     mut shutdown_rx: watch::Receiver<()>,
 ) -> Result<(), RuntimeError> {
     info!("Started consuming messages for sink connector with ID: {plugin_id}");
@@ -322,7 +339,11 @@ pub(crate) async fn consume_messages(
             break;
         };
         let Ok(message) = message else {
-            error!("Failed to receive message.");
+            error!(
+                "Failed to receive message for sink connector with ID: {plugin_id} from stream: {}, topic: {}",
+                topic_metadata.stream, topic_metadata.topic
+            );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -336,7 +357,7 @@ pub(crate) async fn consume_messages(
 
         let messages = std::mem::take(&mut batch);
         let messages_count = messages.len();
-        metrics.increment_messages_consumed(plugin_key, messages_count as u64);
+        metrics.inc_messages_consumed_with_labels(&labels.counter, messages_count as u64);
         let messages_metadata = MessagesMetadata {
             partition_id,
             current_offset,
@@ -354,7 +375,7 @@ pub(crate) async fn consume_messages(
             );
         }
         let start = Instant::now();
-        let processed_count = match process_messages(
+        let (processed_count, ffi_elapsed) = match process_messages(
             plugin_id,
             messages_metadata,
             &topic_metadata,
@@ -362,10 +383,12 @@ pub(crate) async fn consume_messages(
             &consume,
             &transforms,
             &decoder,
+            metrics,
+            labels,
         )
         .await
         {
-            Ok(count) => count,
+            Ok(result) => result,
             Err(error) => {
                 error!(
                     "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
@@ -374,8 +397,12 @@ pub(crate) async fn consume_messages(
             }
         };
 
-        metrics.increment_messages_processed(plugin_key, processed_count as u64);
+        metrics.inc_messages_processed_with_labels(&labels.counter, processed_count as u64);
         let elapsed = start.elapsed();
+        let prepare_elapsed = elapsed.saturating_sub(ffi_elapsed);
+        metrics.observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
+        metrics.observe_stage_with_labels(&labels.stage_ffi, ffi_elapsed);
+        metrics.observe_stage_with_labels(&labels.stage_total, elapsed);
         if verbose {
             info!(
                 "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
@@ -385,6 +412,23 @@ pub(crate) async fn consume_messages(
             debug!(
                 "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
                 elapsed
+            );
+        }
+        if benchmark {
+            let total_us = benchmark::as_micros(elapsed);
+            let ffi_us = benchmark::as_micros(ffi_elapsed);
+            let prepare_us = total_us.saturating_sub(ffi_us);
+            benchmark::emit_sink_event(
+                plugin_key,
+                &topic_metadata.stream,
+                &topic_metadata.topic,
+                partition_id,
+                current_offset,
+                messages_count,
+                processed_count,
+                prepare_us,
+                ffi_us,
+                total_us,
             );
         }
     }
@@ -494,6 +538,7 @@ pub(crate) async fn setup_sink_consumers(
     Ok(consumers)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_messages(
     plugin_id: u32,
     messages_metadata: MessagesMetadata,
@@ -502,7 +547,9 @@ async fn process_messages(
     consume: &ConsumeCallback,
     transforms: &Vec<Arc<dyn Transform>>,
     decoder: &Arc<dyn StreamDecoder>,
-) -> Result<usize, RuntimeError> {
+    metrics: &Arc<Metrics>,
+    labels: &SinkLabels,
+) -> Result<(usize, std::time::Duration), RuntimeError> {
     let messages = messages.into_iter().map(|message| ReceivedMessage {
         id: message.header.id,
         offset: message.header.offset,
@@ -516,6 +563,11 @@ async fn process_messages(
     let count = messages.len();
     let decoded_messages = messages.into_iter().flat_map(|message| {
         let Ok(payload) = decoder.decode(message.payload) else {
+            error!(
+                "Failed to decode message payload (id: {}, offset: {}) for sink connector with ID: {plugin_id}",
+                message.id, message.offset
+            );
+            metrics.inc_errors_with_labels(&labels.counter);
             return None;
         };
 
@@ -540,8 +592,9 @@ async fn process_messages(
             current_message = transform.transform(topic_metadata, message)?;
         }
 
-        // The transform may return no message based on some conditions
+        // Filter contract: transform returning Ok(None) is an intentional drop.
         let Some(message) = current_message else {
+            metrics.inc_messages_filtered_with_labels(&labels.counter, 1);
             continue;
         };
 
@@ -549,6 +602,7 @@ async fn process_messages(
             error!(
                 "ID should be present. Failed to process message for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -556,6 +610,7 @@ async fn process_messages(
             error!(
                 "Offset should be present. Failed to process message with ID: {id} for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -563,6 +618,7 @@ async fn process_messages(
             error!(
                 "Checksum should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -570,6 +626,7 @@ async fn process_messages(
             error!(
                 "Timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -577,6 +634,7 @@ async fn process_messages(
             error!(
                 "Origin timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
@@ -584,23 +642,22 @@ async fn process_messages(
             error!(
                 "Failed to get message payload for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
+            metrics.inc_errors_with_labels(&labels.counter);
             continue;
         };
 
-        let headers: Result<Vec<u8>, RuntimeError> = if let Some(headers) = message.headers {
-            Ok(postcard::to_allocvec(&headers).map_err(|error| {
-                error!("Failed to serialize headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}. {error}");
-                RuntimeError::FailedToSerializeHeaders
-            })?)
-        } else {
-            Ok(vec![])
-        };
-
-        let Ok(headers) = headers else {
-            error!(
-                "Failed to serialize message headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
-            );
-            continue;
+        let headers = match message.headers {
+            Some(headers) => match postcard::to_allocvec(&headers) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    error!(
+                        "Failed to serialize headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}. {error}"
+                    );
+                    metrics.inc_errors_with_labels(&labels.counter);
+                    continue;
+                }
+            },
+            None => vec![],
         };
 
         messages.push(RawMessage {
@@ -639,6 +696,7 @@ async fn process_messages(
         RuntimeError::FailedToSerializeRawMessages
     })?;
 
+    let ffi_start = Instant::now();
     (consume)(
         plugin_id,
         topic_meta.as_ptr(),
@@ -648,6 +706,7 @@ async fn process_messages(
         messages.as_ptr(),
         messages.len(),
     );
+    let ffi_elapsed = ffi_start.elapsed();
 
-    Ok(processed_count)
+    Ok((processed_count, ffi_elapsed))
 }

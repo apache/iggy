@@ -34,9 +34,23 @@ path = "local_state"
 [connectors]
 config_type = "local"
 config_dir = "path/to/connectors"
+
+[logging] # Optional logging configuration
+format = "text" # Options: "text" (default), "json"
 ```
 
 The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+
+## Logging
+
+By default, the runtime emits human-readable text logs via the `tracing` crate. Switching `logging.format` to `json` produces structured JSON lines (one event per line, machine-parseable). When telemetry is enabled, the chosen format applies to the local stdout layer; OpenTelemetry export is unaffected.
+
+```toml
+[logging]
+format = "json"
+```
+
+`RUST_LOG` controls verbosity and per-target filtering (e.g. `RUST_LOG=info,iggy_connectors::benchmark=info`).
 
 ## Configuration Providers
 
@@ -187,6 +201,24 @@ transport = "grpc" # Options: "grpc", "http"
 endpoint = "http://localhost:4317"
 ```
 
+## Benchmark Mode
+
+Each connector configuration accepts an optional `benchmark` flag. When set to `true`, the runtime emits a per-batch `info!` event on the `iggy_connectors::benchmark` tracing target with stage timings in microseconds. This is opt-in and adds a single tracing call per processed batch.
+
+```toml
+type = "sink"
+key = "stdout"
+# ... other fields ...
+benchmark = true
+```
+
+Emitted fields:
+
+- **sink**: `connector_key`, `stream`, `topic`, `partition_id`, `current_offset`, `batch_size`, `processed_count`, `prepare_us`, `ffi_us`, `total_us`
+- **source**: `connector_key`, `stream`, `topic`, `batch_size`, `sent_count`, `decode_us`, `prepare_us`, `iggy_send_us`, `state_save_us`, `total_us`
+
+Filter the stream via `RUST_LOG=iggy_connectors::benchmark=info`. The corresponding stage durations are also recorded in the `iggy_connector_stage_duration_seconds` histogram regardless of this flag, so Prometheus dashboards remain available without enabling text events.
+
 ## Metrics
 
 The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint when enabled. The following metrics are available:
@@ -204,7 +236,14 @@ The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint wh
 - `iggy_connector_messages_sent_total`: Messages sent to Iggy (source)
 - `iggy_connector_messages_consumed_total`: Messages consumed from Iggy (sink)
 - `iggy_connector_messages_processed_total`: Messages processed and sent to sink plugin
+- `iggy_connector_messages_filtered_total`: Messages intentionally dropped by transforms returning `Ok(None)`
 - `iggy_connector_errors_total`: Errors encountered
+
+### Stage Duration Histograms (labeled with `connector_key`, `connector_type`, `stage`)
+
+- `iggy_connector_stage_duration_seconds`: Per-batch processing stage duration
+
+Stages: `Prepare`, `Ffi`, `Decode`, `IggySend`, `StateSave`, `Total`. Histograms are always exposed (independent of `benchmark`); buckets cover 50us to 5s.
 
 ## Stats
 
@@ -239,6 +278,7 @@ The `/stats` endpoint provides runtime and per-connector statistics in JSON form
       "enabled": true,
       "messages_produced": 1000,
       "messages_sent": 1000,
+      "messages_filtered": 0,
       "errors": 0
     },
     {
@@ -251,6 +291,7 @@ The `/stats` endpoint provides runtime and per-connector statistics in JSON form
       "enabled": true,
       "messages_consumed": 1000,
       "messages_processed": 1000,
+      "messages_filtered": 0,
       "errors": 0
     }
   ]

@@ -112,6 +112,7 @@ pub struct ConnectorStats {
     pub messages_consumed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages_processed: Option<u64>,
+    pub messages_filtered: u64,
     pub errors: u64,
 }
 

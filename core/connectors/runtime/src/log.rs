@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use crate::configs::runtime::{TelemetryConfig, TelemetryTransport};
+use crate::configs::runtime::{LogFormat, LoggingConfig, TelemetryConfig, TelemetryTransport};
 use iggy_connector_sdk::LogCallback;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
@@ -31,38 +31,58 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-pub fn init_logging(telemetry_config: &TelemetryConfig, version: &'static str) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("INFO"));
+pub fn init_logging(
+    telemetry_config: &TelemetryConfig,
+    logging_config: &LoggingConfig,
+    version: &'static str,
+) {
+    let env_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("INFO"));
 
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    match (telemetry_config.enabled, logging_config.format) {
+        (true, LogFormat::Text) => {
+            let (logger_provider, tracer_provider) = init_telemetry(telemetry_config, version);
+            let tracer = tracer_provider.tracer(telemetry_config.service_name.clone());
+            global::set_tracer_provider(tracer_provider);
+            global::set_text_map_propagator(TraceContextPropagator::new());
+            tracing_subscriber::registry()
+                .with(env_filter())
+                .with(tracing_subscriber::fmt::layer())
+                .with(OpenTelemetryTracingBridge::new(&logger_provider))
+                .with(OpenTelemetryLayer::new(tracer))
+                .init();
+        }
+        (true, LogFormat::Json) => {
+            let (logger_provider, tracer_provider) = init_telemetry(telemetry_config, version);
+            let tracer = tracer_provider.tracer(telemetry_config.service_name.clone());
+            global::set_tracer_provider(tracer_provider);
+            global::set_text_map_propagator(TraceContextPropagator::new());
+            tracing_subscriber::registry()
+                .with(env_filter())
+                .with(tracing_subscriber::fmt::layer().json())
+                .with(OpenTelemetryTracingBridge::new(&logger_provider))
+                .with(OpenTelemetryLayer::new(tracer))
+                .init();
+        }
+        (false, LogFormat::Text) => {
+            tracing_subscriber::registry()
+                .with(env_filter())
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+        }
+        (false, LogFormat::Json) => {
+            tracing_subscriber::registry()
+                .with(env_filter())
+                .with(tracing_subscriber::fmt::layer().json())
+                .init();
+        }
+    }
 
     if telemetry_config.enabled {
-        let (logger_provider, tracer_provider) = init_telemetry(telemetry_config, version);
-
-        let service_name = telemetry_config.service_name.clone();
-        let tracer = tracer_provider.tracer(service_name);
-        global::set_tracer_provider(tracer_provider);
-        global::set_text_map_propagator(TraceContextPropagator::new());
-
-        let otel_logs_layer = OpenTelemetryTracingBridge::new(&logger_provider);
-        let otel_traces_layer = OpenTelemetryLayer::new(tracer);
-
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(otel_logs_layer)
-            .with(otel_traces_layer)
-            .init();
-
         info!(
-            "Logging initialized with telemetry enabled, service name: {}",
-            telemetry_config.service_name
+            "Logging initialized (format: {}, telemetry enabled, service name: {})",
+            logging_config.format, telemetry_config.service_name
         );
-    } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .init();
     }
 }
 

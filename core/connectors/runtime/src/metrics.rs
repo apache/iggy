@@ -22,8 +22,10 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::error;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -38,6 +40,94 @@ pub enum ConnectorType {
     Sink,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StageLabels {
+    pub connector_key: String,
+    pub connector_type: ConnectorType,
+    pub stage: Stage,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum Stage {
+    Prepare,
+    Ffi,
+    Decode,
+    IggySend,
+    StateSave,
+    Total,
+}
+
+const STAGE_BUCKETS_SECONDS: [f64; 13] = [
+    50e-6, 100e-6, 250e-6, 500e-6, 1e-3, 5e-3, 10e-3, 50e-3, 100e-3, 250e-3, 500e-3, 1.0, 5.0,
+];
+
+#[derive(Debug, Clone)]
+pub struct SinkLabels {
+    pub counter: ConnectorLabels,
+    pub stage_prepare: StageLabels,
+    pub stage_ffi: StageLabels,
+    pub stage_total: StageLabels,
+}
+
+impl SinkLabels {
+    pub fn new(plugin_key: &str) -> Self {
+        let key = plugin_key.to_owned();
+        Self {
+            counter: ConnectorLabels {
+                connector_key: key.clone(),
+                connector_type: ConnectorType::Sink,
+            },
+            stage_prepare: StageLabels {
+                connector_key: key.clone(),
+                connector_type: ConnectorType::Sink,
+                stage: Stage::Prepare,
+            },
+            stage_ffi: StageLabels {
+                connector_key: key.clone(),
+                connector_type: ConnectorType::Sink,
+                stage: Stage::Ffi,
+            },
+            stage_total: StageLabels {
+                connector_key: key,
+                connector_type: ConnectorType::Sink,
+                stage: Stage::Total,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceLabels {
+    pub counter: ConnectorLabels,
+    pub stage_decode: StageLabels,
+    pub stage_prepare: StageLabels,
+    pub stage_iggy_send: StageLabels,
+    pub stage_state_save: StageLabels,
+    pub stage_total: StageLabels,
+}
+
+impl SourceLabels {
+    pub fn new(plugin_key: &str) -> Self {
+        let key = plugin_key.to_owned();
+        let stage = |s: Stage| StageLabels {
+            connector_key: key.clone(),
+            connector_type: ConnectorType::Source,
+            stage: s,
+        };
+        Self {
+            counter: ConnectorLabels {
+                connector_key: key.clone(),
+                connector_type: ConnectorType::Source,
+            },
+            stage_decode: stage(Stage::Decode),
+            stage_prepare: stage(Stage::Prepare),
+            stage_iggy_send: stage(Stage::IggySend),
+            stage_state_save: stage(Stage::StateSave),
+            stage_total: stage(Stage::Total),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Metrics {
     registry: Arc<Registry>,
@@ -49,7 +139,9 @@ pub struct Metrics {
     messages_sent: Family<ConnectorLabels, Counter>,
     messages_consumed: Family<ConnectorLabels, Counter>,
     messages_processed: Family<ConnectorLabels, Counter>,
+    messages_filtered: Family<ConnectorLabels, Counter>,
     errors: Family<ConnectorLabels, Counter>,
+    stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram>,
 }
 
 impl Metrics {
@@ -64,7 +156,10 @@ impl Metrics {
         let messages_sent = Family::<ConnectorLabels, Counter>::default();
         let messages_consumed = Family::<ConnectorLabels, Counter>::default();
         let messages_processed = Family::<ConnectorLabels, Counter>::default();
+        let messages_filtered = Family::<ConnectorLabels, Counter>::default();
         let errors = Family::<ConnectorLabels, Counter>::default();
+        let stage_duration_seconds: Family<StageLabels, Histogram, fn() -> Histogram> =
+            Family::new_with_constructor(stage_histogram);
 
         registry.register(
             "iggy_connectors_sources_total",
@@ -107,9 +202,19 @@ impl Metrics {
             messages_processed.clone(),
         );
         registry.register(
+            "iggy_connector_messages_filtered_total",
+            "Messages intentionally dropped by transforms returning Ok(None)",
+            messages_filtered.clone(),
+        );
+        registry.register(
             "iggy_connector_errors_total",
             "Errors encountered",
             errors.clone(),
+        );
+        registry.register(
+            "iggy_connector_stage_duration_seconds",
+            "Per-batch processing stage duration in seconds",
+            stage_duration_seconds.clone(),
         );
 
         Self {
@@ -122,7 +227,9 @@ impl Metrics {
             messages_sent,
             messages_consumed,
             messages_processed,
+            messages_filtered,
             errors,
+            stage_duration_seconds,
         }
     }
 
@@ -174,49 +281,120 @@ impl Metrics {
         self.sinks_running.dec();
     }
 
+    pub fn observe_stage_with_labels(&self, labels: &StageLabels, duration: Duration) {
+        self.stage_duration_seconds
+            .get_or_create(labels)
+            .observe(duration.as_secs_f64());
+    }
+
+    #[cfg(test)]
     pub fn increment_messages_produced(&self, key: &str, count: u64) {
-        self.messages_produced
-            .get_or_create(&ConnectorLabels {
+        self.inc_messages_produced_with_labels(
+            &ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type: ConnectorType::Source,
-            })
-            .inc_by(count);
+            },
+            count,
+        );
     }
 
+    #[cfg(test)]
     pub fn increment_messages_sent(&self, key: &str, count: u64) {
-        self.messages_sent
-            .get_or_create(&ConnectorLabels {
+        self.inc_messages_sent_with_labels(
+            &ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type: ConnectorType::Source,
-            })
-            .inc_by(count);
+            },
+            count,
+        );
     }
 
+    #[cfg(test)]
     pub fn increment_messages_consumed(&self, key: &str, count: u64) {
-        self.messages_consumed
-            .get_or_create(&ConnectorLabels {
+        self.inc_messages_consumed_with_labels(
+            &ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type: ConnectorType::Sink,
-            })
-            .inc_by(count);
+            },
+            count,
+        );
     }
 
+    #[cfg(test)]
     pub fn increment_messages_processed(&self, key: &str, count: u64) {
-        self.messages_processed
-            .get_or_create(&ConnectorLabels {
+        self.inc_messages_processed_with_labels(
+            &ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type: ConnectorType::Sink,
-            })
-            .inc_by(count);
+            },
+            count,
+        );
     }
 
-    pub fn increment_errors(&self, key: &str, connector_type: ConnectorType) {
-        self.errors
-            .get_or_create(&ConnectorLabels {
+    #[cfg(test)]
+    pub fn increment_messages_filtered(
+        &self,
+        key: &str,
+        connector_type: ConnectorType,
+        count: u64,
+    ) {
+        self.inc_messages_filtered_with_labels(
+            &ConnectorLabels {
                 connector_key: key.to_owned(),
                 connector_type,
-            })
-            .inc();
+            },
+            count,
+        );
+    }
+
+    #[cfg(test)]
+    pub fn increment_errors(&self, key: &str, connector_type: ConnectorType) {
+        self.inc_errors_with_labels(&ConnectorLabels {
+            connector_key: key.to_owned(),
+            connector_type,
+        });
+    }
+
+    #[cfg(test)]
+    pub fn observe_stage_duration(
+        &self,
+        key: &str,
+        connector_type: ConnectorType,
+        stage: Stage,
+        duration: Duration,
+    ) {
+        self.observe_stage_with_labels(
+            &StageLabels {
+                connector_key: key.to_owned(),
+                connector_type,
+                stage,
+            },
+            duration,
+        );
+    }
+
+    pub fn inc_messages_produced_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.messages_produced.get_or_create(labels).inc_by(count);
+    }
+
+    pub fn inc_messages_sent_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.messages_sent.get_or_create(labels).inc_by(count);
+    }
+
+    pub fn inc_messages_consumed_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.messages_consumed.get_or_create(labels).inc_by(count);
+    }
+
+    pub fn inc_messages_processed_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.messages_processed.get_or_create(labels).inc_by(count);
+    }
+
+    pub fn inc_messages_filtered_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        self.messages_filtered.get_or_create(labels).inc_by(count);
+    }
+
+    pub fn inc_errors_with_labels(&self, labels: &ConnectorLabels) {
+        self.errors.get_or_create(labels).inc();
     }
 
     pub fn get_messages_produced(&self, key: &str) -> u64 {
@@ -263,6 +441,49 @@ impl Metrics {
             })
             .get()
     }
+
+    pub fn get_messages_filtered(&self, key: &str, connector_type: ConnectorType) -> u64 {
+        self.messages_filtered
+            .get_or_create(&ConnectorLabels {
+                connector_key: key.to_owned(),
+                connector_type,
+            })
+            .get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_stage_duration_sample_count(
+        &self,
+        key: &str,
+        connector_type: ConnectorType,
+        stage: Stage,
+    ) -> u64 {
+        let output = self.get_formatted_output();
+        let stage_label = match stage {
+            Stage::Prepare => "Prepare",
+            Stage::Ffi => "Ffi",
+            Stage::Decode => "Decode",
+            Stage::IggySend => "IggySend",
+            Stage::StateSave => "StateSave",
+            Stage::Total => "Total",
+        };
+        let type_label = match connector_type {
+            ConnectorType::Source => "Source",
+            ConnectorType::Sink => "Sink",
+        };
+        let needle = format!(
+            "iggy_connector_stage_duration_seconds_count{{connector_key=\"{key}\",connector_type=\"{type_label}\",stage=\"{stage_label}\"}}"
+        );
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle))
+            .and_then(|rest| rest.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+}
+
+fn stage_histogram() -> Histogram {
+    Histogram::new(STAGE_BUCKETS_SECONDS.iter().copied())
 }
 
 #[cfg(test)]
@@ -474,5 +695,150 @@ mod tests {
         assert_eq!(metrics.get_errors("test-source", ConnectorType::Source), 2);
         assert_eq!(metrics.get_errors("test-sink", ConnectorType::Sink), 1);
         assert_eq!(metrics.get_errors("nonexistent", ConnectorType::Source), 0);
+    }
+
+    #[test]
+    fn given_filtered_counter_when_incremented_should_register_under_labels() {
+        let metrics = Metrics::init();
+        metrics.increment_messages_filtered("filter-source", ConnectorType::Source, 7);
+        metrics.increment_messages_filtered("filter-sink", ConnectorType::Sink, 3);
+        metrics.increment_messages_filtered("filter-source", ConnectorType::Source, 5);
+
+        assert_eq!(
+            metrics.get_messages_filtered("filter-source", ConnectorType::Source),
+            12
+        );
+        assert_eq!(
+            metrics.get_messages_filtered("filter-sink", ConnectorType::Sink),
+            3
+        );
+        assert_eq!(
+            metrics.get_messages_filtered("nonexistent", ConnectorType::Source),
+            0
+        );
+
+        let output = metrics.get_formatted_output();
+        assert!(output.contains("iggy_connector_messages_filtered_total"));
+        assert!(output.contains("connector_key=\"filter-source\""));
+        assert!(output.contains("connector_key=\"filter-sink\""));
+    }
+
+    #[test]
+    fn given_filtered_counter_unique_per_connector_type_when_same_key_should_be_separate() {
+        let metrics = Metrics::init();
+        metrics.increment_messages_filtered("shared", ConnectorType::Source, 2);
+        metrics.increment_messages_filtered("shared", ConnectorType::Sink, 4);
+
+        assert_eq!(
+            metrics.get_messages_filtered("shared", ConnectorType::Source),
+            2
+        );
+        assert_eq!(
+            metrics.get_messages_filtered("shared", ConnectorType::Sink),
+            4
+        );
+    }
+
+    #[test]
+    fn given_stage_histogram_when_observations_recorded_should_increment_sample_count() {
+        let metrics = Metrics::init();
+        metrics.observe_stage_duration(
+            "pg",
+            ConnectorType::Sink,
+            Stage::Prepare,
+            Duration::from_micros(120),
+        );
+        metrics.observe_stage_duration(
+            "pg",
+            ConnectorType::Sink,
+            Stage::Prepare,
+            Duration::from_micros(340),
+        );
+        metrics.observe_stage_duration(
+            "pg",
+            ConnectorType::Sink,
+            Stage::Ffi,
+            Duration::from_millis(2),
+        );
+
+        assert_eq!(
+            metrics.get_stage_duration_sample_count("pg", ConnectorType::Sink, Stage::Prepare),
+            2
+        );
+        assert_eq!(
+            metrics.get_stage_duration_sample_count("pg", ConnectorType::Sink, Stage::Ffi),
+            1
+        );
+        assert_eq!(
+            metrics.get_stage_duration_sample_count("pg", ConnectorType::Sink, Stage::Total),
+            0
+        );
+    }
+
+    #[test]
+    fn given_stage_histogram_when_encoded_should_expose_bucket_metrics() {
+        let metrics = Metrics::init();
+        metrics.observe_stage_duration(
+            "es",
+            ConnectorType::Source,
+            Stage::IggySend,
+            Duration::from_micros(750),
+        );
+        let output = metrics.get_formatted_output();
+        assert!(output.contains("iggy_connector_stage_duration_seconds"));
+        assert!(output.contains("connector_key=\"es\""));
+        assert!(output.contains("stage=\"IggySend\""));
+        assert!(output.contains("iggy_connector_stage_duration_seconds_bucket"));
+        assert!(output.contains("iggy_connector_stage_duration_seconds_count"));
+        assert!(output.contains("iggy_connector_stage_duration_seconds_sum"));
+    }
+
+    #[test]
+    fn given_stage_histogram_when_same_label_set_used_twice_should_share_bucket() {
+        let metrics = Metrics::init();
+        for _ in 0..5 {
+            metrics.observe_stage_duration(
+                "k",
+                ConnectorType::Sink,
+                Stage::Total,
+                Duration::from_micros(80),
+            );
+        }
+        assert_eq!(
+            metrics.get_stage_duration_sample_count("k", ConnectorType::Sink, Stage::Total),
+            5
+        );
+    }
+
+    #[test]
+    fn given_source_stages_when_observed_should_each_have_distinct_sample_count() {
+        let metrics = Metrics::init();
+        let cases: [(Stage, u64); 5] = [
+            (Stage::Decode, 1),
+            (Stage::Prepare, 2),
+            (Stage::IggySend, 3),
+            (Stage::StateSave, 4),
+            (Stage::Total, 5),
+        ];
+        for (stage, count) in &cases {
+            for _ in 0..*count {
+                metrics.observe_stage_duration(
+                    "src",
+                    ConnectorType::Source,
+                    stage.clone(),
+                    Duration::from_micros(100),
+                );
+            }
+        }
+        for (stage, expected) in &cases {
+            assert_eq!(
+                metrics.get_stage_duration_sample_count(
+                    "src",
+                    ConnectorType::Source,
+                    stage.clone(),
+                ),
+                *expected
+            );
+        }
     }
 }
