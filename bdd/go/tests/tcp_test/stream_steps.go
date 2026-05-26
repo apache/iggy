@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"fmt"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -31,7 +32,7 @@ import (
 func successfullyCreateStream(prefix string, client iggcon.Client) (uint32, string) {
 	name := createRandomStringWithPrefix(prefix, 128)
 
-	stream, err := client.CreateStream(name)
+	stream, err := client.CreateStream(context.Background(), name)
 
 	itShouldNotReturnError(err)
 	itShouldSuccessfullyCreateStream(stream.Id, name, client)
@@ -79,7 +80,7 @@ func itShouldContainSpecificStream(id uint32, name string, streams []iggcon.Stre
 
 func itShouldSuccessfullyCreateStream(id uint32, expectedName string, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(id)
-	stream, err := client.GetStream(streamIdentifier)
+	stream, err := client.GetStream(context.Background(), streamIdentifier)
 
 	itShouldNotReturnError(err)
 	ginkgo.It("should create stream with id "+string(rune(id)), func() {
@@ -93,7 +94,7 @@ func itShouldSuccessfullyCreateStream(id uint32, expectedName string, client igg
 
 func itShouldSuccessfullyUpdateStream(id uint32, expectedName string, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(id)
-	stream, err := client.GetStream(streamIdentifier)
+	stream, err := client.GetStream(context.Background(), streamIdentifier)
 
 	itShouldNotReturnError(err)
 	ginkgo.It("should update stream with id "+string(rune(id)), func() {
@@ -107,7 +108,7 @@ func itShouldSuccessfullyUpdateStream(id uint32, expectedName string, client igg
 
 func itShouldSuccessfullyDeleteStream(id uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(id)
-	stream, err := client.GetStream(streamIdentifier)
+	stream, err := client.GetStream(context.Background(), streamIdentifier)
 
 	itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 	ginkgo.It("should not return stream", func() {
@@ -117,5 +118,5 @@ func itShouldSuccessfullyDeleteStream(id uint32, client iggcon.Client) {
 
 func deleteStreamAfterTests(streamId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	_ = client.DeleteStream(streamIdentifier)
+	_ = client.DeleteStream(context.Background(), streamIdentifier)
 }
