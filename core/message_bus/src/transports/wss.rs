@@ -469,10 +469,11 @@ mod tests {
     use crate::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
     use rustls::RootCertStore;
+    use server_common::MESSAGE_ALIGN;
+    use server_common::Message;
+    use server_common::iobuf::Frozen;
     use std::net::SocketAddr;
     use std::sync::OnceLock;
 

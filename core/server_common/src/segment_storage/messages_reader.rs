@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IggyError, IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
+use crate::{IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
+use iggy_common::IggyError;
 use std::rc::Rc;
 use std::{
     io::ErrorKind,

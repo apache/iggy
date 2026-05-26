@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"math/rand"
 	"os"
 	"strings"
@@ -31,7 +32,7 @@ import (
 
 func createAuthorizedConnection() iggcon.Client {
 	cli := createClient()
-	_, err := cli.LoginUser("iggy", "iggy")
+	_, err := cli.LoginUser(context.Background(), "iggy", "iggy")
 	if err != nil {
 		panic(err)
 	}
@@ -51,6 +52,10 @@ func createClient() iggcon.Client {
 	if err != nil {
 		panic(err)
 	}
+	if err := cli.Connect(context.Background()); err != nil {
+		panic(err)
+	}
+
 	return cli
 }
 

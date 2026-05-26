@@ -18,13 +18,15 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetClients() ([]iggcon.ClientInfo, error) {
-	buffer, err := c.do(&command.GetClients{})
+func (c *IggyTcpClient) GetClients(ctx context.Context) ([]iggcon.ClientInfo, error) {
+	buffer, err := c.do(ctx, &command.GetClients{})
 	if err != nil {
 		return nil, err
 	}
@@ -32,8 +34,8 @@ func (c *IggyTcpClient) GetClients() ([]iggcon.ClientInfo, error) {
 	return binaryserialization.DeserializeClients(buffer)
 }
 
-func (c *IggyTcpClient) GetClient(clientId uint32) (*iggcon.ClientInfoDetails, error) {
-	buffer, err := c.do(&command.GetClient{ClientID: clientId})
+func (c *IggyTcpClient) GetClient(ctx context.Context, clientId uint32) (*iggcon.ClientInfoDetails, error) {
+	buffer, err := c.do(ctx, &command.GetClient{ClientID: clientId})
 	if err != nil {
 		return nil, err
 	}

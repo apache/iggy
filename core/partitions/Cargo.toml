@@ -38,6 +38,7 @@ iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 ringbuffer = { workspace = true }
+server_common = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

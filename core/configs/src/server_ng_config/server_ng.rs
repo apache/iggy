@@ -35,11 +35,9 @@ use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
-use iggy_common::{
-    Validatable,
-    sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS},
-};
+use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
+use server_common::sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::env;
 use std::sync::Arc;
 

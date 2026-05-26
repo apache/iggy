@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -33,7 +35,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 			topicId, name := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-			topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
+			topic, err := client.GetTopic(context.Background(), streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificTopic(topicId, name, *topic)
@@ -42,7 +44,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 		ginkgo.Context("and tries to get topic from non-existing stream", func() {
 			client := createAuthorizedConnection()
 
-			_, err := client.GetTopic(randomU32Identifier(), randomU32Identifier())
+			_, err := client.GetTopic(context.Background(), randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
@@ -53,7 +55,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 
-			_, err := client.GetTopic(streamIdentifier, randomU32Identifier())
+			_, err := client.GetTopic(context.Background(), streamIdentifier, randomU32Identifier())
 
 			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})

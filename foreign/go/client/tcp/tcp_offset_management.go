@@ -18,13 +18,15 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) (*iggcon.ConsumerOffsetInfo, error) {
-	buffer, err := c.do(&command.GetConsumerOffset{
+func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) (*iggcon.ConsumerOffsetInfo, error) {
+	buffer, err := c.do(ctx, &command.GetConsumerOffset{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -37,8 +39,8 @@ func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId igg
 	return binaryserialization.DeserializeOffset(buffer), nil
 }
 
-func (c *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	_, err := c.do(&command.StoreConsumerOffsetRequest{
+func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
+	_, err := c.do(ctx, &command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
@@ -48,8 +50,8 @@ func (c *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId i
 	return err
 }
 
-func (c *IggyTcpClient) DeleteConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	_, err := c.do(&command.DeleteConsumerOffset{
+func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
+	_, err := c.do(ctx, &command.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,

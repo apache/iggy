@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -28,7 +30,7 @@ var _ = ginkgo.Describe("DELETE USER:", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
 			userIdentifier, _ := iggcon.NewIdentifier(userId)
-			err := client.DeleteUser(userIdentifier)
+			err := client.DeleteUser(context.Background(), userIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteUser(userId, client)
@@ -38,7 +40,7 @@ var _ = ginkgo.Describe("DELETE USER:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to delete user", func() {
 			client := createClient()
-			err := client.DeleteUser(randomU32Identifier())
+			err := client.DeleteUser(context.Background(), randomU32Identifier())
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

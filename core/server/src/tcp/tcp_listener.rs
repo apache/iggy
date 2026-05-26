@@ -18,6 +18,7 @@
 
 use crate::configs::tcp::TcpSocketConfig;
 
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::{ShutdownToken, TaskRegistry};
 use crate::shard::transmission::event::ShardEvent;
@@ -25,7 +26,7 @@ use crate::tcp::connection_handler::{ConnectionAction, handle_connection, handle
 use compio::net::{SocketOpts, TcpListener};
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyError, SenderKind, TransportProtocol};
+use iggy_common::{IggyError, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;

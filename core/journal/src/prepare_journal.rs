@@ -18,9 +18,8 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::consensus::message::{MESSAGE_ALIGN, Message};
 use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
 use std::io;

@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::{Frozen, Owned};
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::{MessageBus, SendError};
+use server_common::{
+    MESSAGE_ALIGN, Message,
+    iobuf::{Frozen, Owned},
+};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};

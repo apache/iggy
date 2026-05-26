@@ -18,12 +18,13 @@
 
 use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
 use crate::binary::handlers::messages::COMPONENT;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::ResolvedPartition;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_binary_protocol::requests::messages::FlushUnsavedBufferRequest;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 

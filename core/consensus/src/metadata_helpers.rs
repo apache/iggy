@@ -21,8 +21,9 @@
 
 use crate::client_table::{ClientTable, REGISTER_REQUEST_ID, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
-use iggy_binary_protocol::{EvictionHeader, EvictionReason, HEADER_SIZE, Message};
+use iggy_binary_protocol::{EvictionHeader, EvictionReason, HEADER_SIZE};
 use message_bus::MessageBus;
+use server_common::Message;
 use std::cell::RefCell;
 
 /// Request preflight (metadata only): session validation, dedup, in-flight check.
@@ -312,10 +313,9 @@ async fn send_eviction_to_client<B, P>(
 mod tests {
     use super::*;
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
     use iggy_binary_protocol::{Command2, Operation, ReplyHeader};
     use message_bus::SendError;
+    use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
     /// Production-sized `ClientTable`.
     fn fresh_client_table() -> RefCell<ClientTable> {

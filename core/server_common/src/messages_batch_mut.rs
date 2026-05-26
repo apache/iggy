@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use super::indexes_mut::IggyIndexesMut;
-use super::message_boundaries::IggyMessageBoundaries;
-use super::message_view_mut::IggyMessageViewMutIterator;
-use crate::{
+use crate::MessageDeduplicator;
+use crate::PooledBuffer;
+use crate::indexes_mut::IggyIndexesMut;
+use iggy_common::{
     IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError, IggyIndexView, IggyMessage,
-    IggyMessageView, IggyMessageViewIterator, IggyMessagesBatch, IggyTimestamp, MAX_PAYLOAD_SIZE,
-    MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
+    IggyMessageBoundaries, IggyMessageView, IggyMessageViewIterator, IggyMessageViewMutIterator,
+    IggyMessagesBatch, IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable,
+    Validatable, random_id,
 };
-use crate::{MessageDeduplicator, PooledBuffer, random_id};
 use lending_iterator::prelude::*;
 use std::ops::Index;
 use std::sync::Arc;
