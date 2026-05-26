@@ -33,7 +33,7 @@ use crate::schema::{ChType, Column};
 use iggy_connector_sdk::Error;
 use simd_json::OwnedValue;
 use simd_json::prelude::{TypedScalarValue, ValueAsArray, ValueAsObject};
-use tracing::error;
+use tracing::{error, warn};
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -239,9 +239,7 @@ pub(crate) fn serialize_value(
 
         // ── Decimal ──────────────────────────────────────────────────────────
         ChType::Decimal(precision, scale) => {
-            let f = coerce_f64(value)?;
-            let scale_factor = 10f64.powi(*scale as i32);
-            let int_val = (f * scale_factor).round() as i128;
+            let int_val = coerce_decimal(value, *precision, *scale)?;
             if *precision <= 9 {
                 buf.extend_from_slice(
                     &i32::try_from(int_val)
@@ -479,6 +477,103 @@ fn coerce_f64(value: &OwnedValue) -> Result<f64, Error> {
             Err(Error::InvalidRecord)
         }
     }
+}
+
+/// Convert a JSON value to the scaled integer representation used by ClickHouse Decimal types.
+///
+/// String and integer inputs are converted without going through f64, preserving full precision.
+/// Float inputs are accepted with a warning for high-precision columns because the JSON parser
+/// has already rounded the value to ~15 significant digits before this function is called.
+fn coerce_decimal(value: &OwnedValue, precision: u8, scale: u8) -> Result<i128, Error> {
+    let scale_pow = 10i128.pow(u32::from(scale));
+    match value {
+        OwnedValue::Static(simd_json::StaticNode::I64(n)) => {
+            i128::from(*n).checked_mul(scale_pow).ok_or_else(|| {
+                error!("Decimal overflow for Decimal({precision}, {scale})");
+                Error::InvalidRecord
+            })
+        }
+        OwnedValue::Static(simd_json::StaticNode::U64(n)) => {
+            i128::from(*n).checked_mul(scale_pow).ok_or_else(|| {
+                error!("Decimal overflow for Decimal({precision}, {scale})");
+                Error::InvalidRecord
+            })
+        }
+        OwnedValue::String(s) => parse_decimal_str(s, scale).map_err(|_| {
+            error!("Cannot parse '{s}' as Decimal({precision}, {scale})");
+            Error::InvalidRecord
+        }),
+        OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
+            // f64 has ~15-16 significant digits; values with more will be silently rounded.
+            // Decimal64 supports 18 and Decimal128 supports 38. Warn so the caller can act.
+            if precision > 15 {
+                warn!(
+                    "Decimal({precision}, {scale}) received as f64; precision beyond ~15 \
+                     significant digits is silently lost. Send the value as a JSON string \
+                     to preserve full precision."
+                );
+            }
+            Ok((f * 10f64.powi(i32::from(scale))).round() as i128)
+        }
+        other => {
+            error!("Cannot coerce {other:?} to Decimal({precision}, {scale})");
+            Err(Error::InvalidRecord)
+        }
+    }
+}
+
+/// Parse a decimal string (e.g. `"-1234.56"`) into a scaled integer without going through f64.
+///
+/// The result equals `value * 10^scale`, rounded half-up when the string has more fractional
+/// digits than `scale`. Returns `Err(())` for malformed input.
+fn parse_decimal_str(s: &str, scale: u8) -> Result<i128, ()> {
+    let s = s.trim();
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+
+    if s.is_empty() {
+        return Err(());
+    }
+
+    let (int_str, frac_str) = match s.find('.') {
+        Some(pos) => (&s[..pos], &s[pos + 1..]),
+        None => (s, ""),
+    };
+
+    let int_val: i128 = if int_str.is_empty() {
+        0
+    } else {
+        int_str.parse().map_err(|_| ())?
+    };
+
+    let scale = u32::from(scale);
+    let mut result = int_val.checked_mul(10i128.pow(scale)).ok_or(())?;
+
+    if !frac_str.is_empty() {
+        // Cap at 38 digits: Decimal128(38) is the widest ClickHouse type, and
+        // 10^38 < i128::MAX, so no intermediate value overflows.
+        let frac_str = if frac_str.len() > 38 {
+            &frac_str[..38]
+        } else {
+            frac_str
+        };
+        let frac_len = frac_str.len() as u32;
+        let frac_val: i128 = frac_str.parse().map_err(|_| ())?;
+        let frac_scaled = if frac_len <= scale {
+            frac_val
+                .checked_mul(10i128.pow(scale - frac_len))
+                .ok_or(())?
+        } else {
+            // More digits than scale: round half-up.
+            let divisor = 10i128.pow(frac_len - scale);
+            (frac_val + divisor / 2) / divisor
+        };
+        result = result.checked_add(frac_scaled).ok_or(())?;
+    }
+
+    Ok(if negative { -result } else { result })
 }
 
 fn coerce_to_string(value: &OwnedValue) -> Result<String, Error> {
@@ -1132,7 +1227,7 @@ mod tests {
     #[test]
     fn serialize_decimal32_scale2() {
         let mut buf = vec![];
-        // 3.15 * 10^2 = 314 → Int32
+        // 3.15 * 10^2 = 315 → Int32
         serialize_value(&json_f64(3.15), &ChType::Decimal(9, 2), &mut buf).unwrap();
         assert_eq!(buf, 315i32.to_le_bytes());
     }
@@ -1168,6 +1263,144 @@ mod tests {
         let mut expected = 100i64.to_le_bytes().to_vec();
         expected.extend_from_slice(&0i64.to_le_bytes());
         assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn serialize_decimal_from_string_integer() {
+        // "315" with scale 2 → 31500 (no fractional part)
+        let mut buf = vec![];
+        serialize_value(&json_str("315"), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 31500i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_string_exact_scale() {
+        let mut buf = vec![];
+        serialize_value(&json_str("3.15"), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 315i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_string_fewer_frac_digits_than_scale() {
+        // "3.1" with scale 2 → 310 (pad with trailing zero)
+        let mut buf = vec![];
+        serialize_value(&json_str("3.1"), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 310i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_string_rounds_extra_frac_digits() {
+        // "3.155" with scale 2 → 316 (rounds 3.155 → 3.16)
+        let mut buf = vec![];
+        serialize_value(&json_str("3.155"), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 316i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_string_negative() {
+        let mut buf = vec![];
+        serialize_value(&json_str("-3.15"), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, (-315i32).to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_i64() {
+        // Integer input: 123 with scale 2 → 12300
+        let mut buf = vec![];
+        serialize_value(&json_i64(123), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 12300i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_from_u64() {
+        let mut buf = vec![];
+        serialize_value(&json_u64(456), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 45600i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_i64_above_f64_precision() {
+        // 2^53 + 1 = 9_007_199_254_740_993 cannot be represented exactly in f64.
+        // The integer path must preserve it exactly.
+        let v = 9_007_199_254_740_993i64;
+        let mut buf = vec![];
+        serialize_value(&json_i64(v), &ChType::Decimal(18, 0), &mut buf).unwrap();
+        assert_eq!(buf, i64::try_from(v).unwrap().to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal128_high_precision_string() {
+        // 19 significant digits — beyond f64's ~15-digit precision.
+        // "123456789012345678.90" with scale 2 must encode as 12345678901234567890.
+        // The old f64 path would give 12345678901234568000 (off by 110 units).
+        let mut buf = vec![];
+        serialize_value(
+            &json_str("123456789012345678.90"),
+            &ChType::Decimal(38, 2),
+            &mut buf,
+        )
+        .unwrap();
+        let expected: i128 = 12_345_678_901_234_567_890;
+        assert_eq!(buf, expected.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal_invalid_string_is_error() {
+        let mut buf = vec![];
+        assert!(
+            serialize_value(&json_str("not-a-number"), &ChType::Decimal(9, 2), &mut buf).is_err()
+        );
+    }
+
+    // ── parse_decimal_str unit tests ─────────────────────────────────────────
+    #[test]
+    fn parse_decimal_str_integer_only() {
+        assert_eq!(parse_decimal_str("42", 2), Ok(4200));
+    }
+
+    #[test]
+    fn parse_decimal_str_exact_scale() {
+        assert_eq!(parse_decimal_str("1.23", 2), Ok(123));
+    }
+
+    #[test]
+    fn parse_decimal_str_fewer_frac_digits() {
+        assert_eq!(parse_decimal_str("1.2", 2), Ok(120));
+    }
+
+    #[test]
+    fn parse_decimal_str_more_frac_digits_rounds_up() {
+        assert_eq!(parse_decimal_str("1.235", 2), Ok(124));
+    }
+
+    #[test]
+    fn parse_decimal_str_more_frac_digits_rounds_down() {
+        assert_eq!(parse_decimal_str("1.234", 2), Ok(123));
+    }
+
+    #[test]
+    fn parse_decimal_str_negative() {
+        assert_eq!(parse_decimal_str("-1.23", 2), Ok(-123));
+    }
+
+    #[test]
+    fn parse_decimal_str_leading_dot() {
+        assert_eq!(parse_decimal_str(".5", 0), Ok(1));
+    }
+
+    #[test]
+    fn parse_decimal_str_zero_scale() {
+        assert_eq!(parse_decimal_str("7.9", 0), Ok(8));
+    }
+
+    #[test]
+    fn parse_decimal_str_empty_is_error() {
+        assert!(parse_decimal_str("", 2).is_err());
+    }
+
+    #[test]
+    fn parse_decimal_str_non_numeric_is_error() {
+        assert!(parse_decimal_str("abc", 2).is_err());
     }
 
     // ── array ────────────────────────────────────────────────────────────────
