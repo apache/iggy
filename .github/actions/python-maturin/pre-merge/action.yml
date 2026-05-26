@@ -79,10 +79,9 @@ runs:
         echo "Running ruff format --check..."
         uv run ruff format --check $DIRS_TO_CHECK
 
-        # mypy only for the SDK (has type stubs)
-        echo "Running mypy on SDK..."
-        uv run mypy --explicit-package-bases "$DIR_SDK"
-        echo "mypy version: $(uv run mypy --version)"
+        echo "Running pyrefly on SDK..."
+        uv run pyrefly check "$DIR_SDK"
+        echo "pyrefly version: $(uv run pyrefly --version)"
       shell: bash
 
     - name: Build Python wheel with coverage instrumentation
