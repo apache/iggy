@@ -420,7 +420,14 @@ fn coerce_i64(value: &OwnedValue) -> Result<i64, Error> {
     match value {
         OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(*n),
         OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(*n as i64),
-        OwnedValue::Static(simd_json::StaticNode::F64(f)) => Ok(*f as i64),
+        OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
+            let n = *f as i64;
+            if n as f64 != *f {
+                error!("Float {f} is not a finite whole number within i64 range");
+                return Err(Error::InvalidRecord);
+            }
+            Ok(n)
+        }
         OwnedValue::String(s) => s.parse::<i64>().map_err(|_| {
             error!("Cannot parse '{s}' as integer");
             Error::InvalidRecord
@@ -439,7 +446,14 @@ fn coerce_u64(value: &OwnedValue) -> Result<u64, Error> {
             error!("Cannot coerce negative integer {n} to unsigned integer");
             Error::InvalidRecord
         }),
-        OwnedValue::Static(simd_json::StaticNode::F64(f)) => Ok(*f as u64),
+        OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
+            let n = *f as u64;
+            if n as f64 != *f {
+                error!("Float {f} is not a finite whole number within u64 range");
+                return Err(Error::InvalidRecord);
+            }
+            Ok(n)
+        }
         OwnedValue::String(s) => s.parse::<u64>().map_err(|_| {
             error!("Cannot parse '{s}' as unsigned integer");
             Error::InvalidRecord
@@ -740,6 +754,63 @@ mod tests {
         let mut buf = vec![];
         assert!(serialize_value(&json_i64(65536), &ChType::UInt16, &mut buf).is_err());
         assert!(serialize_value(&json_i64(-1), &ChType::UInt16, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_whole_number_accepted_for_int64() {
+        let mut buf = vec![];
+        serialize_value(&json_f64(42.0), &ChType::Int64, &mut buf).unwrap();
+        assert_eq!(buf, 42i64.to_le_bytes());
+    }
+
+    #[test]
+    fn float_whole_number_accepted_for_uint64() {
+        let mut buf = vec![];
+        serialize_value(&json_f64(42.0), &ChType::UInt64, &mut buf).unwrap();
+        assert_eq!(buf, 42u64.to_le_bytes());
+    }
+
+    #[test]
+    fn float_nan_rejected_for_signed_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(f64::NAN), &ChType::Int32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_inf_rejected_for_signed_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(f64::INFINITY), &ChType::Int32, &mut buf).is_err());
+        assert!(serialize_value(&json_f64(f64::NEG_INFINITY), &ChType::Int32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_fractional_rejected_for_signed_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(3.14), &ChType::Int32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_nan_rejected_for_unsigned_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(f64::NAN), &ChType::UInt32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_inf_rejected_for_unsigned_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(f64::INFINITY), &ChType::UInt32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_negative_rejected_for_unsigned_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(-1.0), &ChType::UInt32, &mut buf).is_err());
+    }
+
+    #[test]
+    fn float_fractional_rejected_for_unsigned_integer() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_f64(1.5), &ChType::UInt32, &mut buf).is_err());
     }
 
     #[test]
