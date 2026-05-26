@@ -29,6 +29,7 @@
 use crate::schema::{Column, parse_type};
 use bytes::Bytes;
 use iggy_connector_sdk::Error;
+use rand::RngExt;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -236,7 +237,7 @@ impl ClickHouseClient {
                         warn!(
                             "Retryable HTTP {status} on attempt {attempts}/{max_retries}: {body_text}"
                         );
-                        tokio::time::sleep(retry_delay * attempts).await;
+                        tokio::time::sleep(jittered_backoff(retry_delay, attempts)).await;
                     } else {
                         // Non-retryable: 4xx data error — log and fail immediately.
                         error!("ClickHouse insert error HTTP {status}: {body_text}");
@@ -299,6 +300,18 @@ struct SchemaRow {
 
 fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Exponential backoff with full jitter.
+///
+/// Cap grows as `base * 2^attempt`, clamped to 60 s. The actual sleep is
+/// a uniform random value in `[0, cap]`, so concurrent instances spread
+/// their retries instead of thundering back together.
+fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
+    const MAX: Duration = Duration::from_secs(60);
+    let cap = base.saturating_mul(2u32.saturating_pow(attempt)).min(MAX);
+    let cap_ms = cap.as_millis() as u64;
+    Duration::from_millis(rand::rng().random_range(0..=cap_ms))
 }
 
 fn escape_single_quote(s: &str) -> String {

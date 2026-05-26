@@ -40,6 +40,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

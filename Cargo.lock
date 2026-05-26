@@ -6600,6 +6600,7 @@ dependencies = [
  "dashmap",
  "iggy_connector_sdk",
  "once_cell",
+ "rand 0.10.1",
  "reqwest 0.13.3",
  "secrecy",
  "serde",
