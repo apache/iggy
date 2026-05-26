@@ -32,6 +32,9 @@ dependencies = [
 [tool.uv.sources]
 apache-iggy = { path = "../../foreign/python" }
 
+[tool.uv]
+exclude-newer = "7 days"
+
 [tool.ruff.lint]
 select = [
     "S", # detects usage of commands like `exec()` and `eval()`. Also usage of `pickle`, `marshal`, etc.
@@ -49,3 +52,4 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S101"]
+

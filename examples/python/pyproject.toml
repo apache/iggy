@@ -44,3 +44,6 @@ select = [
 
 [tool.uv.sources]
 apache-iggy = { path = "../../foreign/python" }
+
+[tool.uv]
+exclude-newer = "7 days"

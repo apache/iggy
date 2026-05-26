@@ -151,3 +151,6 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
+
+[tool.uv]
+exclude-newer = "7 days"
