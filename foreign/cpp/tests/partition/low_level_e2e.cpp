@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO(slbotbm): create fixture for setup/teardown.
-
 #include <cstdint>
 #include <string>
 #include <vector>

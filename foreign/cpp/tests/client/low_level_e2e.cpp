@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO(slbotbm): create fixture for setup/teardown.
 // TODO(slbotbm): Add tests for join_consumer_group() and leave_consumer_group()
 
 #include <cstdint>
@@ -332,7 +331,6 @@ TEST_F(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
     ASSERT_THROW(client->get_me(), std::exception);
 }
 
-// TODO(slbotbm): add additional validation for get_me after merging join_consumer_group PR.
 TEST_F(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
     RecordProperty("description", "Returns the current authenticated client details.");
     iggy::ffi::Client *client = GetLoggedInClient();
@@ -345,6 +343,74 @@ TEST_F(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
         EXPECT_EQ(static_cast<std::string>(me.transport), "TCP");
         EXPECT_EQ(me.consumer_groups_count, 0u);
         EXPECT_TRUE(me.consumer_groups.empty());
+    });
+}
+
+TEST_F(LowLevelE2E_Client, GetMeReflectsConsumerGroupMembershipChanges) {
+    RecordProperty("description", "Reflects joined consumer groups in get_me and removes them again after leaving.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(stream_details.topics.size(), 1u);
+    const auto created_group = client->create_consumer_group(make_string_identifier(stream_name),
+                                                             make_string_identifier(topic_name), group_name);
+
+    std::size_t baseline_groups_size    = 0;
+    std::uint32_t baseline_groups_count = 0;
+    ASSERT_NO_THROW({
+        const auto me         = client->get_me();
+        baseline_groups_count = me.consumer_groups_count;
+        baseline_groups_size  = me.consumer_groups.size();
+    });
+
+    ASSERT_NO_THROW(client->join_consumer_group(make_numeric_identifier(stream_details.id),
+                                                make_numeric_identifier(stream_details.topics[0].id),
+                                                make_numeric_identifier(created_group.id)));
+
+    ASSERT_NO_THROW({
+        const auto me = client->get_me();
+        EXPECT_GT(me.consumer_groups_count, baseline_groups_count);
+        EXPECT_GT(me.consumer_groups.size(), baseline_groups_size);
+
+        bool found_group = false;
+        for (const auto &group : me.consumer_groups) {
+            if (group.stream_id != stream_details.id || group.topic_id != stream_details.topics[0].id ||
+                group.group_id != created_group.id) {
+                continue;
+            }
+            found_group = true;
+            break;
+        }
+        EXPECT_TRUE(found_group);
+    });
+
+    ASSERT_NO_THROW(client->leave_consumer_group(make_numeric_identifier(stream_details.id),
+                                                 make_numeric_identifier(stream_details.topics[0].id),
+                                                 make_numeric_identifier(created_group.id)));
+
+    ASSERT_NO_THROW({
+        const auto me = client->get_me();
+        EXPECT_GE(me.consumer_groups_count, baseline_groups_count);
+        EXPECT_GE(me.consumer_groups.size(), baseline_groups_size);
+
+        bool found_group = false;
+        for (const auto &group : me.consumer_groups) {
+            if (group.stream_id != stream_details.id || group.topic_id != stream_details.topics[0].id ||
+                group.group_id != created_group.id) {
+                continue;
+            }
+            found_group = true;
+            break;
+        }
+        EXPECT_FALSE(found_group);
     });
 }
 
@@ -396,9 +462,6 @@ TEST_F(LowLevelE2E_Client, GetMeReturnsDistinctClientIdsForDifferentSessions) {
     EXPECT_EQ(second_me.user_id, first_me.user_id);
     EXPECT_EQ(static_cast<std::string>(first_me.transport), "TCP");
     EXPECT_EQ(static_cast<std::string>(second_me.transport), "TCP");
-
-    DeleteClient(second_client);
-    DeleteClient(first_client);
 }
 
 TEST_F(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
@@ -427,8 +490,6 @@ TEST_F(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
     EXPECT_FALSE(static_cast<std::string>(second_me.address).empty());
     EXPECT_EQ(second_me.consumer_groups_count, 0u);
     EXPECT_TRUE(second_me.consumer_groups.empty());
-
-    DeleteClient(second_client);
 }
 
 TEST_F(LowLevelE2E_Client, GetClientBeforeLoginThrows) {
@@ -568,15 +629,13 @@ TEST_F(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
 
     EXPECT_TRUE(found_first);
     EXPECT_TRUE(found_second);
-
-    DeleteClient(second_client);
-    DeleteClient(first_client);
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
     RecordProperty("description", "Returns stable client lists across back-to-back get_clients calls.");
     iggy::ffi::Client *first_client  = GetLoggedInClient();
     iggy::ffi::Client *second_client = GetLoggedInClient();
+    ASSERT_NE(second_client, nullptr);
 
     rust::Vec<iggy::ffi::ClientInfo> first_clients;
     rust::Vec<iggy::ffi::ClientInfo> second_clients;
@@ -604,15 +663,13 @@ TEST_F(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
         }
         EXPECT_TRUE(found_match);
     }
-
-    DeleteClient(second_client);
-    DeleteClient(first_client);
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
     RecordProperty("description", "Returns list entries that agree with get_client for each returned client id.");
     iggy::ffi::Client *first_client  = GetLoggedInClient();
     iggy::ffi::Client *second_client = GetLoggedInClient();
+    ASSERT_NE(second_client, nullptr);
 
     rust::Vec<iggy::ffi::ClientInfo> clients;
     ASSERT_NO_THROW({ clients = first_client->get_clients(); });
@@ -630,9 +687,6 @@ TEST_F(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
         EXPECT_EQ(static_cast<std::string>(details.transport), static_cast<std::string>(client.transport));
         EXPECT_EQ(details.consumer_groups_count, client.consumer_groups_count);
     }
-
-    DeleteClient(second_client);
-    DeleteClient(first_client);
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
@@ -675,9 +729,6 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
         break;
     }
     EXPECT_TRUE(found_after);
-
-    DeleteClient(second_client);
-    DeleteClient(first_client);
 }
 
 TEST_F(LowLevelE2E_Client, PingSucceedsForNewConnection) {
