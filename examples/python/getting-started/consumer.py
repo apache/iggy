@@ -42,8 +42,8 @@ class ValidateUrl(argparse.Action):
         self,
         parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
-        values: typing.List[typing.Any],
-        option_string: str | None = None,
+        values: list[typing.Any],
+        _option_string: str | None = None,
     ):
         parsed_url: urllib.parse.ParseResult = urllib.parse.urlparse("//" + values)
         if parsed_url.netloc == "" or parsed_url.path != "":
@@ -121,14 +121,15 @@ async def main():
         logger.info("Connected.")
         await consume_messages(client)
     except Exception as error:
-        logger.exception("Exception occurred in main function: {}", error)
+        logger.exception(f"Exception occurred in main function: {error}")
 
 
 async def consume_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
-        f"Messages will be consumed from stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with "
-        f"interval {interval * 1000} ms."
+        f"Messages will be consumed from stream: {STREAM_NAME}, "
+        f"topic: {TOPIC_NAME}, partition: {PARTITION_ID} "
+        f"with interval {interval * 1000} ms."
     )
     offset = 0
     messages_per_batch = 10
@@ -155,7 +156,7 @@ async def consume_messages(client: IggyClient):
             n_consumed_batches += 1
             await asyncio.sleep(interval)
         except Exception as error:
-            logger.exception("Exception occurred while consuming messages: {}", error)
+            logger.exception(f"Exception occurred while consuming messages: {error}")
             break
 
     logger.info(f"Consumed {n_consumed_batches} batches of messages, exiting.")

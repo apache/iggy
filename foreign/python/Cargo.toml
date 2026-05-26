@@ -25,6 +25,15 @@ description = "Apache Iggy is the persistent message streaming platform written 
 documentation = "https://iggy.apache.org/docs/"
 repository = "https://github.com/apache/iggy"
 
+[lib]
+name = "apache_iggy"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "stub_gen"
+path = "src/bin/stub_gen.rs"
+doc = false
+
 [dependencies]
 bytes = "1.11.1"
 futures = "0.3.32"
@@ -36,12 +45,3 @@ pyo3-async-runtimes = { version = "0.28.0", features = [
 ] }
 pyo3-stub-gen = "0.22.3"
 tokio = "1.52.3"
-
-[lib]
-name = "apache_iggy"
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "stub_gen"
-path = "src/bin/stub_gen.rs"
-doc = false
