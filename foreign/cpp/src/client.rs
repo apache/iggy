@@ -258,7 +258,7 @@ impl Client {
             self.inner
                 .purge_stream(&rust_stream_id)
                 .await
-                .map_err(|error| format!("Could not purge stream '{}': {error}", rust_stream_id))?;
+                .map_err(|error| format!("Could not purge stream '{rust_stream_id}': {error}"))?;
             Ok(())
         })
     }
@@ -481,8 +481,7 @@ impl Client {
                 .await
                 .map_err(|error| {
                     format!(
-                        "Could not purge topic '{}' on stream '{}': {error}",
-                        rust_topic_id, rust_stream_id
+                        "Could not purge topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
                     )
                 })?;
             Ok(())
