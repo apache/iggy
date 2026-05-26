@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -26,8 +28,6 @@
 
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
-
-// TODO(slbotbm): Add tests for purge_topic after implementing send_messages(...).
 
 class LowLevelE2E_Topic : public E2ETestFixture {};
 
@@ -295,4 +295,417 @@ TEST_F(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                       "server_default", 0, "server_default"),
                  std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when purging a topic on a stream that does not exist.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicAfterStreamDeletionThrows) {
+    RecordProperty("description", "Throws when purging a topic after its stream has been deleted.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
+
+    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when purging a topic that does not exist.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicWithInvalidStreamIdentifierThrows) {
+    RecordProperty("description", "Rejects topic purge requests that use invalid stream identifier formats.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Identifier invalid_kind_id;
+    invalid_kind_id.kind   = "invalid";
+    invalid_kind_id.length = 4;
+    invalid_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->purge_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
+
+    iggy::ffi::Identifier invalid_numeric_id;
+    invalid_numeric_id.kind   = "numeric";
+    invalid_numeric_id.length = 1;
+    invalid_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->purge_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicWithInvalidTopicIdentifierThrows) {
+    RecordProperty("description", "Rejects topic purge requests that use invalid topic identifier formats.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Identifier invalid_kind_id;
+    invalid_kind_id.kind   = "invalid";
+    invalid_kind_id.length = 4;
+    invalid_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
+
+    iggy::ffi::Identifier invalid_numeric_id;
+    invalid_numeric_id.kind   = "numeric";
+    invalid_numeric_id.length = 1;
+    invalid_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicPreservesTopicMetadata) {
+    RecordProperty("description", "Preserves topic metadata after purging its messages.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1, "duration", 1000, "1GiB"));
+
+    auto stream_before_purge = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(stream_before_purge.topics.size(), 1u);
+    const auto topic_before_messages = stream_before_purge.topics.front();
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    messages.push_back(iggy::ffi::make_message(to_payload("preserve-topic-metadata")));
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_before_purge.id),
+                                          make_numeric_identifier(topic_before_messages.id), "partition_id",
+                                          partition_id_bytes(1), std::move(messages)));
+
+    stream_before_purge = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(stream_before_purge.topics.size(), 1u);
+    const auto topic_with_messages = stream_before_purge.topics.front();
+    EXPECT_GT(topic_with_messages.messages_count, 0u);
+    EXPECT_GT(topic_with_messages.size_bytes, 0u);
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+
+    const auto stream_after_purge = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(stream_after_purge.topics.size(), 1u);
+    const auto topic_after_purge = stream_after_purge.topics.front();
+
+    EXPECT_EQ(topic_after_purge.id, topic_with_messages.id);
+    EXPECT_EQ(topic_after_purge.created_at, topic_with_messages.created_at);
+    EXPECT_EQ(topic_after_purge.name, topic_with_messages.name);
+    EXPECT_EQ(topic_after_purge.message_expiry, topic_with_messages.message_expiry);
+    EXPECT_EQ(topic_after_purge.compression_algorithm, topic_with_messages.compression_algorithm);
+    EXPECT_EQ(topic_after_purge.max_topic_size, topic_with_messages.max_topic_size);
+    EXPECT_EQ(topic_after_purge.replication_factor, topic_with_messages.replication_factor);
+    EXPECT_EQ(topic_after_purge.partitions_count, topic_with_messages.partitions_count);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
+    RecordProperty("description", "Purges one topic's messages without affecting the other topics in the stream.");
+    const std::string stream_name       = GetRandomName();
+    const std::string first_topic_name  = GetRandomName();
+    const std::string second_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_stream = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(created_stream.topics.size(), 2u);
+
+    std::uint32_t first_topic_id  = 0;
+    std::uint32_t second_topic_id = 0;
+    bool first_topic_found        = false;
+    bool second_topic_found       = false;
+    for (const auto &topic : created_stream.topics) {
+        const std::string topic_name = static_cast<std::string>(topic.name);
+        if (topic_name == first_topic_name) {
+            first_topic_id    = topic.id;
+            first_topic_found = true;
+        } else if (topic_name == second_topic_name) {
+            second_topic_id    = topic.id;
+            second_topic_found = true;
+        }
+    }
+    ASSERT_TRUE(first_topic_found);
+    ASSERT_TRUE(second_topic_found);
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-first-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
+                                          make_numeric_identifier(first_topic_id), "partition_id",
+                                          partition_id_bytes(0), std::move(first_topic_messages)));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        second_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-second-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
+                                          make_numeric_identifier(second_topic_id), "partition_id",
+                                          partition_id_bytes(0), std::move(second_topic_messages)));
+
+    const auto stream_before_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_before_purge.messages_count, 5u);
+    EXPECT_GT(stream_before_purge.size_bytes, 0u);
+
+    std::unordered_map<std::string, std::uint64_t> messages_before_purge;
+    for (const auto &topic : stream_before_purge.topics) {
+        messages_before_purge[static_cast<std::string>(topic.name)] = topic.messages_count;
+    }
+    EXPECT_EQ(messages_before_purge[first_topic_name], 3u);
+    EXPECT_EQ(messages_before_purge[second_topic_name], 2u);
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(first_topic_name)));
+
+    const auto stream_after_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_after_purge.topics_count, 2u);
+    EXPECT_EQ(stream_after_purge.messages_count, 2u);
+    EXPECT_GT(stream_after_purge.size_bytes, 0u);
+    EXPECT_LT(stream_after_purge.size_bytes, stream_before_purge.size_bytes);
+
+    std::unordered_map<std::string, std::uint64_t> messages_after_purge;
+    std::unordered_map<std::string, std::uint64_t> sizes_after_purge;
+    for (const auto &topic : stream_after_purge.topics) {
+        const std::string topic_name     = static_cast<std::string>(topic.name);
+        messages_after_purge[topic_name] = topic.messages_count;
+        sizes_after_purge[topic_name]    = topic.size_bytes;
+    }
+    EXPECT_EQ(messages_after_purge[first_topic_name], 0u);
+    EXPECT_EQ(sizes_after_purge[first_topic_name], 0u);
+    EXPECT_EQ(messages_after_purge[second_topic_name], 2u);
+    EXPECT_GT(sizes_after_purge[second_topic_name], 0u);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions) {
+    RecordProperty("description", "Purges all messages from every partition in the topic.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_stream = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(created_stream.topics.size(), 1u);
+    const std::uint32_t topic_id = created_stream.topics.front().id;
+
+    for (std::uint32_t partition_id = 0; partition_id < 3; ++partition_id) {
+        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+        for (std::uint32_t i = 0; i < 2; ++i) {
+            messages.push_back(iggy::ffi::make_message(
+                to_payload("purge-topic-partition-" + std::to_string(partition_id) + "-" + std::to_string(i))));
+        }
+        ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
+                                              make_numeric_identifier(topic_id), "partition_id",
+                                              partition_id_bytes(partition_id), std::move(messages)));
+    }
+
+    const auto stream_before_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_before_purge.messages_count, 6u);
+    ASSERT_EQ(stream_before_purge.topics.size(), 1u);
+    EXPECT_EQ(stream_before_purge.topics.front().partitions_count, 3u);
+    EXPECT_EQ(stream_before_purge.topics.front().messages_count, 6u);
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+
+    const auto stream_after_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_after_purge.messages_count, 0u);
+    ASSERT_EQ(stream_after_purge.topics.size(), 1u);
+    EXPECT_EQ(stream_after_purge.topics.front().partitions_count, 3u);
+    EXPECT_EQ(stream_after_purge.topics.front().messages_count, 0u);
+    EXPECT_EQ(stream_after_purge.topics.front().size_bytes, 0u);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicThenSendMessagesAgainSucceeds) {
+    RecordProperty("description", "Allows sending fresh messages again after purging the topic.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_stream = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(created_stream.topics.size(), 1u);
+    const std::uint32_t topic_id = created_stream.topics.front().id;
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> first_batch;
+    first_batch.push_back(iggy::ffi::make_message(to_payload("before-topic-purge")));
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
+                                          "partition_id", partition_id_bytes(0), std::move(first_batch)));
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> second_batch;
+    second_batch.push_back(iggy::ffi::make_message(to_payload("after-topic-purge-0")));
+    second_batch.push_back(iggy::ffi::make_message(to_payload("after-topic-purge-1")));
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
+                                          "partition_id", partition_id_bytes(0), std::move(second_batch)));
+
+    const auto stream_after_resend = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_after_resend.messages_count, 2u);
+    ASSERT_EQ(stream_after_resend.topics.size(), 1u);
+    EXPECT_EQ(stream_after_resend.topics.front().messages_count, 2u);
+    EXPECT_GT(stream_after_resend.topics.front().size_bytes, 0u);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUntouched) {
+    RecordProperty("description",
+                   "Allows purging the same topic twice and keeps the target topic empty without affecting siblings.");
+    const std::string stream_name       = GetRandomName();
+    const std::string first_topic_name  = GetRandomName();
+    const std::string second_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_stream = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(created_stream.topics.size(), 2u);
+
+    std::uint32_t first_topic_id  = 0;
+    std::uint32_t second_topic_id = 0;
+    bool first_topic_found        = false;
+    bool second_topic_found       = false;
+    for (const auto &topic : created_stream.topics) {
+        const std::string topic_name = static_cast<std::string>(topic.name);
+        if (topic_name == first_topic_name) {
+            first_topic_id    = topic.id;
+            first_topic_found = true;
+        } else if (topic_name == second_topic_name) {
+            second_topic_id    = topic.id;
+            second_topic_found = true;
+        }
+    }
+    ASSERT_TRUE(first_topic_found);
+    ASSERT_TRUE(second_topic_found);
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        first_topic_messages.push_back(
+            iggy::ffi::make_message(to_payload("purge-topic-twice-first-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
+                                          make_numeric_identifier(first_topic_id), "partition_id",
+                                          partition_id_bytes(0), std::move(first_topic_messages)));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        second_topic_messages.push_back(
+            iggy::ffi::make_message(to_payload("purge-topic-twice-second-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
+                                          make_numeric_identifier(second_topic_id), "partition_id",
+                                          partition_id_bytes(0), std::move(second_topic_messages)));
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(first_topic_name)));
+    const auto stream_after_first_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_after_first_purge.topics_count, 2u);
+    EXPECT_EQ(stream_after_first_purge.messages_count, 2u);
+
+    std::unordered_map<std::string, std::uint64_t> messages_after_first_purge;
+    std::unordered_map<std::string, std::uint64_t> sizes_after_first_purge;
+    for (const auto &topic : stream_after_first_purge.topics) {
+        const std::string topic_name           = static_cast<std::string>(topic.name);
+        messages_after_first_purge[topic_name] = topic.messages_count;
+        sizes_after_first_purge[topic_name]    = topic.size_bytes;
+    }
+    EXPECT_EQ(messages_after_first_purge[first_topic_name], 0u);
+    EXPECT_EQ(sizes_after_first_purge[first_topic_name], 0u);
+    EXPECT_EQ(messages_after_first_purge[second_topic_name], 2u);
+    EXPECT_GT(sizes_after_first_purge[second_topic_name], 0u);
+
+    ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(first_topic_name)));
+    const auto stream_after_second_purge = client->get_stream(make_string_identifier(stream_name));
+    EXPECT_EQ(stream_after_second_purge.topics_count, 2u);
+    EXPECT_EQ(stream_after_second_purge.messages_count, 2u);
+
+    std::unordered_map<std::string, std::uint64_t> messages_after_second_purge;
+    std::unordered_map<std::string, std::uint64_t> sizes_after_second_purge;
+    for (const auto &topic : stream_after_second_purge.topics) {
+        const std::string topic_name            = static_cast<std::string>(topic.name);
+        messages_after_second_purge[topic_name] = topic.messages_count;
+        sizes_after_second_purge[topic_name]    = topic.size_bytes;
+    }
+    EXPECT_EQ(messages_after_second_purge[first_topic_name], 0u);
+    EXPECT_EQ(sizes_after_second_purge[first_topic_name], 0u);
+    EXPECT_EQ(messages_after_second_purge[second_topic_name], 2u);
+    EXPECT_GT(sizes_after_second_purge[second_topic_name], 0u);
+}
+
+TEST_F(LowLevelE2E_Topic, PurgeTopicBeforeLoginThrows) {
+    RecordProperty("description", "Throws when topic purge is attempted before authentication.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(
+        unauthenticated_client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
 }
