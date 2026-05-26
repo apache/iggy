@@ -27,5 +27,20 @@ dependencies = [
     "loguru==0.7.3",
 ]
 
+[tool.ruff.lint]
+select = [
+    "S", # detects usage of commands like `exec()` and `eval()`. Also usage of `pickle`, `marshal`, etc.
+    "B", # flake8-bugbear rule family for likely bugs and unsafe exception patterns
+    "E", # pycodestyle errors: basic PEP 8 style violations
+    "F", # Pyflakes: undefined names, unused imports, and other logic issues
+    "W", # pycodestyle warnings: whitespace and other style warnings
+    "I", # isort: import sorting and grouping rules
+    "T10", # flake8-debugger: debugger statements like pdb or breakpoint
+    "C4", # flake8-comprehensions: unnecessary or suboptimal comprehensions
+    "ARG", # flake8-unused-arguments: unused function arguments
+    "SIM", # flake8-simplify: simplify redundant logic and expressions
+    "UP", # pyupgrade: use newer, simpler Python syntax
+]
+
 [tool.uv.sources]
 apache-iggy = { path = "../../foreign/python" }

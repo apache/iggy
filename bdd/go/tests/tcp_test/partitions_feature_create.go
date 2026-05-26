@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			partitionsCount := uint32(10)
 			err := client.CreatePartitions(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				partitionsCount,
@@ -47,6 +50,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 		ginkgo.Context("and tries to create partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.CreatePartitions(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				10,
@@ -61,6 +65,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.CreatePartitions(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				10,
@@ -74,6 +79,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 		ginkgo.Context("and tries to create partitions", func() {
 			client := createClient()
 			err := client.CreatePartitions(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				10,

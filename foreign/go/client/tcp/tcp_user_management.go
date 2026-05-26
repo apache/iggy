@@ -18,14 +18,16 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoDetails, error) {
-	buffer, err := c.do(&command.GetUser{Id: identifier})
+func (c *IggyTcpClient) GetUser(ctx context.Context, identifier iggcon.Identifier) (*iggcon.UserInfoDetails, error) {
+	buffer, err := c.do(ctx, &command.GetUser{Id: identifier})
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +38,8 @@ func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoD
 	return binaryserialization.DeserializeUser(buffer)
 }
 
-func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
-	buffer, err := c.do(&command.GetUsers{})
+func (c *IggyTcpClient) GetUsers(ctx context.Context) ([]iggcon.UserInfo, error) {
+	buffer, err := c.do(ctx, &command.GetUsers{})
 	if err != nil {
 		return nil, err
 	}
@@ -45,8 +47,8 @@ func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
 	return binaryserialization.DeserializeUsers(buffer)
 }
 
-func (c *IggyTcpClient) CreateUser(username string, password string, status iggcon.UserStatus, permissions *iggcon.Permissions) (*iggcon.UserInfoDetails, error) {
-	buffer, err := c.do(&command.CreateUser{
+func (c *IggyTcpClient) CreateUser(ctx context.Context, username string, password string, status iggcon.UserStatus, permissions *iggcon.Permissions) (*iggcon.UserInfoDetails, error) {
+	buffer, err := c.do(ctx, &command.CreateUser{
 		Username:    username,
 		Password:    password,
 		Status:      status,
@@ -62,8 +64,8 @@ func (c *IggyTcpClient) CreateUser(username string, password string, status iggc
 	return userInfo, nil
 }
 
-func (c *IggyTcpClient) UpdateUser(userID iggcon.Identifier, username *string, status *iggcon.UserStatus) error {
-	_, err := c.do(&command.UpdateUser{
+func (c *IggyTcpClient) UpdateUser(ctx context.Context, userID iggcon.Identifier, username *string, status *iggcon.UserStatus) error {
+	_, err := c.do(ctx, &command.UpdateUser{
 		UserID:   userID,
 		Username: username,
 		Status:   status,
@@ -71,23 +73,23 @@ func (c *IggyTcpClient) UpdateUser(userID iggcon.Identifier, username *string, s
 	return err
 }
 
-func (c *IggyTcpClient) DeleteUser(identifier iggcon.Identifier) error {
-	_, err := c.do(&command.DeleteUser{
+func (c *IggyTcpClient) DeleteUser(ctx context.Context, identifier iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.DeleteUser{
 		Id: identifier,
 	})
 	return err
 }
 
-func (c *IggyTcpClient) UpdatePermissions(userID iggcon.Identifier, permissions *iggcon.Permissions) error {
-	_, err := c.do(&command.UpdatePermissions{
+func (c *IggyTcpClient) UpdatePermissions(ctx context.Context, userID iggcon.Identifier, permissions *iggcon.Permissions) error {
+	_, err := c.do(ctx, &command.UpdatePermissions{
 		UserID:      userID,
 		Permissions: permissions,
 	})
 	return err
 }
 
-func (c *IggyTcpClient) ChangePassword(userID iggcon.Identifier, currentPassword string, newPassword string) error {
-	_, err := c.do(&command.ChangePassword{
+func (c *IggyTcpClient) ChangePassword(ctx context.Context, userID iggcon.Identifier, currentPassword string, newPassword string) error {
+	_, err := c.do(ctx, &command.ChangePassword{
 		UserID:          userID,
 		CurrentPassword: currentPassword,
 		NewPassword:     newPassword,

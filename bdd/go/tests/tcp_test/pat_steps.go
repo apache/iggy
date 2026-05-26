@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -26,7 +28,7 @@ import (
 // OPERATIONS
 
 func successfullyCreateAccessToken(name string, client iggcon.Client) string {
-	result, err := client.CreatePersonalAccessToken(name, 0)
+	result, err := client.CreatePersonalAccessToken(context.Background(), name, 0)
 	itShouldNotReturnError(err)
 
 	return result.Token
@@ -35,14 +37,14 @@ func successfullyCreateAccessToken(name string, client iggcon.Client) string {
 // ASSERTIONS
 
 func itShouldSuccessfullyCreateAccessToken(name string, client iggcon.Client) {
-	tokens, err := client.GetPersonalAccessTokens()
+	tokens, err := client.GetPersonalAccessTokens(context.Background())
 
 	itShouldNotReturnError(err)
 	itShouldContainSpecificAccessToken(name, tokens)
 }
 
 func itShouldSuccessfullyDeleteAccessToken(name string, client iggcon.Client) {
-	tokens, err := client.GetPersonalAccessTokens()
+	tokens, err := client.GetPersonalAccessTokens(context.Background())
 
 	itShouldNotReturnError(err)
 	found := false
@@ -60,7 +62,7 @@ func itShouldSuccessfullyDeleteAccessToken(name string, client iggcon.Client) {
 
 func itShouldBePossibleToLogInWithAccessToken(token string) {
 	ms := createClient()
-	userId, err := ms.LoginWithPersonalAccessToken(token)
+	userId, err := ms.LoginWithPersonalAccessToken(context.Background(), token)
 
 	itShouldNotReturnError(err)
 	ginkgo.It("should return userId", func() {
