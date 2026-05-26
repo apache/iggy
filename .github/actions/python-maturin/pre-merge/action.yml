@@ -79,8 +79,11 @@ runs:
         echo "Running ruff format --check..."
         uv run ruff format --check $DIRS_TO_CHECK
 
-        echo "Running pyrefly on SDK..."
-        uv run pyrefly check "$DIR_SDK"
+        echo "Running pyrefly on all Python directories..."
+        for dir in $DIRS_TO_CHECK; do
+          echo "Checking with pyrefly: $dir"
+          uv run pyrefly check "$dir"
+        done
         echo "pyrefly version: $(uv run pyrefly --version)"
       shell: bash
 
