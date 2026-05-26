@@ -21,8 +21,9 @@ Basic messaging BDD test implementation for Python SDK
 
 import asyncio
 import socket
-from pytest_bdd import scenarios, given, when, then, parsers
-from apache_iggy import IggyClient, SendMessage, PollingStrategy
+
+from apache_iggy import IggyClient, PollingStrategy, SendMessage
+from pytest_bdd import given, parsers, scenarios, then, when
 
 # Load scenarios from the shared feature file
 scenarios("/app/features/basic_messaging.feature")
@@ -110,7 +111,8 @@ def verify_stream_properties(context, stream_name):
 
 @when(
     parsers.parse(
-        "I create a topic with name {topic_name} in stream {stream_id:d} with {partitions:d} partitions"
+        "I create a topic with name {topic_name} "
+        "in stream {stream_id:d} with {partitions:d} partitions"
     )
 )
 def create_topic(context, topic_name, stream_id, partitions):
@@ -173,7 +175,8 @@ def verify_topic_partitions(context, partitions):
 
 @when(
     parsers.parse(
-        "I send {message_count:d} messages to stream {stream_id:d}, topic {topic_id:d}, partition {partition_id:d}"
+        "I send {message_count:d} messages to stream {stream_id:d}, "
+        "topic {topic_id:d}, partition {partition_id:d}"
     )
 )
 def send_messages(context, message_count, stream_id, topic_id, partition_id):
@@ -208,7 +211,8 @@ def messages_sent_successfully(context):
 
 @when(
     parsers.parse(
-        "I poll messages from stream {stream_id:d}, topic {topic_id:d}, partition {partition_id:d} starting from offset {start_offset:d}"
+        "I poll messages from stream {stream_id:d}, topic {topic_id:d}, "
+        "partition {partition_id:d} starting from offset {start_offset:d}"
     )
 )
 def poll_messages(context, stream_id, topic_id, partition_id, start_offset):
@@ -236,7 +240,8 @@ def verify_message_count(context, expected_count):
 
 @then(
     parsers.parse(
-        "the messages should have sequential offsets from {start_offset:d} to {end_offset:d}"
+        "the messages should have sequential offsets "
+        "from {start_offset:d} to {end_offset:d}"
     )
 )
 def verify_sequential_offsets(context, start_offset, end_offset):
