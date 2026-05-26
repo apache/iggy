@@ -870,11 +870,14 @@ impl TestBinary for ServerHandle {
             self.stderr_path = Some(fs::canonicalize(&stderr_path)?);
         }
 
-        // server-ng production listeners intentionally do not use
-        // SO_REUSEPORT, so the harness must release pre-bound reservation
-        // sockets before spawning the child. The environment still carries
-        // the selected ports; this preserves deterministic client config
-        // without requiring production listener reuse.
+        // Release the reservation BEFORE spawning. Production listeners
+        // set `SO_REUSEPORT` in theory, but holding the reservation across
+        // child startup races with `bind()` on the child side and
+        // sporadically returns `CannotBindToSocket`. The narrow TOCTOU
+        // window between `release` and the child's `bind` is bounded by
+        // process start latency and harness-controlled environment;
+        // hubcio's TODO in `socket_opts.rs` retires the whole
+        // reservation-socket dance.
         if let Some(reserver) = self.port_reserver.take() {
             reserver.release();
         }

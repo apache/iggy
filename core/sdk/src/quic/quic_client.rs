@@ -20,6 +20,8 @@ use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
 #[cfg(feature = "vsr")]
 use crate::session::ConsensusSession;
+#[cfg(feature = "vsr")]
+use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
 use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
@@ -40,6 +42,8 @@ use secrecy::ExposeSecret;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -63,7 +67,9 @@ pub struct QuicClient {
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
-    consensus_session: Arc<Mutex<ConsensusSession>>,
+    // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
+    // `std::sync::Mutex` rationale (pure-CPU critical section).
+    consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
 }
@@ -165,30 +171,36 @@ impl BinaryTransport for QuicClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+}
 
-    #[cfg(feature = "vsr")]
-    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
-        Ok(self.consensus_session.lock().await.client_id())
-    }
+#[cfg(feature = "vsr")]
+impl iggy_common::VsrSessionSealed for QuicClient {}
 
-    #[cfg(feature = "vsr")]
+#[cfg(feature = "vsr")]
+#[async_trait::async_trait]
+impl iggy_common::VsrSessionControl for QuicClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
         if session == 0 {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::InvalidSession(session));
         }
 
-        let mut consensus_session = self.consensus_session.lock().await;
+        let mut consensus_session = self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned");
         if consensus_session.is_bound() {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::AlreadyAuthenticated);
         }
 
         consensus_session.bind(session);
         Ok(())
     }
 
-    #[cfg(feature = "vsr")]
     async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        *self.consensus_session.lock().await = ConsensusSession::new();
+        *self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
     }
 }
@@ -258,7 +270,7 @@ impl QuicClient {
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
-            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
         })
@@ -639,7 +651,9 @@ impl QuicClient {
             if let Some(connection) = connection.as_ref() {
                 #[cfg(feature = "vsr")]
                 let (request_header, request_size) = {
-                    let mut consensus_session = consensus_session.lock().await;
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
                     crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
                 #[cfg(not(feature = "vsr"))]

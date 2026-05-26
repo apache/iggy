@@ -147,6 +147,14 @@ impl PipelineEntry {
         self.reply_sender.take()
     }
 
+    /// `true` iff the entry still owns a reply sender (in-process awaiter).
+    /// Caller checks before [`Self::take_reply_sender`] so it can branch on
+    /// the slot's network-vs-in-process role without consuming the sender.
+    #[must_use]
+    pub const fn has_reply_sender(&self) -> bool {
+        self.reply_sender.is_some()
+    }
+
     /// Record a `prepare_ok` from the given replica.
     /// Returns the new count of acknowledgments.
     pub fn add_ack(&mut self, replica: u8) -> usize {
@@ -978,6 +986,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn set_last_prepare_checksum(&self, checksum: u128) {
         self.last_prepare_checksum.set(checksum);
+    }
+
+    /// Returns a primary-stamped prepare timestamp that is strictly greater
+    /// than every previously-stamped value on this primary.
+    ///
+    /// Without monotonicity, an NTP step backwards could produce
+    /// `prepare[N+1].timestamp < prepare[N].timestamp`, breaking
+    /// `created_at` ordering invariants in deterministic state.
+    pub fn next_monotonic_timestamp(&self) -> u64 {
+        let now = IggyTimestamp::now().as_micros();
+        let prev = self.last_timestamp.get();
+        let next = now.max(prev.saturating_add(1));
+        self.last_timestamp.set(next);
+        next
     }
 
     #[must_use]
@@ -2010,8 +2032,10 @@ where
         let op = consensus.sequencer.current_sequence() + 1;
         // Primary stamps wall-clock once at prepare-build; the value is
         // replicated to every backup so apply() reads the same timestamp
-        // across the cluster (deterministic state-machine apply).
-        let timestamp = IggyTimestamp::now().as_micros();
+        // across the cluster (deterministic state-machine apply). Monotonic
+        // wrapper guards against NTP rewinds; see
+        // `VsrConsensus::next_monotonic_timestamp`.
+        let timestamp = consensus.next_monotonic_timestamp();
 
         self.transmute_header(|old, new| {
             *new = PrepareHeader {

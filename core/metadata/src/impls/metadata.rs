@@ -767,8 +767,19 @@ where
                 // Fire subscriber BEFORE wire send. Slot already updated
                 // (slot-first ordering, see take_reply_sender). Dropped
                 // receiver: ignored.
+                let had_in_process_subscriber = entry.has_reply_sender();
                 if let Some(sender) = entry.take_reply_sender() {
                     let _ = sender.send(reply.clone());
+                }
+
+                // Skip wire send when an in-process subscriber consumed the
+                // reply: the caller (e.g. `complete_login_register`,
+                // `handle_logout_request`) ships its own full-body reply on
+                // the same socket. Sending both desyncs the SDK -- it reads
+                // the first frame, fails to decode the typed body, and
+                // leaves the second frame stuck in the socket buffer.
+                if had_in_process_subscriber {
+                    continue;
                 }
 
                 let generic_reply = reply.into_generic();
@@ -912,6 +923,12 @@ where
         // Subscribe before await so receiver registers before any self-loopback
         // ack fires. compio is single-threaded; explicit anyway.
         consensus.verify_pipeline();
+        // Snapshot (view, commit_min) pre-subscribe. Validate it after
+        // `on_replicate` returns and again on receiver completion: another
+        // task could mutate either during the awaits and silently invalidate
+        // the gate, with release builds proceeding on a stale view-state.
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
         // can drop the borrow. No commit-max advance flips the gate today;
@@ -921,6 +938,10 @@ where
             "submit_register_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_register_in_process: view/commit_min advanced across on_replicate await"
+        );
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
@@ -1024,12 +1045,18 @@ where
             .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
 
         consensus.verify_pipeline();
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         debug_assert!(
             is_caught_up_primary(consensus),
             "submit_logout_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_logout_in_process: view/commit_min advanced across on_replicate await"
+        );
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
@@ -1483,6 +1510,14 @@ where
     let header_bytes = &mut prepare_bytes[..size_of::<PrepareHeader>()];
     let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
         .expect("prepare header bytes should be valid");
+    // Match `Project::project` (core/consensus/src/impls.rs): the primary
+    // stamps wall-clock once here so every replica's `StateHandler::apply`
+    // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
+    // `created_at` on every CreateStream/CreateTopic/CreatePartitions, since
+    // submit_command_in_process bypasses `Project::project` and calls this
+    // helper directly. Shared `next_monotonic_timestamp` keeps the in-process
+    // path on the same monotonic-clock guard as the wire path.
+    let timestamp = consensus.next_monotonic_timestamp();
     *new_header = PrepareHeader {
         cluster: consensus.cluster(),
         size: u32::try_from(size).expect("prepare message size exceeds u32"),
@@ -1496,7 +1531,7 @@ where
         request: request.request,
         commit: consensus.commit_max(),
         op,
-        timestamp: 0,
+        timestamp,
         operation,
         namespace: request.namespace,
         ..Default::default()

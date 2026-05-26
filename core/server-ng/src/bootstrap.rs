@@ -2082,10 +2082,38 @@ fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
                 .borrow_mut()
                 .remove_connection(client_id)
             {
+                // Local-table reclaim happens here; then spawn a detached
+                // task to submit a cluster-replicated `Logout` so peer
+                // replicas drop the slot too. Without this, an
+                // already-committed `Register` lingers on every backup
+                // until they evict the client themselves -- a
+                // local-vs-cluster divergence observable across view
+                // changes. `submit_logout_in_process` requires shard 0
+                // consensus, which this handler always runs on.
                 shard_for_disconnect
                     .plane
                     .metadata()
                     .remove_client_session(vsr_client_id);
+                let shard = Rc::clone(&shard_for_disconnect);
+                compio::runtime::spawn(async move {
+                    // request_id 0 + session 0: synthetic disconnect
+                    // logout; `submit_logout_in_process` short-circuits to
+                    // current commit when no session entry exists, so a
+                    // race with the explicit logout path is a no-op.
+                    if let Err(error) = shard
+                        .plane
+                        .metadata()
+                        .submit_logout_in_process(vsr_client_id, 0, 0)
+                        .await
+                    {
+                        warn!(
+                            vsr_client_id,
+                            ?error,
+                            "disconnect logout submit failed; peer slots may linger until eviction"
+                        );
+                    }
+                })
+                .detach();
             }
         }));
     Rc::new(move |client_id, message| {
@@ -2125,6 +2153,12 @@ fn make_deferred_client_request_handler(
             .remove_connection(client_id)
             && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
         {
+            // TODO(vsr): this handler runs on shards > 0 which have no
+            // consensus; `submit_logout_in_process` would panic. Local
+            // table reclaim only -- bounded local-vs-cluster divergence
+            // window until `evict_oldest` reclaims the peer slot. Fix by
+            // routing a synthetic Logout request through the inter-shard
+            // router to shard 0.
             shard.plane.metadata().remove_client_session(vsr_client_id);
         }
     }));
@@ -2211,7 +2245,7 @@ fn pop_next_client_request(
     message
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_client_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -2234,6 +2268,26 @@ async fn handle_client_request(
 
     let header = *request.header();
     if header.operation == Operation::NonReplicated {
+        // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
+        // legitimately pre-auth (liveness probe + connection bootstrap
+        // metadata). Every other non-replicated code (`GET_STREAM*`,
+        // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
+        // MUST go through Register first, since server-ng has no
+        // per-resource authz layer.
+        let nr_code = u32::from_le_bytes(
+            request.header().reserved[..4]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let allowed_pre_auth = matches!(nr_code, PING_CODE | GET_CLUSTER_METADATA_CODE);
+        if !allowed_pre_auth && sessions.borrow().get_session(transport_client_id).is_none() {
+            warn!(
+                transport_client_id,
+                code = nr_code,
+                "dropping pre-auth non-replicated read"
+            );
+            return;
+        }
         handle_non_replicated_request(shard, transport_client_id, request).await;
         return;
     }
@@ -2464,10 +2518,16 @@ fn maybe_rewrite_pat_request(
         Operation::CreatePersonalAccessToken => {
             let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
+            // Primary mints the raw token + hash here and ships the hash
+            // through consensus. Replicas decode the hash directly. Doing
+            // this inside `CreatePersonalAccessTokenRequest::apply` would
+            // call `ring::rand` per-replica and diverge state.
+            let token_hash = mint_pat_token_hash();
             ReplicatedCreatePersonalAccessTokenRequest {
                 user_id,
                 name: wire.name,
                 expiry: wire.expiry,
+                token_hash,
             }
             .to_bytes()
         }
@@ -2486,6 +2546,19 @@ fn maybe_rewrite_pat_request(
     rewrite_request_body(&request, &rewritten)
 }
 
+/// Mints a fresh PAT raw token and returns its hex-encoded SHA-256 hash
+/// (64 bytes ASCII) for replication. The raw token is currently dropped --
+/// see the TODO on `CreatePersonalAccessTokenRequest::apply` for the missing
+/// return-to-client path.
+fn mint_pat_token_hash() -> [u8; 64] {
+    let (_raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
+    let bytes = hash.as_bytes();
+    let mut out = [0u8; 64];
+    let len = bytes.len().min(64);
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
+}
+
 fn rewrite_request_body(
     request: &Message<RequestHeader>,
     body: &Bytes,
@@ -2502,6 +2575,11 @@ fn rewrite_request_body(
     *header = *request.header();
     header.size = size;
     rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
+    // TODO(vsr): the body changed but `request_checksum` / `checksum` /
+    // `checksum_body` were copied verbatim from the original header. Safe
+    // today because the SDK initializes `request_checksum` to 0 and the
+    // server does not validate it; the moment integrity checking lands,
+    // recompute these here (or zero them and re-sign in a follow-up step).
     Ok(rewritten)
 }
 

@@ -33,6 +33,24 @@ use secrecy::{ExposeSecret, SecretString};
 /// [username_len:u8][username:N][password_len:u8][password:N]
 /// [version_len:u32_le][version:N?][context_len:u32_le][context:N?]
 /// ```
+///
+/// # Cross-version compatibility
+///
+/// This wire shape is gated by the `vsr` cargo feature and lives under
+/// `LOGIN_REGISTER_CODE`. The legacy `LOGIN_USER_CODE` shape (still in use
+/// by non-`vsr` builds) is untouched.
+///
+/// | Client          | Server          | Behavior                                       |
+/// |-----------------|-----------------|------------------------------------------------|
+/// | `vsr` SDK       | `vsr` server-ng | Works                                          |
+/// | non-`vsr` SDK   | `vsr` server-ng | `LOGIN_USER_CODE` -- handled by legacy path    |
+/// | `vsr` SDK       | non-`vsr` server| Server returns `IggyError::InvalidCommand`     |
+/// | non-`vsr` SDK   | non-`vsr` server| Works                                          |
+///
+/// Foreign-language SDKs (C++, C#, Python, Go, Java) currently speak only
+/// the legacy shape; they will silently pick the working leg above until
+/// they wire VSR framing. Bump `IGGY_PROTOCOL_VERSION` (or the equivalent
+/// when the project tracks one) when this changes.
 #[derive(Debug, Clone)]
 pub struct LoginRegisterRequest {
     pub username: WireName,

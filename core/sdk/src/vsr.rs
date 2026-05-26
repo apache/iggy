@@ -39,7 +39,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::{IggyError, IggyTimestamp};
+use iggy_common::IggyError;
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -97,10 +97,13 @@ pub(crate) fn encode_request_header(
         request: request_id,
         session: session_id,
         namespace,
-        // Informational only: copied into `ReplyHeader.timestamp` for RTT
-        // observability. Ordering uses the per-session request counter
-        // (see `ConsensusSession::register_request_id`), not this field.
-        timestamp: IggyTimestamp::now().as_micros(),
+        // Zeroed: the field is "informational" -- the server copies it into
+        // `ReplyHeader.timestamp` for RTT but nothing else reads it. Paying
+        // a `clock_gettime` syscall per encoded request (formerly held the
+        // `consensus_session` lock too) for an unused field is waste.
+        // Reintroduce a real stamp here when an RTT consumer actually wires
+        // it up.
+        timestamp: 0,
         reserved,
         ..Default::default()
     };
@@ -119,7 +122,7 @@ fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
 
     match iggy_binary_protocol::dispatch::lookup_command(code) {
         Some(meta) if !meta.is_replicated() => Ok(Operation::NonReplicated),
-        Some(_) => Err(IggyError::FeatureUnavailable),
+        Some(_) => Err(IggyError::UnknownReplicatedCommand(code)),
         None => Err(IggyError::InvalidCommand),
     }
 }

@@ -89,6 +89,10 @@ define_state! {
         index: AHashMap<Arc<str>, UserId>,
         items: Slab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
+        // SAFETY: deterministic-apply invariant. `AHashMap` iteration order
+        // differs across replicas (random seed), so this map MUST only be
+        // touched via single-key `.get` / `.insert` / `.remove`. Never
+        // iterate. Reach for `BTreeMap` the first time iteration is needed.
         personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
         permissioner: Permissioner,
     }
@@ -145,6 +149,11 @@ impl Users {
         // consensus traffic start, on shard 0 initialization. The read/apply
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
+        // Bootstrap path is intentionally unreplicated (every replica calls
+        // this locally on shard 0). A fresh `IggyTimestamp::now()` per replica
+        // would make `root.created_at` differ across the cluster and break
+        // any future snapshot/state-hash equality check. Stamp the UNIX
+        // epoch sentinel instead: every replica reads the same value.
         self.inner
             .try_apply(UsersCommand::CreateUser(
                 CreateUserRequest {
@@ -167,29 +176,43 @@ impl Users {
                         streams: Vec::new(),
                     }),
                 },
-                IggyTimestamp::now(),
+                IggyTimestamp::zero(),
             ))
             .expect("root user bootstrap must run on the metadata writer");
     }
 }
 
-/// Replicated create-PAT command enriched with the authenticated user id.
+/// Replicated create-PAT command enriched with the authenticated user id
+/// and a primary-minted `token_hash`.
+///
+/// `token_hash` is the hash of the raw token, generated once by the primary
+/// in `maybe_rewrite_pat_request` and shipped in the prepare body. Apply
+/// stores it directly via `PersonalAccessToken::raw`; calling
+/// `PersonalAccessToken::new` inside apply would `ring::rand` per-replica
+/// and produce divergent state (different hash → divergent
+/// `personal_access_token_index`).
+///
+/// Fixed-width 64-byte hex hash on the wire (SHA-256 of the raw token).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePersonalAccessTokenRequest {
     pub user_id: UserId,
     pub name: WireName,
     pub expiry: u64,
+    pub token_hash: [u8; PAT_TOKEN_HASH_BYTES],
 }
+
+pub const PAT_TOKEN_HASH_BYTES: usize = 64;
 
 impl WireEncode for CreatePersonalAccessTokenRequest {
     fn encoded_size(&self) -> usize {
-        4 + self.name.encoded_size() + 8
+        4 + self.name.encoded_size() + 8 + PAT_TOKEN_HASH_BYTES
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.user_id);
         self.name.encode(buf);
         buf.put_u64_le(self.expiry);
+        buf.put_slice(&self.token_hash);
     }
 }
 
@@ -200,11 +223,22 @@ impl WireDecode for CreatePersonalAccessTokenRequest {
         pos += 4;
         let expiry = read_u64_le(buf, pos)?;
         pos += 8;
+        if buf.len() < pos + PAT_TOKEN_HASH_BYTES {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: PAT_TOKEN_HASH_BYTES,
+                have: buf.len() - pos,
+            });
+        }
+        let mut token_hash = [0u8; PAT_TOKEN_HASH_BYTES];
+        token_hash.copy_from_slice(&buf[pos..pos + PAT_TOKEN_HASH_BYTES]);
+        pos += PAT_TOKEN_HASH_BYTES;
         Ok((
             Self {
                 user_id,
                 name,
                 expiry,
+                token_hash,
             },
             pos,
         ))
@@ -362,7 +396,11 @@ impl StateHandler for UpdatePermissionsRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. generated token) instead of empty Bytes.
+// TODO(hubcio): Serialize proper reply (e.g. generated raw token from the
+// primary-side mint) instead of empty Bytes. The raw token is currently
+// generated only at the request-rewrite step on the primary and dropped;
+// surfacing it back to the client needs a side-channel out of
+// `maybe_rewrite_pat_request`.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
@@ -383,8 +421,14 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             return Bytes::new();
         }
 
-        let (pat, _) =
-            PersonalAccessToken::new(self.user_id, self.name.as_ref(), timestamp, expiry);
+        // Replicas store the primary's hash directly via `raw`. Calling
+        // `PersonalAccessToken::new` here would re-roll `ring::rand` per
+        // replica and diverge `personal_access_token_index` -- a
+        // deterministic-apply violation.
+        let token_hash_str = std::str::from_utf8(&self.token_hash)
+            .expect("token_hash is hex-ASCII generated by the primary");
+        let pat =
+            PersonalAccessToken::raw(self.user_id, self.name.as_ref(), token_hash_str, expiry_at);
         let token_hash = Arc::clone(&pat.token);
         user_tokens.insert(name_arc, pat);
         state
@@ -641,6 +685,7 @@ mod tests {
             user_id: 7,
             name: WireName::new("api-token").unwrap(),
             expiry: 3600,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
         };
 
         let bytes = request.to_bytes();
@@ -671,6 +716,7 @@ mod tests {
             user_id: 5,
             name: WireName::new("deploy").unwrap(),
             expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
         };
         create.apply(&mut users, IggyTimestamp::now());
 

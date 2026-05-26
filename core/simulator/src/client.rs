@@ -378,6 +378,11 @@ impl SimClient {
             user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
             expiry,
+            // Deterministic stub for the simulator. Production servers mint
+            // this in `maybe_rewrite_pat_request` on the primary; the
+            // simulator drives the wire path directly without that rewrite
+            // step.
+            token_hash: [b'a'; 64],
         };
         self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes())
     }

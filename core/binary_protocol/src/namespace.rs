@@ -68,3 +68,13 @@ pub const PACKED_NAMESPACE_MAX: u64 = (1u64 << PACKED_NAMESPACE_BITS) - 1;
 /// metadata's single global consensus group from per-partition consensus
 /// groups by value alone.
 pub const METADATA_CONSENSUS_NAMESPACE: u64 = 1u64 << 63;
+
+// Compile-time invariants. Bumping `MAX_STREAMS`/`MAX_TOPICS`/`MAX_PARTITIONS`
+// past the values here would silently collapse the sentinel-above-packed-range
+// guarantee and route writes to the wrong shard; the assertions guard against
+// that in every build (release included), not only under `cargo test`.
+const _: () = {
+    assert!(METADATA_CONSENSUS_NAMESPACE > PACKED_NAMESPACE_MAX);
+    assert!(PACKED_NAMESPACE_BITS == STREAM_BITS + TOPIC_BITS + PARTITION_BITS);
+    assert!(PACKED_NAMESPACE_MAX == (1u64 << PACKED_NAMESPACE_BITS) - 1);
+};

@@ -75,7 +75,14 @@ pub fn bind(
     socket
         .set_reuse_address(true)
         .map_err(|e| IggyError::IoError(e.to_string()))?;
-    #[cfg(unix)]
+    // Match the gate in `core/message_bus/src/socket_opts.rs`: `set_reuse_port`
+    // is absent on illumos/solaris/cygwin, so the cfg must exclude them or
+    // QUIC bind fails to compile on those targets while TCP intentionally
+    // skips.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
+    ))]
     socket
         .set_reuse_port(true)
         .map_err(|e| IggyError::IoError(e.to_string()))?;

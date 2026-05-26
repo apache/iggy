@@ -27,11 +27,15 @@ use rustls::{ClientConfig, pki_types::pem::PemObject};
 use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(not(feature = "vsr"))]
+use bytes::{BufMut, BytesMut};
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 #[cfg(not(feature = "vsr"))]
 use iggy_common::IggyErrorDiscriminants;
+#[cfg(feature = "vsr")]
+use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
@@ -40,6 +44,8 @@ use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, User
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::sync::Mutex as StdMutex;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -66,7 +72,9 @@ pub struct WebSocketClient {
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
-    consensus_session: Arc<Mutex<ConsensusSession>>,
+    // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
+    // `std::sync::Mutex` rationale (pure-CPU critical section).
+    consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
 }
@@ -173,30 +181,36 @@ impl BinaryTransport for WebSocketClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+}
 
-    #[cfg(feature = "vsr")]
-    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
-        Ok(self.consensus_session.lock().await.client_id())
-    }
+#[cfg(feature = "vsr")]
+impl iggy_common::VsrSessionSealed for WebSocketClient {}
 
-    #[cfg(feature = "vsr")]
+#[cfg(feature = "vsr")]
+#[async_trait::async_trait]
+impl iggy_common::VsrSessionControl for WebSocketClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
         if session == 0 {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::InvalidSession(session));
         }
 
-        let mut consensus_session = self.consensus_session.lock().await;
+        let mut consensus_session = self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned");
         if consensus_session.is_bound() {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::AlreadyAuthenticated);
         }
 
         consensus_session.bind(session);
         Ok(())
     }
 
-    #[cfg(feature = "vsr")]
     async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        *self.consensus_session.lock().await = ConsensusSession::new();
+        *self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
     }
 }
@@ -218,7 +232,7 @@ impl WebSocketClient {
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
-            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
         })
@@ -646,7 +660,10 @@ impl WebSocketClient {
 
         #[cfg(feature = "vsr")]
         let request = {
-            let mut consensus_session = self.consensus_session.lock().await;
+            let mut consensus_session = self
+                .consensus_session
+                .lock()
+                .expect("consensus session mutex poisoned");
             crate::vsr::encode_contiguous_request(&mut consensus_session, code, &payload)?
         };
         #[cfg(not(feature = "vsr"))]
@@ -676,21 +693,28 @@ impl WebSocketClient {
 
         #[cfg(feature = "vsr")]
         {
-            let mut response_header = vec![0u8; iggy_binary_protocol::HEADER_SIZE];
+            // Mirror the TCP path: header onto stack, body into its own
+            // buffer, `decode_response_split` slices without concatenation.
+            // Old path did `vec![0; HEADER_SIZE]` + `vec![0; body_size]`
+            // (two zero-fills) + `BytesMut::with_capacity(response_size)` +
+            // two `put_slice` memcopies per reply.
+            let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
             stream.read(&mut response_header).await?;
 
             let response_size = crate::vsr::response_size(&response_header)?;
-            let mut response = BytesMut::with_capacity(response_size);
-            response.put_slice(&response_header);
+            let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+            let body = if body_size > 0 {
+                // `WebSocketStreamKind::read` reads into a slice without a
+                // zero-fill prerequisite; we still allocate `body_size` but
+                // skip the header concatenation.
+                let mut body = vec![0u8; body_size];
+                stream.read(&mut body).await?;
+                Bytes::from(body)
+            } else {
+                Bytes::new()
+            };
 
-            if response_size > iggy_binary_protocol::HEADER_SIZE {
-                let mut response_body =
-                    vec![0u8; response_size - iggy_binary_protocol::HEADER_SIZE];
-                stream.read(&mut response_body).await?;
-                response.put_slice(&response_body);
-            }
-
-            crate::vsr::decode_response(response.freeze())
+            crate::vsr::decode_response_split(&response_header, body)
         }
 
         #[cfg(not(feature = "vsr"))]

@@ -33,6 +33,8 @@ use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 #[cfg(not(feature = "vsr"))]
 use iggy_common::IggyErrorDiscriminants;
+#[cfg(feature = "vsr")]
+use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
@@ -43,6 +45,8 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::sync::Mutex as StdMutex;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -68,7 +72,11 @@ pub struct TcpClient {
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
-    consensus_session: Arc<Mutex<ConsensusSession>>,
+    // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
+    // is `encode_request_header`, which is pure CPU and never awaits. The
+    // tokio variant would pay a waker alloc + internal semaphore on
+    // contention with zero correctness benefit.
+    consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
 }
@@ -174,30 +182,36 @@ impl BinaryTransport for TcpClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+}
 
-    #[cfg(feature = "vsr")]
-    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
-        Ok(self.consensus_session.lock().await.client_id())
-    }
+#[cfg(feature = "vsr")]
+impl iggy_common::VsrSessionSealed for TcpClient {}
 
-    #[cfg(feature = "vsr")]
+#[cfg(feature = "vsr")]
+#[async_trait::async_trait]
+impl iggy_common::VsrSessionControl for TcpClient {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
         if session == 0 {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::InvalidSession(session));
         }
 
-        let mut consensus_session = self.consensus_session.lock().await;
+        let mut consensus_session = self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned");
         if consensus_session.is_bound() {
-            return Err(IggyError::InvalidConfiguration);
+            return Err(IggyError::AlreadyAuthenticated);
         }
 
         consensus_session.bind(session);
         Ok(())
     }
 
-    #[cfg(feature = "vsr")]
     async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        *self.consensus_session.lock().await = ConsensusSession::new();
+        *self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
     }
 }
@@ -260,7 +274,7 @@ impl TcpClient {
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
-            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
         })
@@ -658,7 +672,9 @@ impl TcpClient {
             if let Some(stream) = stream.as_mut() {
                 #[cfg(feature = "vsr")]
                 let (request_header, request_size) = {
-                    let mut consensus_session = consensus_session.lock().await;
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
                     crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
                 #[cfg(not(feature = "vsr"))]

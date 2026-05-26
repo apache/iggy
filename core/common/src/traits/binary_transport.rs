@@ -29,13 +29,26 @@ pub trait BinaryTransport {
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
     fn get_heartbeat_interval(&self) -> IggyDuration;
+}
 
-    #[cfg(feature = "vsr")]
-    async fn get_vsr_client_id(&self) -> Result<u128, IggyError>;
+/// Sealed marker. Downstream crates cannot implement
+/// [`VsrSessionControl`] because they cannot name
+/// `vsr_session_sealed::Sealed`. The session-mutation methods stay
+/// in-crate so only the SDK's login/logout flows can call them.
+#[cfg(feature = "vsr")]
+mod vsr_session_sealed {
+    pub trait Sealed {}
+}
 
-    #[cfg(feature = "vsr")]
+/// VSR-internal session control. Distinct from [`BinaryTransport`] so
+/// `&dyn BinaryTransport` cannot reach `bind`/`reset` -- mid-session
+/// mutation corrupts the dedup counter or silently breaks at-most-once.
+#[cfg(feature = "vsr")]
+#[async_trait]
+pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
-
-    #[cfg(feature = "vsr")]
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
 }
+
+#[cfg(feature = "vsr")]
+pub use vsr_session_sealed::Sealed as VsrSessionSealed;

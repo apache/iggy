@@ -365,11 +365,18 @@ impl ClientTable {
 
     /// Remove a client session and cached reply.
     ///
-    /// **LOCAL ONLY -- does NOT replicate.** Only call from transport-level
-    /// disconnect/logout cleanup to release local table capacity. Using this
-    /// to roll back a cluster-committed [`Operation::Register`] would
-    /// produce local-vs-cluster divergence: peers keep the slot until they
-    /// evict the client themselves.
+    /// **LOCAL ONLY -- does NOT replicate.** Two correct call sites:
+    ///
+    /// 1. **Applying a committed `Operation::Logout`** -- every replica runs
+    ///    this from `on_ack` / `commit_journal` during deterministic apply,
+    ///    so all replicas drop the slot together. Required-on-every-replica.
+    /// 2. **Transport-level disconnect cleanup** -- best-effort capacity
+    ///    reclaim. Bounded window of local-vs-cluster divergence until
+    ///    `evict_oldest` or a `Logout` commit catches the peer side up.
+    ///
+    /// **Forbidden:** using this to roll back a cluster-committed
+    /// `Operation::Register` -- peers keep the slot, producing divergence
+    /// that survives view changes.
     ///
     /// Returns `true` when a slot existed.
     ///
