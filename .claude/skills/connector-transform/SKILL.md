@@ -1,11 +1,33 @@
 ---
 name: connector-transform
-description: Add a new transform under `core/connectors/sdk/src/transforms/`. Transforms mutate, filter, or convert messages between source/encode and decode/sink. Use when adding field-level transforms (add/delete/update/filter), format conversions, envelope unwrapping, or similar config-driven message manipulations for Apache Iggy connectors.
+description: Add a new transform under `core/connectors/sdk/src/transforms/`. Transforms mutate, filter, or convert messages between source/encode and decode/sink. Use when adding field-level transforms (add/delete/update/filter), format conversions, envelope unwrapping, or similar config-driven message manipulations for Apache Iggy connectors. Use for transform authoring. NOT for runtime internals or sink/source loops.
 ---
 
 # Adding a New Apache Iggy Connector Transform
 
-A transform implements `iggy_connector_sdk::transforms::Transform`. It runs after decode (for sinks) or before encode (for sources), in a chain configured per-connector. Config-driven, composable.
+A transform implements `iggy_connector_sdk::transforms::Transform`. It
+runs after decode (for sinks) or before encode (for sources), in a chain
+configured per-connector. Config-driven, composable.
+
+> **Universal connector rules** live in
+> [connectors-overview](../connectors-overview/SKILL.md). This skill covers transform authoring only.
+
+## Contents
+
+- [STOP and ask the user before](#stop-and-ask-the-user-before)
+- [File map](#file-map)
+- [The trait](#the-trait)
+- [Steps to add a new transform](#steps-to-add-a-new-transform)
+- [Rules](#rules)
+- [Common pitfalls](#common-pitfalls)
+- [Before declaring done](#before-declaring-done)
+
+## STOP and ask the user before
+
+- Adding a new transform that mutates payload SHAPE (renaming PK fields, dropping schema-required columns) - breaks downstream sinks silently.
+- Introducing non-determinism (system time, RNG without seed) - breaks tests + replay.
+- Changing the `Transform` trait signature (sync vs async, return type) - cascades to every transform.
+- Making transforms hold mutable runtime state - they're constructed once and `Arc`-cloned across tasks. mutation requires interior locking and is rarely what you actually want.
 
 ## File map
 
@@ -231,12 +253,12 @@ The trait method is sync (not `async`). Don't propose making it async - that wou
 
 ### Errors
 
-| Scenario | Variant |
-| ---------- | --------- |
-| Config validation in `new()` | `Error::InvalidConfigValue("transform_name: ...")` |
-| Per-message validation (bad shape) | `Error::InvalidRecordValue("...")` |
-| Schema resolution failure | `Error::InvalidTransformer` |
-| Format conversion failure | `Error::InvalidPayloadType` |
+| Scenario                           | Variant                                            |
+| ---------------------------------- | -------------------------------------------------- |
+| Config validation in `new()`       | `Error::InvalidConfigValue("transform_name: ...")` |
+| Per-message validation (bad shape) | `Error::InvalidRecordValue("...")`                 |
+| Schema resolution failure          | `Error::InvalidTransformer`                        |
+| Format conversion failure          | `Error::InvalidPayloadType`                        |
 
 Returning `Err` from `transform()` stops the message and is logged. For non-fatal field-level issues (field missing when transform expects it), prefer pass-through (`Ok(Some(message))`) unless config explicitly says to fail.
 
@@ -246,7 +268,7 @@ Returning `Err` from `transform()` stops the message and is logged. For non-fata
 2. **`#[serde(rename_all = "snake_case")]` mismatch** between enum variant name and TOML key.
 3. **Cloning `OwnedValue`** when in-place mutation would work.
 4. **Validating config inside `transform()`** instead of `new()`.
-5. **`std::sync::Mutex` for internal state** on the hot path - precompute in `new()` and store as plain struct fields. Transforms run on every message; locks are wasted work.
+5. **`std::sync::Mutex` for internal state** on the hot path - precompute in `new()` and store as plain struct fields. Transforms run on every message. locks are wasted work.
 6. **Returning `Err` for a filter** - filters use `Ok(None)`.
 
 ## Before declaring done
@@ -261,3 +283,7 @@ cargo test -p iggy_connector_sdk --all-features
 Verify by adding the transform to `core/connectors/runtime/example_config/connectors/` and running the runtime - the transform should apply to each message.
 
 If the transform changes payload shape sufficiently to break downstream sinks (e.g., renaming primary keys), call it out in the PR description.
+
+---
+
+Discussion / help: see [AGENTS.md](../../../AGENTS.md#discussion-and-support).

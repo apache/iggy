@@ -18,7 +18,7 @@
  */
 
 use prometheus_client::encoding::text::encode;
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -47,7 +47,7 @@ pub struct StageLabels {
     pub stage: Stage,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Stage {
     Prepare,
     Ffi,
@@ -55,6 +55,25 @@ pub enum Stage {
     IggySend,
     StateSave,
     Total,
+}
+
+impl Stage {
+    fn as_label(&self) -> &'static str {
+        match self {
+            Stage::Prepare => "prepare",
+            Stage::Ffi => "ffi",
+            Stage::Decode => "decode",
+            Stage::IggySend => "iggy_send",
+            Stage::StateSave => "state_save",
+            Stage::Total => "total",
+        }
+    }
+}
+
+impl EncodeLabelValue for Stage {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        self.as_label().encode(encoder)
+    }
 }
 
 const STAGE_BUCKETS_SECONDS: [f64; 13] = [
@@ -72,26 +91,19 @@ pub struct SinkLabels {
 impl SinkLabels {
     pub fn new(plugin_key: &str) -> Self {
         let key = plugin_key.to_owned();
+        let stage = |s: Stage| StageLabels {
+            connector_key: key.clone(),
+            connector_type: ConnectorType::Sink,
+            stage: s,
+        };
         Self {
             counter: ConnectorLabels {
                 connector_key: key.clone(),
                 connector_type: ConnectorType::Sink,
             },
-            stage_prepare: StageLabels {
-                connector_key: key.clone(),
-                connector_type: ConnectorType::Sink,
-                stage: Stage::Prepare,
-            },
-            stage_ffi: StageLabels {
-                connector_key: key.clone(),
-                connector_type: ConnectorType::Sink,
-                stage: Stage::Ffi,
-            },
-            stage_total: StageLabels {
-                connector_key: key,
-                connector_type: ConnectorType::Sink,
-                stage: Stage::Total,
-            },
+            stage_prepare: stage(Stage::Prepare),
+            stage_ffi: stage(Stage::Ffi),
+            stage_total: stage(Stage::Total),
         }
     }
 }
@@ -459,14 +471,7 @@ impl Metrics {
         stage: Stage,
     ) -> u64 {
         let output = self.get_formatted_output();
-        let stage_label = match stage {
-            Stage::Prepare => "Prepare",
-            Stage::Ffi => "Ffi",
-            Stage::Decode => "Decode",
-            Stage::IggySend => "IggySend",
-            Stage::StateSave => "StateSave",
-            Stage::Total => "Total",
-        };
+        let stage_label = stage.as_label();
         let type_label = match connector_type {
             ConnectorType::Source => "Source",
             ConnectorType::Sink => "Sink",
@@ -787,7 +792,7 @@ mod tests {
         let output = metrics.get_formatted_output();
         assert!(output.contains("iggy_connector_stage_duration_seconds"));
         assert!(output.contains("connector_key=\"es\""));
-        assert!(output.contains("stage=\"IggySend\""));
+        assert!(output.contains("stage=\"iggy_send\""));
         assert!(output.contains("iggy_connector_stage_duration_seconds_bucket"));
         assert!(output.contains("iggy_connector_stage_duration_seconds_count"));
         assert!(output.contains("iggy_connector_stage_duration_seconds_sum"));

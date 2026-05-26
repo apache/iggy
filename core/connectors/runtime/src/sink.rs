@@ -41,7 +41,7 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -549,7 +549,7 @@ async fn process_messages(
     decoder: &Arc<dyn StreamDecoder>,
     metrics: &Arc<Metrics>,
     labels: &SinkLabels,
-) -> Result<(usize, std::time::Duration), RuntimeError> {
+) -> Result<(usize, Duration), RuntimeError> {
     let messages = messages.into_iter().map(|message| ReceivedMessage {
         id: message.header.id,
         offset: message.header.offset,

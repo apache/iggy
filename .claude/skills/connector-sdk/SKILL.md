@@ -5,7 +5,36 @@ description: Extend or modify the Apache Iggy Connectors SDK (`core/connectors/s
 
 # Extending the Apache Iggy Connectors SDK
 
-The SDK (`core/connectors/sdk/`) is the **stable contract** between the runtime and every plugin. Changes ripple to every sink/source in-tree and every third-party plugin. Treat the public surface as a versioned API.
+The SDK (`core/connectors/sdk/`) is the **stable contract** between the
+runtime and every plugin. Changes ripple to every sink/source in-tree
+and every third-party plugin. Treat the public surface as a versioned API.
+
+> **Universal connector rules** (benchmark, SecretString, drop accounting, exemplar patterns) live in
+> [connectors-overview](../connectors-overview/SKILL.md). This skill covers SDK-level changes only.
+
+## Contents
+
+- [STOP and ask the user before](#stop-and-ask-the-user-before)
+- [File map](#file-map)
+- [Cardinal rules](#cardinal-rules)
+- [Adding a new `Schema` variant](#adding-a-new-schema-variant)
+- [Adding a `StreamDecoder` / `StreamEncoder`](#adding-a-streamdecoder--streamencoder)
+- [Adding a new `Error` variant](#adding-a-new-error-variant)
+- [Modifying `Sink` / `Source` / `Transform` traits](#modifying-sink--source--transform-traits)
+- [FFI macros (`sink_connector!`, `source_connector!`)](#ffi-macros-sink_connector-source_connector)
+- [`Payload::try_to_bytes(&self)` is non-negotiable for JSON](#payloadtry_to_bytesself-is-non-negotiable-for-json)
+- [Retry helpers (`retry.rs`)](#retry-helpers-retryrs)
+- [`ConnectorState`](#connectorstate)
+- [Tests for SDK changes](#tests-for-sdk-changes)
+- [Before declaring done](#before-declaring-done)
+
+## STOP and ask the user before
+
+- Bumping the SDK MAJOR version or changing any `#[repr(C)]` layout - misaligns every pre-built plugin `.so`.
+- Changing `Sink` / `Source` / `Transform` / `StreamDecoder` / `StreamEncoder` trait signatures - cascades through every plugin.
+- Removing or renaming a `Schema` variant or `Error` variant - decoders/encoders pinned to it. downstream pattern matches break.
+- Changing wire serialization (postcard / rmp_serde / serde_json) for any FFI / state / config payload.
+- Changing FFI macro return codes or function names (`iggy_*_open` / `consume` / `handle` / `close`) - runtime + plugins both need lockstep update.
 
 ## File map
 
@@ -150,3 +179,7 @@ cargo build -p iggy_connector_stdout_sink -p iggy_connector_random_source
 # If FFI signatures changed, also build the runtime:
 cargo build -p iggy-connectors
 ```
+
+---
+
+Discussion / help: see [AGENTS.md](../../../AGENTS.md#discussion-and-support).

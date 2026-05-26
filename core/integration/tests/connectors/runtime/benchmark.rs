@@ -107,7 +107,7 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
         let decode_us = parse_u64(event, "decode_us");
         let prepare_us = parse_u64(event, "prepare_us");
         let iggy_send_us = parse_u64(event, "iggy_send_us");
-        let state_save_us = parse_u64(event, "state_save_us");
+        let state_save_us = parse_opt_u64(event, "state_save_us");
 
         assert!(batch_size > 0, "source batch_size must be > 0: {event:?}");
         assert!(
@@ -115,7 +115,7 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
             "source sent_count must be <= batch_size (no over-counting on transform/encode drops): {event:?}"
         );
         assert!(total_us > 0, "source total_us must be > 0: {event:?}");
-        let stage_sum = decode_us + prepare_us + iggy_send_us + state_save_us;
+        let stage_sum = decode_us + prepare_us + iggy_send_us + state_save_us.unwrap_or(0);
         assert!(
             stage_sum <= total_us + 100,
             "source stage sum (decode+prepare+iggy_send+state_save) must be <= total_us (with slack): {event:?}"
@@ -354,6 +354,24 @@ fn parse_u64(event: &HashMap<String, String>, key: &str) -> u64 {
         .unwrap_or_else(|error| panic!("field {key} should be u64, got error: {error}: {event:?}"))
 }
 
+fn parse_opt_u64(event: &HashMap<String, String>, key: &str) -> Option<u64> {
+    let raw = event
+        .get(key)
+        .unwrap_or_else(|| panic!("missing field {key} in event {event:?}"));
+    if raw == "None" {
+        return None;
+    }
+    let inner = raw
+        .strip_prefix("Some(")
+        .and_then(|s| s.strip_suffix(")"))
+        .unwrap_or_else(|| panic!("field {key} should be Option<u64>, got {raw}: {event:?}"));
+    Some(
+        inner.parse::<u64>().unwrap_or_else(|error| {
+            panic!("field {key} should be u64, got error: {error}: {event:?}")
+        }),
+    )
+}
+
 #[cfg(test)]
 mod parser_tests {
     use super::*;
@@ -436,7 +454,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         &[
             ("connector_key", "stdout_bench"),
             ("connector_type", "Sink"),
-            ("stage", "Total"),
+            ("stage", "total"),
         ],
     );
     assert!(
@@ -450,7 +468,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         &[
             ("connector_key", "stdout_bench"),
             ("connector_type", "Sink"),
-            ("stage", "Ffi"),
+            ("stage", "ffi"),
         ],
     );
     assert!(
@@ -464,7 +482,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         &[
             ("connector_key", "random_bench"),
             ("connector_type", "Source"),
-            ("stage", "Total"),
+            ("stage", "total"),
         ],
     );
     assert!(
@@ -478,7 +496,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         &[
             ("connector_key", "random_bench"),
             ("connector_type", "Source"),
-            ("stage", "IggySend"),
+            ("stage", "iggy_send"),
         ],
     );
     assert!(
@@ -503,7 +521,7 @@ async fn given_benchmark_flag_off_when_metrics_scraped_should_still_expose_histo
         &[
             ("connector_key", "stdout_off"),
             ("connector_type", "Sink"),
-            ("stage", "Total"),
+            ("stage", "total"),
         ],
     );
     assert!(

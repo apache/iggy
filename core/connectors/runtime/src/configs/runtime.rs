@@ -367,8 +367,8 @@ impl Display for ConnectorsRuntimeConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ http: {}, iggy: {}, connectors: {}, state: {}, telemetry: {} }}",
-            self.http, self.iggy, self.connectors, self.state, self.telemetry
+            "{{ http: {}, iggy: {}, connectors: {}, state: {}, telemetry: {}, logging: {{ format: {} }} }}",
+            self.http, self.iggy, self.connectors, self.state, self.telemetry, self.logging.format
         )
     }
 }

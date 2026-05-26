@@ -1,16 +1,36 @@
 ---
 name: connector-testing
-description: Write tests for Apache Iggy connectors - sinks, sources, transforms, SDK, runtime. Covers BDD unit-test naming, the canonical source state round-trip tests, and the real-infra integration test layout under `core/integration/tests/connectors/` with `testcontainers-modules` + `#[iggy_harness]`. Load when writing or reviewing tests in `core/connectors/` or `core/integration/tests/connectors/`.
+description: Write tests for Apache Iggy connectors - sinks, sources, transforms, SDK, runtime. Covers BDD unit-test naming, the canonical source state round-trip tests, and the real-infra integration test layout under `core/integration/tests/connectors/` with `testcontainers-modules` + `#[iggy_harness]`. Load when writing or reviewing tests in `core/connectors/` or `core/integration/tests/connectors/`. Use for connector test authoring. NOT for runtime internals or non-connector test patterns.
 ---
 
 # Testing Apache Iggy Connectors
 
-There are **two distinct test layers** in this codebase. Use both - they catch different bugs.
+> **Universal connector rules** live in
+> [connectors-overview](../connectors-overview/SKILL.md). Repo-wide testing rules (`#[iggy_harness]`, BDD naming, harness layout) live in [AGENTS.md](../../../AGENTS.md#testing). This skill covers connector-specific test conventions.
 
-| Layer | Location | What it covers | When required |
-| ------- | ---------- | ---------------- | --------------- |
-| **Unit tests** | `#[cfg(test)] mod tests` at EOF of `<plugin>/src/lib.rs` | Config parsing, defaults, fallbacks, payload conversion, query/document building, state ser/de | Every plugin |
-| **Integration tests** | `core/integration/tests/connectors/<name>/` (uses real backend via Docker) | End-to-end: runtime + plugin + real Postgres/ES/Iceberg/Mongo/etc. + Iggy server | Every plugin that integrates with an external system |
+## Contents
+
+- [STOP and ask the user before](#stop-and-ask-the-user-before)
+- [Unit tests](#unit-tests)
+- [Integration tests (real infra via Docker)](#integration-tests-real-infra-via-docker)
+- [SDK + runtime tests](#sdk--runtime-tests)
+- [CI / verification flow](#ci--verification-flow)
+- [Common pitfalls](#common-pitfalls)
+- [Examples worth copying](#examples-worth-copying)
+
+## STOP and ask the user before
+
+- Mocking the database or backend in an integration test - we hit real infra via `testcontainers-modules` (mocks miss migration bugs).
+- Adding a unit test that requires Docker - that belongs under `core/integration/tests/connectors/<backend>/`, not in `<plugin>/src/lib.rs`.
+- Skipping the four canonical source state tests - they're mandatory for every source plugin.
+- Naming a test `test_foo` / `does_bar` - we use BDD `given_X_when_Y_should_Z`.
+
+There are **two distinct test layers**. Use both - they catch different bugs.
+
+| Layer                 | Location                                                                   | What it covers                                                                                 | When required                                        |
+| --------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| **Unit tests**        | `#[cfg(test)] mod tests` at EOF of `<plugin>/src/lib.rs`                   | Config parsing, defaults, fallbacks, payload conversion, query/document building, state ser/de | Every plugin                                         |
+| **Integration tests** | `core/integration/tests/connectors/<name>/` (uses real backend via Docker) | End-to-end: runtime + plugin + real Postgres/ES/Iceberg/Mongo/etc. + Iggy server               | Every plugin that integrates with an external system |
 
 ## Unit tests
 
@@ -36,7 +56,7 @@ You may **omit one part** when the test is small (`given_X_should_Y` instead of 
 
 ### `test_config()` helper
 
-Every plugin's tests start with a small helper returning a tuned-down version of the production config. New tests extend it; don't construct from scratch each time.
+Every plugin's tests start with a small helper returning a tuned-down version of the production config. New tests extend it. don't construct from scratch each time.
 
 ```rust
 fn test_config() -> RandomSourceConfig {
@@ -246,7 +266,7 @@ pub const ENV_SINK_PATH: &str =
     "IGGY_CONNECTORS_SINK_POSTGRES_PATH";
 ```
 
-`<TYPE>` is `SINK` or `SOURCE`; `<KEY>` is the connector key (TOML key field, uppercased). `PLUGIN_CONFIG` is the literal segment used when reaching into your plugin's nested config. Fields marked `#[config_env(skip)]` (e.g., `transforms`, `plugin_config` as a whole) are NOT env-addressable; primitive leaves marked `#[config_env(leaf)]` are.
+`<TYPE>` is `SINK` or `SOURCE`. `<KEY>` is the connector key (TOML key field, uppercased). `PLUGIN_CONFIG` is the literal segment used when reaching into your plugin's nested config. Fields marked `#[config_env(skip)]` (e.g., `transforms`, `plugin_config` as a whole) are NOT env-addressable. primitive leaves marked `#[config_env(leaf)]` are.
 
 The fixture sets these in `setup()` before the runtime reads its config. This is how a dynamic container port reaches a static TOML.
 
@@ -322,15 +342,19 @@ Integration tests assume Docker is available locally and pull images from a publ
 
 ## Examples worth copying
 
-| Concern | Where |
-| --------- | ------- |
-| Source state round-trip | `sources/random_source/src/lib.rs::tests` |
-| Config + query-building unit tests | `sinks/postgres_sink/src/lib.rs::tests` |
-| Real-infra sink integration tests | `core/integration/tests/connectors/postgres/postgres_sink.rs` |
-| Real-infra source integration tests | `core/integration/tests/connectors/postgres/postgres_source.rs` |
-| Restart + state survival | `core/integration/tests/connectors/postgres/restart.rs` |
-| Wiremock-driven HTTP sink test | `core/integration/tests/connectors/http/http_sink.rs` |
-| Testcontainer wrapper | `core/integration/tests/connectors/fixtures/postgres/container.rs` |
-| Fixture impl `TestFixture` | `core/integration/tests/connectors/fixtures/postgres/sink.rs` |
-| Runtime-only error-isolation | `core/integration/tests/connectors/runtime/error_isolation.rs` |
-| Transform tests | `sdk/src/transforms/add_fields.rs::tests`, `filter_fields.rs::tests` |
+| Concern                             | Where                                                                |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| Source state round-trip             | `sources/random_source/src/lib.rs::tests`                            |
+| Config + query-building unit tests  | `sinks/postgres_sink/src/lib.rs::tests`                              |
+| Real-infra sink integration tests   | `core/integration/tests/connectors/postgres/postgres_sink.rs`        |
+| Real-infra source integration tests | `core/integration/tests/connectors/postgres/postgres_source.rs`      |
+| Restart + state survival            | `core/integration/tests/connectors/postgres/restart.rs`              |
+| Wiremock-driven HTTP sink test      | `core/integration/tests/connectors/http/http_sink.rs`                |
+| Testcontainer wrapper               | `core/integration/tests/connectors/fixtures/postgres/container.rs`   |
+| Fixture impl `TestFixture`          | `core/integration/tests/connectors/fixtures/postgres/sink.rs`        |
+| Runtime-only error-isolation        | `core/integration/tests/connectors/runtime/error_isolation.rs`       |
+| Transform tests                     | `sdk/src/transforms/add_fields.rs::tests`, `filter_fields.rs::tests` |
+
+---
+
+Discussion / help: see [AGENTS.md](../../../AGENTS.md#discussion-and-support).

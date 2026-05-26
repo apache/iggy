@@ -26,7 +26,7 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, Error, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
+    ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
     source::HandleCallback, transforms::Transform,
 };
 use once_cell::sync::Lazy;
@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -52,15 +52,15 @@ use crate::{
 use iggy_connector_sdk::api::ConnectorStatus;
 use tokio::task::JoinHandle;
 
-pub struct SourceSenderEntry {
-    pub sender: Sender<ProducedMessages>,
-    pub metrics: Arc<crate::metrics::Metrics>,
-    pub labels: Arc<SourceLabels>,
+pub(crate) struct SourceSenderEntry {
+    pub(crate) sender: Sender<ProducedMessages>,
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
+    pub(crate) labels: Arc<SourceLabels>,
 }
 
-pub static SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>> = Lazy::new(DashMap::new);
+pub(crate) static SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>> = Lazy::new(DashMap::new);
 
-pub fn cleanup_sender(plugin_id: u32) {
+pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
 }
 
@@ -433,7 +433,7 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_decode, decode_elapsed);
 
         let prepare_start = Instant::now();
-        let Ok(iggy_messages) = process_messages(
+        let iggy_messages = process_messages(
             plugin_id,
             &encoder,
             &topic_metadata,
@@ -441,17 +441,7 @@ pub(crate) async fn source_forwarding_loop(
             &transforms,
             &context.metrics,
             &labels,
-        ) else {
-            let error_msg = format!(
-                "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
-                producer.stream(),
-                producer.topic()
-            );
-            error!("{error_msg}");
-            context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
-            continue;
-        };
+        );
         let prepare_elapsed = prepare_start.elapsed();
         context
             .metrics
@@ -493,9 +483,9 @@ pub(crate) async fn source_forwarding_loop(
             );
         }
 
-        let state_save_start = Instant::now();
-        let mut state_save_elapsed = Duration::ZERO;
+        let mut state_save_us: Option<u64> = None;
         if let Some(state) = produced_messages.state {
+            let state_save_start = Instant::now();
             match &state_storage {
                 StateStorage::File(file) => {
                     if let Err(error) = file.save(state).await {
@@ -510,10 +500,11 @@ pub(crate) async fn source_forwarding_loop(
                     debug!("State saved for source connector with ID: {plugin_id}");
                 }
             }
-            state_save_elapsed = state_save_start.elapsed();
+            let state_save_elapsed = state_save_start.elapsed();
             context
                 .metrics
                 .observe_stage_with_labels(&labels.stage_state_save, state_save_elapsed);
+            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
         } else {
             debug!("No state provided for source connector with ID: {plugin_id}");
         }
@@ -532,7 +523,7 @@ pub(crate) async fn source_forwarding_loop(
                 benchmark::as_micros(decode_elapsed),
                 benchmark::as_micros(prepare_elapsed),
                 benchmark::as_micros(iggy_send_elapsed),
-                benchmark::as_micros(state_save_elapsed),
+                state_save_us,
                 benchmark::as_micros(total_elapsed),
             );
         }
@@ -647,16 +638,33 @@ fn process_messages(
     transforms: &Vec<Arc<dyn Transform>>,
     metrics: &Arc<crate::metrics::Metrics>,
     labels: &SourceLabels,
-) -> Result<Vec<IggyMessage>, Error> {
+) -> Vec<IggyMessage> {
     let mut iggy_messages = Vec::with_capacity(messages.len());
     for message in messages {
         let mut current_message = Some(message);
+        let mut transform_failed = false;
         for transform in transforms.iter() {
-            let Some(message) = current_message else {
+            let Some(message) = current_message.take() else {
                 break;
             };
 
-            current_message = transform.transform(topic_metadata, message)?;
+            match transform.transform(topic_metadata, message) {
+                Ok(next) => current_message = next,
+                Err(error) => {
+                    error!(
+                        "Transform '{:?}' failed for source connector with ID: {id}, stream: {}, topic: {}: {error}",
+                        transform.r#type(),
+                        topic_metadata.stream,
+                        topic_metadata.topic
+                    );
+                    metrics.inc_errors_with_labels(&labels.counter);
+                    transform_failed = true;
+                    break;
+                }
+            }
+        }
+        if transform_failed {
+            continue;
         }
 
         // Filter contract: transform returning Ok(None) is an intentional drop.
@@ -685,7 +693,7 @@ fn process_messages(
 
         iggy_messages.push(iggy_message);
     }
-    Ok(iggy_messages)
+    iggy_messages
 }
 
 pub(crate) extern "C" fn handle_produced_messages(
@@ -694,9 +702,13 @@ pub(crate) extern "C" fn handle_produced_messages(
     messages_len: usize,
 ) {
     unsafe {
-        // Entry missing = SOURCE_SENDERS already cleaned up during shutdown - benign race,
-        // expected at close. No metric (operator would conflate it with real failures).
+        // Entry missing = SOURCE_SENDERS cleaned up at shutdown; benign race
+        // expected on stop/restart. No metric (would conflate with real failures).
         let Some(entry) = SOURCE_SENDERS.get(&plugin_id) else {
+            tracing::trace!(
+                plugin_id,
+                "dropping produced batch: sender already cleaned up"
+            );
             return;
         };
         let messages = std::slice::from_raw_parts(messages_ptr, messages_len);

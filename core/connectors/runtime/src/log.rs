@@ -83,6 +83,8 @@ pub fn init_logging(
             "Logging initialized (format: {}, telemetry enabled, service name: {})",
             logging_config.format, telemetry_config.service_name
         );
+    } else {
+        info!("Logging initialized (format: {})", logging_config.format);
     }
 }
 

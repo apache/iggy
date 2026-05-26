@@ -314,7 +314,7 @@ impl std::fmt::Display for SinkConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -325,6 +325,8 @@ impl std::fmt::Display for SinkConfig {
                 .collect::<Vec<String>>()
                 .join(", "),
             self.plugin_config_format,
+            self.verbose,
+            self.benchmark,
         )
     }
 }
@@ -333,7 +335,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -344,6 +346,8 @@ impl std::fmt::Display for SourceConfig {
                 .collect::<Vec<String>>()
                 .join(", "),
             self.plugin_config_format,
+            self.verbose,
+            self.benchmark,
         )
     }
 }

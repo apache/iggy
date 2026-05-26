@@ -69,7 +69,7 @@ pub fn emit_source_event(
     decode_us: u64,
     prepare_us: u64,
     iggy_send_us: u64,
-    state_save_us: u64,
+    state_save_us: Option<u64>,
     total_us: u64,
 ) {
     info!(
@@ -83,7 +83,7 @@ pub fn emit_source_event(
         decode_us = decode_us,
         prepare_us = prepare_us,
         iggy_send_us = iggy_send_us,
-        state_save_us = state_save_us,
+        state_save_us = ?state_save_us,
         total_us = total_us,
         "benchmark"
     );
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn given_source_event_emitted_when_captured_should_contain_all_fields() {
+    fn given_source_event_with_state_save_when_captured_should_contain_some_value() {
         let events = capture(|| {
             emit_source_event(
                 "random",
@@ -211,7 +211,7 @@ mod tests {
                 12,
                 34,
                 567,
-                89,
+                Some(89),
                 750,
             );
         });
@@ -226,7 +226,30 @@ mod tests {
         assert_eq!(event.fields.get("decode_us").unwrap(), "12");
         assert_eq!(event.fields.get("prepare_us").unwrap(), "34");
         assert_eq!(event.fields.get("iggy_send_us").unwrap(), "567");
-        assert_eq!(event.fields.get("state_save_us").unwrap(), "89");
+        assert_eq!(event.fields.get("state_save_us").unwrap(), "Some(89)");
         assert_eq!(event.fields.get("total_us").unwrap(), "750");
+    }
+
+    #[test]
+    fn given_source_event_without_state_save_when_captured_should_contain_none() {
+        let events = capture(|| {
+            emit_source_event(
+                "random",
+                "example_stream",
+                "example_topic",
+                25,
+                23,
+                12,
+                34,
+                567,
+                None,
+                750,
+            );
+        });
+        let event = events
+            .iter()
+            .find(|event| event.target == TARGET && event.message == "benchmark")
+            .expect("benchmark event should be captured");
+        assert_eq!(event.fields.get("state_save_us").unwrap(), "None");
     }
 }

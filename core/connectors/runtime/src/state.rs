@@ -61,13 +61,6 @@ impl StateProvider for FileStateProvider {
     async fn load(&self) -> Result<Option<ConnectorState>, Error> {
         // Orphan tmps are reclaimed by the next save's truncate; deleting
         // here would race a still-draining save across provider instances.
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-            && fs::metadata(parent).await.is_err()
-        {
-            error!("State file parent directory missing: {}", parent.display());
-            return Err(Error::CannotOpenStateFile);
-        }
         match fs::read(&self.path).await {
             Ok(buffer) if buffer.is_empty() => {
                 info!("State file is empty: {}", self.path.display());
@@ -78,6 +71,16 @@ impl StateProvider for FileStateProvider {
                 Ok(Some(ConnectorState(buffer)))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
+                // Distinguish "fresh start" (parent dir OK, file just missing)
+                // from "broken config" (parent dir missing), using a single
+                // post-failure observation - no TOCTOU between two probes.
+                if let Some(parent) = self.path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && fs::metadata(parent).await.is_err()
+                {
+                    error!("State file parent directory missing: {}", parent.display());
+                    return Err(Error::CannotOpenStateFile);
+                }
                 info!(
                     "State file not found, starting fresh: {}",
                     self.path.display()
