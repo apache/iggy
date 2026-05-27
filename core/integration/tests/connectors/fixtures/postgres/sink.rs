@@ -52,7 +52,11 @@ impl PostgresSinkFixture {
     pub async fn wait_for_table(&self, pool: &Pool<Postgres>, table: &str) {
         let query = format!("SELECT 1 FROM {table} LIMIT 1");
         for _ in 0..DEFAULT_POLL_ATTEMPTS {
-            if sqlx::query(&query).fetch_optional(pool).await.is_ok() {
+            if sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+                .fetch_optional(pool)
+                .await
+                .is_ok()
+            {
                 return;
             }
             sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
@@ -74,7 +78,10 @@ impl PostgresSinkFixture {
     {
         let mut rows = Vec::new();
         for _ in 0..DEFAULT_POLL_ATTEMPTS {
-            if let Ok(fetched) = sqlx::query_as::<_, T>(query).fetch_all(pool).await {
+            if let Ok(fetched) = sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(query))
+                .fetch_all(pool)
+                .await
+            {
                 rows = fetched;
                 if rows.len() >= expected_count {
                     return Ok(rows);

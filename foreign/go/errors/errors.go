@@ -18,3 +18,7 @@
 //go:generate go run ./generator/main.go
 
 package ierror
+
+import "errors"
+
+var ErrNilContext = errors.New("nil context")

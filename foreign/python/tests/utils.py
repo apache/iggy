@@ -71,12 +71,12 @@ def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) 
         try:
             with socket.create_connection((host, port), timeout=interval):
                 return
-        except (socket.timeout, ConnectionRefusedError, OSError):
+        except (TimeoutError, ConnectionRefusedError, OSError) as err:
             elapsed_time = time.time() - start_time
             if elapsed_time >= timeout:
                 raise TimeoutError(
                     f"Server not available at {host}:{port} after {timeout}s"
-                )
+                ) from err
             time.sleep(interval)
 
 
@@ -100,8 +100,10 @@ async def wait_for_ping(
         try:
             await client.ping()
             return
-        except Exception:
+        except Exception as err:
             elapsed_time = time.time() - start_time
             if elapsed_time >= timeout:
-                raise TimeoutError(f"Server not responding to ping after {timeout}s")
+                raise TimeoutError(
+                    f"Server not responding to ping after {timeout}s"
+                ) from err
             await asyncio.sleep(interval)

@@ -15,6 +15,8 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 - **Data transformation**: Supports data transformation with the help of existing functions.
 - **Powerful configuration**: Define your sinks, sources, and transformations in the configuration file or fetch them from a remote HTTP API.
 - **Flexible configuration providers**: Support for local file-based and HTTP-based configuration providers for centralized configuration management.
+- **Observability**: Prometheus metrics with per-stage latency histograms, plus an opt-in per-batch tracing benchmark target.
+- **Structured logging**: Selectable text or JSON log format via `[logging]` configuration.
 
 ## Quick Start
 

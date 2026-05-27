@@ -26,6 +26,7 @@ publish = false
 # inside the docker containers. This is a temporary workaround (hopefully).
 [features]
 ci-qemu = []
+vsr = ["iggy/vsr"]
 
 [dependencies]
 assert_cmd = { workspace = true }
@@ -52,7 +53,7 @@ iggy_common = { workspace = true }
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
+keyring-core = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
@@ -89,3 +90,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
 zip = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { workspace = true }

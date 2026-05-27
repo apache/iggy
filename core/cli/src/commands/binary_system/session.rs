@@ -16,10 +16,46 @@
  * under the License.
  */
 
-use keyring::{Entry, Result};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use std::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+use apple_native_keyring_store::keychain::Store;
+#[cfg(target_os = "linux")]
+use dbus_secret_service_keyring_store::store::Store;
+use keyring_core::{Entry, error::Result};
+use tracing::warn;
+#[cfg(target_os = "windows")]
+use windows_native_keyring_store::store::Store;
+
+use crate::commands::cli_command::PRINT_TARGET;
 
 const SESSION_TOKEN_NAME: &str = "iggy-cli-session";
 const SESSION_KEYRING_SERVICE_NAME: &str = "iggy-cli-session";
+
+/// `keyring-core` 1.x has no implicit default backend. Register one on the
+/// first `Entry::new` so unrelated CLI subcommands never touch the OS keyring.
+///
+/// The mutex serializes concurrent callers so two threads cannot both observe
+/// an empty default store and race to install one. `get_default_store()` acts
+/// as the idempotency check, so a transient `Store::new()` failure stays
+/// retryable on the next call.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub fn ensure_default_store() -> Result<()> {
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if keyring_core::get_default_store().is_some() {
+        return Ok(());
+    }
+    let store = Store::new()?;
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn ensure_default_store() -> Result<()> {
+    Ok(())
+}
 
 pub struct ServerSession {
     server_address: String,
@@ -43,6 +79,10 @@ impl ServerSession {
     }
 
     pub fn is_active(&self) -> bool {
+        if let Err(e) = ensure_default_store() {
+            warn!(target: PRINT_TARGET, "keyring backend unavailable, treating session as inactive: {e}");
+            return false;
+        }
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name()) {
             return entry.get_password().is_ok();
         }
@@ -51,12 +91,17 @@ impl ServerSession {
     }
 
     pub fn store(&self, token: &str) -> Result<()> {
+        ensure_default_store()?;
         let entry = Entry::new(&self.get_service_name(), &self.get_token_name())?;
         entry.set_password(token)?;
         Ok(())
     }
 
     pub fn get_token(&self) -> Option<String> {
+        if let Err(e) = ensure_default_store() {
+            warn!(target: PRINT_TARGET, "keyring backend unavailable, cannot read session token: {e}");
+            return None;
+        }
         if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name())
             && let Ok(token) = entry.get_password()
         {
@@ -67,6 +112,7 @@ impl ServerSession {
     }
 
     pub fn delete(&self) -> Result<()> {
+        ensure_default_store()?;
         let entry = Entry::new(&self.get_service_name(), &self.get_token_name())?;
         entry.delete_credential()
     }

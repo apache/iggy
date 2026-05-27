@@ -26,7 +26,7 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, Error, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
+    ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
     source::HandleCallback, transforms::Transform,
 };
 use once_cell::sync::Lazy;
@@ -34,13 +34,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::metrics::ConnectorType;
+use crate::metrics::SourceLabels;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
@@ -48,11 +50,19 @@ use crate::{
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
+use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
 
-pub static SOURCE_SENDERS: Lazy<DashMap<u32, Sender<ProducedMessages>>> = Lazy::new(DashMap::new);
+pub(crate) struct SourceSenderEntry {
+    pub(crate) sender: Sender<ProducedMessages>,
+    // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
+    // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
+    pub(crate) error_counter: Counter,
+}
 
-pub fn cleanup_sender(plugin_id: u32) {
+pub(crate) static SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>> = Lazy::new(DashMap::new);
+
+pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
 }
 
@@ -182,6 +192,7 @@ pub async fn init(
             state_storage,
             error: init_error.clone(),
             verbose: config.verbose,
+            benchmark: config.benchmark,
         });
 
         if let Some(error) = init_error {
@@ -350,14 +361,22 @@ pub(crate) async fn source_forwarding_loop(
     plugin_id: u32,
     plugin_key: String,
     verbose: bool,
+    benchmark: bool,
     producer: IggyProducer,
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
     receiver: Receiver<ProducedMessages>,
     context: Arc<RuntimeContext>,
+    labels: Arc<SourceLabels>,
 ) {
     info!("Source connector with ID: {plugin_id} started.");
+    if benchmark {
+        info!(
+            "Benchmark mode enabled for source connector with ID: {plugin_id}, key: {plugin_key}. \
+             Per-batch events on target 'iggy_connectors::benchmark'."
+        );
+    }
     context
         .sources
         .update_status(
@@ -374,10 +393,11 @@ pub(crate) async fn source_forwarding_loop(
     };
 
     while let Ok(produced_messages) = receiver.recv_async().await {
+        let total_start = Instant::now();
         let count = produced_messages.messages.len();
         context
             .metrics
-            .increment_messages_produced(&plugin_key, count as u64);
+            .inc_messages_produced_with_labels(&labels.counter, count as u64);
         if verbose {
             info!("Source connector with ID: {plugin_id} received {count} messages");
         } else {
@@ -385,11 +405,14 @@ pub(crate) async fn source_forwarding_loop(
         }
         let schema = produced_messages.schema;
         let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
+        let mut decode_errors = 0u64;
+        let decode_start = Instant::now();
         for message in produced_messages.messages {
             let Ok(payload) = schema.try_into_payload(message.payload) else {
                 error!(
                     "Failed to decode message payload with schema: {schema} for source connector with ID: {plugin_id}",
                 );
+                decode_errors += 1;
                 continue;
             };
 
@@ -407,72 +430,112 @@ pub(crate) async fn source_forwarding_loop(
             });
             number += 1;
         }
+        context
+            .metrics
+            .inc_errors_by_with_labels(&labels.counter, decode_errors);
+        let decode_elapsed = decode_start.elapsed();
+        context
+            .metrics
+            .observe_stage_with_labels(&labels.stage_decode, decode_elapsed);
 
-        let Ok(iggy_messages) =
-            process_messages(plugin_id, &encoder, &topic_metadata, messages, &transforms)
-        else {
-            let error_msg = format!(
-                "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
-                producer.stream(),
-                producer.topic()
-            );
-            error!("{error_msg}");
-            context
-                .metrics
-                .increment_errors(&plugin_key, ConnectorType::Source);
-            context.sources.set_error(&plugin_key, &error_msg).await;
-            continue;
-        };
+        let prepare_start = Instant::now();
+        let iggy_messages = process_messages(
+            plugin_id,
+            &encoder,
+            &topic_metadata,
+            messages,
+            &transforms,
+            &context.metrics,
+            &labels,
+        );
+        let prepare_elapsed = prepare_start.elapsed();
+        context
+            .metrics
+            .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
+        let sent_count = iggy_messages.len();
 
-        if let Err(error) = producer.send(iggy_messages).await {
+        let iggy_send_start = Instant::now();
+        let send_result = producer.send(iggy_messages).await;
+        let iggy_send_elapsed = iggy_send_start.elapsed();
+        context
+            .metrics
+            .observe_stage_with_labels(&labels.stage_iggy_send, iggy_send_elapsed);
+
+        // Total histogram + emit (below) run regardless of send outcome.
+        let mut state_save_us: Option<u64> = None;
+        if let Err(error) = send_result {
             let error_msg = format!(
-                "Failed to send {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
+                "Failed to send {sent_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
                 producer.stream(),
                 producer.topic(),
             );
             error!("{error_msg}");
+            context.metrics.inc_errors_with_labels(&labels.counter);
+            context.sources.set_error(&plugin_key, &error_msg).await;
+        } else {
             context
                 .metrics
-                .increment_errors(&plugin_key, ConnectorType::Source);
-            context.sources.set_error(&plugin_key, &error_msg).await;
-            continue;
+                .inc_messages_sent_with_labels(&labels.counter, sent_count as u64);
+
+            if verbose {
+                info!(
+                    "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                    producer.stream(),
+                    producer.topic()
+                );
+            } else {
+                debug!(
+                    "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                    producer.stream(),
+                    producer.topic()
+                );
+            }
+
+            if let Some(state) = produced_messages.state {
+                let state_save_start = Instant::now();
+                match &state_storage {
+                    StateStorage::File(file) => {
+                        if let Err(error) = file.save(state).await {
+                            let error_msg = format!(
+                                "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                            );
+                            error!("{error_msg}");
+                            context.metrics.inc_errors_with_labels(&labels.counter);
+                            context.sources.set_error(&plugin_key, &error_msg).await;
+                        } else {
+                            debug!("State saved for source connector with ID: {plugin_id}");
+                            let state_save_elapsed = state_save_start.elapsed();
+                            context.metrics.observe_stage_with_labels(
+                                &labels.stage_state_save,
+                                state_save_elapsed,
+                            );
+                            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
+                        }
+                    }
+                }
+            } else {
+                debug!("No state provided for source connector with ID: {plugin_id}");
+            }
         }
 
+        let total_elapsed = total_start.elapsed();
         context
             .metrics
-            .increment_messages_sent(&plugin_key, count as u64);
+            .observe_stage_with_labels(&labels.stage_total, total_elapsed);
 
-        if verbose {
-            info!(
-                "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                producer.stream(),
-                producer.topic()
+        if benchmark {
+            benchmark::emit_source_event(
+                &plugin_key,
+                &topic_metadata.stream,
+                &topic_metadata.topic,
+                count,
+                sent_count,
+                benchmark::as_micros(decode_elapsed),
+                benchmark::as_micros(prepare_elapsed),
+                benchmark::as_micros(iggy_send_elapsed),
+                state_save_us,
+                benchmark::as_micros(total_elapsed),
             );
-        } else {
-            debug!(
-                "Sent {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                producer.stream(),
-                producer.topic()
-            );
-        }
-
-        let Some(state) = produced_messages.state else {
-            debug!("No state provided for source connector with ID: {plugin_id}");
-            continue;
-        };
-
-        match &state_storage {
-            StateStorage::File(file) => {
-                if let Err(error) = file.save(state).await {
-                    let error_msg = format!(
-                        "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                    );
-                    error!("{error_msg}");
-                    context.sources.set_error(&plugin_key, &error_msg).await;
-                    continue;
-                }
-                debug!("State saved for source connector with ID: {plugin_id}");
-            }
         }
     }
 
@@ -492,6 +555,7 @@ pub(crate) fn spawn_source_handler(
     plugin_id: u32,
     plugin_key: &str,
     verbose: bool,
+    benchmark: bool,
     producer: IggyProducer,
     encoder: Arc<dyn StreamEncoder>,
     transforms: Vec<Arc<dyn Transform>>,
@@ -500,24 +564,32 @@ pub(crate) fn spawn_source_handler(
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
     let (sender, receiver) = flume::unbounded();
-    SOURCE_SENDERS.insert(plugin_id, sender);
+    let plugin_key = plugin_key.to_string();
+    let labels = Arc::new(SourceLabels::new(&plugin_key));
+    SOURCE_SENDERS.insert(
+        plugin_id,
+        SourceSenderEntry {
+            sender,
+            error_counter: context.metrics.error_counter(&labels.counter),
+        },
+    );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
         callback(plugin_id, handle_produced_messages);
     });
-
-    let plugin_key = plugin_key.to_string();
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
             plugin_id,
             plugin_key,
             verbose,
+            benchmark,
             producer,
             encoder,
             transforms,
             state_storage,
             receiver,
             context,
+            labels,
         )
         .await;
     });
@@ -552,6 +624,7 @@ pub fn handle(
                 plugin_id,
                 &plugin_key,
                 plugin.verbose,
+                plugin.benchmark,
                 producer_wrapper.producer,
                 producer_wrapper.encoder,
                 plugin.transforms,
@@ -572,20 +645,44 @@ fn process_messages(
     topic_metadata: &TopicMetadata,
     messages: Vec<DecodedMessage>,
     transforms: &Vec<Arc<dyn Transform>>,
-) -> Result<Vec<IggyMessage>, Error> {
+    metrics: &Arc<crate::metrics::Metrics>,
+    labels: &SourceLabels,
+) -> Vec<IggyMessage> {
     let mut iggy_messages = Vec::with_capacity(messages.len());
+    // Accumulate per-message drops, flush once after the loop - one Family
+    // lookup instead of one per message under filter/error storms.
+    let mut error_count = 0u64;
+    let mut filtered_count = 0u64;
     for message in messages {
         let mut current_message = Some(message);
+        let mut transform_failed = false;
         for transform in transforms.iter() {
-            let Some(message) = current_message else {
+            let Some(message) = current_message.take() else {
                 break;
             };
 
-            current_message = transform.transform(topic_metadata, message)?;
+            match transform.transform(topic_metadata, message) {
+                Ok(next) => current_message = next,
+                Err(error) => {
+                    error!(
+                        "Transform '{:?}' failed for source connector with ID: {id}, stream: {}, topic: {}: {error}",
+                        transform.r#type(),
+                        topic_metadata.stream,
+                        topic_metadata.topic
+                    );
+                    error_count += 1;
+                    transform_failed = true;
+                    break;
+                }
+            }
+        }
+        if transform_failed {
+            continue;
         }
 
-        // The transform may return no message based on some conditions
+        // Filter contract: transform returning Ok(None) is an intentional drop.
         let Some(message) = current_message else {
+            filtered_count += 1;
             continue;
         };
 
@@ -594,6 +691,7 @@ fn process_messages(
                 "Failed to encode message payload for source connector with ID: {id}, stream: {}, topic: {}",
                 topic_metadata.stream, topic_metadata.topic
             );
+            error_count += 1;
             continue;
         };
 
@@ -602,12 +700,17 @@ fn process_messages(
                 "Failed to build Iggy message for source connector with ID: {id}, stream: {}, topic: {}",
                 topic_metadata.stream, topic_metadata.topic
             );
+            error_count += 1;
             continue;
         };
 
         iggy_messages.push(iggy_message);
     }
-    Ok(iggy_messages)
+    metrics.inc_errors_by_with_labels(&labels.counter, error_count);
+    if filtered_count > 0 {
+        metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
+    }
+    iggy_messages
 }
 
 pub(crate) extern "C" fn handle_produced_messages(
@@ -616,21 +719,30 @@ pub(crate) extern "C" fn handle_produced_messages(
     messages_len: usize,
 ) {
     unsafe {
-        if let Some(sender) = SOURCE_SENDERS.get(&plugin_id) {
-            let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
-            match postcard::from_bytes::<ProducedMessages>(messages) {
-                Ok(messages) => {
-                    if let Err(send_error) = sender.send(messages) {
-                        error!(
-                            "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
-                        );
-                    }
-                }
-                Err(err) => {
+        // Entry missing = SOURCE_SENDERS cleaned up at shutdown; benign race
+        // expected on stop/restart. No metric (would conflate with real failures).
+        let Some(entry) = SOURCE_SENDERS.get(&plugin_id) else {
+            tracing::trace!(
+                plugin_id,
+                "dropping produced batch: sender already cleaned up"
+            );
+            return;
+        };
+        let messages = std::slice::from_raw_parts(messages_ptr, messages_len);
+        match postcard::from_bytes::<ProducedMessages>(messages) {
+            Ok(messages) => {
+                if let Err(send_error) = entry.sender.send(messages) {
                     error!(
-                        "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
+                        "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
                     );
+                    entry.error_counter.inc();
                 }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
+                );
+                entry.error_counter.inc();
             }
         }
     }

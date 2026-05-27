@@ -404,10 +404,10 @@ async fn given_missing_target_table_should_not_create_or_corrupt(
     // connector's HTTP failures didn't take Doris down.
     let pool = fixture.pool().await.expect("pool after failed loads");
     use sqlx::Row;
-    let rows = sqlx::raw_sql(&format!(
+    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SELECT TABLE_NAME FROM information_schema.tables \
          WHERE TABLE_SCHEMA = '{db}'"
-    ))
+    )))
     .fetch_all(&pool)
     .await
     .expect("list tables in test database");
@@ -476,9 +476,9 @@ async fn given_columns_config_should_apply_derived_expression(
     // to equal exactly the row count (one per row).
     let pool = fixture.pool().await.expect("pool");
     use sqlx::Row;
-    let row = sqlx::raw_sql(&format!(
+    let row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "SELECT SUM(calculated - `count`) AS delta FROM {db}.{TEST_TABLE}"
-    ))
+    )))
     .fetch_one(&pool)
     .await
     .expect("sum query");

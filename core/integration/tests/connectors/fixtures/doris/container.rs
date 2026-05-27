@@ -351,7 +351,12 @@ impl DorisContainer {
     async fn create_test_database(&self) -> Result<(), TestBinaryError> {
         let pool = self.create_pool().await?;
         // raw_sql avoids the PREPARE path Doris doesn't accept for DDL.
-        sqlx::raw_sql(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+        // sqlx 0.9's `raw_sql` requires `SqlSafeStr`; the inputs here are
+        // test-controlled (a UUID db name), so `AssertSqlSafe` is appropriate.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            self.database
+        )))
             .execute(&pool)
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
@@ -398,7 +403,11 @@ pub trait DorisOps: Sync {
         // its first tablet/disk report. Retry through that window.
         let mut last_err: Option<sqlx::Error> = None;
         for _ in 0..30 {
-            match sqlx::raw_sql(&ddl).execute(&pool).await {
+            // Borrow `ddl` (not move) — this runs inside the retry loop.
+            match sqlx::raw_sql(sqlx::AssertSqlSafe(ddl.as_str()))
+                .execute(&pool)
+                .await
+            {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     let msg = e.to_string();
@@ -428,10 +437,10 @@ pub trait DorisOps: Sync {
     /// assert the connector did NOT silently auto-create on a failed load.
     async fn table_exists(&self, database: &str, table: &str) -> Result<bool, TestBinaryError> {
         let pool = self.pool().await?;
-        let rows = sqlx::raw_sql(&format!(
+        let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "SELECT TABLE_NAME FROM information_schema.tables \
              WHERE TABLE_SCHEMA = '{database}' AND TABLE_NAME = '{table}'"
-        ))
+        )))
         .fetch_all(&pool)
         .await
         .map_err(|e| TestBinaryError::InvalidState {
@@ -445,7 +454,9 @@ pub trait DorisOps: Sync {
         // SELECT supports PREPARE in Doris but raw_sql is consistent with
         // the rest of the fixture and avoids any future surprises.
         use sqlx::Row;
-        let row = sqlx::raw_sql(&format!("SELECT COUNT(*) AS c FROM {database}.{table}"))
+        let row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) AS c FROM {database}.{table}"
+        )))
             .fetch_one(&pool)
             .await
             .map_err(|e| TestBinaryError::InvalidState {

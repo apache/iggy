@@ -20,25 +20,26 @@ BDD test configuration and fixtures for Python SDK tests.
 """
 
 import asyncio
+import contextlib
 import os
-import pytest
 from dataclasses import dataclass
-from typing import Optional, List
+
+import pytest
 
 
 @dataclass
 class GlobalContext:
     """Global test context similar to Rust implementation."""
 
-    client: Optional[object] = None  # Will be IggyClient
-    server_addr: Optional[str] = None
-    last_stream_id: Optional[int] = None
-    last_stream_name: Optional[str] = None
-    last_topic_id: Optional[int] = None
-    last_topic_name: Optional[str] = None
-    last_topic_partitions: Optional[int] = None
-    last_polled_messages: Optional[List[object]] = None  # Will be List[ReceiveMessage]
-    last_sent_message: Optional[str] = None  # Store message payload as string
+    client: object | None = None  # Will be IggyClient
+    server_addr: str | None = None
+    last_stream_id: int | None = None
+    last_stream_name: str | None = None
+    last_topic_id: int | None = None
+    last_topic_name: str | None = None
+    last_topic_partitions: int | None = None
+    last_polled_messages: list[object] | None = None  # Will be List[ReceiveMessage]
+    last_sent_message: str | None = None  # Store message payload as string
 
 
 @pytest.fixture(scope="session")
@@ -61,7 +62,5 @@ def context():
 
     # Cleanup: disconnect client if connected
     if ctx.client:
-        try:
+        with contextlib.suppress(Exception):
             asyncio.run(ctx.client.disconnect())
-        except Exception:
-            pass

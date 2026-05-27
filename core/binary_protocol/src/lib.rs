@@ -63,6 +63,7 @@ pub mod error;
 pub mod framing;
 pub mod message_layout;
 pub mod message_view;
+pub mod namespace;
 pub mod primitives;
 pub mod requests;
 pub mod responses;

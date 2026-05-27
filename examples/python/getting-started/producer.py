@@ -43,8 +43,8 @@ class ValidateUrl(argparse.Action):
         self,
         parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
-        values: typing.List[typing.Any],
-        option_string: typing.Optional[str] = None,
+        values: list[typing.Any],
+        _option_string: str | None = None,
     ):
         parsed_url: urllib.parse.ParseResult = urllib.parse.urlparse("//" + values)
         if parsed_url.netloc == "" or parsed_url.path != "":
@@ -158,7 +158,9 @@ async def init_system(client: IggyClient):
 async def produce_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
-        f"Messages will be sent to stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with interval {interval * 1000} ms."
+        f"Messages will be sent to stream: {STREAM_NAME}, "
+        f"topic: {TOPIC_NAME}, partition: {PARTITION_ID} "
+        f"with interval {interval * 1000} ms."
     )
     current_id = 0
     messages_per_batch = 10
@@ -171,7 +173,8 @@ async def produce_messages(client: IggyClient):
             message = Message(payload)
             messages.append(message)
         logger.info(
-            f"Attempting to send batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+            f"Attempting to send batch of {messages_per_batch} messages. "
+            f"Batch ID: {current_id // messages_per_batch}"
         )
         try:
             await client.send_messages(
@@ -182,7 +185,8 @@ async def produce_messages(client: IggyClient):
             )
             n_sent_batches += 1
             logger.info(
-                f"Successfully sent batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+                f"Successfully sent batch of {messages_per_batch} messages. "
+                f"Batch ID: {current_id // messages_per_batch}"
             )
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")

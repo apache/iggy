@@ -15,6 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-apache-iggy
-loguru==0.7.3
-argparse==1.4.0
+type = "sink"
+key = "stdout_off"
+enabled = true
+version = 0
+name = "Stdout sink (benchmark off)"
+path = "../../target/debug/libiggy_connector_stdout_sink"
+benchmark = false
+
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 50
+poll_interval = "5ms"
+consumer_group = "stdout_off_sink_connector"
+
+[plugin_config]
+print_payload = false

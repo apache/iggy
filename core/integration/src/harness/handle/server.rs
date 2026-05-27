@@ -93,6 +93,26 @@ impl std::fmt::Debug for ServerHandle {
 }
 
 impl ServerHandle {
+    fn default_server_binary() -> &'static str {
+        #[cfg(feature = "vsr")]
+        {
+            "iggy-server-ng"
+        }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            "iggy-server"
+        }
+    }
+
+    fn launched_binary(&self) -> String {
+        if let Some(path) = &self.config.executable_path {
+            path.clone()
+        } else {
+            Self::default_server_binary().to_string()
+        }
+    }
+
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.addrs.tcp
     }
@@ -402,7 +422,7 @@ impl ServerHandle {
             {
                 let (stdout, stderr) = self.collect_logs();
                 return Err(TestBinaryError::ProcessCrashed {
-                    binary: "iggy-server".to_string(),
+                    binary: self.launched_binary(),
                     exit_code: status.code(),
                     stdout,
                     stderr,
@@ -427,7 +447,7 @@ impl ServerHandle {
         }
 
         Err(TestBinaryError::StartupTimeout {
-            binary: "iggy-server".to_string(),
+            binary: self.launched_binary(),
             timeout_secs: MAX_PORT_WAIT_DURATION_S,
         })
     }
@@ -776,19 +796,41 @@ impl TestBinary for ServerHandle {
         }
 
         #[allow(deprecated)]
+        let launched_binary = self.launched_binary();
         let mut command = if let Some(ref path) = self.config.executable_path {
-            Command::new(path)
+            let path_ref = Path::new(path);
+            if path_ref.components().count() == 1 && !path_ref.exists() {
+                Command::cargo_bin(path).map_err(|e| TestBinaryError::ProcessSpawn {
+                    binary: launched_binary.clone(),
+                    source: std::io::Error::other(e.to_string()),
+                })?
+            } else {
+                Command::new(path)
+            }
         } else {
-            Command::cargo_bin("iggy-server").map_err(|e| TestBinaryError::ProcessSpawn {
-                binary: "iggy-server".to_string(),
-                source: std::io::Error::other(e.to_string()),
+            Command::cargo_bin(Self::default_server_binary()).map_err(|e| {
+                TestBinaryError::ProcessSpawn {
+                    binary: launched_binary.clone(),
+                    source: std::io::Error::other(e.to_string()),
+                }
             })?
         };
 
         command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        // VSR multi-node tests spawn N shards per node * M nodes per test;
+        // the 4096-entry per-ring default exhausts dev memlock budgets
+        // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
+        // supplied an explicit value via `extra_envs` or the parent env.
+        if !self.envs.contains_key("IGGY_SHARD_RUNTIME_CAPACITY")
+            && std::env::var("IGGY_SHARD_RUNTIME_CAPACITY").is_err()
+        {
+            command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
+        }
         command.envs(&self.envs);
 
-        // TODO(hubcio): Remove --follower flag when proper clustering is implemented
+        // Legacy clustering elects node 0 externally and requires explicit followers.
+        // VSR/server-ng elects its own primary and should see symmetric node startup.
+        #[cfg(not(feature = "vsr"))]
         if self.server_id > 0 {
             command.arg("--follower");
         }
@@ -828,20 +870,26 @@ impl TestBinary for ServerHandle {
             self.stderr_path = Some(fs::canonicalize(&stderr_path)?);
         }
 
+        // Release the reservation BEFORE spawning. Production listeners
+        // set `SO_REUSEPORT` in theory, but holding the reservation across
+        // child startup races with `bind()` on the child side and
+        // sporadically returns `CannotBindToSocket`. The narrow TOCTOU
+        // window between `release` and the child's `bind` is bounded by
+        // process start latency and harness-controlled environment;
+        // hubcio's TODO in `socket_opts.rs` retires the whole
+        // reservation-socket dance.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         let child = command.spawn().map_err(|e| TestBinaryError::ProcessSpawn {
-            binary: "iggy-server".to_string(),
+            binary: launched_binary,
             source: e,
         })?;
         self.child_handle = Some(child);
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
-
-        // Release port reservation after server has written config file (bound to ports).
-        // This avoids SO_REUSEPORT load-balancing conflicts during startup.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
 
         self.start_watchdog();
 
