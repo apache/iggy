@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cli::common::{IggyCmdTest, TestHelpCmd, USAGE_PREFIX};
+use crate::cli::common::{CLAP_INDENT, IggyCmdTest, TestHelpCmd, USAGE_PREFIX};
 use serial_test::parallel;
 
 #[tokio::test]
@@ -38,7 +38,7 @@ subsequent commands until logout command is executed.
 Arguments:
   [EXPIRY]...
           Login session expiry time in human-readable format
-
+{CLAP_INDENT}
           Expiry time must be expressed in human-readable format like 1hour 15min 2s.
           If not set default value 15minutes is used. Using "none" disables session expiry time.
 
