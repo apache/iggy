@@ -20,56 +20,18 @@
 // |    stream_id   |    topic_id    |  partition_id  |     unused     |
 // |    STREAM_BITS |    TOPIC_BITS  | PARTITION_BITS |  (64 - total)  |
 // +----------------+----------------+----------------+----------------+
+//
+// The layout constants live in `iggy_binary_protocol::namespace` because
+// both the SDK encoder and this server-side router depend on them and they
+// MUST stay in lockstep -- any drift silently routes writes to the wrong
+// shard. Re-exported here for ergonomics of existing call sites.
 
+pub use iggy_binary_protocol::namespace::{
+    MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE, PACKED_NAMESPACE_BITS,
+    PACKED_NAMESPACE_MAX, PARTITION_BITS, PARTITION_MASK, PARTITION_SHIFT, STREAM_BITS,
+    STREAM_MASK, STREAM_SHIFT, TOPIC_BITS, TOPIC_MASK, TOPIC_SHIFT, bits_required,
+};
 use thiserror::Error;
-
-pub const MAX_STREAMS: usize = 4096;
-pub const MAX_TOPICS: usize = 4096;
-pub const MAX_PARTITIONS: usize = 1_000_000;
-
-const fn bits_required(mut n: u64) -> u32 {
-    if n == 0 {
-        return 1;
-    }
-    let mut b = 0;
-    while n > 0 {
-        b += 1;
-        n >>= 1;
-    }
-    b
-}
-
-pub const STREAM_BITS: u32 = bits_required((MAX_STREAMS - 1) as u64);
-pub const TOPIC_BITS: u32 = bits_required((MAX_TOPICS - 1) as u64);
-pub const PARTITION_BITS: u32 = bits_required((MAX_PARTITIONS - 1) as u64);
-
-pub const PARTITION_SHIFT: u32 = 0;
-pub const TOPIC_SHIFT: u32 = PARTITION_SHIFT + PARTITION_BITS;
-pub const STREAM_SHIFT: u32 = TOPIC_SHIFT + TOPIC_BITS;
-
-pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
-pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
-pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
-
-/// Total bits used by the packed `IggyNamespace` layout (stream | topic | partition).
-/// Any `u64` whose set bits all sit within this range is a legal packable namespace.
-pub const PACKED_NAMESPACE_BITS: u32 = STREAM_BITS + TOPIC_BITS + PARTITION_BITS;
-
-/// Largest `u64` value that can be produced by [`IggyNamespace::new`].
-/// Equivalent to `(1 << PACKED_NAMESPACE_BITS) - 1`.
-pub const PACKED_NAMESPACE_MAX: u64 = (1u64 << PACKED_NAMESPACE_BITS) - 1;
-
-/// Reserved consensus-namespace identifier for the cluster's metadata replica.
-///
-/// The packed `IggyNamespace` layout uses only bits `0..PACKED_NAMESPACE_BITS`,
-/// so the top bit is guaranteed to be unreachable from any
-/// `IggyNamespace::new(stream, topic, partition).inner()`. This lets routers
-/// distinguish metadata's single global consensus group from per-partition
-/// consensus groups by value alone, without needing a wire-format scope tag.
-///
-/// `IggyNamespace::new(0, 0, 0).inner() == 0` is a legal partition, so `0`
-/// cannot serve as a sentinel.
-pub const METADATA_CONSENSUS_NAMESPACE: u64 = 1u64 << 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NamespaceCapacityError {

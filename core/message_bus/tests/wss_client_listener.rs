@@ -67,8 +67,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
 
     let creds = self_signed_for_loopback();
     let cert_chain = creds.cert_chain.clone();
-    let (listener, server_cfg, server_addr) =
-        bind(loopback(), creds).await.expect("wss listener bind");
+    let (listener, server_cfg, server_addr) = bind(loopback(), creds).expect("wss listener bind");
     let token = bus.token();
     let on_accepted = install_wss_clients_locally(Rc::clone(&bus), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -146,8 +145,7 @@ async fn slow_handshake_evicts_registry() {
     });
 
     let creds = self_signed_for_loopback();
-    let (listener, server_cfg, server_addr) =
-        bind(loopback(), creds).await.expect("wss listener bind");
+    let (listener, server_cfg, server_addr) = bind(loopback(), creds).expect("wss listener bind");
     let token = bus.token();
     let on_accepted = install_wss_clients_locally(Rc::clone(&bus), on_request);
     let accept_handle = compio::runtime::spawn(async move {

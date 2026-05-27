@@ -250,7 +250,7 @@ fn build_servers(
         return Ok(Vec::new());
     };
 
-    let node_count = cluster_node_count.unwrap_or(1);
+    let node_count = cluster_node_count.unwrap_or_else(default_cluster_node_count);
 
     if node_count == 1 {
         return Ok(vec![ServerHandle::with_config(config, context.clone())]);
@@ -296,6 +296,18 @@ fn build_servers(
     Ok(servers)
 }
 
+fn default_cluster_node_count() -> usize {
+    #[cfg(feature = "vsr")]
+    {
+        3
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    {
+        1
+    }
+}
+
 fn build_cluster_envs(
     node_index: usize,
     cluster_name: &str,
@@ -311,6 +323,11 @@ fn build_cluster_envs(
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
+    #[cfg(feature = "vsr")]
+    envs.insert(
+        "IGGY_MESSAGE_BUS_RECONNECT_PERIOD".to_string(),
+        "100ms".to_string(),
+    );
     // Node identity is supplied via `--replica-id` on the command line by
     // ServerHandle::spawn; every cluster env var emitted here is identical
     // across all spawned servers.
@@ -327,6 +344,12 @@ fn build_cluster_envs(
             envs.insert(
                 format!("IGGY_CLUSTER_NODES_{i}_PORTS_TCP"),
                 tcp.port().to_string(),
+            );
+        }
+        if let Some(tcp_replica) = addrs.tcp_replica {
+            envs.insert(
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_TCP_REPLICA"),
+                tcp_replica.port().to_string(),
             );
         }
         if let Some(http) = addrs.http {

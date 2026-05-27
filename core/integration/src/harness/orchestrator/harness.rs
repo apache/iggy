@@ -28,9 +28,15 @@ use crate::harness::handle::{
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
+#[cfg(feature = "vsr")]
+use iggy_common::Client;
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::time::{Duration, Instant};
+#[cfg(feature = "vsr")]
+use tokio::time::{sleep, timeout};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -152,6 +158,8 @@ impl TestHarness {
             server.start()?;
         }
 
+        self.wait_for_cluster_ready().await?;
+
         if let Some(seed_fn) = seed {
             let client = self.tcp_root_client().await?;
             seed_fn(client)
@@ -164,6 +172,51 @@ impl TestHarness {
 
         self.started = true;
         Ok(())
+    }
+
+    async fn wait_for_cluster_ready(&self) -> Result<(), TestBinaryError> {
+        #[cfg(not(feature = "vsr"))]
+        {
+            Ok(())
+        }
+
+        #[cfg(feature = "vsr")]
+        {
+            if self.servers.len() <= 1 {
+                return Ok(());
+            }
+
+            const CLUSTER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+            const CLUSTER_READY_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+            const LOGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
+
+            let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
+            let mut last_error = None;
+
+            while Instant::now() < deadline {
+                match timeout(LOGIN_ATTEMPT_TIMEOUT, self.tcp_root_client()).await {
+                    Ok(Ok(client)) => {
+                        let _ = client.disconnect().await;
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => {
+                        last_error = Some(error.to_string());
+                        sleep(CLUSTER_READY_RETRY_INTERVAL).await;
+                    }
+                    Err(_) => {
+                        last_error = Some("login attempt timed out".to_string());
+                        sleep(CLUSTER_READY_RETRY_INTERVAL).await;
+                    }
+                }
+            }
+
+            Err(TestBinaryError::InvalidState {
+                message: format!(
+                    "Timed out waiting for VSR cluster readiness: {}",
+                    last_error.unwrap_or_else(|| "unknown error".to_string())
+                ),
+            })
+        }
     }
 
     async fn start_dependents(&mut self) -> Result<(), TestBinaryError> {

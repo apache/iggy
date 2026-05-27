@@ -56,10 +56,12 @@ mod tests {
     fn test_server_config_builder() {
         let config = TestServerConfig::builder()
             .quic_enabled(false)
+            .executable_path("iggy-server-ng")
             .extra_envs(HashMap::from([("FOO".to_string(), "BAR".to_string())]))
             .build();
 
         assert!(!config.quic_enabled);
+        assert_eq!(config.executable_path.as_deref(), Some("iggy-server-ng"));
         assert_eq!(config.extra_envs.get("FOO"), Some(&"BAR".to_string()));
     }
 
