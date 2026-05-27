@@ -231,9 +231,34 @@ pub(crate) fn serialize_value(
             // Unix time scaled by 10^precision as Int64.
             // precision is validated to be 0-9 by the schema parser, so
             // 10i64.pow(*precision as u32) cannot overflow i64::MAX.
-            let secs_f64 = coerce_to_unix_seconds_f64(value)?;
-            let scale = 10i64.pow(*precision as u32) as f64;
-            let scaled = (secs_f64 * scale).round() as i64;
+            let scale = 10i64.pow(*precision as u32);
+            let scaled = match value {
+                OwnedValue::Static(simd_json::StaticNode::I64(n)) => {
+                    // Integer fast path: multiply in i64 to avoid f64 precision loss.
+                    // At precision=9, a current-era timestamp (~1.7e9 s) * 1e9 = ~1.7e18,
+                    // which exceeds 2^53 and would lose ~256 ns if routed through f64.
+                    n.checked_mul(scale).ok_or_else(|| {
+                        error!("DateTime64 overflow");
+                        Error::InvalidRecord
+                    })?
+                }
+                OwnedValue::Static(simd_json::StaticNode::U64(n)) => {
+                    i64::try_from(*n)
+                        .ok()
+                        .and_then(|n| n.checked_mul(scale))
+                        .ok_or_else(|| {
+                            error!("DateTime64 overflow");
+                            Error::InvalidRecord
+                        })?
+                }
+                _ => {
+                    // Float or string inputs: f64 path is acceptable since floats
+                    // already carry sub-second fractions, and strings go through
+                    // parse_datetime_string which returns fractional seconds.
+                    let secs_f64 = coerce_to_unix_seconds_f64(value)?;
+                    (secs_f64 * scale as f64).round() as i64
+                }
+            };
             buf.extend_from_slice(&scaled.to_le_bytes());
         }
 
@@ -1174,6 +1199,29 @@ mod tests {
         // 1000 seconds → 1_000_000 milliseconds at precision=3
         serialize_value(&json_u64(1000), &ChType::DateTime64(3), &mut buf).unwrap();
         assert_eq!(buf, 1_000_000i64.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_datetime64_nanos_exact() {
+        let mut buf = vec![];
+        // Current-era timestamp: 1_700_000_000 s * 10^9 = 1_700_000_000_000_000_000 ns.
+        // The f64 path would round to the nearest 256 ns boundary; the integer path is exact.
+        serialize_value(
+            &json_i64(1_700_000_000),
+            &ChType::DateTime64(9),
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
+
+        buf.clear();
+        serialize_value(
+            &json_u64(1_700_000_000),
+            &ChType::DateTime64(9),
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
     }
 
     #[test]
