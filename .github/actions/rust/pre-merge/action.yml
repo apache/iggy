@@ -231,7 +231,7 @@ runs:
           echo "::group::Launch shared Doris container (boots during build)"
           if docker run -d --name iggy-doris-shared \
               -p 8030 -p 9030 -p 8040:8040 \
-              apache/doris:doris-all-in-one-2.1.0; then
+              apache/doris:4.0.3-all-slim; then
             DORIS_STARTED=1
           else
             echo "::warning::Failed to start shared Doris container; doris tests will self-boot"

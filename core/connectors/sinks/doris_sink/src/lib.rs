@@ -24,6 +24,7 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::{Method, StatusCode, header};
+use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::str::FromStr;
@@ -139,13 +140,16 @@ struct StreamLoadResponse {
 
 impl DorisSink {
     pub fn new(id: u32, config: DorisSinkConfig) -> Self {
-        let credential = format!("{}:{}", config.username, config.password.expose_secret());
+        let credential = Zeroizing::new(format!(
+            "{}:{}",
+            config.username,
+            config.password.expose_secret()
+        ));
+        let encoded = Zeroizing::new(general_purpose::STANDARD.encode(credential.as_bytes()));
         // `Basic <base64>` is always visible ASCII, so this conversion cannot fail.
-        let mut auth_header = header::HeaderValue::from_str(&format!(
-            "Basic {}",
-            general_purpose::STANDARD.encode(credential)
-        ))
-        .expect("Basic auth header is always valid ASCII");
+        let auth_value = Zeroizing::new(format!("Basic {}", encoded.as_str()));
+        let mut auth_header = header::HeaderValue::from_str(&auth_value)
+            .expect("Basic auth header is always valid ASCII");
         auth_header.set_sensitive(true);
 
         DorisSink {
@@ -315,15 +319,26 @@ impl Connected {
     /// Validate a Stream Load redirect target before re-attaching credentials.
     ///
     /// Doris's FE legitimately redirects (307) to a BE on a *different host*, so
-    /// we can't require same-host. Instead we enforce two rules that close the
+    /// we can't require same-host. Instead we enforce three rules that close the
     /// credential-exfiltration vector a compromised/MITM'd FE would otherwise have:
     ///
+    ///   0. The target scheme must be `http` or `https`. A non-HTTP scheme
+    ///      (`ftp`, `file`, ...) would slip past the downgrade rule when the FE
+    ///      itself is `http`, so reject it before re-attaching credentials.
     ///   1. No scheme downgrade (`https` -> `http`) unless `allow_insecure_redirect`
     ///      is set — a downgrade would push Basic-auth creds onto a cleartext hop.
     ///   2. If `allowed_redirect_hosts` is non-empty, the target must match an
     ///      entry. A bare-host entry pins only the host; a `host:port` entry pins
     ///      the exact endpoint, refusing an allowlisted host on an attacker port.
     fn validate_redirect(&self, target: &reqwest::Url, id: u32) -> Result<(), Error> {
+        // Only http(s) targets ever get credentials re-attached. Preventing something like ftp://.
+        let scheme = target.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(Error::PermanentHttpError(format!(
+                "Doris sink ID {id}: refusing redirect to non-HTTP(S) scheme '{scheme}'"
+            )));
+        }
+
         let downgraded = self.base_url.scheme().eq_ignore_ascii_case("https")
             && !target.scheme().eq_ignore_ascii_case("https");
         if downgraded && !self.allow_insecure_redirect {
@@ -1200,6 +1215,28 @@ mod tests {
                 .validate_redirect(&url("http://be.doris:8040/"), 1)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn redirect_refuses_non_http_scheme() {
+        // An http FE redirecting to a non-HTTP scheme slips past the downgrade
+        // check (the base isn't https) and, with no allowlist, the host check is
+        // skipped — so it must be rejected by the scheme gate before creds are
+        // re-attached. Covers the default (no allowlist) path.
+        for target in [
+            "ftp://be.doris/",
+            "file:///etc/passwd",
+            "gopher://be.doris/",
+        ] {
+            assert!(
+                matches!(
+                    connected("http://fe.doris:8030", false, None)
+                        .validate_redirect(&url(target), 1),
+                    Err(Error::PermanentHttpError(_))
+                ),
+                "scheme of {target} should be refused"
+            );
+        }
     }
 
     #[test]

@@ -471,8 +471,17 @@ pub trait DorisOps: Sync {
             // count is observed (or until we exhaust attempts).
             if let Ok(c) = self.count_rows(database, table).await {
                 last = c;
-                if c >= expected {
+                if c == expected {
                     return Ok(c);
+                }
+                // An overshoot means a duplicate landed (e.g. a label-window
+                // expiry replay). Surface it immediately with a clear message.
+                if c > expected {
+                    return Err(TestBinaryError::InvalidState {
+                        message: format!(
+                            "Expected exactly {expected} rows in {database}.{table} but observed {c} — a duplicate landed (label-window expiry replay?)"
+                        ),
+                    });
                 }
             }
             sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
