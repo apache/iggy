@@ -622,6 +622,15 @@ where
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
+        eprintln!(
+            "DBG on_ack op={} from_replica={} self={} view={} cmin={} cmax={}",
+            header.op,
+            header.replica,
+            consensus.replica(),
+            consensus.view(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        );
 
         if let Err(reason) = ack_preflight(consensus) {
             warn!(
@@ -875,6 +884,15 @@ where
             return Ok(session);
         }
 
+        eprintln!(
+            "DBG submit_register entry client={client_id} primary={} normal={} syncing={} cmin={} cmax={} view={}",
+            consensus.is_primary(),
+            consensus.is_normal(),
+            consensus.is_syncing(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+            consensus.view(),
+        );
         // Status + catch-up gate (see doc). Split variants for telemetry:
         // NotPrimary (try peer) vs NotCaughtUp (retry). Caller policy same.
         if !is_caught_up_primary(consensus) {
@@ -937,6 +955,7 @@ where
             is_caught_up_primary(consensus),
             "submit_register_in_process: gate flipped between check and dispatch"
         );
+        eprintln!("DBG submit_register dispatched prepare client={client_id}, awaiting commit");
         self.on_replicate(prepare).await;
         debug_assert!(
             consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
@@ -944,6 +963,12 @@ where
         );
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
+        eprintln!(
+            "DBG submit_register after on_replicate client={client_id} loopback={} cmin={} cmax={}",
+            loopback.len(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        );
         for message in loopback {
             match message.header().command {
                 Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {

@@ -100,6 +100,34 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     crossfire::mpsc::bounded_blocking_async(capacity)
 }
 
+/// Cross-shard metadata consensus submit.
+///
+/// The metadata consensus group lives only on shard 0. When a client
+/// connection homes on a peer shard, that shard verifies credentials and
+/// owns the session locally, but the consensus proposal (`Register` /
+/// `Logout`) must execute on shard 0. The peer hands just that step here
+/// and awaits the committed op number over `reply` (`None` = transient
+/// submit failure; all `RegisterSubmitError` variants are transient by
+/// contract, so the caller retries rather than distinguishing them).
+pub enum MetadataSubmit {
+    Register {
+        vsr_client_id: u128,
+        reply: Sender<Option<u64>>,
+    },
+    Logout {
+        vsr_client_id: u128,
+        session: u64,
+        request: u64,
+        reply: Sender<Option<u64>>,
+    },
+}
+
+/// Handler shard 0 runs for an inbound [`MetadataSubmit`]. server-ng wires
+/// it to `submit_register_in_process` / `submit_logout_in_process` and
+/// sends the result back over the frame's `reply` sender. `None` on a peer
+/// shard (no consensus): a peer must never receive this frame.
+pub type MetadataSubmitHandler = Rc<dyn Fn(MetadataSubmit)>;
+
 /// Create a bounded inter-shard channel whose sender is tagged with the
 /// owning shard.
 ///
@@ -291,6 +319,11 @@ pub enum LifecycleFrame {
         client_id: u128,
         msg: Frozen<MESSAGE_ALIGN>,
     },
+    /// A peer shard hands a metadata consensus submit (login/logout) to
+    /// shard 0, the metadata consensus owner. The committed op returns over
+    /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
+    /// shard 0; processing it on a peer is a routing bug.
+    MetadataSubmit(MetadataSubmit),
 }
 
 /// Inter-shard channel envelope.
@@ -364,6 +397,12 @@ where
     /// this shard. Invoked for each inbound `Request` frame.
     on_client_request: RequestHandler,
 
+    /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
+    /// these (it owns the metadata consensus group); peers send them here
+    /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
+    /// simulator stub ctor.
+    on_metadata_submit: MetadataSubmitHandler,
+
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
@@ -434,6 +473,7 @@ where
         bus: B,
         on_replica_message: MessageHandler,
         on_client_request: RequestHandler,
+        on_metadata_submit: MetadataSubmitHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
         senders: Vec<TaggedSender>,
@@ -457,6 +497,7 @@ where
             bus,
             on_replica_message,
             on_client_request,
+            on_metadata_submit,
             senders,
             shard_count,
             inbox,
@@ -465,6 +506,28 @@ where
             coordinator,
             metrics,
         })
+    }
+
+    /// Hand a metadata consensus submit (login/logout) to shard 0.
+    ///
+    /// Sends a [`LifecycleFrame::MetadataSubmit`] into shard 0's inbox. The
+    /// caller owns the matching [`Receiver`] (paired with the `reply` sender
+    /// inside `submit`) and awaits the committed op there. On a full /
+    /// disconnected shard-0 inbox the frame is dropped; the dropped `reply`
+    /// sender then surfaces as a recv error the caller maps to a transient
+    /// failure.
+    pub fn forward_metadata_submit(&self, submit: MetadataSubmit) {
+        let frame = ShardFrame::lifecycle(LifecycleFrame::MetadataSubmit(submit));
+        if let Err(error) = self.senders[0].try_send(frame) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::CONSENSUS,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            tracing::warn!(
+                shard = self.id,
+                "forward_metadata_submit: shard-0 inbox rejected frame: {error:?}"
+            );
+        }
     }
 
     /// Return a clone of the shard-0 coordinator handle, if attached.
@@ -503,6 +566,7 @@ where
             bus,
             on_replica_message: std::rc::Rc::new(|_, _| {}),
             on_client_request: std::rc::Rc::new(|_, _| {}),
+            on_metadata_submit: std::rc::Rc::new(|_| {}),
             plane,
             coordinator: None,
             senders: Vec::new(),

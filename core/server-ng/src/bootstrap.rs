@@ -60,8 +60,8 @@ use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, WireName, WirePartitioning,
+    Command2, EvictionReason, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode,
+    WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
@@ -84,7 +84,7 @@ use message_bus::{
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
-use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
+use metadata::impls::metadata::{IggySnapshot, RegisterSubmitError, StreamsFrontend};
 use metadata::impls::recovery::recover;
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
@@ -1116,12 +1116,14 @@ async fn build_shard_for_thread(
     let shard_handle = Rc::new(RefCell::new(None));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
     let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle);
+    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
         on_replica_message,
         on_client_request,
+        on_metadata_submit,
         metadata,
         partitions,
         senders,
@@ -2186,6 +2188,53 @@ fn make_deferred_client_request_handler(
     })
 }
 
+/// Handler shard 0 runs for an inbound [`shard::MetadataSubmit`]: a peer
+/// shard has verified credentials and owns the session locally, and asks
+/// shard 0 (the metadata consensus owner) to run only the consensus
+/// proposal. Spawns a task so the awaiting peer is woken once the op
+/// commits; replies `None` on transient submit failure so the peer never
+/// blocks forever.
+fn make_metadata_submit_handler(shard_handle: &ServerNgShardHandle) -> shard::MetadataSubmitHandler {
+    let shard_handle = Rc::clone(shard_handle);
+    Rc::new(move |submit| {
+        let shard_handle = Rc::clone(&shard_handle);
+        compio::runtime::spawn(async move {
+            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+                return;
+            };
+            match submit {
+                shard::MetadataSubmit::Register {
+                    vsr_client_id,
+                    reply,
+                } => {
+                    let session = shard
+                        .plane
+                        .metadata()
+                        .submit_register_in_process(vsr_client_id)
+                        .await
+                        .ok();
+                    let _ = reply.try_send(session);
+                }
+                shard::MetadataSubmit::Logout {
+                    vsr_client_id,
+                    session,
+                    request,
+                    reply,
+                } => {
+                    let commit = shard
+                        .plane
+                        .metadata()
+                        .submit_logout_in_process(vsr_client_id, session, request)
+                        .await
+                        .ok();
+                    let _ = reply.try_send(commit);
+                }
+            }
+        })
+        .detach();
+    })
+}
+
 fn enqueue_client_request(
     shard: Rc<ServerNgShard>,
     sessions: Rc<RefCell<SessionManager>>,
@@ -2441,6 +2490,66 @@ async fn handle_non_replicated_request(
     }
 }
 
+/// Run the consensus `Register` proposal on the metadata owner (shard 0)
+/// and return the committed session.
+///
+/// Credential verification and session binding stay on the calling (home)
+/// shard -- only this consensus step must execute where the metadata
+/// consensus group lives. On shard 0 it calls in-process directly; on a
+/// peer it forwards a [`shard::MetadataSubmit`] to shard 0 and awaits the
+/// committed op. A dropped reply (shard-0 inbox full / shutdown) maps to a
+/// transient `Canceled`, which the caller wraps so the SDK replays.
+#[allow(clippy::future_not_send)]
+async fn submit_register_on_owner(
+    shard: &Rc<ServerNgShard>,
+    vsr_client_id: u128,
+) -> Result<u64, RegisterSubmitError> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_register_in_process(vsr_client_id)
+            .await;
+    }
+    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::Register {
+        vsr_client_id,
+        reply,
+    });
+    match rx.recv().await {
+        Ok(Some(session)) => Ok(session),
+        _ => Err(RegisterSubmitError::Canceled),
+    }
+}
+
+/// Logout counterpart of [`submit_register_on_owner`].
+#[allow(clippy::future_not_send)]
+async fn submit_logout_on_owner(
+    shard: &Rc<ServerNgShard>,
+    vsr_client_id: u128,
+    session: u64,
+    request: u64,
+) -> Result<u64, RegisterSubmitError> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_logout_in_process(vsr_client_id, session, request)
+            .await;
+    }
+    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::Logout {
+        vsr_client_id,
+        session,
+        request,
+        reply,
+    });
+    match rx.recv().await {
+        Ok(Some(commit)) => Ok(commit),
+        _ => Err(RegisterSubmitError::Canceled),
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_logout_request(
     shard: &Rc<ServerNgShard>,
@@ -2457,12 +2566,7 @@ async fn handle_logout_request(
     };
 
     let request_id = request.header().request;
-    let commit = match shard
-        .plane
-        .metadata()
-        .submit_logout_in_process(vsr_client_id, session, request_id)
-        .await
-    {
+    let commit = match submit_logout_on_owner(shard, vsr_client_id, session, request_id).await {
         Ok(commit) => commit,
         Err(error) => {
             warn!(transport_client_id, error = %error, "logout/unregister failed");
@@ -2611,7 +2715,8 @@ async fn handle_login_register_request(
                 .await
                 {
                     warn!(transport_client_id, error = %error, "login/register failed");
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
                 }
                 return;
             }
@@ -2623,7 +2728,7 @@ async fn handle_login_register_request(
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
                 return;
             }
         }
@@ -2647,7 +2752,8 @@ async fn handle_login_register_request(
                         error = %error,
                         "login/register with PAT failed"
                     );
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
                 }
                 return;
             }
@@ -2657,7 +2763,7 @@ async fn handle_login_register_request(
                     error = %error,
                     "login/register with PAT failed"
                 );
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
                 return;
             }
         }
@@ -2670,13 +2776,37 @@ async fn handle_login_register_request(
     send_login_failure_reply(shard, transport_client_id, request.header()).await;
 }
 
-/// Empty Reply on a failed Register. Without it the SDK -- which only
-/// decodes `Command2::Reply` -- blocks until the socket read timeout fires
-/// for what is really a typed failure. An empty body fails downstream
-/// `LoginRegisterResponse` decoding with `InvalidCommand`, surfacing the
-/// failure to the caller immediately. A future change can switch this to
-/// an Eviction frame with a typed `EvictionReason` once the SDK eviction
-/// decoder lands at every transport.
+/// Decide whether a failed login/register gets a terminal reply or silence.
+///
+/// `Transient` / `InvalidClientId` are `NotEvictable` (see
+/// [`LoginRegisterError`]'s `TryFrom` for `EvictionReason`): the cluster
+/// could not commit *right now* (e.g. a freshly booted primary still
+/// catching up, or a cross-shard submit canceled). Staying silent lets the
+/// SDK read-timeout replay -- a later attempt lands once the primary is
+/// caught up. Replying empty here would instead surface as a hard
+/// `InvalidFormat` decode failure and break the replay.
+///
+/// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
+/// `UserInactive` / `Session`) map to an `EvictionReason`, so we fast-fail
+/// with an empty reply rather than make the client wait for a timeout.
+/// (TODO: ship a typed `Eviction` frame once the SDK eviction decoder lands
+/// on every transport.)
+#[allow(clippy::future_not_send)]
+async fn surface_login_failure(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+    error: &LoginRegisterError,
+) {
+    if EvictionReason::try_from(error).is_ok() {
+        send_login_failure_reply(shard, transport_client_id, request_header).await;
+    }
+}
+
+/// Empty Reply on a terminal failed Register. The SDK only decodes
+/// `Command2::Reply`; an empty body fails `LoginRegisterResponse` decoding
+/// fast instead of hanging until the socket read timeout. Only call for
+/// terminal errors -- see [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
 async fn send_login_failure_reply(
     shard: &Rc<ServerNgShard>,
@@ -3198,12 +3328,7 @@ async fn complete_login_register(
             .map_err(LoginRegisterError::Session)?;
     }
 
-    let session = match shard
-        .plane
-        .metadata()
-        .submit_register_in_process(vsr_client_id)
-        .await
-    {
+    let session = match submit_register_on_owner(shard, vsr_client_id).await {
         Ok(session) => session,
         Err(error) => {
             let _ = sessions
