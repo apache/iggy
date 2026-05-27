@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -28,6 +30,7 @@ import (
 
 func successfullyCreateUser(name string, client iggcon.Client) uint32 {
 	_, err := client.CreateUser(
+		context.Background(),
 		name,
 		createRandomString(16),
 		iggcon.Active,
@@ -47,7 +50,7 @@ func successfullyCreateUser(name string, client iggcon.Client) uint32 {
 		})
 	itShouldNotReturnError(err)
 	nameIdentifier, _ := iggcon.NewIdentifier(name)
-	user, err := client.GetUser(nameIdentifier)
+	user, err := client.GetUser(context.Background(), nameIdentifier)
 	itShouldNotReturnError(err)
 
 	return user.Id
@@ -57,7 +60,7 @@ func successfullyCreateUser(name string, client iggcon.Client) uint32 {
 
 func itShouldSuccessfullyCreateUser(name string, client iggcon.Client) {
 	nameIdentifier, _ := iggcon.NewIdentifier(name)
-	user, err := client.GetUser(nameIdentifier)
+	user, err := client.GetUser(context.Background(), nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -68,7 +71,7 @@ func itShouldSuccessfullyCreateUser(name string, client iggcon.Client) {
 
 func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggcon.Client, permissions map[int]*iggcon.StreamPermissions) {
 	nameIdentifier, _ := iggcon.NewIdentifier(name)
-	user, err := client.GetUser(nameIdentifier)
+	user, err := client.GetUser(context.Background(), nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -99,7 +102,7 @@ func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggcon.Cl
 
 func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggcon.Client) {
 	nameIdentifier, _ := iggcon.NewIdentifier(name)
-	user, err := client.GetUser(nameIdentifier)
+	user, err := client.GetUser(context.Background(), nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -114,7 +117,7 @@ func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggcon.Client
 
 func itShouldSuccessfullyDeleteUser(userId uint32, client iggcon.Client) {
 	identifier, _ := iggcon.NewIdentifier(userId)
-	user, err := client.GetUser(identifier)
+	user, err := client.GetUser(context.Background(), identifier)
 
 	itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
 	ginkgo.It("should not return user", func() {
@@ -124,7 +127,7 @@ func itShouldSuccessfullyDeleteUser(userId uint32, client iggcon.Client) {
 
 func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggcon.Client) {
 	identifier, _ := iggcon.NewIdentifier(userId)
-	user, err := client.GetUser(identifier)
+	user, err := client.GetUser(context.Background(), identifier)
 
 	itShouldNotReturnError(err)
 
@@ -173,5 +176,5 @@ func itShouldContainSpecificUser(name string, users []iggcon.UserInfo) {
 //CLEANUP
 
 func deleteUserAfterTests(identifier iggcon.Identifier, client iggcon.Client) {
-	_ = client.DeleteUser(identifier)
+	_ = client.DeleteUser(context.Background(), identifier)
 }

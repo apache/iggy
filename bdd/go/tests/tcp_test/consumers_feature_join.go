@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -36,6 +38,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 			err := client.JoinConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				groupIdentifier,
@@ -53,6 +56,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.JoinConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				randomU32Identifier(),
@@ -67,6 +71,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.JoinConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -78,6 +83,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 		ginkgo.Context("and tries to join consumer for non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
 			err := client.JoinConsumerGroup(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -91,6 +97,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 		ginkgo.Context("and tries to join to the consumer group", func() {
 			client := createClient()
 			err := client.JoinConsumerGroup(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				randomU32Identifier(),

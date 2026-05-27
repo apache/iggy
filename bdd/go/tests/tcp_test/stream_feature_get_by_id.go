@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -34,7 +35,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			streamId, name := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			stream, err := client.GetStream(streamIdentifier)
+			stream, err := client.GetStream(context.Background(), streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificStream(streamId, name, *stream)
@@ -43,7 +44,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 		ginkgo.Context("and tries to get non-existing stream", func() {
 			client := createAuthorizedConnection()
 
-			_, err := client.GetStream(randomU32Identifier())
+			_, err := client.GetStream(context.Background(), randomU32Identifier())
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
@@ -57,7 +58,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			// create two topics
 			t1Name := createRandomString(32)
 			t2Name := createRandomString(32)
-			t1, err := client.CreateTopic(streamIdentifier,
+			t1, err := client.CreateTopic(context.Background(), streamIdentifier,
 				t1Name,
 				2,
 				iggcon.CompressionAlgorithmNone,
@@ -66,6 +67,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 				nil)
 			itShouldNotReturnError(err)
 			t2, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				t2Name,
 				2,
@@ -78,7 +80,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			itShouldSuccessfullyCreateTopic(streamId, t2.Id, t2Name, client)
 
 			// check stream details
-			stream, err := client.GetStream(streamIdentifier)
+			stream, err := client.GetStream(context.Background(), streamIdentifier)
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificStream(streamId, name, *stream)
 			ginkgo.It("should have exactly 2 topics", func() {
