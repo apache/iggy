@@ -120,12 +120,24 @@ pub enum MetadataSubmit {
         request: u64,
         reply: Sender<Option<u64>>,
     },
+    /// A peer (home) shard relays a client's replicated request to shard 0
+    /// and awaits the committed reply over `reply` (`None` on a transient
+    /// submit failure). The home shard then writes the reply to the
+    /// originating socket -- it owns the connection and the
+    /// `vsr -> transport` mapping, which shard 0 cannot reconstruct from the
+    /// consensus client id.
+    ClientRequest {
+        request: Message<GenericHeader>,
+        reply: Sender<Option<Message<GenericHeader>>>,
+    },
 }
 
-/// Handler shard 0 runs for an inbound [`MetadataSubmit`]. server-ng wires
-/// it to `submit_register_in_process` / `submit_logout_in_process` and
-/// sends the result back over the frame's `reply` sender. `None` on a peer
-/// shard (no consensus): a peer must never receive this frame.
+/// Handler shard 0 runs for an inbound [`MetadataSubmit`].
+///
+/// server-ng wires it to `submit_register_in_process` /
+/// `submit_logout_in_process` / `submit_request_in_process` and sends the
+/// result back over the frame's `reply` sender. A peer shard (no consensus)
+/// must never receive this frame.
 pub type MetadataSubmitHandler = Rc<dyn Fn(MetadataSubmit)>;
 
 /// Create a bounded inter-shard channel whose sender is tagged with the

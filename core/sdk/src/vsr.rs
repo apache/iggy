@@ -77,7 +77,19 @@ pub(crate) fn encode_request_header(
         _ => {
             let operation = operation_for_code(code)?;
             let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
-            (operation, session.next_request_id(), session_id)
+            // NonReplicated ops (ping, reads) bypass server-side dedup --
+            // `ClientTable` only tracks request_ids for replicated ops. If
+            // they consumed the monotonic counter, the next replicated
+            // request would skip an id and the primary's `request_preflight`
+            // would see a `RequestGap` and silently drop it. Read the
+            // current id without advancing; the server ignores it for
+            // NonReplicated.
+            let request_id = if operation == Operation::NonReplicated {
+                session.current_request_id()
+            } else {
+                session.next_request_id()
+            };
+            (operation, request_id, session_id)
         }
     };
     let namespace = namespace_for_request(code, payload, operation)?;

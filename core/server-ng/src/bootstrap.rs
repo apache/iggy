@@ -33,7 +33,7 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -47,7 +47,10 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
-use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::requests::users::{
+    GetUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
+};
+use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -59,6 +62,9 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
+use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
+use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
     Command2, EvictionReason, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode,
     WireEncode, WireIdentifier, WireName, WirePartitioning,
@@ -2194,7 +2200,9 @@ fn make_deferred_client_request_handler(
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits; replies `None` on transient submit failure so the peer never
 /// blocks forever.
-fn make_metadata_submit_handler(shard_handle: &ServerNgShardHandle) -> shard::MetadataSubmitHandler {
+fn make_metadata_submit_handler(
+    shard_handle: &ServerNgShardHandle,
+) -> shard::MetadataSubmitHandler {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |submit| {
         let shard_handle = Rc::clone(&shard_handle);
@@ -2228,6 +2236,22 @@ fn make_metadata_submit_handler(shard_handle: &ServerNgShardHandle) -> shard::Me
                         .await
                         .ok();
                     let _ = reply.try_send(commit);
+                }
+                shard::MetadataSubmit::ClientRequest { request, reply } => {
+                    let committed = match request.try_into_typed::<RequestHeader>() {
+                        Ok(typed) => shard
+                            .plane
+                            .metadata()
+                            .submit_request_in_process(typed)
+                            .await
+                            .ok()
+                            .map(server_common::Message::into_generic),
+                        Err(error) => {
+                            warn!(?error, "ClientRequest submit: undecodable request header");
+                            None
+                        }
+                    };
+                    let _ = reply.try_send(committed);
                 }
             }
         })
@@ -2412,19 +2436,64 @@ async fn handle_client_request(
             new_header.session = bound_session;
         }
     });
-    let request = match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
-        Ok(request) => request,
-        Err(error) => {
+    let (request, raw_pat_token) =
+        match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
+            Ok(rewritten) => rewritten,
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "dropping request with invalid PAT replication context"
+                );
+                return;
+            }
+        };
+    let request_header = *request.header();
+    // Replicated request: run consensus on the metadata owner (shard 0) and
+    // bring the committed reply back here. This shard owns the connection,
+    // so it writes the reply to the socket via the transport client id --
+    // shard 0 can't route by the consensus client id (no home-shard bits).
+    match submit_client_request_on_owner(shard, request).await {
+        Some(reply) => {
+            // The raw PAT token never enters consensus (it is non-deterministic
+            // and secret), so the committed reply body is empty. Substitute the
+            // raw-token response here, on the minting client's home shard, using
+            // the confirmed commit position from the committed reply.
+            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    warn!(
+                        transport_client_id,
+                        error = %error,
+                        "failed to build raw PAT reply"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "failed to deliver committed reply to client"
+                );
+            }
+        }
+        None => {
+            // Transient submit failure (not primary / not caught up / dedup
+            // absorbed). Stay silent; the SDK read-timeout replays.
             warn!(
                 transport_client_id,
-                error = %error,
                 operation = ?header.operation,
-                "dropping request with invalid PAT replication context"
+                "replicated request not committed (transient); client will replay"
             );
-            return;
         }
-    };
-    shard.dispatch(request.into_generic());
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -2550,6 +2619,37 @@ async fn submit_logout_on_owner(
     }
 }
 
+/// Submit a replicated client request to the metadata owner (shard 0) and
+/// return the committed reply.
+///
+/// The metadata consensus group lives on shard 0, but the connection lives
+/// on the home shard (this shard). Run consensus where it belongs and bring
+/// the committed reply back here so the caller can write it to the
+/// originating socket -- shard 0 cannot route the reply by the consensus
+/// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
+/// `None` = transient submit failure (SDK read-timeout replays).
+#[allow(clippy::future_not_send)]
+async fn submit_client_request_on_owner(
+    shard: &Rc<ServerNgShard>,
+    request: Message<RequestHeader>,
+) -> Option<Message<GenericHeader>> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_request_in_process(request)
+            .await
+            .ok()
+            .map(server_common::Message::into_generic);
+    }
+    let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
+        request: request.into_generic(),
+        reply,
+    });
+    rx.recv().await.ok().flatten()
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_logout_request(
     shard: &Rc<ServerNgShard>,
@@ -2607,17 +2707,18 @@ fn maybe_rewrite_pat_request(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
     let operation = request.header().operation;
     let user_id = match operation {
         Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
             .borrow()
             .get_user_id(transport_client_id)
             .ok_or(IggyError::Unauthenticated)?,
-        _ => return Ok(request),
+        _ => return Ok((request, None)),
     };
 
     let body = request_body(&request);
+    let mut raw_token = None;
     let rewritten = match operation {
         Operation::CreatePersonalAccessToken => {
             let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
@@ -2625,8 +2726,10 @@ fn maybe_rewrite_pat_request(
             // Primary mints the raw token + hash here and ships the hash
             // through consensus. Replicas decode the hash directly. Doing
             // this inside `CreatePersonalAccessTokenRequest::apply` would
-            // call `ring::rand` per-replica and diverge state.
-            let token_hash = mint_pat_token_hash();
+            // call `ring::rand` per-replica and diverge state. The raw token
+            // is returned to this client only (see `handle_client_request`).
+            let (raw, token_hash) = mint_pat_raw_and_hash();
+            raw_token = Some(raw);
             ReplicatedCreatePersonalAccessTokenRequest {
                 user_id,
                 name: wire.name,
@@ -2647,20 +2750,20 @@ fn maybe_rewrite_pat_request(
         _ => unreachable!(),
     };
 
-    rewrite_request_body(&request, &rewritten)
+    Ok((rewrite_request_body(&request, &rewritten)?, raw_token))
 }
 
-/// Mints a fresh PAT raw token and returns its hex-encoded SHA-256 hash
-/// (64 bytes ASCII) for replication. The raw token is currently dropped --
-/// see the TODO on `CreatePersonalAccessTokenRequest::apply` for the missing
-/// return-to-client path.
-fn mint_pat_token_hash() -> [u8; 64] {
-    let (_raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
+/// Mints a fresh PAT and returns the raw token plus its hex-encoded SHA-256
+/// hash (64 bytes ASCII). Only the hash is replicated; the raw token is
+/// returned to the minting client by the home shard (it cannot be reproduced
+/// by the deterministic `apply` running on every replica).
+fn mint_pat_raw_and_hash() -> (String, [u8; 64]) {
+    let (raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
     let bytes = hash.as_bytes();
     let mut out = [0u8; 64];
     let len = bytes.len().min(64);
     out[..len].copy_from_slice(&bytes[..len]);
-    out
+    (raw, out)
 }
 
 fn rewrite_request_body(
@@ -2983,6 +3086,18 @@ fn build_non_replicated_response(
                 build_get_topics_response(shard, &request.stream_id)?.to_bytes(),
             ))
         }
+        GET_USERS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_get_users_response(shard)?.to_bytes(),
+        )),
+        GET_USER_CODE => {
+            let request =
+                GetUserRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            build_get_user_response(shard, &request.user_id).map(|response| {
+                response.map_or(NonReplicatedResponse::Empty, |response| {
+                    NonReplicatedResponse::Bytes(response.to_bytes())
+                })
+            })
+        }
         POLL_MESSAGES_CODE => {
             let request =
                 PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -3115,6 +3230,53 @@ fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsRes
             .map(|(_, stream)| stream_response(stream))
             .collect::<Result<Vec<_>, _>>()
             .map(|streams| GetStreamsResponse { streams })
+    })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
+    Ok(UserResponse {
+        id: user.id,
+        created_at: user.created_at.as_micros(),
+        status: user.status.as_code(),
+        username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+    })
+}
+
+fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersResponse, IggyError> {
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        users
+            .items
+            .iter()
+            .map(|(_, user)| user_response(user))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|users| GetUsersResponse { users })
+    })
+}
+
+fn build_get_user_response(
+    shard: &Rc<ServerNgShard>,
+    user_id: &WireIdentifier,
+) -> Result<Option<UserDetailsResponse>, IggyError> {
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        let resolved = match user_id {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
+                users.items.contains(id).then_some(id)
+            }
+            WireIdentifier::String(name) => users.index.get(name.as_str()).map(|&id| id as usize),
+        };
+        let Some(id) = resolved else {
+            return Ok(None);
+        };
+        let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
+        Ok(Some(UserDetailsResponse {
+            user: user_response(user)?,
+            permissions: user
+                .permissions
+                .as_ref()
+                .map(|p| iggy_common::wire_conversions::permissions_to_wire(p)),
+        }))
     })
 }
 
@@ -3464,6 +3626,36 @@ fn build_reply_from_bytes(
         body.len(),
         |out| out.copy_from_slice(body),
     )
+}
+
+/// If a raw PAT token was minted (`CreatePersonalAccessToken`), replace the
+/// committed reply -- whose body is empty because the raw token never entered
+/// consensus -- with a `RawPersonalAccessTokenResponse`, reusing the confirmed
+/// commit position from the committed reply. Otherwise the committed reply
+/// passes through unchanged.
+fn build_raw_pat_reply(
+    request_header: &RequestHeader,
+    committed: Message<GenericHeader>,
+    raw_token: Option<String>,
+) -> Result<Message<GenericHeader>, IggyError> {
+    let Some(raw) = raw_token else {
+        return Ok(committed);
+    };
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let committed_header =
+        bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
+            .map_err(|_| IggyError::InvalidFormat)?;
+    let commit = committed_header.commit;
+    let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
+    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let reply = build_reply_from_bytes(
+        request_header,
+        request_header.client,
+        request_header.session,
+        commit,
+        &body,
+    );
+    Ok(reply.into_generic())
 }
 
 fn build_reply_with_body(
