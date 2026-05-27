@@ -315,11 +315,60 @@ fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
 }
 
 fn escape_single_quote(s: &str) -> String {
-    s.replace('\'', "\\'")
+    s.replace('\'', "''")
 }
 
 fn escape_backtick(s: &str) -> String {
-    s.replace('`', "\\`")
+    s.replace('`', "``")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_single_quote_plain() {
+        assert_eq!(escape_single_quote("hello"), "hello");
+    }
+
+    #[test]
+    fn escape_single_quote_doubles_quote() {
+        assert_eq!(escape_single_quote("it's"), "it''s");
+    }
+
+    #[test]
+    fn escape_single_quote_trailing_backslash_cannot_break_out() {
+        // A trailing backslash must not escape the closing quote in SQL.
+        // With the old \' approach, "foo\" → 'foo\'' which keeps the string open.
+        // With doubling, "foo\" → 'foo\'' is never produced; output is "foo\" untouched,
+        // and no single quote is present so no doubling occurs — the backslash is inert
+        // inside a single-quoted ClickHouse string when not followed by a special char.
+        let result = escape_single_quote("foo\\");
+        assert_eq!(result, "foo\\");
+        // Critically, the result contains no single quote, so it cannot close+reopen the literal.
+        assert!(!result.contains("\\'"));
+    }
+
+    #[test]
+    fn escape_backtick_plain() {
+        assert_eq!(escape_backtick("my_table"), "my_table");
+    }
+
+    #[test]
+    fn escape_backtick_doubles_backtick() {
+        assert_eq!(escape_backtick("ta`ble"), "ta``ble");
+    }
+
+    #[test]
+    fn escape_backtick_trailing_backslash_cannot_break_out() {
+        // With the old \` approach, "innocent\" → `innocent\`` where \` is an escaped
+        // backtick, leaving the identifier unclosed — SQL injection vector.
+        // With doubling, the backslash is passed through as-is and is inert because
+        // no \` sequence is ever produced.
+        let result = escape_backtick("innocent\\");
+        assert_eq!(result, "innocent\\");
+        assert!(!result.contains("\\`"));
+    }
 }
 
 fn urlencoded(s: &str) -> String {
