@@ -25,7 +25,7 @@ use compio::buf::IoBuf;
 use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
-use iggy_common::PooledBuffer;
+use server_common::PooledBuffer;
 use std::sync::Arc;
 use tracing::info;
 

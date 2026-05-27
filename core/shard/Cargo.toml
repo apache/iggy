@@ -36,6 +36,9 @@ message_bus = { path = "../message_bus" }
 metadata = { path = "../metadata" }
 papaya = { workspace = true }
 partitions = { path = "../partitions" }
+prometheus-client = { workspace = true }
+server_common = { path = "../server_common" }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [lints.clippy]

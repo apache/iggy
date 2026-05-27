@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::{HandlerResult, wire_consumer_to_consumer, wire_id_to_identifier};
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::ResolvedTopic;
 use crate::streaming::session::Session;
@@ -24,7 +25,6 @@ use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 use tracing::debug;
 

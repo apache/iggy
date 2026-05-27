@@ -18,8 +18,8 @@
 use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
 use crate::streaming::segments::Segment;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use server_common::sharding::IggyNamespace;
 
 impl IggyShard {
     /// Performs all cleanup for a topic's partitions: time-based expiry then size-based trimming.

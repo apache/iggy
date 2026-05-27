@@ -18,6 +18,7 @@
 
 use super::get_stream_handler::compute_stream_stats;
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::WireName;
@@ -25,7 +26,6 @@ use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 use tracing::debug;
 

@@ -78,6 +78,24 @@ components:
     paths:
       - "core/binary_protocol/**"
 
+  # Miri (UB detector) on unsafe-heavy crates that don't pull tokio/compio.
+  # Scoped to `iggy_binary_protocol` (heavy unsafe in `consensus/iobuf.rs`:
+  # ref-counted CoW buffer, manual atomics, pointer arithmetic) plus the
+  # `consensus` crate (zero unsafe but exercises binary_protocol's unsafe
+  # via integration). Other crates (journal, metadata, partitions, common)
+  # instantiate compio, which uses io_uring syscalls Miri cannot emulate.
+  # See the `# Alignment` doc on the `ConsensusHeader` trait for the
+  # alignment contract that motivates this check.
+  rust-miri:
+    depends_on:
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "core/binary_protocol/**"
+      - "core/consensus/**"
+    tasks:
+      - "miri"
+
   rust-server:
     depends_on:
       - "rust-workspace"
@@ -198,6 +216,15 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/python/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-php:
+    depends_on:
+      - "rust-sdk" # PHP SDK wraps the Rust SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
+    paths:
+      - "foreign/php/**"
     tasks: ["lint", "test", "build"]
 
   sdk-node:

@@ -32,9 +32,7 @@ use async_channel::bounded;
 use common::{header_only, install_wss_clients_locally, loopback};
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::wss::{bind, run};
 use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
@@ -43,6 +41,7 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, MessageBusConfig, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,8 +67,7 @@ async fn wss_client_listener_accepts_and_round_trips() {
 
     let creds = self_signed_for_loopback();
     let cert_chain = creds.cert_chain.clone();
-    let (listener, server_cfg, server_addr) =
-        bind(loopback(), creds).await.expect("wss listener bind");
+    let (listener, server_cfg, server_addr) = bind(loopback(), creds).expect("wss listener bind");
     let token = bus.token();
     let on_accepted = install_wss_clients_locally(Rc::clone(&bus), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -147,8 +145,7 @@ async fn slow_handshake_evicts_registry() {
     });
 
     let creds = self_signed_for_loopback();
-    let (listener, server_cfg, server_addr) =
-        bind(loopback(), creds).await.expect("wss listener bind");
+    let (listener, server_cfg, server_addr) = bind(loopback(), creds).expect("wss listener bind");
     let token = bus.token();
     let on_accepted = install_wss_clients_locally(Rc::clone(&bus), on_request);
     let accept_handle = compio::runtime::spawn(async move {

@@ -155,6 +155,7 @@ impl ReservedPort {
 /// Pre-allocated ports for all enabled protocols.
 pub struct PortReserver {
     tcp: Option<ReservedPort>,
+    tcp_replica: Option<ReservedPort>,
     quic: Option<ReservedPort>,
     http: Option<ReservedPort>,
     websocket: Option<ReservedPort>,
@@ -184,6 +185,7 @@ impl SinglePortReserver {
 #[derive(Debug, Clone)]
 pub struct ProtocolAddresses {
     pub tcp: Option<SocketAddr>,
+    pub tcp_replica: Option<SocketAddr>,
     pub quic: Option<SocketAddr>,
     pub http: Option<SocketAddr>,
     pub websocket: Option<SocketAddr>,
@@ -226,6 +228,7 @@ impl PortReserver {
         config: &TestServerConfig,
     ) -> Result<Self, TestBinaryError> {
         let tcp = Some(ReservedPort::tcp(ip_kind)?);
+        let tcp_replica = Some(ReservedPort::tcp(ip_kind)?);
 
         let quic = if config.quic_enabled {
             Some(ReservedPort::udp(ip_kind)?)
@@ -247,6 +250,7 @@ impl PortReserver {
 
         Ok(Self {
             tcp,
+            tcp_replica,
             quic,
             http,
             websocket,
@@ -257,6 +261,7 @@ impl PortReserver {
     pub fn addresses(&self) -> ProtocolAddresses {
         ProtocolAddresses {
             tcp: self.tcp.as_ref().map(ReservedPort::addr),
+            tcp_replica: self.tcp_replica.as_ref().map(ReservedPort::addr),
             quic: self.quic.as_ref().map(ReservedPort::addr),
             http: self.http.as_ref().map(ReservedPort::addr),
             websocket: self.websocket.as_ref().map(ReservedPort::addr),
@@ -267,6 +272,9 @@ impl PortReserver {
     pub fn release(self) {
         if let Some(tcp) = self.tcp {
             tcp.release();
+        }
+        if let Some(tcp_replica) = self.tcp_replica {
+            tcp_replica.release();
         }
         if let Some(quic) = self.quic {
             quic.release();

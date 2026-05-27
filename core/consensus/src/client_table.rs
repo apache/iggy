@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{Message, ReplyHeader};
+use iggy_binary_protocol::ReplyHeader;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::collections::HashMap;
 use std::mem::size_of;
 use tracing::trace;
@@ -119,7 +118,7 @@ pub enum RequestStatus {
 /// Backs Register session, request contiguity, metadata-retry dedup, and
 /// `NoSession`/`SessionTooLow` eviction. Partition plane is at-least-once;
 /// `SendMessages` retries can re-commit at a new offset and consumers
-/// dedup via message ID (`iggy_common::MessageDeduplicator`).
+/// dedup via message ID (`server_common::MessageDeduplicator`).
 ///
 /// Do not add per-partition `ClientTable` or `(client_id, request)` dedup
 /// on the partition side, that flips iggy's contract toward at-most-once.
@@ -362,6 +361,32 @@ impl ClientTable {
             .as_mut()
             .expect("index/slot mismatch")
             .reply = CachedReply::from_message(reply);
+    }
+
+    /// Remove a client session and cached reply.
+    ///
+    /// **LOCAL ONLY -- does NOT replicate.** Two correct call sites:
+    ///
+    /// 1. **Applying a committed `Operation::Logout`** -- every replica runs
+    ///    this from `on_ack` / `commit_journal` during deterministic apply,
+    ///    so all replicas drop the slot together. Required-on-every-replica.
+    /// 2. **Transport-level disconnect cleanup** -- best-effort capacity
+    ///    reclaim. Bounded window of local-vs-cluster divergence until
+    ///    `evict_oldest` or a `Logout` commit catches the peer side up.
+    ///
+    /// **Forbidden:** using this to roll back a cluster-committed
+    /// `Operation::Register` -- peers keep the slot, producing divergence
+    /// that survives view changes.
+    ///
+    /// Returns `true` when a slot existed.
+    ///
+    /// [`Operation::Register`]: iggy_binary_protocol::Operation
+    pub fn remove_client(&mut self, client_id: u128) -> bool {
+        let Some(slot_idx) = self.index.remove(&client_id) else {
+            return false;
+        };
+        self.slots[slot_idx] = None;
+        true
     }
 
     /// Evict client with oldest commit, preferring no-in-flight.

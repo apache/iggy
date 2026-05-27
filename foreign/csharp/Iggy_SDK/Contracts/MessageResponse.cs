@@ -18,6 +18,7 @@
 using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
+using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts;
@@ -28,6 +29,10 @@ namespace Apache.Iggy.Contracts;
 [JsonConverter(typeof(MessageResponseConverter))]
 public sealed class MessageResponse
 {
+    private byte[]? _rawUserHeaders;
+    private Dictionary<HeaderKey, HeaderValue>? _userHeaders;
+    private bool _userHeadersInitialized;
+
     /// <summary>
     ///     Message header.
     /// </summary>
@@ -41,12 +46,51 @@ public sealed class MessageResponse
     /// <summary>
     ///     Headers defined by the user.
     /// </summary>
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders
+    {
+        get
+        {
+            if (!_userHeadersInitialized)
+            {
+                _userHeaders = _rawUserHeaders is { Length: > 0 }
+                    ? BinaryMapper.TryMapHeaders(_rawUserHeaders)
+                    : null;
+                _userHeadersInitialized = true;
+            }
+
+            return _userHeaders;
+        }
+        set
+        {
+            _userHeaders = value;
+            _userHeadersInitialized = true;
+        }
+    }
 
     /// <summary>
     ///     Raw user header bytes before deserialization.
     ///     Used internally for decrypting encrypted headers.
     /// </summary>
     [JsonIgnore]
-    internal byte[]? RawUserHeaders { get; set; }
+    internal byte[]? RawUserHeaders
+    {
+        get => _rawUserHeaders;
+        set
+        {
+            _rawUserHeaders = value;
+            _userHeaders = null;
+            _userHeadersInitialized = false;
+        }
+    }
+
+    internal void ParseUserHeaders()
+    {
+        if (!_userHeadersInitialized)
+        {
+            _userHeaders = _rawUserHeaders is { Length: > 0 }
+                ? BinaryMapper.TryMapHeaders(_rawUserHeaders)
+                : null;
+            _userHeadersInitialized = true;
+        }
+    }
 }

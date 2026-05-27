@@ -43,7 +43,6 @@ ignored = [
     "err_trail",
     "error_set",
     "figlet-rs",
-    "flume",
     "fs2",
     "hash32",
     "human-repr",
@@ -99,12 +98,14 @@ async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 consensus = { workspace = true }
+crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -113,7 +114,6 @@ dotenvy = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
-flume = { workspace = true }
 fs2 = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
@@ -146,6 +146,7 @@ secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
 server = { workspace = true }
+server_common = { workspace = true }
 shard = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }

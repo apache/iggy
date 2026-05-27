@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 
@@ -34,6 +35,7 @@ func successfullyCreateTopic(streamId uint32, client iggcon.Client) (uint32, str
 	name := createRandomString(128)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topic, err := client.CreateTopic(
+		context.Background(),
 		streamIdentifier,
 		name,
 		2,
@@ -89,7 +91,7 @@ func itShouldContainSpecificTopic(id uint32, name string, topics []iggcon.Topic)
 func itShouldSuccessfullyCreateTopic(streamId uint32, topicId uint32, expectedName string, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
+	topic, err := client.GetTopic(context.Background(), streamIdentifier, topicIdentifier)
 	ginkgo.It("should create topic with id "+string(rune(topicId)), func() {
 		gomega.Expect(topic).NotTo(gomega.BeNil())
 		gomega.Expect(topic.Id).To(gomega.Equal(topicId))
@@ -105,7 +107,7 @@ func itShouldSuccessfullyCreateTopic(streamId uint32, topicId uint32, expectedNa
 func itShouldSuccessfullyUpdateTopic(streamId uint32, topicId uint32, expectedName string, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
+	topic, err := client.GetTopic(context.Background(), streamIdentifier, topicIdentifier)
 
 	ginkgo.It("should update topic with id "+string(rune(topicId)), func() {
 		gomega.Expect(topic).NotTo(gomega.BeNil())
@@ -122,7 +124,7 @@ func itShouldSuccessfullyUpdateTopic(streamId uint32, topicId uint32, expectedNa
 func itShouldSuccessfullyDeleteTopic(streamId uint32, topicId uint32, client iggcon.Client) {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
+	topic, err := client.GetTopic(context.Background(), streamIdentifier, topicIdentifier)
 
 	itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 	ginkgo.It("should not return topic", func() {

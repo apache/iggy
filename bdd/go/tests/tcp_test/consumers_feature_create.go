@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			name := createRandomString(16)
 			group, err := client.CreateConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				name,
@@ -47,6 +50,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 		ginkgo.Context("and tries to create consumer group for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			_, err := client.CreateConsumerGroup(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				createRandomString(16),
@@ -61,6 +65,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				createRandomString(16),
@@ -79,6 +84,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.CreateConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				name,
@@ -95,6 +101,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.CreateConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				createRandomString(256),
@@ -108,6 +115,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 		ginkgo.Context("and tries to create consumer group", func() {
 			client := createClient()
 			_, err := client.CreateConsumerGroup(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				createRandomString(16),

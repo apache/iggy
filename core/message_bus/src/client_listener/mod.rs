@@ -25,7 +25,7 @@
 //!   peer cannot block the accept loop.
 //! - The `on_accepted` callback is responsible for minting a
 //!   `client_id`. The plain TCP and pre-upgrade WS paths route to the
-//!   owning shard via `ShardFramePayload::ClientConnectionSetup` and
+//!   owning shard via `shard::LifecycleFrame::ClientConnectionSetup` and
 //!   `ClientWsConnectionSetup` respectively. TCP-TLS, WSS, and QUIC
 //!   stay shard-0 terminal: their connection state is not serialisable
 //!   so the callback installs locally on shard 0 instead of shipping a

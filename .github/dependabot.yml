@@ -24,8 +24,6 @@ updates:
     rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(deps): "
-    assignees:
-      - "apache/iggy-committers"
     reviewers:
       - "apache/iggy-committers"
     groups:
@@ -43,8 +41,6 @@ updates:
     rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(deps): "
-    assignees:
-      - "apache/iggy-committers"
     reviewers:
       - "apache/iggy-committers"
     groups:

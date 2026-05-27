@@ -44,7 +44,7 @@ use tracing::{debug, error, info};
 pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
     // `SO_REUSEPORT` intentionally not set: only shard 0 binds the client
     // listener. The shard-0 coordinator round-robins accepts to owning
-    // shards via `ShardFramePayload::ClientConnectionSetup`.
+    // shards via `shard::LifecycleFrame::ClientConnectionSetup`.
     let opts = SocketOpts::new().nodelay(true);
     let listener = TcpListener::bind_with_options(addr, &opts)
         .await

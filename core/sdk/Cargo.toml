@@ -28,16 +28,21 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "README.md"
 
+[features]
+vsr = ["iggy_common/vsr"]
+
 [dependencies]
 async-broadcast = { workspace = true }
 async-dropper = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 quinn = { workspace = true }
 reqwest = { workspace = true }

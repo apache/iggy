@@ -26,8 +26,8 @@ use crate::shard::{
 };
 use futures::future::join_all;
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use iggy_common::{Identifier, IggyError};
+use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::hash::Hasher as _;
 use tracing::{error, info, warn};
 

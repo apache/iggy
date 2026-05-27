@@ -17,7 +17,19 @@
 
 use crate::ffi;
 use iggy::prelude::ConsumerGroupDetails as RustConsumerGroupDetails;
-use iggy_common::ConsumerGroupMember as RustConsumerGroupMember;
+use iggy_common::{
+    ConsumerGroupInfo as RustConsumerGroupInfo, ConsumerGroupMember as RustConsumerGroupMember,
+};
+
+impl From<RustConsumerGroupInfo> for ffi::ConsumerGroupInfo {
+    fn from(group: RustConsumerGroupInfo) -> Self {
+        ffi::ConsumerGroupInfo {
+            stream_id: group.stream_id,
+            topic_id: group.topic_id,
+            group_id: group.group_id,
+        }
+    }
+}
 
 impl From<RustConsumerGroupMember> for ffi::ConsumerGroupMember {
     fn from(member: RustConsumerGroupMember) -> Self {

@@ -36,18 +36,22 @@ use consensus::{
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{AckLevel, Message, Operation, PrepareHeader};
+use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader};
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind, SegmentStorage,
-    send_messages2::stamp_prepare_for_persistence,
-    send_messages2::{convert_request_message, decode_prepare_slice},
-    sharding::IggyNamespace,
+    IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
 };
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus};
+use server_common::{
+    Message, SegmentStorage,
+    iobuf::Frozen,
+    send_messages2::{
+        convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
+    },
+    sharding::IggyNamespace,
+};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -59,7 +63,7 @@ use tracing::{debug, warn};
 //
 // Note: there is no per-client write dedup at the partition plane.
 // `SendMessages` retries are at-least-once and may commit multiple times.
-// Consumers handle duplicate messages via `iggy_common::MessageDeduplicator`
+// Consumers handle duplicate messages via `server_common::MessageDeduplicator`
 // (message-id based) if they care.
 #[derive(Debug)]
 pub struct IggyPartition<B = IggyMessageBus>
@@ -1416,14 +1420,14 @@ where
                     .send_to_client(prepare_header.client, reply_buffers)
                     .await
                 {
-                    warn!(
+                    tracing::error!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
                         client = prepare_header.client,
                         op = prepare_header.op,
                         namespace_raw,
                         %error,
-                        "failed to send reply to client"
+                        "client reply forward failed, no retransmit path; client will time out",
                     );
                 }
             }

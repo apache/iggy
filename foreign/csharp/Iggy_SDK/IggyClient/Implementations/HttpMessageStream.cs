@@ -28,6 +28,7 @@ using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 using Apache.Iggy.StringHandlers;
 using Apache.Iggy.Utils;
@@ -301,6 +302,17 @@ public class HttpMessageStream : IIggyClient
 
         await HandleResponseAsync(response, true);
         return PolledMessages.Empty;
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId,
+        Consumer consumer,
+        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    {
+        var messages = await PollMessagesAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
+            autoCommit, token);
+        return BinaryMapper.ToRentedMessages(messages);
     }
 
     /// <inheritdoc />

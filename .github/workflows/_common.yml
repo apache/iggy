@@ -18,12 +18,6 @@
 name: _common
 on:
   workflow_call:
-    inputs:
-      skip_pr_title:
-        type: boolean
-        required: false
-        default: false
-        description: "Skip PR title check (for push events)"
 
 permissions:
   contents: read
@@ -48,6 +42,15 @@ jobs:
       - name: Check Python SDK versions are synchronized
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
+  python-interpreter-versions:
+    name: Check Python interpreter versions sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check Python interpreter versions are synchronized
+        run: ./scripts/ci/sync-python-version.sh --check
+
   version-consistency:
     name: Check version consistency
     runs-on: ubuntu-latest
@@ -66,75 +69,6 @@ jobs:
 
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
-
-  pr-title:
-    name: Check PR Title
-    if: github.event_name == 'pull_request' && !inputs.skip_pr_title
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate PR Title
-        uses: amannn/action-semantic-pull-request@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-            repo
-            deps
-          scopes: |
-            bdd
-            bench
-            ci
-            cli
-            clock
-            common
-            connector
-            connectors
-            cpp
-            csharp
-            deps
-            deps-dev
-            docs
-            example
-            go
-            helm
-            integration
-            io_uring
-            java
-            journal
-            js
-            mcp
-            node
-            partitions
-            proc
-            pr_template
-            python
-            repo
-            rust
-            sdk
-            security
-            server
-            server-ng
-            shard
-            test
-            web
-            consensus
-            cluster
-            metadata
-            message_bus
-            storage
-            simulator
-            configs
 
   license-headers:
     name: Check license headers
@@ -260,7 +194,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.45.0
+        uses: crate-ci/typos@v1.46.2
 
   summary:
     name: Common checks summary
@@ -268,8 +202,8 @@ jobs:
       [
         rust-versions,
         python-versions,
+        python-interpreter-versions,
         version-consistency,
-        pr-title,
         license-headers,
         third-party-licenses,
         markdown,
@@ -290,25 +224,10 @@ jobs:
           echo "| Check | Status | Description |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
 
-          # PR-specific checks
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_TITLE="${{ needs.pr-title.result }}"
-
-            # Add emoji based on status
-            if [ "$PR_TITLE" = "success" ]; then
-              echo "| ✅ PR Title | success | Follows conventional format |" >> $GITHUB_STEP_SUMMARY
-            elif [ "$PR_TITLE" = "failure" ]; then
-              echo "| ❌ PR Title | failure | Must follow conventional format |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| ⏭️ PR Title | $PR_TITLE | Check skipped |" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "| ⏭️ PR Title | skipped | Not a pull request |" >> $GITHUB_STEP_SUMMARY
-          fi
-
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"
           PYTHON_VERSIONS="${{ needs.python-versions.result }}"
+          PYTHON_INTERPRETER_VERSIONS="${{ needs.python-interpreter-versions.result }}"
           VERSION_CONSISTENCY="${{ needs.version-consistency.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
           THIRD_PARTY_LICENSES="${{ needs.third-party-licenses.result }}"
@@ -328,6 +247,14 @@ jobs:
             echo "| ❌ Python SDK Versions | failure | Version mismatch between Cargo.toml and pyproject.toml |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Python SDK Versions | $PYTHON_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$PYTHON_INTERPRETER_VERSIONS" = "success" ]; then
+            echo "| ✅ Python Interpreter Versions | success | Python interpreter versions synchronized |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$PYTHON_INTERPRETER_VERSIONS" = "failure" ]; then
+            echo "| ❌ Python Interpreter Versions | failure | Python interpreter version mismatch detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Python Interpreter Versions | $PYTHON_INTERPRETER_VERSIONS | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$VERSION_CONSISTENCY" = "success" ]; then
