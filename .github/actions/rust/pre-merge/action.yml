@@ -278,14 +278,18 @@ runs:
           echo "::group::Wait for shared Doris container"
           FE_PORT=""
           for _ in $(seq 1 90); do
-            FE_PORT=$(docker port iggy-doris-shared 8030/tcp 2>/dev/null | head -1 | sed 's/.*://')
+            # `|| FE_PORT=""` is load-bearing: the container may have exited
+            # during boot, and under `set -e`/`pipefail` a non-zero `docker port`
+            # (no such container) would abort the whole step. A dead/unhealthy
+            # shared container must fall back to self-boot, not fail CI.
+            FE_PORT=$(docker port iggy-doris-shared 8030/tcp 2>/dev/null | head -1 | sed 's/.*://') || FE_PORT=""
             if [[ -n "$FE_PORT" ]] && curl -fsS "http://127.0.0.1:${FE_PORT}/api/health" >/dev/null 2>&1; then
               break
             fi
             FE_PORT=""
             sleep 2
           done
-          MYSQL_PORT=$(docker port iggy-doris-shared 9030/tcp 2>/dev/null | head -1 | sed 's/.*://')
+          MYSQL_PORT=$(docker port iggy-doris-shared 9030/tcp 2>/dev/null | head -1 | sed 's/.*://') || MYSQL_PORT=""
           if [[ -n "$FE_PORT" && -n "$MYSQL_PORT" ]]; then
             export DORIS_FE_URL="http://127.0.0.1:${FE_PORT}"
             export DORIS_FE_MYSQL_PORT="${MYSQL_PORT}"
