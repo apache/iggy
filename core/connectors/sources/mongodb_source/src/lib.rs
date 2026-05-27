@@ -23,12 +23,7 @@ use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
-use mongodb::{
-    Client, Collection,
-    bson::Document,
-    bson::doc,
-    options::{ClientOptions},
-};
+use mongodb::{Client, Collection, bson::Document, bson::doc, options::ClientOptions};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -165,10 +160,10 @@ impl MongodbSource {
                         timestamp_dt.timestamp_millis(),
                     )
                 && latest_timestamp.is_none_or(|current| timestamp > current)
-                {
-                    latest_timestamp = Some(timestamp);
-                }
-                
+            {
+                latest_timestamp = Some(timestamp);
+            }
+
             let payload = serde_json::to_vec(&doc).map_err(|e| {
                 Error::Serialization(format!("Failed to serialize document: {}", e))
             })?;
