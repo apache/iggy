@@ -31,6 +31,9 @@ readme = "README.md"
 pkg-url = "{ repo }/releases/download/{ name }-{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 
+[package.metadata.cargo-machete]
+ignored = ["cfg_aliases"]
+
 [lib]
 name = "iggy_cli"
 path = "src/lib.rs"
@@ -43,7 +46,7 @@ path = "src/main.rs"
 default = ["login-session"]
 login-session = [
     "dep:keyring-core",
-    "dep:dbus-secret-service-keyring-store",
+    "dep:zbus-secret-service-keyring-store",
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
 ]
@@ -73,14 +76,19 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, default-features = false }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-dbus-secret-service-keyring-store = { workspace = true, optional = true }
+# `cfg(secret_service_keyring)` is the cfg_aliases alias for the BSD/Linux
+# desktop platforms; see build.rs.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { workspace = true, optional = true }
+
+[build-dependencies]
+cfg_aliases = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
