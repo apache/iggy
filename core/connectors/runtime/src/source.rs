@@ -50,12 +50,14 @@ use crate::{
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
+use prometheus_client::metrics::counter::Counter;
 use tokio::task::JoinHandle;
 
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedMessages>,
-    pub(crate) metrics: Arc<crate::metrics::Metrics>,
-    pub(crate) labels: Arc<SourceLabels>,
+    // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
+    // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
+    pub(crate) error_counter: Counter,
 }
 
 pub(crate) static SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>> = Lazy::new(DashMap::new);
@@ -403,13 +405,14 @@ pub(crate) async fn source_forwarding_loop(
         }
         let schema = produced_messages.schema;
         let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
+        let mut decode_errors = 0u64;
         let decode_start = Instant::now();
         for message in produced_messages.messages {
             let Ok(payload) = schema.try_into_payload(message.payload) else {
                 error!(
                     "Failed to decode message payload with schema: {schema} for source connector with ID: {plugin_id}",
                 );
-                context.metrics.inc_errors_with_labels(&labels.counter);
+                decode_errors += 1;
                 continue;
             };
 
@@ -427,6 +430,9 @@ pub(crate) async fn source_forwarding_loop(
             });
             number += 1;
         }
+        context
+            .metrics
+            .inc_errors_by_with_labels(&labels.counter, decode_errors);
         let decode_elapsed = decode_start.elapsed();
         context
             .metrics
@@ -449,7 +455,15 @@ pub(crate) async fn source_forwarding_loop(
         let sent_count = iggy_messages.len();
 
         let iggy_send_start = Instant::now();
-        if let Err(error) = producer.send(iggy_messages).await {
+        let send_result = producer.send(iggy_messages).await;
+        let iggy_send_elapsed = iggy_send_start.elapsed();
+        context
+            .metrics
+            .observe_stage_with_labels(&labels.stage_iggy_send, iggy_send_elapsed);
+
+        // Total histogram + emit (below) run regardless of send outcome.
+        let mut state_save_us: Option<u64> = None;
+        if let Err(error) = send_result {
             let error_msg = format!(
                 "Failed to send {sent_count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
                 producer.stream(),
@@ -458,56 +472,52 @@ pub(crate) async fn source_forwarding_loop(
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
             context.sources.set_error(&plugin_key, &error_msg).await;
-            continue;
-        }
-        let iggy_send_elapsed = iggy_send_start.elapsed();
-        context
-            .metrics
-            .observe_stage_with_labels(&labels.stage_iggy_send, iggy_send_elapsed);
-
-        context
-            .metrics
-            .inc_messages_sent_with_labels(&labels.counter, sent_count as u64);
-
-        if verbose {
-            info!(
-                "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                producer.stream(),
-                producer.topic()
-            );
         } else {
-            debug!(
-                "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
-                producer.stream(),
-                producer.topic()
-            );
-        }
-
-        let mut state_save_us: Option<u64> = None;
-        if let Some(state) = produced_messages.state {
-            let state_save_start = Instant::now();
-            match &state_storage {
-                StateStorage::File(file) => {
-                    if let Err(error) = file.save(state).await {
-                        let error_msg = format!(
-                            "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                        );
-                        error!("{error_msg}");
-                        context.metrics.inc_errors_with_labels(&labels.counter);
-                        context.sources.set_error(&plugin_key, &error_msg).await;
-                        continue;
-                    }
-                    debug!("State saved for source connector with ID: {plugin_id}");
-                }
-            }
-            let state_save_elapsed = state_save_start.elapsed();
             context
                 .metrics
-                .observe_stage_with_labels(&labels.stage_state_save, state_save_elapsed);
-            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
-        } else {
-            debug!("No state provided for source connector with ID: {plugin_id}");
+                .inc_messages_sent_with_labels(&labels.counter, sent_count as u64);
+
+            if verbose {
+                info!(
+                    "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                    producer.stream(),
+                    producer.topic()
+                );
+            } else {
+                debug!(
+                    "Sent {sent_count} of {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}",
+                    producer.stream(),
+                    producer.topic()
+                );
+            }
+
+            if let Some(state) = produced_messages.state {
+                let state_save_start = Instant::now();
+                match &state_storage {
+                    StateStorage::File(file) => {
+                        if let Err(error) = file.save(state).await {
+                            let error_msg = format!(
+                                "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                            );
+                            error!("{error_msg}");
+                            context.metrics.inc_errors_with_labels(&labels.counter);
+                            context.sources.set_error(&plugin_key, &error_msg).await;
+                        } else {
+                            debug!("State saved for source connector with ID: {plugin_id}");
+                            let state_save_elapsed = state_save_start.elapsed();
+                            context.metrics.observe_stage_with_labels(
+                                &labels.stage_state_save,
+                                state_save_elapsed,
+                            );
+                            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
+                        }
+                    }
+                }
+            } else {
+                debug!("No state provided for source connector with ID: {plugin_id}");
+            }
         }
+
         let total_elapsed = total_start.elapsed();
         context
             .metrics
@@ -560,8 +570,7 @@ pub(crate) fn spawn_source_handler(
         plugin_id,
         SourceSenderEntry {
             sender,
-            metrics: context.metrics.clone(),
-            labels: labels.clone(),
+            error_counter: context.metrics.error_counter(&labels.counter),
         },
     );
 
@@ -640,6 +649,10 @@ fn process_messages(
     labels: &SourceLabels,
 ) -> Vec<IggyMessage> {
     let mut iggy_messages = Vec::with_capacity(messages.len());
+    // Accumulate per-message drops, flush once after the loop - one Family
+    // lookup instead of one per message under filter/error storms.
+    let mut error_count = 0u64;
+    let mut filtered_count = 0u64;
     for message in messages {
         let mut current_message = Some(message);
         let mut transform_failed = false;
@@ -657,7 +670,7 @@ fn process_messages(
                         topic_metadata.stream,
                         topic_metadata.topic
                     );
-                    metrics.inc_errors_with_labels(&labels.counter);
+                    error_count += 1;
                     transform_failed = true;
                     break;
                 }
@@ -669,7 +682,7 @@ fn process_messages(
 
         // Filter contract: transform returning Ok(None) is an intentional drop.
         let Some(message) = current_message else {
-            metrics.inc_messages_filtered_with_labels(&labels.counter, 1);
+            filtered_count += 1;
             continue;
         };
 
@@ -678,7 +691,7 @@ fn process_messages(
                 "Failed to encode message payload for source connector with ID: {id}, stream: {}, topic: {}",
                 topic_metadata.stream, topic_metadata.topic
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -687,11 +700,15 @@ fn process_messages(
                 "Failed to build Iggy message for source connector with ID: {id}, stream: {}, topic: {}",
                 topic_metadata.stream, topic_metadata.topic
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
         iggy_messages.push(iggy_message);
+    }
+    metrics.inc_errors_by_with_labels(&labels.counter, error_count);
+    if filtered_count > 0 {
+        metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
     }
     iggy_messages
 }
@@ -718,14 +735,14 @@ pub(crate) extern "C" fn handle_produced_messages(
                     error!(
                         "Failed to send messages for source connector with ID: {plugin_id}. Channel closed: {send_error}"
                     );
-                    entry.metrics.inc_errors_with_labels(&entry.labels.counter);
+                    entry.error_counter.inc();
                 }
             }
             Err(err) => {
                 error!(
                     "Failed to deserialize produced messages for source connector with ID: {plugin_id}. {err}"
                 );
-                entry.metrics.inc_errors_with_labels(&entry.labels.counter);
+                entry.error_counter.inc();
             }
         }
     }

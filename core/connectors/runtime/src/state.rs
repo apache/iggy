@@ -48,12 +48,54 @@ pub struct FileStateProvider {
 impl FileStateProvider {
     pub fn new(path: String) -> Self {
         let path = PathBuf::from(path);
+        debug_assert!(
+            path.file_name().is_some(),
+            "state path must end in a file name, got {}",
+            path.display()
+        );
         let tmp_path = tmp_path_for(&path);
         FileStateProvider {
             path,
             tmp_path,
             save_lock: Mutex::new(()),
         }
+    }
+
+    /// Writes + fdatasyncs the tmp file, cleaning it up on its own failures.
+    async fn write_tmp(&self, bytes: &[u8]) -> Result<(), Error> {
+        let result = self.write_tmp_inner(bytes).await;
+        if result.is_err() {
+            cleanup_tmp(&self.tmp_path).await;
+        }
+        result
+    }
+
+    async fn write_tmp_inner(&self, bytes: &[u8]) -> Result<(), Error> {
+        let mut tmp = open_options_for_state()
+            .open(&self.tmp_path)
+            .await
+            .map_err(|error| {
+                error!(
+                    "Cannot create temp state file: {}. {error}.",
+                    self.tmp_path.display()
+                );
+                Error::CannotWriteStateFile
+            })?;
+        tmp.write_all(bytes).await.map_err(|error| {
+            error!(
+                "Cannot write temp state file: {}. {error}.",
+                self.tmp_path.display()
+            );
+            Error::CannotWriteStateFile
+        })?;
+        // fdatasync: skip mtime/atime sync. Parent dir is synced separately.
+        tmp.sync_data().await.map_err(|error| {
+            error!(
+                "Cannot sync temp state file: {}. {error}.",
+                self.tmp_path.display()
+            );
+            Error::CannotWriteStateFile
+        })
     }
 }
 
@@ -71,9 +113,7 @@ impl StateProvider for FileStateProvider {
                 Ok(Some(ConnectorState(buffer)))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                // Distinguish "fresh start" (parent dir OK, file just missing)
-                // from "broken config" (parent dir missing), using a single
-                // post-failure observation - no TOCTOU between two probes.
+                // Missing parent dir = broken config, not a fresh start.
                 if let Some(parent) = self.path.parent()
                     && !parent.as_os_str().is_empty()
                     && fs::metadata(parent).await.is_err()
@@ -97,38 +137,7 @@ impl StateProvider for FileStateProvider {
     async fn save(&self, state: ConnectorState) -> Result<(), Error> {
         let _guard = self.save_lock.lock().await;
 
-        let mut tmp = open_options_for_state()
-            .open(&self.tmp_path)
-            .await
-            .map_err(|error| {
-                error!(
-                    "Cannot create temp state file: {}. {error}.",
-                    self.tmp_path.display()
-                );
-                Error::CannotWriteStateFile
-            })?;
-
-        if let Err(error) = tmp.write_all(&state.0).await {
-            error!(
-                "Cannot write temp state file: {}. {error}.",
-                self.tmp_path.display()
-            );
-            drop(tmp);
-            cleanup_tmp(&self.tmp_path).await;
-            return Err(Error::CannotWriteStateFile);
-        }
-
-        // fdatasync: skip mtime/atime sync. Parent dir is synced separately.
-        if let Err(error) = tmp.sync_data().await {
-            error!(
-                "Cannot sync temp state file: {}. {error}.",
-                self.tmp_path.display()
-            );
-            drop(tmp);
-            cleanup_tmp(&self.tmp_path).await;
-            return Err(Error::CannotWriteStateFile);
-        }
-        drop(tmp);
+        self.write_tmp(&state.0).await?;
 
         if let Err(error) = fs::rename(&self.tmp_path, &self.path).await {
             error!(
@@ -140,7 +149,9 @@ impl StateProvider for FileStateProvider {
             return Err(Error::CannotWriteStateFile);
         }
 
-        sync_parent_dir(&self.path).await;
+        // Make the rename durable. A failure here means the new dentry may not
+        // survive a power loss, so surface it rather than silently succeeding.
+        sync_parent_dir(&self.path).await?;
 
         debug!("Saved state file: {}", self.path.display());
         Ok(())
@@ -176,31 +187,30 @@ async fn cleanup_tmp(tmp_path: &Path) {
 }
 
 #[cfg(unix)]
-async fn sync_parent_dir(path: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
+async fn sync_parent_dir(path: &Path) -> Result<(), Error> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
     };
-    match fs::File::open(parent).await {
-        Ok(dir) => {
-            if let Err(error) = dir.sync_all().await {
-                warn!(
-                    "Failed to fsync state directory: {}. {error}.",
-                    parent.display()
-                );
-            }
-        }
-        Err(error) => {
-            warn!(
-                "Failed to open state directory for fsync: {}. {error}.",
-                parent.display()
-            );
-        }
-    }
+    let dir = fs::File::open(parent).await.map_err(|error| {
+        error!(
+            "Failed to open state directory for fsync: {}. {error}.",
+            parent.display()
+        );
+        Error::CannotWriteStateFile
+    })?;
+    dir.sync_all().await.map_err(|error| {
+        error!(
+            "Failed to fsync state directory: {}. {error}.",
+            parent.display()
+        );
+        Error::CannotWriteStateFile
+    })
 }
 
 #[cfg(not(unix))]
-async fn sync_parent_dir(_path: &Path) {
+async fn sync_parent_dir(_path: &Path) -> Result<(), Error> {
     // Directory fsync is POSIX-only.
+    Ok(())
 }
 
 #[cfg(test)]

@@ -375,7 +375,7 @@ pub(crate) async fn consume_messages(
             );
         }
         let start = Instant::now();
-        let (processed_count, ffi_elapsed) = match process_messages(
+        let result = process_messages(
             plugin_id,
             messages_metadata,
             &topic_metadata,
@@ -386,23 +386,53 @@ pub(crate) async fn consume_messages(
             metrics,
             labels,
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                error!(
-                    "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
-                );
-                return Err(error);
+        .await;
+        let elapsed = start.elapsed();
+        // Total always records; sub-stages only on success (no 0-sample skew).
+        metrics.observe_stage_with_labels(&labels.stage_total, elapsed);
+
+        let (processed_count, decode_us, prepare_us, ffi_us) = match &result {
+            Ok(timing) => {
+                let prepare_elapsed = elapsed
+                    .saturating_sub(timing.ffi_elapsed)
+                    .saturating_sub(timing.decode_elapsed);
+                metrics.observe_stage_with_labels(&labels.stage_decode, timing.decode_elapsed);
+                metrics.observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
+                metrics.observe_stage_with_labels(&labels.stage_ffi, timing.ffi_elapsed);
+                (
+                    timing.processed_count,
+                    benchmark::as_micros(timing.decode_elapsed),
+                    benchmark::as_micros(prepare_elapsed),
+                    benchmark::as_micros(timing.ffi_elapsed),
+                )
             }
+            Err(_) => (0, 0, 0, 0),
         };
 
+        if benchmark {
+            benchmark::emit_sink_event(
+                plugin_key,
+                &topic_metadata.stream,
+                &topic_metadata.topic,
+                partition_id,
+                current_offset,
+                messages_count,
+                processed_count,
+                decode_us,
+                prepare_us,
+                ffi_us,
+                benchmark::as_micros(elapsed),
+            );
+        }
+
+        if let Err(error) = result {
+            error!(
+                "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
+            );
+            return Err(error);
+        }
+
         metrics.inc_messages_processed_with_labels(&labels.counter, processed_count as u64);
-        let elapsed = start.elapsed();
-        let prepare_elapsed = elapsed.saturating_sub(ffi_elapsed);
-        metrics.observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
-        metrics.observe_stage_with_labels(&labels.stage_ffi, ffi_elapsed);
-        metrics.observe_stage_with_labels(&labels.stage_total, elapsed);
         if verbose {
             info!(
                 "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
@@ -412,23 +442,6 @@ pub(crate) async fn consume_messages(
             debug!(
                 "Consumed {messages_count} messages in {:#?} for sink connector with ID: {plugin_id}",
                 elapsed
-            );
-        }
-        if benchmark {
-            let total_us = benchmark::as_micros(elapsed);
-            let ffi_us = benchmark::as_micros(ffi_elapsed);
-            let prepare_us = total_us.saturating_sub(ffi_us);
-            benchmark::emit_sink_event(
-                plugin_key,
-                &topic_metadata.stream,
-                &topic_metadata.topic,
-                partition_id,
-                current_offset,
-                messages_count,
-                processed_count,
-                prepare_us,
-                ffi_us,
-                total_us,
             );
         }
     }
@@ -549,8 +562,8 @@ async fn process_messages(
     decoder: &Arc<dyn StreamDecoder>,
     metrics: &Arc<Metrics>,
     labels: &SinkLabels,
-) -> Result<(usize, Duration), RuntimeError> {
-    let messages = messages.into_iter().map(|message| ReceivedMessage {
+) -> Result<SinkBatchTiming, RuntimeError> {
+    let received = messages.into_iter().map(|message| ReceivedMessage {
         id: message.header.id,
         offset: message.header.offset,
         checksum: message.header.checksum,
@@ -560,18 +573,26 @@ async fn process_messages(
         payload: message.payload.into(),
     });
 
-    let count = messages.len();
-    let decoded_messages = messages.into_iter().flat_map(|message| {
+    let count = received.len();
+    // Per-message drops are accumulated and flushed once after the loops to
+    // avoid a Family lookup per message under decode/transform/error storms.
+    let mut error_count = 0u64;
+    let mut filtered_count = 0u64;
+
+    // Decode is timed separately from transform + serialize so the sink's
+    // stage="decode" / stage="prepare" labels mean the same as the source's.
+    let decode_start = Instant::now();
+    let mut decoded = Vec::with_capacity(count);
+    for message in received {
         let Ok(payload) = decoder.decode(message.payload) else {
             error!(
                 "Failed to decode message payload (id: {}, offset: {}) for sink connector with ID: {plugin_id}",
                 message.id, message.offset
             );
-            metrics.inc_errors_with_labels(&labels.counter);
-            return None;
+            error_count += 1;
+            continue;
         };
-
-        Some(DecodedMessage {
+        decoded.push(DecodedMessage {
             id: Some(message.id),
             offset: Some(message.offset),
             checksum: Some(message.checksum),
@@ -579,22 +600,38 @@ async fn process_messages(
             origin_timestamp: Some(message.origin_timestamp),
             headers: message.headers,
             payload,
-        })
-    });
-    let mut messages = Vec::with_capacity(count);
-    for message in decoded_messages {
+        });
+    }
+    let decode_elapsed = decode_start.elapsed();
+
+    let mut messages = Vec::with_capacity(decoded.len());
+    for message in decoded {
         let mut current_message = Some(message);
         for transform in transforms.iter() {
-            let Some(message) = current_message else {
+            let Some(message) = current_message.take() else {
                 break;
             };
-
-            current_message = transform.transform(topic_metadata, message)?;
+            // Drop-and-continue on a single bad message, mirroring the source
+            // side - one malformed payload must not kill the whole batch.
+            match transform.transform(topic_metadata, message) {
+                Ok(next) => current_message = next,
+                Err(error) => {
+                    error!(
+                        "Transform '{:?}' failed for sink connector with ID: {plugin_id}, stream: {}, topic: {}: {error}",
+                        transform.r#type(),
+                        topic_metadata.stream,
+                        topic_metadata.topic
+                    );
+                    error_count += 1;
+                    current_message = None;
+                    break;
+                }
+            }
         }
 
         // Filter contract: transform returning Ok(None) is an intentional drop.
         let Some(message) = current_message else {
-            metrics.inc_messages_filtered_with_labels(&labels.counter, 1);
+            filtered_count += 1;
             continue;
         };
 
@@ -602,7 +639,7 @@ async fn process_messages(
             error!(
                 "ID should be present. Failed to process message for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -610,7 +647,7 @@ async fn process_messages(
             error!(
                 "Offset should be present. Failed to process message with ID: {id} for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -618,7 +655,7 @@ async fn process_messages(
             error!(
                 "Checksum should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -626,7 +663,7 @@ async fn process_messages(
             error!(
                 "Timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -634,7 +671,7 @@ async fn process_messages(
             error!(
                 "Origin timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -642,7 +679,7 @@ async fn process_messages(
             error!(
                 "Failed to get message payload for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
-            metrics.inc_errors_with_labels(&labels.counter);
+            error_count += 1;
             continue;
         };
 
@@ -653,7 +690,7 @@ async fn process_messages(
                     error!(
                         "Failed to serialize headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}. {error}"
                     );
-                    metrics.inc_errors_with_labels(&labels.counter);
+                    error_count += 1;
                     continue;
                 }
             },
@@ -669,6 +706,11 @@ async fn process_messages(
             headers,
             payload,
         });
+    }
+
+    metrics.inc_errors_by_with_labels(&labels.counter, error_count);
+    if filtered_count > 0 {
+        metrics.inc_messages_filtered_with_labels(&labels.counter, filtered_count);
     }
 
     let processed_count = messages.len();
@@ -708,5 +750,15 @@ async fn process_messages(
     );
     let ffi_elapsed = ffi_start.elapsed();
 
-    Ok((processed_count, ffi_elapsed))
+    Ok(SinkBatchTiming {
+        processed_count,
+        decode_elapsed,
+        ffi_elapsed,
+    })
+}
+
+struct SinkBatchTiming {
+    processed_count: usize,
+    decode_elapsed: Duration,
+    ffi_elapsed: Duration,
 }

@@ -76,6 +76,7 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
 
         let batch_size = parse_u64(event, "batch_size");
         let processed_count = parse_u64(event, "processed_count");
+        let decode_us = parse_u64(event, "decode_us");
         let prepare_us = parse_u64(event, "prepare_us");
         let ffi_us = parse_u64(event, "ffi_us");
         let total_us = parse_u64(event, "total_us");
@@ -87,8 +88,8 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
         );
         assert!(total_us > 0, "sink total_us must be > 0: {event:?}");
         assert!(
-            prepare_us + ffi_us <= total_us + 100,
-            "sink prepare_us + ffi_us must be <= total_us (with slack): {event:?}"
+            decode_us + prepare_us + ffi_us <= total_us + 100,
+            "sink decode+prepare+ffi must be <= total_us (with slack): {event:?}"
         );
     }
 
@@ -107,7 +108,8 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
         let decode_us = parse_u64(event, "decode_us");
         let prepare_us = parse_u64(event, "prepare_us");
         let iggy_send_us = parse_u64(event, "iggy_send_us");
-        let state_save_us = parse_opt_u64(event, "state_save_us");
+        let state_save_us = parse_u64(event, "state_save_us");
+        let state_saved = event.get("state_saved").map(|v| v == "true");
 
         assert!(batch_size > 0, "source batch_size must be > 0: {event:?}");
         assert!(
@@ -115,7 +117,12 @@ async fn given_benchmark_enabled_when_batches_flow_should_emit_typed_events(harn
             "source sent_count must be <= batch_size (no over-counting on transform/encode drops): {event:?}"
         );
         assert!(total_us > 0, "source total_us must be > 0: {event:?}");
-        let stage_sum = decode_us + prepare_us + iggy_send_us + state_save_us.unwrap_or(0);
+        assert_eq!(
+            state_saved,
+            Some(true),
+            "source benchmark event must carry a state_saved flag: {event:?}"
+        );
+        let stage_sum = decode_us + prepare_us + iggy_send_us + state_save_us;
         assert!(
             stage_sum <= total_us + 100,
             "source stage sum (decode+prepare+iggy_send+state_save) must be <= total_us (with slack): {event:?}"
@@ -354,24 +361,6 @@ fn parse_u64(event: &HashMap<String, String>, key: &str) -> u64 {
         .unwrap_or_else(|error| panic!("field {key} should be u64, got error: {error}: {event:?}"))
 }
 
-fn parse_opt_u64(event: &HashMap<String, String>, key: &str) -> Option<u64> {
-    let raw = event
-        .get(key)
-        .unwrap_or_else(|| panic!("missing field {key} in event {event:?}"));
-    if raw == "None" {
-        return None;
-    }
-    let inner = raw
-        .strip_prefix("Some(")
-        .and_then(|s| s.strip_suffix(")"))
-        .unwrap_or_else(|| panic!("field {key} should be Option<u64>, got {raw}: {event:?}"));
-    Some(
-        inner.parse::<u64>().unwrap_or_else(|error| {
-            panic!("field {key} should be u64, got error: {error}: {event:?}")
-        }),
-    )
-}
-
 #[cfg(test)]
 mod parser_tests {
     use super::*;
@@ -453,7 +442,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         "iggy_connector_stage_duration_seconds_count",
         &[
             ("connector_key", "stdout_bench"),
-            ("connector_type", "Sink"),
+            ("connector_type", "sink"),
             ("stage", "total"),
         ],
     );
@@ -467,7 +456,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         "iggy_connector_stage_duration_seconds_count",
         &[
             ("connector_key", "stdout_bench"),
-            ("connector_type", "Sink"),
+            ("connector_type", "sink"),
             ("stage", "ffi"),
         ],
     );
@@ -481,7 +470,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         "iggy_connector_stage_duration_seconds_count",
         &[
             ("connector_key", "random_bench"),
-            ("connector_type", "Source"),
+            ("connector_type", "source"),
             ("stage", "total"),
         ],
     );
@@ -495,7 +484,7 @@ async fn given_runtime_processing_batches_when_metrics_scraped_should_expose_sta
         "iggy_connector_stage_duration_seconds_count",
         &[
             ("connector_key", "random_bench"),
-            ("connector_type", "Source"),
+            ("connector_type", "source"),
             ("stage", "iggy_send"),
         ],
     );
@@ -520,7 +509,7 @@ async fn given_benchmark_flag_off_when_metrics_scraped_should_still_expose_histo
         "iggy_connector_stage_duration_seconds_count",
         &[
             ("connector_key", "stdout_off"),
-            ("connector_type", "Sink"),
+            ("connector_type", "sink"),
             ("stage", "total"),
         ],
     );
@@ -630,6 +619,7 @@ async fn given_logging_format_json_when_benchmark_events_emitted_should_be_serde
         "decode_us",
         "prepare_us",
         "iggy_send_us",
+        "state_saved",
         "state_save_us",
         "total_us",
     ] {
@@ -638,6 +628,13 @@ async fn given_logging_format_json_when_benchmark_events_emitted_should_be_serde
             "source benchmark JSON event missing field {key}: {source_event}"
         );
     }
+
+    // state_save_us must be a JSON number, not a quoted string, so numeric
+    // consumers can parse it directly under the JSON log layer.
+    assert!(
+        fields.get("state_save_us").is_some_and(|v| v.is_number()),
+        "state_save_us must serialize as a JSON number: {source_event}"
+    );
 }
 
 async fn wait_for_json_benchmark_events(

@@ -152,32 +152,24 @@ pub struct LoggingConfig {
     pub format: LogFormat,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    strum::Display,
+    strum::EnumString,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum LogFormat {
     #[default]
     Text,
     Json,
-}
-
-impl Display for LogFormat {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogFormat::Text => write!(f, "text"),
-            LogFormat::Json => write!(f, "json"),
-        }
-    }
-}
-
-impl FromStr for LogFormat {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "text" => Ok(LogFormat::Text),
-            "json" => Ok(LogFormat::Json),
-            other => Err(format!("Invalid log format: {other}")),
-        }
-    }
 }
 
 #[cfg(test)]

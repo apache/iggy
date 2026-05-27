@@ -100,7 +100,7 @@ Don't mix.
 ## State storage (`state.rs`)
 
 - File path: `{state_path}/source_{connector_key}.state`. Mode `0o600` on Unix.
-- `save()` is crash-atomic. `rename(2)` is atomic in the namespace (no observer sees a half-renamed file). the preceding `sync_data` on the tmp file plus the post-rename parent-dir `sync_all` are what make a crash leave either the old or new content - never truncated. A `Mutex<()>` serializes concurrent saves on the same provider.
+- `save()` is crash-atomic. `rename(2)` is atomic in the namespace (no observer sees a half-renamed file). the preceding `sync_data` on the tmp file plus the post-rename parent-dir `sync_all` are what make a crash leave either the old or new content - never truncated. The parent-dir fsync failure is propagated as `CannotWriteStateFile` (not swallowed) so a lost rename surfaces instead of silently restarting the source from scratch. A `Mutex<()>` serializes concurrent saves on the same provider.
 - Save after every successful Apache Iggy send. Save failure logs + continues. next batch retries.
 - `load()` returns `Ok(None)` for missing or empty files. After a `NotFound` read, re-stats the parent directory: missing parent -> `Err(CannotOpenStateFile)` so a broken state path fails at init rather than masquerading as "fresh start".
 - Sinks have no state - only sources.
@@ -109,15 +109,15 @@ Don't mix.
 
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
-3. Callback runs in the SDK macro's spawned async task. pushes postcard-serialized `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps sender + `Arc<Metrics>` + `Arc<SourceLabels>` so the FFI callback can bump `errors` on postcard-deserialize failure or channel-closed send without runtime context.
+3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
 4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
 5. On success, save returned `ConnectorState` via `FileStateProvider`.
 
 **Shutdown ordering (`manager/source.rs::stop_connector`):**
 
-1. Call `iggy_source_close` FIRST. SDK contract: no callbacks after this returns.
-2. Then await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector`.
-3. Finally `cleanup_sender(plugin_id)` - removes the `SOURCE_SENDERS` entry. (Doing this first would race in-flight callbacks against an empty map. the silent-drop branch in `handle_produced_messages` exists for the brief shutdown window only.)
+1. Call `iggy_source_close` FIRST. It blocks until the plugin's polling task stops, so no new send callbacks fire after it returns.
+2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender makes the forwarding task's `recv_async()` resolve with `Disconnected` and exit cleanly, instead of blocking until the abort timeout.
+3. Finally await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector` (a late `file.save()` could otherwise race the new instance). The silent-drop branch in `handle_produced_messages` only covers the window between close and cleanup.
 
 Gotchas:
 
@@ -133,10 +133,14 @@ Per `[[streams]]` entry per sink:
 2. Spawn one task per topic (`spawn_consume_tasks`).
 3. Poll Iggy → batch messages (default `batch_length = 1000`, `poll_interval = 5ms`). A `consumer.next()` `Err` (transport/decode at the Iggy client boundary) bumps `errors` and `continue`s - offset already auto-committed via `AutoCommit::When(AutoCommitWhen::PollingMessages)`, message effectively dropped.
 4. Decode via `Schema::decoder()`. Decode failure logs + bumps `errors`. `messages_filtered` is reserved for the transform filter contract (`Ok(None)`).
-5. Apply transforms (chain). `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
-6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`.
+5. Apply transforms (chain). A transform `Err` is logged, bumps `errors`, and drops only that message (drop-and-continue, mirroring the source) - one bad payload never kills the batch. `Ok(None)` filters the message - bumps `messages_filtered{connector_type="sink"}`.
+6. Postcard-encode batch as `RawMessages`. Headers as a separate postcard blob. Per-message failures (missing field, payload conversion, header serialization) bump `errors` + skip. Batch-level failures (postcard serialization of metadata / `RawMessages`) propagate `Err` -> `spawn_consume_tasks` wrapper bumps `errors` + `set_error`. The total histogram and benchmark emit still fire for the failed batch before the `Err` propagates.
 7. Call `iggy_sink_consume(id, topic_meta, messages_meta, messages)`.
 8. Non-zero return → log + `errors` increment.
+
+Per-message counters (decode errors, transform errors, filters, field/serialize drops) are accumulated and flushed once per batch via `inc_errors_by_with_labels` / `inc_messages_filtered_with_labels`, not one `Family` lookup per message.
+
+Stages (both labels snake_case): `decode` (schema decode loop), `prepare` (transform + serialize = total - decode - ffi), `ffi` (plugin consume call), `total`. Same `decode` / `prepare` meaning as the source side.
 
 Gotchas:
 
@@ -147,7 +151,7 @@ Gotchas:
 
 `LoggingConfig` in `configs/runtime.rs` exposes `format: LogFormat` (`Text` default, `Json`), env-addressable via `IGGY_CONNECTORS_LOGGING_FORMAT=json`. `log::init_logging` matches on `(telemetry.enabled, format)` and installs the right `fmt::layer()`/`fmt::layer().json()` + OpenTelemetry layer. OTel pipeline untouched by `format` - only the stdout layer switches.
 
-When extending logging, preserve the 4-branch matrix - tracing-subscriber layers have different concrete types for text vs JSON and cannot be unified without boxing the entire registry.
+`fmt::layer()` and `fmt::layer().json()` are different concrete types, so the stdout layer is built once as a `Box<dyn Layer<_>>` (via `.boxed()`) by matching on `format`, then a single 2-arm branch on `telemetry.enabled` attaches the OTel layers. When extending, keep the boxed-layer + 2-arm shape rather than re-expanding into a 4-way match.
 
 ## The `verbose` flag
 
@@ -224,10 +228,10 @@ When adding a metric:
 
 ## Drop accounting (wired sites)
 
-`metrics.inc_errors_with_labels(&labels.counter)` before `continue` on every non-filter drop. Hot path uses pre-built `SinkLabels`/`SourceLabels`. `&str`-based wrappers are `#[cfg(test)]`-only.
+Per-message drops in the batch loops are counted into a local `u64` and flushed once after the loop via `inc_errors_by_with_labels` / `inc_messages_filtered_with_labels` - one `Family` lookup per batch, not per message. One-shot drops outside a loop (e.g. `consumer.next()` Err) still call `inc_errors_with_labels` directly. Hot path uses pre-built `SinkLabels`/`SourceLabels`. `&str`-based wrappers are `#[cfg(test)]`-only.
 
 - `sink.rs::consume_messages` - `consumer.next()` Err
-- `sink.rs::process_messages` - decode, missing required fields, payload conversion, header serialization (per-message)
+- `sink.rs::process_messages` - decode, transform Err (drop-and-continue), missing required fields, payload conversion, header serialization (accumulated, flushed once per batch)
 - `sink.rs::spawn_consume_tasks` task wrapper - bumps once on `consume_messages` Err
 - `source.rs::source_forwarding_loop` - payload decode, prepare (transform/encode) failure, Iggy send Err, state save Err
 - `source.rs::process_messages` - transform Err (logs + bumps `errors` + continue. does NOT propagate, so one bad payload doesn't flip the connector to permanent ERROR), transform encode failure, `build_iggy_message` failure
@@ -241,7 +245,7 @@ Filter case bumps `messages_filtered` via `inc_messages_filtered_with_labels`. A
 2. **Plugin ID counter is monotonic.** No reset, no reuse.
 3. **FFI return codes:** `0` success, non-zero failure.
 4. **Don't add static mutable state** beyond `LOG_CALLBACK`, `PLUGIN_ID`, `SOURCE_SENDERS`.
-5. **Pair `cleanup_sender(id)` with shutdown** for sources (avoid flume leak). Order: close FFI -> drain tasks -> cleanup.
+5. **Pair `cleanup_sender(id)` with shutdown** for sources (avoid flume leak). Order: close FFI -> cleanup sender -> drain/abort tasks.
 6. **Restart uses `restart_guard.try_lock()`** - no thundering-herd regression.
 7. **No timeouts on plugin FFI calls without a kill-task strategy.** A timeout that returns from the runtime but leaves the plugin running has the worst of both worlds.
 

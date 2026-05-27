@@ -34,10 +34,25 @@ pub struct ConnectorLabels {
     pub connector_type: ConnectorType,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum ConnectorType {
     Source,
     Sink,
+}
+
+impl ConnectorType {
+    fn as_label(&self) -> &'static str {
+        match self {
+            ConnectorType::Source => "source",
+            ConnectorType::Sink => "sink",
+        }
+    }
+}
+
+impl EncodeLabelValue for ConnectorType {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        self.as_label().encode(encoder)
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -83,6 +98,7 @@ const STAGE_BUCKETS_SECONDS: [f64; 13] = [
 #[derive(Debug, Clone)]
 pub struct SinkLabels {
     pub counter: ConnectorLabels,
+    pub stage_decode: StageLabels,
     pub stage_prepare: StageLabels,
     pub stage_ffi: StageLabels,
     pub stage_total: StageLabels,
@@ -101,6 +117,7 @@ impl SinkLabels {
                 connector_key: key.clone(),
                 connector_type: ConnectorType::Sink,
             },
+            stage_decode: stage(Stage::Decode),
             stage_prepare: stage(Stage::Prepare),
             stage_ffi: stage(Stage::Ffi),
             stage_total: stage(Stage::Total),
@@ -409,6 +426,19 @@ impl Metrics {
         self.errors.get_or_create(labels).inc();
     }
 
+    /// Batched error increment - one `Family` lookup for a whole loop's worth
+    /// of drops instead of one per message. No-op when `count == 0`.
+    pub fn inc_errors_by_with_labels(&self, labels: &ConnectorLabels, count: u64) {
+        if count > 0 {
+            self.errors.get_or_create(labels).inc_by(count);
+        }
+    }
+
+    /// Owned `errors` counter (Arc-shared atomic) for lookup-free hot-path increments.
+    pub fn error_counter(&self, labels: &ConnectorLabels) -> Counter {
+        self.errors.get_or_create(labels).clone()
+    }
+
     pub fn get_messages_produced(&self, key: &str) -> u64 {
         self.messages_produced
             .get_or_create(&ConnectorLabels {
@@ -472,10 +502,7 @@ impl Metrics {
     ) -> u64 {
         let output = self.get_formatted_output();
         let stage_label = stage.as_label();
-        let type_label = match connector_type {
-            ConnectorType::Source => "Source",
-            ConnectorType::Sink => "Sink",
-        };
+        let type_label = connector_type.as_label();
         let needle = format!(
             "iggy_connector_stage_duration_seconds_count{{connector_key=\"{key}\",connector_type=\"{type_label}\",stage=\"{stage_label}\"}}"
         );
@@ -573,7 +600,7 @@ mod tests {
         let output = metrics.get_formatted_output();
         assert!(output.contains("iggy_connector_messages_produced_total"));
         assert!(output.contains("connector_key=\"test-source\""));
-        assert!(output.contains("connector_type=\"Source\""));
+        assert!(output.contains("connector_type=\"source\""));
     }
 
     #[test]
@@ -594,7 +621,7 @@ mod tests {
         let output = metrics.get_formatted_output();
         assert!(output.contains("iggy_connector_messages_consumed_total"));
         assert!(output.contains("connector_key=\"test-sink\""));
-        assert!(output.contains("connector_type=\"Sink\""));
+        assert!(output.contains("connector_type=\"sink\""));
     }
 
     #[test]
@@ -615,7 +642,7 @@ mod tests {
         let output = metrics.get_formatted_output();
         assert!(output.contains("iggy_connector_errors_total"));
         assert!(output.contains("connector_key=\"test-source\""));
-        assert!(output.contains("connector_type=\"Source\""));
+        assert!(output.contains("connector_type=\"source\""));
     }
 
     #[test]
@@ -626,7 +653,7 @@ mod tests {
         let output = metrics.get_formatted_output();
         assert!(output.contains("iggy_connector_errors_total"));
         assert!(output.contains("connector_key=\"test-sink\""));
-        assert!(output.contains("connector_type=\"Sink\""));
+        assert!(output.contains("connector_type=\"sink\""));
     }
 
     #[test]

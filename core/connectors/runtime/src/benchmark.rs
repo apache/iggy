@@ -38,6 +38,7 @@ pub fn emit_sink_event(
     current_offset: u64,
     batch_size: usize,
     processed_count: usize,
+    decode_us: u64,
     prepare_us: u64,
     ffi_us: u64,
     total_us: u64,
@@ -52,6 +53,7 @@ pub fn emit_sink_event(
         current_offset = current_offset,
         batch_size = batch_size,
         processed_count = processed_count,
+        decode_us = decode_us,
         prepare_us = prepare_us,
         ffi_us = ffi_us,
         total_us = total_us,
@@ -72,6 +74,7 @@ pub fn emit_source_event(
     state_save_us: Option<u64>,
     total_us: u64,
 ) {
+    // Flat bool + u64, not an Option: keeps the field JSON-numeric (a Debug Option serializes as a quoted string).
     info!(
         target: TARGET,
         connector_type = "source",
@@ -83,7 +86,8 @@ pub fn emit_source_event(
         decode_us = decode_us,
         prepare_us = prepare_us,
         iggy_send_us = iggy_send_us,
-        state_save_us = ?state_save_us,
+        state_saved = state_save_us.is_some(),
+        state_save_us = state_save_us.unwrap_or(0),
         total_us = total_us,
         "benchmark"
     );
@@ -182,7 +186,9 @@ mod tests {
     #[test]
     fn given_sink_event_emitted_when_captured_should_contain_all_fields() {
         let events = capture(|| {
-            emit_sink_event("postgres", "qw", "records", 0, 100, 50, 50, 234, 1456, 1700);
+            emit_sink_event(
+                "postgres", "qw", "records", 0, 100, 50, 50, 120, 234, 1456, 1700,
+            );
         });
         let event = events
             .iter()
@@ -194,6 +200,7 @@ mod tests {
         assert_eq!(event.fields.get("topic").unwrap(), "records");
         assert_eq!(event.fields.get("batch_size").unwrap(), "50");
         assert_eq!(event.fields.get("processed_count").unwrap(), "50");
+        assert_eq!(event.fields.get("decode_us").unwrap(), "120");
         assert_eq!(event.fields.get("prepare_us").unwrap(), "234");
         assert_eq!(event.fields.get("ffi_us").unwrap(), "1456");
         assert_eq!(event.fields.get("total_us").unwrap(), "1700");
@@ -226,12 +233,13 @@ mod tests {
         assert_eq!(event.fields.get("decode_us").unwrap(), "12");
         assert_eq!(event.fields.get("prepare_us").unwrap(), "34");
         assert_eq!(event.fields.get("iggy_send_us").unwrap(), "567");
-        assert_eq!(event.fields.get("state_save_us").unwrap(), "Some(89)");
+        assert_eq!(event.fields.get("state_saved").unwrap(), "true");
+        assert_eq!(event.fields.get("state_save_us").unwrap(), "89");
         assert_eq!(event.fields.get("total_us").unwrap(), "750");
     }
 
     #[test]
-    fn given_source_event_without_state_save_when_captured_should_contain_none() {
+    fn given_source_event_without_state_save_when_captured_should_be_zero_and_unsaved() {
         let events = capture(|| {
             emit_source_event(
                 "random",
@@ -250,6 +258,7 @@ mod tests {
             .iter()
             .find(|event| event.target == TARGET && event.message == "benchmark")
             .expect("benchmark event should be captured");
-        assert_eq!(event.fields.get("state_save_us").unwrap(), "None");
+        assert_eq!(event.fields.get("state_saved").unwrap(), "false");
+        assert_eq!(event.fields.get("state_save_us").unwrap(), "0");
     }
 }

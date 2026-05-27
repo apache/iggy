@@ -214,8 +214,8 @@ benchmark = true
 
 Emitted fields:
 
-- **sink**: `connector_key`, `stream`, `topic`, `partition_id`, `current_offset`, `batch_size`, `processed_count`, `prepare_us`, `ffi_us`, `total_us`
-- **source**: `connector_key`, `stream`, `topic`, `batch_size`, `sent_count`, `decode_us`, `prepare_us`, `iggy_send_us`, `state_save_us`, `total_us`
+- **sink**: `connector_key`, `stream`, `topic`, `partition_id`, `current_offset`, `batch_size`, `processed_count`, `decode_us`, `prepare_us`, `ffi_us`, `total_us`
+- **source**: `connector_key`, `stream`, `topic`, `batch_size`, `sent_count`, `decode_us`, `prepare_us`, `iggy_send_us`, `state_saved`, `state_save_us`, `total_us` (`state_save_us` is 0 when `state_saved` is false)
 
 Filter the stream via `RUST_LOG=iggy_connectors::benchmark=info`. The corresponding stage durations are also recorded in the `iggy_connector_stage_duration_seconds` histogram regardless of this flag, so Prometheus dashboards remain available without enabling text events.
 
@@ -243,7 +243,9 @@ The runtime exposes Prometheus-compatible metrics via the `/metrics` endpoint wh
 
 - `iggy_connector_stage_duration_seconds`: Per-batch processing stage duration
 
-Stages: `Prepare`, `Ffi`, `Decode`, `IggySend`, `StateSave`, `Total`. Histograms are always exposed (independent of `benchmark`); buckets cover 50us to 5s.
+Stage label values (snake_case): `decode`, `prepare`, `total` on both sides; `ffi` on sinks; `iggy_send`, `state_save` on sources. The `connector_type` label is also snake_case (`source` / `sink`). Histograms are always exposed (independent of `benchmark`); buckets cover 50us to 5s.
+
+**Cardinality:** each `(connector_key, stage)` pair yields ~16 series (13 explicit buckets + `+Inf` + `_sum` + `_count`), times 3 stages per sink or 5 per source, times the number of distinct `connector_key` values. `connector_key` comes from operator config, so keep it bounded. Do not template per-user or per-request keys into it or the time-series database will blow up.
 
 ## Stats
 

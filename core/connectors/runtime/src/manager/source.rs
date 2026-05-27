@@ -148,14 +148,15 @@ impl SourceManager {
             )
         };
 
-        // Close FFI first so the plugin's polling task stops invoking the
-        // send callback; then await + abort our tasks; cleanup_sender last
-        // so in-flight callbacks still find their entry.
+        // Order: close FFI (stops callbacks) -> drop sender (unblocks
+        // recv_async) -> await tasks. Reversing risks an abort mid-save.
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
             (container.iggy_source_close)(plugin_id);
             info!("Closed source connector with ID: {plugin_id} for plugin: {key}");
         }
+
+        source::cleanup_sender(plugin_id);
 
         for mut handle in task_handles {
             if tokio::time::timeout(Duration::from_secs(5), &mut handle)
@@ -169,8 +170,6 @@ impl SourceManager {
                 let _ = handle.await;
             }
         }
-
-        source::cleanup_sender(plugin_id);
 
         {
             let mut details = details.lock().await;

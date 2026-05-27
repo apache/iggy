@@ -129,14 +129,14 @@ New TOML fields use `#[serde(default)]` or `Option<T>`. Adding a field must not 
 Every sink and source supports an opt-in `benchmark: bool` flag (`SinkConfig`/`SourceConfig`, also env `IGGY_CONNECTORS_<TYPE>_<KEY>_BENCHMARK=true`). Two independent surfaces:
 
 1. **Tracing events** (only when flag is on) - one structured `info!` per batch under target `iggy_connectors::benchmark` with per-stage microsecond timings:
-   - Sink: `connector_type, connector_key, stream, topic, partition_id, current_offset, batch_size, processed_count, prepare_us, ffi_us, total_us`
-   - Source: `connector_type, connector_key, stream, topic, batch_size, sent_count, decode_us, prepare_us, iggy_send_us, state_save_us, total_us`
+   - Sink: `connector_type, connector_key, stream, topic, partition_id, current_offset, batch_size, processed_count, decode_us, prepare_us, ffi_us, total_us`
+   - Source: `connector_type, connector_key, stream, topic, batch_size, sent_count, decode_us, prepare_us, iggy_send_us, state_saved, state_save_us, total_us` (`state_save_us` is 0 when `state_saved` is false - emitted as flat number + bool, not an Option, so the JSON layer keeps it numeric)
    - Filter live: `RUST_LOG=iggy_connectors::benchmark=info`
    - Also emitted on startup: a one-shot `"Benchmark mode enabled for ..."` info log per connector.
 
 2. **Prometheus histograms** (always on, regardless of flag):
-   - Metric: `iggy_connector_stage_duration_seconds{connector_key, connector_type, stage}`
-   - `stage` (snake_case): `prepare`, `ffi` (sink only), `decode`, `iggy_send`, `state_save` (source only), `total` (both)
+   - Metric: `iggy_connector_stage_duration_seconds{connector_key, connector_type, stage}` (both labels snake_case)
+   - `stage` (snake_case): `decode`, `prepare`, `total` on both sides; `ffi` (sink only); `iggy_send`, `state_save` (source only). `decode` and `prepare` mean the same thing on both sides - decode is schema decoding, prepare is transform + encode/serialize.
    - Buckets: see `runtime/src/metrics.rs::STAGE_BUCKETS_SECONDS`
    - Example: `histogram_quantile(0.95, sum(rate(iggy_connector_stage_duration_seconds_bucket{stage="ffi"}[5m])) by (le, connector_key))`
 
@@ -198,7 +198,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 ## Drop accounting
 
 - **Filter drops** (transform returning `Ok(None)`) bump `messages_filtered`.
-- **Every non-filter drop** bumps `errors` via `metrics.inc_errors_with_labels(&labels.counter)` before `continue`. Hot-path calls always use the pre-built `SinkLabels`/`SourceLabels` cache. `&str`-based wrappers on `Metrics` are `#[cfg(test)]`-only.
+- **Every non-filter drop** bumps `errors`. Inside the per-batch loops the count is accumulated in a local and flushed once after the loop via `inc_errors_by_with_labels` (filters likewise via `inc_messages_filtered_with_labels`) - one `Family` lookup per batch, not per message. One-shot drops outside a loop call `inc_errors_with_labels` directly. Hot-path calls always use the pre-built `SinkLabels`/`SourceLabels` cache. `&str`-based wrappers on `Metrics` are `#[cfg(test)]`-only.
 
 ## Common review smells
 
