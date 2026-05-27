@@ -41,11 +41,7 @@ impl PersonalAccessToken {
         now: IggyTimestamp,
         expiry: IggyExpiry,
     ) -> (Self, String) {
-        let mut buffer: [u8; SIZE] = [0; SIZE];
-        let system_random = ring::rand::SystemRandom::new();
-        system_random.fill(&mut buffer).unwrap();
-        let token = as_base64(&buffer);
-        let token_hash = Self::hash_token(&token);
+        let (token, token_hash) = Self::mint_raw_and_hash();
         (
             Self {
                 user_id,
@@ -55,6 +51,22 @@ impl PersonalAccessToken {
             },
             token,
         )
+    }
+
+    /// Mint a fresh raw token and its hash without constructing a
+    /// `PersonalAccessToken`. The VSR primary calls this in
+    /// `maybe_rewrite_pat_request` so the hash is replicated in the prepare
+    /// body; replicas decode and store it directly via
+    /// [`Self::raw`]. Calling [`Self::new`] inside the state-machine apply
+    /// would re-roll `ring::rand` per replica and diverge state.
+    #[must_use]
+    pub fn mint_raw_and_hash() -> (String, String) {
+        let mut buffer: [u8; SIZE] = [0; SIZE];
+        let system_random = ring::rand::SystemRandom::new();
+        system_random.fill(&mut buffer).unwrap();
+        let token = as_base64(&buffer);
+        let hash = Self::hash_token(&token);
+        (token, hash)
     }
 
     pub fn raw(

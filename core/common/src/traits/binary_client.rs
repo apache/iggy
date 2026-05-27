@@ -19,6 +19,15 @@
 use crate::{BinaryTransport, Client};
 use async_trait::async_trait;
 
-/// A client that can send and receive binary messages.
+/// A client that can send and receive binary messages. In `vsr` builds it
+/// also exposes the sealed [`VsrSessionControl`](crate::VsrSessionControl)
+/// for the SDK's login/logout flows; that surface stays out of
+/// [`BinaryTransport`] so external `&dyn BinaryTransport` consumers can't
+/// touch consensus session state.
+#[cfg(feature = "vsr")]
+#[async_trait]
+pub trait BinaryClient: BinaryTransport + Client + crate::VsrSessionControl {}
+
+#[cfg(not(feature = "vsr"))]
 #[async_trait]
 pub trait BinaryClient: BinaryTransport + Client {}

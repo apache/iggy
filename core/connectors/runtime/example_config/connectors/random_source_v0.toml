@@ -22,6 +22,7 @@ version = 0
 name = "Random source"
 path = "target/release/libiggy_connector_random_source"
 plugin_config_format = "json"
+benchmark = true # Emit per-batch timings on target `iggy_connectors::benchmark`
 
 [[streams]]
 stream = "example_stream"

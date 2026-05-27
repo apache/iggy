@@ -507,6 +507,13 @@ pub enum IggyError {
 
     #[error("IO error: {0}")]
     IoError(String) = 13000,
+
+    #[error("VSR session already bound; reset before re-binding")]
+    AlreadyAuthenticated = 14000,
+    #[error("VSR session value {0} is invalid (must be non-zero)")]
+    InvalidSession(u64) = 14001,
+    #[error("Replicated command with unknown code {0}")]
+    UnknownReplicatedCommand(u32) = 14002,
 }
 
 impl IggyError {

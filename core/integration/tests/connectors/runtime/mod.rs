@@ -17,4 +17,5 @@
  * under the License.
  */
 
+mod benchmark;
 mod error_isolation;

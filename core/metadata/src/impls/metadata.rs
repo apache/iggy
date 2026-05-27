@@ -56,12 +56,24 @@ fn freeze_client_reply(
 
 pub trait StreamsFrontend {
     #[must_use]
+    fn users(&self) -> &Users;
+    #[must_use]
     fn streams(&self) -> &Streams;
+    #[must_use]
+    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
 impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+    fn users(&self) -> &Users {
+        &self.inner().0
+    }
+
     fn streams(&self) -> &Streams {
         &self.inner().1.0
+    }
+
+    fn consumer_groups(&self) -> &ConsumerGroups {
+        &self.inner().1.1.0
     }
 }
 
@@ -711,6 +723,13 @@ where
                         in_flight,
                     );
                     reply
+                } else if prepare_header.operation == Operation::Logout {
+                    // Logout unregisters the VSR client session on every replica.
+                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                    self.client_table
+                        .borrow_mut()
+                        .remove_client(prepare_header.client);
+                    reply
                 } else {
                     // Normal op: apply SM, commit_reply.
                     let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
@@ -748,8 +767,19 @@ where
                 // Fire subscriber BEFORE wire send. Slot already updated
                 // (slot-first ordering, see take_reply_sender). Dropped
                 // receiver: ignored.
+                let had_in_process_subscriber = entry.has_reply_sender();
                 if let Some(sender) = entry.take_reply_sender() {
                     let _ = sender.send(reply.clone());
+                }
+
+                // Skip wire send when an in-process subscriber consumed the
+                // reply: the caller (e.g. `complete_login_register`,
+                // `handle_logout_request`) ships its own full-body reply on
+                // the same socket. Sending both desyncs the SDK -- it reads
+                // the first frame, fails to decode the typed body, and
+                // leaves the second frame stuck in the socket buffer.
+                if had_in_process_subscriber {
+                    continue;
                 }
 
                 let generic_reply = reply.into_generic();
@@ -796,7 +826,7 @@ where
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
         let op = message.header().operation();
-        op.is_metadata() || op == Operation::Register
+        op.is_metadata() || matches!(op, Operation::Register | Operation::Logout)
     }
 }
 
@@ -893,6 +923,12 @@ where
         // Subscribe before await so receiver registers before any self-loopback
         // ack fires. compio is single-threaded; explicit anyway.
         consensus.verify_pipeline();
+        // Snapshot (view, commit_min) pre-subscribe. Validate it after
+        // `on_replicate` returns and again on receiver completion: another
+        // task could mutate either during the awaits and silently invalidate
+        // the gate, with release builds proceeding on a stale view-state.
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
         // can drop the borrow. No commit-max advance flips the gate today;
@@ -902,6 +938,27 @@ where
             "submit_register_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_register_in_process: view/commit_min advanced across on_replicate await"
+        );
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => warn!(
+                        error = %error,
+                        "dropping malformed PrepareOk from metadata loopback queue"
+                    ),
+                },
+                command => warn!(
+                    ?command,
+                    "dropping unexpected message from metadata loopback queue"
+                ),
+            }
+        }
 
         match receiver.await {
             Ok(reply) => Ok(reply.header().commit),
@@ -919,6 +976,119 @@ where
                     .ok_or(RegisterSubmitError::Canceled)
             }
         }
+    }
+
+    /// Submit `Logout` from in-process, await commit.
+    ///
+    /// # Returns
+    /// Commit op for the logout. If the client session is already absent, this
+    /// is idempotent and returns the current metadata commit.
+    ///
+    /// # Errors
+    /// Returns a consensus submission error when this node cannot accept the
+    /// logout prepare, the metadata pipeline is saturated, or the pending
+    /// request is canceled before commit.
+    ///
+    /// # Panics
+    /// Panics when called with the reserved client id `0`, on a non-consensus
+    /// metadata shard, or if the prepare gate flips between validation and
+    /// local dispatch.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_logout_in_process(
+        &self,
+        client_id: u128,
+        session: u64,
+        request: u64,
+    ) -> Result<u64, RegisterSubmitError> {
+        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_logout_in_process: consensus only exists on shard 0");
+
+        if self.client_table.borrow().get_session(client_id).is_none() {
+            return Ok(consensus.commit_min());
+        }
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    RegisterSubmitError::NotCaughtUp
+                } else {
+                    RegisterSubmitError::NotPrimary
+                },
+            );
+        }
+
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(client_id)
+        {
+            return Err(RegisterSubmitError::InProgress);
+        }
+
+        if consensus.pipeline().borrow().is_full() {
+            return Err(RegisterSubmitError::PipelineFull);
+        }
+
+        let request = build_logout_request_message(consensus, client_id, session, request);
+        debug_assert!(
+            {
+                use iggy_binary_protocol::ConsensusHeader;
+                request.header().validate().is_ok()
+            },
+            "build_logout_request_message produced a header that fails validate()"
+        );
+        let prepare = self
+            .prepare_request(request)
+            .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
+
+        consensus.verify_pipeline();
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        debug_assert!(
+            is_caught_up_primary(consensus),
+            "submit_logout_in_process: gate flipped between check and dispatch"
+        );
+        self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_logout_in_process: view/commit_min advanced across on_replicate await"
+        );
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => warn!(
+                        error = %error,
+                        "dropping malformed PrepareOk from metadata loopback queue"
+                    ),
+                },
+                command => warn!(
+                    ?command,
+                    "dropping unexpected message from metadata loopback queue"
+                ),
+            }
+        }
+
+        match receiver.await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => {
+                if self.client_table.borrow().get_session(client_id).is_none() {
+                    Ok(consensus.commit_min())
+                } else {
+                    Err(RegisterSubmitError::Canceled)
+                }
+            }
+        }
+    }
+
+    pub fn remove_client_session(&self, client_id: u128) -> bool {
+        self.client_table.borrow_mut().remove_client(client_id)
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after
@@ -1182,6 +1352,8 @@ where
                 self.client_table
                     .borrow_mut()
                     .commit_register(header.client, reply, in_flight);
+            } else if header.operation == Operation::Logout {
+                self.client_table.borrow_mut().remove_client(header.client);
             } else {
                 // Normal op: apply SM, commit_reply.
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
@@ -1288,6 +1460,37 @@ where
     msg
 }
 
+fn build_logout_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    session: u64,
+    request: u64,
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let mut msg = Message::<RequestHeader>::new(header_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        &mut msg.as_mut_slice()[..header_size],
+    )
+    .expect("zeroed bytes are a valid RequestHeader");
+    *header = RequestHeader {
+        command: Command2::Request,
+        operation: Operation::Logout,
+        size: u32::try_from(header_size).expect("RequestHeader size fits u32"),
+        cluster: consensus.cluster(),
+        view: consensus.view(),
+        release: 0,
+        client: client_id,
+        session,
+        request,
+        ..RequestHeader::default()
+    };
+    msg
+}
+
 fn build_prepare_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     request: &RequestHeader,
@@ -1307,6 +1510,14 @@ where
     let header_bytes = &mut prepare_bytes[..size_of::<PrepareHeader>()];
     let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
         .expect("prepare header bytes should be valid");
+    // Match `Project::project` (core/consensus/src/impls.rs): the primary
+    // stamps wall-clock once here so every replica's `StateHandler::apply`
+    // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
+    // `created_at` on every CreateStream/CreateTopic/CreatePartitions, since
+    // submit_command_in_process bypasses `Project::project` and calls this
+    // helper directly. Shared `next_monotonic_timestamp` keeps the in-process
+    // path on the same monotonic-clock guard as the wire path.
+    let timestamp = consensus.next_monotonic_timestamp();
     *new_header = PrepareHeader {
         cluster: consensus.cluster(),
         size: u32::try_from(size).expect("prepare message size exceeds u32"),
@@ -1320,7 +1531,7 @@ where
         request: request.request,
         commit: consensus.commit_max(),
         op,
-        timestamp: 0,
+        timestamp,
         operation,
         namespace: request.namespace,
         ..Default::default()
