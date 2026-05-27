@@ -45,9 +45,9 @@ pub struct ClickHouseSinkConfig {
     pub password: Option<SecretString>,
     pub table: String,
     /// "json_each_row" (default), "row_binary", or "string"
-    pub insert_format: Option<String>,
+    pub insert_format: Option<InsertFormat>,
     /// "json_each_row" (default), "csv", or "tsv" — only used when insert_format = "string"
-    pub string_format: Option<String>,
+    pub string_format: Option<StringFormat>,
     pub timeout_seconds: Option<u64>,
     pub max_retries: Option<u32>,
     /// Delay between retry attempts, in seconds.
@@ -55,23 +55,17 @@ pub struct ClickHouseSinkConfig {
     pub verbose_logging: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InsertFormat {
     #[default]
     JsonEachRow,
     RowBinary,
+    #[serde(rename = "string")]
     StringPassthrough,
 }
 
 impl InsertFormat {
-    fn from_config(s: Option<&str>) -> Self {
-        match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("row_binary") => InsertFormat::RowBinary,
-            Some("string") => InsertFormat::StringPassthrough,
-            _ => InsertFormat::JsonEachRow,
-        }
-    }
-
     pub fn clickhouse_format_name(&self, string_fmt: StringFormat) -> &'static str {
         match self {
             InsertFormat::JsonEachRow => "JSONEachRow",
@@ -81,7 +75,8 @@ impl InsertFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StringFormat {
     #[default]
     JsonEachRow,
@@ -90,14 +85,6 @@ pub enum StringFormat {
 }
 
 impl StringFormat {
-    fn from_config(s: Option<&str>) -> Self {
-        match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("csv") => StringFormat::Csv,
-            Some("tsv") => StringFormat::Tsv,
-            _ => StringFormat::JsonEachRow,
-        }
-    }
-
     pub fn clickhouse_format_name(&self) -> &'static str {
         match self {
             StringFormat::JsonEachRow => "JSONEachRow",
@@ -131,8 +118,8 @@ pub struct ClickHouseSink {
 
 impl ClickHouseSink {
     pub fn new(id: u32, config: ClickHouseSinkConfig) -> Self {
-        let insert_format = InsertFormat::from_config(config.insert_format.as_deref());
-        let string_format = StringFormat::from_config(config.string_format.as_deref());
+        let insert_format = config.insert_format.unwrap_or_default();
+        let string_format = config.string_format.unwrap_or_default();
         let retry_delay = Duration::from_secs(config.retry_delay.unwrap_or(DEFAULT_RETRY_DELAY_SECS));
 
         ClickHouseSink {
@@ -217,7 +204,7 @@ mod tests {
     #[test]
     fn given_row_binary_insert_format_should_parse_correctly() {
         let mut config = test_config();
-        config.insert_format = Some("row_binary".into());
+        config.insert_format = Some(InsertFormat::RowBinary);
         let sink = ClickHouseSink::new(1, config);
         assert_eq!(sink.insert_format, InsertFormat::RowBinary);
     }
@@ -225,7 +212,7 @@ mod tests {
     #[test]
     fn given_string_insert_format_should_parse_correctly() {
         let mut config = test_config();
-        config.insert_format = Some("string".into());
+        config.insert_format = Some(InsertFormat::StringPassthrough);
         let sink = ClickHouseSink::new(1, config);
         assert_eq!(sink.insert_format, InsertFormat::StringPassthrough);
     }
@@ -233,10 +220,33 @@ mod tests {
     #[test]
     fn given_csv_string_format_should_parse_correctly() {
         let mut config = test_config();
-        config.insert_format = Some("string".into());
-        config.string_format = Some("csv".into());
+        config.insert_format = Some(InsertFormat::StringPassthrough);
+        config.string_format = Some(StringFormat::Csv);
         let sink = ClickHouseSink::new(1, config);
         assert_eq!(sink.string_format, StringFormat::Csv);
+    }
+
+    #[test]
+    fn given_unknown_insert_format_string_should_fail_to_deserialise() {
+        let toml = r#"
+            url = "http://localhost:8123"
+            table = "events"
+            insert_format = "rowbinary"
+        "#;
+        let result = toml::from_str::<ClickHouseSinkConfig>(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_unknown_string_format_string_should_fail_to_deserialise() {
+        let toml = r#"
+            url = "http://localhost:8123"
+            table = "events"
+            insert_format = "string"
+            string_format = "comma_separated"
+        "#;
+        let result = toml::from_str::<ClickHouseSinkConfig>(toml);
+        assert!(result.is_err());
     }
 
     #[test]
