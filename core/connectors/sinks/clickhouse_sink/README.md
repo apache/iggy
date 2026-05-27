@@ -56,6 +56,13 @@ verbose_logging = false
 | `retry_delay` | u64 | `1` | Delay between retries, in seconds |
 | `verbose_logging` | bool | `false` | Log inserts at info level instead of debug |
 
+> **TODO:** `database` and `table` values are interpolated directly into SQL. Currently only
+> single quotes are escaped; backslashes pass through unchanged, which can misparse string
+> literals if a value ends with `\`. A future improvement should validate both fields against a
+> strict allowlist (`^[A-Za-z_][A-Za-z0-9_]*$`) at config load and escape backslashes in SQL
+> string literals. Deferred because these sinks run in operator-controlled environments where
+> config values are trusted.
+
 ## Insert Formats
 
 ### `json_each_row` (Default)

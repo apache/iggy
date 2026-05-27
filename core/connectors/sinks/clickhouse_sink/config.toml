@@ -37,6 +37,9 @@ database = "default"
 username = "default"
 password = ""
 table = "events"
+# TODO: validate database/table with a strict allowlist (^[A-Za-z_][A-Za-z0-9_]*$) and
+# escape backslashes in SQL string literals (currently only ' is escaped). Deferred
+# because sinks run in operator-controlled environments where config values are trusted.
 
 # Insert format: "json_each_row" (default), "row_binary", or "string"
 #   json_each_row  — accepts Payload::Json; ClickHouse handles type coercion
