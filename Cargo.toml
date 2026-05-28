@@ -100,6 +100,7 @@ bon = "3.9.1"
 byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bytes = "1.11.1"
+cfg_aliases = "0.2.1"
 charming = "0.6.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
@@ -139,7 +140,6 @@ cyper = { version = "0.8.3", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.8.0" }
 darling = "0.23"
 dashmap = "6.2.1"
-dbus-secret-service-keyring-store = { version = "1.0.0", features = ["crypto-rust", "vendored"] }
 deltalake = { version = "0.32.3", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
@@ -329,6 +329,7 @@ webpki-roots = "1.0.7"
 windows-native-keyring-store = "1.1.0"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
+zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
