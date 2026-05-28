@@ -25,8 +25,8 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'testing'", specifier = ">=3.0,<4.0" },
     { name = "ruff", marker = "extra == 'all'", specifier = ">=0.1.0,<1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0,<1.0" },
-    { name = "testcontainers", marker = "extra == 'all'", specifier = ">=3.7.0,<5.0" },
-    { name = "testcontainers", marker = "extra == 'testing-docker'", specifier = ">=3.7.0,<5.0" },
+    { name = "testcontainers", marker = "extra == 'all'", specifier = ">=4.14.2,<5.0" },
+    { name = "testcontainers", marker = "extra == 'testing-docker'", specifier = ">=4.14.2,<5.0" },
 ]
 provides-extras = ["testing", "testing-docker", "dev", "all"]
 
