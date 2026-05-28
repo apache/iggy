@@ -26,6 +26,27 @@ fn print_discord_link() {
     eprintln!();
 }
 
+/// Formats an `RLIMIT_MEMLOCK` value for diagnostic output.
+///
+/// `u64::MAX` is rendered as `unlimited` (the value getrlimit returns
+/// for an uncapped limit); other values are rendered as raw bytes plus
+/// a coarse MB-or-KB suffix so operators can eyeball whether the limit
+/// is in the ballpark of the 4096-entry io_uring ring footprint.
+#[cfg(target_os = "linux")]
+fn format_limit(limit: u64) -> String {
+    if limit == u64::MAX {
+        "unlimited".to_string()
+    } else {
+        let kb = limit / 1024;
+        let mb = kb / 1024;
+        if mb > 0 {
+            format!("{limit} bytes ({mb} MB)")
+        } else {
+            format!("{limit} bytes ({kb} KB)")
+        }
+    }
+}
+
 /// Prints information about locked memory limits when runtime creation fails.
 /// This is typically needed when io_uring cannot allocate memory due to RLIMIT_MEMLOCK.
 #[cfg(target_os = "linux")]
@@ -37,20 +58,6 @@ pub fn print_locked_memory_limit_info() {
         Err(_) => {
             eprintln!("Failed to retrieve locked memory limits");
             return;
-        }
-    };
-
-    let format_limit = |limit: u64| -> String {
-        if limit == u64::MAX {
-            "unlimited".to_string()
-        } else {
-            let kb = limit / 1024;
-            let mb = kb / 1024;
-            if mb > 0 {
-                format!("{} bytes ({} MB)", limit, mb)
-            } else {
-                format!("{} bytes ({} KB)", limit, kb)
-            }
         }
     };
 
@@ -297,20 +304,17 @@ pub const fn print_io_uring_permission_info() {}
 #[cfg(not(target_os = "linux"))]
 pub const fn print_invalid_io_uring_args_info() {}
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use super::parse_kernel_version;
+    use super::{format_limit, parse_kernel_version};
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_standard_kernel_version() {
+    fn parse_kernel_version_standard() {
         assert_eq!(parse_kernel_version("6.8.0-45-generic"), Some((6, 8)));
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_wsl2_kernel_version() {
+    fn parse_kernel_version_wsl2() {
         assert_eq!(
             parse_kernel_version("5.15.153.1-microsoft-standard-WSL2"),
             Some((5, 15))
@@ -318,20 +322,38 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_minimal_version() {
+    fn parse_kernel_version_minimal() {
         assert_eq!(parse_kernel_version("5.19"), Some((5, 19)));
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_garbage_returns_none() {
+    fn parse_kernel_version_garbage_returns_none() {
         assert_eq!(parse_kernel_version("not-a-version"), None);
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_empty_returns_none() {
+    fn parse_kernel_version_empty_returns_none() {
         assert_eq!(parse_kernel_version(""), None);
+    }
+
+    #[test]
+    fn parse_kernel_version_overflow_returns_none() {
+        // u32::MAX + 1 in the major slot must not silently wrap.
+        assert_eq!(parse_kernel_version("4294967296.0"), None);
+    }
+
+    #[test]
+    fn format_limit_unlimited() {
+        assert_eq!(format_limit(u64::MAX), "unlimited");
+    }
+
+    #[test]
+    fn format_limit_sub_mb_uses_kb_suffix() {
+        assert_eq!(format_limit(64 * 1024), "65536 bytes (64 KB)");
+    }
+
+    #[test]
+    fn format_limit_mb_range_uses_mb_suffix() {
+        assert_eq!(format_limit(8 * 1024 * 1024), "8388608 bytes (8 MB)");
     }
 }

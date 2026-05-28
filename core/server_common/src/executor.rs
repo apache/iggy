@@ -19,7 +19,25 @@
 
 use compio::runtime::Runtime;
 
+const DEFAULT_SHARD_RUNTIME_CAPACITY: u32 = 4096;
+const SHARD_RUNTIME_CAPACITY_ENV: &str = "IGGY_SHARD_RUNTIME_CAPACITY";
+
+/// Resolves the per-shard io_uring SQ/CQ capacity from `IGGY_SHARD_RUNTIME_CAPACITY`,
+/// falling back to [`DEFAULT_SHARD_RUNTIME_CAPACITY`] when the var is missing or
+/// fails to parse as `u32`.
+fn shard_capacity_from_env() -> u32 {
+    std::env::var(SHARD_RUNTIME_CAPACITY_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_SHARD_RUNTIME_CAPACITY)
+}
+
 /// Creates a compio runtime for a shard thread, with shard-specific `io_uring` flags.
+///
+/// The per-ring SQ/CQ capacity defaults to `4096` and can be overridden via the
+/// `IGGY_SHARD_RUNTIME_CAPACITY` env var, which the multi-node integration
+/// harness sets to `256` so N nodes * M shards fit under an 8 MiB
+/// `RLIMIT_MEMLOCK` budget without `ENOMEM` at ring setup.
 ///
 /// # Errors
 ///
@@ -37,7 +55,7 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     let mut proactor = compio::driver::ProactorBuilder::new();
 
     proactor
-        .capacity(4096)
+        .capacity(shard_capacity_from_env())
         .coop_taskrun(true)
         .taskrun_flag(true);
 
@@ -48,7 +66,67 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     proactor.thread_pool_limit(0);
 
     compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor.clone())
+        .with_proactor(proactor.to_owned())
         .event_interval(128)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_SHARD_RUNTIME_CAPACITY, SHARD_RUNTIME_CAPACITY_ENV, shard_capacity_from_env,
+    };
+    use serial_test::serial;
+
+    fn with_capacity_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        // SAFETY: tests in this module are #[serial], so no other thread races
+        // on the process-wide environment while the guard is active.
+        let prev = std::env::var(SHARD_RUNTIME_CAPACITY_ENV).ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(SHARD_RUNTIME_CAPACITY_ENV, v),
+                None => std::env::remove_var(SHARD_RUNTIME_CAPACITY_ENV),
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SHARD_RUNTIME_CAPACITY_ENV, v),
+                None => std::env::remove_var(SHARD_RUNTIME_CAPACITY_ENV),
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[serial]
+    fn shard_capacity_from_env_uses_parsed_value() {
+        with_capacity_env(Some("256"), || {
+            assert_eq!(shard_capacity_from_env(), 256);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn shard_capacity_from_env_falls_back_when_unset() {
+        with_capacity_env(None, || {
+            assert_eq!(shard_capacity_from_env(), DEFAULT_SHARD_RUNTIME_CAPACITY);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn shard_capacity_from_env_falls_back_on_unparseable() {
+        with_capacity_env(Some("not-a-number"), || {
+            assert_eq!(shard_capacity_from_env(), DEFAULT_SHARD_RUNTIME_CAPACITY);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn shard_capacity_from_env_falls_back_on_negative() {
+        with_capacity_env(Some("-1"), || {
+            assert_eq!(shard_capacity_from_env(), DEFAULT_SHARD_RUNTIME_CAPACITY);
+        });
+    }
 }
