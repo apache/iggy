@@ -44,8 +44,9 @@
 //!
 use crate::AcceptedWssClientFn;
 use crate::lifecycle::ShutdownToken;
+use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
-use compio::net::{SocketOpts, TcpListener};
+use compio::net::TcpListener;
 use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
@@ -65,7 +66,7 @@ use tracing::{debug, error, info};
 ///   from `credentials` (cert / key mismatch).
 /// - [`IggyError::CannotBindToSocket`] if the TCP bind fails.
 #[allow(clippy::future_not_send)]
-pub async fn bind(
+pub fn bind(
     addr: SocketAddr,
     credentials: TlsServerCredentials,
 ) -> Result<(TcpListener, Arc<rustls::ServerConfig>, SocketAddr), IggyError> {
@@ -76,9 +77,7 @@ pub async fn bind(
         .map_err(|e| IggyError::IoError(format!("WSS server config build failed: {e}")))?;
     cfg.max_early_data_size = 0;
 
-    let opts = SocketOpts::new().nodelay(true);
-    let listener = TcpListener::bind_with_options(addr, &opts)
-        .await
+    let listener = bind_reusable_tcp_listener(addr)
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener
         .local_addr()

@@ -84,6 +84,8 @@ pub struct CreateSinkConfig {
     pub plugin_config: Option<serde_json::Value>,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
+    pub benchmark: bool,
 }
 
 impl CreateSinkConfig {
@@ -99,6 +101,7 @@ impl CreateSinkConfig {
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
             verbose: self.verbose,
+            benchmark: self.benchmark,
         }
     }
 }
@@ -119,6 +122,8 @@ pub struct SinkConfig {
     pub plugin_config: Option<serde_json::Value>,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
+    pub benchmark: bool,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -132,6 +137,8 @@ pub struct CreateSourceConfig {
     pub plugin_config: Option<serde_json::Value>,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
+    pub benchmark: bool,
 }
 
 impl CreateSourceConfig {
@@ -147,6 +154,7 @@ impl CreateSourceConfig {
             plugin_config_format: self.plugin_config_format,
             plugin_config: self.plugin_config.clone(),
             verbose: self.verbose,
+            benchmark: self.benchmark,
         }
     }
 }
@@ -167,6 +175,8 @@ pub struct SourceConfig {
     pub plugin_config: Option<serde_json::Value>,
     #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
+    pub benchmark: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -304,7 +314,7 @@ impl std::fmt::Display for SinkConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -315,6 +325,8 @@ impl std::fmt::Display for SinkConfig {
                 .collect::<Vec<String>>()
                 .join(", "),
             self.plugin_config_format,
+            self.verbose,
+            self.benchmark,
         )
     }
 }
@@ -323,7 +335,7 @@ impl std::fmt::Display for SourceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?} }}",
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], plugin_config_format: {:?}, verbose: {}, benchmark: {} }}",
             self.enabled,
             self.name,
             self.path,
@@ -334,6 +346,8 @@ impl std::fmt::Display for SourceConfig {
                 .collect::<Vec<String>>()
                 .join(", "),
             self.plugin_config_format,
+            self.verbose,
+            self.benchmark,
         )
     }
 }

@@ -25,17 +25,30 @@ use crate::{
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::LOGIN_REGISTER_WITH_PAT_CODE;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::codes::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE;
 use iggy_binary_protocol::codes::{
     CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE,
 };
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
-    GetPersonalAccessTokensRequest, LoginWithPersonalAccessTokenRequest,
+    GetPersonalAccessTokensRequest,
 };
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::requests::users::LoginRegisterWithPatRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+#[cfg(not(feature = "vsr"))]
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
+#[cfg(feature = "vsr")]
+use secrecy::SecretString;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> PersonalAccessTokenClient for B {
@@ -90,16 +103,61 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
+        #[cfg(feature = "vsr")]
+        {
+            let response = match self
+                .send_raw_with_response(
+                    LOGIN_REGISTER_WITH_PAT_CODE,
+                    LoginRegisterWithPatRequest {
+                        token: SecretString::from(token.to_string()),
+                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        client_context: Some(String::new()),
+                    }
+                    .to_bytes(),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
+                }
+            };
+            let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
+                Ok(wire_resp) => wire_resp,
+                Err(error) => {
+                    self.reset_vsr_session().await?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
+                self.reset_vsr_session().await?;
+                return Err(error);
+            }
+            self.set_state(ClientState::Authenticated).await;
+            self.publish_event(DiagnosticEvent::SignedIn).await;
+            return Ok(IdentityInfo {
+                user_id: wire_resp.user_id,
+                access_token: None,
+            });
+        }
+
+        #[cfg(not(feature = "vsr"))]
         let wire_token = WireName::new(token).map_err(|_| IggyError::InvalidFormat)?;
+        #[cfg(not(feature = "vsr"))]
         let response = self
             .send_raw_with_response(
                 LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
                 LoginWithPersonalAccessTokenRequest { token: wire_token }.to_bytes(),
             )
             .await?;
+        #[cfg(not(feature = "vsr"))]
         self.set_state(ClientState::Authenticated).await;
+        #[cfg(not(feature = "vsr"))]
         self.publish_event(DiagnosticEvent::SignedIn).await;
+        #[cfg(not(feature = "vsr"))]
         let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
+        #[cfg(not(feature = "vsr"))]
         Ok(IdentityInfo::from(wire_resp))
     }
 }

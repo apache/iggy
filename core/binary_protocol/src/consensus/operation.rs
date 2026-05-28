@@ -32,6 +32,16 @@ pub enum Operation {
     /// but skips state machine dispatch at commit time, the metadata
     /// plane calls `commit_register` directly. Session number = commit op.
     Register = 1,
+
+    /// Non-replicated client request carried in VSR framing. The concrete
+    /// legacy command code is stored outside the operation discriminant by the
+    /// transport/server bridge and must not enter the replicated log.
+    NonReplicated = 2,
+
+    /// Unregister a client session with the cluster. Carries the legacy
+    /// `LogoutUser` command through the consensus pipeline and removes the
+    /// client-table entry at commit time.
+    Logout = 3,
     // Internal metadata operations (journal / replica-only)
     CreateTopicWithAssignments = 64,
     CreatePartitionsWithAssignments = 65,
@@ -114,12 +124,15 @@ impl Operation {
         )
     }
 
-    /// VSR protocol-level operations that go through consensus but skip
-    /// state machine dispatch at commit time.
+    /// VSR protocol-level operations that are not mapped directly to a
+    /// legacy command code.
     #[must_use]
     #[inline]
     pub const fn is_vsr_reserved(&self) -> bool {
-        matches!(self, Self::Reserved | Self::Register)
+        matches!(
+            self,
+            Self::Reserved | Self::Register | Self::Logout | Self::NonReplicated
+        )
     }
 
     /// Data-plane operations routed to the shard owning the partition.
@@ -144,6 +157,8 @@ impl Operation {
         match self {
             Self::Reserved
             | Self::Register
+            | Self::Logout
+            | Self::NonReplicated
             | Self::CreateTopicWithAssignments
             | Self::CreatePartitionsWithAssignments => None,
             Self::CreateStream
@@ -236,16 +251,22 @@ mod tests {
     fn vsr_reserved_have_no_code() {
         assert_eq!(Operation::Reserved.to_command_code(), None);
         assert_eq!(Operation::Register.to_command_code(), None);
+        assert_eq!(Operation::Logout.to_command_code(), None);
+        assert_eq!(Operation::NonReplicated.to_command_code(), None);
     }
 
     #[test]
     fn vsr_reserved_classification() {
         assert!(Operation::Reserved.is_vsr_reserved());
         assert!(Operation::Register.is_vsr_reserved());
+        assert!(Operation::Logout.is_vsr_reserved());
+        assert!(Operation::NonReplicated.is_vsr_reserved());
         assert!(!Operation::CreateStream.is_vsr_reserved());
         assert!(!Operation::SendMessages.is_vsr_reserved());
         assert!(!Operation::Register.is_metadata());
         assert!(!Operation::Register.is_partition());
+        assert!(!Operation::Logout.is_metadata());
+        assert!(!Operation::Logout.is_partition());
         assert_eq!(
             Operation::CreateTopicWithAssignments.to_command_code(),
             None

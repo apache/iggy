@@ -29,8 +29,6 @@ pub enum RuntimeError {
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
-    #[error("Failed to serialize headers")]
-    FailedToSerializeHeaders,
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     #[error("Iggy client error")]

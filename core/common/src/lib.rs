@@ -42,6 +42,8 @@ pub use http::topics::*;
 pub use http::users::*;
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
+#[cfg(feature = "vsr")]
+pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed};
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;

@@ -30,18 +30,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Cleanup disk space
-      if: runner.os == 'Linux'
-      run: |
-        echo "Disk space before cleanup:"
-        df -h
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        # sudo docker image prune --all --force
-        # sudo docker builder prune -a
-        echo "Disk space after cleanup:"
-        df -h
-      shell: bash
-
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
@@ -354,9 +342,6 @@ runs:
         --exclude bench-dashboard-frontend
       shell: bash
       env:
-        # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
-        # references when linking dbus-sys (required by keyring crate)
-        CFLAGS: "-mno-outline-atomics"
         PKG_CONFIG_ALLOW_CROSS: "1"
         PKG_CONFIG_ALL_STATIC: "1"
 

@@ -28,4 +28,6 @@ pub mod quic;
 pub mod session;
 pub mod stream_builder;
 pub mod tcp;
+#[cfg(feature = "vsr")]
+mod vsr;
 pub mod websocket;
