@@ -212,6 +212,13 @@ impl DorisContainer {
                     .with_port(FE_HTTP_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
+            // Doris 4.0.3's start_be.sh refuses to start (exit 1) unless
+            // vm.max_map_count >= 2000000 and swap is off and ulimit -n >= 60000.
+            // Hosts (CI runners, dev laptops) rarely satisfy all three, and the BE
+            // dying makes the container exit before it ever reports healthy. Skip
+            // those gate checks; the test workload is tiny so the conservative
+            // thresholds don't matter. (CI also raises vm.max_map_count on the host.)
+            .with_env_var("SKIP_CHECK_ULIMIT", "true")
             .with_network(unique_network)
             .with_mapped_port(0, FE_HTTP_PORT.tcp())
             .with_mapped_port(0, FE_MYSQL_PORT.tcp())
@@ -357,12 +364,12 @@ impl DorisContainer {
             "CREATE DATABASE IF NOT EXISTS {}",
             self.database
         )))
-            .execute(&pool)
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "DorisContainer".to_string(),
-                message: format!("Failed to create test database: {e}"),
-            })?;
+        .execute(&pool)
+        .await
+        .map_err(|e| TestBinaryError::FixtureSetup {
+            fixture_type: "DorisContainer".to_string(),
+            message: format!("Failed to create test database: {e}"),
+        })?;
         Ok(())
     }
 }
@@ -457,11 +464,11 @@ pub trait DorisOps: Sync {
         let row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) AS c FROM {database}.{table}"
         )))
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to count rows in {database}.{table}: {e}"),
-            })?;
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to count rows in {database}.{table}: {e}"),
+        })?;
         // Doris returns COUNT(*) as BIGINT; sqlx decodes that to i64.
         let count: i64 = row.try_get(0).map_err(|e| TestBinaryError::InvalidState {
             message: format!("Failed to read count column: {e}"),

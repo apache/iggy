@@ -229,9 +229,26 @@ runs:
         DORIS_STARTED=0
         if [[ "$RUNNER_OS" == "Linux" ]] && { [[ -z "$NEXTEST_FILTER" ]] || echo "$NEXTEST_FILTER" | grep -qi 'integration'; }; then
           echo "::group::Launch shared Doris container (boots during build)"
+          # ROOT CAUSE of the regression: 4.0.3's start_be.sh hard-`exit 1`s unless
+          # `vm.max_map_count >= 2000000` (the 2.1.0 image had no such gate, which is
+          # why it worked). The runner default is far lower, so the BE died on start;
+          # its death ends the entrypoint's `wait`, the container exits, and every
+          # doris test falls onto the slow per-test self-boot path → 1h timeout.
+          # Raise it on the host (inherited by all containers, shared and self-boot);
+          # reproduced locally that this brings the BE alive. `SKIP_CHECK_ULIMIT`
+          # additionally bypasses start_be.sh's swap/ulimit gates so we needn't
+          # swapoff the runner.
+          sudo sysctl -w vm.max_map_count=2000000 || true
+          # Secondary: this boots *concurrently with the cargo build* on a 16GB
+          # runner, and 4.0.3 sizes for a dedicated host (FE 8GB -Xms heap, BE
+          # mem_limit `auto` ≈ 90% of RAM). Cap both (FE 2GB + BE 4GB) so Doris fits
+          # beside the build, ~matching the 2.1.0 footprint. Override the entrypoint
+          # to rewrite the confs, then hand off to the image's normal entry_point.sh.
           if docker run -d --name iggy-doris-shared \
               -p 8030 -p 9030 -p 8040:8040 \
-              apache/doris:4.0.3-all-slim; then
+              -e SKIP_CHECK_ULIMIT=true \
+              --entrypoint bash apache/doris:4.0.3-all-slim \
+              -c "sed -i 's/-Xmx8192m -Xms8192m/-Xmx2048m -Xms2048m/' /opt/apache-doris/fe/conf/fe.conf && echo 'mem_limit = 4096M' >> /opt/apache-doris/be/conf/be.conf && exec bash /usr/local/bin/entry_point.sh"; then
             DORIS_STARTED=1
           else
             echo "::warning::Failed to start shared Doris container; doris tests will self-boot"
@@ -296,6 +313,18 @@ runs:
             echo "Shared Doris ready: FE ${DORIS_FE_URL}, MySQL ${MYSQL_PORT}"
           else
             echo "::warning::Shared Doris did not become healthy; doris tests will self-boot"
+            # Diagnostics: why did 4.0.3-all-slim not become healthy as a bare
+            # `docker run` (2.1.0 did, and 4.0.3 self-boots fine via testcontainers)?
+            # Capture container state (Exited? OOMKilled? exit code) and the tail
+            # of its logs so we can tell crash/OOM apart from slow-boot.
+            echo "::group::Shared Doris diagnostics"
+            docker ps -a --filter name=iggy-doris-shared \
+              --format 'status={{.Status}} state={{.State}}' 2>&1 || true
+            docker inspect iggy-doris-shared \
+              --format 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}}' 2>&1 || true
+            echo "--- last 60 lines of container logs ---"
+            docker logs --tail 60 iggy-doris-shared 2>&1 || true
+            echo "::endgroup::"
             docker rm -f iggy-doris-shared >/dev/null 2>&1 || true
           fi
           echo "::endgroup::"
