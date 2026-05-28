@@ -15,7 +15,7 @@
         <PackageVersion Include="Moq" Version="4.20.72" />
         <PackageVersion Include="Reqnroll.xunit.v3" Version="3.3.3" />
         <PackageVersion Include="Shouldly" Version="4.3.0" />
-        <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
+        <PackageVersion Include="System.IO.Hashing" Version="10.0.8" />
         <PackageVersion Include="Testcontainers" Version="4.10.0" />
         <PackageVersion Include="TUnit" Version="1.12.93" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5">
