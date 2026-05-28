@@ -30,9 +30,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Free runner disk space
-      uses: ./.github/actions/utils/free-disk-space
-
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
