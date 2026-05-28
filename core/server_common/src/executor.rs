@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn shard_capacity_from_env_falls_back_on_unparseable() {
+    fn shard_capacity_from_env_falls_back_on_unparsable() {
         with_capacity_env(Some("not-a-number"), || {
             assert_eq!(shard_capacity_from_env(), DEFAULT_SHARD_RUNTIME_CAPACITY);
         });
