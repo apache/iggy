@@ -56,7 +56,6 @@ members = [
     "core/sdk",
     "core/server",
     "core/server-ng",
-    "core/server-runtime",
     "core/server_common",
     "core/shard",
     "core/simulator",
@@ -270,7 +269,6 @@ serial_test = "3.4.0"
 server = { path = "core/server" }
 server-ng = { path = "core/server-ng" }
 server_common = { path = "core/server_common" }
-server_runtime = { path = "core/server-runtime" }
 shard = { path = "core/shard" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"

@@ -28,18 +28,18 @@ use server_ng::server_error::ServerNgError;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
-    let bootstrap_runtime = match server_runtime::create_shard_executor() {
+    let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {
             match e.kind() {
                 std::io::ErrorKind::InvalidInput => {
-                    server_runtime::diagnostics::print_invalid_io_uring_args_info();
+                    server_common::diagnostics::print_invalid_io_uring_args_info();
                 }
                 std::io::ErrorKind::OutOfMemory => {
-                    server_runtime::diagnostics::print_locked_memory_limit_info();
+                    server_common::diagnostics::print_locked_memory_limit_info();
                 }
                 std::io::ErrorKind::PermissionDenied => {
-                    server_runtime::diagnostics::print_io_uring_permission_info();
+                    server_common::diagnostics::print_io_uring_permission_info();
                 }
                 _ => {}
             }

@@ -16,6 +16,6 @@
  * under the License.
  */
 
-pub use server_runtime::diagnostics::print_invalid_io_uring_args_info;
-pub use server_runtime::diagnostics::print_io_uring_permission_info;
-pub use server_runtime::diagnostics::print_locked_memory_limit_info;
+pub use server_common::diagnostics::print_invalid_io_uring_args_info;
+pub use server_common::diagnostics::print_io_uring_permission_info;
+pub use server_common::diagnostics::print_locked_memory_limit_info;

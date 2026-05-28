@@ -11424,7 +11424,6 @@ dependencies = [
  "serde",
  "serde_json",
  "server_common",
- "server_runtime",
  "slab",
  "socket2 0.6.3",
  "strum 0.28.0",
@@ -11502,7 +11501,6 @@ dependencies = [
  "serde",
  "server",
  "server_common",
- "server_runtime",
  "shard",
  "slab",
  "socket2 0.6.3",
@@ -11546,14 +11544,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
-]
-
-[[package]]
-name = "server_runtime"
-version = "0.1.0"
-dependencies = [
- "compio",
- "nix",
 ]
 
 [[package]]

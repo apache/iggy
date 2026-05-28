@@ -170,7 +170,7 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-pub use server_runtime::create_shard_executor;
+pub use server_common::create_shard_executor;
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
     match enforce_fsync {

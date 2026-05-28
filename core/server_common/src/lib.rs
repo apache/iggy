@@ -20,6 +20,8 @@ mod buffer;
 mod certificates;
 mod consensus_message;
 mod deduplication;
+pub mod diagnostics;
+mod executor;
 mod in_flight;
 mod indexes_mut;
 // TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
@@ -50,6 +52,7 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use deduplication::MessageDeduplicator;
+pub use executor::create_shard_executor;
 pub use in_flight::IggyMessagesBatchSetInFlight;
 pub use indexes_mut::IggyIndexesMut;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
