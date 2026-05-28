@@ -18,6 +18,8 @@
 
 use crate::tcp::tcp_stream::ConnectionStream;
 use async_trait::async_trait;
+#[cfg(feature = "vsr")]
+use bytes::BytesMut;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,6 +39,28 @@ impl TcpTlsConnectionStream {
             client_address,
             stream,
         }
+    }
+
+    #[cfg(feature = "vsr")]
+    pub async fn read_buf(&mut self, buf: &mut BytesMut, len: usize) -> Result<(), IggyError> {
+        let target_len = buf.len() + len;
+        while buf.len() < target_len {
+            let read = self.stream.read_buf(buf).await.map_err(|error| {
+                error!(
+                    "Failed to read data by client: {} from the TCP TLS connection: {error}",
+                    self.client_address
+                );
+                IggyError::TcpError
+            })?;
+            if read == 0 {
+                error!(
+                    "Failed to read data by client: {} from the TCP TLS connection: unexpected EOF",
+                    self.client_address
+                );
+                return Err(IggyError::TcpError);
+            }
+        }
+        Ok(())
     }
 }
 

@@ -41,7 +41,12 @@ path = "src/main.rs"
 
 [features]
 default = ["login-session"]
-login-session = ["dep:keyring"]
+login-session = [
+    "dep:keyring-core",
+    "dep:dbus-secret-service-keyring-store",
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -56,7 +61,7 @@ figlet-rs = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-keyring = { workspace = true, optional = true }
+keyring-core = { workspace = true, optional = true }
 passterm = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -67,6 +72,15 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

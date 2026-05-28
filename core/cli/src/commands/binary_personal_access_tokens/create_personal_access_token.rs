@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use keyring::Entry;
+use keyring_core::Entry;
 use tracing::{Level, event};
 
 pub struct CreatePersonalAccessTokenCmd {

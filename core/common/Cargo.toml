@@ -27,6 +27,9 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "README.md"
 
+[features]
+vsr = []
+
 [dependencies]
 aes-gcm = { workspace = true }
 async-broadcast = { workspace = true }

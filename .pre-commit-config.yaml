@@ -134,6 +134,13 @@ repos:
         types: [ text ]
         pass_filenames: true
 
+      - id: skills
+        name: skills (AI agent skill frontmatter + link check)
+        entry: ./scripts/ci/skills.sh
+        language: system
+        files: ^\.claude/skills/.*\.md$
+        pass_filenames: false
+
       - id: taplo
         name: taplo (TOML format)
         entry: ./scripts/ci/taplo.sh

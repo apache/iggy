@@ -44,6 +44,7 @@ use std::{
 use tracing::{error, info};
 
 mod api;
+mod benchmark;
 pub(crate) mod configs;
 pub(crate) mod context;
 pub(crate) mod error;
@@ -138,7 +139,7 @@ async fn main() -> Result<(), RuntimeError> {
         .await
         .expect("Failed to load configuration");
 
-    log::init_logging(&config.telemetry, VERSION);
+    log::init_logging(&config.telemetry, &config.logging, VERSION);
 
     std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
 
@@ -418,6 +419,7 @@ struct SinkConnectorPlugin {
     consumers: Vec<SinkConnectorConsumer>,
     error: Option<String>,
     verbose: bool,
+    benchmark: bool,
 }
 
 struct SinkConnectorConsumer {
@@ -449,6 +451,7 @@ struct SourceConnectorPlugin {
     state_storage: StateStorage,
     error: Option<String>,
     verbose: bool,
+    benchmark: bool,
 }
 
 struct SourceConnectorProducer {
