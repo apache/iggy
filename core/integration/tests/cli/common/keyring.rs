@@ -16,21 +16,37 @@
  * under the License.
  */
 
-#[cfg(target_os = "linux")]
-use dbus_secret_service_keyring_store::store::Store;
-#[cfg(target_os = "linux")]
-use std::sync::Once;
+#[cfg(all(feature = "login-session", secret_service_keyring))]
+mod backend {
+    use std::sync::OnceLock;
+    use zbus_secret_service_keyring_store::store::Store;
 
-/// `keyring-core` 1.x has no implicit default backend; tests must register one
-/// before any `Entry::new` (directly or via `ServerSession`).
-#[cfg(target_os = "linux")]
-pub(crate) fn ensure_keyring_store() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let store = Store::new().expect("Failed to create dbus secret-service store");
-        keyring_core::set_default_store(store);
-    });
+    /// Single global init result. `OnceLock` (not `Once`) so a failed
+    /// `Store::new` doesn't poison the slot and cascade `PoisonError` to every
+    /// subsequent test in the same process; the original error is replayed
+    /// verbatim instead.
+    static KEYRING_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    pub(crate) fn ensure_keyring_store() {
+        let result = KEYRING_INIT.get_or_init(|| match Store::new() {
+            Ok(store) => {
+                keyring_core::set_default_store(store);
+                Ok(())
+            }
+            Err(err) => Err(format!(
+                "failed to create zbus secret-service keyring store: {err}. \
+                 Ensure DBUS_SESSION_BUS_ADDRESS is set and a secret-service \
+                 provider (gnome-keyring-daemon, KWallet, KeePassXC) is running."
+            )),
+        });
+        if let Err(msg) = result {
+            panic!("{msg}");
+        }
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "login-session", secret_service_keyring))]
+pub(crate) use backend::ensure_keyring_store;
+
+#[cfg(not(all(feature = "login-session", secret_service_keyring)))]
 pub(crate) fn ensure_keyring_store() {}

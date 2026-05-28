@@ -16,6 +16,16 @@
  * under the License.
  */
 
-pub use server_common::diagnostics::print_invalid_io_uring_args_info;
-pub use server_common::diagnostics::print_io_uring_permission_info;
-pub use server_common::diagnostics::print_locked_memory_limit_info;
+#![recursion_limit = "256"]
+
+fn main() {
+    cfg_aliases::cfg_aliases! {
+        secret_service_keyring: { any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ) },
+    }
+}

@@ -37,6 +37,30 @@ repos:
       - id: ruff-format
         files: ^(foreign|bdd|examples)/python/.*\.(py|pyi)$
 
+  # Python type checking
+  - repo: local
+    hooks:
+      - id: pyrefly-foreign-python
+        name: pyrefly (foreign/python)
+        entry: bash -lc 'cd foreign/python && uv run pyrefly check'
+        language: system
+        files: ^foreign/python/.*\.(py|pyi)$
+        pass_filenames: false
+
+      - id: pyrefly-bdd-python
+        name: pyrefly (bdd/python)
+        entry: bash -lc 'cd bdd/python && uv run pyrefly check'
+        language: system
+        files: ^bdd/python/.*\.py$
+        pass_filenames: false
+
+      - id: pyrefly-examples-python
+        name: pyrefly (examples/python)
+        entry: bash -lc 'cd examples/python && uv run pyrefly check'
+        language: system
+        files: ^examples/python/.*\.py$
+        pass_filenames: false
+
   # CI scripts
   - repo: local
     hooks:

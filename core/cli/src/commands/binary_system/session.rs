@@ -16,17 +16,17 @@
  * under the License.
  */
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(keyring_supported)]
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use apple_native_keyring_store::keychain::Store;
-#[cfg(target_os = "linux")]
-use dbus_secret_service_keyring_store::store::Store;
 use keyring_core::{Entry, error::Result};
 use tracing::warn;
 #[cfg(target_os = "windows")]
 use windows_native_keyring_store::store::Store;
+#[cfg(secret_service_keyring)]
+use zbus_secret_service_keyring_store::store::Store;
 
 use crate::commands::cli_command::PRINT_TARGET;
 
@@ -40,7 +40,7 @@ const SESSION_KEYRING_SERVICE_NAME: &str = "iggy-cli-session";
 /// an empty default store and race to install one. `get_default_store()` acts
 /// as the idempotency check, so a transient `Store::new()` failure stays
 /// retryable on the next call.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(keyring_supported)]
 pub fn ensure_default_store() -> Result<()> {
     static INIT_LOCK: Mutex<()> = Mutex::new(());
     let _guard = INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -52,7 +52,7 @@ pub fn ensure_default_store() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(keyring_supported))]
 pub fn ensure_default_store() -> Result<()> {
     Ok(())
 }
