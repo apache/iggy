@@ -135,12 +135,6 @@ jobs:
             export PKG_CONFIG_ALL_STATIC=1
           fi
 
-          # aarch64 musl: disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
-          # references when linking dbus-sys (required by keyring crate)
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            export CFLAGS="-mno-outline-atomics"
-          fi
-
           # musl builds: use musl-gcc as linker to ensure proper linking against musl libc
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
