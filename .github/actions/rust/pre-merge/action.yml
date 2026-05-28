@@ -219,41 +219,14 @@ runs:
 
         source <(cargo llvm-cov show-env --export-prefix)
 
-        # Launch the shared Doris container EARLY (detached) so its ~60-90s
-        # FE/BE boot overlaps the cargo build + test-compile below; we only wait
-        # for it to be healthy just before running tests (by which point it is
-        # usually already up). Gated to Linux + integration in scope. A launch
-        # failure is non-fatal: doris tests fall back to self-booting their own
-        # container. BE 8040 is pinned 1:1 because the FE redirects Stream Load
-        # to 127.0.0.1:8040 (hardcoded in the image entrypoint).
-        DORIS_STARTED=0
-        if [[ "$RUNNER_OS" == "Linux" ]] && { [[ -z "$NEXTEST_FILTER" ]] || echo "$NEXTEST_FILTER" | grep -qi 'integration'; }; then
-          echo "::group::Launch shared Doris container (boots during build)"
-          # ROOT CAUSE of the regression: 4.0.3's start_be.sh hard-`exit 1`s unless
-          # `vm.max_map_count >= 2000000` (the 2.1.0 image had no such gate, which is
-          # why it worked). The runner default is far lower, so the BE died on start;
-          # its death ends the entrypoint's `wait`, the container exits, and every
-          # doris test falls onto the slow per-test self-boot path → 1h timeout.
-          # Raise it on the host (inherited by all containers, shared and self-boot);
-          # reproduced locally that this brings the BE alive. `SKIP_CHECK_ULIMIT`
-          # additionally bypasses start_be.sh's swap/ulimit gates so we needn't
-          # swapoff the runner.
+        # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
+        # This kernel param can only be set on the host (no container can raise it),
+        # so we raise it here. Everything else about booting Doris — image, heap/mem
+        # caps, port mappings, BE-alive wait — lives in the testcontainers fixture
+        # at core/integration/tests/connectors/fixtures/doris/container.rs, so
+        # `cargo test` and CI follow exactly the same path.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
           sudo sysctl -w vm.max_map_count=2000000 || true
-          # Secondary: this boots *concurrently with the cargo build* on a 16GB
-          # runner, and 4.0.3 sizes for a dedicated host (FE 8GB -Xms heap, BE
-          # mem_limit `auto` ≈ 90% of RAM). Cap both (FE 2GB + BE 4GB) so Doris fits
-          # beside the build, ~matching the 2.1.0 footprint. Override the entrypoint
-          # to rewrite the confs, then hand off to the image's normal entry_point.sh.
-          if docker run -d --name iggy-doris-shared \
-              -p 8030 -p 9030 -p 8040:8040 \
-              -e SKIP_CHECK_ULIMIT=true \
-              --entrypoint bash apache/doris:4.0.3-all-slim \
-              -c "sed -i 's/-Xmx8192m -Xms8192m/-Xmx2048m -Xms2048m/' /opt/apache-doris/fe/conf/fe.conf && echo 'mem_limit = 4096M' >> /opt/apache-doris/be/conf/be.conf && exec bash /usr/local/bin/entry_point.sh"; then
-            DORIS_STARTED=1
-          else
-            echo "::warning::Failed to start shared Doris container; doris tests will self-boot"
-          fi
-          echo "::endgroup::"
         fi
 
         bins_start=$(date +%s)
@@ -285,49 +258,6 @@ runs:
           export DBUS_SESSION_BUS_ADDRESS
           eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
-        fi
-
-        # Wait for the Doris container launched before the build to become
-        # healthy, then export its address for the fixtures. After the
-        # multi-minute compile it is usually already up, so this returns
-        # quickly; if it never comes up, warn and let doris tests self-boot.
-        if [[ "$DORIS_STARTED" == "1" ]]; then
-          echo "::group::Wait for shared Doris container"
-          FE_PORT=""
-          for _ in $(seq 1 90); do
-            # `|| FE_PORT=""` is load-bearing: the container may have exited
-            # during boot, and under `set -e`/`pipefail` a non-zero `docker port`
-            # (no such container) would abort the whole step. A dead/unhealthy
-            # shared container must fall back to self-boot, not fail CI.
-            FE_PORT=$(docker port iggy-doris-shared 8030/tcp 2>/dev/null | head -1 | sed 's/.*://') || FE_PORT=""
-            if [[ -n "$FE_PORT" ]] && curl -fsS "http://127.0.0.1:${FE_PORT}/api/health" >/dev/null 2>&1; then
-              break
-            fi
-            FE_PORT=""
-            sleep 2
-          done
-          MYSQL_PORT=$(docker port iggy-doris-shared 9030/tcp 2>/dev/null | head -1 | sed 's/.*://') || MYSQL_PORT=""
-          if [[ -n "$FE_PORT" && -n "$MYSQL_PORT" ]]; then
-            export DORIS_FE_URL="http://127.0.0.1:${FE_PORT}"
-            export DORIS_FE_MYSQL_PORT="${MYSQL_PORT}"
-            echo "Shared Doris ready: FE ${DORIS_FE_URL}, MySQL ${MYSQL_PORT}"
-          else
-            echo "::warning::Shared Doris did not become healthy; doris tests will self-boot"
-            # Diagnostics: why did 4.0.3-all-slim not become healthy as a bare
-            # `docker run` (2.1.0 did, and 4.0.3 self-boots fine via testcontainers)?
-            # Capture container state (Exited? OOMKilled? exit code) and the tail
-            # of its logs so we can tell crash/OOM apart from slow-boot.
-            echo "::group::Shared Doris diagnostics"
-            docker ps -a --filter name=iggy-doris-shared \
-              --format 'status={{.Status}} state={{.State}}' 2>&1 || true
-            docker inspect iggy-doris-shared \
-              --format 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}}' 2>&1 || true
-            echo "--- last 60 lines of container logs ---"
-            docker logs --tail 60 iggy-doris-shared 2>&1 || true
-            echo "::endgroup::"
-            docker rm -f iggy-doris-shared >/dev/null 2>&1 || true
-          fi
-          echo "::endgroup::"
         fi
 
         test_start=$(date +%s)
@@ -376,11 +306,6 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
-      shell: bash
-
-    - name: Stop shared Doris container
-      if: always() && runner.os == 'Linux' && startsWith(inputs.task, 'test-')
-      run: docker rm -f iggy-doris-shared >/dev/null 2>&1 || true
       shell: bash
 
     - name: Backwards compatibility check

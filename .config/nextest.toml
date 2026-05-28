@@ -23,16 +23,12 @@ threads-required = "num-cpus"
 
 # Doris tests are serialized among themselves, but no longer monopolize the
 # whole runner. The all-in-one image's BE advertises 127.0.0.1:8040 for the
-# FE→BE 307 redirect, so only one Doris container can bind host:8040 at a time.
-# A `max-threads = 1` test-group enforces "one Doris test at a time" *across
-# nextest's per-test processes* (an in-process Mutex can't, since each test is
-# its own process) — which is what keeps the self-boot fallback safe — while
-# letting unrelated light tests fill the rest of the runner.
-#
-# In CI a single shared container is started at the job level and its address
-# exported via DORIS_FE_URL (see the rust pre-merge action), so these tests
-# connect instead of booting; the serialization then just orders fast
-# connect+load workloads rather than ~60-90s container boots.
+# FE→BE 307 redirect, so only one Doris container per process can bind
+# host:8040. Within a nextest binary the fixture caches one shared container in
+# `SHARED_DORIS` so the first doris test pays the ~40s boot and the rest reuse
+# it; `max-threads = 1` keeps a second nextest binary (or a re-run) from
+# racing the same host port, while still letting unrelated light tests fill
+# the rest of the runner.
 [test-groups.doris]
 max-threads = 1
 
