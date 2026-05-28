@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM mcr.microsoft.com/devcontainers/python:3.13-bullseye
+FROM mcr.microsoft.com/devcontainers/python:1-3.10-bullseye
 
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv $VIRTUAL_ENV
