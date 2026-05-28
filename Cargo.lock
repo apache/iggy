@@ -517,7 +517,7 @@ dependencies = [
  "arrow-csv",
  "arrow-data 58.3.0",
  "arrow-ipc 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-ord 58.3.0",
  "arrow-row",
  "arrow-schema 58.3.0",
@@ -723,30 +723,6 @@ dependencies = [
  "arrow-schema 58.3.0",
  "arrow-select 58.3.0",
  "flatbuffers",
-]
-
-[[package]]
-name = "arrow-json"
-version = "57.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a84a905f41fedfcd7679813c89a61dc369c0f932b27aa8dcc6aa051cc781a97d"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-buffer 57.3.1",
- "arrow-cast 57.3.1",
- "arrow-data 57.3.1",
- "arrow-schema 57.3.1",
- "chrono",
- "half",
- "indexmap 2.14.0",
- "itoa",
- "lexical-core",
- "memchr",
- "num-traits",
- "ryu",
- "serde_core",
- "serde_json",
- "simdutf8",
 ]
 
 [[package]]
@@ -3835,7 +3811,7 @@ dependencies = [
  "arrow-buffer 58.3.0",
  "arrow-cast 58.3.0",
  "arrow-ipc 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-ord 58.3.0",
  "arrow-row",
  "arrow-schema 58.3.0",
@@ -5088,8 +5064,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -6212,7 +6188,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -6779,7 +6755,7 @@ dependencies = [
 name = "iggy_connector_iceberg_sink"
 version = "0.4.1-edge.1"
 dependencies = [
- "arrow-json 57.3.1",
+ "arrow-json",
  "async-trait",
  "dashmap",
  "iceberg",
