@@ -73,6 +73,11 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
             messages_sent: Some(context.metrics.get_messages_sent(&source.key)),
             messages_consumed: None,
             messages_processed: None,
+            messages_filtered: Some(
+                context
+                    .metrics
+                    .get_messages_filtered(&source.key, ConnectorType::Source),
+            ),
             errors: context
                 .metrics
                 .get_errors(&source.key, ConnectorType::Source),
@@ -94,6 +99,11 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
             messages_sent: None,
             messages_consumed: Some(context.metrics.get_messages_consumed(&sink.key)),
             messages_processed: Some(context.metrics.get_messages_processed(&sink.key)),
+            messages_filtered: Some(
+                context
+                    .metrics
+                    .get_messages_filtered(&sink.key, ConnectorType::Sink),
+            ),
             errors: context.metrics.get_errors(&sink.key, ConnectorType::Sink),
         });
     }

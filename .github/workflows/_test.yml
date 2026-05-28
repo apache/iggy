@@ -97,6 +97,13 @@ jobs:
           verbose: true
           override_pr: ${{ github.event.pull_request.number }}
 
+      # PHP SDK
+      - name: Run PHP SDK task
+        if: inputs.component == 'sdk-php'
+        uses: ./.github/actions/php/pre-merge
+        with:
+          task: ${{ inputs.task }}
+
       # Node SDK
       - name: Run Node SDK task
         if: inputs.component == 'sdk-node'

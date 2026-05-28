@@ -21,7 +21,7 @@ use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
-use iggy_cli::commands::binary_system::session::ServerSession;
+use iggy_cli::commands::binary_system::session::{ServerSession, ensure_default_store};
 use passterm::{Stream, isatty, prompt_password_tty};
 use secrecy::{ExposeSecret, SecretString};
 use std::env::var;
@@ -29,7 +29,7 @@ use std::env::var;
 #[cfg(feature = "login-session")]
 mod credentials_login_session {
     pub(crate) use iggy_cli::commands::cli_command::PRINT_TARGET;
-    pub(crate) use keyring::Entry;
+    pub(crate) use keyring_core::Entry;
     pub(crate) use tracing::{Level, event};
 }
 
@@ -91,6 +91,7 @@ impl<'a> IggyCredentials<'a> {
                     let server_address = format!("iggy:{server_address}");
                     event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
                     server_address, token_name);
+                    ensure_default_store()?;
                     let entry = Entry::new(&server_address, token_name)?;
                     let token = entry.get_password()?;
 

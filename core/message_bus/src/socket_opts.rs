@@ -23,9 +23,10 @@
 //! than by `SO_KEEPALIVE`. Only `TCP_NODELAY` toggling lives in this
 //! module today.
 
-use compio::net::TcpStream;
-use socket2::SockRef;
+use compio::net::{TcpListener, TcpStream};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::io;
+use std::net::SocketAddr;
 
 /// Disable Nagle on a per-connection socket.
 ///
@@ -42,4 +43,68 @@ use std::io;
 /// Nagle-delayed frame on the soft-failure path.
 pub fn apply_nodelay_for_connection(stream: &TcpStream) -> io::Result<()> {
     SockRef::from(stream).set_tcp_nodelay(true)
+}
+
+/// Build a TCP listener compatible with the harness's pre-bound reservation
+/// sockets.
+///
+/// Only shard 0 binds the real listener; `SO_REUSEPORT` is enabled here solely
+/// so the server process can claim a port already held open by the integration
+/// harness during startup.
+///
+/// TODO: remove `SO_REUSEPORT` again once the integration harness stops
+/// holding placeholder reservation sockets open across child startup.
+pub fn bind_reusable_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
+    ))]
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(libc::SOMAXCONN)?;
+    socket.set_nonblocking(true)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_reusable_tcp_listener;
+    use compio::runtime::Runtime;
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn reusable_tcp_listener_can_bind_over_reserved_port() {
+        let reserve_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+        let socket = Socket::new(
+            Domain::for_address(reserve_addr),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .expect("reserve socket");
+        socket.set_reuse_address(true).expect("reserve reuseaddr");
+        #[cfg(all(
+            unix,
+            not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
+        ))]
+        socket.set_reuse_port(true).expect("reserve reuseport");
+        socket.bind(&reserve_addr.into()).expect("reserve bind");
+        socket.listen(1).expect("reserve listen");
+        let addr = socket
+            .local_addr()
+            .expect("reserve local addr")
+            .as_socket()
+            .expect("socket addr");
+
+        let runtime = Runtime::new().expect("runtime");
+        runtime.enter(|| {
+            let listener = bind_reusable_tcp_listener(addr)
+                .expect("second listener should bind on reserved port");
+            assert_eq!(listener.local_addr().expect("listener addr"), addr);
+        });
+    }
 }

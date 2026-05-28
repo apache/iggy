@@ -216,7 +216,7 @@ impl PostgresSink {
         sql.push_str(&format!(", payload {payload_type}"));
         sql.push_str(", created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())");
 
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(pool)
             .await
             .map_err(|e| Error::InitError(format!("Failed to create table '{table_name}': {e}")))?;
@@ -368,7 +368,7 @@ impl PostgresSink {
         include_origin_timestamp: bool,
         payload_format: PayloadFormat,
     ) -> Result<(), (sqlx::Error, bool)> {
-        let mut query_builder = sqlx::query(query);
+        let mut query_builder = sqlx::query(sqlx::AssertSqlSafe(query));
 
         for message in messages {
             let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {

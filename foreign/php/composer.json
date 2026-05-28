@@ -1,0 +1,15 @@
+{
+    "name": "apache/iggy-php",
+    "description": "PHP extension bindings for Apache Iggy.",
+    "license": "Apache-2.0",
+    "type": "library",
+    "require": {
+        "php": ">=8.3"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5"
+    },
+    "scripts": {
+        "test": "phpunit"
+    }
+}
