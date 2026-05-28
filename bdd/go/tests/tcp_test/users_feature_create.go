@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -29,6 +31,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 
 			username := createRandomString(16)
 			_, err := client.CreateUser(
+				context.Background(),
 				username,
 				createRandomString(16),
 				iggcon.Active,
@@ -83,6 +86,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 
 			username := createRandomString(16)
 			_, err := client.CreateUser(
+				context.Background(),
 				username,
 				createRandomString(16),
 				iggcon.Active,
@@ -116,6 +120,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 			client := createClient()
 
 			_, err := client.CreateUser(
+				context.Background(),
 				createRandomString(16),
 				createRandomString(16),
 				iggcon.Active,

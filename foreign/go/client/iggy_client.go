@@ -21,6 +21,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
@@ -54,10 +56,14 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 
 type IggyClient struct {
 	iggcon.Client
-	cancel context.CancelFunc
+	cancel             context.CancelFunc
+	wg                 sync.WaitGroup
+	heartbeatInterval  time.Duration
+	heartbeatTriggered atomic.Bool
 }
 
-// NewIggyClient create the IggyClient instance.
+// NewIggyClient creates the IggyClient instance without connecting.
+// Call Connect to establish the connection to the server.
 // If no Option is provided, NewIggyClient will create a default TCP client.
 func NewIggyClient(options ...Option) (iggcon.Client, error) {
 	opts := GetDefaultOptions()
@@ -66,42 +72,56 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 		opt(&opts)
 	}
 
-	var err error
 	var cli iggcon.Client
 	switch opts.protocol {
 	case iggcon.Tcp:
-		cli, err = tcp.NewIggyTcpClient(opts.tcpOptions...)
+		cli = tcp.NewIggyTcpClient(opts.tcpOptions...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to create an iggy client: %w", err)
+	ic := &IggyClient{
+		Client:            cli,
+		cancel:            func() {},
+		heartbeatInterval: opts.heartbeatInterval,
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	heartbeatInterval := opts.heartbeatInterval
-	if heartbeatInterval > 0 {
+	return ic, nil
+}
+
+// Connect establishes the connection to the server and starts the heartbeat loop if not started.
+func (ic *IggyClient) Connect(ctx context.Context) error {
+	if err := ic.Client.Connect(ctx); err != nil {
+		return err
+	}
+	if ic.heartbeatTriggered.Swap(true) {
+		return nil
+	}
+	if ic.heartbeatInterval > 0 {
+		lifetimeCtx, cancel := context.WithCancel(context.Background())
+		ic.cancel = cancel
+		ic.wg.Add(1)
 		go func() {
-			ticker := time.NewTicker(heartbeatInterval)
+			defer ic.wg.Done()
+			ticker := time.NewTicker(ic.heartbeatInterval)
 			defer ticker.Stop()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-lifetimeCtx.Done():
 					return
 				case <-ticker.C:
-					if err := cli.Ping(); err != nil {
+					pingCtx, pingCancel := context.WithTimeout(lifetimeCtx, ic.heartbeatInterval/2)
+					if err := ic.Ping(pingCtx); err != nil {
 						log.Printf("[WARN] heartbeat failed: %v", err)
 					}
+					pingCancel()
 				}
 			}
 		}()
 	}
-	return &IggyClient{
-		Client: cli,
-		cancel: cancel,
-	}, nil
+	return nil
 }
 
 func (ic *IggyClient) Close() error {
 	ic.cancel()
+	ic.wg.Wait()
 	return ic.Client.Close()
 }

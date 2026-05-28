@@ -9,11 +9,6 @@ source = { directory = "../../foreign/python" }
 
 [package.metadata]
 requires-dist = [
-    { name = "black", marker = "extra == 'all'", specifier = ">=23.0,<27.0" },
-    { name = "black", marker = "extra == 'dev'", specifier = ">=23.0,<27.0" },
-    { name = "isort", marker = "extra == 'all'", specifier = ">=5.12.0,<6.0" },
-    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.12.0,<6.0" },
-    { name = "loguru", marker = "extra == 'all'", specifier = ">=0.7.0,<1.0" },
     { name = "maturin", marker = "extra == 'all'", specifier = ">=1.2,<2.0" },
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.2,<2.0" },
     { name = "mypy", marker = "extra == 'all'", specifier = ">=1.5.0,<2.0" },
@@ -30,8 +25,8 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'testing'", specifier = ">=3.0,<4.0" },
     { name = "ruff", marker = "extra == 'all'", specifier = ">=0.1.0,<1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0,<1.0" },
-    { name = "testcontainers", extras = ["docker"], marker = "extra == 'all'", specifier = ">=3.7.0,<5.0" },
-    { name = "testcontainers", extras = ["docker"], marker = "extra == 'testing-docker'", specifier = ">=3.7.0,<5.0" },
+    { name = "testcontainers", marker = "extra == 'all'", specifier = ">=3.7.0,<5.0" },
+    { name = "testcontainers", marker = "extra == 'testing-docker'", specifier = ">=3.7.0,<5.0" },
 ]
 provides-extras = ["testing", "testing-docker", "dev", "all"]
 

@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -31,7 +33,7 @@ var _ = ginkgo.Describe("GET USER:", func() {
 			userIdentifier, _ := iggcon.NewIdentifier(userId)
 			defer deleteUserAfterTests(userIdentifier, client)
 
-			users, err := client.GetUsers()
+			users, err := client.GetUsers(context.Background())
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificUser(name, users)
@@ -41,7 +43,7 @@ var _ = ginkgo.Describe("GET USER:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to all get users", func() {
 			client := createClient()
-			_, err := client.GetUsers()
+			_, err := client.GetUsers(context.Background())
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

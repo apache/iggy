@@ -18,14 +18,16 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetTopics(streamId iggcon.Identifier) ([]iggcon.Topic, error) {
-	buffer, err := c.do(&command.GetTopics{StreamId: streamId})
+func (c *IggyTcpClient) GetTopics(ctx context.Context, streamId iggcon.Identifier) ([]iggcon.Topic, error) {
+	buffer, err := c.do(ctx, &command.GetTopics{StreamId: streamId})
 	if err != nil {
 		return nil, err
 	}
@@ -33,8 +35,8 @@ func (c *IggyTcpClient) GetTopics(streamId iggcon.Identifier) ([]iggcon.Topic, e
 	return binaryserialization.DeserializeTopics(buffer)
 }
 
-func (c *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Identifier) (*iggcon.TopicDetails, error) {
-	buffer, err := c.do(&command.GetTopic{StreamId: streamId, TopicId: topicId})
+func (c *IggyTcpClient) GetTopic(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier) (*iggcon.TopicDetails, error) {
+	buffer, err := c.do(ctx, &command.GetTopic{StreamId: streamId, TopicId: topicId})
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +53,7 @@ func (c *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Iden
 }
 
 func (c *IggyTcpClient) CreateTopic(
+	ctx context.Context,
 	streamId iggcon.Identifier,
 	name string,
 	partitionsCount uint32,
@@ -69,7 +72,7 @@ func (c *IggyTcpClient) CreateTopic(
 		return nil, ierror.ErrInvalidReplicationFactor
 	}
 
-	buffer, err := c.do(&command.CreateTopic{
+	buffer, err := c.do(ctx, &command.CreateTopic{
 		StreamId:             streamId,
 		Name:                 name,
 		PartitionsCount:      partitionsCount,
@@ -86,6 +89,7 @@ func (c *IggyTcpClient) CreateTopic(
 }
 
 func (c *IggyTcpClient) UpdateTopic(
+	ctx context.Context,
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
 	name string,
@@ -100,7 +104,7 @@ func (c *IggyTcpClient) UpdateTopic(
 	if replicationFactor != nil && *replicationFactor == 0 {
 		return ierror.ErrInvalidReplicationFactor
 	}
-	_, err := c.do(&command.UpdateTopic{
+	_, err := c.do(ctx, &command.UpdateTopic{
 		StreamId:             streamId,
 		TopicId:              topicId,
 		CompressionAlgorithm: compressionAlgorithm,
@@ -112,7 +116,7 @@ func (c *IggyTcpClient) UpdateTopic(
 	return err
 }
 
-func (c *IggyTcpClient) DeleteTopic(streamId, topicId iggcon.Identifier) error {
-	_, err := c.do(&command.DeleteTopic{StreamId: streamId, TopicId: topicId})
+func (c *IggyTcpClient) DeleteTopic(ctx context.Context, streamId, topicId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.DeleteTopic{StreamId: streamId, TopicId: topicId})
 	return err
 }

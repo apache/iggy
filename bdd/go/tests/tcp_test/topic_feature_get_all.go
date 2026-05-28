@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -31,7 +33,7 @@ var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			topics, err := client.GetTopics(streamIdentifier)
+			topics, err := client.GetTopics(context.Background(), streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificTopic(topicId, name, topics)
@@ -41,7 +43,7 @@ var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to get all topics", func() {
 			client := createClient()
-			_, err := client.GetTopics(randomU32Identifier())
+			_, err := client.GetTopics(context.Background(), randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})
