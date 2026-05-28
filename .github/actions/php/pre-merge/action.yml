@@ -26,9 +26,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Free runner disk space
-      uses: ./.github/actions/utils/free-disk-space
-
     - name: Install PHP build dependencies
       shell: bash
       run: |

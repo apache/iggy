@@ -32,7 +32,16 @@ runs:
         df -h
         before=$(df --output=avail -B1 / | tail -n1)
         start=$(date +%s)
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        paths=(/usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL)
+        # Skip /usr/share/dotnet when actions/setup-dotnet has provisioned it
+        # (DOTNET_ROOT set or `dotnet` already on PATH); removing it breaks
+        # subsequent dotnet invocations.
+        if [ -z "${DOTNET_ROOT:-}" ] && ! command -v dotnet >/dev/null 2>&1; then
+          paths+=(/usr/share/dotnet)
+        else
+          echo "Keeping /usr/share/dotnet (DOTNET_ROOT=${DOTNET_ROOT:-unset}, dotnet on PATH=$(command -v dotnet || echo no))"
+        fi
+        sudo rm -rf "${paths[@]}"
         # Uncomment these if more space is needed
         # sudo docker image prune --all --force
         # sudo docker builder prune -a
