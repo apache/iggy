@@ -26,6 +26,7 @@ import asyncio
 import os
 
 import pytest
+
 from apache_iggy import IggyClient
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
@@ -81,7 +82,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "unit: marks tests as unit tests (fast)")
 
 
-def pytest_collection_modifyitems(config, items):
+def pytest_collection_modifyitems(items):
     """Modify test collection to add markers automatically."""
     for item in items:
         # Mark all tests in test_iggy_sdk.py as integration tests

@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -25,7 +27,7 @@ var _ = ginkgo.Describe("LOGOUT FEATURE:", func() {
 	ginkgo.When("User is logged in", func() {
 		ginkgo.Context("and tries to log out", func() {
 			client := createAuthorizedConnection()
-			err := client.LogoutUser()
+			err := client.LogoutUser(context.Background())
 
 			itShouldNotReturnError(err)
 		})
@@ -34,7 +36,7 @@ var _ = ginkgo.Describe("LOGOUT FEATURE:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to log out", func() {
 			client := createClient()
-			err := client.LogoutUser()
+			err := client.LogoutUser(context.Background())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

@@ -19,12 +19,13 @@
 use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
 use crate::binary::handlers::streams::get_stream_handler::build_topic_header;
 use crate::metadata::TopicMeta;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::topics::GetTopicRequest;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::debug;
 

@@ -424,6 +424,10 @@ fn generate_harness_setup(
     // Always add extra_envs (may be empty)
     server_builder_calls.push(quote!(.extra_envs(__extra_envs)));
 
+    if let Some(ref executable_path) = attrs.server.executable_path {
+        server_builder_calls.push(quote!(.executable_path(#executable_path)));
+    }
+
     // If a config_path is specified, inject IGGY_CONFIG_PATH into extra_envs
     let config_path_setup = if let Some(ref config_path) = attrs.server.config_path {
         quote! {

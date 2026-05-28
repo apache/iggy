@@ -17,6 +17,7 @@
  */
 
 use crate::configs::websocket::WebSocketConfig;
+use crate::sender::{SenderKind, WebSocketSender};
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
@@ -25,8 +26,8 @@ use compio::net::{SocketOpts, TcpListener};
 use compio::ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
+use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
-use iggy_common::{IggyError, SenderKind, WebSocketSender};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{debug, error, info};

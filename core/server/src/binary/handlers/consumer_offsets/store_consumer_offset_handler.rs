@@ -20,12 +20,12 @@ use std::rc::Rc;
 
 use crate::binary::dispatch::{HandlerResult, wire_consumer_to_consumer, wire_id_to_identifier};
 use crate::binary::handlers::consumer_offsets::COMPONENT;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use tracing::debug;
 
 pub async fn handle_store_consumer_offset(

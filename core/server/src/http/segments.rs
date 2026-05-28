@@ -31,9 +31,9 @@ use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::delete_segments::DeleteSegments;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::wire_conversions::identifier_to_wire;
 use send_wrapper::SendWrapper;
+use server_common::sharding::IggyNamespace;
 use std::sync::Arc;
 use tracing::instrument;
 

@@ -34,6 +34,7 @@ use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
 };
 use serde::{Deserialize, Serialize};
+use server_common::sharding::IggyNamespace;
 use slab::Slab;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -313,6 +314,27 @@ impl Streams {
     }
 
     #[must_use]
+    pub fn namespace_from_partition(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        partition_id: u32,
+    ) -> Option<IggyNamespace> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let stream = inner.items.get(stream_id)?;
+            let topic = stream.topics.get(topic_id)?;
+            let partition_id = usize::try_from(partition_id).ok()?;
+            topic
+                .partitions
+                .iter()
+                .any(|partition| partition.id == partition_id)
+                .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
+        })
+    }
+
+    #[must_use]
     pub fn highest_partition_consensus_group_id(&self) -> u64 {
         self.inner.read(|inner| {
             inner
@@ -330,7 +352,7 @@ impl Streams {
 // TODO(hubcio): Serialize proper reply (e.g. assigned stream ID) instead of empty Bytes.
 impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if state.index.contains_key(&name_arc) {
             return Bytes::new();
@@ -339,7 +361,7 @@ impl StateHandler for CreateStreamRequest {
         let stream = Stream {
             id: 0,
             name: name_arc.clone(),
-            created_at: IggyTimestamp::now(),
+            created_at: timestamp,
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -356,7 +378,7 @@ impl StateHandler for CreateStreamRequest {
 
 impl StateHandler for UpdateStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return Bytes::new();
         };
@@ -380,7 +402,7 @@ impl StateHandler for UpdateStreamRequest {
 
 impl StateHandler for DeleteStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return Bytes::new();
         };
@@ -397,7 +419,7 @@ impl StateHandler for DeleteStreamRequest {
 
 impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, _state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         // TODO
         todo!();
     }
@@ -406,7 +428,7 @@ impl StateHandler for PurgeStreamRequest {
 // TODO(hubcio): Serialize proper reply (e.g. assigned topic ID) instead of empty Bytes.
 impl StateHandler for CreateTopicWithAssignmentsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
         };
@@ -428,7 +450,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let topic = Topic {
             id: 0,
             name: name_arc.clone(),
-            created_at: IggyTimestamp::now(),
+            created_at: timestamp,
             replication_factor,
             message_expiry: IggyExpiry::from(self.request.message_expiry),
             compression_algorithm: CompressionAlgorithm::from_code(
@@ -449,7 +471,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                 let partition = Partition {
                     id: partition.partition_id as usize,
                     consensus_group_id: partition.consensus_group_id,
-                    created_at: IggyTimestamp::now(),
+                    created_at: timestamp,
                 };
                 topic.partitions.push(partition);
             }
@@ -462,7 +484,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
 
 impl StateHandler for UpdateTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return Bytes::new();
         };
@@ -500,7 +522,7 @@ impl StateHandler for UpdateTopicRequest {
 
 impl StateHandler for DeleteTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return Bytes::new();
         };
@@ -522,7 +544,7 @@ impl StateHandler for DeleteTopicRequest {
 
 impl StateHandler for PurgeTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, _state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         // TODO
         todo!();
     }
@@ -531,7 +553,7 @@ impl StateHandler for PurgeTopicRequest {
 // TODO(hubcio): Serialize proper reply (e.g. assigned partition IDs) instead of empty Bytes.
 impl StateHandler for CreatePartitionsWithAssignmentsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
         };
@@ -568,7 +590,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             let partition = Partition {
                 id: partition_id,
                 consensus_group_id: partition.consensus_group_id,
-                created_at: IggyTimestamp::now(),
+                created_at: timestamp,
             };
             topic.partitions.push(partition);
         }
@@ -578,7 +600,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
 
 impl StateHandler for DeletePartitionsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return Bytes::new();
         };
@@ -770,7 +792,7 @@ mod tests {
         let request = CreateStreamRequest {
             name: WireName::new(name).unwrap(),
         };
-        let _ = StateHandler::apply(&request, inner);
+        let _ = StateHandler::apply(&request, inner, IggyTimestamp::now());
     }
 
     fn make_topic_request(
@@ -806,7 +828,7 @@ mod tests {
                 },
             ],
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner);
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
         let streams: Streams = inner.into();
 
         assert_eq!(
@@ -833,7 +855,7 @@ mod tests {
                 },
             ],
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner);
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
             request: WireCreatePartitionsRequest {
@@ -852,7 +874,7 @@ mod tests {
                 },
             ],
         };
-        let _ = StateHandler::apply(&create_partitions, &mut inner);
+        let _ = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
 
         assert_eq!(inner.items[0].topics[0].partitions.len(), 4);
         assert_eq!(inner.items[0].topics[0].partitions[2].id, 2);

@@ -16,15 +16,11 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
-};
-use iggy_binary_protocol::requests::personal_access_tokens::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
@@ -38,12 +34,15 @@ use iggy_binary_protocol::requests::users::{
     UpdateUserRequest,
 };
 use iggy_binary_protocol::{
-    AckLevel, Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
+    AckLevel, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
-use iggy_common::send_messages2::{
-    IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
+use server_common::sharding::IggyNamespace;
+use server_common::{
+    Message,
+    iobuf::Owned,
+    send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned},
 };
-use iggy_common::sharding::IggyNamespace;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
@@ -376,8 +375,14 @@ impl SimClient {
     /// Panics if `name` is not a valid `WireName`.
     pub fn create_personal_access_token(&self, name: &str, expiry: u64) -> Message<RequestHeader> {
         let wire = CreatePersonalAccessTokenRequest {
+            user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
             expiry,
+            // Deterministic stub for the simulator. Production servers mint
+            // this in `maybe_rewrite_pat_request` on the primary; the
+            // simulator drives the wire path directly without that rewrite
+            // step.
+            token_hash: [b'a'; 64],
         };
         self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes())
     }
@@ -386,6 +391,7 @@ impl SimClient {
     /// Panics if `name` is not a valid `WireName`.
     pub fn delete_personal_access_token(&self, name: &str) -> Message<RequestHeader> {
         let wire = DeletePersonalAccessTokenRequest {
+            user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())

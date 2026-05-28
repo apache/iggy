@@ -193,9 +193,7 @@ fn spawn_shutdown_watchdog(
 #[allow(clippy::future_not_send)]
 async fn reader_loop(
     mut read_half: OwnedReadHalf<TcpStream>,
-    in_tx: async_channel::Sender<
-        iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
-    >,
+    in_tx: async_channel::Sender<server_common::Message<iggy_binary_protocol::GenericHeader>>,
     max_message_size: usize,
     label: &'static str,
     peer: String,
@@ -292,9 +290,10 @@ mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
     use async_channel::bounded;
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use server_common::MESSAGE_ALIGN;
+    use server_common::Message;
+    use server_common::iobuf::Frozen;
     use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]

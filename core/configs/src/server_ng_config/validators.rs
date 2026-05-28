@@ -31,8 +31,8 @@ use super::COMPONENT_NG;
 use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
+use server_common::sharding::IggyNamespace;
 
 impl Validatable<ConfigurationError> for ServerNgConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {

@@ -40,6 +40,7 @@ pub mod io;
 pub mod log;
 pub mod metadata;
 pub mod quic;
+pub mod sender;
 pub mod server_error;
 pub mod shard;
 pub mod shard_allocator;

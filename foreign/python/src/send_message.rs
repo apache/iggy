@@ -26,7 +26,6 @@ use pyo3_stub_gen::{
 use std::str::FromStr;
 
 /// A Python class representing a message to be sent.
-///
 /// This class wraps a Rust message meant for sending, facilitating
 /// the creation of such messages from Python and their subsequent use in Rust.
 #[pyclass(from_py_object)]
@@ -60,7 +59,6 @@ impl Clone for SendMessage {
 #[pymethods]
 impl SendMessage {
     /// Constructs a new `SendMessage` instance from a string or bytes.
-    ///
     /// This method allows for the creation of a `SendMessage` instance
     /// directly from Python using the provided string or bytes data.
     #[new]

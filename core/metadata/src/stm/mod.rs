@@ -87,9 +87,14 @@ pub trait Command {
 /// Per-command handler for a given state type.
 /// Each command struct implements this for the state it mutates.
 /// Returns a `Bytes` response that will be threaded into the Reply message.
+///
+/// `timestamp` is the primary's stamp from the enclosing `PrepareHeader`,
+/// replicated identically to every replica. Handlers that record a wall-clock
+/// instant in state MUST use this value (not `IggyTimestamp::now()`) so the
+/// state-machine apply remains deterministic across replicas.
 pub trait StateHandler {
     type State;
-    fn apply(&self, state: &mut Self::State) -> Bytes;
+    fn apply(&self, state: &mut Self::State, timestamp: iggy_common::IggyTimestamp) -> Bytes;
 }
 
 #[derive(Debug)]
@@ -381,13 +386,13 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation([<$operation Request>]),
+                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
                 )*
             }
 
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
-                type Input = ::iggy_binary_protocol::Message<::iggy_binary_protocol::PrepareHeader>;
+                type Input = ::server_common::Message<::iggy_binary_protocol::PrepareHeader>;
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
@@ -404,7 +409,8 @@ macro_rules! collect_handlers {
                                 );
                                 let cmd = [<$operation Request>]::decode_from(&body)
                                     .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
-                                Ok(Either::Left([<$state Command>]::$operation(cmd)))
+                                let ts = ::iggy_common::IggyTimestamp::from(header.timestamp);
+                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts)))
                             },
                         )*
                         _ => Ok(Either::Right(input)),
@@ -416,8 +422,8 @@ macro_rules! collect_handlers {
                 fn dispatch(&mut self, cmd: &[<$state Command>]) {
                     self.last_result = Some(match cmd {
                         $(
-                            [<$state Command>]::$operation(payload) => {
-                                $crate::stm::StateHandler::apply(payload, self)
+                            [<$state Command>]::$operation(payload, ts) => {
+                                $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
                     });

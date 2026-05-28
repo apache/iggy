@@ -92,6 +92,7 @@ secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+server_common = { workspace = true }
 server_runtime = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }

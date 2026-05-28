@@ -28,8 +28,9 @@
 //! dispatch table so the surface compiles, and so the v2.4 outcome-
 //! expansion lands cleanly when the shadow is upgraded.
 
-use iggy_binary_protocol::{Message, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{ReplyHeader, RequestHeader};
 use rand_xoshiro::Xoshiro256Plus;
+use server_common::Message;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;

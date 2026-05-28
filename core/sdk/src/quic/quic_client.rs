@@ -18,6 +18,10 @@
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
+#[cfg(feature = "vsr")]
+use crate::session::ConsensusSession;
+#[cfg(feature = "vsr")]
+use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
 use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
@@ -25,6 +29,8 @@ use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     QuicConnectionStringOptions, TransportProtocol, validate_server_address,
@@ -36,12 +42,16 @@ use secrecy::ExposeSecret;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
@@ -56,6 +66,12 @@ pub struct QuicClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
+    // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
+    // `std::sync::Mutex` rationale (pure-CPU critical section).
+    consensus_session: Arc<StdMutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
+    skip_auto_login_once: Mutex<bool>,
 }
 
 unsafe impl Send for QuicClient {}
@@ -126,18 +142,66 @@ impl BinaryTransport for QuicClient {
             return Err(IggyError::Disconnected);
         }
 
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
         self.disconnect().await?;
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
         let server_address = self.current_server_address.lock().await.to_string();
         info!(
             "Reconnecting to the server: {}, by client: {}",
             server_address, self.config.client_address
         );
-        self.connect().await?;
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
         self.send_raw(code, payload).await
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
+    }
+}
+
+#[cfg(feature = "vsr")]
+impl iggy_common::VsrSessionSealed for QuicClient {}
+
+#[cfg(feature = "vsr")]
+#[async_trait::async_trait]
+impl iggy_common::VsrSessionControl for QuicClient {
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidSession(session));
+        }
+
+        let mut consensus_session = self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned");
+        if consensus_session.is_bound() {
+            return Err(IggyError::AlreadyAuthenticated);
+        }
+
+        consensus_session.bind(session);
+        Ok(())
+    }
+
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        *self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        Ok(())
     }
 }
 
@@ -205,6 +269,10 @@ impl QuicClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
+            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
+            skip_auto_login_once: Mutex::new(false),
         })
     }
 
@@ -234,34 +302,43 @@ impl QuicClient {
             return Err(IggyError::EmptyResponse);
         }
 
-        let status = u32::from_le_bytes(
-            buffer[..4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        if status != 0 {
-            error!(
-                "Received an invalid response with status: {} ({}).",
-                status,
-                IggyError::from_code_as_string(status)
+        #[cfg(feature = "vsr")]
+        {
+            crate::vsr::decode_response(Bytes::from(buffer))
+        }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            let status = u32::from_le_bytes(
+                buffer[..4]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
+            if status != 0 {
+                error!(
+                    "Received an invalid response with status: {} ({}).",
+                    status,
+                    IggyError::from_code_as_string(status)
+                );
 
-            return Err(IggyError::from_code(status));
+                return Err(IggyError::from_code(status));
+            }
+
+            let length = u32::from_le_bytes(
+                buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            );
+            trace!("Status: OK. Response length: {}", length);
+            if length <= 1 {
+                return Ok(Bytes::new());
+            }
+
+            Ok(Bytes::copy_from_slice(
+                &buffer[RESPONSE_INITIAL_BYTES_LENGTH
+                    ..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
+            ))
         }
-
-        let length = u32::from_le_bytes(
-            buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        trace!("Status: OK. Response length: {}", length);
-        if length <= 1 {
-            return Ok(Bytes::new());
-        }
-
-        Ok(Bytes::copy_from_slice(
-            &buffer[RESPONSE_INITIAL_BYTES_LENGTH..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
-        ))
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
@@ -376,6 +453,12 @@ impl QuicClient {
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
 
+            #[cfg(feature = "vsr")]
+            let skip_auto_login = {
+                let mut guard = self.skip_auto_login_once.lock().await;
+                std::mem::take(&mut *guard)
+            };
+
             // Handle auto-login
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
@@ -383,32 +466,67 @@ impl QuicClient {
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
-                    info!(
-                        "{NAME} client: {} is signing in...",
-                        self.config.client_address
-                    );
-                    self.set_state(ClientState::Authenticating).await;
-                    match credentials {
-                        Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password.expose_secret()).await?;
-                            self.publish_event(DiagnosticEvent::SignedIn).await;
-                            info!(
-                                "{NAME} client: {} has signed in with the user credentials, username: {username}",
-                                self.config.client_address
-                            );
+                    #[cfg(feature = "vsr")]
+                    if skip_auto_login {
+                        info!("Skipping automatic sign-in for a retried login/register request.");
+                        false
+                    } else {
+                        info!(
+                            "{NAME} client: {} is signing in...",
+                            self.config.client_address
+                        );
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                                    self.config.client_address
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with a personal access token.",
+                                    self.config.client_address
+                                );
+                            }
                         }
-                        Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token.expose_secret())
-                                .await?;
-                            self.publish_event(DiagnosticEvent::SignedIn).await;
-                            info!(
-                                "{NAME} client: {} has signed in with a personal access token.",
-                                self.config.client_address
-                            );
-                        }
-                    }
 
-                    self.handle_leader_redirection().await?
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
+                    {
+                        info!(
+                            "{NAME} client: {} is signing in...",
+                            self.config.client_address
+                        );
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                                    self.config.client_address
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with a personal access token.",
+                                    self.config.client_address
+                                );
+                            }
+                        }
+
+                        self.handle_leader_redirection().await?
+                    }
                 }
             };
 
@@ -469,6 +587,8 @@ impl QuicClient {
         }
 
         self.endpoint.wait_idle().await;
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} QUIC client has been shutdown.");
@@ -487,6 +607,8 @@ impl QuicClient {
         self.set_state(ClientState::Disconnected).await;
         self.connection.lock().await.take();
         self.endpoint.wait_idle().await;
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!(
@@ -521,30 +643,68 @@ impl QuicClient {
 
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
+        #[cfg(feature = "vsr")]
+        let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
             if let Some(connection) = connection.as_ref() {
+                #[cfg(feature = "vsr")]
+                let (request_header, request_size) = {
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                };
+                #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                 let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                     error!("Failed to open a bidirectional stream: {error}");
                     IggyError::QuicError
                 })?;
                 trace!("Sending a QUIC request with code: {code}");
+                #[cfg(feature = "vsr")]
+                trace!(
+                    "Sending a QUIC VSR request of size {} with code: {code}",
+                    request_size
+                );
+                #[cfg(feature = "vsr")]
+                send.write_all(bytemuck::bytes_of(&request_header))
+                    .await
+                    .map_err(|error| {
+                        error!("Failed to write VSR request header: {error}");
+                        IggyError::QuicError
+                    })?;
+                #[cfg(feature = "vsr")]
+                if !payload.is_empty() {
+                    send.write_all(&payload).await.map_err(|error| {
+                        error!("Failed to write VSR request payload: {error}");
+                        IggyError::QuicError
+                    })?;
+                }
+                #[cfg(feature = "vsr")]
+                send.finish().map_err(|error| {
+                    error!("Failed to finish VSR request stream: {error}");
+                    IggyError::QuicError
+                })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&(payload_length as u32).to_le_bytes())
                     .await
                     .map_err(|error| {
                         error!("Failed to write payload length: {error}");
                         IggyError::QuicError
                     })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&code.to_le_bytes()).await.map_err(|error| {
                     error!("Failed to write payload code: {error}");
                     IggyError::QuicError
                 })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&payload).await.map_err(|error| {
                     error!("Failed to write payload: {error}");
                     IggyError::QuicError
                 })?;
+                #[cfg(not(feature = "vsr"))]
                 send.finish().map_err(|error| {
                     error!("Failed to finish sending data: {error}");
                     IggyError::QuicError
@@ -562,6 +722,11 @@ impl QuicClient {
             IggyError::QuicError
         })?
     }
+}
+
+#[cfg(feature = "vsr")]
+const fn is_login_register_code(code: u32) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
 
 fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
