@@ -43,8 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Cleanup disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Free runner disk space
+        uses: ./.github/actions/utils/free-disk-space
 
       - name: Install system dependencies
         run: |
