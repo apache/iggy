@@ -20,25 +20,25 @@ BDD test configuration and fixtures for Python SDK tests.
 """
 
 import asyncio
-import contextlib
 import os
 from dataclasses import dataclass
 
 import pytest
+from apache_iggy import IggyClient, ReceiveMessage
 
 
 @dataclass
 class GlobalContext:
     """Global test context similar to Rust implementation."""
 
-    client: object | None = None  # Will be IggyClient
+    client: IggyClient | None = None
     server_addr: str | None = None
     last_stream_id: int | None = None
     last_stream_name: str | None = None
     last_topic_id: int | None = None
     last_topic_name: str | None = None
     last_topic_partitions: int | None = None
-    last_polled_messages: list[object] | None = None  # Will be List[ReceiveMessage]
+    last_polled_messages: list[ReceiveMessage] | None = None
     last_sent_message: str | None = None  # Store message payload as string
 
 
@@ -59,8 +59,3 @@ def context():
     ctx.server_addr = os.environ.get("IGGY_TCP_ADDRESS", "127.0.0.1:8090")
 
     yield ctx
-
-    # Cleanup: disconnect client if connected
-    if ctx.client:
-        with contextlib.suppress(Exception):
-            asyncio.run(ctx.client.disconnect())
