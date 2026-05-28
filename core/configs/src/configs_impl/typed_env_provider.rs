@@ -55,7 +55,7 @@ const IGNORED_ENV_VARS: &[&str] = &[
     "IGGY_ROOT_PASSWORD",
     "IGGY_ROOT_USERNAME",
     // Tunes per-shard io_uring SQ/CQ capacity; read directly by
-    // `server::bootstrap::create_shard_executor` (see that fn for rationale).
+    // `server_common::executor::create_shard_executor` (see that fn for rationale).
     "IGGY_SHARD_RUNTIME_CAPACITY",
     "IGGY_TEST_CLEANUP_DISABLED",
     "IGGY_TEST_VERBOSE",
