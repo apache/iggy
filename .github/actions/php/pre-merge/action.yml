@@ -26,6 +26,10 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Free disk space
+      if: inputs.task != 'lint'
+      uses: ./.github/actions/utils/free-disk-space
+
     - name: Install PHP build dependencies
       shell: bash
       run: |

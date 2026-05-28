@@ -26,6 +26,10 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Free disk space
+      if: inputs.task != 'lint'
+      uses: ./.github/actions/utils/free-disk-space
+
     - name: Setup Java with cache
       uses: ./.github/actions/utils/setup-java-with-cache
       with:
