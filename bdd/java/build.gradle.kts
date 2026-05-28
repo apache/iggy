@@ -31,7 +31,7 @@ dependencies {
     testImplementation("org.apache.iggy:iggy")
     testImplementation("io.cucumber:cucumber-java:7.33.0")
     testImplementation("io.cucumber:cucumber-junit-platform-engine:7.33.0")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.0")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.0")
     testImplementation("org.junit.platform:junit-platform-suite:1.11.0")
 }
 
