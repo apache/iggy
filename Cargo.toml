@@ -78,7 +78,7 @@ apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 argon2 = "0.5.3"
 # Pinned to 57 because iceberg 0.9.1 still requires arrow/parquet 57.
 arrow = "57.3.1"
-arrow-array = "57.3.1"
+arrow-array = "58.3.0"
 arrow-json = "57.3.1"
 assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
