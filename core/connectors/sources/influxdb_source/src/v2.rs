@@ -531,6 +531,32 @@ mod tests {
         );
         assert_eq!(result.messages.len(), 2);
     }
+
+    // ── NEW regression tests: prevent poisoned cursor persistence ─────────────
+
+    #[test]
+    fn process_rows_unparsable_cursor_does_not_become_max_cursor_when_later_row_is_valid() {
+        let rows = vec![
+            row(&[("_time", "not-a-timestamp"), ("_value", "1")]),
+            row(&[("_time", "2024-01-01T00:00:00Z"), ("_value", "2")]),
+        ];
+        let result = process_rows(&rows, &ctx(BASE_CURSOR, 0), 0).unwrap();
+        assert_eq!(result.max_cursor.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(result.rows_at_max_cursor, 1);
+        assert_eq!(result.messages.len(), 2);
+    }
+
+    #[test]
+    fn process_rows_all_unparsable_cursor_values_yield_no_max_cursor() {
+        let rows = vec![
+            row(&[("_time", "bad1"), ("_value", "1")]),
+            row(&[("_time", "bad2"), ("_value", "2")]),
+        ];
+        let result = process_rows(&rows, &ctx(BASE_CURSOR, 0), 0).unwrap();
+        assert!(result.max_cursor.is_none());
+        assert_eq!(result.rows_at_max_cursor, 0);
+        assert_eq!(result.messages.len(), 2);
+    }
 }
 
 // ── Query execution ───────────────────────────────────────────────────────────
@@ -792,24 +818,25 @@ pub(crate) fn process_rows(
             }
         }
 
-        if let Some(cv) = cv {
+        // FIX: Only parsed cursor timestamps may influence max_cursor.
+        // Otherwise, garbage strings can be persisted into state.last_timestamp and
+        // permanently brick the connector until state is manually cleared.
+        if let (Some(cv), Some(cv_dt)) = (cv, cv_dt) {
             match max_cursor_parsed {
                 None => {
                     max_cursor = Some(cv.to_string());
-                    max_cursor_parsed = cv_dt;
+                    max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
                 }
-                Some(current_dt) => match cv_dt {
-                    Some(v) if v > current_dt => {
+                Some(current_dt) => {
+                    if cv_dt > current_dt {
                         max_cursor = Some(cv.to_string());
-                        max_cursor_parsed = Some(v);
+                        max_cursor_parsed = Some(cv_dt);
                         rows_at_max_cursor = 1;
-                    }
-                    Some(v) if v == current_dt => {
+                    } else if cv_dt == current_dt {
                         rows_at_max_cursor += 1;
                     }
-                    _ => {}
-                },
+                }
             }
         }
 

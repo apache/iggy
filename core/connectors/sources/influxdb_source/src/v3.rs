@@ -467,10 +467,30 @@ pub(crate) async fn poll(
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let base_batch = config.batch_size.unwrap_or(500).max(1);
+
+    // NOTE: cap_factor must be computed BEFORE effective_batch so we can clamp the
+    // persisted state value against the current config cap.
+    let cap_factor = config
+        .stuck_batch_cap_factor
+        .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
+
+    // FIX: clamp persisted inflated effective_batch_size against base_batch * cap_factor.
+    //
+    // If an operator lowers batch_size or stuck_batch_cap_factor between restarts,
+    // a persisted inflated effective_batch_size can exceed the new cap. If we use
+    // it directly, next_stuck_batch_size() may return None on the first stuck poll,
+    // tripping the circuit breaker immediately with zero inflation attempt.
+    //
+    // cap_factor == 0 disables stuck detection; keep behavior consistent by not
+    // clamping in that case.
     let effective_batch = if state.effective_batch_size == 0 {
         base_batch
-    } else {
+    } else if cap_factor == 0 {
         state.effective_batch_size
+    } else {
+        state
+            .effective_batch_size
+            .min(base_batch.saturating_mul(cap_factor))
     };
 
     let response_data = run_query(
@@ -484,9 +504,6 @@ pub(crate) async fn poll(
     .await?;
     let rows = parse_jsonl_rows(&response_data)?;
 
-    let cap_factor = config
-        .stuck_batch_cap_factor
-        .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
     let ctx = RowContext {
         cursor_field: config
             .cursor_field
@@ -2333,5 +2350,72 @@ mod http_tests {
         assert_eq!(&result.messages[0].payload, b"hello");
         // Second row payload must be the decoded bytes of "world" (base64 "d29ybGQ=").
         assert_eq!(&result.messages[1].payload, b"world");
+    }
+
+    // ── NEW regression test: clamp persisted effective_batch_size on read ─────
+
+    #[tokio::test]
+    async fn poll_clamps_persisted_effective_batch_size_to_new_cap() {
+        // Persisted state can contain an inflated effective_batch_size from earlier stuck polling.
+        // If the operator lowers batch_size or stuck_batch_cap_factor between restarts,
+        // the new cap can be lower than the persisted effective_batch_size.
+        //
+        // Without clamping, next_stuck_batch_size() sees current >= cap and returns None
+        // on the first stuck poll, tripping the circuit breaker immediately.
+        //
+        // This test captures the request body and checks the substituted SQL query uses
+        // LIMIT = base_batch * cap_factor rather than the unbounded persisted value.
+        let captured_body: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let cap2 = captured_body.clone();
+
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move |request: Request| {
+                let cap = cap2.clone();
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    *cap.lock().await = String::from_utf8_lossy(&bytes).to_string();
+                    // Return empty OK body so poll completes quickly.
+                    (StatusCode::OK, "")
+                }
+            }),
+        );
+        let base = start_server(app).await;
+
+        let mut cfg = make_config(&base);
+        cfg.batch_size = Some(10);
+        cfg.stuck_batch_cap_factor = Some(2); // cap = 20
+
+        // Persisted inflated value from a previous run.
+        let state = V3State {
+            last_timestamp: Some("1970-01-01T00:00:00Z".to_string()),
+            effective_batch_size: 5000,
+            last_timestamp_row_offset: 0,
+            processed_rows: 0,
+            stuck_cursor: None,
+        };
+
+        let _ = poll(
+            &make_client(),
+            &cfg,
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let body = captured_body.lock().await;
+        assert!(
+            body.contains("LIMIT 20") || body.contains("limit 20"),
+            "expected outbound query to be clamped to LIMIT 20, got body: {body}"
+        );
+        assert!(
+            !body.contains("LIMIT 5000") && !body.contains("limit 5000"),
+            "must not send un-clamped LIMIT 5000, got body: {body}"
+        );
     }
 }
