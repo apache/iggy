@@ -252,6 +252,9 @@ pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result
 /// payload.
 pub type ClientForwardFn = Box<dyn Fn(u128, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
 
+/// Callback invoked when a client connection metadata entry is removed.
+pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
+
 /// Callback invoked on every successful replica handshake.
 ///
 /// Fired by the replica listener / outbound connector. The callback decides
@@ -559,6 +562,9 @@ pub struct IggyMessageBus {
     /// table. Production leaves this unset; tests install a callback to
     /// observe the path.
     connection_lost_fn: RefCell<Option<ConnectionLostFn>>,
+    /// Invoked when a client connection metadata entry is removed during
+    /// connection teardown.
+    client_connection_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
     /// Per-connection metadata exposed to the caller via
     /// [`Self::client_meta`]. Populated by the install path on
     /// successful registry insert; removed on connection teardown.
@@ -672,6 +678,7 @@ impl IggyMessageBus {
             replica_forward_fn: OnceCell::new(),
             client_forward_fn: OnceCell::new(),
             connection_lost_fn: RefCell::new(None),
+            client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
             owner_table,
         }
@@ -723,7 +730,24 @@ impl IggyMessageBus {
     }
 
     pub(crate) fn remove_client_meta(&self, client_id: u128) {
-        self.client_meta.borrow_mut().remove(&client_id);
+        if self.client_meta.borrow_mut().remove(&client_id).is_some() {
+            self.notify_client_connection_lost(client_id);
+        }
+    }
+
+    pub fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
+        *self.client_connection_lost_fn.borrow_mut() = Some(f);
+    }
+
+    fn notify_client_connection_lost(&self, client_id: u128) {
+        let cb = self
+            .client_connection_lost_fn
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone);
+        if let Some(f) = cb {
+            f(client_id);
+        }
     }
 
     /// Install the notifier used by delegated replica connections to tell

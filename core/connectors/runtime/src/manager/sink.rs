@@ -214,6 +214,7 @@ impl SinkManager {
             consumers,
             callback,
             config.verbose,
+            config.benchmark,
             metrics,
             context.clone(),
         );

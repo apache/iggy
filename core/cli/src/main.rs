@@ -97,6 +97,7 @@ use tracing::{Level, event};
 #[cfg(feature = "login-session")]
 mod main_login_session {
     pub(crate) use crate::args::session::SessionAction;
+    pub(crate) use iggy_cli::commands::binary_system::session::ensure_default_store;
     pub(crate) use iggy_cli::commands::binary_system::session_status::SessionStatusCmd;
     pub(crate) use iggy_cli::commands::binary_system::{login::LoginCmd, logout::LogoutCmd};
     pub(crate) use iggy_cli::commands::utils::login_session_expiry::LoginSessionExpiry;
@@ -376,6 +377,14 @@ async fn main() -> Result<(), IggyCmdError> {
 
     let mut logging = Logging::new();
     logging.init(args.cli.quiet, &args.cli.debug);
+
+    // keyring-core 1.x has no implicit default backend. Register one up front
+    // so any subcommand that touches `Entry::new` (login, PAT store/delete,
+    // token-name lookup) sees the backend regardless of code-path ordering.
+    #[cfg(feature = "login-session")]
+    if let Err(e) = ensure_default_store() {
+        tracing::warn!(target: PRINT_TARGET, "keyring backend unavailable: {e}");
+    }
 
     let command = args.command.clone().unwrap();
 

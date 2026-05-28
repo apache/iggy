@@ -179,8 +179,20 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // This roughly estimates the number of tasks we will create.
     let mut proactor = compio::driver::ProactorBuilder::new();
 
+    // Each shard reserves io_uring SQ + CQ entries against `RLIMIT_MEMLOCK`.
+    // The multi-node integration tests spawn N nodes * M shards in a single
+    // process tree under a memlock budget that's often capped to 8 MiB on
+    // dev machines; the 4096-entry default blows past that and the OS
+    // returns `Cannot allocate memory` (EAGAIN/ENOMEM) during ring setup.
+    // The env knob lets the test harness shrink the per-ring footprint
+    // without compiling a separate test build. Production keeps the
+    // higher default for throughput.
+    let capacity = std::env::var("IGGY_SHARD_RUNTIME_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4096);
     proactor
-        .capacity(4096)
+        .capacity(capacity)
         .coop_taskrun(true)
         .taskrun_flag(true);
 

@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct SourceManager {
@@ -148,16 +148,27 @@ impl SourceManager {
             )
         };
 
-        source::cleanup_sender(plugin_id);
-
-        for handle in task_handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
-
+        // Order: close FFI (stops callbacks) -> drop sender (unblocks
+        // recv_async) -> await tasks. Reversing risks an abort mid-save.
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
             (container.iggy_source_close)(plugin_id);
             info!("Closed source connector with ID: {plugin_id} for plugin: {key}");
+        }
+
+        source::cleanup_sender(plugin_id);
+
+        for mut handle in task_handles {
+            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+            {
+                warn!(
+                    "Timed out waiting for source task to finish (plugin_id: {plugin_id}); aborting to prevent stale collisions with the next start."
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
         }
 
         {
@@ -218,6 +229,7 @@ impl SourceManager {
             plugin_id,
             key,
             config.verbose,
+            config.benchmark,
             producer,
             encoder,
             transforms,

@@ -16,25 +16,43 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le, read_u128_le};
+use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
 use crate::primitives::identifier::WireName;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretString};
 
 /// Combined login + register request for server-ng.
 ///
-/// The client sends credentials and its ephemeral `client_id`. The server
-/// verifies credentials locally, then submits `Operation::Register` through
-/// consensus. The response carries `user_id` + `session` (commit op number).
+/// The server verifies credentials locally, then submits `Operation::Register`
+/// through consensus. The response carries `user_id` + `session` (commit op
+/// number). The `client_id` is carried in the VSR `RequestHeader.client` field
+/// (populated by the SDK at encode time); the body no longer duplicates it.
 ///
 /// Wire format:
 /// ```text
-/// [client_id:16 LE][username_len:u8][username:N][password_len:u8][password:N]
+/// [username_len:u8][username:N][password_len:u8][password:N]
 /// [version_len:u32_le][version:N?][context_len:u32_le][context:N?]
 /// ```
+///
+/// # Cross-version compatibility
+///
+/// This wire shape is gated by the `vsr` cargo feature and lives under
+/// `LOGIN_REGISTER_CODE`. The legacy `LOGIN_USER_CODE` shape (still in use
+/// by non-`vsr` builds) is untouched.
+///
+/// | Client          | Server          | Behavior                                       |
+/// |-----------------|-----------------|------------------------------------------------|
+/// | `vsr` SDK       | `vsr` server-ng | Works                                          |
+/// | non-`vsr` SDK   | `vsr` server-ng | `LOGIN_USER_CODE` -- handled by legacy path    |
+/// | `vsr` SDK       | non-`vsr` server| Server returns `IggyError::InvalidCommand`     |
+/// | non-`vsr` SDK   | non-`vsr` server| Works                                          |
+///
+/// Foreign-language SDKs (C++, C#, Python, Go, Java) currently speak only
+/// the legacy shape; they will silently pick the working leg above until
+/// they wire VSR framing. Bump `IGGY_PROTOCOL_VERSION` (or the equivalent
+/// when the project tracks one) when this changes.
 #[derive(Debug, Clone)]
 pub struct LoginRegisterRequest {
-    pub client_id: u128,
     pub username: WireName,
     pub password: SecretString,
     pub version: Option<String>,
@@ -43,7 +61,7 @@ pub struct LoginRegisterRequest {
 
 impl WireEncode for LoginRegisterRequest {
     fn encoded_size(&self) -> usize {
-        16 + self.username.encoded_size()
+        self.username.encoded_size()
             + 1
             + self.password.expose_secret().len()
             + 4
@@ -53,7 +71,6 @@ impl WireEncode for LoginRegisterRequest {
     }
 
     fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u128_le(self.client_id);
         self.username.encode(buf);
         let password = self.password.expose_secret();
         #[allow(clippy::cast_possible_truncation)]
@@ -80,11 +97,8 @@ impl WireEncode for LoginRegisterRequest {
 
 impl WireDecode for LoginRegisterRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let client_id = read_u128_le(buf, 0)?;
-        let mut pos = 16;
-
-        let (username, name_len) = WireName::decode(&buf[pos..])?;
-        pos += name_len;
+        let (username, name_len) = WireName::decode(buf)?;
+        let mut pos = name_len;
 
         let password_len = read_u8(buf, pos)? as usize;
         pos += 1;
@@ -113,7 +127,6 @@ impl WireDecode for LoginRegisterRequest {
 
         Ok((
             Self {
-                client_id,
                 username,
                 password,
                 version,
@@ -129,7 +142,6 @@ mod tests {
     use super::*;
 
     fn assert_req_eq(a: &LoginRegisterRequest, b: &LoginRegisterRequest) {
-        assert_eq!(a.client_id, b.client_id);
         assert_eq!(a.username, b.username);
         assert_eq!(a.password.expose_secret(), b.password.expose_secret());
         assert_eq!(a.version, b.version);
@@ -139,7 +151,6 @@ mod tests {
     #[test]
     fn roundtrip_full() {
         let req = LoginRegisterRequest {
-            client_id: 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0,
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("secret"),
             version: Some("1.0.0".to_string()),
@@ -154,7 +165,6 @@ mod tests {
     #[test]
     fn roundtrip_no_optionals() {
         let req = LoginRegisterRequest {
-            client_id: 42,
             username: WireName::new("user").unwrap(),
             password: SecretString::from("pass"),
             version: None,
@@ -169,7 +179,6 @@ mod tests {
     #[test]
     fn encoded_size_matches_output() {
         let req = LoginRegisterRequest {
-            client_id: 1,
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("p"),
             version: Some("v1".to_string()),
@@ -181,7 +190,6 @@ mod tests {
     #[test]
     fn truncated_returns_error() {
         let req = LoginRegisterRequest {
-            client_id: 1,
             username: WireName::new("u").unwrap(),
             password: SecretString::from("p"),
             version: Some("v".to_string()),
@@ -197,20 +205,16 @@ mod tests {
     }
 
     #[test]
-    fn wire_layout_client_id_first() {
+    fn wire_layout_username_first() {
         let req = LoginRegisterRequest {
-            client_id: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
             username: WireName::new("u").unwrap(),
             password: SecretString::from("p"),
             version: None,
             client_context: None,
         };
         let bytes = req.to_bytes();
-        // First 16 bytes are client_id in LE.
-        let client_id = u128::from_le_bytes(bytes[..16].try_into().unwrap());
-        assert_eq!(client_id, req.client_id);
-        // Then username: [1, b'u'], password: [1, b'p'], version: [0,0,0,0], client_context: [0,0,0,0]
-        assert_eq!(bytes[16], 1); // username len
-        assert_eq!(bytes[17], b'u');
+        // Username: [1, b'u'], password: [1, b'p'], version: [0,0,0,0], client_context: [0,0,0,0]
+        assert_eq!(bytes[0], 1); // username len
+        assert_eq!(bytes[1], b'u');
     }
 }
