@@ -17,12 +17,21 @@
  * under the License.
  */
 
-// Doris fixture. One Doris container is shared across every doris test in the
-// same nextest binary via `SHARED_DORIS` (the first test pays the boot cost;
-// subsequent tests reuse the cluster and just create their own per-test UUID
-// database). This replaces what used to live in `.github/actions/rust/pre-merge`
-// as a manual `docker run` + wait dance, so `cargo test` and CI follow exactly
-// the same path.
+// Doris fixture. One Doris container is shared across every doris test in this
+// CI job (or local `cargo test` session) via testcontainers' reusable-containers
+// feature: the container is named `iggy-doris-test` and marked
+// `ReuseDirective::Always`, so the first test creates it and every subsequent
+// test (in this or any other test process on the same Docker daemon) attaches
+// to it. This is what makes `cargo test` and CI follow the same path — the old
+// orchestration in `.github/actions/rust/pre-merge` is gone.
+//
+// Cross-process sharing matters because nextest runs each test in its own
+// process. An in-process `OnceCell` would reboot Doris every time, and the new
+// container would race the previous one for the BE's 1:1-mapped 8040 port.
+//
+// The container outlives the test session by design (that's what enables
+// reuse). CI runners are ephemeral so it dies with them; locally, `docker rm
+// -f iggy-doris-test` forces a fresh boot.
 //
 // Two host-level prerequisites cannot live inside the container:
 //   * `vm.max_map_count >= 2_000_000` — Doris 4.0.3's `start_be.sh` hard-exits
@@ -37,13 +46,13 @@ use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::OnceCell;
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, GenericImage, ImageExt, ReuseDirective,
+};
 use tokio::time::sleep;
 use tracing::info;
 use uuid::Uuid;
@@ -54,6 +63,10 @@ const DORIS_IMAGE: &str = "apache/doris";
 // in 2024 and never refreshed). `-slim` is the smaller base, so it pulls faster
 // on CI runners.
 const DORIS_TAG: &str = "4.0.3-all-slim";
+// Fixed name + `ReuseDirective::Always` is what makes the container survive
+// across nextest's per-test processes. Stable name means every test process
+// inspecting the Docker daemon finds the same one.
+const DORIS_CONTAINER_NAME: &str = "iggy-doris-test";
 const FE_HTTP_PORT: u16 = 8030;
 const FE_MYSQL_PORT: u16 = 9030;
 const BE_HTTP_PORT: u16 = 8040;
@@ -155,23 +168,56 @@ PROPERTIES (
 pub const COLUMNS_MAPPING_HEADER: &str =
     "id, name, count, amount, active, timestamp, calculated = count + 1";
 
-/// One Doris cluster shared across every test in this test binary. Boot is
-/// amortized over the binary's entire run.
-struct SharedDoris {
-    // Kept alive for the lifetime of the test process. testcontainers' Drop
-    // stops the container on program exit.
+/// Linux-only host precheck. macOS / Windows have no `/proc/sys/vm/max_map_count`
+/// (and the all-in-one image is already unusable on macOS for the BE-redirect
+/// routing reason — see the file header). Treat the check as a no-op there; the
+/// container start will surface any real issue.
+#[cfg(target_os = "linux")]
+fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
+    let v: u64 = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if v < REQUIRED_VM_MAX_MAP_COUNT {
+        return Err(TestBinaryError::FixtureSetup {
+            fixture_type: "SharedDoris".to_string(),
+            message: format!(
+                "Doris 4.0.3 BE refuses to start unless vm.max_map_count >= \
+                 {REQUIRED_VM_MAX_MAP_COUNT} (current: {v}). \
+                 Run: `sudo sysctl -w vm.max_map_count={REQUIRED_VM_MAX_MAP_COUNT}`"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
+    Ok(())
+}
+
+pub struct DorisContainer {
+    // Held only so testcontainers' Drop runs on test exit. ReuseDirective::Always
+    // makes that Drop a no-op (the container is left running for the next test
+    // to attach to), but keeping the handle around is still required to keep
+    // the bollard client connection alive.
     _container: ContainerAsync<GenericImage>,
     fe_url: String,
     fe_mysql_host_port: u16,
+    // Unique per test, so many tests can share one cluster without their loads
+    // colliding. Created during setup; the connector writes into it.
+    database: String,
 }
 
-impl SharedDoris {
-    async fn boot() -> Result<Self, TestBinaryError> {
+impl DorisContainer {
+    pub async fn start() -> Result<Self, TestBinaryError> {
         check_vm_max_map_count()?;
 
         // Custom entrypoint patches FE heap + BE mem_limit before handing off
         // to the image's normal entry_point.sh; SKIP_CHECK_ULIMIT bypasses the
-        // image's swap/ulimit gates so we needn't swapoff the runner.
+        // image's swap/ulimit gates so we needn't swapoff the runner. Only
+        // runs on first boot; ignored on attach because the existing container
+        // already has its config applied.
         let entrypoint_cmd = format!(
             "sed -i '{FE_HEAP_OVERRIDE_SED}' /opt/apache-doris/fe/conf/fe.conf && \
              echo '{BE_MEM_LIMIT_OVERRIDE}' >> /opt/apache-doris/be/conf/be.conf && \
@@ -183,6 +229,12 @@ impl SharedDoris {
         // 1:1 — the FE always returns Location: http://127.0.0.1:8040/...
         // for the Stream Load redirect, and that's only reachable from the
         // host if container:8040 is bound to host:8040.
+        //
+        // `with_container_name` + `with_reuse(Always)` is what makes the
+        // container survive across nextest's per-test processes: the first
+        // test creates `iggy-doris-test`, every later test (in any process)
+        // attaches to it. The 1:1 BE port is therefore held continuously by
+        // one container, never racing with itself across container restarts.
         let container = GenericImage::new(DORIS_IMAGE, DORIS_TAG)
             // GenericImage's own with_entrypoint/with_wait_for must come before
             // any ImageExt method, which turns GenericImage into ContainerRequest.
@@ -197,45 +249,66 @@ impl SharedDoris {
             .with_mapped_port(0, FE_HTTP_PORT.tcp())
             .with_mapped_port(0, FE_MYSQL_PORT.tcp())
             .with_mapped_port(BE_HTTP_PORT, BE_HTTP_PORT.tcp())
+            .with_container_name(DORIS_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SharedDoris".to_string(),
+                fixture_type: "DorisContainer".to_string(),
                 message: format!("Failed to start container: {e}"),
             })?;
-
-        info!("Started shared Doris all-in-one container");
 
         let ports = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SharedDoris".to_string(),
+                fixture_type: "DorisContainer".to_string(),
                 message: format!("Failed to read mapped ports: {e}"),
             })?;
 
         let fe_http_host_port = ports.map_to_host_port_ipv4(FE_HTTP_PORT).ok_or_else(|| {
             TestBinaryError::FixtureSetup {
-                fixture_type: "SharedDoris".to_string(),
+                fixture_type: "DorisContainer".to_string(),
                 message: "No host mapping for Doris FE HTTP port".to_string(),
             }
         })?;
         let fe_mysql_host_port = ports.map_to_host_port_ipv4(FE_MYSQL_PORT).ok_or_else(|| {
             TestBinaryError::FixtureSetup {
-                fixture_type: "SharedDoris".to_string(),
+                fixture_type: "DorisContainer".to_string(),
                 message: "No host mapping for Doris FE MySQL port".to_string(),
             }
         })?;
 
-        info!("Doris FE HTTP -> {fe_http_host_port}, FE MySQL -> {fe_mysql_host_port}");
+        info!(
+            "Doris container ready (name={DORIS_CONTAINER_NAME}): FE HTTP -> {fe_http_host_port}, FE MySQL -> {fe_mysql_host_port}"
+        );
+
+        // A fresh database per test so any number of tests can share one
+        // cluster without their Stream Loads colliding. `simple()` drops the
+        // hyphens so the name stays a valid Doris identifier ([A-Za-z0-9_]).
+        let database = format!("iggy_test_db_{}", Uuid::new_v4().simple());
 
         let this = Self {
             _container: container,
             fe_url: format!("http://127.0.0.1:{fe_http_host_port}"),
             fe_mysql_host_port,
+            database,
         };
+
+        // Required on first boot; fast-paths in <1s once the BE is already
+        // alive on subsequent test-process attaches.
         this.wait_for_be_alive().await?;
+        this.create_test_database().await?;
         Ok(this)
+    }
+
+    pub fn fe_url(&self) -> String {
+        self.fe_url.clone()
+    }
+
+    /// The unique per-test database this fixture's connector writes into.
+    pub fn database(&self) -> &str {
+        &self.database
     }
 
     async fn create_pool(&self) -> Result<MySqlPool, TestBinaryError> {
@@ -257,7 +330,7 @@ impl SharedDoris {
             .connect_with(opts)
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SharedDoris".to_string(),
+                fixture_type: "DorisContainer".to_string(),
                 message: format!("Failed to connect to Doris over MySQL: {e}"),
             })
     }
@@ -308,69 +381,21 @@ impl SharedDoris {
             sleep(Duration::from_millis(DEFAULT_BE_REGISTRATION_INTERVAL_MS)).await;
         }
         Err(TestBinaryError::FixtureSetup {
-            fixture_type: "SharedDoris".to_string(),
+            fixture_type: "DorisContainer".to_string(),
             message: format!(
                 "Doris BE did not register within {DEFAULT_BE_REGISTRATION_ATTEMPTS} attempts ({last_diag})"
             ),
         })
     }
-}
 
-static SHARED_DORIS: OnceCell<Arc<SharedDoris>> = OnceCell::const_new();
-
-/// Linux-only host precheck. macOS / Windows have no `/proc/sys/vm/max_map_count`
-/// (and the all-in-one image is already unusable on macOS for the BE-redirect
-/// routing reason — see the file header). Treat the check as a no-op there; the
-/// container start will surface any real issue.
-#[cfg(target_os = "linux")]
-fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
-    let v: u64 = std::fs::read_to_string("/proc/sys/vm/max_map_count")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    if v < REQUIRED_VM_MAX_MAP_COUNT {
-        return Err(TestBinaryError::FixtureSetup {
-            fixture_type: "SharedDoris".to_string(),
-            message: format!(
-                "Doris 4.0.3 BE refuses to start unless vm.max_map_count >= \
-                 {REQUIRED_VM_MAX_MAP_COUNT} (current: {v}). \
-                 Run: `sudo sysctl -w vm.max_map_count={REQUIRED_VM_MAX_MAP_COUNT}`"
-            ),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
-    Ok(())
-}
-
-pub struct DorisContainer {
-    shared: Arc<SharedDoris>,
-    // Unique per test, so many tests can share one cluster without their loads
-    // colliding. Created during setup; the connector writes into it.
-    database: String,
-}
-
-impl DorisContainer {
-    pub async fn start() -> Result<Self, TestBinaryError> {
-        let shared = SHARED_DORIS
-            .get_or_try_init(|| async { SharedDoris::boot().await.map(Arc::new) })
-            .await?
-            .clone();
-
-        // A fresh database per test so any number of tests can share one
-        // cluster without their Stream Loads colliding. `simple()` drops the
-        // hyphens so the name stays a valid Doris identifier ([A-Za-z0-9_]).
-        let database = format!("iggy_test_db_{}", Uuid::new_v4().simple());
-
-        let pool = shared.create_pool().await?;
+    async fn create_test_database(&self) -> Result<(), TestBinaryError> {
+        let pool = self.create_pool().await?;
         // raw_sql avoids the PREPARE path Doris doesn't accept for DDL.
         // sqlx 0.9's `raw_sql` requires `SqlSafeStr`; the input here is a UUID
         // we just generated, so `AssertSqlSafe` is appropriate.
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "CREATE DATABASE IF NOT EXISTS {database}"
+            "CREATE DATABASE IF NOT EXISTS {}",
+            self.database
         )))
         .execute(&pool)
         .await
@@ -378,21 +403,7 @@ impl DorisContainer {
             fixture_type: "DorisContainer".to_string(),
             message: format!("Failed to create test database: {e}"),
         })?;
-
-        Ok(Self { shared, database })
-    }
-
-    pub fn fe_url(&self) -> String {
-        self.shared.fe_url.clone()
-    }
-
-    /// The unique per-test database this fixture's connector writes into.
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
-    async fn create_pool(&self) -> Result<MySqlPool, TestBinaryError> {
-        self.shared.create_pool().await
+        Ok(())
     }
 }
 

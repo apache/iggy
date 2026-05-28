@@ -80,6 +80,7 @@ sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }

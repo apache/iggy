@@ -7165,6 +7165,7 @@ dependencies = [
  "sysinfo 0.39.2",
  "tempfile",
  "test-case",
+ "testcontainers",
  "testcontainers-modules",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
