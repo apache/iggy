@@ -43,9 +43,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Cleanup disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-
       - name: Install system dependencies
         run: |
           sudo apt-get update --yes
