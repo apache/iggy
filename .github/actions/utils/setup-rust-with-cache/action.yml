@@ -39,6 +39,9 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Free runner disk space
+      uses: ./.github/actions/utils/free-disk-space
+
     - name: Install system dependencies (Linux)
       if: runner.os == 'Linux'
       run: |
