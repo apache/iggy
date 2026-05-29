@@ -66,7 +66,7 @@ inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const c
 }
 class E2ETestFixture : public ::testing::Test {
   public:
-    ~E2ETestFixture() { Cleanup(); }
+    ~E2ETestFixture() { CleanupBestEffort(); }
     void TearDown() override { Cleanup(); }
 
   protected:
@@ -129,9 +129,10 @@ class E2ETestFixture : public ::testing::Test {
     }
 
     void DeleteClient(iggy::ffi::Client *&client) {
-        ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-        ForgetClient(client);
+        iggy::ffi::Client *client_to_delete = client;
         client = nullptr;
+        ForgetClient(client_to_delete);
+        EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
     }
 
     void Cleanup() {
@@ -140,6 +141,11 @@ class E2ETestFixture : public ::testing::Test {
     }
 
   private:
+    void CleanupBestEffort() noexcept {
+        CleanupStreamsBestEffort();
+        CleanupClientsBestEffort();
+    }
+
     void ForgetClient(iggy::ffi::Client *client) {
         const auto found = std::find(clients_.begin(), clients_.end(), client);
         if (found != clients_.end()) {
@@ -153,17 +159,51 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        ASSERT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
-        ASSERT_NE(cleanup_client, nullptr);
-        ASSERT_NO_THROW(cleanup_client->connect());
-        ASSERT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
-        for (const auto &stream_name : tracked_stream_names_) {
-            ASSERT_NO_THROW(cleanup_client->delete_stream(make_string_identifier(stream_name)));
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NE(cleanup_client, nullptr);
+        if (cleanup_client != nullptr) {
+            EXPECT_NO_THROW(cleanup_client->connect());
+            EXPECT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
+            for (const auto &stream_name : tracked_stream_names_) {
+                EXPECT_NO_THROW(cleanup_client->delete_stream(make_string_identifier(stream_name)));
+            }
+            for (const auto stream_id : tracked_stream_ids_) {
+                EXPECT_NO_THROW(cleanup_client->delete_stream(make_numeric_identifier(stream_id)));
+            }
+            EXPECT_NO_THROW(iggy::ffi::delete_connection(cleanup_client));
         }
-        for (const auto stream_id : tracked_stream_ids_) {
-            ASSERT_NO_THROW(cleanup_client->delete_stream(make_numeric_identifier(stream_id)));
+
+        tracked_stream_names_.clear();
+        tracked_stream_ids_.clear();
+    }
+
+    void CleanupStreamsBestEffort() noexcept {
+        if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
+            return;
         }
-        ASSERT_NO_THROW(iggy::ffi::delete_connection(cleanup_client));
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        try {
+            cleanup_client = iggy::ffi::new_connection("");
+            if (cleanup_client != nullptr) {
+                cleanup_client->connect();
+                cleanup_client->login_user("iggy", "iggy");
+                for (const auto &stream_name : tracked_stream_names_) {
+                    cleanup_client->delete_stream(make_string_identifier(stream_name));
+                }
+                for (const auto stream_id : tracked_stream_ids_) {
+                    cleanup_client->delete_stream(make_numeric_identifier(stream_id));
+                }
+            }
+        } catch (...) {
+        }
+
+        if (cleanup_client != nullptr) {
+            try {
+                iggy::ffi::delete_connection(cleanup_client);
+            } catch (...) {
+            }
+        }
 
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
@@ -171,8 +211,21 @@ class E2ETestFixture : public ::testing::Test {
 
     void CleanupClients() {
         for (iggy::ffi::Client *&client : clients_) {
-            ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+            iggy::ffi::Client *client_to_delete = client;
             client = nullptr;
+            EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
+        }
+        clients_.clear();
+    }
+
+    void CleanupClientsBestEffort() noexcept {
+        for (iggy::ffi::Client *&client : clients_) {
+            iggy::ffi::Client *client_to_delete = client;
+            client = nullptr;
+            try {
+                iggy::ffi::delete_connection(client_to_delete);
+            } catch (...) {
+            }
         }
         clients_.clear();
     }

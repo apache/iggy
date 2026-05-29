@@ -650,69 +650,30 @@ TEST_F(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
     ASSERT_GE(first_clients.size(), 2u);
     ASSERT_GE(second_clients.size(), 2u);
 
-    bool found_first_me_in_first_clients = false;
-    for (const auto &entry : first_clients) {
-        if (entry.client_id != first_me.client_id) {
-            continue;
+    const auto expect_entry_matches = [](const rust::Vec<iggy::ffi::ClientInfo> &clients,
+                                         const iggy::ffi::ClientInfoDetails &expected) {
+        bool found = false;
+        for (const auto &entry : clients) {
+            if (entry.client_id != expected.client_id) {
+                continue;
+            }
+
+            found = true;
+            EXPECT_EQ(entry.has_user_id, expected.has_user_id);
+            EXPECT_EQ(entry.user_id, expected.user_id);
+            EXPECT_EQ(static_cast<std::string>(entry.address), static_cast<std::string>(expected.address));
+            EXPECT_EQ(static_cast<std::string>(entry.transport), static_cast<std::string>(expected.transport));
+            EXPECT_EQ(entry.consumer_groups_count, expected.consumer_groups_count);
+            break;
         }
 
-        found_first_me_in_first_clients = true;
-        EXPECT_EQ(entry.has_user_id, first_me.has_user_id);
-        EXPECT_EQ(entry.user_id, first_me.user_id);
-        EXPECT_EQ(static_cast<std::string>(entry.address), static_cast<std::string>(first_me.address));
-        EXPECT_EQ(static_cast<std::string>(entry.transport), static_cast<std::string>(first_me.transport));
-        EXPECT_EQ(entry.consumer_groups_count, first_me.consumer_groups_count);
-        break;
-    }
-    EXPECT_TRUE(found_first_me_in_first_clients);
+        EXPECT_TRUE(found);
+    };
 
-    bool found_second_me_in_first_clients = false;
-    for (const auto &entry : first_clients) {
-        if (entry.client_id != second_me.client_id) {
-            continue;
-        }
-
-        found_second_me_in_first_clients = true;
-        EXPECT_EQ(entry.has_user_id, second_me.has_user_id);
-        EXPECT_EQ(entry.user_id, second_me.user_id);
-        EXPECT_EQ(static_cast<std::string>(entry.address), static_cast<std::string>(second_me.address));
-        EXPECT_EQ(static_cast<std::string>(entry.transport), static_cast<std::string>(second_me.transport));
-        EXPECT_EQ(entry.consumer_groups_count, second_me.consumer_groups_count);
-        break;
-    }
-    EXPECT_TRUE(found_second_me_in_first_clients);
-
-    bool found_first_me_in_second_clients = false;
-    for (const auto &entry : second_clients) {
-        if (entry.client_id != first_me.client_id) {
-            continue;
-        }
-
-        found_first_me_in_second_clients = true;
-        EXPECT_EQ(entry.has_user_id, first_me.has_user_id);
-        EXPECT_EQ(entry.user_id, first_me.user_id);
-        EXPECT_EQ(static_cast<std::string>(entry.address), static_cast<std::string>(first_me.address));
-        EXPECT_EQ(static_cast<std::string>(entry.transport), static_cast<std::string>(first_me.transport));
-        EXPECT_EQ(entry.consumer_groups_count, first_me.consumer_groups_count);
-        break;
-    }
-    EXPECT_TRUE(found_first_me_in_second_clients);
-
-    bool found_second_me_in_second_clients = false;
-    for (const auto &entry : second_clients) {
-        if (entry.client_id != second_me.client_id) {
-            continue;
-        }
-
-        found_second_me_in_second_clients = true;
-        EXPECT_EQ(entry.has_user_id, second_me.has_user_id);
-        EXPECT_EQ(entry.user_id, second_me.user_id);
-        EXPECT_EQ(static_cast<std::string>(entry.address), static_cast<std::string>(second_me.address));
-        EXPECT_EQ(static_cast<std::string>(entry.transport), static_cast<std::string>(second_me.transport));
-        EXPECT_EQ(entry.consumer_groups_count, second_me.consumer_groups_count);
-        break;
-    }
-    EXPECT_TRUE(found_second_me_in_second_clients);
+    expect_entry_matches(first_clients, first_me);
+    expect_entry_matches(first_clients, second_me);
+    expect_entry_matches(second_clients, first_me);
+    expect_entry_matches(second_clients, second_me);
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
