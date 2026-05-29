@@ -1,10 +1,13 @@
-## Which issue does this PR close?
+## Which issue does this PR address?
 
 <!--
-We generally require a GitHub issue to be filed for all bug fixes and enhancements. You can link an issue to this PR using the GitHub syntax. For example `Closes #123` indicates that this PR will close issue #123.
+We generally require a GitHub issue for all bug fixes and enhancements. Link it with GitHub syntax, keep the line that applies and delete the other:
+- `Closes #123` auto-closes the issue when this PR merges (full fix).
+- `Relates to #123` links without closing (partial or related work).
 -->
 
 Closes #
+Relates to #
 
 ## Rationale
 

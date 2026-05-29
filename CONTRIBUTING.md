@@ -32,6 +32,12 @@ These require design discussion in the issue before coding:
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
 
+### Green CI
+
+Maintainers will not start reviewing a PR while its CI is failing. Get the
+pipeline green first - a red build, lint, or test means the PR is not ready
+for review.
+
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
@@ -104,137 +110,22 @@ Keep subject under 72 chars. Use body for details if needed.
 
 ## PR Triage Commands
 
-You can move a PR around the review queue by posting a slash command in the
-PR conversation. The pattern is similar to `rust-lang/triagebot`. The
-machinery lives in
-[`./.github/workflows/pr-triage-apply.yml`](./.github/workflows/pr-triage-apply.yml)
-(with a read-only collector in
-[`./.github/workflows/pr-triage-collect.yml`](./.github/workflows/pr-triage-collect.yml)
-that hops the token-permission gap for fork PRs) if you want to peek.
+Move a PR around the review queue by posting a slash command on its own
+line in a regular PR comment (not an inline review reply):
 
-### Commands
-
-| Command | Who can use it | What it does |
+| Command | Who | Effect |
 | --- | --- | --- |
-| `/request-review @user-or-team ...` | the PR author or a maintainer | Requests review from one or more `@user` or `@org/team` handles |
-| `/ready` | the PR author or a maintainer | Marks the PR `S-waiting-on-review` |
-| `/author` | a maintainer, or any returning contributor (>=1 merged PR) | Marks the PR `S-waiting-on-author` |
+| `/ready` | author or maintainer | mark `S-waiting-on-review` |
+| `/author` | maintainer or returning contributor | mark `S-waiting-on-author` |
+| `/request-review @user-or-team ...` | author or maintainer | request review from the listed `@user` / `@org/team` handles |
 
-A "maintainer" here means someone with write access to apache/iggy
-(in practice, the `@apache/iggy-committers` team). Automated comments from
-bots like Dependabot do not run commands.
+Some labels move on their own: opening or marking a non-draft PR ready sets
+`S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
+closing or converting to draft clears both.
 
-Each command has to start its own line. Leading whitespace is fine, but
-prose like `please /ready` will not match. You can put more than one command
-in a single comment: `/request-review` plus `/ready`, or `/request-review`
-plus `/author`. `/request-review` may carry several handles on one line and
-may also repeat across lines; all of them are collected and requested
-together. For `/ready` and `/author`, the last one wins, so `/ready` then
-`/author` in the same comment ends up as `S-waiting-on-author`.
-
-### Typical flow
-
-1. You open a PR. CODEOWNERS pings `@apache/iggy-committers` automatically.
-2. A maintainer reviews. Submitting a "Request changes" review moves the
-   PR to your queue automatically; they can also comment `/author`.
-3. You push fixes, then comment `/ready`. The PR moves back to the review
-   queue.
-4. Either side can comment `/request-review @somebody` to pull in a
-   specific person or team.
-
-To find PRs waiting on review, filter with
-`is:open is:pr label:S-waiting-on-review` on the Pulls tab.
-
-### Lifecycle automation
-
-Some labels are managed for you based on what happens to the PR:
-
-| When | What happens |
-| --- | --- |
-| You open a PR (not a draft) | Gets `S-waiting-on-review`, unless an `S-*` label is already set |
-| You mark a draft "Ready for review" | Gets `S-waiting-on-review`, unless an `S-*` label is already set |
-| You convert the PR back to a draft | Both `S-*` labels are removed |
-| The PR is closed or merged | Both `S-*` labels are removed |
-
-Reopening a PR does not re-label it. Drop a `/ready` or `/author` comment
-to put it back in a queue.
-
-Drafts are skipped by the automatic labelling, but `/ready` and `/author`
-still work on drafts if you want to signal intent before clicking "Ready
-for review".
-
-### Review state
-
-Submitting a review with "Request changes" is treated as an implicit
-`/author`: the PR moves to `S-waiting-on-author`. Anyone GitHub recognizes
-as a repo contributor or above can trigger this - the same set that can
-issue an explicit `/author`. If your review body also contains an explicit
-`/ready` or `/author`, that command wins.
-
-### Tips
-
-- **One comment per command burst.** To request several reviewers at once,
-  list them on a single `/request-review` line (or several lines) in one
-  comment. Posting separate comments back-to-back can lose the middle one
-  due to how CI runs are scheduled.
-- **Edits don't re-trigger.** If you typo a command and edit the comment, it
-  will not run. Post a new comment instead.
-- **Use the main conversation, not inline review replies.** Commands posted
-  as replies on a specific line of the diff are ignored. Post them in the
-  PR's main comment thread.
-- **Suffixes don't match.** `/ready-to-merge` or `/readyish` will not flip
-  state - only `/ready` followed by a space or end-of-line counts.
-
-### When something goes wrong
-
-Commands take up to ~90s to apply: the read-only collector hands the
-event off to the write-capable apply workflow via an artifact, which
-adds latency on top of GitHub Actions scheduling. Wait for a reaction
-before re-issuing - duplicate commands can interleave.
-
-The workflow reacts on your comment so you get quick feedback: a 👍 means
-a command was applied, a 😕 means a command was recognized but you lacked
-permission to run it. A failed `/request-review` also posts a one-line
-reply naming the handles GitHub rejected. Commands posted in a review body
-(rather than a normal comment) cannot be reacted to, so they stay
-log-only.
-
-If no reaction appears within a couple of minutes, the apply run likely
-failed. Open the repo's "Actions" tab and look at the `PR Triage Apply`
-run for the comment you posted - the run log says exactly what it saw
-and why (no permission, unknown user, transient API error, etc.). The
-`PR Triage Collect` run that appears on the PR's "Checks" tab is just
-the read-only event collector; the actual labelling happens in
-`PR Triage Apply`, which is triggered via `workflow_run` and is not
-attached to the PR's checks.
-
-### Examples
-
-Mark your PR ready after addressing feedback:
-
-```text
-/ready
-```
-
-Ask the author to take another look:
-
-```text
-/author
-```
-
-Request a specific reviewer and mark ready in one comment:
-
-```text
-/request-review @somebody
-/ready
-```
-
-Request several reviewers in one go (do this instead of posting separate
-comments). They can share one line, span multiple lines, or both:
-
-```text
-/request-review @alice @bob @apache/iggy-committers
-```
+Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
+permission; if neither shows up, check the `PR Triage Apply` run in the
+Actions tab.
 
 ## Close Policy
 
