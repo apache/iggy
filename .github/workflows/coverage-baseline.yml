@@ -60,6 +60,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
+      # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
+      # Host-only kernel param (no container can raise it). Mirrors the same step in
+      # .github/actions/rust/pre-merge/action.yml; without it every Doris connector
+      # integration test panics at fixture setup.
+      - name: Raise vm.max_map_count for Doris
+        run: sudo sysctl -w vm.max_map_count=2000000 || true
+        shell: bash
+
       - name: Build and test with coverage
         run: |
           source <(cargo llvm-cov show-env --export-prefix)
