@@ -160,6 +160,7 @@ components:
       - "machete"
       - "test-1"
       - "test-2"
+      - "test-3"
       - "compat"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"

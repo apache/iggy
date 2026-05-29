@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -170,13 +170,13 @@ runs:
     - name: Build and test with coverage
       if: startsWith(inputs.task, 'test-')
       run: |
-        # Parse partition index from task name (test-1 -> hash:1/2, test-2 -> hash:2/2)
+        # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, test-3 -> hash:3/3)
         TASK="${{ inputs.task }}"
         PARTITION_FLAG=""
         if [[ "$TASK" =~ ^test-([0-9]+)$ ]]; then
           PARTITION_INDEX="${BASH_REMATCH[1]}"
-          PARTITION_FLAG="--partition hash:${PARTITION_INDEX}/2"
-          echo "::notice::Running test partition ${PARTITION_INDEX}/2"
+          PARTITION_FLAG="--partition hash:${PARTITION_INDEX}/3"
+          echo "::notice::Running test partition ${PARTITION_INDEX}/3"
         fi
 
         # Read DAG-based affected crate filter (computed in earlier step)
