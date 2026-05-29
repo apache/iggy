@@ -51,6 +51,7 @@ type IggyTcpClient struct {
 	conn                   net.Conn
 	mtx                    sync.Mutex
 	config                 config
+	logger                 iggcon.Logger
 	MessageCompression     iggcon.IggyMessageCompression
 	leaderRedirectionState iggcon.LeaderRedirectionState
 	clientAddress          string
@@ -71,6 +72,8 @@ type config struct {
 	reconnection tcpClientReconnectionConfig
 	// noDelay disable Nagle's algorithm for the TCP connection
 	noDelay bool
+	// logger is the logger used for internal diagnostics
+	logger iggcon.Logger
 }
 
 func defaultTcpClientConfig() config {
@@ -156,6 +159,13 @@ func WithServerAddress(address string) Option {
 	}
 }
 
+// WithLogger sets the logger for the TCP client.
+func WithLogger(logger iggcon.Logger) Option {
+	return func(opts *Options) {
+		opts.config.logger = logger
+	}
+}
+
 // TLSOption is a functional option for configuring TLS settings.
 type TLSOption func(cfg *tlsConfig)
 
@@ -203,8 +213,14 @@ func NewIggyTcpClient(options ...Option) *IggyTcpClient {
 		}
 	}
 
+	logger := opts.config.logger
+	if logger == nil {
+		logger = iggcon.NewNoopLogger()
+	}
+
 	return &IggyTcpClient{
 		config:                 opts.config,
+		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
 		state:                  iggcon.StateDisconnected,
