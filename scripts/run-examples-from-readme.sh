@@ -294,12 +294,10 @@ run_php_examples() {
         for extension_candidate in \
             target/debug/libiggy_php.so \
             target/debug/libiggy_php.dylib \
-            target/debug/iggy_php.dll \
             foreign/php/target/debug/libiggy_php.so \
-            foreign/php/target/debug/libiggy_php.dylib \
-            foreign/php/target/debug/iggy_php.dll; do
+            foreign/php/target/debug/libiggy_php.dylib; do
             if [ -f "${extension_candidate}" ]; then
-                PHP_IGGY_EXTENSION="${extension_candidate}"
+                PHP_IGGY_EXTENSION="$(pwd)/${extension_candidate}"
                 break
             fi
         done

@@ -23,7 +23,6 @@ declare(strict_types=1);
 
 use Iggy\Client;
 use Iggy\PollingStrategy;
-use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
 
 function iggy_connection_string(): string
@@ -56,7 +55,7 @@ function ensure_stream_and_topic(Client $client, string $stream, string $topic):
     }
 
     if ($client->getTopic($stream, $topic) === null) {
-        $client->createTopic($stream, $topic, 1, null, null, null, null);
+        $client->createTopic($stream, $topic, 1);
     }
 }
 
@@ -79,10 +78,6 @@ function print_polled_messages(Client $client, string $stream, string $topic, in
     }
 
     foreach ($messages as $message) {
-        if (!$message instanceof ReceiveMessage) {
-            continue;
-        }
-
         echo "Received message at offset {$message->offset()}: {$message->payload()}", PHP_EOL;
     }
 }

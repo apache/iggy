@@ -28,10 +28,6 @@ $topic = 'php-basic-topic';
 $client = iggy_client();
 
 ensure_stream_and_topic($client, $stream, $topic);
-send_payloads($client, $stream, $topic, [
-    'basic-message-alpha',
-    'basic-message-beta',
-    'basic-message-gamma',
-]);
+send_payloads($client, $stream, $topic, example_payloads('basic', 3));
 
 echo "Sent 3 PHP basic messages", PHP_EOL;
