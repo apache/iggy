@@ -55,12 +55,13 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/server/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # Edge :edge refresh gate (scripts/ci/edge-affected-images.sh). Image ships
-    # both the server and CLI binaries. crates: cargo package names matched
-    # against `cargo rail plan`; paths: git pathspecs matched against the diff.
+    # :edge refresh gate (scripts/ci/edge-affected-images.sh). Ships server + CLI
+    # with the web UI embedded at compile time, so web-only changes must rebuild
+    # it. crates: matched against `cargo rail plan`; paths: extra git pathspecs
+    # (the dockerfile: above is gated automatically).
     gate:
       crates: [server, iggy-cli]
-      paths: [core/server/Dockerfile]
+      paths: [web]
 
   rust-mcp:
     tag_pattern: "^mcp-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -72,7 +73,6 @@ components:
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
     gate:
       crates: [iggy-mcp]
-      paths: [core/ai/mcp/Dockerfile]
 
   rust-bench-dashboard:
     tag_pattern: "^bench-dashboard-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -86,7 +86,6 @@ components:
     gate:
       crates: [iggy-bench-dashboard-server, bench-dashboard-frontend]
       paths:
-        - core/bench/dashboard/server/Dockerfile
         - core/bench/dashboard/server/docker-entrypoint.sh
 
   rust-connectors:
@@ -100,7 +99,6 @@ components:
     # Image ships only the runtime binary; plugin .so files are not bundled.
     gate:
       crates: [iggy-connectors]
-      paths: [core/connectors/runtime/Dockerfile]
 
   web-ui:
     tag_pattern: "^web-ui-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"

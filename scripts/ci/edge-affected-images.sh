@@ -68,14 +68,27 @@ fi
 
 RAIL_ERR="$(mktemp)"
 trap 'rm -f "$RAIL_ERR"' EXIT
-PLAN="$(cargo rail plan --since "$BASE" -f json 2>"$RAIL_ERR" || true)"
-if [[ -z "$PLAN" ]]; then
-  echo "::warning::edge-gate: cargo-rail failed, refreshing all images. $(cat "$RAIL_ERR" 2>/dev/null || true)" >&2
+
+# Capture cargo-rail's exit status explicitly: a nonzero exit means the plan is
+# untrustworthy, so fall open. `|| true` would hide the failure and let
+# malformed stdout reach the parsing below.
+if ! PLAN="$(cargo rail plan --since "$BASE" -f json 2>"$RAIL_ERR")"; then
+  echo "::warning::edge-gate: cargo-rail exited nonzero, refreshing all images. $(cat "$RAIL_ERR" 2>/dev/null || true)" >&2
   emit_all
   exit 0
 fi
 
-MODE="$(jq -r '.scope.mode // "full"' <<<"$PLAN")"
+# Parse defensively: malformed output must fall OPEN, never abort under set -e
+# (that fails closed and skips the publish). jq prints nothing on a parse error,
+# leaving MODE empty. A valid {mode:crates, crates:[]} is the normal
+# docs/SDK/config-only push and must publish nothing, so only an unparsable
+# MODE or a non-"crates" mode escalates to emit_all.
+MODE="$(jq -r '.scope.mode // "full"' <<<"$PLAN" 2>/dev/null || true)"
+if [[ -z "$MODE" ]]; then
+  echo "::warning::edge-gate: unparsable cargo-rail output, refreshing all images" >&2
+  emit_all
+  exit 0
+fi
 if [[ "$MODE" != "crates" ]]; then
   echo "::notice::edge-gate: cargo-rail reports full workspace, refreshing all images" >&2
   emit_all
@@ -83,18 +96,15 @@ if [[ "$MODE" != "crates" ]]; then
 fi
 
 mapfile -t AFFECTED < <(jq -r '.scope.crates // [] | .[]' <<<"$PLAN")
-
-crate_affected() {
-  local want="$1" crate
-  for crate in ${AFFECTED[@]+"${AFFECTED[@]}"}; do
-    [[ "$crate" == "$want" ]] && return 0
-  done
-  return 1
-}
+declare -A AFFECTED_SET=()
+for crate in ${AFFECTED[@]+"${AFFECTED[@]}"}; do
+  AFFECTED_SET["$crate"]=1
+done
 
 SELECTED=()
 for img in "${ALL_IMAGES[@]}"; do
-  # An image with no gate block fails open (always refreshed).
+  # No gate block fails open (always refreshed). An incomplete gate fails closed
+  # (under-publishes): enumerate every embedded/COPYed source.
   if [[ "$(jq -r --arg k "$img" '.[$k] | has("gate")' <<<"$CFG_JSON")" != "true" ]]; then
     SELECTED+=("$img")
     continue
@@ -103,15 +113,17 @@ for img in "${ALL_IMAGES[@]}"; do
   keep=false
 
   while IFS= read -r crate; do
-    [[ -z "$crate" ]] && continue
-    if crate_affected "$crate"; then
+    if [[ -n "${AFFECTED_SET[$crate]:-}" ]]; then
       keep=true
       break
     fi
   done < <(jq -r --arg k "$img" '.[$k].gate.crates // [] | .[]' <<<"$CFG_JSON")
 
   if [[ "$keep" == false ]]; then
-    mapfile -t gate_paths < <(jq -r --arg k "$img" '.[$k].gate.paths // [] | .[]' <<<"$CFG_JSON")
+    # dockerfile: is the build context's primary input; gate.paths lists any
+    # extra sources COPYed or embedded beyond the crate closure.
+    mapfile -t gate_paths < <(jq -r --arg k "$img" \
+      '[.[$k].dockerfile] + (.[$k].gate.paths // []) | .[] | select(. != null)' <<<"$CFG_JSON")
     if [[ ${#gate_paths[@]} -gt 0 ]] && ! git diff --quiet "$BASE" "$HEAD" -- "${gate_paths[@]}"; then
       keep=true
     fi
