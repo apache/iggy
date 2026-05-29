@@ -22,7 +22,6 @@ use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 /// A Python class representing a received message.
-///
 /// This class wraps a Rust message, allowing for access to its payload and offset from Python.
 #[pyclass]
 #[gen_stub_pyclass]
@@ -35,42 +34,36 @@ pub struct ReceiveMessage {
 #[pymethods]
 impl ReceiveMessage {
     /// Retrieves the payload of the received message.
-    ///
     /// The payload is returned as a Python bytes object.
     pub fn payload<'a>(&self, py: Python<'a>) -> Bound<'a, PyBytes> {
         PyBytes::new(py, &self.inner.payload)
     }
 
     /// Retrieves the offset of the received message.
-    ///
     /// The offset represents the position of the message within its topic.
     pub fn offset(&self) -> u64 {
         self.inner.header.offset
     }
 
     /// Retrieves the timestamp of the received message.
-    ///
     /// The timestamp represents the time of the message within its topic.
     pub fn timestamp(&self) -> u64 {
         self.inner.header.timestamp
     }
 
     /// Retrieves the id of the received message.
-    ///
     /// The id represents unique identifier of the message within its topic.
     pub fn id(&self) -> u128 {
         self.inner.header.id
     }
 
     /// Retrieves the checksum of the received message.
-    ///
     /// The checksum represents the integrity of the message within its topic.
     pub fn checksum(&self) -> u64 {
         self.inner.header.checksum
     }
 
     /// Retrieves the length of the received message.
-    ///
     /// The length represents the length of the payload.
     pub fn length(&self) -> u32 {
         self.inner.header.payload_length

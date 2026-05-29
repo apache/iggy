@@ -182,6 +182,9 @@ pub struct ServerAttrs {
     /// Dynamic config overrides using dot-notation paths.
     pub config_overrides: Vec<ConfigOverride>,
 
+    /// Executable path or bare cargo binary name to launch for the test server.
+    pub executable_path: Option<String>,
+
     /// Path to a TOML config file for the server.
     pub config_path: Option<String>,
 
@@ -440,6 +443,11 @@ fn parse_server_attrs(input: ParseStream) -> syn::Result<ServerAttrs> {
                 let lit: LitStr = input.parse()?;
                 server.config_path = Some(lit.value());
             }
+            "executable_path" => {
+                input.parse::<Token![=]>()?;
+                let lit: LitStr = input.parse()?;
+                server.executable_path = Some(lit.value());
+            }
             _ => {
                 input.parse::<Token![=]>()?;
                 let value = parse_config_value(input)?;
@@ -625,6 +633,15 @@ mod tests {
         let attrs: IggyTestAttrs = syn::parse_quote!(server(segment.size = "1MiB"));
         let segment_size = attrs.server.find_override("segment.size").unwrap();
         assert!(matches!(&segment_size.value, ConfigValue::Static(s) if s == "1MiB"));
+    }
+
+    #[test]
+    fn parse_server_executable_path() {
+        let attrs: IggyTestAttrs = syn::parse_quote!(server(executable_path = "iggy-server-ng"));
+        assert_eq!(
+            attrs.server.executable_path.as_deref(),
+            Some("iggy-server-ng")
+        );
     }
 
     #[test]

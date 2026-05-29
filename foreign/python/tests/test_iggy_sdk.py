@@ -27,6 +27,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
+
 from apache_iggy import AutoCommit, IggyClient, PollingStrategy, ReceiveMessage
 from apache_iggy import SendMessage as Message
 
@@ -458,7 +459,8 @@ class TestConsumerGroup:
 
         assert consumer.stream() == stream_name
         assert consumer.topic() == topic_name
-        # This internally loads `current_partition_id` which is set to 0 until you start consuming
+        # This internally loads `current_partition_id`
+        # which is set to 0 until you start consuming
         assert consumer.partition_id() == 0
         assert consumer.get_last_consumed_offset(partition_id) is None
         assert consumer.get_last_stored_offset(partition_id) is None

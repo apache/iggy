@@ -65,7 +65,7 @@ impl PostgresSourceJsonFixture {
             )",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
@@ -87,7 +87,7 @@ impl PostgresSourceJsonFixture {
             "INSERT INTO {} (id, name, count, amount, active, timestamp, tag) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(id)
             .bind(name)
             .bind(count)
@@ -163,7 +163,7 @@ impl PostgresSourceByteaFixture {
             )",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
@@ -171,7 +171,7 @@ impl PostgresSourceByteaFixture {
 
     pub async fn insert_payload(&self, pool: &Pool<Postgres>, id: i32, payload: &[u8]) {
         let query = format!("INSERT INTO {} (id, payload) VALUES ($1, $2)", Self::TABLE);
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(id)
             .bind(payload)
             .execute(pool)
@@ -243,7 +243,7 @@ impl PostgresSourceJsonbFixture {
             )",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
@@ -251,7 +251,7 @@ impl PostgresSourceJsonbFixture {
 
     pub async fn insert_json(&self, pool: &Pool<Postgres>, id: i32, data: &serde_json::Value) {
         let query = format!("INSERT INTO {} (id, data) VALUES ($1, $2)", Self::TABLE);
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(id)
             .bind(data)
             .execute(pool)
@@ -327,7 +327,7 @@ impl PostgresSourceDeleteFixture {
             )",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
@@ -335,7 +335,7 @@ impl PostgresSourceDeleteFixture {
 
     pub async fn insert_row(&self, pool: &Pool<Postgres>, name: &str, value: i32) {
         let query = format!("INSERT INTO {} (name, value) VALUES ($1, $2)", Self::TABLE);
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(name)
             .bind(value)
             .execute(pool)
@@ -414,7 +414,7 @@ impl PostgresSourceMarkFixture {
             )",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
@@ -425,7 +425,7 @@ impl PostgresSourceMarkFixture {
             "INSERT INTO {} (name, value, is_processed) VALUES ($1, $2, $3)",
             Self::TABLE
         );
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(name)
             .bind(value)
             .bind(false)
@@ -443,7 +443,7 @@ impl PostgresSourceMarkFixture {
             "SELECT COUNT(*) FROM {} WHERE is_processed = FALSE",
             Self::TABLE
         );
-        let count: (i64,) = sqlx::query_as(&query)
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
             .fetch_one(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
@@ -455,7 +455,7 @@ impl PostgresSourceMarkFixture {
             "SELECT COUNT(*) FROM {} WHERE is_processed = TRUE",
             Self::TABLE
         );
-        let count: (i64,) = sqlx::query_as(&query)
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
             .fetch_one(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));

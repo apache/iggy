@@ -17,7 +17,7 @@
 
 import argparse
 import asyncio
-from collections import namedtuple
+from typing import NamedTuple
 
 from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
 from loguru import logger
@@ -29,10 +29,12 @@ TOPIC_ID = 0
 PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
-ArgNamespace = namedtuple("ArgNamespace", ["connection_string"])
+
+class ArgNamespace(NamedTuple):
+    connection_string: str
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> ArgNamespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "connection_string",
@@ -43,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         type=str,
     )
-    return parser.parse_args()
+    return ArgNamespace(**vars(parser.parse_args()))
 
 
 async def main():
@@ -58,8 +60,9 @@ async def main():
 async def consume_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
-        f"Messages will be consumed from stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with "
-        f"interval {interval * 1000} ms."
+        f"Messages will be consumed from stream: {STREAM_NAME}, "
+        f"topic: {TOPIC_NAME}, partition: {PARTITION_ID} "
+        f"with interval {interval * 1000} ms."
     )
     offset = 0
     messages_per_batch = 10
@@ -86,7 +89,7 @@ async def consume_messages(client: IggyClient):
             n_consumed_batches += 1
             await asyncio.sleep(interval)
         except Exception as error:
-            logger.exception("Exception occurred while consuming messages: {}", error)
+            logger.exception(f"Exception occurred while consuming messages: {error}")
             break
 
     logger.info(f"Consumed {n_consumed_batches} batches of messages, exiting.")

@@ -44,6 +44,7 @@ pub struct SourceConfig {
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
+    pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
 }
 ```
 
@@ -69,6 +70,7 @@ name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
+benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]

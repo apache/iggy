@@ -17,7 +17,7 @@
 
 import argparse
 import asyncio
-from collections import namedtuple
+from typing import NamedTuple
 
 from apache_iggy import IggyClient, StreamDetails, TopicDetails
 from apache_iggy import SendMessage as Message
@@ -30,10 +30,12 @@ TOPIC_ID = 0
 PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
-ArgNamespace = namedtuple("ArgNamespace", ["connection_string"])
+
+class ArgNamespace(NamedTuple):
+    connection_string: str
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> ArgNamespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "connection_string",
@@ -44,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         type=str,
     )
-    return parser.parse_args()
+    return ArgNamespace(**vars(parser.parse_args()))
 
 
 async def main():
@@ -60,7 +62,7 @@ async def main():
 async def init_system(client: IggyClient):
     try:
         logger.info(f"Creating stream with name {STREAM_NAME}...")
-        stream: StreamDetails = await client.get_stream(STREAM_NAME)
+        stream: StreamDetails | None = await client.get_stream(STREAM_NAME)
         if stream is None:
             await client.create_stream(name=STREAM_NAME)
             logger.info("Stream was created successfully.")
@@ -73,7 +75,7 @@ async def init_system(client: IggyClient):
 
     try:
         logger.info(f"Creating topic {TOPIC_NAME} in stream {STREAM_NAME}")
-        topic: TopicDetails = await client.get_topic(STREAM_NAME, TOPIC_NAME)
+        topic: TopicDetails | None = await client.get_topic(STREAM_NAME, TOPIC_NAME)
         if topic is None:
             await client.create_topic(
                 stream=STREAM_NAME,
@@ -92,7 +94,9 @@ async def init_system(client: IggyClient):
 async def produce_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
-        f"Messages will be sent to stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with interval {interval * 1000} ms."
+        f"Messages will be sent to stream: {STREAM_NAME}, "
+        f"topic: {TOPIC_NAME}, partition: {PARTITION_ID} "
+        f"with interval {interval * 1000} ms."
     )
     current_id = 0
     messages_per_batch = 10
@@ -105,7 +109,8 @@ async def produce_messages(client: IggyClient):
             message = Message(payload)
             messages.append(message)
         logger.info(
-            f"Attempting to send batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+            f"Attempting to send batch of {messages_per_batch} messages. "
+            f"Batch ID: {current_id // messages_per_batch}"
         )
         try:
             await client.send_messages(
@@ -116,7 +121,8 @@ async def produce_messages(client: IggyClient):
             )
             n_sent_batches += 1
             logger.info(
-                f"Successfully sent batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+                f"Successfully sent batch of {messages_per_batch} messages. "
+                f"Batch ID: {current_id // messages_per_batch}"
             )
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")

@@ -85,6 +85,9 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
+- Server-side message compression is not supported yet. Topic compression values
+  are reserved for future disk/network compression support; use message headers
+  for manual compression today (see `examples/rust/src/message-headers/message-compression`).
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
 - Support for **OpenTelemetry** logs & traces + Prometheus metrics
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
@@ -320,7 +323,7 @@ Get `dev` stream details:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
-Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), disabled compression (`none`) and disabled message expiry (skipped optional parameter):
+Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 

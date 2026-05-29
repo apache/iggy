@@ -34,10 +34,12 @@ body:
       required: true
 
   - type: dropdown
-    id: component
+    id: area
     attributes:
-      label: Component
-      description: Which part of the project does this affect?
+      label: Affected area / component
+      description: |
+        Which part(s) of the project does this affect? Your selection is auto-labeled on the issue.
+      multiple: true
       options:
         - Iggy server
         - Rust SDK
@@ -46,11 +48,20 @@ body:
         - Python SDK
         - "C# SDK"
         - Node.js SDK
+        - "C++ SDK"
+        - PHP SDK
         - CLI
         - Web UI
         - Connectors
+        - MCP server
+        - Configuration
+        - Wire protocol / API
+        - Metadata
+        - Clustering / replication
+        - Performance
         - Documentation
-        - Other
+        - CI / build / tooling
+        - Other / not sure
     validations:
       required: false
 
@@ -69,3 +80,18 @@ body:
       description: Other approaches you thought of.
     validations:
       required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to submit a pull request to implement this feature
+
+  - type: checkboxes
+    id: good-first-issue
+    attributes:
+      label: Good first issue
+      description: A suggestion for triage; a maintainer decides whether to apply the label.
+      options:
+        - label: I think this could be a good first issue for a new contributor

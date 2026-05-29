@@ -83,8 +83,9 @@
 
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
+use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
-use compio::net::{SocketOpts, TcpListener, TcpStream};
+use compio::net::{TcpListener, TcpStream};
 use compio::runtime::JoinHandle;
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
@@ -108,12 +109,7 @@ pub type MessageHandler = Rc<dyn Fn(u8, Message<GenericHeader>)>;
 /// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
 #[allow(clippy::future_not_send)]
 pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
-    // `SO_REUSEPORT` intentionally not set: only shard 0 binds the replica
-    // listener. Kernel-level accept distribution would fight the shard-0
-    // coordinator's explicit round-robin allocation.
-    let opts = SocketOpts::new().nodelay(true);
-    let listener = TcpListener::bind_with_options(addr, &opts)
-        .await
+    let listener = bind_reusable_tcp_listener(addr)
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener
         .local_addr()

@@ -18,6 +18,8 @@
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_stream::ConnectionStream;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
+#[cfg(feature = "vsr")]
+use bytes::BytesMut;
 use iggy_common::IggyError;
 
 #[derive(Debug)]
@@ -32,6 +34,14 @@ impl ConnectionStreamKind {
         match self {
             Self::Tcp(c) => c.read(buf).await,
             Self::TcpTls(c) => c.read(buf).await,
+        }
+    }
+
+    #[cfg(feature = "vsr")]
+    pub async fn read_buf(&mut self, buf: &mut BytesMut, len: usize) -> Result<(), IggyError> {
+        match self {
+            Self::Tcp(c) => c.read_buf(buf, len).await,
+            Self::TcpTls(c) => c.read_buf(buf, len).await,
         }
     }
 

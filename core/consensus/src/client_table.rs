@@ -363,6 +363,32 @@ impl ClientTable {
             .reply = CachedReply::from_message(reply);
     }
 
+    /// Remove a client session and cached reply.
+    ///
+    /// **LOCAL ONLY -- does NOT replicate.** Two correct call sites:
+    ///
+    /// 1. **Applying a committed `Operation::Logout`** -- every replica runs
+    ///    this from `on_ack` / `commit_journal` during deterministic apply,
+    ///    so all replicas drop the slot together. Required-on-every-replica.
+    /// 2. **Transport-level disconnect cleanup** -- best-effort capacity
+    ///    reclaim. Bounded window of local-vs-cluster divergence until
+    ///    `evict_oldest` or a `Logout` commit catches the peer side up.
+    ///
+    /// **Forbidden:** using this to roll back a cluster-committed
+    /// `Operation::Register` -- peers keep the slot, producing divergence
+    /// that survives view changes.
+    ///
+    /// Returns `true` when a slot existed.
+    ///
+    /// [`Operation::Register`]: iggy_binary_protocol::Operation
+    pub fn remove_client(&mut self, client_id: u128) -> bool {
+        let Some(slot_idx) = self.index.remove(&client_id) else {
+            return false;
+        };
+        self.slots[slot_idx] = None;
+        true
+    }
+
     /// Evict client with oldest commit, preferring no-in-flight.
     ///
     /// Deterministic: fixed-array iteration, ties broken by lowest slot index.

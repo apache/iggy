@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
@@ -26,7 +28,7 @@ var _ = ginkgo.Describe("GET ALL CLIENT FEATURE:", func() {
 	ginkgo.When("user is logged in", func() {
 		ginkgo.Context("and tries to log with correct data", func() {
 			client := createAuthorizedConnection()
-			clients, err := client.GetClients()
+			clients, err := client.GetClients(context.Background())
 
 			itShouldNotReturnError(err)
 			ginkgo.It("should return stats", func() {
@@ -42,7 +44,7 @@ var _ = ginkgo.Describe("GET ALL CLIENT FEATURE:", func() {
 	ginkgo.When("user is not logged in", func() {
 		ginkgo.Context("and tries get all clients", func() {
 			client := createClient()
-			clients, err := client.GetClients()
+			clients, err := client.GetClients(context.Background())
 
 			itShouldReturnUnauthenticatedError(err)
 			ginkgo.It("should not return clients", func() {
