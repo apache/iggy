@@ -65,6 +65,29 @@ jobs:
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
+      - name: Install PHP build dependencies
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            libclang-dev \
+            libhwloc-dev \
+            libssl-dev \
+            php8.3-cli \
+            php8.3-dev \
+            pkg-config
+
+          php_bin="$(command -v php8.3)"
+          php_config="$(command -v php-config8.3)"
+          {
+            echo "PHP=${php_bin}"
+            echo "PHP_CONFIG=${php_config}"
+          } >> "$GITHUB_ENV"
+          "${php_bin}" --version
+          "${php_config}" --version
+
       - name: Cache uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: actions/cache@v5
@@ -123,6 +146,20 @@ jobs:
             fi
           fi
 
+      - name: Build PHP extension for examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target"
+          cargo build --manifest-path foreign/php/Cargo.toml
+          extension="$(find target/debug -maxdepth 1 -name 'libiggy_php.so' -print -quit)"
+          if [ -z "$extension" ]; then
+            echo "PHP extension was not produced"
+            exit 1
+          fi
+          echo "PHP_IGGY_EXTENSION=$(realpath "$extension")" >> "$GITHUB_ENV"
+          ls -lh "$extension"
+
       - name: Build Node SDK for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
         run: |
@@ -149,6 +186,10 @@ jobs:
       - name: Run Python examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         run: ./scripts/run-examples-from-readme.sh --language python
+
+      - name: Run PHP examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
+        run: ./scripts/run-examples-from-readme.sh --language php
 
       - name: Run Node.js examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
