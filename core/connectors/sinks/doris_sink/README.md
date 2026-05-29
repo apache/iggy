@@ -1,0 +1,99 @@
+# Apache Doris Sink
+
+The Doris sink connector consumes JSON messages from Iggy streams and writes them to a pre-created Apache Doris table via Doris's [Stream Load HTTP API](https://doris.apache.org/docs/data-operate/import/import-way/stream-load-manual).
+
+## Requirements
+
+- The target Doris **database and table must be pre-created** before enabling the sink. The connector never issues DDL.
+- `database` and `table` config values must match `[A-Za-z0-9_]+`. Anything else is rejected at startup with `Error::InvalidConfigValue` — this also prevents path traversal in the constructed `/api/{db}/{table}/_stream_load` URL.
+- Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). If a non-JSON payload reaches the connector it logs at `error!` and aborts the whole poll; since the consumer offset is already committed at poll time the batch is not replayed — effectively silent data loss — so the upstream schema must be guaranteed JSON. (Under `schema = "json"` the SDK drops non-JSON before the connector sees it, so this abort is a defensive guard.)
+- The Iggy message JSON shape must match the target table columns. Use the optional `columns` plugin setting if the column order differs from the JSON keys.
+
+## How it works
+
+1. For each batch of messages, the connector serializes the JSON payloads into a JSON array.
+2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first_offset}-{last_offset}`.
+   - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(label_prefix, stream, topic)` triple. So identities that sanitize to the same string get distinct labels — whether the collision is in the names (`events.v1` vs `events_v1`) or in two tenants' prefixes that truncate alike (`prod_events_us_east_1` vs `..._2`) — and no boundary-shift aliasing is possible (`("ab","c")` ≠ `("a","bc")`).
+   - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
+   - Doris dedupes loads by label inside its `label_keep_max_second` window. The deterministic label is **forward-compatible scaffolding**: if the runtime ever gains retry/redrive, a duplicate load would be absorbed, not doubled. **Today it protects no production scenario** — there is no retry loop, `consume()` runs once per poll, and the runtime discards its return value. Delivery is at-most-once: the offset is committed before `consume()` runs, so a failed load is never replayed.
+3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it. Where the HTTP stack negotiates the handshake it also lets Doris reject auth/4xx before the body uploads — a secondary benefit, not relied on for correctness.)
+4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
+   `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 (or a redirect with no usable `Location`) are rejected as a permanent `PermanentHttpError`, since retrying a malformed/looping redirect cannot help.
+5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
+   - `Success` → batch accepted.
+   - `Label Already Exists` → idempotent replay, treated as success.
+   - `Publish Timeout` or HTTP `5xx`/`408`/`429` → classified as a transient error (`Error::CannotStoreData`) — retryable in principle, but per the at-most-once note above the runtime does not currently act on it.
+   - `Fail`, any other `4xx`, or an unparsable response body → permanent error (`Error::PermanentHttpError`); retrying would not help even if the runtime did redrive.
+
+## Configuration
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `fe_url` | yes | — | Doris frontend HTTP base URL, e.g. `http://localhost:8030`. |
+| `database` | yes | — | Target database. Must match `[A-Za-z0-9_]+`. |
+| `table` | yes | — | Target table. Must match `[A-Za-z0-9_]+`. |
+| `username` | yes | — | Doris user with `LOAD_PRIV` on the table. |
+| `password` | yes | — | Doris user password. Stored as a `secrecy::SecretString` and never logged. |
+| `label_prefix` | no | `iggy` | Prefix for the deterministic Stream Load label. |
+| `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
+| `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
+| `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
+| `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
+| `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
+| `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |
+| `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |
+| `allowed_redirect_hosts` | no | unset | Allowlist of redirect targets. Each entry is `host` (pins the host, any port) or `host:port` (pins the exact endpoint). When set and non-empty, any other redirect target is refused. |
+
+### Example
+
+```toml
+type = "sink"
+key = "doris"
+enabled = true
+version = 0
+name = "Doris sink"
+path = "target/release/libiggy_connector_doris_sink"
+plugin_config_format = "toml"
+
+[[streams]]
+stream = "events"
+topics = ["doris_events"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "doris_sink"
+
+[plugin_config]
+fe_url = "http://localhost:8030"
+database = "iggy_demo"
+table = "events"
+username = "root"
+password = "replace_with_secret"
+label_prefix = "iggy"
+batch_size = 1000
+timeout = "30s"
+```
+
+## Security notes
+
+- **Use `https://` in production.** The connector accepts `http://` URLs and logs a `warn!` when `fe_url` points at a non-loopback host over plain HTTP, but it does not refuse. Over `http://`, the HTTP Basic credentials travel in cleartext.
+- **Trust boundary on the FE.** The connector intentionally preserves the `Authorization` header across the FE → BE 307 redirect (reqwest would otherwise strip it on cross-host redirects).
+  A compromised or MITM'd FE could try to exfiltrate credentials by responding with `Location: http://attacker/`. Before re-attaching credentials, the connector validates the redirect target: it **refuses a scheme downgrade** (`https://` → `http://`) unless `allow_insecure_redirect = true`, requires an **absolute** `Location` (a relative one is rejected, not silently resolved), and — if `allowed_redirect_hosts` is set — refuses any target outside that allowlist.
+  **When `allowed_redirect_hosts` is unset (the default), any same-scheme host is accepted** — that is the price of supporting the normal cross-host FE → BE topology out of the box. For lockdown in hostile networks, set `allowed_redirect_hosts` to your known BE endpoints and deploy Doris over TLS. List a bare `host` to pin only the host, or `host:port` to pin the exact endpoint — pinning the port closes the "allowlisted host, attacker port" vector.
+- **`columns` and `where` are SQL-expression pass-throughs.** Whatever you put in those config fields is forwarded verbatim to Doris's Stream Load and evaluated as a SQL expression. Keep this config trusted.
+
+## Operational guidance
+
+- **`label_keep_max_second`.** Idempotent replay relies on Doris retaining each label for at least as long as it could take the Iggy runtime to redrive a failed batch. The Doris default is 3 days, which is conservative. If you set this lower on the Doris side, make sure your runtime retry budget fits inside the window — once a label expires, a replay re-loads instead of deduping, producing duplicate rows.
+- **Keep `batch_size` stable across a redrive.** The label includes the chunk's `first_offset` and `last_offset`, which are a function of `batch_size`. If you change `batch_size` between a failed load and its redrive, the chunk boundaries shift, the offsets differ, and the new label no longer matches the old one — so Doris re-loads instead of deduping, producing duplicate rows.
+- **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
+- **Multi-chunk batches are best-effort for operational failures.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load. If a chunk fails *operationally* (serialize, HTTP, or status-classification error), the connector still attempts the remaining chunks and then returns the worst error — it does **not** stop at the first such failure.
+  The runtime commits the consumer offset for the whole poll before `consume()` runs, so a failed chunk is not replayed regardless; pushing the other chunks through maximizes delivered data, and the worst error is surfaced at the end (logged at `error!` for observability — the runtime currently discards `consume()`'s return value, so there is no retry or DLQ).
+  The one deliberate exception is a **non-JSON payload**, which is treated as a schema-contract violation and aborts the whole poll immediately (see the Requirements note above). Under `schema = "json"` this is unreachable, so it is a defensive guard rather than a normal path.
+
+## Limitations
+
+- JSON payload only. CSV and raw-text payloads are not supported yet.
+- HTTP Basic auth only.
+- No automatic table creation.
+- No built-in retry middleware or circuit breaker — the runtime decides whether to redrive a failing batch. A hardening pass with `iggy_connector_sdk::retry::*` is planned as a follow-up.
