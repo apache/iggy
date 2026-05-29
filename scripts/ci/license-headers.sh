@@ -52,6 +52,12 @@ if [ ! -f "licenserc.toml" ]; then
   exit 1
 fi
 
+if ! command -v jq &> /dev/null; then
+  echo "❌ jq command not found"
+  echo "💡 Install jq: https://jqlang.github.io/jq/download/"
+  exit 1
+fi
+
 HAWKEYE_VERSION="6.5.1"
 
 # Check if HawkEye is available
@@ -76,9 +82,7 @@ extract_hawkeye_paths() {
   local key="$1"
   local file="$2"
 
-  sed -n "s/.*\"$key\":\\[//; s/\\],\".*//; s/\\]}.*//; p" "$file" \
-    | tr ',' '\n' \
-    | sed 's/^"//; s/"$//' \
+  jq -r --arg key "$key" '.[$key] // [] | .[]' "$file" \
     | awk -v root="$REPO_ROOT" '
         NF {
           if (index($0, root "/") == 1) {
