@@ -103,7 +103,7 @@ cargo run --example message-headers-type-consumer
 
 Demonstrates using HeaderKey/HeaderValue for message metadata instead of payload-based typing, with header-based message routing.
 
-Shows how user headers can be used for message compression in transit:
+Shows how user headers can be used for manual userspace message compression in transit. This is the current workaround while built-in topic/server compression remains unsupported:
 
 ```bash
 cargo run --example message-headers-compression-producer
