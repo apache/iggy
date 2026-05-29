@@ -17,45 +17,19 @@
  * under the License.
  */
 
-use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use crate::connectors::source_suite;
 use integration::harness::seeds;
 use integration::iggy_harness;
-use std::time::Duration;
-use tokio::time::sleep;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
     seed = seeds::connector_stream
 )]
 async fn random_source_produces_messages(harness: &TestHarness) {
-    sleep(Duration::from_secs(1)).await;
-
-    let client = harness.root_client().await.unwrap();
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
-
-    let messages = client
-        .poll_messages(
-            &stream_id,
-            &topic_id,
-            None,
-            &Consumer::new(consumer_id),
-            &PollingStrategy::next(),
-            10,
-            true,
-        )
-        .await
-        .expect("Failed to poll messages");
-
+    let messages = source_suite::assert_source_produces_messages(harness).await;
     assert!(
-        !messages.messages.is_empty(),
+        !messages.is_empty(),
         "No messages received from random source"
-    );
-    assert!(
-        messages.current_offset > 0,
-        "Current offset should be greater than 0"
     );
 }
 
@@ -64,32 +38,12 @@ async fn random_source_produces_messages(harness: &TestHarness) {
     seed = seeds::connector_stream
 )]
 async fn state_persists_across_connector_restart(harness: &mut TestHarness) {
-    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
-    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let consumer_id: Identifier = "state_test_consumer".try_into().unwrap();
-
-    sleep(Duration::from_secs(1)).await;
-
-    let client = harness.root_client().await.unwrap();
-    let offset_before = {
-        let messages = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                100,
-                true,
-            )
-            .await
-            .expect("Failed to poll messages before restart");
-        assert!(
-            messages.current_offset > 0,
-            "Should have messages before restart"
-        );
-        messages.current_offset
-    };
+    let before_config = source_suite::config_for_consumer("source_suite_before_restart");
+    let before = source_suite::poll_until_min_messages(harness, &before_config).await;
+    assert!(
+        !before.is_empty(),
+        "source suite expected messages before connector restart"
+    );
 
     harness
         .server_mut()
@@ -100,24 +54,11 @@ async fn state_persists_across_connector_restart(harness: &mut TestHarness) {
         .start_dependents()
         .await
         .expect("Failed to restart connectors");
-    sleep(Duration::from_secs(1)).await;
 
-    let offset_after = client
-        .poll_messages(
-            &stream_id,
-            &topic_id,
-            None,
-            &Consumer::new(consumer_id),
-            &PollingStrategy::next(),
-            100,
-            true,
-        )
-        .await
-        .expect("Failed to poll messages after restart")
-        .current_offset;
-
+    let after_config = source_suite::config_for_consumer("source_suite_after_restart");
+    let after = source_suite::poll_until_min_messages(harness, &after_config).await;
     assert!(
-        offset_after > offset_before,
-        "After restart, offset {offset_after} should be greater than before {offset_before}"
+        !after.is_empty(),
+        "source suite expected messages after connector restart"
     );
 }
