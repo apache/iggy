@@ -133,8 +133,34 @@ write_hawkeye_report() {
 
 if [ "$MODE" = "fix" ]; then
   echo "🔧 Adding license headers to files..."
+  TEMP_FILE=$(mktemp)
+  MISSING_FILE=$(mktemp)
+  UNKNOWN_FILE=$(mktemp)
+  LOG_FILE=$(mktemp)
+  trap 'rm -f "$TEMP_FILE" "$MISSING_FILE" "$UNKNOWN_FILE" "$LOG_FILE"' EXIT
+
+  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || true
+  extract_hawkeye_paths missing "$TEMP_FILE" > "$MISSING_FILE"
+  extract_hawkeye_paths unknown "$TEMP_FILE" > "$UNKNOWN_FILE"
+
+  if [ -s "$UNKNOWN_FILE" ]; then
+    echo "❌ Cannot add license headers to unknown file types:"
+    echo ""
+    append_hawkeye_section "Unknown file types" "$UNKNOWN_FILE"
+    exit 1
+  fi
+
   run_hawkeye format --config licenserc.toml --fail-if-updated false --fail-if-unknown
-  echo "✅ License headers have been added to files"
+
+  if [ -s "$MISSING_FILE" ]; then
+    append_hawkeye_section "Updated license headers" "$MISSING_FILE"
+  fi
+
+  if [ ! -s "$MISSING_FILE" ] && [ ! -s "$UNKNOWN_FILE" ]; then
+    echo "✅ No license header changes needed"
+  else
+    echo "✅ License header fix completed"
+  fi
 else
   echo "🔍 Checking license headers..."
 

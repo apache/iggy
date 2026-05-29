@@ -18,30 +18,20 @@
 baseDir = "."
 headerPath = "ASF_LICENSE.txt"
 strictCheck = true
-useDefaultMapping = false
+useDefaultMapping = true
 keywords = ["Licensed to the Apache Software Foundation"]
 
 excludes = [
     "**/target/**",
-    "target/**",
     "**/node_modules/**",
-    "node_modules/**",
     "**/.venv/**",
-    ".venv/**",
     "**/venv/**",
-    "venv/**",
     "**/dist/**",
-    "dist/**",
     "**/build/**",
-    "build/**",
     "**/.idea/**",
-    ".idea/**",
     "**/.vscode/**",
-    ".vscode/**",
     "**/.gradle/**",
-    ".gradle/**",
     "**/.svelte-kit/**",
-    ".svelte-kit/**",
     "**/bin/**",
     "**/obj/**",
     "**/local_data*/**",
@@ -90,15 +80,12 @@ excludes = [
 
 [mapping.DOUBLESLASH_STYLE]
 extensions = [
-    "c",
-    "cc",
-    "cpp",
     "cs",
     "go",
-    "h",
-    "hpp",
     "mjs",
+    "php",
     "rs",
+    "js",
 ]
 
 [mapping.SCRIPT_STYLE]
@@ -127,14 +114,21 @@ extensions = [
     "css",
     "fbs",
     "java",
-    "js",
     "kt",
     "kts",
     "proto",
     "ts",
+    "c",
+    "cc",
+    "cpp",
+    "h",
+    "hpp",
 ]
 
 [mapping.XML_STYLE]
+filenames = [
+    "phpunit.xml.dist",
+]
 extensions = [
     "csproj",
     "html",
