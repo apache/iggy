@@ -93,6 +93,7 @@ pub use types::consumer::consumer_offset_info::*;
 pub use types::consumer::consumer_offsets::*;
 pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
 pub use types::either::Either;
+pub use types::http::HttpMethod;
 pub use types::identifier::*;
 pub use types::message::*;
 pub use types::partition::*;

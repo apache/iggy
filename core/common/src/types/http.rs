@@ -16,7 +16,25 @@
  * under the License.
  */
 
-mod hello_world;
-#[cfg(not(feature = "vsr"))]
-mod producer;
-mod raw;
+use strum::{Display, EnumString, IntoStaticStr};
+
+/// HTTP request method, kept dependency-free so `iggy_common` carries no
+/// concrete HTTP client type.
+#[derive(Clone, Copy, Debug, Default, Display, PartialEq, Eq, EnumString, IntoStaticStr)]
+pub enum HttpMethod {
+    #[default]
+    #[strum(serialize = "GET")]
+    Get,
+    #[strum(serialize = "POST")]
+    Post,
+    #[strum(serialize = "PUT")]
+    Put,
+    #[strum(serialize = "PATCH")]
+    Patch,
+    #[strum(serialize = "DELETE")]
+    Delete,
+    #[strum(serialize = "HEAD")]
+    Head,
+    #[strum(serialize = "OPTIONS")]
+    Options,
+}
