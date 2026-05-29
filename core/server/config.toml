@@ -415,9 +415,8 @@ key = ""
 
 # Compression configuration
 [system.compression]
-# Placeholder for future server-side compression support. The server does not
-# currently compress messages on disk or over the network. Use `none` for now;
-# manual userspace compression can be implemented with message headers.
+# Reserved for future server-side compression support; use "none" today.
+# For manual compression, store the algorithm in message headers.
 # Allows overriding the default compression algorithm per data segment (boolean).
 # `true` will permit different compression algorithms for individual segments.
 # `false` will make all data segments use the default compression algorithm.
