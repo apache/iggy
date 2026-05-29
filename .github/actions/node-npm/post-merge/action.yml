@@ -129,6 +129,20 @@ runs:
       run: |
         cd foreign/node
 
+        # npm publish defaults the dist-tag to `latest` for ANY version,
+        # including semver prereleases. An -edge/-rc build published under
+        # `latest` hijacks it from the stable release, so route prereleases
+        # to a channel tag derived from the prerelease identifier (edge, rc,
+        # ...) and reserve `latest` for stable versions.
+        VERSION="${{ inputs.version }}"
+        if [[ "$VERSION" == *-* ]]; then
+          pre="${VERSION#*-}"
+          DIST_TAG="${pre%%.*}"
+        else
+          DIST_TAG="latest"
+        fi
+        echo "npm dist-tag: $DIST_TAG"
+
         if [ "${{ inputs.dry_run }}" = "true" ]; then
           echo "🔍 Dry run - would publish to npm:"
           echo ""
@@ -158,11 +172,12 @@ runs:
           fi
 
           echo "📦 Publishing to npm registry..."
-          echo "Version: ${{ inputs.version }}"
+          echo "Version: $VERSION (dist-tag: $DIST_TAG)"
           echo ""
 
-          # Publish with provenance for supply chain security
-          npm publish --provenance --access public
+          # Publish with provenance for supply chain security. --tag keeps
+          # prereleases off `latest` (npm's default tag for any version).
+          npm publish --provenance --access public --tag "$DIST_TAG"
 
           if [ $? -eq 0 ]; then
             echo ""
