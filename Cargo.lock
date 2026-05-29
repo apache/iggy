@@ -6716,6 +6716,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_doris_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "blake3",
+ "bytes",
+ "humantime",
+ "iggy_connector_sdk",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "iggy_connector_elasticsearch_sink"
 version = "0.4.1-edge.1"
 dependencies = [
@@ -7185,6 +7205,7 @@ dependencies = [
  "iggy-cli",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_connector_doris_sink",
  "iggy_connector_sdk",
  "jsonwebtoken",
  "keyring-core",
@@ -7209,6 +7230,7 @@ dependencies = [
  "sysinfo 0.39.2",
  "tempfile",
  "test-case",
+ "testcontainers",
  "testcontainers-modules",
  "tokio",
  "toml 1.1.2+spec-1.1.0",

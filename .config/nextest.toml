@@ -21,6 +21,22 @@
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
+# Doris tests are serialized among themselves, but no longer monopolize the
+# whole runner. The all-in-one image's BE advertises 127.0.0.1:8040 for the
+# FE→BE 307 redirect, so only one Doris container per process can bind
+# host:8040. Within a nextest binary the fixture caches one shared container in
+# `SHARED_DORIS` so the first doris test pays the ~40s boot and the rest reuse
+# it; `max-threads = 1` keeps a second nextest binary (or a re-run) from
+# racing the same host port, while still letting unrelated light tests fill
+# the rest of the runner.
+[test-groups.doris]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::doris::/)'
+test-group = "doris"
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 4 }
 
