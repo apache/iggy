@@ -19,7 +19,7 @@
 use strum::{Display, EnumString, IntoStaticStr};
 
 /// HTTP request method, kept dependency-free so `iggy_common` carries no
-/// concrete HTTP client type.
+/// concrete HTTP client type. Defaults to `Get`.
 #[derive(Clone, Copy, Debug, Default, Display, PartialEq, Eq, EnumString, IntoStaticStr)]
 pub enum HttpMethod {
     #[default]

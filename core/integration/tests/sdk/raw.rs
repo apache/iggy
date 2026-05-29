@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
-use iggy_binary_protocol::codes::{GET_STATS_CODE, PING_CODE};
+use iggy_binary_protocol::codes::{GET_STATS_CODE, LOGIN_USER_CODE, PING_CODE};
 use iggy_binary_protocol::requests::system::{GetStatsRequest, PingRequest};
 use integration::iggy_harness;
 
@@ -44,9 +45,8 @@ async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
     assert_raw_round_trip(&client).await;
 }
 
-/// Each transport answers its own raw escape hatch and rejects the other's
-/// with [`IggyError::FeatureUnavailable`]: the binary `(code, payload)` frame
-/// has no HTTP analogue and the `(method, path)` request has no binary one.
+/// Each transport answers its own raw method and returns `FeatureUnavailable`
+/// for the other's.
 async fn assert_raw_round_trip(client: &IggyClient) {
     match client.get_connection_info().await.protocol {
         TransportProtocol::Http => {
@@ -79,6 +79,24 @@ async fn assert_raw_round_trip(client: &IggyClient) {
                 .await
                 .expect("authenticated binary command should return a body");
             assert!(!stats.is_empty());
+
+            // Rejected before the wire (guards the VSR consensus-session panic
+            // when a login code is sent raw on a bound client).
+            let error = client
+                .send_binary_request(LOGIN_USER_CODE, Bytes::new())
+                .await
+                .expect_err("session-control codes must be rejected by the raw path");
+            assert_eq!(error, IggyError::InvalidCommand);
+
+            // VSR encoder is closed-world: unknown code rejected at encode time.
+            #[cfg(feature = "vsr")]
+            {
+                let error = client
+                    .send_binary_request(60_000, Bytes::new())
+                    .await
+                    .expect_err("unknown code must be rejected under VSR");
+                assert_eq!(error, IggyError::InvalidCommand);
+            }
 
             let error = client
                 .send_http_request(HttpMethod::Get, "/ping", None)

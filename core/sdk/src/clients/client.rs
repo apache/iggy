@@ -31,6 +31,10 @@ use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::codes::{
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE,
+};
 use iggy_common::Consumer;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
@@ -41,6 +45,16 @@ use tokio::spawn;
 use tokio::time::sleep;
 use tracing::log::warn;
 use tracing::{debug, error, info};
+
+/// Auth/session codes rejected by the raw binary path. Must go through the
+/// typed `login_user` / `logout_user` methods to keep session state correct.
+const SESSION_CONTROL_CODES: [u32; 5] = [
+    LOGIN_USER_CODE,
+    LOGOUT_USER_CODE,
+    LOGIN_REGISTER_CODE,
+    LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE,
+];
 
 /// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
 ///
@@ -185,9 +199,19 @@ impl IggyClient {
         self.client.read().await.get_connection_info().await
     }
 
-    /// Send a raw binary command (`code` + serialized `payload`) and return the
-    /// raw response. Binary transports only; HTTP yields `FeatureUnavailable`.
+    /// Send a raw binary command (`code` + serialized `payload`), returning the
+    /// raw response. Binary transports only (HTTP yields `FeatureUnavailable`).
+    ///
+    /// Login and logout codes are rejected with `InvalidCommand`. Use the
+    /// `login_user` / `logout_user` methods so SDK session state stays correct.
+    ///
+    /// Custom codes only work on the classic protocol. Under `vsr` the encoder
+    /// is closed-world: an unknown code yields `InvalidCommand`, a replicated
+    /// code with no mapping yields `UnknownReplicatedCommand`.
     pub async fn send_binary_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if SESSION_CONTROL_CODES.contains(&code) {
+            return Err(IggyError::InvalidCommand);
+        }
         match &*self.client.read().await {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
@@ -206,7 +230,10 @@ impl IggyClient {
     ) -> Result<Bytes, IggyError> {
         match &*self.client.read().await {
             ClientWrapper::Http(client) => client.send_http_request(method, path, body).await,
-            _ => Err(IggyError::FeatureUnavailable),
+            ClientWrapper::Tcp(_)
+            | ClientWrapper::Quic(_)
+            | ClientWrapper::WebSocket(_)
+            | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
         }
     }
 }
@@ -449,5 +476,17 @@ mod tests {
             IggyClient::from_connection_string("iggy+http://user:secret@127.0.0.1:1234").unwrap();
         let result = client.send_binary_request(0, Bytes::new()).await;
         assert!(matches!(result, Err(IggyError::FeatureUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn should_reject_session_control_codes_on_binary_request() {
+        let client = IggyClient::default();
+        for code in SESSION_CONTROL_CODES {
+            let result = client.send_binary_request(code, Bytes::new()).await;
+            assert!(
+                matches!(result, Err(IggyError::InvalidCommand)),
+                "code {code} must be rejected before reaching the transport"
+            );
+        }
     }
 }
