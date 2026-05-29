@@ -130,7 +130,7 @@ class E2ETestFixture : public ::testing::Test {
 
     void DeleteClient(iggy::ffi::Client *&client) {
         iggy::ffi::Client *client_to_delete = client;
-        client = nullptr;
+        client                              = nullptr;
         ForgetClient(client_to_delete);
         EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
     }
@@ -212,7 +212,7 @@ class E2ETestFixture : public ::testing::Test {
     void CleanupClients() {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
-            client = nullptr;
+            client                              = nullptr;
             EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
         }
         clients_.clear();
@@ -221,7 +221,7 @@ class E2ETestFixture : public ::testing::Test {
     void CleanupClientsBestEffort() noexcept {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
-            client = nullptr;
+            client                              = nullptr;
             try {
                 iggy::ffi::delete_connection(client_to_delete);
             } catch (...) {
