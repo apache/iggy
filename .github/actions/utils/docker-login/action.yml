@@ -1,0 +1,113 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: docker-login
+description: >
+  Log in to a Docker registry with exponential-backoff retry. The
+  post-merge publish occasionally hits a transient registry/auth flake
+  (e.g. `Error response from daemon: Get https://registry-1.docker.io/v2/:
+  unknown:`) that a single attempt cannot survive; docker/login-action has
+  no built-in retry. Mirrors the wait-for-url / wait-for-crate backoff idiom.
+
+inputs:
+  username:
+    description: "Registry username."
+    required: true
+  password:
+    description: "Registry password or access token. Passed via stdin, never argv."
+    required: true
+  registry:
+    description: "Registry host. Empty means Docker Hub (docker.io)."
+    required: false
+    default: ""
+  max_attempts:
+    description: "Maximum login attempts before giving up."
+    required: false
+    default: "5"
+  initial_sleep_seconds:
+    description: "Sleep between the first two attempts in seconds. Doubles each attempt, capped at max_sleep_seconds."
+    required: false
+    default: "2"
+  max_sleep_seconds:
+    description: "Upper bound on per-attempt sleep, in seconds."
+    required: false
+    default: "30"
+
+runs:
+  using: composite
+  steps:
+    - name: Docker login with retry
+      shell: bash
+      env:
+        USERNAME: ${{ inputs.username }}
+        PASSWORD: ${{ inputs.password }}
+        REGISTRY: ${{ inputs.registry }}
+        MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        INITIAL_SLEEP_SECONDS: ${{ inputs.initial_sleep_seconds }}
+        MAX_SLEEP_SECONDS: ${{ inputs.max_sleep_seconds }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${USERNAME}" ] || [ -z "${PASSWORD}" ]; then
+          echo "❌ docker-login: username and password are required"
+          exit 1
+        fi
+        if ! [[ "${MAX_ATTEMPTS}" =~ ^[0-9]+$ ]] || [ "${MAX_ATTEMPTS}" -lt 1 ]; then
+          echo "❌ docker-login: max_attempts '${MAX_ATTEMPTS}' must be a positive integer"
+          exit 1
+        fi
+        if ! [[ "${INITIAL_SLEEP_SECONDS}" =~ ^[0-9]+$ ]]; then
+          echo "❌ docker-login: initial_sleep_seconds '${INITIAL_SLEEP_SECONDS}' must be a non-negative integer"
+          exit 1
+        fi
+        if ! [[ "${MAX_SLEEP_SECONDS}" =~ ^[0-9]+$ ]] || [ "${MAX_SLEEP_SECONDS}" -lt 1 ]; then
+          echo "❌ docker-login: max_sleep_seconds '${MAX_SLEEP_SECONDS}' must be a positive integer"
+          exit 1
+        fi
+
+        target="${REGISTRY:-docker.io}"
+        echo "🔐 Logging in to ${target} (up to ${MAX_ATTEMPTS} attempts)"
+
+        # Empty REGISTRY means Docker Hub: omit the host arg entirely.
+        login_args=(-u "${USERNAME}" --password-stdin)
+        if [ -n "${REGISTRY}" ]; then
+          login_args=("${REGISTRY}" "${login_args[@]}")
+        fi
+
+        sleep_s="${INITIAL_SLEEP_SECONDS}"
+        for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+          # Token on stdin only: never argv or a logged env echo. GitHub masks
+          # the secret regardless; this keeps it out of process listings too.
+          if printf '%s' "${PASSWORD}" | docker login "${login_args[@]}"; then
+            echo "✅ Logged in to ${target} (attempt ${attempt}/${MAX_ATTEMPTS})"
+            exit 0
+          fi
+
+          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+            break
+          fi
+          echo "⏳ Login failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${sleep_s}s"
+          sleep "${sleep_s}"
+          sleep_s=$(( sleep_s * 2 ))
+          if [ "${sleep_s}" -gt "${MAX_SLEEP_SECONDS}" ]; then
+            sleep_s="${MAX_SLEEP_SECONDS}"
+          fi
+        done
+
+        echo "❌ docker login to ${target} failed after ${MAX_ATTEMPTS} attempts"
+        echo "   Likely a transient registry outage or auth rate-limit; rerun the job."
+        exit 1
