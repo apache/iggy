@@ -2263,6 +2263,51 @@ async fn join_cg(client: &IggyClient) {
         .unwrap();
 }
 
+fn assert_balanced_partition_distribution(cg: &ConsumerGroupDetails, expected_total: u32) {
+    let member_count = cg.members.len() as u32;
+    assert!(member_count > 0, "No members in consumer group");
+
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(
+        total, expected_total,
+        "Total partitions mismatch. Expected {expected_total}, got {total}. Members: {:?}",
+        cg.members
+    );
+
+    let fair_share = expected_total / member_count;
+    let remainder = expected_total % member_count;
+
+    let min_expected = fair_share;
+    let max_expected = if remainder > 0 {
+        fair_share + 1
+    } else {
+        fair_share
+    };
+
+    for member in &cg.members {
+        assert!(
+            member.partitions_count >= min_expected && member.partitions_count <= max_expected,
+            "Member {} has {} partitions, expected between {} and {}. \
+             Distribution is unbalanced! Members: {:?}",
+            member.id,
+            member.partitions_count,
+            min_expected,
+            max_expected,
+            cg.members
+        );
+    }
+
+    let counts: Vec<u32> = cg.members.iter().map(|m| m.partitions_count).collect();
+    let min_count = *counts.iter().min().unwrap();
+    let max_count = *counts.iter().max().unwrap();
+    assert!(
+        max_count - min_count <= 1,
+        "Partition distribution variance too high: min={min_count}, max={max_count}. \
+         Difference should be at most 1. Members: {:?}",
+        cg.members
+    );
+}
+
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
     heartbeat.interval = "2s",
@@ -3262,6 +3307,539 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
     );
 
     // Cleanup
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            16,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    for partition_id in 0..16u32 {
+        let message = IggyMessage::from_str(&format!("msg-p{partition_id}")).unwrap();
+        let mut messages = vec![message];
+        root_client
+            .send_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Partitioning::partition_id(partition_id),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+    }
+
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members[0].partitions_count, 16);
+
+    let mut clients = vec![client1];
+    for _ in 2..=16 {
+        let client = harness.new_client().await.unwrap();
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(&client).await;
+        clients.push(client);
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 16);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 16);
+
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 1,
+            "With 16 partitions and 16 consumers, each must have exactly 1. \
+             Member {} has {}. Members: {:?}",
+            member.id, member.partitions_count, cg.members
+        );
+    }
+
+    let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_partitions = HashSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                None,
+                &consumer,
+                &PollingStrategy::offset(0),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        if !polled.messages.is_empty() {
+            assert!(
+                polled_partitions.insert(polled.partition_id),
+                "Consumer {i} got partition {} already taken! Duplicate!",
+                polled.partition_id
+            );
+        }
+    }
+    assert_eq!(polled_partitions.len(), 16);
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            12,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members[0].partitions_count, 12);
+
+    let client2 = harness.new_client().await.unwrap();
+    let client3 = harness.new_client().await.unwrap();
+    let client4 = harness.new_client().await.unwrap();
+
+    for client in [&client2, &client3, &client4] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+    }
+
+    let stream_id = Identifier::named(STREAM_NAME).unwrap();
+    let topic_id = Identifier::named(TOPIC_NAME).unwrap();
+    let group_id = Identifier::named(CONSUMER_GROUP_NAME).unwrap();
+
+    let (r2, r3, r4) = tokio::join!(
+        client2.join_consumer_group(&stream_id, &topic_id, &group_id),
+        client3.join_consumer_group(&stream_id, &topic_id, &group_id),
+        client4.join_consumer_group(&stream_id, &topic_id, &group_id),
+    );
+    r2.unwrap();
+    r3.unwrap();
+    r4.unwrap();
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 4);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 12);
+
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 3,
+            "With 12 partitions and 4 consumers, each should have exactly 3. \
+             Member {} has {}. Members: {:?}",
+            member.id, member.partitions_count, cg.members
+        );
+    }
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            10,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    let client1 = harness.new_client().await.unwrap();
+    client1
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&client1).await;
+
+    let mut clients = vec![client1];
+    for _ in 2..=4 {
+        let client = harness.new_client().await.unwrap();
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(&client).await;
+        clients.push(client);
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 4);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 10);
+
+    let mut count_with_3 = 0;
+    let mut count_with_2 = 0;
+    for member in &cg.members {
+        match member.partitions_count {
+            3 => count_with_3 += 1,
+            2 => count_with_2 += 1,
+            n => panic!(
+                "Member {} has {n} partitions, expected 2 or 3. Members: {:?}",
+                member.id, cg.members
+            ),
+        }
+    }
+    assert_eq!(
+        count_with_3, 2,
+        "Expected 2 members with 3 partitions (10/4=2 remainder 2). Members: {:?}",
+        cg.members
+    );
+    assert_eq!(
+        count_with_2, 2,
+        "Expected 2 members with 2 partitions. Members: {:?}",
+        cg.members
+    );
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_collect_excess_from_multiple_overassigned_members(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            16,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    for client in [&client1, &client2] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(200)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 16);
+
+    let mut new_clients = Vec::new();
+    for _ in 3..=8 {
+        let client = harness.new_client().await.unwrap();
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(&client).await;
+        new_clients.push(client);
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 8);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 16);
+
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 2,
+            "With 16 partitions and 8 consumers, each should have exactly 2. \
+             Member {} has {}. Members: {:?}",
+            member.id, member.partitions_count, cg.members
+        );
+    }
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            24,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    let first_client = harness.new_client().await.unwrap();
+    first_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    join_cg(&first_client).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members[0].partitions_count, 24);
+
+    let mut all_clients = vec![first_client];
+    for _ in 2..=8 {
+        let client = harness.new_client().await.unwrap();
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(&client).await;
+        all_clients.push(client);
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 8);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 24);
+
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 3,
+            "With 24 partitions and 8 consumers, each should have exactly 3. \
+             Member {} has {}. This indicates the round-robin distribution is broken. \
+             Members: {:?}",
+            member.id, member.partitions_count, cg.members
+        );
+    }
+
+    root_client
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .unwrap();
+}
+
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
+    heartbeat.enabled = true,
+    heartbeat.interval = "2s",
+    tcp.socket.override_defaults = true,
+    tcp.socket.nodelay = true
+))]
+async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
+    let root_client = harness.root_client().await.unwrap();
+
+    root_client.create_stream(STREAM_NAME).await.unwrap();
+    root_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            16,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    root_client
+        .create_consumer_group(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            CONSUMER_GROUP_NAME,
+        )
+        .await
+        .unwrap();
+
+    let client1 = harness.new_client().await.unwrap();
+    let client2 = harness.new_client().await.unwrap();
+    let client3 = harness.new_client().await.unwrap();
+    let client4 = harness.new_client().await.unwrap();
+
+    for client in [&client1, &client2, &client3, &client4] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(300)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 4);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 16);
+
+    drop(client3);
+    drop(client4);
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 2);
+    let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+    assert_eq!(total, 16);
+
+    let client5 = harness.new_client().await.unwrap();
+    let client6 = harness.new_client().await.unwrap();
+    for client in [&client5, &client6] {
+        client
+            .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+            .await
+            .unwrap();
+        join_cg(client).await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+
+    let cg = get_consumer_group(&root_client).await;
+    assert_eq!(cg.members_count, 4);
+    assert_unique_partition_assignments(&cg);
+    assert_balanced_partition_distribution(&cg, 16);
+
+    for member in &cg.members {
+        assert_eq!(
+            member.partitions_count, 4,
+            "After churn, each of 4 members should have 4 of 16 partitions. \
+             Member {} has {}. Members: {:?}",
+            member.id, member.partitions_count, cg.members
+        );
+    }
+
     root_client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await

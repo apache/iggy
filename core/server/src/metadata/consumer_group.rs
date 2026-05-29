@@ -126,7 +126,7 @@ impl ConsumerGroupMeta {
             .collect();
 
         // Collect idle members (no partitions and not already a revocation target)
-        let mut idle_slab_ids: Vec<usize> = self
+        let idle_slab_ids: Vec<usize> = self
             .members
             .iter()
             .filter(|(id, m)| m.partitions.is_empty() && !revocation_targets.contains(id))
@@ -137,14 +137,21 @@ impl ConsumerGroupMeta {
             return;
         }
 
-        // Find over-assigned members and mark excess as pending revocation
+        // Two-pass distribution: we first collect ALL excess partitions, then distribute
+        // them round-robin. This ensures even distribution when one member holds many
+        // partitions and multiple idle members join. Without this, the first idle member
+        // would receive all excess partitions while others starve.
+        //
+        // Example: 16 partitions held by 1 member, 15 idle members join
+        //   Single-pass: member1 gets 15, members 2-15 get 0-1 each (unbalanced)
+        //   Two-pass: each of 16 members gets exactly 1 partition
+
+        // Pass 1: Collect excess partitions from over-assigned members
         let member_ids: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
         let mut members_with_remainder = remainder;
+        let mut all_excess: Vec<(PartitionId, usize)> = Vec::new();
 
         for &mid in &member_ids {
-            if idle_slab_ids.is_empty() {
-                break;
-            }
             let effective_count = self
                 .members
                 .get(mid)
@@ -158,7 +165,6 @@ impl ConsumerGroupMeta {
                 })
                 .unwrap_or(0);
 
-            // This member's max allowed partitions
             let max_allowed = if members_with_remainder > 0 {
                 fair_share + 1
             } else {
@@ -172,13 +178,11 @@ impl ConsumerGroupMeta {
                 continue;
             }
 
-            // Mark excess partitions as pending revocation (from the END of the list)
             let excess_count = effective_count - max_allowed;
             if members_with_remainder > 0 && effective_count > fair_share {
                 members_with_remainder = members_with_remainder.saturating_sub(1);
             }
 
-            // Collect partitions eligible for revocation (not already pending)
             let revocable: Vec<PartitionId> = self
                 .members
                 .get(mid)
@@ -198,23 +202,27 @@ impl ConsumerGroupMeta {
                 .unwrap_or_default();
 
             for partition_id in revocable.into_iter().take(excess_count) {
-                if idle_slab_ids.is_empty() {
-                    break;
-                }
-                let idle_id = idle_slab_ids.remove(0);
-                let target_member_id = self
-                    .members
-                    .get(idle_id)
-                    .map(|m| m.id)
-                    .unwrap_or(usize::MAX);
-                if let Some(member) = self.members.get_mut(mid) {
-                    member.pending_revocations.push(PendingRevocation {
-                        partition_id,
-                        target_slab_id: idle_id,
-                        target_member_id,
-                        created_at_micros: IggyTimestamp::now().as_micros(),
-                    });
-                }
+                all_excess.push((partition_id, mid));
+            }
+        }
+
+        // Pass 2: Distribute collected partitions round-robin across idle members
+        let now = IggyTimestamp::now().as_micros();
+        for (i, (partition_id, source_mid)) in all_excess.into_iter().enumerate() {
+            // Modulo ensures partitions cycle through idle members evenly
+            let idle_id = idle_slab_ids[i % idle_slab_ids.len()];
+            let target_member_id = self
+                .members
+                .get(idle_id)
+                .map(|m| m.id)
+                .unwrap_or(usize::MAX);
+            if let Some(member) = self.members.get_mut(source_mid) {
+                member.pending_revocations.push(PendingRevocation {
+                    partition_id,
+                    target_slab_id: idle_id,
+                    target_member_id,
+                    created_at_micros: now,
+                });
             }
         }
     }
