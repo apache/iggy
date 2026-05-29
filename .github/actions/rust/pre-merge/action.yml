@@ -207,6 +207,16 @@ runs:
 
         source <(cargo llvm-cov show-env --export-prefix)
 
+        # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
+        # This kernel param can only be set on the host (no container can raise it),
+        # so we raise it here. Everything else about booting Doris — image, heap/mem
+        # caps, port mappings, BE-alive wait — lives in the testcontainers fixture
+        # at core/integration/tests/connectors/fixtures/doris/container.rs, so
+        # `cargo test` and CI follow exactly the same path.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          sudo sysctl -w vm.max_map_count=2000000 || true
+        fi
+
         bins_start=$(date +%s)
         if [[ -n "$PACKAGE_FLAGS" ]]; then
           cargo build --locked $PACKAGE_FLAGS

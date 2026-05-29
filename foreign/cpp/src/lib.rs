@@ -194,7 +194,7 @@ mod ffi {
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        // fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
+        fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         #[allow(clippy::too_many_arguments)]
         fn create_topic(
             self: &Client,
@@ -207,7 +207,7 @@ mod ffi {
             message_expiry_value: u64,
             max_topic_size: String,
         ) -> Result<()>;
-        // fn purge_topic(&self, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,

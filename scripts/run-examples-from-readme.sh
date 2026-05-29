@@ -22,7 +22,7 @@ set -euo pipefail
 # Unified script to run SDK examples from README.md files.
 # Usage: ./scripts/run-examples-from-readme.sh [OPTIONS]
 #
-#   --language LANG   Language to test: rust|go|node|python|java|csharp (default: all)
+#   --language LANG   Language to test: rust|go|node|python|php|java|csharp (default: all)
 #   --target TARGET   Cargo target architecture for the server binary
 #   --skip-tls        Skip TLS example tests
 #
@@ -285,6 +285,47 @@ run_python_examples() {
 }
 
 # shellcheck disable=SC2329
+run_php_examples() {
+    resolve_server_binary "${TARGET}"
+
+    local php_bin="${PHP:-php}"
+    if [ -z "${PHP_IGGY_EXTENSION:-}" ]; then
+        local extension_candidate
+        for extension_candidate in \
+            target/debug/libiggy_php.so \
+            target/debug/libiggy_php.dylib \
+            foreign/php/target/debug/libiggy_php.so \
+            foreign/php/target/debug/libiggy_php.dylib; do
+            if [ -f "${extension_candidate}" ]; then
+                PHP_IGGY_EXTENSION="$(pwd)/${extension_candidate}"
+                break
+            fi
+        done
+        export PHP_IGGY_EXTENSION
+    fi
+
+    if [ -z "${PHP_IGGY_EXTENSION:-}" ] || [ ! -f "${PHP_IGGY_EXTENSION}" ]; then
+        echo "Error: PHP extension not found. Build foreign/php first or set PHP_IGGY_EXTENSION."
+        exit 1
+    fi
+
+    TRANSFORM_COMMAND() {
+        local command="$1"
+        printf '%s\n' "${command/#php /\"${php_bin}\" }"
+    }
+
+    run_language_examples \
+        "PHP" \
+        "examples/php" \
+        "README.md" \
+        "^php " \
+        "" \
+        "" \
+        0 \
+        "--fresh"
+}
+
+# shellcheck disable=SC2329
 run_java_examples() {
     resolve_server_binary "${TARGET}"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -355,16 +396,17 @@ case "${LANGUAGE}" in
     node)   run_one run_node_examples   "Node"   ;;
     go)     run_one run_go_examples     "Go"     ;;
     python) run_one run_python_examples "Python" ;;
+    php)    run_one run_php_examples    "PHP"    ;;
     java)   run_one run_java_examples   "Java"   ;;
     csharp) run_one run_csharp_examples "C#"     ;;
     all)
-        for lang in rust node go python java csharp; do
+        for lang in rust node go python php java csharp; do
             run_one "run_${lang}_examples" "${lang}"
         done
         ;;
     *)
         echo "Unknown language: ${LANGUAGE}"
-        echo "Supported: rust, node, go, python, java, csharp, all"
+        echo "Supported: rust, node, go, python, php, java, csharp, all"
         exit 1
         ;;
 esac
