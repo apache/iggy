@@ -341,10 +341,13 @@ pub(crate) fn serialize_value(
             })?;
             write_varint(obj.len() as u64, buf);
             for (k, v) in obj {
-                // Map keys must be serialisable as the key type. JSON object
-                // keys are always strings, so we wrap them in OwnedValue::String.
-                let key_val = OwnedValue::String(k.clone());
-                serialize_value(&key_val, key_type, buf)?;
+                match key_type.as_ref() {
+                    ChType::String => write_string(k.as_bytes(), buf),
+                    _ => {
+                        let key_val = OwnedValue::String(k.clone());
+                        serialize_value(&key_val, key_type, buf)?;
+                    }
+                }
                 serialize_value(v, val_type, buf)?;
             }
         }
