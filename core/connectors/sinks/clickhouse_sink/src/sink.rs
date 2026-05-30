@@ -35,6 +35,10 @@ impl Sink for ClickHouseSink {
         let client = ClickHouseClient::new(
             self.config.url.clone(),
             self.database().to_owned(),
+            self.config.table.clone(),
+            self.insert_format
+                .clickhouse_format_name(self.string_format)
+                .to_owned(),
             self.username(),
             self.password(),
             self.timeout(),
@@ -68,7 +72,7 @@ impl Sink for ClickHouseSink {
         if self.insert_format == InsertFormat::RowBinary {
             let mut attempts = 0u32;
             let schema = loop {
-                match client.fetch_schema(&self.config.table).await {
+                match client.fetch_schema().await {
                     Ok(schema) => break schema,
                     Err(e) => {
                         attempts += 1;
@@ -147,13 +151,7 @@ impl Sink for ClickHouseSink {
         }
 
         client
-            .insert(
-                table,
-                format_name,
-                body,
-                self.max_retries(),
-                self.retry_delay,
-            )
+            .insert(body, self.max_retries(), self.retry_delay)
             .await?;
 
         let count = messages.len() as u64;

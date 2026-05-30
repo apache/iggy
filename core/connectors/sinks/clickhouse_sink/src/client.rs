@@ -46,6 +46,10 @@ pub(crate) struct ClickHouseClient {
     inner: reqwest::Client,
     base_url: String,
     database: String,
+    table: String,
+    format_name: String,
+    insert_url: String,
+    insert_query: String,
 }
 
 impl ClickHouseClient {
@@ -53,6 +57,8 @@ impl ClickHouseClient {
     pub fn new(
         base_url: String,
         database: String,
+        table: String,
+        format_name: String,
         username: &str,
         password: &str,
         timeout: Duration,
@@ -75,10 +81,26 @@ impl ClickHouseClient {
             .build()
             .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {e}")))?;
 
+        let insert_url = format!(
+            "{}/?database={}&date_time_input_format=best_effort",
+            base_url,
+            urlencoded(&database),
+        );
+        let insert_query = format!(
+            "INSERT INTO `{}`.`{}` FORMAT {}",
+            escape_backtick(&database),
+            escape_backtick(&table),
+            format_name,
+        );
+
         Ok(ClickHouseClient {
             inner,
             base_url,
             database,
+            table,
+            format_name,
+            insert_url,
+            insert_query,
         })
     }
 
@@ -104,16 +126,16 @@ impl ClickHouseClient {
         }
     }
 
-    /// Fetch the column definitions for `table` in the configured database.
+    /// Fetch the column definitions for the configured table.
     /// Returns columns ordered by their position in the table definition.
-    pub async fn fetch_schema(&self, table: &str) -> Result<Vec<Column>, Error> {
+    pub async fn fetch_schema(&self) -> Result<Vec<Column>, Error> {
         let query = format!(
             "SELECT name, type, default_kind FROM system.columns \
              WHERE database = '{}' AND table = '{}' \
              ORDER BY position \
              FORMAT JSONEachRow",
             escape_single_quote(&self.database),
-            escape_single_quote(table),
+            escape_single_quote(&self.table),
         );
 
         let body = self.run_query(&query).await?;
@@ -143,18 +165,18 @@ impl ClickHouseClient {
 
         if columns.is_empty() {
             error!(
-                "Table '{table}' not found or has no columns in database '{}'",
-                self.database
+                "Table '{}' not found or has no columns in database '{}'",
+                self.table, self.database
             );
             return Err(Error::InitError(format!(
-                "Table '{table}' not found in database '{}'",
-                self.database
+                "Table '{}' not found in database '{}'",
+                self.table, self.database
             )));
         }
 
         info!(
             "Fetched schema for table '{}': {} columns",
-            table,
+            self.table,
             columns.len()
         );
         Ok(columns)
@@ -173,8 +195,6 @@ impl ClickHouseClient {
     /// deduplication at read time. See the README for details.
     pub async fn insert(
         &self,
-        table: &str,
-        format: &str,
         body: Vec<u8>,
         max_retries: u32,
         retry_delay: Duration,
@@ -184,26 +204,14 @@ impl ClickHouseClient {
             return Ok(());
         }
 
-        let query = format!(
-            "INSERT INTO `{}`.`{}` FORMAT {}",
-            escape_backtick(&self.database),
-            escape_backtick(table),
-            format,
-        );
-        let url = format!(
-            "{}/?database={}&date_time_input_format=best_effort",
-            self.base_url,
-            urlencoded(&self.database),
-        );
-
         let body = Bytes::from(body);
         let mut attempts = 0u32;
         loop {
             let result = self
                 .inner
-                .post(&url)
+                .post(&self.insert_url)
                 .header(CONTENT_TYPE, "application/octet-stream")
-                .query(&[("query", &query)])
+                .query(&[("query", &self.insert_query)])
                 .body(body.clone())
                 .send()
                 .await;
@@ -216,8 +224,8 @@ impl ClickHouseClient {
                             "Inserted {} bytes into {}.{} FORMAT {}",
                             body.len(),
                             self.database,
-                            table,
-                            format
+                            self.table,
+                            self.format_name
                         );
                         return Ok(());
                     }
@@ -385,5 +393,55 @@ mod tests {
         let result = escape_backtick("innocent\\");
         assert_eq!(result, "innocent\\");
         assert!(!result.contains("\\`"));
+    }
+
+    fn test_client(database: &str, table: &str, format_name: &str) -> ClickHouseClient {
+        ClickHouseClient::new(
+            "http://localhost:8123".to_owned(),
+            database.to_owned(),
+            table.to_owned(),
+            format_name.to_owned(),
+            "user",
+            "pass",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("client construction failed")
+    }
+
+    #[test]
+    fn given_plain_config_new_should_precompute_insert_url() {
+        let client = test_client("mydb", "events", "JSONEachRow");
+        assert_eq!(
+            client.insert_url,
+            "http://localhost:8123/?database=mydb&date_time_input_format=best_effort"
+        );
+    }
+
+    #[test]
+    fn given_plain_config_new_should_precompute_insert_query() {
+        let client = test_client("mydb", "events", "JSONEachRow");
+        assert_eq!(
+            client.insert_query,
+            "INSERT INTO `mydb`.`events` FORMAT JSONEachRow"
+        );
+    }
+
+    #[test]
+    fn given_database_needing_encoding_new_should_percent_encode_insert_url() {
+        let client = test_client("my db", "events", "JSONEachRow");
+        assert!(
+            client.insert_url.contains("database=my%20db"),
+            "URL was: {}",
+            client.insert_url
+        );
+    }
+
+    #[test]
+    fn given_names_with_backticks_new_should_double_escape_insert_query() {
+        let client = test_client("my`db", "ta`ble", "JSONEachRow");
+        assert_eq!(
+            client.insert_query,
+            "INSERT INTO `my``db`.`ta``ble` FORMAT JSONEachRow"
+        );
     }
 }
