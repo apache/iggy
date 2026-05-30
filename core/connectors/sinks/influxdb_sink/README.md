@@ -28,7 +28,7 @@ bucket     = "my-bucket"
 token      = "my-token"
 
 # Optional
-measurement = "iggy_events"      # line-protocol measurement name (default: topic name)
+measurement = "iggy_events"      # line-protocol measurement name (default: iggy_messages)
 precision   = "us"               # ns | us | ms | s  (default: "us")
 batch_size  = 500                # messages per write request (default: 500)
 payload_format = "json"          # json | text | base64 (default: "json")

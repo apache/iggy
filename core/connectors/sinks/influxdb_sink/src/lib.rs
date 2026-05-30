@@ -799,14 +799,10 @@ impl Sink for InfluxDbSink {
                 .await
             {
                 Ok(()) => {
-                    self.circuit_breaker.record_success();
                     self.write_success
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    if !matches!(e, Error::PermanentHttpError(_)) {
-                        self.circuit_breaker.record_failure().await;
-                    }
                     self.write_errors
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     error!(
@@ -819,6 +815,17 @@ impl Sink for InfluxDbSink {
                     }
                 }
             }
+        }
+
+        // Record CB outcome once per consume() call, not per chunk. Recording
+        // success inside the loop would reset the failure counter mid-consume,
+        // preventing the CB from opening on sustained mixed-success batches.
+        match &first_error {
+            None => self.circuit_breaker.record_success(),
+            Some(e) if !matches!(e, Error::PermanentHttpError(_)) => {
+                self.circuit_breaker.record_failure().await;
+            }
+            Some(_) => {}
         }
 
         let total_processed = self

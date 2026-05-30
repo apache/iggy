@@ -36,7 +36,6 @@ use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use serde_json::json;
 use tracing::warn;
-use uuid::Uuid;
 
 pub(crate) const DEFAULT_STUCK_CAP_FACTOR: u32 = 10;
 /// Upper bound for `stuck_batch_cap_factor`. A value of 1000 with batch_size=1000
@@ -374,42 +373,46 @@ pub(crate) fn process_rows(
     // All messages before this index have timestamps < max_cursor (safe to emit
     // on a full mixed-timestamp batch without risking loss at max_cursor).
     let mut safe_message_count = 0usize;
-    // Fallback ID base for rows that lack the cursor field (rare — such rows
-    // cause an error at the end of this function unless other rows have it).
-    let id_base = Uuid::new_v4().as_u128();
     for row in rows.iter() {
         // DB-absolute position: offset into the full result set for this cursor value.
         // Using batch-relative position (messages.len() alone) would assign the same ID
         // to different rows when OFFSET regresses after a serialization failure.
         let db_pos = row_offset_base as u128 + messages.len() as u128;
-        // Default to random fallback; overwritten below if cursor field is present.
-        let mut this_row_id = id_base.wrapping_add(db_pos);
-        if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
-            let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
-            // Stable ID using i128 arithmetic to avoid the i64 nanosecond overflow
-            // that occurs for timestamps outside ~1678-2262 CE.
-            let nanos_i128 =
-                cv_dt.timestamp() as i128 * 1_000_000_000 + cv_dt.timestamp_subsec_nanos() as i128;
-            this_row_id = (nanos_i128 as u128).wrapping_add(db_pos);
-            match max_cursor_parsed {
-                Some(cur_dt) if cv_dt > cur_dt => {
-                    // New max: current max becomes penultimate. All messages pushed so
-                    // far are strictly before this new max timestamp.
-                    penultimate_cursor = max_cursor.take();
-                    max_cursor = Some(cv_owned.into_owned());
-                    max_cursor_parsed = Some(cv_dt);
-                    rows_at_max_cursor = 1;
-                    safe_message_count = messages.len();
-                }
-                Some(cur_dt) if cv_dt == cur_dt => {
-                    rows_at_max_cursor += 1;
-                }
-                Some(_) => {} // cv_dt < cur_dt: older row, no cursor update
-                None => {
-                    max_cursor = Some(cv_owned.into_owned());
-                    max_cursor_parsed = Some(cv_dt);
-                    rows_at_max_cursor = 1;
-                }
+        let raw_cv = row
+            .get(ctx.cursor_field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                Error::InvalidRecordValue(format!(
+                    "Row missing '{}' cursor field — message ID would be non-deterministic \
+                     on re-delivery, breaking deduplication. \
+                     Ensure your query selects the cursor column.",
+                    ctx.cursor_field
+                ))
+            })?;
+        let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
+        // Stable ID using i128 arithmetic to avoid the i64 nanosecond overflow
+        // that occurs for timestamps outside ~1678-2262 CE.
+        let nanos_i128 =
+            cv_dt.timestamp() as i128 * 1_000_000_000 + cv_dt.timestamp_subsec_nanos() as i128;
+        let this_row_id = (nanos_i128 as u128).wrapping_add(db_pos);
+        match max_cursor_parsed {
+            Some(cur_dt) if cv_dt > cur_dt => {
+                // New max: current max becomes penultimate. All messages pushed so
+                // far are strictly before this new max timestamp.
+                penultimate_cursor = max_cursor.take();
+                max_cursor = Some(cv_owned.into_owned());
+                max_cursor_parsed = Some(cv_dt);
+                rows_at_max_cursor = 1;
+                safe_message_count = messages.len();
+            }
+            Some(cur_dt) if cv_dt == cur_dt => {
+                rows_at_max_cursor += 1;
+            }
+            Some(_) => {} // cv_dt < cur_dt: older row, no cursor update
+            None => {
+                max_cursor = Some(cv_owned.into_owned());
+                max_cursor_parsed = Some(cv_dt);
+                rows_at_max_cursor = 1;
             }
         }
 
@@ -428,15 +431,6 @@ pub(crate) fn process_rows(
             headers: None,
             payload,
         });
-    }
-
-    if !rows.is_empty() && max_cursor.is_none() {
-        return Err(Error::InvalidRecordValue(format!(
-            "No '{}' field found in any returned row — cursor cannot advance; \
-             the connector would re-deliver the same rows on every poll. \
-             Ensure your query selects the cursor column.",
-            ctx.cursor_field
-        )));
     }
 
     Ok(RowProcessingResult {
@@ -544,14 +538,12 @@ pub(crate) async fn poll(
     {
         let safe_count = result.safe_message_count;
         if safe_count == 0 {
-            // ORDER BY invariant violated: unsorted result placed max_cursor row first.
-            // open() rejects such queries at startup when cap_factor > 0, so this
-            // path should be unreachable in practice. Fall through rather than
-            // advancing with zero messages (which would silently drop the first row).
-            warn!(
-                "InfluxDB V3 source — full mixed-timestamp batch has safe_message_count=0; \
-                     ORDER BY invariant may be violated. Falling through to normal advance."
-            );
+            // Unreachable under the ORDER BY invariant: penultimate_cursor is only set
+            // when a strictly-greater timestamp is observed, which requires at least one
+            // prior message. If we reach here the result set violated ascending order
+            // (e.g. a DESC sort slipped past validation). Trip the circuit breaker so
+            // the operator sees a hard failure rather than silent data loss.
+            return Err(Error::InvalidState);
         } else {
             let max_ts = result.max_cursor.as_deref().unwrap_or("unknown");
             warn!(
@@ -657,7 +649,6 @@ pub(crate) async fn poll(
         };
     }
 
-    let processed_rows = state.processed_rows + result.messages.len() as u64;
     let old_dt = state.last_timestamp.as_deref().and_then(|s| {
         DateTime::parse_from_rfc3339(s)
             .ok()
@@ -685,6 +676,9 @@ pub(crate) async fn poll(
             } else {
                 (vec![], base_batch, true, false)
             };
+        // Count only actually emitted messages — on the pure-regression path
+        // messages is vec![], so processed_rows must not include the suppressed rows.
+        let processed_rows = state.processed_rows + messages.len() as u64;
         return Ok(PollResult {
             messages,
             new_state: V3State {
@@ -699,6 +693,8 @@ pub(crate) async fn poll(
             is_stuck,
         });
     }
+
+    let processed_rows = state.processed_rows + result.messages.len() as u64;
 
     let advanced_cursor = match (
         result.max_cursor.as_deref(),

@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 source_connector!(InfluxDbSource);
 
@@ -360,6 +360,16 @@ impl Source for InfluxDbSource {
                         .into(),
                 ));
             }
+            if cap > 0 && query_has_desc_order(&cfg.query) {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must use ascending ORDER BY on the cursor column. \
+                     ORDER BY ... DESC causes silent data loss: after advancing the cursor \
+                     to the highest timestamp in a batch, all older rows in that batch are \
+                     below the new cursor and are never re-fetched. \
+                     Use 'ORDER BY time' (ascending) instead of 'ORDER BY time DESC'."
+                        .into(),
+                ));
+            }
         }
 
         // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
@@ -369,7 +379,7 @@ impl Source for InfluxDbSource {
         // don't discover this only after data loss. Queries using strict `>` do not
         // need skip-N and are not affected.
         if let InfluxDbSourceConfig::V2(cfg) = &self.config
-            && query_has_inclusive_cursor_flux(&cfg.query)
+            && query_has_inclusive_cursor(&cfg.query, "//")
             && !query_has_sort_call(&cfg.query)
         {
             return Err(Error::InvalidConfigValue(format!(
@@ -386,7 +396,7 @@ impl Source for InfluxDbSource {
         // `>= '$cursor'`, rows at the cursor timestamp are re-fetched and
         // re-delivered on the next poll (there is no skip-N dedup for V3).
         if let InfluxDbSourceConfig::V3(cfg) = &self.config
-            && query_has_inclusive_cursor(&cfg.query)
+            && query_has_inclusive_cursor(&cfg.query, "--")
         {
             return Err(Error::InvalidConfigValue(
                 "V3 source query uses '>= $cursor' (inclusive). V3 uses strict \
@@ -446,6 +456,21 @@ impl Source for InfluxDbSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
+        tokio::time::sleep(self.poll_interval).await;
+        let level = if self.config.verbose_logging() {
+            tracing::Level::INFO
+        } else {
+            tracing::Level::DEBUG
+        };
+        macro_rules! poll_event {
+            ($($tt:tt)+) => {
+                if level == tracing::Level::INFO {
+                    tracing::info!($($tt)+)
+                } else {
+                    tracing::debug!($($tt)+)
+                }
+            };
+        }
         if self.circuit_breaker.is_open().await {
             warn!(
                 "{CONNECTOR_NAME} ID: {} — circuit breaker is OPEN. Skipping poll.",
@@ -454,7 +479,6 @@ impl Source for InfluxDbSource {
             // TODO: sleep for the CB's remaining cool-down duration rather than
             // poll_interval to avoid wakeup churn. Requires CircuitBreaker to
             // expose a remaining_cool_down() method (SDK change).
-            tokio::time::sleep(self.poll_interval).await;
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
@@ -501,25 +525,15 @@ impl Source for InfluxDbSource {
                                 result.skipped,
                             );
 
-                            if self.config.verbose_logging() {
-                                info!(
-                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
-                                     Total: {}. Cursor: {:?}",
-                                    self.id,
-                                    messages.len(),
-                                    state.processed_rows,
-                                    state.last_timestamp
-                                );
-                            } else {
-                                debug!(
-                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
-                                     Total: {}. Cursor: {:?}",
-                                    self.id,
-                                    messages.len(),
-                                    state.processed_rows,
-                                    state.last_timestamp
-                                );
-                            }
+                            poll_event!(
+                                skipped = result.skipped,
+                                "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
+                                 Total: {}. Cursor: {:?}",
+                                self.id,
+                                messages.len(),
+                                state.processed_rows,
+                                state.last_timestamp.as_deref()
+                            );
                             state.clone()
                             // lock released here
                         };
@@ -604,19 +618,14 @@ impl Source for InfluxDbSource {
                             let mut state = state_mu.lock().await;
                             *state = new;
 
-                            if self.config.verbose_logging() {
-                                info!(
-                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
-                                     Total: {}. Cursor: {:?}",
-                                    self.id, msg_count, state.processed_rows, state.last_timestamp
-                                );
-                            } else {
-                                debug!(
-                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
-                                     Total: {}. Cursor: {:?}",
-                                    self.id, msg_count, state.processed_rows, state.last_timestamp
-                                );
-                            }
+                            poll_event!(
+                                "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
+                                 Total: {}. Cursor: {:?}",
+                                self.id,
+                                msg_count,
+                                state.processed_rows,
+                                state.last_timestamp.as_deref()
+                            );
                             state.clone()
                             // lock released here
                         };
@@ -681,11 +690,11 @@ impl Source for InfluxDbSource {
 
 impl InfluxDbSource {
     async fn handle_poll_error(&self, e: Error) -> Result<ProducedMessages, Error> {
-        if !matches!(e, Error::PermanentHttpError(_)) {
-            self.circuit_breaker.record_failure().await;
-        }
+        // Record failure for all errors including PermanentHttpError. A permanently
+        // broken query (e.g. 400 Bad Request) would loop forever at poll_interval
+        // without CB protection if we exempt it; the operator needs the CB to trip.
+        self.circuit_breaker.record_failure().await;
         error!("{CONNECTOR_NAME} ID: {} poll failed: {e}", self.id);
-        tokio::time::sleep(self.poll_interval).await;
         Err(e)
     }
 }
@@ -709,6 +718,30 @@ fn query_has_order_by(query: &str) -> bool {
             None => line,
         };
         code.to_ascii_uppercase().contains("ORDER BY")
+    })
+}
+
+/// Return `true` if `query` contains `ORDER BY ... DESC` (case-insensitive).
+///
+/// Scans for `ORDER BY` in non-comment code, then tokenises the text that
+/// follows to detect a standalone `DESC` keyword. `DESCRIBE` and other
+/// identifiers that start with `DESC` are excluded by the word-boundary check.
+fn query_has_desc_order(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let upper = code.to_ascii_uppercase();
+        if let Some(ob_pos) = upper.find("ORDER BY") {
+            let after = &upper[ob_pos + "ORDER BY".len()..];
+            after
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|token| token == "DESC")
+        } else {
+            false
+        }
     })
 }
 
@@ -741,43 +774,18 @@ fn query_has_sort_call(query: &str) -> bool {
     })
 }
 
+/// Returns `true` if a V3 SQL `query` contains a `>= $cursor` comparison in any
+/// quoting style (`'$cursor'`, `"$cursor"`, or bare `$cursor`) outside of comments.
+///
 /// Returns `true` if a V2 Flux `query` contains a `>= $cursor` comparison outside of
 /// comments. Flux uses `//` for line comments and `/* */` for block comments.
 ///
 /// Checks for the bare and quoted forms (`$cursor`, `'$cursor'`, `"$cursor"`) to
 /// avoid false positives on unrelated `>=` comparisons (e.g. `r.val >= 0`).
-fn query_has_inclusive_cursor_flux(query: &str) -> bool {
+fn query_has_inclusive_cursor(query: &str, comment_char: &str) -> bool {
     let q = strip_block_comments(query);
     q.lines().any(|line| {
-        let code = match line.find("//") {
-            Some(pos) => &line[..pos],
-            None => line,
-        };
-        let mut rest = code;
-        while let Some(pos) = rest.find(">=") {
-            let after = rest[pos + 2..].trim_start_matches([' ', '\t']);
-            let inner = after
-                .strip_prefix('\'')
-                .or_else(|| after.strip_prefix('"'))
-                .unwrap_or(after);
-            if inner.starts_with("$cursor")
-                && !inner["$cursor".len()..]
-                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return true;
-            }
-            rest = &rest[pos + 2..];
-        }
-        false
-    })
-}
-
-/// Returns `true` if a V3 SQL `query` contains a `>= $cursor` comparison in any
-/// quoting style (`'$cursor'`, `"$cursor"`, or bare `$cursor`) outside of comments.
-fn query_has_inclusive_cursor(query: &str) -> bool {
-    let q = strip_block_comments(query);
-    q.lines().any(|line| {
-        let code = match line.find("--") {
+        let code = match line.find(comment_char) {
             Some(pos) => &line[..pos],
             None => line,
         };
@@ -1725,58 +1733,67 @@ mod tests {
     #[test]
     fn inclusive_cursor_flux_not_detected_for_unrelated_gte() {
         // >= on a non-cursor field must NOT trigger: would wrongly reject valid queries
-        assert!(!query_has_inclusive_cursor_flux(
-            r#"from(bucket:"b") |> range(start: $cursor) |> filter(fn: (r) => r.val >= 10)"#
+        assert!(!query_has_inclusive_cursor(
+            r#"from(bucket:"b") |> range(start: $cursor) |> filter(fn: (r) => r.val >= 10)"#,
+            "//"
         ));
-        assert!(!query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") |> filter(fn: (r) => r.v >= 5) // inclusive"
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r.v >= 5) // inclusive",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_detected_bare() {
-        assert!(query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor)"
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor)",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_detected_single_quote() {
-        assert!(query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= '$cursor')"
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= '$cursor')",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_detected_double_quote() {
-        assert!(query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= \"$cursor\")"
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= \"$cursor\")",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_not_detected_when_only_in_line_comment() {
         // >= $cursor inside a // comment must not trigger
-        assert!(!query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") // r._time >= $cursor\n|> range(start: $cursor)"
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") // r._time >= $cursor\n|> range(start: $cursor)",
+            "//"
         ));
         // unrelated >= in comment: also no trigger
-        assert!(!query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") // batch_size >= 100\n|> range(start: $cursor)"
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") // batch_size >= 100\n|> range(start: $cursor)",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_not_detected_when_only_in_block_comment() {
-        assert!(!query_has_inclusive_cursor_flux(
-            "/* use >= '$cursor' for inclusive */ from(bucket:\"b\") |> range(start: $cursor)"
+        assert!(!query_has_inclusive_cursor(
+            "/* use >= '$cursor' for inclusive */ from(bucket:\"b\") |> range(start: $cursor)",
+            "//"
         ));
     }
 
     #[test]
     fn inclusive_cursor_flux_not_detected_for_extended_identifier() {
-        assert!(!query_has_inclusive_cursor_flux(
-            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor_start)"
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor_start)",
+            "//"
         ));
     }
 
@@ -1785,61 +1802,72 @@ mod tests {
     #[test]
     fn inclusive_cursor_detected_single_quote() {
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit"
+            "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit",
+            "--"
         ));
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >='$cursor' LIMIT $limit"
+            "SELECT * FROM t WHERE time >='$cursor' LIMIT $limit",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_detected_double_quote() {
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >= \"$cursor\" LIMIT $limit"
+            "SELECT * FROM t WHERE time >= \"$cursor\" LIMIT $limit",
+            "--"
         ));
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >=\"$cursor\" LIMIT $limit"
+            "SELECT * FROM t WHERE time >=\"$cursor\" LIMIT $limit",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_detected_bare() {
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >= $cursor LIMIT $limit"
+            "SELECT * FROM t WHERE time >= $cursor LIMIT $limit",
+            "--"
         ));
         assert!(query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >=$cursor LIMIT $limit"
+            "SELECT * FROM t WHERE time >=$cursor LIMIT $limit",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_not_detected_for_strict_gt() {
         assert!(!query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit"
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_not_detected_for_extended_identifier() {
         assert!(!query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >= '$cursor_field' LIMIT $limit"
+            "SELECT * FROM t WHERE time >= '$cursor_field' LIMIT $limit",
+            "--"
         ));
         assert!(!query_has_inclusive_cursor(
-            "SELECT * FROM t WHERE time >= $cursor_field LIMIT $limit"
+            "SELECT * FROM t WHERE time >= $cursor_field LIMIT $limit",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_not_detected_when_only_in_sql_comment() {
         assert!(!query_has_inclusive_cursor(
-            "-- use >= '$cursor' for inclusive\nSELECT * FROM t WHERE time > '$cursor'"
+            "-- use >= '$cursor' for inclusive\nSELECT * FROM t WHERE time > '$cursor'",
+            "--"
         ));
     }
 
     #[test]
     fn inclusive_cursor_not_detected_when_only_in_block_comment() {
         assert!(!query_has_inclusive_cursor(
-            "/* example: time >= '$cursor' */ SELECT * FROM t WHERE time > '$cursor'"
+            "/* example: time >= '$cursor' */ SELECT * FROM t WHERE time > '$cursor'",
+            "--"
         ));
     }
 
