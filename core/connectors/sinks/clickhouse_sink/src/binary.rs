@@ -29,6 +29,8 @@
 //! - `RowBinaryWithDefaults`: each top-level column is preceded by a 1-byte
 //!   flag (`0x01` = use server DEFAULT, `0x00` = value follows).
 
+use std::borrow::Cow;
+
 use crate::schema::{ChType, Column};
 use iggy_connector_sdk::Error;
 use simd_json::OwnedValue;
@@ -308,7 +310,7 @@ pub(crate) fn serialize_value(
         // ── Enums ────────────────────────────────────────────────────────────
         ChType::Enum8(map) => {
             let s = coerce_to_string(value)?;
-            let v = map.get(s.as_str()).ok_or_else(|| {
+            let v = map.get(&*s).ok_or_else(|| {
                 error!("Unknown Enum8 value: {s}");
                 Error::InvalidRecord
             })?;
@@ -316,7 +318,7 @@ pub(crate) fn serialize_value(
         }
         ChType::Enum16(map) => {
             let s = coerce_to_string(value)?;
-            let v = map.get(s.as_str()).ok_or_else(|| {
+            let v = map.get(&*s).ok_or_else(|| {
                 error!("Unknown Enum16 value: {s}");
                 Error::InvalidRecord
             })?;
@@ -603,13 +605,13 @@ fn parse_decimal_str(s: &str, scale: u8) -> Result<i128, ()> {
     Ok(if negative { -result } else { result })
 }
 
-fn coerce_to_string(value: &OwnedValue) -> Result<String, Error> {
+fn coerce_to_string(value: &OwnedValue) -> Result<Cow<'_, str>, Error> {
     match value {
-        OwnedValue::String(s) => Ok(s.to_string()),
-        OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(n.to_string()),
-        OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(n.to_string()),
-        OwnedValue::Static(simd_json::StaticNode::F64(f)) => Ok(f.to_string()),
-        OwnedValue::Static(simd_json::StaticNode::Bool(b)) => Ok(b.to_string()),
+        OwnedValue::String(s) => Ok(Cow::Borrowed(s.as_str())),
+        OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(Cow::Owned(n.to_string())),
+        OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(Cow::Owned(n.to_string())),
+        OwnedValue::Static(simd_json::StaticNode::F64(f)) => Ok(Cow::Owned(f.to_string())),
+        OwnedValue::Static(simd_json::StaticNode::Bool(b)) => Ok(Cow::Owned(b.to_string())),
         other => {
             error!("Cannot coerce {other:?} to string");
             Err(Error::InvalidRecord)
