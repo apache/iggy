@@ -54,7 +54,9 @@ impl Sink for ClickHouseSink {
                         return Err(e);
                     }
                     let backoff = retry_delay * attempts;
-                    warn!("Ping failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…");
+                    warn!(
+                        "Ping failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…"
+                    );
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -75,7 +77,9 @@ impl Sink for ClickHouseSink {
                             return Err(e);
                         }
                         let backoff = retry_delay * attempts;
-                        warn!("fetch_schema failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…");
+                        warn!(
+                            "fetch_schema failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…"
+                        );
                         tokio::time::sleep(backoff).await;
                     }
                 }

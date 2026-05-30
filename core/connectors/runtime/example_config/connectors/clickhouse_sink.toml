@@ -52,5 +52,5 @@ insert_format = "json_each_row"
 
 timeout_seconds = 30
 max_retries = 3
-retry_delay = 1  # seconds
+retry_delay = 1 # seconds
 verbose_logging = false

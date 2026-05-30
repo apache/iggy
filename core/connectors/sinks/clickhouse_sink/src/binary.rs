@@ -243,15 +243,13 @@ pub(crate) fn serialize_value(
                         Error::InvalidRecord
                     })?
                 }
-                OwnedValue::Static(simd_json::StaticNode::U64(n)) => {
-                    i64::try_from(*n)
-                        .ok()
-                        .and_then(|n| n.checked_mul(scale))
-                        .ok_or_else(|| {
-                            error!("DateTime64 overflow");
-                            Error::InvalidRecord
-                        })?
-                }
+                OwnedValue::Static(simd_json::StaticNode::U64(n)) => i64::try_from(*n)
+                    .ok()
+                    .and_then(|n| n.checked_mul(scale))
+                    .ok_or_else(|| {
+                        error!("DateTime64 overflow");
+                        Error::InvalidRecord
+                    })?,
                 _ => {
                     // Float or string inputs: f64 path is acceptable since floats
                     // already carry sub-second fractions, and strings go through
@@ -1208,21 +1206,11 @@ mod tests {
         let mut buf = vec![];
         // Current-era timestamp: 1_700_000_000 s * 10^9 = 1_700_000_000_000_000_000 ns.
         // The f64 path would round to the nearest 256 ns boundary; the integer path is exact.
-        serialize_value(
-            &json_i64(1_700_000_000),
-            &ChType::DateTime64(9),
-            &mut buf,
-        )
-        .unwrap();
+        serialize_value(&json_i64(1_700_000_000), &ChType::DateTime64(9), &mut buf).unwrap();
         assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
 
         buf.clear();
-        serialize_value(
-            &json_u64(1_700_000_000),
-            &ChType::DateTime64(9),
-            &mut buf,
-        )
-        .unwrap();
+        serialize_value(&json_u64(1_700_000_000), &ChType::DateTime64(9), &mut buf).unwrap();
         assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
     }
 
