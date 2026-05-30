@@ -20,12 +20,13 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
+use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
-    IdentityInfo, TransportProtocol, validate_api_url,
+    HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
 };
-use reqwest::{Response, StatusCode, Url};
+use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
@@ -200,6 +201,31 @@ impl HttpTransport for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidHttpRequest)?;
         Self::handle_response(response).await
+    }
+
+    async fn send_http_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<Bytes, IggyError> {
+        let method = Method::from_bytes(<&str>::from(method).as_bytes())
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let url = self.get_url(path)?;
+        let token = self.access_token.read().await;
+        let mut request = self.client.request(method, url).bearer_auth(token.deref());
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let response = Self::handle_response(response).await?;
+        response
+            .bytes()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)
     }
 
     /// Returns true if the client is authenticated.

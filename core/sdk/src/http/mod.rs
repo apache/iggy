@@ -20,7 +20,7 @@ pub mod cluster;
 pub mod consumer_groups;
 pub mod consumer_offsets;
 pub mod http_client;
-mod http_transport;
+pub(crate) mod http_transport;
 pub mod messages;
 pub mod partitions;
 pub mod personal_access_tokens;

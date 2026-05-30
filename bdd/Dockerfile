@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM rust:1.89.0-alpine3.22 AS builder
+FROM rust:1.95.0-alpine3.22 AS builder
 RUN apk add musl-dev
 
 WORKDIR /app

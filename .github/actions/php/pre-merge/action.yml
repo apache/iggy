@@ -36,18 +36,24 @@ runs:
           libclang-dev \
           libhwloc-dev \
           libssl-dev \
-          php-cli \
-          php-dev \
-          php-mbstring \
-          php-xml \
+          php8.3-cli \
+          php8.3-dev \
+          php8.3-mbstring \
+          php8.3-xml \
           pkg-config \
           unzip
 
-        echo "PHP=$(command -v php)" >> "$GITHUB_ENV"
-        echo "PHP_CONFIG=$(command -v php-config)" >> "$GITHUB_ENV"
-        php --version
-        php-config --version
-        composer --version
+        php_bin="$(command -v php8.3)"
+        php_config="$(command -v php-config8.3)"
+        composer_bin="$(command -v composer)"
+        {
+          echo "PHP=${php_bin}"
+          echo "PHP_CONFIG=${php_config}"
+          echo "COMPOSER_BIN=${composer_bin}"
+        } >> "$GITHUB_ENV"
+        "${php_bin}" --version
+        "${php_config}" --version
+        "${php_bin}" "${composer_bin}" --version
 
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
@@ -74,7 +80,7 @@ runs:
       if: inputs.task == 'lint'
       shell: bash
       run: |
-        php -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
+        "${PHP}" -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
         cargo fmt --manifest-path foreign/php/Cargo.toml -- --check
         cargo install cargo-php --locked
         cargo build --manifest-path foreign/php/Cargo.toml
@@ -96,7 +102,7 @@ runs:
         find foreign/php \
           -path foreign/php/vendor -prune -o \
           -name '*.php' -print0 \
-          | xargs -0 -n1 php -l
+          | xargs -0 -n1 "${PHP}" -l
 
     - name: Build PHP extension
       if: inputs.task == 'build'
@@ -127,7 +133,8 @@ runs:
       if: inputs.task == 'test'
       shell: bash
       working-directory: foreign/php
-      run: composer install --no-interaction --prefer-dist --no-progress
+      run: |
+        "${PHP}" "${COMPOSER_BIN}" install --no-interaction --prefer-dist --no-progress
 
     - name: Start Iggy server
       if: inputs.task == 'test'

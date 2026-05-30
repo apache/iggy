@@ -34,6 +34,7 @@ members = [
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/delta_sink",
+    "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
@@ -177,10 +178,10 @@ hwlocality = "1.0.0-alpha.12"
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.10.1-edge.1" }
+iggy = { path = "core/sdk", version = "0.10.1-edge.2" }
 iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.1-edge.1" }
-iggy_common = { path = "core/common", version = "0.10.1-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.1-edge.2" }
+iggy_common = { path = "core/common", version = "0.10.1-edge.2" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
@@ -278,6 +279,10 @@ sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
+    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
+    # integration-test fixture talks to it over this driver. Cargo unifies
+    # features across the workspace, so it is declared once here.
+    "mysql",
     "chrono",
     "uuid",
     "json",
@@ -290,6 +295,7 @@ sysinfo = "0.39.2"
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
+testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
@@ -327,6 +333,7 @@ web-sys = { version = "0.3", features = [
 ] }
 webpki-roots = "1.0.7"
 windows-native-keyring-store = "1.1.0"
+wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }

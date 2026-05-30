@@ -11,7 +11,7 @@ future resolves; it does not provide fiber-aware or non-blocking I/O.
 ## Requirements
 
 - Rust and Cargo
-- PHP with `php-config`
+- PHP 8.3 or newer with `php-config`
 - `cargo-php`
 - Composer, for installing PHPUnit
 - Docker, for running the integration test server
