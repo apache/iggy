@@ -199,21 +199,18 @@ pub(crate) fn serialize_value(
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            let bytes = hex::decode(hex_str).map_err(|_| {
+            // ClickHouse UUID: two LE UInt64 words, low word (bytes 8-15) first.
+            // hex_str[..16] is the high u64, hex_str[16..] the low u64 (both big-endian).
+            let hi = u64::from_str_radix(&hex_str[..16], 16).map_err(|_| {
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            // ClickHouse serialises UUID as UInt128 little-endian, writing the low 64-bit
-            // word before the high 64-bit word. The UUID bytes decoded above are in
-            // big-endian (network) order, so bytes[8..] is the low word and bytes[..8]
-            // is the high word. We copy them into the output in that order and reverse
-            // each half in place to convert from big-endian to little-endian.
-            let mut uuid_buf = [0u8; 16];
-            uuid_buf[..8].copy_from_slice(&bytes[8..]); // low_u64
-            uuid_buf[8..].copy_from_slice(&bytes[..8]); // high_u64
-            uuid_buf[..8].reverse();
-            uuid_buf[8..].reverse();
-            buf.extend_from_slice(&uuid_buf);
+            let lo = u64::from_str_radix(&hex_str[16..], 16).map_err(|_| {
+                error!("Cannot decode UUID hex: {s}");
+                Error::InvalidRecord
+            })?;
+            buf.extend_from_slice(&lo.to_le_bytes());
+            buf.extend_from_slice(&hi.to_le_bytes());
         }
 
         // ── Date types ───────────────────────────────────────────────────────
@@ -1052,12 +1049,12 @@ mod tests {
     // ── uuid ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn serialize_uuid_writes_low_u64_then_high_u64_little_endian() {
+    fn serialize_uuid_clickhouse_wire_format() {
         let mut buf = vec![];
+        // ClickHouse UUID wire format: two LE UInt64 words, low word (bytes 8-15) first.
         // 550e8400-e29b-41d4-a716-446655440000
-        // high_u64 = 0x550e8400e29b41d4  →  LE: [d4 41 9b e2 00 84 0e 55]
-        // low_u64  = 0xa716446655440000  →  LE: [00 00 44 55 66 44 16 a7]
-        // Wire order (UInt128 LE): low_u64 first, high_u64 second.
+        //   low  u64 = 0xa716446655440000 → LE: [00 00 44 55 66 44 16 a7]
+        //   high u64 = 0x550e8400e29b41d4 → LE: [d4 41 9b e2 00 84 0e 55]
         serialize_value(
             &json_str("550e8400-e29b-41d4-a716-446655440000"),
             &ChType::Uuid,
@@ -1572,31 +1569,5 @@ mod tests {
         assert_eq!(buf.len(), 16);
         assert_eq!(buf[15], 1);
         assert!(buf[..15].iter().all(|&b| b == 0));
-    }
-}
-
-// Hex decoding helper (no extra dep — manual implementation for UUID)
-mod hex {
-    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if !s.len().is_multiple_of(2) {
-            return Err(());
-        }
-        s.as_bytes()
-            .chunks(2)
-            .map(|chunk| {
-                let hi = from_hex_digit(chunk[0])?;
-                let lo = from_hex_digit(chunk[1])?;
-                Ok((hi << 4) | lo)
-            })
-            .collect()
-    }
-
-    fn from_hex_digit(b: u8) -> Result<u8, ()> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            _ => Err(()),
-        }
     }
 }
