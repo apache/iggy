@@ -120,6 +120,9 @@ pub enum InfluxDbSinkConfig {
     V3(V3SinkConfig),
 }
 
+// NOTE: This Deserialize impl is structurally identical to InfluxDbSourceConfig's impl in
+// influxdb_source/src/common.rs. If backward-compat logic changes (e.g. a new version key),
+// both impls must be updated in sync.
 impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;

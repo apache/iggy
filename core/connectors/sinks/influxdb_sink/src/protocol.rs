@@ -34,23 +34,32 @@ use iggy_connector_sdk::Error;
 /// in the InfluxDB line-protocol spec and would corrupt tag-set parsing.
 #[inline]
 pub(crate) fn write_measurement(buf: &mut String, value: &str) -> Result<(), Error> {
-    for ch in value.chars() {
-        match ch {
-            '\t' => {
+    // Span-copy: all escape targets are ASCII (single byte), so byte positions
+    // are always valid UTF-8 char boundaries. Copy each unescaped span in one
+    // push_str instead of one push per char.
+    let bytes = value.as_bytes();
+    let mut last = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'\t' => {
                 return Err(Error::InvalidConfigValue(
                     "measurement name must not contain tab characters — tabs are not valid \
                      in the InfluxDB line-protocol spec and would corrupt tag-set parsing"
                         .into(),
                 ));
             }
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
+            b'\\' => "\\\\",
+            b',' => "\\,",
+            b' ' => "\\ ",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        buf.push_str(&value[last..i]);
+        buf.push_str(esc);
+        last = i + 1;
     }
+    buf.push_str(&value[last..]);
     Ok(())
 }
 
@@ -64,24 +73,33 @@ pub(crate) fn write_measurement(buf: &mut String, value: &str) -> Result<(), Err
 /// in the InfluxDB line-protocol spec and would corrupt tag-set parsing.
 #[inline]
 pub(crate) fn write_tag_value(buf: &mut String, value: &str) -> Result<(), Error> {
-    for ch in value.chars() {
-        match ch {
-            '\t' => {
-                return Err(Error::InvalidConfigValue(
+    // Span-copy: all escape targets are ASCII (single byte), so byte positions
+    // are always valid UTF-8 char boundaries. Copy each unescaped span in one
+    // push_str instead of one push per char.
+    let bytes = value.as_bytes();
+    let mut last = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'\t' => {
+                return Err(Error::CannotStoreData(
                     "tag value must not contain tab characters — tabs are not valid \
                      in the InfluxDB line-protocol spec and would corrupt tag-set parsing"
                         .into(),
                 ));
             }
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            '=' => buf.push_str("\\="),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
+            b'\\' => "\\\\",
+            b',' => "\\,",
+            b'=' => "\\=",
+            b' ' => "\\ ",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        buf.push_str(&value[last..i]);
+        buf.push_str(esc);
+        last = i + 1;
     }
+    buf.push_str(&value[last..]);
     Ok(())
 }
 

@@ -456,7 +456,6 @@ impl Source for InfluxDbSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        tokio::time::sleep(self.poll_interval).await;
         let level = if self.config.verbose_logging() {
             tracing::Level::INFO
         } else {
@@ -479,12 +478,14 @@ impl Source for InfluxDbSource {
             // TODO: sleep for the CB's remaining cool-down duration rather than
             // poll_interval to avoid wakeup churn. Requires CircuitBreaker to
             // expose a remaining_cool_down() method (SDK change).
+            tokio::time::sleep(self.poll_interval).await;
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
                 state: None,
             });
         }
+        tokio::time::sleep(self.poll_interval).await;
 
         let client = self.get_client()?;
         let auth = self
@@ -545,6 +546,9 @@ impl Source for InfluxDbSource {
                         );
                         match &persisted {
                             Some(_) => {
+                                // Relaxed: the SDK drives poll() from a single select! loop —
+                                // no concurrent poll() calls exist, so no cross-thread ordering
+                                // guarantee is needed here.
                                 self.state_serialize_failures.store(0, Ordering::Relaxed);
                             }
                             None => {
@@ -614,10 +618,13 @@ impl Source for InfluxDbSource {
                         let messages = result.messages;
                         let schema = result.schema;
                         let msg_count = messages.len();
-                        let state_snap = {
+                        // Clone before acquiring the lock so the String allocation is
+                        // outside the critical section; the original is moved into
+                        // the mutex, the clone is used for serialization.
+                        let for_serialize = new.clone();
+                        {
                             let mut state = state_mu.lock().await;
                             *state = new;
-
                             poll_event!(
                                 "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
                                  Total: {}. Cursor: {:?}",
@@ -626,17 +633,19 @@ impl Source for InfluxDbSource {
                                 state.processed_rows,
                                 state.last_timestamp.as_deref()
                             );
-                            state.clone()
                             // lock released here
-                        };
+                        }
 
                         let persisted = ConnectorState::serialize(
-                            &PersistedState::V3(state_snap),
+                            &PersistedState::V3(for_serialize),
                             CONNECTOR_NAME,
                             self.id,
                         );
                         match &persisted {
                             Some(_) => {
+                                // Relaxed: the SDK drives poll() from a single select! loop —
+                                // no concurrent poll() calls exist, so no cross-thread ordering
+                                // guarantee is needed here.
                                 self.state_serialize_failures.store(0, Ordering::Relaxed);
                             }
                             None => {

@@ -53,6 +53,9 @@ pub enum InfluxDbSourceConfig {
 /// Existing V2 configs that omit the `version` field are treated as `"v2"` so
 /// deployments can upgrade without touching their config files. Explicitly
 /// unknown version strings are rejected with a clear error.
+///
+/// NOTE: The sink crate (`influxdb_sink/src/lib.rs`) has a structurally identical impl
+/// for `InfluxDbSinkConfig`. If backward-compat logic changes here, update both.
 impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;

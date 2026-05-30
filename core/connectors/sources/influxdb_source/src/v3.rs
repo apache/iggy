@@ -713,6 +713,13 @@ pub(crate) async fn poll(
         // case, use stuck_batch_cap_factor = 0 to disable stuck detection and
         // accept potential re-delivery instead.
         _ if state.last_timestamp_row_offset > 0 && state.stuck_cursor.is_some() => {
+            warn!(
+                "Advancing cursor past stuck_cursor={:?} on empty follow-up batch. \
+                 Any backdated writes at this timestamp inserted after this poll \
+                 will be silently skipped. Set stuck_batch_cap_factor=0 to disable \
+                 stuck detection if your workload has out-of-order ingestion.",
+                state.stuck_cursor.as_deref()
+            );
             state.stuck_cursor.clone()
         }
         _ => state.last_timestamp.clone(),
