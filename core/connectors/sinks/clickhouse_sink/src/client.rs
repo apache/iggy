@@ -193,6 +193,9 @@ impl ClickHouseClient {
     /// If the server committed the batch but the response was lost, the retry
     /// produces duplicate rows. Callers must tolerate this or handle
     /// deduplication at read time. See the README for details.
+    // TODO: accept `Bytes` instead of `Vec<u8>` so callers can build into a
+    // `BytesMut`, freeze it zero-copy, and reuse a thread-local buffer across
+    // batches. `insert` is `pub(crate)` so the change is fully contained.
     pub async fn insert(
         &self,
         body: Vec<u8>,
