@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.None(),
@@ -51,6 +54,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			messages := createDefaultMessages()
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				iggcon.None(),
@@ -63,6 +67,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
 			err := client.SendMessages(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				iggcon.None(),
@@ -80,6 +85,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.PartitionId(createRandomUInt32()),
@@ -96,6 +102,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.PartitionId(createRandomUInt32()),

@@ -110,7 +110,7 @@ pub trait PostgresSourceOps: PostgresOps {
     ) -> impl std::future::Future<Output = i64> + Send + 'a {
         async move {
             let query = format!("SELECT COUNT(*) FROM {}", self.table_name());
-            let count: (i64,) = sqlx::query_as(&query)
+            let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
                 .fetch_one(pool)
                 .await
                 .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));

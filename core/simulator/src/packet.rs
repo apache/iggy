@@ -40,10 +40,11 @@
 
 use crate::ready_queue::{Ready, ReadyQueue};
 use enumset::EnumSet;
-use iggy_binary_protocol::{Command2, GenericHeader, Message};
+use iggy_binary_protocol::{Command2, GenericHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
+use server_common::Message;
 use std::collections::HashMap;
 
 /// Per-link command filter. An `EnumSet<Command2>` where:
@@ -781,10 +782,8 @@ mod tests {
         let header: &mut GenericHeader =
             bytemuck::checked::try_from_bytes_mut(&mut buf).expect("zeroed bytes are valid");
         header.command = command;
-        Message::try_from(
-            iggy_binary_protocol::consensus::iobuf::Owned::<4096>::copy_from_slice(&buf),
-        )
-        .expect("generic test buffer must contain a valid generic message")
+        Message::try_from(server_common::iobuf::Owned::<4096>::copy_from_slice(&buf))
+            .expect("generic test buffer must contain a valid generic message")
     }
 
     /// Helper: disable all links to/from a given replica (isolate it).

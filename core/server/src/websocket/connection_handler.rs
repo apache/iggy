@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::{self, HandlerResult, MAX_CONTROL_FRAME_PAYLOAD};
+use crate::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
@@ -25,7 +26,7 @@ use bytes::BytesMut;
 use futures::FutureExt;
 use iggy_binary_protocol::RequestFrame;
 use iggy_binary_protocol::codes::{SEND_MESSAGES_CODE, command_name};
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::io::ErrorKind;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};

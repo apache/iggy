@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -44,6 +46,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			// send test messages
 			messages := createDefaultMessages()
 			err := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.PartitionId(partitionId),
@@ -53,6 +56,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 
 			// store consumer offset
 			err = client.StoreConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -63,20 +67,20 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 
 			// verify offset was stored
 			storedOffset, err := client.GetConsumerOffset(
-				consumer, streamIdentifier, topicIdentifier, &partitionId,
+				context.Background(), consumer, streamIdentifier, topicIdentifier, &partitionId,
 			)
 			itShouldNotReturnError(err)
 			itShouldReturnStoredConsumerOffset(storedOffset, partitionId, testOffset)
 
 			// delete the offset
 			err = client.DeleteConsumerOffset(
-				consumer, streamIdentifier, topicIdentifier, &partitionId,
+				context.Background(), consumer, streamIdentifier, topicIdentifier, &partitionId,
 			)
 			itShouldNotReturnError(err)
 
 			// verify offset was deleted
 			storedOffset, err = client.GetConsumerOffset(
-				consumer, streamIdentifier, topicIdentifier, &partitionId,
+				context.Background(), consumer, streamIdentifier, topicIdentifier, &partitionId,
 			)
 			itShouldNotReturnError(err)
 			itShouldReturnNilOffsetForNewConsumerGroup(storedOffset)
@@ -97,6 +101,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			consumer := iggcon.NewSingleConsumer(groupIdentifier)
 
 			err := client.DeleteConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -117,6 +122,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			err := client.DeleteConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -132,6 +138,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			err := client.DeleteConsumerOffset(
+				context.Background(),
 				consumer,
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -147,7 +154,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			err := client.DeleteConsumerOffset(
-				consumer, randomU32Identifier(), randomU32Identifier(), &partitionId,
+				context.Background(), consumer, randomU32Identifier(), randomU32Identifier(), &partitionId,
 			)
 			itShouldReturnUnauthenticatedError(err)
 		})

@@ -19,6 +19,7 @@
 
 mod clickhouse;
 mod delta;
+mod doris;
 mod elasticsearch;
 mod http;
 mod iceberg;
@@ -32,6 +33,10 @@ pub use clickhouse::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
 pub use delta::{DeltaFixture, DeltaS3Fixture};
+pub use doris::{
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
+    DorisSinkPreCreatedFixture,
+};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,

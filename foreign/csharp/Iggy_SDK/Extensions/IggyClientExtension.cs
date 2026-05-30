@@ -52,10 +52,10 @@ public static class IggyClientExtension
     /// <param name="consumer">Consumer</param>
     /// <param name="deserializer">Optional deserializer</param>
     /// <returns>Iggy consumer builder</returns>
-    public static IggyConsumerBuilder CreateConsumerBuilder<T>(this IIggyClient client, Identifier streamId,
-        Identifier topicId, Consumer consumer, IDeserializer<T> deserializer) where T : IDeserializer<T>
+    public static IggyConsumerBuilder<T> CreateConsumerBuilder<T>(this IIggyClient client, Identifier streamId,
+        Identifier topicId, Consumer consumer, IDeserializer<T> deserializer)
     {
-        return IggyConsumerBuilder.Create(client, streamId, topicId, consumer);
+        return IggyConsumerBuilder<T>.Create(client, streamId, topicId, consumer, deserializer);
     }
 
     /// <summary>

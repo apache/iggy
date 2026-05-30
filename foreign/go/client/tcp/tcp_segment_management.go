@@ -18,17 +18,20 @@
 package tcp
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) DeleteSegments(
+	ctx context.Context,
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
 	partitionId uint32,
 	segmentsCount uint32,
 ) error {
-	_, err := c.do(&command.DeleteSegments{
+	_, err := c.do(ctx, &command.DeleteSegments{
 		StreamId:      streamId,
 		TopicId:       topicId,
 		PartitionId:   partitionId,

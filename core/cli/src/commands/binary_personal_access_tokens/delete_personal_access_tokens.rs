@@ -21,7 +21,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use keyring::Entry;
+use keyring_core::Entry;
 use tracing::{Level, event};
 
 pub struct DeletePersonalAccessTokenCmd {

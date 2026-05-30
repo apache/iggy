@@ -33,8 +33,7 @@
 //! [`ShutdownToken`]: crate::lifecycle::ShutdownToken
 
 use compio::runtime::JoinHandle;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
+use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as HmEntry;
@@ -730,7 +729,8 @@ impl ReplicaRegistry {
 mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use server_common::Message;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_bus_msg() -> BusMessage {

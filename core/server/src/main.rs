@@ -24,8 +24,7 @@ use dotenvy::dotenv;
 use err_trail::ErrContext;
 use figlet_rs::FIGlet;
 use iggy_common::SemanticVersion;
-use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
 use server::SEMANTIC_VERSION;
 use server::args::Args;
 use server::bootstrap::{
@@ -49,6 +48,8 @@ use server::streaming::clients::client_manager::{Client, ClientManager};
 use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
+use server_common::MemoryPool;
+use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;

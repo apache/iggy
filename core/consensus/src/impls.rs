@@ -25,11 +25,14 @@ use crate::{
 };
 use bit_set::BitSet;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, Message, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+use iggy_common::IggyTimestamp;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
+use server_common::Message;
+use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -142,6 +145,14 @@ impl PipelineEntry {
     /// Idempotent: subsequent calls return `None`.
     pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
         self.reply_sender.take()
+    }
+
+    /// `true` iff the entry still owns a reply sender (in-process awaiter).
+    /// Caller checks before [`Self::take_reply_sender`] so it can branch on
+    /// the slot's network-vs-in-process role without consuming the sender.
+    #[must_use]
+    pub const fn has_reply_sender(&self) -> bool {
+        self.reply_sender.is_some()
     }
 
     /// Record a `prepare_ok` from the given replica.
@@ -691,6 +702,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "replica index must be < replica_count"
         );
         assert!(replica_count >= 1, "need at least 1 replica");
+        // Consensus-control routing distinguishes metadata frames from
+        // partition frames by namespace value: metadata uses the sentinel,
+        // partitions use `IggyNamespace::inner()` which lives strictly
+        // inside the packed range. A namespace outside both ranges would
+        // route to neither and silently warn-drop on every receiving peer.
+        debug_assert!(
+            namespace == METADATA_CONSENSUS_NAMESPACE || IggyNamespace::is_packable(namespace),
+            "VsrConsensus namespace must be METADATA_CONSENSUS_NAMESPACE or a packable \
+             IggyNamespace; got {namespace:#x}"
+        );
         // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
         // across groups. Consider using a proper hash (e.g., Murmur3) of
         // (replica_id, namespace) for production.
@@ -965,6 +986,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn set_last_prepare_checksum(&self, checksum: u128) {
         self.last_prepare_checksum.set(checksum);
+    }
+
+    /// Returns a primary-stamped prepare timestamp that is strictly greater
+    /// than every previously-stamped value on this primary.
+    ///
+    /// Without monotonicity, an NTP step backwards could produce
+    /// `prepare[N+1].timestamp < prepare[N].timestamp`, breaking
+    /// `created_at` ordering invariants in deterministic state.
+    pub fn next_monotonic_timestamp(&self) -> u64 {
+        let now = IggyTimestamp::now().as_micros();
+        let prev = self.last_timestamp.get();
+        let next = now.max(prev.saturating_add(1));
+        self.last_timestamp.set(next);
+        next
     }
 
     #[must_use]
@@ -1995,6 +2030,12 @@ where
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
+        // Primary stamps wall-clock once at prepare-build; the value is
+        // replicated to every backup so apply() reads the same timestamp
+        // across the cluster (deterministic state-machine apply). Monotonic
+        // wrapper guards against NTP rewinds; see
+        // `VsrConsensus::next_monotonic_timestamp`.
+        let timestamp = consensus.next_monotonic_timestamp();
 
         self.transmute_header(|old, new| {
             *new = PrepareHeader {
@@ -2010,7 +2051,7 @@ where
                 request: old.request,
                 commit: consensus.commit_max.get(),
                 op,
-                timestamp: 0, // 0 for now. Implement correct way to get timestamp later
+                timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
                 ..Default::default()
@@ -2248,7 +2289,8 @@ mod pipeline_entry_tests {
     //! subscriber `Canceled` even on happy path. Tests pin both halves.
 
     use super::*;
-    use iggy_binary_protocol::{Command2, Message, ReplyHeader};
+    use iggy_binary_protocol::{Command2, ReplyHeader};
+    use server_common::Message;
 
     fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();

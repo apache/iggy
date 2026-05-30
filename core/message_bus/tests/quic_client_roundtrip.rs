@@ -25,9 +25,7 @@ use async_channel::bounded;
 use common::{header_only, install_quic_clients_locally, loopback};
 use compio_quic::{ClientBuilder, Endpoint};
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::QuicTuning;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::quic::{bind, run};
@@ -36,6 +34,7 @@ use message_bus::transports::quic::{QuicTransportConn, server_config_with_cert};
 use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -83,7 +82,7 @@ async fn request_reply_round_trip() {
     let (cert, key) = self_signed();
     let server_cfg = server_config_with_cert(vec![cert.clone()], key, &QuicTuning::default())
         .expect("server config");
-    let (endpoint, server_addr) = bind(loopback(), server_cfg).await.expect("bind");
+    let (endpoint, server_addr) = bind(loopback(), server_cfg).expect("bind");
 
     let token = bus.token();
     let on_accepted = install_quic_clients_locally(bus.clone(), on_request);
@@ -160,7 +159,7 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
     let (cert, key) = self_signed();
     let server_cfg = server_config_with_cert(vec![cert.clone()], key, &QuicTuning::default())
         .expect("server config");
-    let (endpoint, server_addr) = bind(loopback(), server_cfg).await.expect("bind");
+    let (endpoint, server_addr) = bind(loopback(), server_cfg).expect("bind");
 
     let token = bus.token();
     let on_accepted = install_quic_clients_locally(bus.clone(), on_request);

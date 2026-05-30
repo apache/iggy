@@ -23,10 +23,12 @@ pub mod user;
 
 use bytes::Bytes;
 use iggy_common::Either;
-use left_right::{Absorb, ReadHandle, WriteHandle};
+use left_right::{Absorb, ReadHandle, ReadHandleFactory, WriteHandle};
 use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+
+pub use left_right::ReadHandleFactory as LeftRightFactory;
 
 pub struct WriteCell<T, O>
 where
@@ -85,9 +87,14 @@ pub trait Command {
 /// Per-command handler for a given state type.
 /// Each command struct implements this for the state it mutates.
 /// Returns a `Bytes` response that will be threaded into the Reply message.
+///
+/// `timestamp` is the primary's stamp from the enclosing `PrepareHeader`,
+/// replicated identically to every replica. Handlers that record a wall-clock
+/// instant in state MUST use this value (not `IggyTimestamp::now()`) so the
+/// state-machine apply remains deterministic across replicas.
 pub trait StateHandler {
     type State;
-    fn apply(&self, state: &mut Self::State) -> Bytes;
+    fn apply(&self, state: &mut Self::State, timestamp: iggy_common::IggyTimestamp) -> Bytes;
 }
 
 #[derive(Debug)]
@@ -113,7 +120,62 @@ where
         let guard = self.read.enter().expect("read handle should be accessible");
         f(&*guard)
     }
+
+    /// Produce a `Send + Sync` factory that can mint additional [`ReadHandle`]s
+    /// on other threads. Use this to share the read side across compio shard
+    /// runtimes without sharing the (`!Sync`) [`ReadHandle`] itself.
+    #[must_use]
+    pub fn factory(&self) -> ReadHandleFactory<T> {
+        self.read.factory()
+    }
+
+    /// Build a reader-only [`LeftRight`] from a factory minted on the owning
+    /// thread. The new [`ReadHandle`] is materialised here (the caller's
+    /// thread), keeping the `!Sync` discipline local. `write` stays `None`,
+    /// so [`Self::try_apply`] returns
+    /// [`ApplyOnReaderError::ReaderOnly`] instead of mutating state if the
+    /// routing layer ever dispatches a write to this instance.
+    ///
+    /// Takes the factory by value so the constructor reads as ownership
+    /// transfer from the owning shard to the peer-shard reader.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn from_factory(factory: ReadHandleFactory<T>) -> Self {
+        Self {
+            write: None,
+            read: Arc::new(factory.handle()),
+        }
+    }
 }
+
+/// Error returned by [`LeftRight::try_apply`] when invoked on a
+/// reader-only instance built via [`LeftRight::from_factory`].
+///
+/// A reader-only [`LeftRight`] holds no [`WriteCell`] (`write` is `None`)
+/// because peer shards rebuild their state machine from a
+/// [`ReadHandleFactory`] minted on the owning shard. Hitting this error
+/// means the routing layer dispatched a write to a non-owner shard,
+/// which is a programming error - the namespace-to-shard mapping owns
+/// the invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApplyOnReaderError {
+    /// `try_apply` was called on a reader-only [`LeftRight`] (no write
+    /// handle). The command was not applied; state is unchanged.
+    ReaderOnly,
+}
+
+impl std::fmt::Display for ApplyOnReaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReaderOnly => f.write_str(
+                "apply invoked on reader-only LeftRight (no write handle on this shard)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApplyOnReaderError {}
 
 impl<T> From<T> for LeftRight<T, <T as Command>::Cmd>
 where
@@ -132,13 +194,19 @@ impl<T> LeftRight<T, <T as Command>::Cmd>
 where
     T: Absorb<<T as Command>::Cmd> + Clone + Command,
 {
-    /// # Panics
-    /// Panics if this is not the owner shard (no write handle available).
-    pub fn do_apply(&self, cmd: <T as Command>::Cmd) {
-        self.write
-            .as_ref()
-            .expect("no write handle - not the owner shard")
-            .apply(cmd);
+    /// Apply `cmd` to the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyOnReaderError::ReaderOnly`] when invoked on an
+    /// instance built via [`Self::from_factory`] (peer-shard reader). The
+    /// command is dropped without mutating state - the caller is the
+    /// routing layer and the invariant violation must be surfaced, not
+    /// hidden behind a panic.
+    pub fn try_apply(&self, cmd: <T as Command>::Cmd) -> Result<(), ApplyOnReaderError> {
+        let cell = self.write.as_ref().ok_or(ApplyOnReaderError::ReaderOnly)?;
+        cell.apply(cmd);
+        Ok(())
     }
 }
 
@@ -256,6 +324,41 @@ macro_rules! define_state {
                     [<$state Inner>]::new().into()
                 }
             }
+
+            impl $state {
+                /// Mint a `Send + Sync` [`ReadHandleFactory`] for this state.
+                /// Allows the read side to be carried across shard threads
+                /// without sharing the underlying `!Sync` [`ReadHandle`].
+                #[must_use]
+                pub fn factory(&self) -> $crate::stm::LeftRightFactory<[<$state Inner>]> {
+                    self.inner.factory()
+                }
+
+                /// Construct a reader-only state wrapper from a factory minted
+                /// by the writer-side shard. The thread that calls this owns
+                /// the resulting [`ReadHandle`]; calling `apply` on the
+                /// returned wrapper panics because `write` is `None`.
+                #[must_use]
+                pub fn from_factory(
+                    factory: $crate::stm::LeftRightFactory<[<$state Inner>]>,
+                ) -> Self {
+                    Self {
+                        inner: $crate::stm::LeftRight::from_factory(factory),
+                    }
+                }
+            }
+
+            impl $crate::stm::mux::WithFactory for $state {
+                type Bundle = $crate::stm::LeftRightFactory<[<$state Inner>]>;
+
+                fn factory_bundle(&self) -> Self::Bundle {
+                    self.factory()
+                }
+
+                fn from_factory_bundle(bundle: Self::Bundle) -> Self {
+                    Self::from_factory(bundle)
+                }
+            }
         }
     };
 }
@@ -283,13 +386,13 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation([<$operation Request>]),
+                    $operation([<$operation Request>], ::iggy_common::IggyTimestamp),
                 )*
             }
 
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
-                type Input = ::iggy_binary_protocol::Message<::iggy_binary_protocol::PrepareHeader>;
+                type Input = ::server_common::Message<::iggy_binary_protocol::PrepareHeader>;
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
@@ -306,7 +409,8 @@ macro_rules! collect_handlers {
                                 );
                                 let cmd = [<$operation Request>]::decode_from(&body)
                                     .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
-                                Ok(Either::Left([<$state Command>]::$operation(cmd)))
+                                let ts = ::iggy_common::IggyTimestamp::from(header.timestamp);
+                                Ok(Either::Left([<$state Command>]::$operation(cmd, ts)))
                             },
                         )*
                         _ => Ok(Either::Right(input)),
@@ -318,8 +422,8 @@ macro_rules! collect_handlers {
                 fn dispatch(&mut self, cmd: &[<$state Command>]) {
                     self.last_result = Some(match cmd {
                         $(
-                            [<$state Command>]::$operation(payload) => {
-                                $crate::stm::StateHandler::apply(payload, self)
+                            [<$state Command>]::$operation(payload, ts) => {
+                                $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*
                     });
@@ -336,7 +440,15 @@ macro_rules! collect_handlers {
 
                     match <[<$state Inner>] as $crate::stm::Command>::parse(input)? {
                         Either::Left(cmd) => {
-                            self.inner.do_apply(cmd);
+                            self.inner.try_apply(cmd).map_err(|err| {
+                                ::tracing::error!(
+                                    state = stringify!($state),
+                                    "metadata write dispatched to reader-only \
+                                     state machine: {err}; the routing layer must \
+                                     own namespace-to-shard mapping for this state"
+                                );
+                                ::iggy_common::IggyError::InvalidConfiguration
+                            })?;
                             let result = self.inner.read(|state| {
                                 state.last_result.clone().unwrap_or_default()
                             });
@@ -364,4 +476,69 @@ macro_rules! collect_handlers {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use left_right::Absorb;
+
+    #[derive(Debug, Default, Clone)]
+    struct Counter(u64);
+
+    #[derive(Debug, Clone, Copy)]
+    enum CounterCmd {
+        Inc,
+    }
+
+    impl Absorb<CounterCmd> for Counter {
+        fn absorb_first(&mut self, _cmd: &mut CounterCmd, _other: &Self) {
+            self.0 += 1;
+        }
+
+        fn absorb_second(&mut self, _cmd: CounterCmd, _other: &Self) {
+            self.0 += 1;
+        }
+
+        fn sync_with(&mut self, first: &Self) {
+            *self = first.clone();
+        }
+    }
+
+    impl Command for Counter {
+        type Cmd = CounterCmd;
+        type Input = ();
+        type Error = ();
+
+        fn parse(_input: Self::Input) -> Result<Either<Self::Cmd, Self::Input>, Self::Error> {
+            Ok(Either::Left(CounterCmd::Inc))
+        }
+    }
+
+    #[test]
+    fn try_apply_on_writer_mutates_state() {
+        let lr: LeftRight<Counter, CounterCmd> = Counter::default().into();
+        lr.try_apply(CounterCmd::Inc)
+            .expect("writer must accept apply");
+        assert_eq!(lr.read(|c| c.0), 1);
+    }
+
+    #[test]
+    fn try_apply_on_reader_returns_reader_only_error() {
+        // Reader-only LeftRight (built from a factory minted on the writer)
+        // must surface `ApplyOnReaderError::ReaderOnly` instead of mutating
+        // state or panicking - the routing layer is the only caller and the
+        // invariant violation has to be visible to it.
+        let writer: LeftRight<Counter, CounterCmd> = Counter::default().into();
+        let reader = LeftRight::<Counter, CounterCmd>::from_factory(writer.factory());
+        let err = reader
+            .try_apply(CounterCmd::Inc)
+            .expect_err("reader-only instance must reject try_apply");
+        assert_eq!(err, ApplyOnReaderError::ReaderOnly);
+        assert_eq!(
+            reader.read(|c| c.0),
+            0,
+            "reader state must be unchanged after a rejected try_apply"
+        );
+    }
 }

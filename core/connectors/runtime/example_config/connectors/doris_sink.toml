@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "doris"
+enabled = true
+version = 0
+name = "Doris sink"
+path = "<BASE_DIR>/target/release/libiggy_connector_doris_sink"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "events"
+topics = ["doris_events"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "doris_sink"
+
+[plugin_config]
+fe_url = "http://localhost:8030"
+database = "iggy_demo"
+table = "events"
+username = "root"
+password = "replace_with_secret"
+label_prefix = "iggy"
+batch_size = 1000
+timeout = "30s"
+# TCP connect timeout (default "5s"). Independent of timeout; raise it for
+# cross-region or cold-start FEs that are slow to accept the connection.
+# connect_timeout = "5s"
+# Stream Load redirect security. Doris's FE redirects (307) to a BE on another
+# host; credentials are re-attached across that hop. By default a redirect that
+# downgrades https -> http is refused (it would leak credentials in cleartext).
+# Set true only for a known-insecure FE -> BE topology.
+# allow_insecure_redirect = false
+# Optional allowlist of hosts a redirect may target. When set and non-empty,
+# any redirect to another host is refused (hard lockdown against a MITM'd FE).
+# allowed_redirect_hosts = ["be1.doris.internal", "be2.doris.internal"]

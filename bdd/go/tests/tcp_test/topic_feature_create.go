@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -36,6 +37,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				name,
 				2,
@@ -54,6 +56,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			name := createRandomString(32)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				name,
 				2,
@@ -74,6 +77,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				name,
 				2,
@@ -92,6 +96,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
 			_, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				createRandomString(256),
 				2,
@@ -110,6 +115,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier[uint32](10)
 			_, err := client.CreateTopic(
+				context.Background(),
 				streamIdentifier,
 				"name",
 				2,

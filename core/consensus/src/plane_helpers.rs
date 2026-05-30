@@ -19,11 +19,9 @@ use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{
-    Command2, Message, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
-};
+use iggy_binary_protocol::{Command2, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader};
 use message_bus::{MessageBus, SendError};
+use server_common::{Message, iobuf::Owned};
 use std::ops::AsyncFnOnce;
 
 /// Shared pipeline-first request flow (metadata + partitions).
@@ -449,9 +447,8 @@ pub async fn send_prepare_ok<B, P>(
 mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline};
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
     use message_bus::SendError;
+    use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
     #[derive(Debug, Default)]
     struct NoopBus;
@@ -472,6 +469,10 @@ mod tests {
         ) -> Result<(), SendError> {
             Ok(())
         }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     fn prepare_message(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
@@ -675,6 +676,10 @@ mod tests {
             self.sent.borrow_mut().push((replica, data));
             Ok(())
         }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
     #[test]

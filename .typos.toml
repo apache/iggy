@@ -19,6 +19,8 @@
 [default.extend-identifiers]
 # NDJSON = Newline Delimited JSON — "NdJson" is valid Rust CamelCase
 NdJson = "NdJson"
+# Valid Python package name used in dependency metadata and lockfiles
+certifi = "certifi"
 
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]

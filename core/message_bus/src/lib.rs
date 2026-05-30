@@ -59,7 +59,7 @@
 //! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
 //!   connections have no dupable plaintext fd, so shard 0 terminates
 //!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
-//!   inter-shard flume.
+//!   inter-shard crossfire channel.
 //! - 0-RTT stays disabled by default on any future QUIC path. Per-
 //!   command opt-in requires a checked-in idempotence audit.
 //!
@@ -84,8 +84,7 @@ pub mod framing;
 pub mod installer;
 pub mod lifecycle;
 pub mod replica;
-#[doc(hidden)]
-pub mod socket_opts;
+pub(crate) mod socket_opts;
 pub mod transports;
 
 pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
@@ -96,35 +95,165 @@ pub use installer::conn_info::{
 };
 pub use lifecycle::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, FusedShutdown,
-    RejectedRegistration, ReplicaRegistry, Shutdown, ShutdownToken,
+    ReplicaRegistry, Shutdown, ShutdownToken,
 };
 pub use transports::tls::TlsServerCredentials;
 
 use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use iggy_binary_protocol::GenericHeader;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use std::array;
+use std::cell::{OnceCell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-/// Callback for forwarding a consensus message to a remote shard.
+/// Maximum number of replicas a single cluster supports. Replica ids are
+/// `u8`, so the address space is 0..=255.
+pub const MAX_REPLICAS: usize = 256;
+
+/// Sentinel stored in [`ReplicaOwnerTable`] slots that have no current owner.
+///
+/// `u16::MAX` is reserved by the server bootstrap so it can never be a real
+/// shard id: `bootstrap` rejects any server whose shard count does not fit
+/// in `u16` or is `>= OWNER_NONE`, returning `ShardsCountOverflow` rather
+/// than minting a shard id that collides with this sentinel.
+pub const OWNER_NONE: u16 = u16::MAX;
+
+/// Shared atomic owner table mapping `replica_id` to `owning_shard_id`.
+///
+/// One Arc-cloned instance is allocated per server-ng process at
+/// bootstrap and shared across every shard's [`IggyMessageBus`]. The owning shard
+/// stamps its id into a slot when an inbound replica connection passes
+/// the registry-insert race; the same shard CAS-clears the slot when
+/// its connection dies (`notify_connection_lost`). Non-owning shards
+/// only ever read.
+///
+/// Lock-free by construction: every operation is a single relaxed-or-
+/// stronger atomic on a fixed `[AtomicU16; MAX_REPLICAS]`. Sized for
+/// 256 slots upfront, so install / disconnect cost is `O(1)` and no
+/// hashing or allocation happens on the hot path.
+///
+/// The table is the sole authority for cross-shard replica routing:
+/// `send_to_replica`'s slow path and [`IggyMessageBus::owning_shard`]
+/// both read it directly. No separate broadcast or reconcile loop is
+/// involved.
+pub struct ReplicaOwnerTable {
+    slots: [AtomicU16; MAX_REPLICAS],
+}
+
+impl ReplicaOwnerTable {
+    /// Build a fresh table with every slot initialised to [`OWNER_NONE`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slots: array::from_fn(|_| AtomicU16::new(OWNER_NONE)),
+        }
+    }
+
+    /// Try to claim `shard_id` as the current owner of `replica_id`.
+    ///
+    /// Returns `true` when the caller now owns the slot. Two paths
+    /// resolve to `true`:
+    /// * `compare_exchange(OWNER_NONE -> shard_id)` wins. Common case.
+    /// * The CAS fails because the slot already stores `shard_id`. A
+    ///   same-shard reclaim during the post-loop clear window
+    ///   ([`IggyMessageBus::notify_connection_lost`]) is benign: the
+    ///   slot already names us, and the stale post-loop will stand
+    ///   down once it observes a live registry entry.
+    ///
+    /// Returns `false` only when a **different** shard owns the slot.
+    /// In that case the caller must drop the inbound fd without
+    /// spawning, mirroring the existing local-`replicas().contains`
+    /// early-return at [`installer::install_replica_conn`].
+    ///
+    /// Closes the multi-shard install race where two parallel inbound
+    /// shard-delegated installs for the same `replica_id` both pass
+    /// their local per-shard registry check and both stamp the
+    /// owner-table: the second stamp would clobber the first, leaving
+    /// the loser's registry as an orphan that no cross-shard route
+    /// reaches. The CAS gates the install before any task is spawned.
+    ///
+    /// The inverse op is [`Self::clear_if_owned_by`]; both must agree on
+    /// `shard_id` to keep the slot self-consistent.
+    pub fn try_claim(&self, replica_id: u8, shard_id: u16) -> bool {
+        match self.slots[usize::from(replica_id)].compare_exchange(
+            OWNER_NONE,
+            shard_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(actual) => actual == shard_id,
+        }
+    }
+
+    /// Clear the slot iff its current owner is `shard_id`. Returns
+    /// `true` when the CAS succeeded.
+    ///
+    /// The CAS prevents a stale post-loop on shard A from clobbering a
+    /// slot that has since been re-registered on shard B.
+    pub fn clear_if_owned_by(&self, replica_id: u8, shard_id: u16) -> bool {
+        self.slots[usize::from(replica_id)]
+            .compare_exchange(shard_id, OWNER_NONE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Read the current owner of `replica_id`. Returns `None` when the
+    /// slot is [`OWNER_NONE`].
+    #[must_use]
+    pub fn owner(&self, replica_id: u8) -> Option<u16> {
+        match self.slots[usize::from(replica_id)].load(Ordering::Acquire) {
+            OWNER_NONE => None,
+            owner => Some(owner),
+        }
+    }
+}
+
+impl Default for ReplicaOwnerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Callback for forwarding a consensus replica message to the owning shard.
 ///
 /// Provided by the shard layer at bus construction and installed via
-/// [`IggyMessageBus::set_replica_forward_fn`] / [`IggyMessageBus::set_client_forward_fn`].
-/// Arguments: `(target_shard_id, message)`. Returns `Ok(())` on successful
-/// enqueue into the inter-shard channel, or [`SendError::RoutingFailed`] on
-/// `try_send` failure.
+/// [`IggyMessageBus::set_replica_forward_fn`]. Arguments:
+/// `(replica_id, owning_shard_id, message)`. Returns `Ok(())` on successful
+/// enqueue into the inter-shard channel.
+///
+/// `replica_id` is carried explicitly so the receiver can rebuild
+/// `ShardFrame::Lifecycle`'s `ForwardReplicaSend { replica_id, msg }`
+/// payload; the bus' slow path knows the id but the closure body, which lives
+/// in the shard layer, would otherwise have to re-derive it from the message.
 ///
 /// Asymmetry vs the `Rc<dyn Fn>` siblings (`AcceptedReplicaFn`,
 /// `AcceptedClientFn`, `ConnectionLostFn`): the forward fn has a single
 /// owner (the bus) and is installed once at bootstrap; `Box` suffices.
 /// The `Rc` siblings are shared with accept loops and connection tasks
 /// that outlive the caller and need independent ownership.
-pub type ShardForwardFn = Box<dyn Fn(u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
+pub type ReplicaForwardFn = Box<dyn Fn(u8, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
+
+/// Callback for forwarding a client-bound message to the owning shard.
+///
+/// Provided by the shard layer at bus construction and installed via
+/// [`IggyMessageBus::set_client_forward_fn`]. Arguments:
+/// `(client_id, owning_shard_id, message)`. Returns `Ok(())` on successful
+/// enqueue into the inter-shard channel.
+///
+/// `owning_shard_id` is the value returned by [`client_id_owning_shard`];
+/// the slow path passes it pre-resolved so the closure does not redo the
+/// shift. `client_id` is carried so the receiver can rebuild the
+/// `ShardFrame::Lifecycle`'s `ForwardClientSend { client_id, msg }`
+/// payload.
+pub type ClientForwardFn = Box<dyn Fn(u128, u16, Frozen<MESSAGE_ALIGN>) -> Result<(), SendError>>;
+
+/// Callback invoked when a client connection metadata entry is removed.
+pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
 
 /// Callback invoked on every successful replica handshake.
 ///
@@ -161,8 +290,14 @@ pub struct AcceptedQuicConn {
 impl AcceptedQuicConn {
     /// Bundle a freshly-accepted QUIC connection and its first
     /// bidirectional stream pair.
+    ///
+    /// `pub(crate)` by design: the constructor's signature mentions
+    /// `compio_quic::Connection`, `SendStream`, and `RecvStream`, all
+    /// kept off the bus's public `SemVer` surface for the same reason
+    /// [`Self::into_parts`] is crate-private. The QUIC listener in
+    /// [`crate::client_listener::quic`] is the only mint site.
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         connection: compio_quic::Connection,
         streams: (compio_quic::SendStream, compio_quic::RecvStream),
     ) -> Self {
@@ -220,7 +355,7 @@ pub type AcceptedQuicClientFn = std::rc::Rc<dyn Fn(AcceptedQuicConn)>;
 /// Fires after shard 0's WS listener accepts a raw TCP socket. The
 /// HTTP-Upgrade handshake has NOT run yet; the callback hands the
 /// raw stream off to the owning shard via inter-shard fd-shipping
-/// (`ShardFramePayload::ClientWsConnectionSetup`). The owning shard
+/// (`shard::LifecycleFrame::ClientWsConnectionSetup`). The owning shard
 /// runs the upgrade locally; no subprotocol is negotiated. The
 /// shipped fd is plain TCP at ship-time, so fd-delegation (which
 /// requires a dupable plaintext fd) stays well-defined.
@@ -291,6 +426,34 @@ pub type ConnectionLostFn = std::rc::Rc<dyn Fn(u8)>;
 /// on first poll. Future transports (QUIC, TLS) that would introduce real
 /// yields must advertise that change in their own doc; consensus code
 /// relies on the no-yield property to reason about reentrancy.
+///
+/// # Recovery asymmetry between `send_to_replica` and `send_to_client`
+///
+/// `send_to_replica` carries VSR-covered frames (`Prepare` / `PrepareOk`
+/// / view-change / `Commit`). A `ReplicaForwardFailed` on full
+/// inter-shard inbox is recovered by VSR retransmit and is
+/// informational.
+/// `send_to_client` carries the final Reply payload to the originating
+/// client; it has no in-protocol retransmit. A `ClientForwardFailed` is
+/// terminal: the client never receives the reply and times out.
+/// Operators must size `inbox_capacity` for the worst-case cross-shard
+/// reply burst. Each drop is logged at the drop site via `tracing`;
+/// alert on those logs today. The `frame_drops_total`
+/// `{variant="forward_client_send"}` counter is the structured
+/// complement and becomes scrape-able once a per-shard exporter lands.
+/// The symmetric `{variant="forward_replica_send"}` counter stays
+/// informational only.
+///
+/// # Setter install contract
+///
+/// The three setters below do NOT share one install rule:
+/// - [`Self::set_connection_lost_fn`] is re-installable (`RefCell`
+///   slot); it is a test observation hook some setups swap mid-test.
+/// - [`Self::set_replica_forward_fn`] and [`Self::set_client_forward_fn`]
+///   are one-shot (`OnceCell` slot) and panic on a second install;
+///   they are bootstrap-only wiring invariants.
+///
+/// A bus impl must preserve this divergence - see each method.
 pub trait MessageBus {
     fn send_to_client(
         &self,
@@ -305,15 +468,50 @@ pub trait MessageBus {
     ) -> impl Future<Output = Result<(), SendError>>;
 
     /// Install a notifier the bus will invoke when a delegated replica
-    /// connection dies abnormally. Used by shard-0 bootstrap to push a
-    /// `ShardFramePayload::ConnectionLost` into shard 0's inbox so the
-    /// coordinator can forget the replica's mapping.
+    /// connection dies abnormally. Production wiring leaves this unset
+    /// because the shard-shared [`ReplicaOwnerTable`] is CAS-cleared
+    /// inside `IggyMessageBus::notify_connection_lost` before the
+    /// callback runs, so cross-shard routing recovers without any
+    /// follow-up message. Test code installs a callback to assert the
+    /// notifier path fires exactly once per disconnect.
     ///
-    /// Default impl is a no-op for buses that do not delegate real
-    /// connections (simulator, test doubles); the production
-    /// `IggyMessageBus` overrides it to wire into its internal
-    /// `connection_lost_fn` hook.
-    fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+    /// No default: every bus must explicitly opt in or stub. A silent
+    /// no-op default previously masked a wiring bug where shard 0 never
+    /// learned a delegated replica died.
+    ///
+    /// Re-installing is allowed by design - the backing slot is a
+    /// `RefCell`, so a second call overwrites the first. This is the
+    /// deliberate exception to the install rules of
+    /// [`Self::set_replica_forward_fn`] / [`Self::set_client_forward_fn`]:
+    /// the notifier is a test observation hook some setups swap
+    /// mid-test, not a one-shot bootstrap invariant.
+    fn set_connection_lost_fn(&self, f: ConnectionLostFn);
+
+    /// Install the replica-plane inter-shard forward closure.
+    ///
+    /// No default: every bus must explicitly opt in or stub. Mirrors the
+    /// reason `set_connection_lost_fn` is required - a silent no-op
+    /// default could mask a wiring bug where cross-shard replica sends
+    /// drop on the floor without anyone noticing.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a second install on the same bus. Unlike
+    /// [`Self::set_connection_lost_fn`], the forward closure is a
+    /// one-shot bootstrap invariant backed by a `OnceCell`, so a
+    /// double-install is a wiring bug rather than a supported re-bind.
+    fn set_replica_forward_fn(&self, f: ReplicaForwardFn);
+
+    /// Install the client-plane inter-shard forward closure.
+    ///
+    /// No default: every bus must explicitly opt in or stub. Same
+    /// rationale as [`Self::set_replica_forward_fn`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a second install on the same bus, same one-shot
+    /// `OnceCell` invariant as [`Self::set_replica_forward_fn`].
+    fn set_client_forward_fn(&self, f: ClientForwardFn);
 }
 
 /// Production message bus backed by real TCP connections.
@@ -330,7 +528,10 @@ pub trait MessageBus {
 /// - `send_to_*` clones the per-peer `Sender` out of the registry, calls
 ///   `try_send` on it, and returns. No `.await` happens in the body. Drops
 ///   on `Full` (returned as [`SendError::Backpressure`]) are recovered by
-///   VSR retransmission.
+///   VSR retransmission for replica-bound consensus traffic. Client Reply
+///   drops returned as [`SendError::ClientForwardFailed`] have no
+///   retransmit and are terminal; see the trait-level "Recovery
+///   asymmetry" section on [`MessageBus`].
 /// - The per-connection writer task batches up to `config.max_batch` messages into
 ///   a single `writev` syscall on the plaintext TCP plane (see
 ///   [`transports::tcp`]).
@@ -345,25 +546,33 @@ pub struct IggyMessageBus {
     replicas: ReplicaRegistry,
     background_tasks: RefCell<Vec<JoinHandle<()>>>,
     config: MessageBusConfig,
-    /// For each replica, the shard that owns the TCP connection from this
-    /// shard's perspective. Present on ALL shards (owning and non-owning).
-    /// On the owning shard, `shard_mapping[replica] == self.shard_id`.
-    shard_mapping: RefCell<HashMap<u8, u16>>,
     /// Forwards a replica-bound message to the shard that owns the replica's
-    /// TCP connection. `None` on single-shard setups and tests.
-    replica_forward_fn: RefCell<Option<ShardForwardFn>>,
+    /// TCP connection. Empty on single-shard setups and tests. Installed
+    /// once at bootstrap via [`Self::set_replica_forward_fn`]; the slow
+    /// path reads through [`OnceCell::get`] without a runtime borrow.
+    replica_forward_fn: OnceCell<ReplicaForwardFn>,
     /// Forwards a client-bound message to the shard that owns the client's
     /// TCP connection (the owning shard is encoded in the top 16 bits of
-    /// the client id). `None` on single-shard setups and tests.
-    client_forward_fn: RefCell<Option<ShardForwardFn>>,
-    /// Invoked by a delegated replica connection's writer / reader tasks
-    /// when they exit abnormally. `None` when running without a shard-0
-    /// coordinator (single-shard deployments and tests).
+    /// the client id). Empty on single-shard setups and tests. Installed
+    /// once at bootstrap via [`Self::set_client_forward_fn`]; the slow
+    /// path reads through [`OnceCell::get`] without a runtime borrow.
+    client_forward_fn: OnceCell<ClientForwardFn>,
+    /// Optional disconnect notifier invoked by
+    /// `Self::notify_connection_lost` after it CAS-clears the owner
+    /// table. Production leaves this unset; tests install a callback to
+    /// observe the path.
     connection_lost_fn: RefCell<Option<ConnectionLostFn>>,
+    /// Invoked when a client connection metadata entry is removed during
+    /// connection teardown.
+    client_connection_lost_fn: RefCell<Option<ClientConnectionLostFn>>,
     /// Per-connection metadata exposed to the caller via
     /// [`Self::client_meta`]. Populated by the install path on
     /// successful registry insert; removed on connection teardown.
     client_meta: RefCell<ahash::AHashMap<u128, Rc<ClientConnMeta>>>,
+    /// Shard-shared atomic owner table. Stamped by the install path
+    /// after a successful registry insert; CAS-cleared by
+    /// `Self::notify_connection_lost`. See [`ReplicaOwnerTable`].
+    owner_table: Arc<ReplicaOwnerTable>,
 }
 
 impl IggyMessageBus {
@@ -408,6 +617,20 @@ impl IggyMessageBus {
         Self::with_tunables(shard_id, MessageBusConfig::from(cfg))
     }
 
+    /// Production constructor for multi-shard server-ng: same as
+    /// [`Self::with_config`] but takes a pre-allocated
+    /// [`ReplicaOwnerTable`] Arc. Bootstrap allocates one table per
+    /// server-ng process and clones the Arc into every shard so all
+    /// buses see the same atomic slots.
+    #[must_use]
+    pub fn with_config_and_owner_table(
+        shard_id: u16,
+        cfg: &ServerNgConfig,
+        owner_table: Arc<ReplicaOwnerTable>,
+    ) -> Self {
+        Self::with_tunables_and_owner_table(shard_id, MessageBusConfig::from(cfg), owner_table)
+    }
+
     /// Construct a bus from already-derived runtime tunables.
     ///
     /// Used by the public constructors above and by tests that need to
@@ -420,6 +643,24 @@ impl IggyMessageBus {
     /// `config.max_batch > IOV_MAX_LIMIT`.
     #[must_use]
     pub fn with_tunables(shard_id: u16, config: MessageBusConfig) -> Self {
+        Self::with_tunables_and_owner_table(shard_id, config, Arc::new(ReplicaOwnerTable::new()))
+    }
+
+    /// Construct a bus with explicit runtime tunables and a pre-allocated
+    /// owner table. Server-ng bootstrap uses this so every shard's bus
+    /// shares the same atomic slots; tests use [`Self::with_tunables`]
+    /// which allocates a fresh table per bus.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.max_batch == 0` or
+    /// `config.max_batch > IOV_MAX_LIMIT`.
+    #[must_use]
+    pub fn with_tunables_and_owner_table(
+        shard_id: u16,
+        config: MessageBusConfig,
+        owner_table: Arc<ReplicaOwnerTable>,
+    ) -> Self {
         assert!(
             config.max_batch > 0 && config.max_batch <= IOV_MAX_LIMIT,
             "MessageBusConfig::max_batch must be in 1..={IOV_MAX_LIMIT} (writev IOV_MAX/2 cap); got {}",
@@ -434,12 +675,45 @@ impl IggyMessageBus {
             replicas: ReplicaRegistry::new(),
             background_tasks: RefCell::new(Vec::new()),
             config,
-            shard_mapping: RefCell::new(HashMap::new()),
-            replica_forward_fn: RefCell::new(None),
-            client_forward_fn: RefCell::new(None),
+            replica_forward_fn: OnceCell::new(),
+            client_forward_fn: OnceCell::new(),
             connection_lost_fn: RefCell::new(None),
+            client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
+            owner_table,
         }
+    }
+
+    /// Clone of the shard-shared owner table Arc.
+    #[must_use]
+    pub fn owner_table(&self) -> Arc<ReplicaOwnerTable> {
+        Arc::clone(&self.owner_table)
+    }
+
+    /// Try to claim this bus' shard id as owner of `replica_id`.
+    ///
+    /// Returns `true` when the claim succeeded (the slot now points at
+    /// `self.shard_id`, either because it was `OWNER_NONE` or because
+    /// it already stored `self.shard_id`). Returns `false` when a
+    /// different shard owns the slot; the caller must drop the
+    /// inbound connection.
+    ///
+    /// Called by [`installer::install_replica_conn`] **before**
+    /// spawning tasks or inserting into the local registry. See
+    /// [`ReplicaOwnerTable::try_claim`] for the multi-shard race this
+    /// closes.
+    #[must_use]
+    pub fn mark_replica_owned(&self, replica_id: u8) -> bool {
+        self.owner_table.try_claim(replica_id, self.shard_id)
+    }
+
+    /// CAS-clear the owner-table slot for `replica_id` if its current
+    /// owner is this bus' shard id. The CAS prevents a stale post-loop
+    /// from clobbering a slot that has since been re-registered on a
+    /// different shard.
+    pub fn clear_replica_owned(&self, replica_id: u8) -> bool {
+        self.owner_table
+            .clear_if_owned_by(replica_id, self.shard_id)
     }
 
     /// Look up the per-connection metadata recorded for `client_id`.
@@ -456,7 +730,24 @@ impl IggyMessageBus {
     }
 
     pub(crate) fn remove_client_meta(&self, client_id: u128) {
-        self.client_meta.borrow_mut().remove(&client_id);
+        if self.client_meta.borrow_mut().remove(&client_id).is_some() {
+            self.notify_client_connection_lost(client_id);
+        }
+    }
+
+    pub fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
+        *self.client_connection_lost_fn.borrow_mut() = Some(f);
+    }
+
+    fn notify_client_connection_lost(&self, client_id: u128) {
+        let cb = self
+            .client_connection_lost_fn
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone);
+        if let Some(f) = cb {
+            f(client_id);
+        }
     }
 
     /// Install the notifier used by delegated replica connections to tell
@@ -472,6 +763,31 @@ impl IggyMessageBus {
     /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
     /// without tripping the runtime borrow check.
     pub(crate) fn notify_connection_lost(&self, replica_id: u8) {
+        // Stand down if a live registry entry exists for this replica. A
+        // reconnect that round-robined back to this same shard installs a
+        // fresh entry before this stale post-loop runs; the owner-table
+        // CAS in `clear_replica_owned` only guards *different*-shard
+        // re-registration, so a same-shard reinstall leaves the slot
+        // == self.shard_id and the clear below would clobber the live
+        // connection's slot, stranding cross-shard `send_to_replica`
+        // forever. Every caller removes its own registry entry before
+        // invoking this, so a live entry here is always a newer install
+        // that now owns the slot. No token needed: the bus is
+        // single-threaded (compio), so this check, the clear, and a
+        // competing `install_replica_conn` cannot interleave.
+        if self.replicas.contains(replica_id) {
+            return;
+        }
+        // CAS-clear first so any reader racing the user callback already
+        // sees the slot vacated. The CAS no-ops if a different shard
+        // already owns the slot (post-loop arriving after a
+        // re-installation on another shard).
+        self.clear_replica_owned(replica_id);
+        tracing::warn!(
+            shard_id = self.shard_id,
+            replica_id,
+            "replica connection lost"
+        );
         let cb = self
             .connection_lost_fn
             .borrow()
@@ -493,11 +809,14 @@ impl IggyMessageBus {
     ///
     /// # Panics
     ///
-    /// Panics on re-entrant `RefCell::borrow_mut` if called from inside
-    /// an in-flight forward-closure invocation. All production call sites
-    /// are bootstrap only (single-threaded compio, no re-entry).
-    pub fn set_replica_forward_fn(&self, f: ShardForwardFn) {
-        *self.replica_forward_fn.borrow_mut() = Some(f);
+    /// Panics if called more than once on the same bus. The bootstrap is
+    /// the sole caller and runs exactly once per bus; a second install
+    /// signals a wiring bug we want to surface loudly.
+    pub fn set_replica_forward_fn(&self, f: ReplicaForwardFn) {
+        self.replica_forward_fn
+            .set(f)
+            .ok()
+            .expect("replica_forward_fn installed twice (bootstrap invariant)");
     }
 
     /// Install the client-plane inter-shard forward closure.
@@ -510,41 +829,23 @@ impl IggyMessageBus {
     ///
     /// # Panics
     ///
-    /// Panics on re-entrant `RefCell::borrow_mut` if called from inside
-    /// an in-flight forward-closure invocation.
-    pub fn set_client_forward_fn(&self, f: ShardForwardFn) {
-        *self.client_forward_fn.borrow_mut() = Some(f);
+    /// Panics if called more than once on the same bus. Same rationale as
+    /// [`Self::set_replica_forward_fn`].
+    pub fn set_client_forward_fn(&self, f: ClientForwardFn) {
+        self.client_forward_fn
+            .set(f)
+            .ok()
+            .expect("client_forward_fn installed twice (bootstrap invariant)");
     }
 
-    /// Update the shard mapping for a replica.
+    /// Get the owning shard for a replica, if any.
     ///
-    /// Called when the allocation strategy assigns or reassigns connections.
-    ///
-    /// # Panics
-    ///
-    /// Panics on re-entrant `RefCell::borrow_mut` if called while
-    /// [`IggyMessageBus::owning_shard`] (or any other read-side of
-    /// `shard_mapping`) holds an outstanding read borrow on the same
-    /// bus instance.
-    pub fn set_shard_mapping(&self, replica: u8, owning_shard: u16) {
-        self.shard_mapping
-            .borrow_mut()
-            .insert(replica, owning_shard);
-    }
-
-    /// Remove all shard mappings for a replica (on deallocation).
-    ///
-    /// # Panics
-    ///
-    /// Same re-entrant-`borrow_mut` constraint as
-    /// [`IggyMessageBus::set_shard_mapping`].
-    pub fn remove_shard_mapping(&self, replica: u8) {
-        self.shard_mapping.borrow_mut().remove(&replica);
-    }
-
-    /// Get the owning shard for a replica, if mapped.
+    /// Reads the shard-shared [`ReplicaOwnerTable`], which is stamped
+    /// synchronously by the owning shard's installer and CAS-cleared on
+    /// disconnect inside `Self::notify_connection_lost`.
+    #[must_use]
     pub fn owning_shard(&self, replica: u8) -> Option<u16> {
-        self.shard_mapping.borrow().get(&replica).copied()
+        self.owner_table.owner(replica)
     }
 
     #[must_use]
@@ -713,6 +1014,14 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn set_connection_lost_fn(&self, f: ConnectionLostFn) {
         (**self).set_connection_lost_fn(f);
     }
+
+    fn set_replica_forward_fn(&self, f: ReplicaForwardFn) {
+        (**self).set_replica_forward_fn(f);
+    }
+
+    fn set_client_forward_fn(&self, f: ClientForwardFn) {
+        (**self).set_client_forward_fn(f);
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -737,11 +1046,12 @@ impl MessageBus for IggyMessageBus {
                 Err(_msg) => Err(SendError::ClientNotFound(client_id)),
             };
         }
-        let forward = self.client_forward_fn.borrow();
-        let forward = forward
-            .as_ref()
+        let forward = self
+            .client_forward_fn
+            .get()
             .ok_or(SendError::ClientRouteMissing(client_id))?;
-        forward(owning_shard, message).map_err(|_| SendError::ClientForwardFailed(client_id))
+        forward(client_id, owning_shard, message)
+            .map_err(|_| SendError::ClientForwardFailed(client_id))
     }
 
     async fn send_to_replica(
@@ -760,21 +1070,42 @@ impl MessageBus for IggyMessageBus {
             Err(message) => message,
         };
         // Slow path: route via the inter-shard channel to the owning shard.
+        // The shard-shared `owner_table` is the authoritative routing
+        // view: `mark_replica_owned` stamps it on install and
+        // `clear_replica_owned` CAS-clears it on disconnect.
         let owning_shard = self
-            .shard_mapping
-            .borrow()
-            .get(&replica)
-            .copied()
+            .owner_table
+            .owner(replica)
             .ok_or(SendError::ReplicaNotConnected(replica))?;
-        let forward = self.replica_forward_fn.borrow();
-        let forward = forward
-            .as_ref()
+        // The fast path already failed (no live registry slot), so a
+        // self-owner here means the disconnect is mid-flight:
+        // `close_peer_if_token_matches` took the slot but
+        // `clear_replica_owned` has not yet run. Forwarding now would
+        // `try_send` a `ForwardReplicaSend` onto our own inbox and the
+        // pump would re-enter this path - a self-inbox ping-pong on the
+        // consensus hot path. Treat as not connected, mirroring the
+        // `send_to_client` self-owner guard.
+        if owning_shard == self.shard_id {
+            return Err(SendError::ReplicaNotConnected(replica));
+        }
+        let forward = self
+            .replica_forward_fn
+            .get()
             .ok_or(SendError::ReplicaRouteMissing(replica))?;
-        forward(owning_shard, message).map_err(|_| SendError::ReplicaForwardFailed(replica))
+        forward(replica, owning_shard, message)
+            .map_err(|_| SendError::ReplicaForwardFailed(replica))
     }
 
     fn set_connection_lost_fn(&self, f: ConnectionLostFn) {
         Self::set_connection_lost_fn(self, f);
+    }
+
+    fn set_replica_forward_fn(&self, f: ReplicaForwardFn) {
+        Self::set_replica_forward_fn(self, f);
+    }
+
+    fn set_client_forward_fn(&self, f: ClientForwardFn) {
+        Self::set_client_forward_fn(self, f);
     }
 }
 
@@ -823,16 +1154,20 @@ mod tests {
         let bus = IggyMessageBus::new(5);
         let captured: std::rc::Rc<RefCell<Option<u16>>> = std::rc::Rc::new(RefCell::new(None));
         let captured_clone = captured.clone();
-        bus.set_client_forward_fn(Box::new(move |target, _msg| {
+        let client_id = (7u128 << 112) | 0x2a;
+        let captured_id: std::rc::Rc<RefCell<Option<u128>>> = std::rc::Rc::new(RefCell::new(None));
+        let captured_id_clone = captured_id.clone();
+        bus.set_client_forward_fn(Box::new(move |id, target, _msg| {
+            *captured_id_clone.borrow_mut() = Some(id);
             *captured_clone.borrow_mut() = Some(target);
             Ok(())
         }));
 
-        let client_id = (7u128 << 112) | 0x2a;
         bus.send_to_client(client_id, dummy_message().into_frozen())
             .await
             .expect("forward_fn should accept");
         assert_eq!(*captured.borrow(), Some(7));
+        assert_eq!(*captured_id.borrow(), Some(client_id));
     }
 
     #[compio::test]
@@ -863,21 +1198,25 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_replica_slow_path_uses_shard_mapping_and_forwards() {
+    async fn send_to_replica_slow_path_uses_owner_table_and_forwards() {
         let bus = IggyMessageBus::new(0);
         let captured: std::rc::Rc<RefCell<Option<u16>>> = std::rc::Rc::new(RefCell::new(None));
         let captured_clone = captured.clone();
-        bus.set_replica_forward_fn(Box::new(move |target, _msg| {
+        let captured_id: std::rc::Rc<RefCell<Option<u8>>> = std::rc::Rc::new(RefCell::new(None));
+        let captured_id_clone = captured_id.clone();
+        bus.set_replica_forward_fn(Box::new(move |id, target, _msg| {
+            *captured_id_clone.borrow_mut() = Some(id);
             *captured_clone.borrow_mut() = Some(target);
             Ok(())
         }));
-        bus.set_shard_mapping(5, 3);
+        assert!(bus.owner_table().try_claim(5, 3));
 
         bus.send_to_replica(5, dummy_message().into_frozen())
             .await
             .expect("forward ok");
 
         assert_eq!(*captured.borrow(), Some(3));
+        assert_eq!(*captured_id.borrow(), Some(5));
     }
 
     #[compio::test]
@@ -889,6 +1228,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::ReplicaNotConnected(9)));
+    }
+
+    /// Disconnect-race window: the registry slot is already gone (fast
+    /// path misses) but `owner_table` still points at this shard because
+    /// `clear_replica_owned` has not run yet. The slow path must treat a
+    /// self-owner as not connected rather than forwarding the frame onto
+    /// its own inbox - mirrors the `send_to_client` self-owner guard.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_replica_slow_path_self_owner_returns_not_connected() {
+        let bus = IggyMessageBus::new(3);
+        assert!(bus.owner_table().try_claim(5, 3));
+
+        let err = bus
+            .send_to_replica(5, dummy_message().into_frozen())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::ReplicaNotConnected(5)));
     }
 
     #[compio::test]
@@ -990,6 +1347,43 @@ mod tests {
         assert_eq!(counter.get(), 11);
     }
 
+    /// Same-shard reconnect race: a stale post-loop from a dead connection
+    /// must not CAS-clear the owner-table slot that a live reinstall
+    /// (round-robined back to this shard) just stamped. The slot is only
+    /// released once no live registry entry remains.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn notify_connection_lost_stands_down_when_replica_reregistered() {
+        let bus = IggyMessageBus::new(3);
+
+        // Live reinstall: registry entry present + owner table stamped.
+        let (tx, _rx) = async_channel::bounded(8);
+        let writer = compio::runtime::spawn(async {});
+        let reader = compio::runtime::spawn(async {});
+        let (conn_shutdown, _conn_token) = Shutdown::new();
+        bus.replicas()
+            .insert(7, tx, writer, reader, conn_shutdown)
+            .expect("insert ok");
+        assert!(bus.mark_replica_owned(7), "owner-table claim must succeed");
+
+        // Stale predecessor post-loop fires while the reinstall is live.
+        bus.notify_connection_lost(7);
+        assert_eq!(
+            bus.owning_shard(7),
+            Some(3),
+            "stale post-loop cleared a re-registered replica's owner slot",
+        );
+
+        // Genuine disconnect: no live entry, the slot is released.
+        bus.replicas().remove(7);
+        bus.notify_connection_lost(7);
+        assert_eq!(
+            bus.owning_shard(7),
+            None,
+            "owner slot must clear once no live connection remains",
+        );
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn shutdown_loop_drains_tasks_added_during_shutdown() {
@@ -1016,5 +1410,44 @@ mod tests {
             0,
             "shutdown must leave background_tasks empty",
         );
+    }
+
+    #[test]
+    fn try_claim_wins_from_none() {
+        let table = ReplicaOwnerTable::new();
+        assert!(table.try_claim(42, 3), "claim from OWNER_NONE must win");
+        assert_eq!(table.owner(42), Some(3));
+    }
+
+    #[test]
+    fn try_claim_loses_to_different_shard() {
+        let table = ReplicaOwnerTable::new();
+        assert!(table.try_claim(42, 5));
+        assert!(
+            !table.try_claim(42, 7),
+            "claim from different shard must lose"
+        );
+        assert_eq!(
+            table.owner(42),
+            Some(5),
+            "losing claim must not mutate the slot",
+        );
+    }
+
+    #[test]
+    fn try_claim_same_shard_returns_true() {
+        // Models the same-shard reclaim window: previous install on
+        // this shard stamped the slot, post-loop's
+        // `clear_replica_owned` has not run yet, a new install for the
+        // same replica id arrives. The CAS-from-NONE fails but
+        // `try_claim` treats `actual == shard_id` as success so the
+        // new install proceeds.
+        let table = ReplicaOwnerTable::new();
+        assert!(table.try_claim(42, 5));
+        assert!(
+            table.try_claim(42, 5),
+            "same-shard reclaim must be accepted",
+        );
+        assert_eq!(table.owner(42), Some(5));
     }
 }

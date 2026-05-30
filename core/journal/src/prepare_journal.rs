@@ -18,14 +18,13 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::consensus::message::{MESSAGE_ALIGN, Message};
 use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
-use std::cell::{Cell, Ref, RefCell};
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
+use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
 use std::io;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -44,7 +43,7 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 /// still contains them, but they become unreachable for recovery).
 ///
 /// **NOTE:** This number needs to be chosen in balance between number of
-/// entries in [`core::consensus::pipeline_prepare_queue_max`]. Because this number controls
+/// entries in [`consensus::PIPELINE_PREPARE_QUEUE_MAX`]. Because this number controls
 /// how many committed but not yet snapshotted entries that the buffer can
 /// hold. This may need to be tuned properly.
 pub(crate) const SLOT_COUNT: usize = 1024;
@@ -54,12 +53,27 @@ pub(crate) const SLOT_COUNT: usize = 1024;
 #[allow(clippy::module_name_repetitions)]
 pub enum JournalError {
     Io(io::Error),
+    /// Journal entered an irrecoverable state after a partial `drain()`
+    /// failure: the atomic `rename` succeeded but a subsequent step
+    /// (parent-dir fsync or storage reopen) failed, leaving in-memory
+    /// state desynced from on-disk state. Every IO entry point refuses
+    /// further work until the journal is rebuilt by re-opening the WAL.
+    ///
+    /// `stage` names which drain step failed (for diagnostics); `source`
+    /// is the underlying `io::Error` that caused it, kept so operators
+    /// see the original kernel error (`ENOSPC`, `EIO`, ...) rather than
+    /// just a generic poison marker.
+    Poisoned {
+        stage: &'static str,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "journal I/O error: {e}"),
+            Self::Poisoned { stage, .. } => write!(f, "journal poisoned at {stage}"),
         }
     }
 }
@@ -68,6 +82,7 @@ impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
+            Self::Poisoned { source, .. } => Some(source),
         }
     }
 }
@@ -101,6 +116,26 @@ pub struct PrepareJournal {
     /// an un-snapshotted entry (op > `snapshot_op`) panics and the upper layer must
     /// take a snapshot before the journal wraps.
     snapshot_op: Cell<u64>,
+    /// Populated once `drain()` has progressed past the atomic `rename`
+    /// and a subsequent step has failed, meaning the on-disk WAL and the
+    /// in-memory index no longer agree. All IO entry points must
+    /// short-circuit with `JournalError::Poisoned` to prevent the next
+    /// `append` from writing into the orphaned old fd or
+    /// `entry`/`entry_at` from serving headers whose offsets reference
+    /// the pre-drain layout.
+    ///
+    /// `OnceCell` (not `Cell<Option<_>>`) because the underlying
+    /// `io::Error` is `!Clone` and the journal is dead after the first
+    /// set; first-write-wins matches the actual semantics and avoids
+    /// `RefCell` borrow-panic risk on the read fast path.
+    poisoned: OnceCell<PoisonState>,
+}
+
+/// Captured cause of journal poisoning. `stage` names the drain step
+/// that tripped; `source` is the original `io::Error` for forensics.
+struct PoisonState {
+    stage: &'static str,
+    source: io::Error,
 }
 
 impl fmt::Debug for PrepareJournal {
@@ -108,6 +143,7 @@ impl fmt::Debug for PrepareJournal {
         f.debug_struct("PrepareJournal")
             .field("write_offset", &self.storage.file_len())
             .field("last_op", &self.last_op.get())
+            .field("poisoned", &self.poisoned.get().map(|p| p.stage))
             .finish_non_exhaustive()
     }
 }
@@ -117,9 +153,83 @@ const fn slot_for_op(op: u64) -> usize {
     op as usize % SLOT_COUNT
 }
 
+/// Repair a damaged WAL tail by truncating to `pos`, or surface a loud
+/// error when truncation would be unsafe.
+///
+/// Truncation is only sound for a torn final append, which writes at most
+/// one entry's worth of bytes. If more than `MAX_ENTRY_SIZE` bytes follow
+/// `pos`, the damage is mid-file: truncating would silently discard every
+/// committed entry after it, so this hard-errors instead of repairing.
+#[allow(clippy::future_not_send)]
+async fn truncate_or_fail(
+    storage: &FileStorage,
+    pos: u64,
+    reason: &'static str,
+) -> Result<(), JournalError> {
+    let trailing = storage.file_len().saturating_sub(pos);
+    // Sound only because this WAL appends exactly one entry per `append`
+    // + fsync, so a torn tail is at most one entry wide. A batched-append
+    // WAL could leave a torn tail many entries wide, and this
+    // `> MAX_ENTRY_SIZE` check would misclassify it as mid-file damage.
+    if trailing > MAX_ENTRY_SIZE {
+        return Err(JournalError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "mid-file WAL corruption at pos {pos}: {reason}; {trailing} bytes \
+                 follow (> MAX_ENTRY_SIZE {MAX_ENTRY_SIZE}), refusing to truncate \
+                 and discard committed entries"
+            ),
+        )));
+    }
+    storage.truncate(pos).await?;
+    // The repair must be crash-durable. `FileStorage::truncate` is a
+    // bare `set_len`; without this fsync a power loss right after the
+    // repair re-presents the torn tail on the next boot. Mirrors the
+    // write-then-fsync the `append` path already does.
+    storage.fsync().await?;
+    Ok(())
+}
+
+/// Best-effort unlink of the drain temp file on any error path between
+/// `File::create(wal.tmp)` and the atomic `rename`. Without this, every
+/// failed drain leaks a `wal.tmp` next to the WAL; the next drain
+/// truncates it on re-create so safety holds, but operators see the tmp
+/// files accumulate across crashed/aborted drains. `defuse` is called
+/// after a successful rename so the now-renamed file is not removed.
+///
+/// `Drop` cannot be async, so the unlink is a blocking `std::fs::remove_file`.
+/// This only runs on the drain failure path (already returning an error),
+/// so a sync syscall here is acceptable. Errors are swallowed: the file
+/// may already be gone (e.g. rename succeeded but a later step failed
+/// and we defused too late) and there is no useful recovery from a
+/// failed cleanup unlink.
+struct TmpFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TmpFileGuard {
+    const fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
 impl PrepareJournal {
-    /// Open the WAL file, scanning forward to rebuild the in-memory index.
+    /// Open the WAL file in read-write mode, scanning forward to rebuild
+    /// the in-memory index.
     ///
     /// `snapshot_op` is the highest op that has been durably snapshotted.
     /// It must be provided so that `append()` can detect slot collisions
@@ -133,6 +243,11 @@ impl PrepareJournal {
     #[allow(clippy::future_not_send)]
     pub async fn open(path: &Path, snapshot_op: u64) -> Result<Self, JournalError> {
         let storage = FileStorage::open(path).await?;
+        Self::scan(storage, snapshot_op).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn scan(storage: FileStorage, snapshot_op: u64) -> Result<Self, JournalError> {
         let file_len = storage.file_len();
         let mut headers: Vec<Option<PrepareHeader>> = vec![None; SLOT_COUNT];
         let mut offsets: Vec<Option<u64>> = vec![None; SLOT_COUNT];
@@ -149,10 +264,13 @@ impl PrepareJournal {
             aligned.as_mut_slice().copy_from_slice(&header_buf);
             // `try_from_bytes`: corrupt discriminant on disk must NOT panic;
             // route through the same truncate-here branch as command/size below.
+            // Copying into a 16-aligned scratch first keeps the
+            // `PrepareHeader` (u128 fields) load aligned for miri's
+            // strict-provenance / tree-borrows checks.
             let Ok(header_ref) =
                 bytemuck::checked::try_from_bytes::<PrepareHeader>(aligned.as_slice())
             else {
-                storage.truncate(pos).await?;
+                truncate_or_fail(&storage, pos, "corrupt header (invalid bit pattern)").await?;
                 break;
             };
             let header: PrepareHeader = *header_ref;
@@ -162,19 +280,25 @@ impl PrepareJournal {
                 || (header.size as usize) < HEADER_SIZE
                 || u64::from(header.size) > MAX_ENTRY_SIZE
             {
-                // Corrupt or non-prepare entry, truncate here
-                storage.truncate(pos).await?;
+                truncate_or_fail(&storage, pos, "corrupt or non-prepare entry").await?;
                 break;
             }
 
             let entry_size = u64::from(header.size);
 
+            // TODO(hubcio): verify `header.checksum` / `header.checksum_body`
+            // against the entry body during scan and route a mismatch
+            // through `truncate_or_fail`. Blocked on the writer side: the
+            // `PrepareHeader` projection in consensus builds prepares with
+            // `..Default::default()` so the integrity fields are always 0.
+            // Until a producer computes them, verification here would be
+            // trivially-passing noise. Without it, a body bit-flip that
+            // leaves the header valid is replayed silently as corrupt
+            // state.
+
             // Check if the full entry fits
             if pos + entry_size > file_len {
-                // Truncated entry at tail
-                // This handles the case where crash happened during write and
-                // only header was written and body was not. so we truncate the file to the start of the entry.
-                storage.truncate(pos).await?;
+                truncate_or_fail(&storage, pos, "truncated entry at tail").await?;
                 break;
             }
 
@@ -196,7 +320,7 @@ impl PrepareJournal {
 
         // If there are leftover bytes less than a header, truncate them
         if pos < storage.file_len() {
-            storage.truncate(pos).await?;
+            truncate_or_fail(&storage, pos, "leftover bytes shorter than a header").await?;
         }
 
         Ok(Self {
@@ -205,6 +329,7 @@ impl PrepareJournal {
             offsets: RefCell::new(offsets),
             last_op: Cell::new(last_op),
             snapshot_op: Cell::new(snapshot_op),
+            poisoned: OnceCell::new(),
         })
     }
 
@@ -244,17 +369,63 @@ impl PrepareJournal {
         &self.storage
     }
 
+    /// Stage name at which the journal was poisoned, if any. `None`
+    /// means healthy. Returned as a `&'static str` so callers in
+    /// non-IO paths (diagnostics, `Debug`) can read it without an
+    /// `io::Error` clone.
+    pub fn poison_reason(&self) -> Option<&'static str> {
+        self.poisoned.get().map(|p| p.stage)
+    }
+
+    /// Build an `io::Error` representing the current poison state. The
+    /// caller is expected to have already established that the journal
+    /// is poisoned; the embedded `source.kind()` propagates the original
+    /// kernel error (`ENOSPC`, `EIO`, ...) so the operator sees more
+    /// than a generic poison marker.
+    fn poisoned_io_error(state: &PoisonState) -> io::Error {
+        io::Error::new(
+            state.source.kind(),
+            format!("journal poisoned at {}: {}", state.stage, state.source),
+        )
+    }
+
+    /// Record the first poison cause (subsequent calls are silently
+    /// ignored - the journal is already dead) and build the descriptive
+    /// `io::Error` callers return up the stack. Consumes `source` so the
+    /// original kernel error is preserved in the cell for forensics
+    /// rather than discarded after the immediate return.
+    fn poison(&self, stage: &'static str, source: io::Error) -> io::Error {
+        let kind = source.kind();
+        let msg = format!("journal poisoned at {stage}: {source}");
+        let _ = self.poisoned.set(PoisonState { stage, source });
+        io::Error::new(kind, msg)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_poison(&self, reason: &'static str) {
+        let _ = self.poisoned.set(PoisonState {
+            stage: reason,
+            source: io::Error::other(reason),
+        });
+    }
+
     /// Async entry read for recovery.
     ///
     /// Returns `Ok(None)` if the op is not in the index.
     ///
     /// # Errors
     /// Returns an I/O error if the read fails or the entry is malformed.
+    /// Returns an `io::ErrorKind::Other` error if the journal is
+    /// poisoned; the in-memory index and the on-disk layout disagree
+    /// and the stored offsets cannot be trusted.
     #[allow(clippy::future_not_send)]
     pub async fn entry_at(
         &self,
         header: &PrepareHeader,
     ) -> io::Result<Option<Message<PrepareHeader>>> {
+        if let Some(state) = self.poisoned.get() {
+            return Err(Self::poisoned_io_error(state));
+        }
         let (offset, size) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
@@ -329,13 +500,10 @@ impl Journal<FileStorage> for PrepareJournal {
     /// future appends treat drained slots as safe to overwrite. Rewrites
     /// the WAL file keeping only entries outside the drained range.
     async fn drain(&self, ops: RangeInclusive<u64>) -> io::Result<Vec<Self::Entry>> {
-        let end_op = *ops.end();
-
-        // Advance the snapshot watermark so future appends treat
-        // drained ops as safe to overwrite.
-        if end_op > self.snapshot_op.get() {
-            self.snapshot_op.set(end_op);
+        if let Some(state) = self.poisoned.get() {
+            return Err(Self::poisoned_io_error(state));
         }
+        let end_op = *ops.end();
 
         // Partition slots into drained and live entries.
         let mut to_drain: Vec<(PrepareHeader, u64)> = Vec::new();
@@ -372,6 +540,7 @@ impl Journal<FileStorage> for PrepareJournal {
         // Write live entries to a temp file.
         let wal_path = self.storage.path();
         let tmp_path = wal_path.with_extension("wal.tmp");
+        let tmp_guard = TmpFileGuard::new(tmp_path.clone());
         {
             let mut tmp = compio::fs::File::create(&tmp_path).await?;
             let mut write_pos: u64 = 0;
@@ -387,16 +556,55 @@ impl Journal<FileStorage> for PrepareJournal {
         }
 
         // Atomic replace.
+        //
+        // COMMIT POINT. From here on the on-disk WAL has been swapped
+        // and the in-memory index has not yet been rebuilt for the
+        // compacted layout. Every subsequent fallible step poisons the
+        // journal before returning so the next `append` cannot write at
+        // a stale `write_offset` into the orphaned old fd, and the next
+        // `entry`/`entry_at` cannot serve offsets from the pre-drain
+        // layout that no longer exist in the new file.
         compio::fs::rename(&tmp_path, wal_path).await?;
+        // Rename has consumed `tmp_path`; nothing left to unlink.
+        tmp_guard.defuse();
 
-        // Fsync parent directory to make the rename durable.
+        // Fsync parent directory to make the rename durable. Without
+        // this the rename can be lost across a power failure and the
+        // pre-drain WAL re-presents on recovery; with the journal
+        // poisoned the caller learns the drain is not durable instead
+        // of silently proceeding.
         if let Some(parent) = wal_path.parent() {
-            let dir = compio::fs::File::open(parent).await?;
-            dir.sync_all().await?;
+            let dir = match compio::fs::File::open(parent).await {
+                Ok(d) => d,
+                Err(e) => {
+                    return Err(self.poison("drain: open parent dir for fsync", e));
+                }
+            };
+            if let Err(e) = dir.sync_all().await {
+                return Err(self.poison("drain: parent dir fsync", e));
+            }
         }
 
-        // Reopen the file descriptor at the same path.
-        self.storage.reopen().await?;
+        // Reopen the file descriptor at the same path. A failure here
+        // leaves the old fd (now pointing at the orphaned pre-rename
+        // inode) live inside `FileStorage` with a stale `write_offset`;
+        // poisoning prevents a follow-up `append` from writing bytes
+        // into the orphan that disappear on the next process restart.
+        if let Err(e) = self.storage.reopen().await {
+            return Err(self.poison("drain: storage reopen after rename", e));
+        }
+
+        // Advance the snapshot watermark only AFTER the WAL rewrite is
+        // durable (tmp create -> write -> fsync -> rename -> fsync parent
+        // -> reopen). Advancing earlier would leave `snapshot_op` past
+        // entries still present on disk on any `?` failure above, letting
+        // a future `append()` pass the slot collision check at
+        // `existing.op <= snapshot_op` and silently evict a live entry
+        // from the index. The entry would survive on disk but become
+        // unreachable, stalling `RetransmitPrepares` until view change.
+        if end_op > self.snapshot_op.get() {
+            self.snapshot_op.set(end_op);
+        }
 
         // Rebuild offsets for the compacted layout and clear drained slots.
         let mut headers = self.headers.borrow_mut();
@@ -420,27 +628,59 @@ impl Journal<FileStorage> for PrepareJournal {
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
+        if let Some(state) = self.poisoned.get() {
+            return Err(Self::poisoned_io_error(state));
+        }
         let header = *entry.header();
-        let offset = self.storage.file_len();
-
-        self.storage.write_append(entry.as_slice().to_vec()).await?;
-        self.storage.fsync().await?;
-
         let slot = slot_for_op(header.op);
-        let mut headers = self.headers.borrow_mut();
-        let mut offsets = self.offsets.borrow_mut();
 
-        if let Some(existing) = &headers[slot] {
-            assert!(
-                existing.op <= self.snapshot_op.get(),
-                "journal slot collision: appending op {} would evict op {} \
-                 which has not been snapshotted (snapshot_op={})",
-                header.op,
-                existing.op,
-                self.snapshot_op.get(),
-            );
+        // Slot collision must be detected BEFORE `write_append + fsync`:
+        // a post-fsync panic would leave bytes durably on disk, and the
+        // recovery scan on the next boot would re-hit the same collision,
+        // turning a single shard fault into a cluster-wide bootloop.
+        {
+            let headers = self.headers.borrow();
+            if let Some(existing) = &headers[slot]
+                && existing.op > self.snapshot_op.get()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal slot collision: appending op {} would evict op {} \
+                         which has not been snapshotted (snapshot_op={})",
+                        header.op,
+                        existing.op,
+                        self.snapshot_op.get(),
+                    ),
+                ));
+            }
         }
 
+        let offset = self.storage.file_len();
+        // `truncate_or_fail` classifies any post-`pos` trailing region
+        // larger than `MAX_ENTRY_SIZE` as mid-file damage rather than a
+        // torn tail. That classification is only sound because this WAL
+        // appends exactly one entry per `append` + fsync. A
+        // batched-append regression that wrote more than one entry's
+        // worth of bytes per fsync would let a crash leave a torn tail
+        // many entries wide, and `truncate_or_fail` would silently
+        // discard committed entries. Pin the invariant here so any such
+        // regression trips in debug/test builds before reaching prod.
+        debug_assert!(
+            u64::from(header.size) <= MAX_ENTRY_SIZE,
+            "WAL invariant: append must write at most MAX_ENTRY_SIZE bytes; \
+             truncate_or_fail relies on this (got {} bytes)",
+            header.size
+        );
+        // Hand the message's owned aligned buffer straight to compio: avoids a
+        // per-append heap alloc + memcpy of up to MAX_ENTRY_SIZE bytes on the
+        // consensus replicate hot path. `Owned` already implements `IoBuf`, so
+        // `write_append` consumes it without copying.
+        self.storage.write_append(entry.into_owned()).await?;
+        self.storage.fsync().await?;
+
+        let mut headers = self.headers.borrow_mut();
+        let mut offsets = self.offsets.borrow_mut();
         headers[slot] = Some(header);
         offsets[slot] = Some(offset);
 
@@ -454,6 +694,9 @@ impl Journal<FileStorage> for PrepareJournal {
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
+        if self.poisoned.get().is_some() {
+            return None;
+        }
         let (size, offset) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
@@ -632,6 +875,78 @@ mod tests {
     }
 
     #[compio::test]
+    async fn truncate_or_fail_durably_repairs_torn_tail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        let good_len = {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal.append(make_prepare(1, 64)).await.unwrap();
+            journal.append(make_prepare(2, 64)).await.unwrap();
+            journal.storage.fsync().await.unwrap();
+            journal.storage.file_len()
+        };
+
+        // Simulate a writer crash mid-append: junk bytes past the last
+        // good entry, shorter than MAX_ENTRY_SIZE so it reads as a torn
+        // tail rather than mid-file corruption.
+        {
+            let storage = FileStorage::open(&path).await.unwrap();
+            storage.write_append(vec![0xAB_u8; 16]).await.unwrap();
+            storage.fsync().await.unwrap();
+        }
+
+        // The recovery repair path truncates back to the last good entry.
+        {
+            let storage = FileStorage::open(&path).await.unwrap();
+            truncate_or_fail(&storage, good_len, "torn tail test")
+                .await
+                .unwrap();
+        }
+
+        // The repair is durable: a fresh open sees the file ending
+        // exactly at the last good entry, with no torn tail to re-repair.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(journal.last_op(), Some(2));
+        assert!(journal.header(3).is_none());
+    }
+
+    #[compio::test]
+    async fn open_rejects_mid_file_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        // A corrupt header followed by more than MAX_ENTRY_SIZE of
+        // trailing bytes is mid-file damage, not a torn final append. A
+        // read-write open must hard-error instead of silently truncating
+        // and discarding every committed entry after the corruption.
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            // All-0xFF is not a valid `Command2`/`Operation` bit pattern,
+            // so `try_from_bytes` rejects the header.
+            file.write_all(&[0xFF_u8; HEADER_SIZE]).unwrap();
+            // Sparse-extend past MAX_ENTRY_SIZE so the corruption at pos 0
+            // sits far from EOF without writing 64 MiB.
+            file.set_len(MAX_ENTRY_SIZE + HEADER_SIZE as u64).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let err = PrepareJournal::open(&path, 0).await;
+        assert!(
+            err.is_err(),
+            "mid-file corruption must hard-error, not truncate"
+        );
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            size_before, size_after,
+            "a rejected mid-file scan must not truncate the WAL"
+        );
+    }
+
+    #[compio::test]
     async fn iter_headers_from() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
@@ -750,18 +1065,144 @@ mod tests {
     }
 
     #[compio::test]
-    #[should_panic(expected = "journal slot collision")]
-    async fn append_panics_on_evicting_unsnapshotted_entry() {
+    async fn append_errors_on_evicting_unsnapshotted_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         journal.append(make_prepare(3, 32)).await.unwrap();
-        // No snapshot taken, evicting op 3 must panic
+        let size_after_first = journal.storage.file_len();
+
+        // No snapshot taken: evicting op 3 must return an error WITHOUT
+        // persisting any bytes; a post-fsync panic would otherwise wedge
+        // recovery into a bootloop on the next open.
         let wraparound_op = 3 + SLOT_COUNT as u64;
-        journal
+        let err = journal
             .append(make_prepare(wraparound_op, 32))
             .await
-            .unwrap();
+            .expect_err("slot collision must surface as Err, not panic");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("journal slot collision"),
+            "unexpected error message: {err}"
+        );
+        assert_eq!(
+            journal.storage.file_len(),
+            size_after_first,
+            "failed append must not persist bytes"
+        );
+
+        // Reopen: prior op still recoverable, no collision residue.
+        drop(journal);
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(journal.last_op(), Some(3));
+    }
+
+    const POISON_REASON: &str = "test: simulated post-rename failure";
+
+    #[compio::test]
+    async fn poisoned_journal_rejects_append() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        let size_before = journal.storage.file_len();
+
+        journal.force_poison(POISON_REASON);
+        assert_eq!(journal.poison_reason(), Some(POISON_REASON));
+
+        let err = journal
+            .append(make_prepare(2, 32))
+            .await
+            .expect_err("poisoned journal must reject append");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains(POISON_REASON),
+            "missing poison reason: {err}"
+        );
+        assert_eq!(
+            journal.storage.file_len(),
+            size_before,
+            "rejected append must not touch storage"
+        );
+    }
+
+    #[compio::test]
+    async fn poisoned_journal_rejects_drain() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=3 {
+            journal.append(make_prepare(op, 32)).await.unwrap();
+        }
+        let size_before = journal.storage.file_len();
+
+        journal.force_poison(POISON_REASON);
+
+        let err = journal
+            .drain(1..=2)
+            .await
+            .expect_err("poisoned journal must reject drain");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains(POISON_REASON));
+        assert_eq!(
+            journal.storage.file_len(),
+            size_before,
+            "rejected drain must not rewrite WAL"
+        );
+    }
+
+    #[compio::test]
+    async fn poisoned_journal_returns_none_from_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        let msg = make_prepare(1, 32);
+        journal.append(msg.deep_copy()).await.unwrap();
+
+        journal.force_poison(POISON_REASON);
+
+        let h = *msg.header();
+        assert!(
+            journal.entry(&h).await.is_none(),
+            "poisoned journal must not serve cached on-disk reads"
+        );
+    }
+
+    #[compio::test]
+    async fn poisoned_journal_rejects_entry_at() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        let msg = make_prepare(1, 32);
+        journal.append(msg.deep_copy()).await.unwrap();
+
+        journal.force_poison(POISON_REASON);
+
+        let err = journal
+            .entry_at(msg.header())
+            .await
+            .expect_err("poisoned entry_at must err");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains(POISON_REASON));
+    }
+
+    #[compio::test]
+    async fn in_memory_accessors_still_work_when_poisoned() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(2, 32)).await.unwrap();
+
+        journal.force_poison(POISON_REASON);
+
+        // In-memory state remains the last-known-good snapshot. Useful
+        // for diagnostics/recovery; the IO paths are what would corrupt
+        // the WAL, not these lookups.
+        assert_eq!(journal.last_op(), Some(2));
+        assert!(journal.header(1).is_some());
+        assert!(journal.header(2).is_some());
+        assert_eq!(journal.iter_headers_from(1).len(), 2);
     }
 }

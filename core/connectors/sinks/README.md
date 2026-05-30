@@ -8,6 +8,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 
 | Sink | Description |
 | ---- | ----------- |
+| **doris_sink** | Loads JSON messages into Apache Doris tables via the Stream Load HTTP API |
 | **elasticsearch_sink** | Sends messages to Elasticsearch indices for full-text search and analytics |
 | **iceberg_sink** | Writes data to Apache Iceberg tables via REST catalog with S3/GCS/Azure storage |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
@@ -51,6 +52,7 @@ pub struct SinkConfig {
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
+    pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
 }
 ```
 
@@ -76,6 +78,7 @@ name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 plugin_config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
+benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
 
 # Collection of the streams from which messages are consumed
 [[streams]]

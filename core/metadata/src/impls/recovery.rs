@@ -19,9 +19,9 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use iggy_binary_protocol::consensus::PrepareHeader;
-use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
+use server_common::Message;
 use std::fmt;
 use std::path::Path;
 
@@ -98,6 +98,9 @@ pub struct RecoveredMetadata<M> {
 /// 4. Replay journal entries from the first post-snapshot op through the state machine
 /// 5. Return the assembled `RecoveredMetadata`
 ///
+/// Only the owning shard (shard 0) should call this. Peer shards receive
+/// a `ReadHandleFactory` bundle from shard 0 and skip WAL access entirely.
+///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
 #[allow(clippy::future_not_send)]
@@ -110,7 +113,6 @@ where
     let metadata_dir = data_dir.join(super::METADATA_DIR);
     std::fs::create_dir_all(&metadata_dir)?;
 
-    // 1. Load snapshot if present.
     let snapshot_path = metadata_dir.join("snapshot.bin");
     let snapshot = if snapshot_path.exists() {
         Some(IggySnapshot::load(&snapshot_path)?)
@@ -121,24 +123,17 @@ where
         .as_ref()
         .map_or(0, |snapshot| snapshot.sequence_number() + 1);
 
-    // 2. Restore state machine from snapshot, or start from a fresh empty state.
     let mux_stm = match snapshot.as_ref() {
         Some(snapshot) => M::restore_snapshot(snapshot.snapshot())?,
         None => M::default(),
     };
 
-    // 3. Open journal, scan the WAL and build index
     let journal_path = metadata_dir.join("journal.wal");
-    let journal = PrepareJournal::open(
-        &journal_path,
-        snapshot.as_ref().map_or(0, IggySnapshot::sequence_number),
-    )
-    .await?;
+    let watermark = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+    let journal = PrepareJournal::open(&journal_path, watermark).await?;
 
-    // 4. Replay journal entries after snapshot.
-    // Intentional fail-fast for now: if replay hits a bad entry, recovery
-    // aborts and the operator must repair or truncate the WAL before the
-    // node can boot again.
+    // Intentional fail-fast: a bad entry aborts recovery and the operator
+    // must repair or truncate the WAL before the node can boot again.
     let headers_to_replay = journal.iter_headers_from(replay_from);
 
     let mut last_applied_op: Option<u64> = None;
@@ -169,9 +164,9 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::consensus::iobuf::Owned;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
+    use server_common::iobuf::Owned;
     use tempfile::tempdir;
 
     use crate::MuxStateMachine;

@@ -20,10 +20,10 @@ use crate::metadata::TopicMeta;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ResolvedStream, ResolvedTopic};
 use crate::streaming::topics::storage::{create_topic_file_hierarchy, delete_topic_directory};
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
 };
+use server_common::sharding::IggyNamespace;
 use std::sync::Arc;
 
 /// Info returned when a topic is deleted - contains what callers need for logging/events.
