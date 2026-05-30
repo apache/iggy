@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn float_fractional_rejected_for_signed_integer() {
         let mut buf = vec![];
-        assert!(serialize_value(&json_f64(3.14), &ChType::Int32, &mut buf).is_err());
+        assert!(serialize_value(&json_f64(3.15), &ChType::Int32, &mut buf).is_err());
     }
 
     #[test]
@@ -1363,7 +1363,7 @@ mod tests {
         let v = 9_007_199_254_740_993i64;
         let mut buf = vec![];
         serialize_value(&json_i64(v), &ChType::Decimal(18, 0), &mut buf).unwrap();
-        assert_eq!(buf, i64::try_from(v).unwrap().to_le_bytes());
+        assert_eq!(buf, v.to_le_bytes());
     }
 
     #[test]

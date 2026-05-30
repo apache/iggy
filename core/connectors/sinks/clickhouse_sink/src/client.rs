@@ -322,6 +322,23 @@ fn escape_backtick(s: &str) -> String {
     s.replace('`', "``")
 }
 
+fn urlencoded(s: &str) -> String {
+    // Minimal percent-encoding for the database name query parameter.
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
+            other => {
+                let mut buf = [0u8; 4];
+                for byte in other.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{byte:02X}"));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,21 +386,4 @@ mod tests {
         assert_eq!(result, "innocent\\");
         assert!(!result.contains("\\`"));
     }
-}
-
-fn urlencoded(s: &str) -> String {
-    // Minimal percent-encoding for the database name query parameter.
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
-            other => {
-                let mut buf = [0u8; 4];
-                for byte in other.encode_utf8(&mut buf).bytes() {
-                    out.push_str(&format!("%{byte:02X}"));
-                }
-            }
-        }
-    }
-    out
 }
