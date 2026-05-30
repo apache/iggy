@@ -131,13 +131,46 @@ write_hawkeye_report() {
   rm -f "$missing_file" "$unknown_file"
 }
 
+find_duplicate_license_headers() {
+  local output_file="$1"
+  local path
+
+  : > "$output_file"
+
+  while IFS= read -r -d '' path; do
+    if ! LC_ALL=C grep -Iq . "$path"; then
+      continue
+    fi
+
+    if awk '
+      NR > 120 { exit }
+      /^[[:space:]]*$/ { next }
+      NR == 1 && /^#!/ { next }
+      NR == 1 && /^<\?(php|xml)/ { next }
+      /^[[:space:]]*(#|\/\/|\/\*|\*|<!--|-->)/ {
+        if (index($0, "Licensed to the Apache Software Foundation")) {
+          count++
+        }
+        next
+      }
+      { exit }
+      END { exit count > 1 ? 0 : 1 }
+    ' "$path"; then
+      printf './%s\n' "$path" >> "$output_file"
+    fi
+  done < <(git ls-files -z)
+
+  sort -o "$output_file" "$output_file"
+}
+
 if [ "$MODE" = "fix" ]; then
   echo "🔧 Adding license headers to files..."
   TEMP_FILE=$(mktemp)
   MISSING_FILE=$(mktemp)
   UNKNOWN_FILE=$(mktemp)
+  DUPLICATE_FILE=$(mktemp)
   LOG_FILE=$(mktemp)
-  trap 'rm -f "$TEMP_FILE" "$MISSING_FILE" "$UNKNOWN_FILE" "$LOG_FILE"' EXIT
+  trap 'rm -f "$TEMP_FILE" "$MISSING_FILE" "$UNKNOWN_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
 
   run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || true
   extract_hawkeye_paths missing "$TEMP_FILE" > "$MISSING_FILE"
@@ -151,9 +184,18 @@ if [ "$MODE" = "fix" ]; then
   fi
 
   run_hawkeye format --config licenserc.toml --fail-if-updated false --fail-if-unknown
+  find_duplicate_license_headers "$DUPLICATE_FILE"
 
   if [ -s "$MISSING_FILE" ]; then
     append_hawkeye_section "Updated license headers" "$MISSING_FILE"
+  fi
+
+  if [ -s "$DUPLICATE_FILE" ]; then
+    echo "❌ Found duplicate license headers after fixing:"
+    echo ""
+    append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE"
+    echo "💡 Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+    exit 1
   fi
 
   if [ ! -s "$MISSING_FILE" ] && [ ! -s "$UNKNOWN_FILE" ]; then
@@ -166,10 +208,15 @@ else
 
   TEMP_FILE=$(mktemp)
   REPORT_FILE=$(mktemp)
+  DUPLICATE_FILE=$(mktemp)
   LOG_FILE=$(mktemp)
-  trap 'rm -f "$TEMP_FILE" "$REPORT_FILE" "$LOG_FILE"' EXIT
+  trap 'rm -f "$TEMP_FILE" "$REPORT_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
 
-  if run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1; then
+  HAWKEYE_STATUS=0
+  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || HAWKEYE_STATUS=$?
+  find_duplicate_license_headers "$DUPLICATE_FILE"
+
+  if [ "$HAWKEYE_STATUS" -eq 0 ] && [ ! -s "$DUPLICATE_FILE" ]; then
     echo "✅ All files have proper license headers"
   else
     write_hawkeye_report "$TEMP_FILE" "$REPORT_FILE"
@@ -178,7 +225,12 @@ else
     echo ""
     if [ -s "$REPORT_FILE" ]; then
       sed 's/^/  /' < "$REPORT_FILE"
-    else
+    fi
+    if [ -s "$DUPLICATE_FILE" ]; then
+      append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE" | sed 's/^/  /'
+      echo "  💡 Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+    fi
+    if [ ! -s "$REPORT_FILE" ] && [ ! -s "$DUPLICATE_FILE" ]; then
       sed 's/^/  /' < "$LOG_FILE"
     fi
     echo ""
@@ -192,7 +244,12 @@ else
         echo '```'
         if [ -s "$REPORT_FILE" ]; then
           cat "$REPORT_FILE"
-        else
+        fi
+        if [ -s "$DUPLICATE_FILE" ]; then
+          append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE"
+          echo "Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+        fi
+        if [ ! -s "$REPORT_FILE" ] && [ ! -s "$DUPLICATE_FILE" ]; then
           cat "$LOG_FILE"
         fi
         echo '```'

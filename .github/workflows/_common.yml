@@ -81,7 +81,7 @@ jobs:
         with:
           mode: --version
 
-      - name: Check Apache license headers
+      - name: Check license headers
         run: ./scripts/ci/license-headers.sh --check
 
   third-party-licenses:
