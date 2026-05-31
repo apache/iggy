@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -39,7 +40,7 @@ type Option func(config *Options)
 
 type Options struct {
 	config config
-	logger iggcon.Logger
+	logger *slog.Logger
 }
 
 func GetDefaultOptions() Options {
@@ -52,7 +53,7 @@ type IggyTcpClient struct {
 	conn                   net.Conn
 	mtx                    sync.Mutex
 	config                 config
-	logger                 iggcon.Logger
+	logger                 *slog.Logger
 	MessageCompression     iggcon.IggyMessageCompression
 	leaderRedirectionState iggcon.LeaderRedirectionState
 	clientAddress          string
@@ -159,7 +160,7 @@ func WithServerAddress(address string) Option {
 }
 
 // WithLogger sets the logger for the TCP client.
-func WithLogger(logger iggcon.Logger) Option {
+func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
 		opts.logger = logger
 	}
@@ -214,7 +215,7 @@ func NewIggyTcpClient(options ...Option) *IggyTcpClient {
 
 	logger := opts.logger
 	if logger == nil {
-		logger = iggcon.NewNoopLogger()
+		logger = iggcon.NopLogger()
 	}
 
 	return &IggyTcpClient{
