@@ -39,6 +39,7 @@ type Option func(config *Options)
 
 type Options struct {
 	config config
+	logger iggcon.Logger
 }
 
 func GetDefaultOptions() Options {
@@ -72,8 +73,6 @@ type config struct {
 	reconnection tcpClientReconnectionConfig
 	// noDelay disable Nagle's algorithm for the TCP connection
 	noDelay bool
-	// logger is the logger used for internal diagnostics
-	logger iggcon.Logger
 }
 
 func defaultTcpClientConfig() config {
@@ -162,7 +161,7 @@ func WithServerAddress(address string) Option {
 // WithLogger sets the logger for the TCP client.
 func WithLogger(logger iggcon.Logger) Option {
 	return func(opts *Options) {
-		opts.config.logger = logger
+		opts.logger = logger
 	}
 }
 
@@ -213,7 +212,7 @@ func NewIggyTcpClient(options ...Option) *IggyTcpClient {
 		}
 	}
 
-	logger := opts.config.logger
+	logger := opts.logger
 	if logger == nil {
 		logger = iggcon.NewNoopLogger()
 	}
