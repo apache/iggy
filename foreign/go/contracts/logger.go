@@ -17,19 +17,23 @@
 
 package iggcon
 
-type LogLevel int
-
-const (
-	LogLevelDebug LogLevel = iota
-	LogLevelInfo
-	LogLevelWarn
-	LogLevelError
-	LogLevelSilent
+import (
+	"io"
+	"log/slog"
+	"os"
 )
 
-type Logger interface {
-	Debug(msg string, args ...any)
-	Info(msg string, args ...any)
-	Warn(msg string, args ...any)
-	Error(msg string, args ...any)
+func NewLogger(level slog.Level, writer io.Writer) *slog.Logger {
+	handler := slog.NewTextHandler(writer, &slog.HandlerOptions{
+		Level: level,
+	})
+	return slog.New(handler)
+}
+
+func NewStderrLogger(level slog.Level) *slog.Logger {
+	return NewLogger(level, os.Stderr)
+}
+
+func NopLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
