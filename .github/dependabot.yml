@@ -171,6 +171,10 @@ updates:
       - "csharp"
     cooldown:
       default-days: 7
+    ignore:
+      - dependency-name: "System.IO.Hashing"
+      - dependency-name: "Microsoft.SourceLink.GitHub"
+      - dependency-name: "Microsoft.Extensions.Logging.Abstractions"
     groups:
       minor-and-patch:
         patterns:
