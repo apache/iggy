@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
@@ -27,7 +28,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tracing::info;
 
-const INFLUXDB_IMAGE: &str = "influxdb";
+const INFLUXDB_IMAGE: &str = "docker.io/library/influxdb";
 const INFLUXDB_TAG: &str = "2.7-alpine";
 const INFLUXDB_PORT: u16 = 8086;
 
@@ -117,6 +118,7 @@ impl InfluxDbContainer {
                 .with_env_var("DOCKER_INFLUXDB_INIT_ORG", INFLUXDB_ORG)
                 .with_env_var("DOCKER_INFLUXDB_INIT_BUCKET", INFLUXDB_BUCKET)
                 .with_env_var("DOCKER_INFLUXDB_INIT_ADMIN_TOKEN", INFLUXDB_TOKEN)
+                .with_container_name(fixtures::unique_container_name("influxdb"))
                 .start()
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {

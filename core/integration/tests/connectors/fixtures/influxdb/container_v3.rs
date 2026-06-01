@@ -26,6 +26,7 @@
 //! - Query: `POST /api/v3/query_sql` with `{"db":…,"q":…,"format":"jsonl"}`
 //! - Auth: `Authorization: Bearer {token}`
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
@@ -115,6 +116,7 @@ impl InfluxDb3Container {
                     "memory",
                     "--without-auth",
                 ])
+                .with_container_name(fixtures::unique_container_name("influxdb3"))
                 .start()
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {
