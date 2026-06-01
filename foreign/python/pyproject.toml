@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.8.1.dev1"
+version = "0.8.1.dev2"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -96,12 +96,6 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S101", "B017"]
 
-[tool.mypy]
-
-[[tool.mypy.overrides]]
-module = ["testcontainers", "testcontainers.*"]
-ignore_missing_imports = true
-
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
@@ -118,21 +112,21 @@ testing-docker = ["testcontainers>=3.7.0,<5.0"]
 # Development tools
 dev = [
     "maturin>=1.2,<2.0",
+    "pyrefly>=1.0.0",
     "ruff>=0.1.0,<1.0",
-    "mypy>=1.5.0,<2.0",
 ]
 
 # All dependencies for full development setup
 all = [
+    "maturin>=1.2,<2.0",
+    "pyrefly>=1.0.0",
     "pytest>=9.0.3,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
-    "testcontainers>=3.7.0,<5.0",
-    "maturin>=1.2,<2.0",
     "ruff>=0.1.0,<1.0",
-    "mypy>=1.5.0,<2.0",
+    "testcontainers>=3.7.0,<5.0",
 ]
 
 [tool.pytest.ini_options]
@@ -150,4 +144,13 @@ markers = [
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[tool.pyrefly]
+search-path = ["."]
+project-includes = [
+    "**/*.py*",
 ]

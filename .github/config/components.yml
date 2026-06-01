@@ -218,6 +218,15 @@ components:
       - "foreign/python/**"
     tasks: ["lint", "test", "build"]
 
+  sdk-php:
+    depends_on:
+      - "rust-sdk" # PHP SDK wraps the Rust SDK
+      - "rust-server" # For integration tests
+      - "ci-infrastructure" # CI changes trigger full regression
+    paths:
+      - "foreign/php/**"
+    tasks: ["lint", "test", "build"]
+
   sdk-node:
     depends_on:
       - "rust-sdk" # Node SDK depends on core SDK
@@ -392,6 +401,18 @@ components:
       - "scripts/run-examples-from-readme.sh"
       - "scripts/utils.sh"
     tasks: ["examples-python"]
+
+  examples-php:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-php"
+      - "ci-infrastructure"
+    paths:
+      - "examples/php/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-php"]
 
   examples-node:
     depends_on:

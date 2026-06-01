@@ -23,14 +23,19 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "apache-iggy",
+    "pyrefly>=1.0.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24.0",
     "pytest-bdd>=6.0.0",
     "pytest-cov>=4.0.0",
+    "ruff>=0.15.13",
 ]
 
 [tool.uv.sources]
 apache-iggy = { path = "../../foreign/python" }
+
+[tool.uv]
+exclude-newer = "7 days"
 
 [tool.ruff.lint]
 select = [
@@ -49,3 +54,8 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S101"]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+]

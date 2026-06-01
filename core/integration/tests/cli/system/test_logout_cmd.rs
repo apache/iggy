@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase};
+use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase, ensure_keyring_store};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
@@ -30,6 +30,7 @@ pub(super) struct TestLogoutCmd {
 
 impl TestLogoutCmd {
     pub(super) fn new(server_address: String) -> Self {
+        ensure_keyring_store();
         Self { server_address }
     }
 }
