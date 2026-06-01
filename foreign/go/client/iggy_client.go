@@ -48,6 +48,8 @@ func GetDefaultOptions() Options {
 type Option func(*Options)
 
 // WithTcp sets the client protocol to TCP and applies custom TCP options.
+// tcp.WithLogger here only affects the transport; use WithLogger for
+// the client-level heartbeat.
 func WithTcp(tcpOpts ...tcp.Option) Option {
 	return func(opts *Options) {
 		opts.protocol = iggcon.Tcp
@@ -56,6 +58,8 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 }
 
 // WithLogger sets the logger for the Iggy client and its underlying transport.
+// This logger is used by the heartbeat and forwarded to the transport as a
+// default. A tcp.WithLogger passed via WithTcp overrides only the transport.
 // When no logger is provided, all internal log output is silently discarded.
 func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
@@ -87,7 +91,9 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 		logger = iggcon.NopLogger()
 	}
 
-	// Prepend the logger option so transport inherits it.
+	// Prepend the logger so the transport inherits it as a default.
+	// A tcp.WithLogger in opts.tcpOptions will override the transport's
+	// copy; the heartbeat keeps using logger above.
 	tcpOpts := append([]tcp.Option{tcp.WithLogger(logger)}, opts.tcpOptions...)
 
 	var cli iggcon.Client
@@ -129,7 +135,7 @@ func (ic *IggyClient) Connect(ctx context.Context) error {
 				case <-ticker.C:
 					pingCtx, pingCancel := context.WithTimeout(lifetimeCtx, ic.heartbeatInterval/2)
 					if err := ic.Ping(pingCtx); err != nil {
-						ic.logger.Warn("heartbeat failed", "err", err)
+						ic.logger.Warn("heartbeat failed", "error", err)
 					}
 					pingCancel()
 				}
