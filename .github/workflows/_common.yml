@@ -76,16 +76,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Setup Go
-        uses: ./.github/actions/utils/setup-go-with-cache
+      - name: Install HawkEye
+        uses: korandoru/hawkeye@v6.5.1
         with:
-          go-version: "1.23"
-          download-deps: "false"
+          mode: --version
 
-      - name: Install addlicense
-        run: go install github.com/google/addlicense@4529cd558fa0bf07ab0f2650e36d089fb1c07c89
-
-      - name: Check Apache license headers
+      - name: Check license headers
         run: ./scripts/ci/license-headers.sh --check
 
   third-party-licenses:
