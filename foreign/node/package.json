@@ -54,7 +54,7 @@
     "uuidv7": "1.2.1"
   },
   "devDependencies": {
-    "@commitlint/cli": "20.1.0",
+    "@commitlint/cli": "21.0.1",
     "@commitlint/config-conventional": "20.0.0",
     "@cucumber/cucumber": "12.9.0",
     "@swc-node/register": "1.11.1",
