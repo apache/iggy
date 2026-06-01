@@ -7,7 +7,8 @@ This directory contains cross-SDK Behavior-Driven Development (BDD) tests for Ap
 ```bash
 bdd/
 ├── scenarios/                  # Shared Gherkin feature files
-│   └── basic_messaging.feature
+│   ├── basic_messaging.feature
+│   └── leader_redirection.feature
 ├── rust/                       # Rust SDK BDD implementation
 │   ├── Dockerfile              # Rust BDD test container
 │   ├── tests/
@@ -25,7 +26,10 @@ bdd/
 │   ├── Dockerfile              # Java BDD test container
 │   ├── src/test/
 │   └── build.gradle.kts
-├── docker-compose.yml          # Orchestrates server + SDK containers
+├── docker-compose.yml          # Base: SDK test clients (always included)
+├── docker-compose.server.yml   # Single iggy-server for basic_messaging
+├── docker-compose.cluster.yml  # Leader + follower for leader_redirection
+├── docker-compose.coverage.yml # Coverage collection overlay
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
 ```
@@ -35,16 +39,22 @@ bdd/
 ### Quick Start
 
 ```bash
-# Run all SDK tests
+# Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
+#   sdk:     rust | python | go | node | csharp | java | all | clean  (default: all)
+#   feature: basic_messaging | leader_redirection | all  (default: all)
+
+# Run all features for all SDKs
 ../scripts/run-bdd-tests.sh all
 
-# Run specific SDK tests
+# Run specific SDK tests (all features)
 ../scripts/run-bdd-tests.sh rust
 ../scripts/run-bdd-tests.sh python
-../scripts/run-bdd-tests.sh go
-../scripts/run-bdd-tests.sh node
-../scripts/run-bdd-tests.sh csharp
-../scripts/run-bdd-tests.sh java
+
+# Run only basic_messaging
+../scripts/run-bdd-tests.sh rust basic_messaging
+
+# Run only leader_redirection
+../scripts/run-bdd-tests.sh all leader_redirection
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean

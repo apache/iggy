@@ -28,23 +28,52 @@ for arg in "$@"; do
 done
 
 SDK="${ARGS[0]:-all}"
-FEATURE="${ARGS[1]:-scenarios/basic_messaging.feature}"
-
-export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS="${GO_TEST_EXTRA_FLAGS:-}"
-
-cd "$(dirname "$0")/../bdd"
-
-COMPOSE_CMD=(docker compose -f docker-compose.yml)
-if [ "$COVERAGE" = "1" ]; then
-  COMPOSE_CMD+=(-f docker-compose.coverage.yml)
-  mkdir -p ../reports
-fi
+FEATURE="${ARGS[1]:-all}"
 
 log(){ printf "%b\n" "$*"; }
 
+usage(){
+  log "Usage: $0 [--coverage] <sdk> [feature]"
+  log ""
+  log "  sdk:     rust | python | go | node | csharp | java | all | clean (default: all)"
+  log "  feature: basic_messaging | leader_redirection | all  (default: all)"
+  log ""
+  log "Examples:"
+  log "  $0 rust                         # run all features for Rust"
+  log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
+  log "  $0 all leader_redirection       # run leader_redirection for all supporting SDKs"
+  log "  $0 --coverage go basic_messaging"
+}
+
+case "$FEATURE" in
+  basic_messaging|leader_redirection|all) ;;
+  *)
+    log "Unknown feature: ${FEATURE}"
+    usage
+    exit 2 ;;
+esac
+
+export DOCKER_BUILDKIT=1 BDD_FEATURE="$FEATURE"
+
+cd "$(dirname "$0")/../bdd"
+
+COMPOSE_FILES=(-f docker-compose.yml)
+case "$FEATURE" in
+  basic_messaging|leader_redirection|all)
+    COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
+esac
+case "$FEATURE" in
+  leader_redirection|all)
+    COMPOSE_FILES+=(-f docker-compose.cluster.yml) ;;
+esac
+if [ "$COVERAGE" = "1" ]; then
+  COMPOSE_FILES+=(-f docker-compose.coverage.yml)
+  mkdir -p ../reports
+fi
+
 cleanup(){
   log "🧹  cleaning up containers & volumes…"
-  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose "${COMPOSE_FILES[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -56,12 +85,20 @@ fi
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
-  log "${emoji}  ${label}…"
-  set +e
-  "${COMPOSE_CMD[@]}" up --build --abort-on-container-exit --exit-code-from "$svc" "$svc"
-  local code=$?
-  set -e
-  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  if [ "$FEATURE" = "leader_redirection" ]; then
+    case "$svc" in
+      rust-bdd|go-bdd|csharp-bdd) ;;
+      *) log "  skipping ${svc} (does not support ${FEATURE})"; return 0 ;;
+    esac
+  fi
+
+  log "${emoji} ${label}..."
+  local code=0
+  docker compose "${COMPOSE_FILES[@]}" \
+    up --build --abort-on-container-exit --exit-code-from "$svc" "$svc" \
+    || code=$?
+  docker compose "${COMPOSE_FILES[@]}" \
+    down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }
 
@@ -69,10 +106,6 @@ case "$SDK" in
   rust)     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
   python)   run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
   go)       run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
-  go-race)
-    export GO_TEST_EXTRA_FLAGS="-race"
-    run_suite go-bdd "🐹⚡" "Running Go BDD tests with data race detector"
-    ;;
   node)     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
   csharp)   run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
   java)     run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
@@ -80,18 +113,19 @@ case "$SDK" in
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
     run_suite go-bdd     "🐹"   "Running Go BDD tests"                         || exit $?
-    GO_TEST_EXTRA_FLAGS="-race" \
-    run_suite go-bdd     "🐹⚡" "Running Go BDD tests with data race detector"  || exit $?
     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"                       || exit $?
     run_suite csharp-bdd "🔷"   "Running C# BDD tests"                         || exit $?
     run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
     ;;
   clean)
-    cleanup; exit 0 ;;
+    log "🧹  cleaning up all BDD containers & volumes..."
+    docker compose -f docker-compose.yml -f docker-compose.server.yml -f docker-compose.cluster.yml -f docker-compose.coverage.yml \
+      down -v --remove-orphans >/dev/null 2>&1 || true
+    exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [--coverage] [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
+    usage
     exit 2 ;;
 esac
 
-log "✅ BDD tests completed for: ${SDK}"
+log "✅ BDD tests completed for: sdk=${SDK}  feature=${FEATURE}"

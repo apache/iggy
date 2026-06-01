@@ -1,0 +1,165 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Iggy leader + follower cluster test setup.
+# Activated by: ./scripts/run-bdd-tests.sh <sdk> leader_redirection
+#               ./scripts/run-bdd-tests.sh <sdk> all
+
+services:
+  iggy-leader:
+    image: iggy-bdd-server
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: core/server/Dockerfile
+      target: runtime-prebuilt
+      args:
+        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
+        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+        LIBC: glibc
+        PROFILE: debug
+    command: [ "--fresh", "--with-default-root-credentials", "--replica-id", "0" ]
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8091", "ping" ]
+      interval: 20s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    environment:
+      - RUST_LOG=info
+      - IGGY_SYSTEM_PATH=local_data_leader
+      - IGGY_TCP_ADDRESS=0.0.0.0:8091
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3001
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8081
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8071
+      - IGGY_CLUSTER_ENABLED=true
+      - IGGY_CLUSTER_NAME=test-cluster
+      - IGGY_CLUSTER_NODES_0_NAME=leader-node
+      - IGGY_CLUSTER_NODES_0_IP=iggy-leader
+      - IGGY_CLUSTER_NODES_0_REPLICA_ID=0
+      - IGGY_CLUSTER_NODES_0_PORTS_TCP=8091
+      - IGGY_CLUSTER_NODES_0_PORTS_QUIC=8081
+      - IGGY_CLUSTER_NODES_0_PORTS_HTTP=3001
+      - IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET=8071
+      - IGGY_CLUSTER_NODES_1_NAME=follower-node
+      - IGGY_CLUSTER_NODES_1_IP=iggy-follower
+      - IGGY_CLUSTER_NODES_1_REPLICA_ID=1
+      - IGGY_CLUSTER_NODES_1_PORTS_TCP=8092
+      - IGGY_CLUSTER_NODES_1_PORTS_QUIC=8082
+      - IGGY_CLUSTER_NODES_1_PORTS_HTTP=3002
+      - IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET=8072
+    volumes:
+      - iggy_leader_data:/app/local_data_leader
+    networks:
+      - iggy-bdd-network
+
+  iggy-follower:
+    image: iggy-bdd-server
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: core/server/Dockerfile
+      target: runtime-prebuilt
+      args:
+        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
+        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+        LIBC: glibc
+        PROFILE: debug
+    command: [ "--fresh", "--with-default-root-credentials", "--follower", "--replica-id", "1" ]
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8092", "ping" ]
+      interval: 20s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    environment:
+      - RUST_LOG=info
+      - IGGY_SYSTEM_PATH=local_data_follower
+      - IGGY_TCP_ADDRESS=0.0.0.0:8092
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3002
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8082
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8072
+      - IGGY_CLUSTER_ENABLED=true
+      - IGGY_CLUSTER_NAME=test-cluster
+      - IGGY_CLUSTER_NODES_0_NAME=leader-node
+      - IGGY_CLUSTER_NODES_0_IP=iggy-leader
+      - IGGY_CLUSTER_NODES_0_REPLICA_ID=0
+      - IGGY_CLUSTER_NODES_0_PORTS_TCP=8091
+      - IGGY_CLUSTER_NODES_0_PORTS_QUIC=8081
+      - IGGY_CLUSTER_NODES_0_PORTS_HTTP=3001
+      - IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET=8071
+      - IGGY_CLUSTER_NODES_1_NAME=follower-node
+      - IGGY_CLUSTER_NODES_1_IP=iggy-follower
+      - IGGY_CLUSTER_NODES_1_REPLICA_ID=1
+      - IGGY_CLUSTER_NODES_1_PORTS_TCP=8092
+      - IGGY_CLUSTER_NODES_1_PORTS_QUIC=8082
+      - IGGY_CLUSTER_NODES_1_PORTS_HTTP=3002
+      - IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET=8072
+    volumes:
+      - iggy_follower_data:/app/local_data_follower
+    networks:
+      - iggy-bdd-network
+
+  rust-bdd:
+    depends_on:
+      iggy-leader:
+        condition: service_healthy
+      iggy-follower:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
+      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
+
+  go-bdd:
+    depends_on:
+      iggy-leader:
+        condition: service_healthy
+      iggy-follower:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
+      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
+
+  csharp-bdd:
+    depends_on:
+      iggy-leader:
+        condition: service_healthy
+      iggy-follower:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
+      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
+
+volumes:
+  iggy_leader_data:
+  iggy_follower_data:
