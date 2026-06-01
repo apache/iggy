@@ -27,7 +27,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.apache.iggy:iggy:local-dev")
+    implementation("org.apache.iggy:iggy:0.8.0")
     implementation("org.slf4j:slf4j-simple:2.0.13")
     implementation("tools.jackson.core:jackson-databind:3.0.3")
 }
