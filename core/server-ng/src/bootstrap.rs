@@ -32,8 +32,8 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -50,6 +50,8 @@ use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::{
     GetUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
 };
+use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
+use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
@@ -2361,7 +2363,7 @@ async fn handle_client_request(
             );
             return;
         }
-        handle_non_replicated_request(shard, transport_client_id, request).await;
+        handle_non_replicated_request(shard, sessions, transport_client_id, request).await;
         return;
     }
 
@@ -2499,6 +2501,7 @@ async fn handle_client_request(
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) {
@@ -2523,6 +2526,27 @@ async fn handle_non_replicated_request(
                     error = %error,
                     "failed to send non-replicated ping reply"
                 );
+            }
+        }
+        GET_ME_CODE => {
+            // `get_me` reports the requesting connection's own identity,
+            // which lives in the session manager + transport meta (not in
+            // `IggyMetadata`), so it is built here rather than in
+            // `build_non_replicated_response`.
+            let response = build_get_me_response(shard, sessions, transport_client_id);
+            let commit = current_metadata_commit(shard);
+            let reply = NonReplicatedResponse::Bytes(response.to_bytes()).into_reply(
+                request.header(),
+                request.header().client,
+                request.header().session,
+                commit,
+            );
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(transport_client_id, error = %error, "failed to send get_me reply");
             }
         }
         _ => match build_non_replicated_response(shard, code, request_body(&request)) {
@@ -2556,6 +2580,68 @@ async fn handle_non_replicated_request(
                 );
             }
         },
+    }
+}
+
+/// Build the `get_me` reply for the requesting connection from its
+/// session (user id) and transport meta (transport kind + peer address).
+/// `consumer_groups` is empty: server-ng does not yet track per-client
+/// consumer-group membership.
+///
+/// TODO(clients-table): the transport kind + peer address are read from
+/// the message-bus `client_meta` here, which couples this metadata read
+/// to the bus's connection bookkeeping. The client identity (id, user,
+/// transport, address, consumer-group membership) should instead live in
+/// a first-class clients table in `IggyMetadata`, populated at Register
+/// time, so `get_me` / `get_client` / `get_clients` all read from one
+/// authoritative source via `frontend()` rather than reaching into the
+/// bus. Rework this API once that table exists.
+fn build_get_me_response(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) -> ClientDetailsResponse {
+    // `get_me` is auth-gated, so a bound session's user id is normally
+    // present. Fall back to the wire "no user" sentinel (`u32::MAX`)
+    // rather than `0`, which is a valid id (server-ng is 0-based, so
+    // root is user id 0) and would otherwise impersonate root.
+    let user_id = sessions
+        .borrow()
+        .get_user_id(transport_client_id)
+        .unwrap_or(u32::MAX);
+    let (transport, address) = shard.bus.client_meta(transport_client_id).map_or_else(
+        || (1u8, String::new()),
+        |meta| {
+            (
+                transport_kind_to_wire(meta.transport),
+                meta.peer_addr.to_string(),
+            )
+        },
+    );
+    ClientDetailsResponse {
+        client: ClientResponse {
+            // The transport client id is a u128 `(shard << 112) | seq`; the
+            // legacy wire `client_id` is the u32 seq tail.
+            #[allow(clippy::cast_possible_truncation)]
+            client_id: transport_client_id as u32,
+            user_id,
+            transport,
+            address,
+            consumer_groups_count: 0,
+        },
+        consumer_groups: Vec::new(),
+    }
+}
+
+/// Map the transport kind to the legacy wire discriminant
+/// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
+/// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
+/// (TCP, TCP-TLS, or a future) variant falls back to TCP.
+const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
+    match kind {
+        ClientTransportKind::Quic => 2,
+        ClientTransportKind::Ws | ClientTransportKind::Wss => 4,
+        _ => 1,
     }
 }
 
