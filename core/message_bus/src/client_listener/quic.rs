@@ -166,8 +166,8 @@ pub async fn run(
                                 return;
                             };
                             debug!(%peer_addr, "QUIC client accepted, handing to installer");
-                            let (connection, streams) = conn.into_parts();
-                            on_accepted(AcceptedQuicConn::new(connection, streams));
+                            let connection = conn.into_inner();
+                            on_accepted(AcceptedQuicConn::new(connection));
                         });
                         handshake_handles.push(handle);
                     }
