@@ -226,6 +226,7 @@ jobs:
               'Slash commands (own line, regular comment) move it around the queue:',
               '',
               '- `/ready` - back to `S-waiting-on-review` after addressing feedback',
+              '- `/author` - flip to `S-waiting-on-author` while you finish changes',
               '- `/request-review @user-or-team` - request a reviewer',
               '',
               'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#pr-triage-commands) for details.',
