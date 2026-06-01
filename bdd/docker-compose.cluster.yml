@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Iggy leader + follower cluster for leader_redirection tests.
+# Iggy leader + follower cluster test setup.
 # Activated by: ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
 

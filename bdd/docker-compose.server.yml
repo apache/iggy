@@ -15,8 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Single Iggy server for basic_messaging tests.
+# Single Iggy server test setup.
 # Activated by: ./scripts/run-bdd-tests.sh <sdk> basic_messaging
+#               ./scripts/run-bdd-tests.sh <sdk> leader_redirection
 #               ./scripts/run-bdd-tests.sh <sdk> all
 
 services:
