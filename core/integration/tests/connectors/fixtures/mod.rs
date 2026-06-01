@@ -42,7 +42,7 @@ pub use influxdb::{
     InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture, InfluxDbSourceFixture,
     InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
-pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture};
+pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, MeilisearchSourceFixture};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,

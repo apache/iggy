@@ -18,3 +18,4 @@
  */
 
 mod meilisearch_sink;
+mod meilisearch_source;

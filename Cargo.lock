@@ -6719,6 +6719,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_meilisearch_source"
+version = "0.4.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "meilisearch-sdk",
+ "once_cell",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_mongodb_sink"
 version = "0.4.0"
 dependencies = [

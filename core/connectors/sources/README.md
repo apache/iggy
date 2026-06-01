@@ -9,6 +9,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | Source | Description |
 | ------ | ----------- |
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
+| **meilisearch_source** | Polls documents from Meilisearch indices with offset-based tracking |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
 
