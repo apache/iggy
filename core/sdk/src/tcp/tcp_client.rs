@@ -19,16 +19,25 @@
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
+#[cfg(feature = "vsr")]
+use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(not(feature = "vsr"))]
+use bytes::BufMut;
+use bytes::{Bytes, BytesMut};
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
+#[cfg(feature = "vsr")]
+use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpConnectionStringOptions,
-    TransportProtocol,
+    IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
@@ -36,13 +45,17 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "vsr")]
+use std::sync::Mutex as StdMutex;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
@@ -58,6 +71,14 @@ pub struct TcpClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
+    // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
+    // is `encode_request_header`, which is pure CPU and never awaits. The
+    // tokio variant would pay a waker alloc + internal semaphore on
+    // contention with zero correctness benefit.
+    consensus_session: Arc<StdMutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
+    skip_auto_login_once: Mutex<bool>,
 }
 
 impl Default for TcpClient {
@@ -126,7 +147,19 @@ impl BinaryTransport for TcpClient {
             return Err(IggyError::Disconnected);
         }
 
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
         self.disconnect().await?;
+
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
 
         {
             let client_address = self.get_client_address_value().await;
@@ -137,12 +170,49 @@ impl BinaryTransport for TcpClient {
             );
         }
 
-        self.connect().await?;
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
         self.send_raw(code, payload).await
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
+    }
+}
+
+#[cfg(feature = "vsr")]
+impl iggy_common::VsrSessionSealed for TcpClient {}
+
+#[cfg(feature = "vsr")]
+#[async_trait::async_trait]
+impl iggy_common::VsrSessionControl for TcpClient {
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidSession(session));
+        }
+
+        let mut consensus_session = self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned");
+        if consensus_session.is_bound() {
+            return Err(IggyError::AlreadyAuthenticated);
+        }
+
+        consensus_session.bind(session);
+        Ok(())
+    }
+
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        *self
+            .consensus_session
+            .lock()
+            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        Ok(())
     }
 }
 
@@ -203,9 +273,14 @@ impl TcpClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
+            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
+            skip_auto_login_once: Mutex::new(false),
         })
     }
 
+    #[cfg(not(feature = "vsr"))]
     async fn handle_response(
         status: u32,
         length: u32,
@@ -427,6 +502,12 @@ impl TcpClient {
             self.set_state(ClientState::Connected).await;
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
+            #[cfg(feature = "vsr")]
+            let skip_auto_login = {
+                let mut guard = self.skip_auto_login_once.lock().await;
+                std::mem::take(&mut *guard)
+            };
+
             // Handle auto-login
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
@@ -434,25 +515,53 @@ impl TcpClient {
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
-                    info!("{NAME} client: {client_address} is signing in...");
-                    self.set_state(ClientState::Authenticating).await;
-                    match credentials {
-                        Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password.expose_secret()).await?;
-                            info!(
-                                "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                            );
+                    #[cfg(feature = "vsr")]
+                    if skip_auto_login {
+                        info!("Skipping automatic sign-in for a retried login/register request.");
+                        false
+                    } else {
+                        info!("{NAME} client: {client_address} is signing in...");
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with a personal access token.",
+                                );
+                            }
                         }
-                        Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token.expose_secret())
-                                .await?;
-                            info!(
-                                "{NAME} client: {client_address} has signed in with a personal access token.",
-                            );
-                        }
-                    }
 
-                    self.handle_leader_redirection().await?
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
+                    {
+                        info!("{NAME} client: {client_address} is signing in...");
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with a personal access token.",
+                                );
+                            }
+                        }
+
+                        self.handle_leader_redirection().await?
+                    }
                 }
             };
 
@@ -510,6 +619,8 @@ impl TcpClient {
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
         self.stream.lock().await.take();
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!("{NAME} client: {client_address} has disconnected from server at: {now}.");
@@ -527,6 +638,8 @@ impl TcpClient {
         if let Some(mut stream) = stream {
             stream.shutdown().await?;
         }
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} TCP client: {client_address} has been shutdown.");
@@ -551,43 +664,107 @@ impl TcpClient {
         }
 
         let stream = self.stream.clone();
+        #[cfg(feature = "vsr")]
+        let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {
+                #[cfg(feature = "vsr")]
+                let (request_header, request_size) = {
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                };
+                #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                #[cfg(feature = "vsr")]
+                trace!(
+                    "Sending a TCP VSR request of size {} with code: {code}",
+                    request_size
+                );
+                #[cfg(not(feature = "vsr"))]
                 trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                #[cfg(feature = "vsr")]
+                stream.write(bytemuck::bytes_of(&request_header)).await?;
+                #[cfg(feature = "vsr")]
+                if !payload.is_empty() {
+                    stream.write(&payload).await?;
+                }
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&code.to_le_bytes()).await?;
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&payload).await?;
                 stream.flush().await?;
                 trace!("Sent a TCP request with code: {code}, waiting for a response...");
-                let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-                let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                    error!(
-                        "Failed to read response for TCP request with code: {code}: {error}",
-                        code = code,
-                        error = error
-                    );
-                    IggyError::Disconnected
-                })?;
+                #[cfg(feature = "vsr")]
+                {
+                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                    // `stream.read` delegates to `read_exact`; on success it
+                    // always returns the requested length, so no short-read
+                    // guard is needed here.
+                    stream.read(&mut response_header).await.map_err(|error| {
+                        error!(
+                            "Failed to read VSR response header for TCP request with code: {code}: {error}",
+                            code = code,
+                            error = error
+                        );
+                        IggyError::Disconnected
+                    })?;
 
-                if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                    error!("Received an invalid or empty response.");
-                    return Err(IggyError::EmptyResponse);
+                    let response_size = crate::vsr::response_size(&response_header)?;
+
+                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    let body = if body_size > 0 {
+                        let mut body = BytesMut::with_capacity(body_size);
+                        stream.read_buf(&mut body, body_size).await.map_err(|error| {
+                            error!(
+                                "Failed to read VSR response body for TCP request with code: {code}: {error}",
+                                code = code,
+                                error = error
+                            );
+                            IggyError::Disconnected
+                        })?;
+                        body.freeze()
+                    } else {
+                        Bytes::new()
+                    };
+
+                    return crate::vsr::decode_response_split(&response_header, body);
                 }
 
-                let status = u32::from_le_bytes(
-                    response_buffer[..4]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                );
-                let length = u32::from_le_bytes(
-                    response_buffer[4..]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                );
-                return TcpClient::handle_response(status, length, stream).await;
+                #[cfg(not(feature = "vsr"))]
+                {
+                    let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                    let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                        error!(
+                            "Failed to read response for TCP request with code: {code}: {error}",
+                            code = code,
+                            error = error
+                        );
+                        IggyError::Disconnected
+                    })?;
+
+                    if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
+                        error!("Received an invalid or empty response.");
+                        return Err(IggyError::EmptyResponse);
+                    }
+
+                    let status = u32::from_le_bytes(
+                        response_buffer[..4]
+                            .try_into()
+                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                    );
+                    let length = u32::from_le_bytes(
+                        response_buffer[4..]
+                            .try_into()
+                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                    );
+                    return TcpClient::handle_response(status, length, stream).await;
+                }
             }
 
             error!("Cannot send data. Client is not connected.");
@@ -610,12 +787,37 @@ impl TcpClient {
     }
 }
 
+#[cfg(feature = "vsr")]
+const fn is_login_register_code(code: u32) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+}
+
 /// Unit tests for TcpClient.
 /// Currently only tests for "from_connection_string()" are implemented.
 /// TODO: Add complete unit tests for TcpClient.
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "vsr"))]
+    use tokio::io::AsyncWriteExt;
+    #[cfg(not(feature = "vsr"))]
+    use tokio::net::TcpListener;
+
+    #[cfg(not(feature = "vsr"))]
+    async fn make_dummy_stream(data: &[u8]) -> ConnectionStreamKind {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let data = data.to_vec();
+        tokio::spawn(async move {
+            let (mut server_side, _) = listener.accept().await.unwrap();
+            server_side.write_all(&data).await.unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, client))
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -883,5 +1085,45 @@ mod tests {
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_return_error_when_status_is_non_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(1, 0, &mut stream).await;
+        assert!(tcp_client.is_err());
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_return_ok_when_status_is_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 0, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_less_than_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 5, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_equal_to_one() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 1, &mut stream).await;
+        assert_eq!(tcp_client.unwrap(), Bytes::new());
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_return_err_when_length_exceeds_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 50, &mut stream).await;
+        assert!(tcp_client.is_err());
     }
 }

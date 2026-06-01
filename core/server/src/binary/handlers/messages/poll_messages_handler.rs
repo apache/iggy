@@ -19,12 +19,13 @@
 use crate::binary::dispatch::{
     HandlerResult, wire_consumer_to_consumer, wire_id_to_identifier, wire_polling_to_strategy,
 };
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-use iggy_common::SenderKind;
-use iggy_common::{IggyError, PooledBuffer};
+use iggy_common::IggyError;
+use server_common::PooledBuffer;
 use std::rc::Rc;
 use tracing::{debug, trace};
 

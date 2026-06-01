@@ -9,6 +9,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | Source | Description |
 | ------ | ----------- |
 | **elasticsearch_source** | Polls documents from Elasticsearch indices with timestamp-based tracking |
+| **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
 | **meilisearch_source** | Polls documents from Meilisearch indices with offset-based tracking |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
@@ -45,6 +46,7 @@ pub struct SourceConfig {
     pub plugin_config_format: Option<ConfigFormat>,
     pub plugin_config: Option<serde_json::Value>,
     pub verbose: bool, // Log message processing at info level instead of debug (default: false)
+    pub benchmark: bool, // Emit per-batch timing events on the `iggy_connectors::benchmark` target (default: false)
 }
 ```
 
@@ -70,6 +72,7 @@ name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
 config_format = "toml"
 verbose = false # Log message processing at info level instead of debug
+benchmark = false # Emit per-batch timing events on `iggy_connectors::benchmark` target
 
 # Collection of the streams to which the produced messages are sent
 [[streams]]

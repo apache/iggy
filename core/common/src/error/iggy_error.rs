@@ -86,6 +86,8 @@ pub enum IggyError {
     InvalidIpAddress(String, String) = 35,
     #[error("Http error {0}")]
     HttpError(String) = 36,
+    #[error("Invalid API URL: {0}")]
+    InvalidApiUrl(String) = 37,
     #[error("Unauthenticated")]
     Unauthenticated = 40,
     #[error("Unauthorized")]
@@ -505,6 +507,13 @@ pub enum IggyError {
 
     #[error("IO error: {0}")]
     IoError(String) = 13000,
+
+    #[error("VSR session already bound; reset before re-binding")]
+    AlreadyAuthenticated = 14000,
+    #[error("VSR session value {0} is invalid (must be non-zero)")]
+    InvalidSession(u64) = 14001,
+    #[error("Replicated command with unknown code {0}")]
+    UnknownReplicatedCommand(u32) = 14002,
 }
 
 impl IggyError {

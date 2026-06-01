@@ -44,7 +44,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::connector::start as start_connector;
 use crate::replica::listener::{bind as bind_replica_listener, run as run_replica_listener};
 use crate::transports::quic::server_config_with_cert;
-use crate::transports::tls::TlsServerCredentials;
+use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
 use crate::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
     AcceptedWsClientFn, AcceptedWssClientFn, IggyMessageBus, client_listener,
@@ -193,6 +193,10 @@ pub async fn start_on_shard_zero(
         return Ok(None);
     }
 
+    if quic_listen_addr.is_some() || tcp_tls_listen_addr.is_some() || wss_listen_addr.is_some() {
+        install_default_crypto_provider();
+    }
+
     assert_listen_addrs_distinct(
         replica_listen_addr,
         client_listen_addr,
@@ -253,7 +257,7 @@ pub async fn start_on_shard_zero(
                     .map_err(|e| {
                         IggyError::IoError(format!("QUIC server config build failed: {e}"))
                     })?;
-            let (endpoint, quic_bound) = client_listener::quic::bind(addr, server_config).await?;
+            let (endpoint, quic_bound) = client_listener::quic::bind(addr, server_config)?;
             let token_for_quic = bus.token();
             let handshake_grace = bus.config().handshake_grace;
             let quic_handle = compio::runtime::spawn(async move {
@@ -280,8 +284,7 @@ pub async fn start_on_shard_zero(
         on_accepted_tcp_tls_client,
     ) {
         (Some(addr), Some(creds), Some(on_accepted_tls)) => {
-            let (listener, server_config, tls_bound) =
-                client_listener::tcp_tls::bind(addr, creds).await?;
+            let (listener, server_config, tls_bound) = client_listener::tcp_tls::bind(addr, creds)?;
             let token_for_tls = bus.token();
             let tls_handle = compio::runtime::spawn(async move {
                 client_listener::tcp_tls::run(
@@ -303,8 +306,7 @@ pub async fn start_on_shard_zero(
 
     let wss_bound = match (wss_listen_addr, wss_credentials, on_accepted_wss_client) {
         (Some(addr), Some(creds), Some(on_accepted_wss)) => {
-            let (listener, server_config, wss_bound) =
-                client_listener::wss::bind(addr, creds).await?;
+            let (listener, server_config, wss_bound) = client_listener::wss::bind(addr, creds)?;
             let token_for_wss = bus.token();
             let wss_handle = compio::runtime::spawn(async move {
                 client_listener::wss::run(listener, server_config, token_for_wss, on_accepted_wss)

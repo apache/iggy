@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ var _ = ginkgo.Describe("DELETE SEGMENTS:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.DeleteSegments(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				0,
@@ -47,6 +50,7 @@ var _ = ginkgo.Describe("DELETE SEGMENTS:", func() {
 		ginkgo.Context("and tries to delete segments for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.DeleteSegments(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				0,
@@ -62,6 +66,7 @@ var _ = ginkgo.Describe("DELETE SEGMENTS:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.DeleteSegments(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				0,
@@ -76,6 +81,7 @@ var _ = ginkgo.Describe("DELETE SEGMENTS:", func() {
 		ginkgo.Context("and tries to delete segments", func() {
 			client := createClient()
 			err := client.DeleteSegments(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				0,

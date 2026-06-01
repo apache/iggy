@@ -43,6 +43,9 @@ on:
         description: "Name of the uploaded artifact containing wheels"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     runs-on: ${{ matrix.runner }}
@@ -82,7 +85,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -144,7 +147,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -206,7 +209,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.10"
           architecture: x64
 
       - name: Build wheels

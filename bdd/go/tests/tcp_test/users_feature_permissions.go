@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -31,6 +33,7 @@ var _ = ginkgo.Describe("UPDATE USER PERMISSIONS:", func() {
 			defer deleteUserAfterTests(identifier, client)
 
 			err := client.UpdatePermissions(
+				context.Background(),
 				identifier,
 				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
@@ -57,6 +60,7 @@ var _ = ginkgo.Describe("UPDATE USER PERMISSIONS:", func() {
 			client := createClient()
 			username := createRandomString(16)
 			err := client.UpdateUser(
+				context.Background(),
 				randomU32Identifier(),
 				&username,
 				nil,

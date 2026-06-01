@@ -35,39 +35,17 @@
 //! - [`StartViewChangeHeader`] - replica suspects primary failure (header-only)
 //! - [`DoViewChangeHeader`] - replica -> primary candidate (header-only)
 //! - [`StartViewHeader`] - new primary -> all replicas (header-only)
-//!
-//! ## Message wrapper
-//! - [`message::Message`] - typed consensus message wrapper over request or response backing
 
 mod command;
 mod error;
 mod header;
-// iobuf was moved here verbatim from the former `core/iobuf` crate. Its
-// implementation is intentionally untouched for rc2; the existing lints
-// predate the move and are tracked as tech debt for a 0.9.x cleanup pass.
-#[allow(
-    private_interfaces,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::return_self_not_must_use,
-    clippy::missing_const_for_fn,
-    clippy::non_send_fields_in_send_ty,
-    clippy::use_self
-)]
-pub mod iobuf;
-pub mod message;
 mod operation;
 
 pub use command::Command2;
 pub use error::ConsensusError;
 pub use header::{
-    CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
-    StartViewHeader, read_size_field,
-};
-pub use message::{
-    ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
-    MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+    CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
+    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
+    SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader, read_size_field,
 };
 pub use operation::Operation;

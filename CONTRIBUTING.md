@@ -10,10 +10,6 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
-## Size Limits
-
-For new contributors we require to keep PRs under 500 lines of code, unless explicitly approved by a maintainer under linked issue.
-
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:
@@ -31,6 +27,12 @@ These require design discussion in the issue before coding:
 **If you can't run it, you can't submit it.**
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
+
+### Green CI
+
+Maintainers will not start reviewing a PR while its CI is failing. Get the
+pipeline green first - a red build, lint, or test means the PR is not ready
+for review.
 
 ### Single Purpose
 
@@ -101,6 +103,25 @@ chore(integration): remove streaming tests superseded by API-level coverage
 ```
 
 Keep subject under 72 chars. Use body for details if needed.
+
+## PR Triage Commands
+
+Move a PR around the review queue by posting a slash command on its own
+line in a regular PR comment (not an inline review reply):
+
+| Command | Who | Effect |
+| --- | --- | --- |
+| `/ready` | author or maintainer | mark `S-waiting-on-review` |
+| `/author` | maintainer or returning contributor | mark `S-waiting-on-author` |
+| `/request-review @user-or-team ...` | author or maintainer | request review from the listed `@user` / `@org/team` handles |
+
+Some labels move on their own: opening or marking a non-draft PR ready sets
+`S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
+closing or converting to draft clears both.
+
+Commands take up to ~90s. A 👍 reaction means applied, 😕 means you lacked
+permission; if neither shows up, check the `PR Triage Apply` run in the
+Actions tab.
 
 ## Close Policy
 

@@ -21,14 +21,14 @@ use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
-use iggy_binary_protocol::WireIdentifier;
-use iggy_binary_protocol::requests::personal_access_tokens::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
-};
+use bytes::{BufMut, BytesMut};
+use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     UpdateUserRequest,
 };
+use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
     GlobalPermissions, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
     StreamPermissions, UserId, UserStatus,
@@ -89,6 +89,11 @@ define_state! {
         index: AHashMap<Arc<str>, UserId>,
         items: Slab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
+        // SAFETY: deterministic-apply invariant. `AHashMap` iteration order
+        // differs across replicas (random seed), so this map MUST only be
+        // touched via single-key `.get` / `.insert` / `.remove`. Never
+        // iterate. Reach for `BTreeMap` the first time iteration is needed.
+        personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
         permissioner: Permissioner,
     }
 }
@@ -121,11 +126,156 @@ impl UsersInner {
     }
 }
 
+impl Users {
+    #[must_use]
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&UsersInner) -> R,
+    {
+        self.inner.read(f)
+    }
+
+    /// Ensures a root user exists in an empty user set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `username` is not a valid wire-format username.
+    pub fn ensure_root_user(&self, username: &str, password_hash: &str) {
+        if self.read(|users| !users.items.is_empty()) {
+            return;
+        }
+
+        // Boot-only invariant: server-ng calls this before listeners and
+        // consensus traffic start, on shard 0 initialization. The read/apply
+        // split cannot race another user creation in that phase.
+        let username = WireName::new(username).expect("root username must be valid");
+        // Bootstrap path is intentionally unreplicated (every replica calls
+        // this locally on shard 0). A fresh `IggyTimestamp::now()` per replica
+        // would make `root.created_at` differ across the cluster and break
+        // any future snapshot/state-hash equality check. Stamp the UNIX
+        // epoch sentinel instead: every replica reads the same value.
+        self.inner
+            .try_apply(UsersCommand::CreateUser(
+                CreateUserRequest {
+                    username,
+                    password: password_hash.to_string(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: Some(WirePermissions {
+                        global: WireGlobalPermissions {
+                            manage_servers: true,
+                            read_servers: true,
+                            manage_users: true,
+                            read_users: true,
+                            manage_streams: true,
+                            read_streams: true,
+                            manage_topics: true,
+                            read_topics: true,
+                            poll_messages: true,
+                            send_messages: true,
+                        },
+                        streams: Vec::new(),
+                    }),
+                },
+                IggyTimestamp::zero(),
+            ))
+            .expect("root user bootstrap must run on the metadata writer");
+    }
+}
+
+/// Replicated create-PAT command enriched with the authenticated user id
+/// and a primary-minted `token_hash`.
+///
+/// `token_hash` is the hash of the raw token, generated once by the primary
+/// in `maybe_rewrite_pat_request` and shipped in the prepare body. Apply
+/// stores it directly via `PersonalAccessToken::raw`; calling
+/// `PersonalAccessToken::new` inside apply would `ring::rand` per-replica
+/// and produce divergent state (different hash → divergent
+/// `personal_access_token_index`).
+///
+/// Fixed-width 64-byte hex hash on the wire (SHA-256 of the raw token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePersonalAccessTokenRequest {
+    pub user_id: UserId,
+    pub name: WireName,
+    pub expiry: u64,
+    pub token_hash: [u8; PAT_TOKEN_HASH_BYTES],
+}
+
+pub const PAT_TOKEN_HASH_BYTES: usize = 64;
+
+impl WireEncode for CreatePersonalAccessTokenRequest {
+    fn encoded_size(&self) -> usize {
+        4 + self.name.encoded_size() + 8 + PAT_TOKEN_HASH_BYTES
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.user_id);
+        self.name.encode(buf);
+        buf.put_u64_le(self.expiry);
+        buf.put_slice(&self.token_hash);
+    }
+}
+
+impl WireDecode for CreatePersonalAccessTokenRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        let user_id = read_u32_le(buf, 0)?;
+        let (name, mut pos) = WireName::decode(&buf[4..])?;
+        pos += 4;
+        let expiry = read_u64_le(buf, pos)?;
+        pos += 8;
+        if buf.len() < pos + PAT_TOKEN_HASH_BYTES {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: PAT_TOKEN_HASH_BYTES,
+                have: buf.len() - pos,
+            });
+        }
+        let mut token_hash = [0u8; PAT_TOKEN_HASH_BYTES];
+        token_hash.copy_from_slice(&buf[pos..pos + PAT_TOKEN_HASH_BYTES]);
+        pos += PAT_TOKEN_HASH_BYTES;
+        Ok((
+            Self {
+                user_id,
+                name,
+                expiry,
+                token_hash,
+            },
+            pos,
+        ))
+    }
+}
+
+/// Replicated delete-PAT command enriched with the authenticated user id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletePersonalAccessTokenRequest {
+    pub user_id: UserId,
+    pub name: WireName,
+}
+
+impl WireEncode for DeletePersonalAccessTokenRequest {
+    fn encoded_size(&self) -> usize {
+        4 + self.name.encoded_size()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.user_id);
+        self.name.encode(buf);
+    }
+}
+
+impl WireDecode for DeletePersonalAccessTokenRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        let user_id = read_u32_le(buf, 0)?;
+        let (name, consumed) = WireName::decode(&buf[4..])?;
+        Ok((Self { user_id, name }, 4 + consumed))
+    }
+}
+
 // TODO(hubcio): Serialize proper reply (e.g. assigned user ID) instead of empty Bytes.
 impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
             return Bytes::new();
@@ -142,7 +292,7 @@ impl StateHandler for CreateUserRequest {
             username: username_arc.clone(),
             password_hash: Arc::from(self.password.as_str()),
             status,
-            created_at: IggyTimestamp::now(),
+            created_at: timestamp,
             permissions,
         };
 
@@ -162,7 +312,7 @@ impl StateHandler for CreateUserRequest {
 impl StateHandler for UpdateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -196,7 +346,7 @@ impl StateHandler for UpdateUserRequest {
 impl StateHandler for DeleteUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -205,7 +355,11 @@ impl StateHandler for DeleteUserRequest {
             let username = user.username.clone();
             state.items.remove(user_id);
             state.index.remove(&username);
-            state.personal_access_tokens.remove(&(user_id as UserId));
+            if let Some(tokens) = state.personal_access_tokens.remove(&(user_id as UserId)) {
+                for pat in tokens.values() {
+                    state.personal_access_token_index.remove(&pat.token);
+                }
+            }
         }
         Bytes::new()
     }
@@ -213,7 +367,7 @@ impl StateHandler for DeleteUserRequest {
 
 impl StateHandler for ChangePasswordRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -227,7 +381,7 @@ impl StateHandler for ChangePasswordRequest {
 
 impl StateHandler for UpdatePermissionsRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -242,42 +396,56 @@ impl StateHandler for UpdatePermissionsRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. generated token) instead of empty Bytes.
+// TODO(hubcio): Serialize proper reply (e.g. generated raw token from the
+// primary-side mint) instead of empty Bytes. The raw token is currently
+// generated only at the request-rewrite step on the primary and dropped;
+// surfacing it back to the client needs a side-channel out of
+// `maybe_rewrite_pat_request`.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
-        // TODO: Stub until protocol gets adjusted.
-        let user_id = 0;
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
         let expiry = IggyExpiry::from(self.expiry);
-        let user_tokens = state.personal_access_tokens.entry(user_id).or_default();
+        let user_tokens = state
+            .personal_access_tokens
+            .entry(self.user_id)
+            .or_default();
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if user_tokens.contains_key(&name_arc) {
             return Bytes::new();
         }
 
-        let expiry_at = PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), expiry);
+        let expiry_at = PersonalAccessToken::calculate_expiry_at(timestamp, expiry);
         if let Some(expiry_at) = expiry_at
-            && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
+            && expiry_at.as_micros() <= timestamp.as_micros()
         {
             return Bytes::new();
         }
 
-        let (pat, _) =
-            PersonalAccessToken::new(user_id, self.name.as_ref(), IggyTimestamp::now(), expiry);
+        // Replicas store the primary's hash directly via `raw`. Calling
+        // `PersonalAccessToken::new` here would re-roll `ring::rand` per
+        // replica and diverge `personal_access_token_index` -- a
+        // deterministic-apply violation.
+        let token_hash_str = std::str::from_utf8(&self.token_hash)
+            .expect("token_hash is hex-ASCII generated by the primary");
+        let pat =
+            PersonalAccessToken::raw(self.user_id, self.name.as_ref(), token_hash_str, expiry_at);
+        let token_hash = Arc::clone(&pat.token);
         user_tokens.insert(name_arc, pat);
+        state
+            .personal_access_token_index
+            .insert(token_hash, (self.user_id, Arc::from(self.name.as_str())));
         Bytes::new()
     }
 }
 
 impl StateHandler for DeletePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
-        // TODO: Stub until protocol gets adjusted.
-        let user_id = 0;
-
-        if let Some(user_tokens) = state.personal_access_tokens.get_mut(&user_id) {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+        if let Some(user_tokens) = state.personal_access_tokens.get_mut(&self.user_id) {
             let name_arc: Arc<str> = Arc::from(self.name.as_str());
-            user_tokens.remove(&name_arc);
+            if let Some(pat) = user_tokens.remove(&name_arc) {
+                state.personal_access_token_index.remove(&pat.token);
+            }
         }
         Bytes::new()
     }
@@ -441,16 +609,21 @@ impl Snapshotable for Users {
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
+        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)> =
+            AHashMap::new();
         for (user_id, tokens) in snapshot.personal_access_tokens {
             let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
             for (name, pat_snap) in tokens {
+                let name: Arc<str> = Arc::from(name.as_str());
                 let pat = PersonalAccessToken::raw(
                     pat_snap.user_id,
                     &pat_snap.name,
                     &pat_snap.token,
                     pat_snap.expiry_at,
                 );
-                token_map.insert(Arc::from(name.as_str()), pat);
+                personal_access_token_index
+                    .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
+                token_map.insert(name, pat);
             }
             personal_access_tokens.insert(user_id, token_map);
         }
@@ -492,6 +665,7 @@ impl Snapshotable for Users {
             index,
             items,
             personal_access_tokens,
+            personal_access_token_index,
             permissioner,
             last_result: None,
         };
@@ -500,3 +674,66 @@ impl Snapshotable for Users {
 }
 
 impl_fill_restore!(Users, users);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_pat_request_roundtrip_preserves_user_id() {
+        let request = CreatePersonalAccessTokenRequest {
+            user_id: 7,
+            name: WireName::new("api-token").unwrap(),
+            expiry: 3600,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        };
+
+        let bytes = request.to_bytes();
+        let (decoded, consumed) = CreatePersonalAccessTokenRequest::decode(&bytes).unwrap();
+
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn delete_pat_request_roundtrip_preserves_user_id() {
+        let request = DeletePersonalAccessTokenRequest {
+            user_id: 11,
+            name: WireName::new("staging").unwrap(),
+        };
+
+        let bytes = request.to_bytes();
+        let (decoded, consumed) = DeletePersonalAccessTokenRequest::decode(&bytes).unwrap();
+
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn pat_apply_uses_authenticated_user_id() {
+        let mut users = UsersInner::new();
+        let create = CreatePersonalAccessTokenRequest {
+            user_id: 5,
+            name: WireName::new("deploy").unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        };
+        create.apply(&mut users, IggyTimestamp::now());
+
+        assert!(users.personal_access_tokens.contains_key(&5));
+        assert!(!users.personal_access_tokens.contains_key(&0));
+        let token = users.personal_access_tokens[&5]
+            .get("deploy")
+            .expect("token should be stored under the authenticated user");
+        assert_eq!(token.user_id, 5);
+
+        let delete = DeletePersonalAccessTokenRequest {
+            user_id: 5,
+            name: WireName::new("deploy").unwrap(),
+        };
+        delete.apply(&mut users, IggyTimestamp::now());
+
+        assert!(users.personal_access_tokens[&5].is_empty());
+        assert!(users.personal_access_token_index.is_empty());
+    }
+}

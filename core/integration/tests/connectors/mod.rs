@@ -19,6 +19,7 @@
 
 mod api;
 mod delta;
+mod doris;
 mod elasticsearch;
 mod fixtures;
 mod http;
@@ -30,6 +31,7 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
+mod runtime;
 mod stdout;
 
 use iggy_common::IggyTimestamp;

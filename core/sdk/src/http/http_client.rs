@@ -20,12 +20,13 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
+use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
-    IdentityInfo, TransportProtocol,
+    HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
 };
-use reqwest::{Response, StatusCode, Url};
+use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
@@ -202,6 +203,31 @@ impl HttpTransport for HttpClient {
         Self::handle_response(response).await
     }
 
+    async fn send_http_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<Bytes, IggyError> {
+        let method = Method::from_bytes(<&str>::from(method).as_bytes())
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let url = self.get_url(path)?;
+        let token = self.access_token.read().await;
+        let mut request = self.client.request(method, url).bearer_auth(token.deref());
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let response = Self::handle_response(response).await?;
+        response
+            .bytes()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)
+    }
+
     /// Returns true if the client is authenticated.
     async fn is_authenticated(&self) -> bool {
         let token = self.access_token.read().await;
@@ -266,11 +292,8 @@ impl HttpClient {
 
     /// Create a new HTTP client for interacting with the Iggy API using the provided configuration.
     pub fn create(config: Arc<HttpClientConfig>) -> Result<Self, IggyError> {
-        let api_url = Url::parse(&config.api_url);
-        if api_url.is_err() {
-            return Err(IggyError::CannotParseUrl);
-        }
-        let api_url = api_url.unwrap();
+        validate_api_url(&config.api_url)?;
+        let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(TracingMiddleware::<SpanBackendWithUrl>::new())
@@ -536,5 +559,16 @@ mod tests {
             http_client.as_ref().unwrap().heartbeat_interval,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[test]
+    fn should_fail_create_with_invalid_api_url_even_without_builder() {
+        let config = Arc::new(HttpClientConfig {
+            api_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+
+        let http_client = HttpClient::create(config);
+        assert!(http_client.is_err());
     }
 }

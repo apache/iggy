@@ -154,7 +154,7 @@ impl<'a> IggyMessageViewIterator<'a> {
         }
     }
 
-    pub(crate) fn new_with_boundaries(
+    pub fn new_with_boundaries(
         messages: &'a [u8],
         indexes: &'a [u8],
         base_position: u32,

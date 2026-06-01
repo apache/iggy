@@ -37,6 +37,7 @@ use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
+use server_common::sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::env;
 use std::sync::Arc;
 
@@ -60,6 +61,8 @@ const DEFAULT_CONFIG_PATH: &str = "core/server-ng/config.toml";
 pub struct ServerNgConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
+    #[serde(default)]
+    pub extra: ExtraConfig,
     pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
@@ -71,6 +74,28 @@ pub struct ServerNgConfig {
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
     pub message_bus: MessageBusConfig,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct ExtraConfig {
+    pub namespace: NamespaceConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct NamespaceConfig {
+    pub max_streams: usize,
+    pub max_topics: usize,
+    pub max_partitions: usize,
+}
+
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        Self {
+            max_streams: MAX_STREAMS,
+            max_topics: MAX_TOPICS,
+            max_partitions: MAX_PARTITIONS,
+        }
+    }
 }
 
 impl ServerNgConfig {

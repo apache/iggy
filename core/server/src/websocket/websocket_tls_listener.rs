@@ -17,6 +17,7 @@
  */
 
 use crate::configs::websocket::WebSocketConfig;
+use crate::sender::{SenderKind, WebSocketTlsSender};
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
@@ -26,7 +27,7 @@ use compio::tls::TlsAcceptor;
 use compio::ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyError, SenderKind, TransportProtocol, WebSocketTlsSender};
+use iggy_common::{IggyError, TransportProtocol};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
@@ -247,7 +248,7 @@ async fn accept_loop(
 
 fn generate_self_signed_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
-    iggy_common::generate_self_signed_certificate("localhost")
+    server_common::generate_self_signed_certificate("localhost")
 }
 
 fn load_certificates(

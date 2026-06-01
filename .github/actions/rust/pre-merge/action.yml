@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat)"
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -30,21 +30,13 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Cleanup disk space
-      if: runner.os == 'Linux'
-      run: |
-        echo "Disk space before cleanup:"
-        df -h
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        # sudo docker image prune --all --force
-        # sudo docker builder prune -a
-        echo "Disk space after cleanup:"
-        df -h
-      shell: bash
-
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
+        # Miri builds against a nightly toolchain with a separate `target/miri`
+        # subtree; isolate its cache from the stable `dev` namespace so the
+        # two don't evict each other.
+        shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
         print-cache-status: ${{ startsWith(inputs.task, 'test-') }}
 
     - name: Install tools for specific tasks
@@ -215,6 +207,16 @@ runs:
 
         source <(cargo llvm-cov show-env --export-prefix)
 
+        # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
+        # This kernel param can only be set on the host (no container can raise it),
+        # so we raise it here. Everything else about booting Doris — image, heap/mem
+        # caps, port mappings, BE-alive wait — lives in the testcontainers fixture
+        # at core/integration/tests/connectors/fixtures/doris/container.rs, so
+        # `cargo test` and CI follow exactly the same path.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          sudo sysctl -w vm.max_map_count=2000000 || true
+        fi
+
         bins_start=$(date +%s)
         if [[ -n "$PACKAGE_FLAGS" ]]; then
           cargo build --locked $PACKAGE_FLAGS
@@ -303,6 +305,29 @@ runs:
           --port 8090 --wait-secs 180
       shell: bash
 
+    # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
+    # compio. Pinned nightly so MIRIFLAGS behavior is stable across CI runs;
+    # bump the date quarterly. Tree-borrows is the future-default aliasing
+    # model and accepts the legitimate `NonNull::add` arithmetic in
+    # `iobuf.rs` that stacked-borrows would reject. Strict-provenance
+    # rejects int-to-pointer round trips, which we don't use.
+    - name: Install nightly Rust + miri component
+      if: inputs.task == 'miri'
+      run: |
+        rustup toolchain install nightly-2026-04-21 --component miri --profile minimal --no-self-update
+        cargo +nightly-2026-04-21 miri setup
+      shell: bash
+
+    - name: Run miri
+      if: inputs.task == 'miri'
+      env:
+        MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
+      run: |
+        cargo +nightly-2026-04-21 miri test --locked \
+          -p iggy_binary_protocol \
+          -p consensus
+      shell: bash
+
     # aarch64 builds (run on ARM64 runners)
     - name: Build aarch64-gnu
       if: inputs.task == 'build-aarch64-gnu'
@@ -327,9 +352,6 @@ runs:
         --exclude bench-dashboard-frontend
       shell: bash
       env:
-        # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync
-        # references when linking dbus-sys (required by keyring crate)
-        CFLAGS: "-mno-outline-atomics"
         PKG_CONFIG_ALLOW_CROSS: "1"
         PKG_CONFIG_ALL_STATIC: "1"
 

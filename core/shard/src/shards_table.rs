@@ -16,7 +16,7 @@
 // under the License.
 
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
+use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::hash::Hasher as _;
 
 /// Lookup table that maps partition namespaces to their owning shard.
@@ -32,7 +32,11 @@ pub trait ShardsTable {
     fn shard_for(&self, namespace: IggyNamespace) -> Option<u16>;
 }
 
-/// No-op shards table for single-shard setups.
+/// Always-`None` impl. Satisfies the trait for test / simulator paths
+/// that never route via the table (e.g. [`crate::IggyShard::without_inbox`]).
+/// Do not use in production: the router drops any partition frame whose
+/// `shard_for` returns `None`, so a real cluster wired to this impl would
+/// silently shed every partition request.
 impl ShardsTable for () {
     fn shard_for(&self, _namespace: IggyNamespace) -> Option<u16> {
         None

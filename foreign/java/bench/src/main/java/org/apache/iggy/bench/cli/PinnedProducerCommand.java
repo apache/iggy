@@ -19,7 +19,7 @@
 
 package org.apache.iggy.bench.cli;
 
-import org.apache.iggy.bench.benchmarks.tcp.async.TcpAsyncPinnedProducer;
+import org.apache.iggy.bench.benchmarks.runners.tcp.async.TcpAsyncPinnedProducer;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.slf4j.Logger;

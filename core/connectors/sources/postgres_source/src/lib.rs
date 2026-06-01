@@ -115,6 +115,23 @@ pub struct DatabaseRecord {
     pub old_data: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Copy)]
+struct RowProcessingConfig<'a> {
+    table: &'a str,
+    tracking_column: &'a str,
+    pk_column: &'a str,
+    payload_format: PayloadFormat,
+    payload_col: &'a str,
+    snake_case_columns: bool,
+    include_metadata: bool,
+}
+
+struct ProcessedRow {
+    message: ProducedMessage,
+    max_offset: Option<String>,
+    row_pk: Option<String>,
+}
+
 const CONNECTOR_NAME: &str = "PostgreSQL source";
 
 impl PostgresSource {
@@ -308,16 +325,23 @@ impl PostgresSource {
             .publication_name
             .as_deref()
             .unwrap_or("iggy_publication");
+        let quoted_publication = quote_identifier(publication_name)?;
         let tables_clause = if self.config.tables.is_empty() {
             "FOR ALL TABLES".to_string()
         } else {
-            format!("FOR TABLE {}", self.config.tables.join(", "))
+            let quoted_tables = self
+                .config
+                .tables
+                .iter()
+                .map(|t| quote_qualified_identifier(t))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("FOR TABLE {}", quoted_tables.join(", "))
         };
 
         let create_publication_sql =
-            format!("CREATE PUBLICATION IF NOT EXISTS {publication_name} {tables_clause}");
+            format!("CREATE PUBLICATION IF NOT EXISTS {quoted_publication} {tables_clause}");
 
-        sqlx::query(&create_publication_sql)
+        sqlx::query(sqlx::AssertSqlSafe(create_publication_sql))
             .execute(pool)
             .await
             .map_err(|e| Error::InitError(format!("Failed to create publication: {e}")))?;
@@ -327,14 +351,15 @@ impl PostgresSource {
             .replication_slot
             .as_deref()
             .unwrap_or("iggy_slot");
-        let create_slot_sql = format!(
-            "SELECT pg_create_logical_replication_slot('{slot_name}', 'pgoutput') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        );
 
-        sqlx::query(&create_slot_sql)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
+        sqlx::query(
+            "SELECT pg_create_logical_replication_slot($1, 'pgoutput') \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        )
+        .bind(slot_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
 
         info!("PostgreSQL CDC setup completed. Publication: {publication_name}, Slot: {slot_name}");
         Ok(())
@@ -389,7 +414,7 @@ impl PostgresSource {
         );
 
         // Database I/O without holding the lock
-        let rows = sqlx::query(&logical_repl_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(logical_repl_sql))
             .fetch_all(pool)
             .await
             .map_err(|e| {
@@ -445,14 +470,27 @@ impl PostgresSource {
             .primary_key_column
             .as_deref()
             .unwrap_or(tracking_column);
-        let payload_format = self.payload_format();
-        let payload_col = self.config.payload_column.as_deref().unwrap_or("");
+
+        let row_config = RowProcessingConfig {
+            table: "",
+            tracking_column,
+            pk_column,
+            payload_format: self.payload_format(),
+            payload_col: self.config.payload_column.as_deref().unwrap_or(""),
+            snake_case_columns: self.config.snake_case_columns.unwrap_or(false),
+            include_metadata: self.config.include_metadata.unwrap_or(true),
+        };
 
         // Collect state updates to apply after processing
         let mut state_updates: Vec<(String, String)> = Vec::new();
         let mut total_processed: u64 = 0;
 
         for table in &self.config.tables {
+            let table_config = RowProcessingConfig {
+                table,
+                ..row_config
+            };
+
             // Get last offset with minimal lock time
             let last_offset = {
                 let state = self.state.lock().await;
@@ -468,7 +506,7 @@ impl PostgresSource {
 
             // Database I/O without holding the lock
             let rows = with_retry(
-                || sqlx::query(&query).fetch_all(pool),
+                || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
                 self.get_max_retries(),
                 self.retry_delay.as_millis() as u64,
             )
@@ -478,82 +516,16 @@ impl PostgresSource {
             let mut processed_ids: Vec<String> = Vec::new();
 
             for row in rows {
-                let mut row_pk: Option<String> = None;
-                let mut extracted_payload: Option<Vec<u8>> = None;
-                let mut data = serde_json::Map::new();
+                let processed = self.process_row(&row, &table_config)?;
 
-                for (i, column) in row.columns().iter().enumerate() {
-                    let column_name = if self.config.snake_case_columns.unwrap_or(false) {
-                        to_snake_case(column.name())
-                    } else {
-                        column.name().to_string()
-                    };
-
-                    if !payload_col.is_empty() && column.name() == payload_col {
-                        extracted_payload =
-                            Some(self.extract_payload_column(&row, i, payload_format)?);
-                        continue;
-                    }
-
-                    let value = self.extract_column_value(&row, i)?;
-                    data.insert(column_name.clone(), value.clone());
-
-                    if column.name() == tracking_column {
-                        if let serde_json::Value::String(ref s) = value {
-                            max_offset = Some(s.clone());
-                        } else if let serde_json::Value::Number(ref n) = value {
-                            max_offset = Some(n.to_string());
-                        }
-                    }
-
-                    if column.name() == pk_column {
-                        if let serde_json::Value::String(ref s) = value {
-                            row_pk = Some(s.clone());
-                        } else if let serde_json::Value::Number(ref n) = value {
-                            row_pk = Some(n.to_string());
-                        }
-                    }
-                }
-
-                if let Some(pk) = row_pk {
+                if let Some(pk) = processed.row_pk {
                     processed_ids.push(pk);
                 }
+                if let Some(offset) = processed.max_offset {
+                    max_offset = Some(offset);
+                }
 
-                let payload = if let Some(bytes) = extracted_payload {
-                    bytes
-                } else {
-                    let record = if self.config.include_metadata.unwrap_or(true) {
-                        DatabaseRecord {
-                            table_name: table.clone(),
-                            operation_type: "SELECT".to_string(),
-                            timestamp: Utc::now(),
-                            data: serde_json::Value::Object(data),
-                            old_data: None,
-                        }
-                    } else {
-                        let mut simple_record = serde_json::Map::new();
-                        simple_record.insert("data".to_string(), serde_json::Value::Object(data));
-                        DatabaseRecord {
-                            table_name: table.clone(),
-                            operation_type: "SELECT".to_string(),
-                            timestamp: Utc::now(),
-                            data: serde_json::Value::Object(simple_record),
-                            old_data: None,
-                        }
-                    };
-                    simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
-                };
-
-                let message = ProducedMessage {
-                    id: Some(Uuid::new_v4().as_u128()),
-                    headers: None,
-                    checksum: None,
-                    timestamp: Some(Utc::now().timestamp_millis() as u64),
-                    origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
-                    payload,
-                };
-
-                messages.push(message);
+                messages.push(processed.message);
                 total_processed += 1;
             }
 
@@ -599,7 +571,7 @@ impl PostgresSource {
             return Ok(());
         }
 
-        let quoted_table = quote_identifier(table)?;
+        let quoted_table = quote_qualified_identifier(table)?;
         let quoted_pk = quote_identifier(pk_column)?;
 
         let ids_list = ids
@@ -624,7 +596,7 @@ impl PostgresSource {
                 debug!("Deleting {} processed rows from '{table}'", ids.len());
             }
 
-            sqlx::query(&delete_query)
+            sqlx::query(sqlx::AssertSqlSafe(delete_query))
                 .execute(pool)
                 .await
                 .map_err(|e| {
@@ -643,7 +615,7 @@ impl PostgresSource {
                 debug!("Marking {} rows as processed in '{table}'", ids.len());
             }
 
-            sqlx::query(&update_query)
+            sqlx::query(sqlx::AssertSqlSafe(update_query))
                 .execute(pool)
                 .await
                 .map_err(|e| {
@@ -681,7 +653,7 @@ impl PostgresSource {
         last_offset: &Option<String>,
         batch_size: u32,
     ) -> Result<String, Error> {
-        let quoted_table = quote_identifier(table)?;
+        let quoted_table = quote_qualified_identifier(table)?;
         let quoted_tracking = quote_identifier(tracking_column)?;
 
         let base_query = format!("SELECT * FROM {quoted_table}");
@@ -851,6 +823,90 @@ impl PostgresSource {
         None
     }
 
+    fn process_row(
+        &self,
+        row: &sqlx::postgres::PgRow,
+        config: &RowProcessingConfig,
+    ) -> Result<ProcessedRow, Error> {
+        let mut row_pk: Option<String> = None;
+        let mut max_offset: Option<String> = None;
+        let mut extracted_payload: Option<Vec<u8>> = None;
+        let mut data = serde_json::Map::new();
+
+        for (i, column) in row.columns().iter().enumerate() {
+            let column_name = if config.snake_case_columns {
+                to_snake_case(column.name())
+            } else {
+                column.name().to_string()
+            };
+
+            if !config.payload_col.is_empty() && column.name() == config.payload_col {
+                extracted_payload =
+                    Some(self.extract_payload_column(row, i, config.payload_format)?);
+                continue;
+            }
+
+            let value = extract_column_value(row, i)?;
+            data.insert(column_name.clone(), value.clone());
+
+            if column.name() == config.tracking_column {
+                if let serde_json::Value::String(ref s) = value {
+                    max_offset = Some(s.clone());
+                } else if let serde_json::Value::Number(ref n) = value {
+                    max_offset = Some(n.to_string());
+                }
+            }
+
+            if column.name() == config.pk_column {
+                if let serde_json::Value::String(ref s) = value {
+                    row_pk = Some(s.clone());
+                } else if let serde_json::Value::Number(ref n) = value {
+                    row_pk = Some(n.to_string());
+                }
+            }
+        }
+
+        let payload = if let Some(bytes) = extracted_payload {
+            bytes
+        } else {
+            let record = if config.include_metadata {
+                DatabaseRecord {
+                    table_name: config.table.to_string(),
+                    operation_type: "SELECT".to_string(),
+                    timestamp: Utc::now(),
+                    data: serde_json::Value::Object(data),
+                    old_data: None,
+                }
+            } else {
+                let mut simple_record = serde_json::Map::new();
+                simple_record.insert("data".to_string(), serde_json::Value::Object(data));
+                DatabaseRecord {
+                    table_name: config.table.to_string(),
+                    operation_type: "SELECT".to_string(),
+                    timestamp: Utc::now(),
+                    data: serde_json::Value::Object(simple_record),
+                    old_data: None,
+                }
+            };
+            simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+        };
+
+        let message = ProducedMessage {
+            id: Some(Uuid::new_v4().as_u128()),
+            headers: None,
+            checksum: None,
+            timestamp: Some(Utc::now().timestamp_millis() as u64),
+            origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+            payload,
+        };
+
+        Ok(ProcessedRow {
+            message,
+            max_offset,
+            row_pk,
+        })
+    }
+
     fn extract_payload_column(
         &self,
         row: &sqlx::postgres::PgRow,
@@ -885,137 +941,151 @@ impl PostgresSource {
             }
         }
     }
+}
 
-    fn extract_column_value(
-        &self,
-        row: &sqlx::postgres::PgRow,
-        column_index: usize,
-    ) -> Result<serde_json::Value, Error> {
-        let column = &row.columns()[column_index];
-        let type_name = column.type_info().name();
+fn extract_column_value(
+    row: &sqlx::postgres::PgRow,
+    column_index: usize,
+) -> Result<serde_json::Value, Error> {
+    let column = &row.columns()[column_index];
+    let type_name = column.type_info().name();
 
-        match type_name {
-            "BOOL" => {
-                let value: Option<bool> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::Bool)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT2" => {
-                let value: Option<i16> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as i64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT4" => {
-                let value: Option<i32> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as i64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT8" => {
-                let value: Option<i64> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "FLOAT4" => {
-                let value: Option<f32> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as f64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "FLOAT8" => {
-                let value: Option<f64> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "NUMERIC" => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "VARCHAR" | "TEXT" | "CHAR" => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "TIMESTAMP" | "TIMESTAMPTZ" => {
-                let value: Option<DateTime<Utc>> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "UUID" => {
-                let value: Option<Uuid> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|u| serde_json::Value::String(u.to_string()))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "JSON" | "JSONB" => {
-                let value: Option<serde_json::Value> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value.unwrap_or(serde_json::Value::Null))
-            }
-            "BYTEA" => {
-                let value: Option<Vec<u8>> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|bytes| {
-                        use base64::Engine;
-                        serde_json::Value::String(
-                            base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        )
-                    })
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            _ => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null))
-            }
+    match type_name {
+        "BOOL" => {
+            let value: Option<bool> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::Bool)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT2" => {
+            let value: Option<i16> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT4" => {
+            let value: Option<i32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT8" => {
+            let value: Option<i64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT4" => {
+            let value: Option<f32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as f64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT8" => {
+            let value: Option<f64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "NUMERIC" => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMP" | "TIMESTAMPTZ" => {
+            let value: Option<DateTime<Utc>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "UUID" => {
+            let value: Option<Uuid> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|u| serde_json::Value::String(u.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "JSON" | "JSONB" => {
+            let value: Option<serde_json::Value> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value.unwrap_or(serde_json::Value::Null))
+        }
+        "BYTEA" => {
+            let value: Option<Vec<u8>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|bytes| {
+                    use base64::Engine;
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        _ => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
         }
     }
 }
 
 fn quote_identifier(name: &str) -> Result<String, Error> {
     if name.is_empty() {
-        return Err(Error::InvalidConfig);
+        return Err(Error::InvalidConfigValue(
+            "identifier must not be empty".to_string(),
+        ));
     }
     if name.contains('\0') {
-        return Err(Error::InvalidConfig);
+        return Err(Error::InvalidConfigValue(format!(
+            "identifier '{name}' contains NUL byte"
+        )));
     }
     let escaped = name.replace('"', "\"\"");
     Ok(format!("\"{escaped}\""))
+}
+
+/// Quote a possibly schema-qualified identifier like `public.users` as
+/// `"public"."users"`. Each dot-separated segment is validated and quoted
+/// independently so that schema-qualified table names survive intact.
+fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
+    if !name.contains('.') {
+        return quote_identifier(name);
+    }
+    let parts: Result<Vec<_>, _> = name.split('.').map(quote_identifier).collect();
+    Ok(parts?.join("."))
 }
 
 fn format_offset_value(value: &str) -> String {
@@ -1230,6 +1300,30 @@ mod tests {
     fn given_empty_identifier_should_fail() {
         let result = quote_identifier("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_unqualified_name_should_quote_as_single_identifier() {
+        let result = quote_qualified_identifier("users").expect("Failed to quote");
+        assert_eq!(result, "\"users\"");
+    }
+
+    #[test]
+    fn given_schema_qualified_name_should_quote_each_segment() {
+        let result = quote_qualified_identifier("public.users").expect("Failed to quote");
+        assert_eq!(result, "\"public\".\"users\"");
+    }
+
+    #[test]
+    fn given_qualified_name_with_quote_chars_should_escape_each_segment() {
+        let result = quote_qualified_identifier("my\"schema.my\"table").expect("Failed to quote");
+        assert_eq!(result, "\"my\"\"schema\".\"my\"\"table\"");
+    }
+
+    #[test]
+    fn given_qualified_name_with_empty_segment_should_fail() {
+        assert!(quote_qualified_identifier("public.").is_err());
+        assert!(quote_qualified_identifier(".users").is_err());
     }
 
     #[test]

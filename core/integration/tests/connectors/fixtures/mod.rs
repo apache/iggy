@@ -17,7 +17,10 @@
  * under the License.
  */
 
+use uuid::Uuid;
+
 mod delta;
+mod doris;
 mod elasticsearch;
 mod http;
 mod iceberg;
@@ -28,7 +31,27 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+/// Prefix on every test container name so `just clean-test-containers` reaps
+/// them all with one `name=^iggy-test-` filter. A new fixture only has to use
+/// `unique_container_name` (or a fixed `iggy-test-<svc>` for reuse containers)
+/// to be covered.
+pub(crate) const TEST_CONTAINER_PREFIX: &str = "iggy-test-";
+
+/// Unique per-test container name for ephemeral fixtures. Reuse fixtures
+/// (elasticsearch, doris) use a fixed `iggy-test-<svc>` literal instead, since
+/// the stable name is what lets later test processes attach to the same one.
+pub(crate) fn unique_container_name(service: &str) -> String {
+    format!(
+        "{TEST_CONTAINER_PREFIX}{service}-{}",
+        Uuid::new_v4().simple()
+    )
+}
+
 pub use delta::{DeltaFixture, DeltaS3Fixture};
+pub use doris::{
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
+    DorisSinkPreCreatedFixture,
+};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
@@ -38,9 +61,9 @@ pub use iceberg::{
     DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps, IcebergPreCreatedFixture,
 };
 pub use influxdb::{
-    InfluxDbSinkBase64Fixture, InfluxDbSinkFixture, InfluxDbSinkNoMetadataFixture,
-    InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture, InfluxDbSourceFixture,
-    InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
+    InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,
+    InfluxDbSinkNoMetadataFixture, InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
+    InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
 pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, MeilisearchSourceFixture};
 pub use mongodb::{

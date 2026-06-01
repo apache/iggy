@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::{self, HandlerResult, MAX_CONTROL_FRAME_PAYLOAD};
+use crate::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -27,7 +28,7 @@ use compio::quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
 use iggy_binary_protocol::RequestFrame;
 use iggy_binary_protocol::codes::{GET_CLUSTER_METADATA_CODE, SEND_MESSAGES_CODE, command_name};
-use iggy_common::{IggyError, SenderKind, TransportProtocol};
+use iggy_common::{IggyError, TransportProtocol};
 use std::rc::Rc;
 use tracing::{debug, error, info, trace, warn};
 

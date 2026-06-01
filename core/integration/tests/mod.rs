@@ -31,15 +31,24 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+#[cfg(not(feature = "vsr"))]
 mod cli;
+#[cfg(not(feature = "vsr"))]
 mod cluster;
+#[cfg(not(feature = "vsr"))]
 mod config_provider;
+#[cfg(not(feature = "vsr"))]
 mod connectors;
+#[cfg(not(feature = "vsr"))]
 mod data_integrity;
+#[cfg(not(feature = "vsr"))]
 mod mcp;
 mod sdk;
+#[cfg(not(feature = "vsr"))]
 mod server;
+#[cfg(not(feature = "vsr"))]
 mod state;
+mod storage;
 
 lazy_static! {
     static ref TESTS_FAILED: AtomicBool = AtomicBool::new(false);

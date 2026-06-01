@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
+use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, ensure_keyring_store};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::PersonalAccessTokenExpiry;
-use keyring::Entry;
+use keyring_core::Entry;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 use std::fmt::{Display, Formatter, Result};
@@ -53,6 +53,7 @@ struct TestLoginOptions {
 
 impl TestLoginOptions {
     fn new(token_name: String, using_token: UsingToken, server_address: String) -> Self {
+        ensure_keyring_store();
         Self {
             token_name: token_name.clone(),
             token_value: None,

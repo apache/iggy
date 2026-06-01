@@ -43,7 +43,7 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 - **Auto-commit** offset policies: `Interval`, `When`, `After`, `IntervalOrWhen`, `IntervalOrAfter`, or disabled.
 - **Stream builder** (`IggyStream`, `IggyStreamProducer`, `IggyStreamConsumer`) for declarative producer + consumer setup on shared or separate stream/topic.
 - **Reliability**: automatic reconnection with retries, heartbeat, send retries, and offset auto-commit handled by the high-level API.
-- **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), per-topic compression (currently `None` and `Gzip`), server-honored message expiry, and server-side deduplication.
+- **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), topic compression metadata (`None` and `Gzip`; no runtime compression yet), server-honored message expiry, and server-side deduplication.
 - **Admin**: stream/topic/partition CRUD, consumer-group management, server-side consumer offsets, system stats.
 
 ## Installation

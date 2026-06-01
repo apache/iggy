@@ -1,0 +1,143 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Issue Labeler / Assigner
+
+# Two add-only triage steps that run when a reporter opens or edits an issue:
+#
+# 1. Label: maps the "Affected area / component" dropdown from the bug/feature
+#    issue forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters
+#    who lack triage permission still get their issue categorized at creation.
+#
+# 2. Assign: if the reporter ticked the "Contribution" checkbox ("I'm willing
+#    to submit a pull request ..."), assign the issue to its author so the
+#    volunteer is on record. addAssignees is idempotent and issue authors are
+#    always assignable, even as outside contributors.
+#
+# Add-only by design: neither step removes anything. Reporters rarely deselect,
+# and removing would fight maintainers who labeled or reassigned by hand. Both
+# API calls are idempotent, so re-running on `edited` is harmless.
+#
+# SECURITY: the issue body is attacker-controlled text. The label step parses
+# it only for exact matches against the fixed AREA_LABELS allowlist below. The
+# assign step uses the body only as a boolean gate; the assignee comes from the
+# trusted `payload.issue.user.login`, never from body content, so the body
+# cannot inject an assignee. No checkout, no exec of issue contents, no token
+# export.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Apply area labels from issue form
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Dropdown option text -> repo label. Keep in sync with the
+            // `Affected area / component` options in
+            // .github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml.
+            const AREA_LABELS = {
+              'Iggy server': 'server',
+              'Rust SDK': 'rust',
+              'Go SDK': 'go',
+              'Java SDK': 'java',
+              'Python SDK': 'python',
+              'C# SDK': 'csharp',
+              'Node.js SDK': 'javascript',
+              'C++ SDK': 'C++',
+              'PHP SDK': 'php',
+              'CLI': 'tui',
+              'Web UI': 'web',
+              'Connectors': 'connectors',
+              'MCP server': 'mcp',
+              'Configuration': 'config',
+              'Wire protocol / API': 'api',
+              'Metadata': 'metadata',
+              'Clustering / replication': 'cluster',
+              'Performance': 'performance',
+              'Documentation': 'docs',
+              'CI / build / tooling': 'CI/CD',
+              // 'Other / not sure' intentionally maps to no label.
+            };
+            const HEADING = 'Affected area / component';
+
+            const body = context.payload.issue.body || '';
+            // Issue-form bodies render as `### <label>\n\n<value>`; capture
+            // the dropdown's value block, up to the next `###` or the end.
+            const esc = HEADING.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const section = body.match(
+              new RegExp('###[ \\t]+' + esc + '[ \\t]*\\n+([\\s\\S]*?)(?:\\n###|$)'),
+            );
+            // Multi-select renders the picks comma-separated on one line.
+            // Option text never contains a comma, so split on it safely.
+            const picks = (section ? section[1] : '')
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean);
+            const labels = [...new Set(
+              picks.map(p => AREA_LABELS[p]).filter(Boolean),
+            )];
+
+            if (labels.length === 0) {
+              core.info('no mappable area selected, nothing to label');
+              return;
+            }
+            core.info(`applying labels: ${labels.join(', ')}`);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              labels,
+            });
+
+      - name: Assign author who volunteered to contribute
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // The "Contribution" checkbox in both issue forms renders as a
+            // task-list line. Checked, it reads `- [x] I'm willing to submit a
+            // pull request ...`; the tail differs per template (bug: "to fix
+            // this bug", feature: "to implement this feature"), so match the
+            // shared prefix only.
+            const body = context.payload.issue.body || '';
+            const volunteered =
+              /(^|\n)\s*-\s*\[[xX]\]\s+I'm willing to submit a pull request/.test(body);
+            if (!volunteered) {
+              core.info('author did not volunteer to contribute, nothing to assign');
+              return;
+            }
+
+            // Assignee is the trusted author from the event payload, never the
+            // body. addAssignees is a no-op if already assigned and silently
+            // ignores non-assignable users; issue authors are always assignable.
+            const author = context.payload.issue.user.login;
+            core.info(`assigning volunteering author: ${author}`);
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              assignees: [author],
+            });

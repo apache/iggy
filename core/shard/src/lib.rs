@@ -18,6 +18,7 @@
 pub mod builder;
 pub mod config;
 pub mod coordinator;
+pub mod metrics;
 mod router;
 pub mod shards_table;
 
@@ -27,14 +28,12 @@ use consensus::{
     LocalPipeline, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     Sequencer, VsrAction, VsrConsensus,
 };
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{
-    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Message, MessageBag, PrepareHeader,
-    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -45,6 +44,8 @@ use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use partitions::{IggyPartition, IggyPartitions};
+use server_common::sharding::IggyNamespace;
+use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -105,12 +106,34 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Bootstrap uses this to build the per-shard sender `Vec` such that
 /// `vec[i]` necessarily reaches shard `i`.
 #[must_use]
-pub fn shard_channel<R: Send + 'static>(
-    owner_shard: u16,
-    capacity: usize,
-) -> (TaggedSender<R>, Receiver<ShardFrame<R>>) {
-    let (tx, rx) = channel::<ShardFrame<R>>(capacity);
+pub fn shard_channel(owner_shard: u16, capacity: usize) -> (TaggedSender, Receiver<ShardFrame>) {
+    let (tx, rx) = channel::<ShardFrame>(capacity);
     (TaggedSender::new(owner_shard, tx), rx)
+}
+
+/// Build canonical-ordered `(senders, inboxes)` pair for an N-shard mesh.
+///
+/// Each `inboxes[i]` drains exclusively on the runtime owning shard `i`. The
+/// returned `senders` Vec satisfies `senders[i].shard_id() == i` by
+/// construction; clone it into every shard before spawning so all shards
+/// share the same mesh.
+///
+/// Receivers are wrapped in `Option` because [`Receiver`] (crossfire
+/// `AsyncRx`) is non-cloneable on purpose; bootstrap takes the slot for
+/// shard `i` exactly once when spawning the owning thread.
+#[must_use]
+pub fn shard_mesh_channels(
+    total_shards: u16,
+    capacity: usize,
+) -> (Vec<TaggedSender>, Vec<Option<Receiver<ShardFrame>>>) {
+    let mut senders = Vec::with_capacity(total_shards as usize);
+    let mut inboxes = Vec::with_capacity(total_shards as usize);
+    for shard_id in 0..total_shards {
+        let (tx, rx) = shard_channel(shard_id, capacity);
+        senders.push(tx);
+        inboxes.push(Some(rx));
+    }
+    (senders, inboxes)
 }
 
 /// A [`Sender`] annotated with the id of the shard whose paired receiver it
@@ -121,20 +144,20 @@ pub fn shard_channel<R: Send + 'static>(
 /// permuted `Vec<Sender<_>>` would silently misroute every setup, mapping,
 /// and forward frame. Construct senders through [`shard_channel`] (or
 /// [`TaggedSender::new`]) at the channel-creation site; the coordinator and
-/// [`IggyShard`] ctors then assert `senders[i].shard_id() == i`, turning the
-/// ordering invariant from a doc comment into a ctor-checked type property.
-pub struct TaggedSender<R: Send + 'static = ()> {
+/// [`IggyShard`] ctors then validate `senders[i].shard_id() == i`,
+/// returning [`ShardCtorError`] if violated.
+pub struct TaggedSender {
     shard_id: u16,
-    inner: Sender<ShardFrame<R>>,
+    inner: Sender<ShardFrame>,
 }
 
-impl<R: Send + 'static> TaggedSender<R> {
+impl TaggedSender {
     /// Wrap an already-constructed sender with the id of the shard whose
     /// paired receiver drains it. Prefer [`shard_channel`] unless an
     /// existing sender is being re-tagged (e.g., tests that build senders
     /// manually and know the ordering is correct).
     #[must_use]
-    pub const fn new(shard_id: u16, inner: Sender<ShardFrame<R>>) -> Self {
+    pub const fn new(shard_id: u16, inner: Sender<ShardFrame>) -> Self {
         Self { shard_id, inner }
     }
 
@@ -142,14 +165,9 @@ impl<R: Send + 'static> TaggedSender<R> {
     pub const fn shard_id(&self) -> u16 {
         self.shard_id
     }
-
-    #[must_use]
-    pub const fn sender(&self) -> &Sender<ShardFrame<R>> {
-        &self.inner
-    }
 }
 
-impl<R: Send + 'static> Clone for TaggedSender<R> {
+impl Clone for TaggedSender {
     fn clone(&self) -> Self {
         Self {
             shard_id: self.shard_id,
@@ -158,38 +176,78 @@ impl<R: Send + 'static> Clone for TaggedSender<R> {
     }
 }
 
-impl<R: Send + 'static> std::ops::Deref for TaggedSender<R> {
-    type Target = Sender<ShardFrame<R>>;
+impl std::ops::Deref for TaggedSender {
+    type Target = Sender<ShardFrame>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-/// Assert the canonical ordering `senders[i].shard_id() == i`. Called from
-/// every ctor that accepts a pre-built `Vec<TaggedSender<_>>`.
+/// Error returned by [`IggyShard::new`] and the shard builder when ctor
+/// preconditions are violated.
 ///
-/// # Panics
-///
-/// Panics if any sender in `senders` carries a `shard_id` that does not
-/// match its index. Bootstrap programming error.
-fn assert_sender_ordering<R: Send + 'static>(senders: &[TaggedSender<R>]) {
-    for (idx, sender) in senders.iter().enumerate() {
-        let expected = u16::try_from(idx).expect("shard count must fit in u16");
-        assert_eq!(
-            sender.shard_id(),
-            expected,
-            "senders[{idx}] carries shard_id {}; inter-shard vec must be in canonical order",
-            sender.shard_id(),
-        );
-    }
+/// Both are bootstrap programming errors: the surrounding crate either
+/// built the `senders` vec out of canonical order, or produced more
+/// shards than the inter-shard addressing scheme supports. Surfaced as
+/// `Err` instead of panicking so the host process can log and abort with
+/// a typed error.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ShardCtorError {
+    #[error(
+        "senders[{index}] carries shard_id {actual}; inter-shard vec must be in canonical \
+         order (senders[i].shard_id() == i)"
+    )]
+    SenderOrderingInvalid {
+        index: usize,
+        expected: u16,
+        actual: u16,
+    },
+    #[error("shard count {count} does not fit in u16; inter-shard frame addressing is u16-indexed")]
+    ShardCountOverflow { count: usize },
+    #[error(
+        "shard-0 coordinator senders length {senders} does not match total_shards {total_shards} \
+         (total_shards must be >= 1 and equal senders.len())"
+    )]
+    CoordinatorSendersMismatch { senders: usize, total_shards: u16 },
 }
 
-/// Payload carried by a [`ShardFrame`].
+/// Validate the canonical ordering `senders[i].shard_id() == i`.
+/// Returns `Err` for the first index that violates the invariant.
+pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), ShardCtorError> {
+    for (idx, sender) in senders.iter().enumerate() {
+        let expected = u16::try_from(idx).map_err(|_| ShardCtorError::ShardCountOverflow {
+            count: senders.len(),
+        })?;
+        let actual = sender.shard_id();
+        if actual != expected {
+            return Err(ShardCtorError::SenderOrderingInvalid {
+                index: idx,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Lifecycle frame variants.
+///
+/// Connection setup and cross-shard forwards: every frame the inter-shard
+/// channel carries that is NOT a consensus protocol message lives here.
+/// Splitting these out from [`ShardFrame::Consensus`] keeps the consensus
+/// dispatch path hot and cache-tight while leaving lifecycle traffic on
+/// the same single channel (preserving relative ordering between consensus
+/// and lifecycle frames at near-zero cost).
+///
+/// Trade-off: consensus and lifecycle traffic compete for one bounded
+/// inbox. A consensus burst or retransmit storm can fill it exactly when
+/// a terminal-drop [`LifecycleFrame::ForwardClientSend`] needs the space;
+/// `inbox_capacity` is a single knob and cannot isolate the two frame
+/// classes.
 #[non_exhaustive]
-pub enum ShardFramePayload {
-    /// A consensus protocol message routed between shards.
-    Consensus(Message<GenericHeader>),
+pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound replica TCP connection fd to the owning
     /// shard. The receiving shard wraps the fd in a `TcpStream` and spawns
     /// writer + reader tasks on its own compio runtime. The `fd` is an
@@ -221,12 +279,6 @@ pub enum ShardFramePayload {
     /// Shard 0 therefore terminates QUIC locally and uses the existing
     /// `ForwardClientSend` variant for outbound traffic.
     ClientWsConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
-    /// Shard 0 broadcasts the owner for a replica to every shard so each
-    /// bus' `send_to_replica` slow path can route through the correct owner.
-    ReplicaMappingUpdate { replica_id: u8, owning_shard: u16 },
-    /// Shard 0 broadcasts that a replica mapping should be forgotten (e.g.
-    /// after a connection loss and before the next allocate).
-    ReplicaMappingClear { replica_id: u8 },
     /// A non-owning shard forwards a replica send to the owning shard's
     /// local bus; the owning shard then takes the fast path.
     ForwardReplicaSend {
@@ -239,83 +291,58 @@ pub enum ShardFramePayload {
         client_id: u128,
         msg: Frozen<MESSAGE_ALIGN>,
     },
-    /// Owning shard notifies shard 0 that a replica connection died.
-    /// Shard 0 clears the mapping cluster-wide and drives a reconnect.
-    ConnectionLost { replica_id: u8 },
 }
 
-/// Envelope for inter-shard channel messages.
+/// Inter-shard channel envelope.
 ///
-/// Wraps a [`ShardFramePayload`] together with an optional one-shot response
-/// channel.  Fire-and-forget dispatches leave `response_sender` as `None`;
-/// request-response dispatches provide a sender that the message pump will
-/// notify once the message has been processed.
-///
-/// The response type `R` is generic so that higher layers (e.g. HTTP handlers)
-/// can carry a response enum while the consensus layer can default to `()`.
-pub struct ShardFrame<R: Send + 'static = ()> {
-    pub payload: ShardFramePayload,
-    pub response_sender: Option<Sender<R>>,
+/// Concrete enum; no generic. Consensus dispatches are fire-and-forget by
+/// VSR design (replies travel as their own wire-level messages: `Reply`
+/// to clients, `PrepareOk` to the primary), so no response channel rides
+/// in the frame.
+#[non_exhaustive]
+pub enum ShardFrame {
+    /// A consensus protocol message (Request / Prepare / `PrepareOk` /
+    /// view-change family / Commit). Fire-and-forget. Drops on full inbox
+    /// are recovered by VSR retransmit timers.
+    ///
+    /// `target_shard` is stamped by the sender at enqueue time, so the
+    /// receiving pump never re-derives routing in release builds. The
+    /// receiver still validates `target_shard == self.id` and drops
+    /// frames stamped for the wrong shard (`MISROUTED`) to preserve the
+    /// single-pump invariant under any caller bug.
+    Consensus {
+        target_shard: u16,
+        message: Message<GenericHeader>,
+    },
+    /// A connection setup or cross-shard forward frame. Drop recovery
+    /// depends on the frame class: [`LifecycleFrame::ForwardReplicaSend`]
+    /// is VSR-covered, connection-setup frames are recovered by the
+    /// connector's periodic reconnect sweep, but
+    /// [`LifecycleFrame::ForwardClientSend`] is terminal - no retransmit,
+    /// the client never receives the reply.
+    Lifecycle(LifecycleFrame),
 }
 
-impl<R: Send + 'static> ShardFrame<R> {
-    /// Create a fire-and-forget consensus message frame.
+impl ShardFrame {
+    /// Create a consensus frame addressed to `target_shard`. The sender
+    /// is the routing authority; `accept_frame_for_self` compares this
+    /// stamp against the receiving shard id in O(1).
     #[must_use]
-    pub const fn fire_and_forget(message: Message<GenericHeader>) -> Self {
-        Self {
-            payload: ShardFramePayload::Consensus(message),
-            response_sender: None,
+    pub const fn consensus(target_shard: u16, message: Message<GenericHeader>) -> Self {
+        Self::Consensus {
+            target_shard,
+            message,
         }
     }
 
-    /// Create a request-response consensus message frame. Returns the frame
-    /// and a receiver that the caller can await for completion notification.
+    /// Create a lifecycle frame.
     #[must_use]
-    pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
-        let (tx, rx) = channel(1);
-        (
-            Self {
-                payload: ShardFramePayload::Consensus(message),
-                response_sender: Some(tx),
-            },
-            rx,
-        )
-    }
-
-    /// Create a fire-and-forget lifecycle frame (connection setup, loss).
-    #[must_use]
-    pub const fn lifecycle(payload: ShardFramePayload) -> Self {
-        Self {
-            payload,
-            response_sender: None,
-        }
+    pub const fn lifecycle(payload: LifecycleFrame) -> Self {
+        Self::Lifecycle(payload)
     }
 }
 
-/// Broadcast a `ReplicaMappingClear` to every shard (including sender-self).
-///
-/// Used by shard 0's `ConnectionLost` handler and by
-/// [`coordinator::ShardZeroCoordinator::broadcast_mapping_clear`] so both
-/// paths go through the same try-send-and-log logic. `try_send` failures
-/// (inbox full or disconnected) are logged at debug: the next mapping
-/// broadcast or reconnect sweep will reconcile.
-pub(crate) fn broadcast_mapping_clear<R: Send + 'static>(
-    senders: &[TaggedSender<R>],
-    replica_id: u8,
-) {
-    for sender in senders {
-        let clear = ShardFramePayload::ReplicaMappingClear { replica_id };
-        if let Err(e) = sender.try_send(ShardFrame::lifecycle(clear)) {
-            tracing::debug!(
-                shard_id = sender.shard_id(),
-                replica_id,
-                "mapping clear try_send failed: {e:?}"
-            );
-        }
-    }
-}
-
-pub struct IggyShard<B, MJ, S, M, T = (), R: Send + 'static = ()>
+pub struct IggyShard<B, MJ, S, M, T = ()>
 where
     B: MessageBus,
 {
@@ -324,8 +351,8 @@ where
     pub plane: ShardPlane<B, MJ, S, M>,
 
     /// Handle to the local bus. Retained alongside the bus owned by every
-    /// consensus plane so the router can reach the `ConnectionInstaller` /
-    /// mapping surface without going through consensus.
+    /// consensus plane so the router can reach the `ConnectionInstaller`
+    /// surface without going through consensus.
     pub bus: B,
 
     /// Callback attached to every delegated replica connection installed
@@ -344,26 +371,33 @@ where
     /// [`assert_sender_ordering`] is invoked in the ctor so `senders[i]`
     /// is guaranteed to feed the shard whose `id == i`. Call sites can
     /// therefore index by `target_shard` without re-checking.
-    senders: Vec<TaggedSender<R>>,
+    senders: Vec<TaggedSender>,
+
+    /// Total shard count, cached from `senders.len()` at construction.
+    /// `senders` is immutable post-ctor, so consensus routing reads this
+    /// rather than recomputing the `usize -> u32` conversion per frame.
+    shard_count: u32,
 
     /// Receiver end of this shard's inbox.  Peer shards (and self) send
     /// messages here via the corresponding sender.
-    inbox: Receiver<ShardFrame<R>>,
+    inbox: Receiver<ShardFrame>,
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
     partition_consensus: PartitionConsensusConfig<B>,
 
-    /// Shard 0 coordinator, set at bootstrap on shard 0 only. The router's
-    /// `ConnectionLost` handler calls [`coordinator::ShardZeroCoordinator::forget_mapping`]
-    /// so the periodic refresh task stops re-broadcasting the mapping of
-    /// a replica that has disconnected. `None` on non-zero shards and in
-    /// single-shard tests that bypass the coordinator.
-    coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator<R>>>,
+    /// Shard 0 coordinator, supplied at construction. Holds round-robin
+    /// state for replica and client delegation. `None` on non-zero shards
+    /// and in single-shard tests that bypass the coordinator.
+    coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
+
+    /// Per-shard observability counters. Cloned at metric increment sites,
+    /// so cheap (`Arc` clone) regardless of label cardinality.
+    metrics: crate::metrics::ShardMetrics,
 }
 
-impl<B, MJ, S, M, T, R: Send + 'static> IggyShard<B, MJ, S, M, T, R>
+impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -371,22 +405,29 @@ where
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
-    ///   by the consensus planes so the router can reach installer /
-    ///   mapping operations directly).
+    ///   by the consensus planes so the router can reach the
+    ///   `ConnectionInstaller` surface directly).
     /// * `senders` - one [`TaggedSender`] per shard. The ctor asserts
     ///   `senders[i].shard_id() == i`; use [`shard_channel`] at
     ///   construction time so every sender carries the id of the shard
     ///   whose receiver drains it.
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `shards_table` - namespace -> shard routing table.
+    /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
+    ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
+    ///   the coordinator is injected at construction time so an
+    ///   `IggyShard` cannot appear half-wired to a reader.
+    /// * `metrics` - per-shard observability handle; currently the
+    ///   `frame_drops_total` counter.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `senders` is not in canonical order (any
-    /// `senders[i].shard_id() != i`). That is a bootstrap programming
-    /// error; the resulting permutation would silently misroute every
-    /// inter-shard frame.
-    #[must_use]
+    /// Returns [`ShardCtorError::SenderOrderingInvalid`] if `senders` is
+    /// not in canonical order (any `senders[i].shard_id() != i`) and
+    /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
+    /// fit in `u16`. Both are bootstrap programming errors: the
+    /// permutation would silently misroute every inter-shard frame, or
+    /// addressing space (u16) would wrap.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: ShardIdentity,
@@ -395,15 +436,21 @@ where
         on_client_request: RequestHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
-        senders: Vec<TaggedSender<R>>,
-        inbox: Receiver<ShardFrame<R>>,
+        senders: Vec<TaggedSender>,
+        inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
-    ) -> Self {
-        assert_sender_ordering(&senders);
+        coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
+        metrics: crate::metrics::ShardMetrics,
+    ) -> Result<Self, ShardCtorError> {
+        validate_sender_ordering(&senders)?;
+        let shard_count =
+            u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
+                count: senders.len(),
+            })?;
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
-        Self {
+        Ok(Self {
             id,
             name,
             plane,
@@ -411,29 +458,22 @@ where
             on_replica_message,
             on_client_request,
             senders,
+            shard_count,
             inbox,
             shards_table,
             partition_consensus,
-            coordinator: None,
-        }
+            coordinator,
+            metrics,
+        })
     }
 
-    /// Attach a shard-0 coordinator. Bootstrap calls this on the shard 0
-    /// `IggyShard` only; other shards keep `coordinator = None`. The
-    /// router's `ConnectionLost` handler will call
-    /// [`coordinator::ShardZeroCoordinator::forget_mapping`] via this
-    /// reference so the periodic refresh stops re-broadcasting dead
-    /// replica mappings.
-    pub fn set_coordinator(&mut self, coord: Rc<crate::coordinator::ShardZeroCoordinator<R>>) {
-        self.coordinator = Some(coord);
-    }
-
-    /// `true` when a [`coordinator::ShardZeroCoordinator`] has been attached
-    /// via [`set_coordinator`](Self::set_coordinator). Shard 0 bootstrap is
-    /// expected to flip this on; every other shard keeps it `false`.
+    /// Return a clone of the shard-0 coordinator handle, if attached.
+    /// Bootstrap uses this to wire the listener accept callbacks
+    /// (replica + client) to coordinator-driven fd-delegation instead
+    /// of installing connections locally on shard 0.
     #[must_use]
-    pub const fn has_coordinator(&self) -> bool {
-        self.coordinator.is_some()
+    pub fn coordinator(&self) -> Option<Rc<crate::coordinator::ShardZeroCoordinator>> {
+        self.coordinator.clone()
     }
 
     /// Create a shard without inter-shard channels or delegated connections.
@@ -451,9 +491,9 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
-        // TODO: previously we used unbounded channel with flume,
-        // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
-        // This needs to be revisited in the future.
+        // TODO(hubcio): crossfire's Flavor trait blocks unbounded channels
+        // with the current type setup; revisit when crossfire grows an
+        // unbounded variant or we replace it.
         let (_tx, inbox) = channel(1);
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
@@ -466,9 +506,17 @@ where
             plane,
             coordinator: None,
             senders: Vec::new(),
+            // The simulator delivers inbound messages straight to
+            // `on_message`, bypassing the inter-shard router. The router's
+            // `shard_count` should therefore never be read on this path,
+            // but `pub fn dispatch` is still reachable; pinning to 1 keeps
+            // `% shard_count` from panicking if a future caller slips
+            // through, while preserving single-shard routing semantics.
+            shard_count: 1,
             inbox,
             shards_table,
             partition_consensus,
+            metrics: crate::metrics::ShardMetrics::for_shard(),
         }
     }
 
@@ -480,7 +528,7 @@ where
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
-impl<B, MJ, S, M, T, R: Send + 'static> IggyShard<B, MJ, S, M, T, R>
+impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
     B: MessageBus,
 {
@@ -488,6 +536,15 @@ where
     ///
     /// Routes requests, replication messages, and acks to either the metadata
     /// plane or the partitions plane based on `PlaneIdentity::is_applicable`.
+    //
+    // TODO(hubcio): perf - this `MessageBag::try_from` is the second parse of
+    // the same frame; the first ran in `IggyShard::dispatch` (router.rs ~85)
+    // to extract (operation, namespace) for routing. The work here re-runs
+    // `bytemuck::checked::try_from_bytes` + per-header `validate()` on bytes
+    // already validated upstream. See the matching TODO in router.rs for the
+    // fix: thread the classified `MessageBag` through `ShardFrame::Consensus`
+    // so this function takes the bag directly and the match below dispatches
+    // without re-parsing.
     #[allow(clippy::future_not_send)]
     pub async fn on_message(&self, message: Message<GenericHeader>)
     where
@@ -587,7 +644,11 @@ where
     /// # Panics
     /// Panics if a loopback message is not a valid `PrepareOk` message.
     #[allow(clippy::future_not_send)]
-    pub async fn process_loopback(&self, buf: &mut Vec<Message<GenericHeader>>) -> usize
+    pub async fn process_loopback(
+        &self,
+        buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> usize
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -603,6 +664,10 @@ where
             > + StreamsFrontend,
     {
         debug_assert!(buf.is_empty(), "buf must be empty on entry");
+        debug_assert!(
+            namespace_scratch.is_empty(),
+            "namespace_scratch must be empty on entry",
+        );
 
         let mut total = 0;
         let planes = self.plane.inner();
@@ -619,8 +684,8 @@ where
             }
         }
 
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
+        namespace_scratch.extend(planes.1.0.namespaces().copied());
+        for namespace in namespace_scratch.drain(..) {
             let partition = planes
                 .1
                 .0
@@ -642,9 +707,17 @@ where
 
     /// Initializes a partition and its dedicated consensus instance on this shard.
     ///
+    /// Used only by the `simulator` crate to seed partitions on the
+    /// in-process replica array. Production boots via the
+    /// `load_partition` helper in `server-ng` bootstrap, which takes the
+    /// cluster `self_replica_id` explicitly from `topology` and never
+    /// folds the local shard id into the consensus replica space.
+    ///
     /// # Panics
-    /// Panics if the shard id does not fit in `u8`, which is currently required
-    /// by the partition consensus replica id.
+    /// Panics if `self.id > u8::MAX` (256+). The simulator currently
+    /// caps replica count at `MAX_REPLICAS = 256`, so the cast always
+    /// succeeds in the only caller; the constraint is recorded here so
+    /// any future caller in production code reads it before the cast.
     pub fn init_partition(&mut self, namespace: IggyNamespace)
     where
         B: MessageBus + Clone,
@@ -678,6 +751,23 @@ where
 
     /// Handle incoming view-change/control message. Metadata use metadata
     /// consensus. Partitions loop all partitions, use partition consensus.
+    ///
+    // TODO(hubcio): every VSR callback below
+    // (`on_start_view_change`, `on_do_view_change`, `on_start_view`,
+    // `on_commit`, `tick_partitions`) materialises
+    // `planes.1.0.namespaces().copied().collect::<Vec<_>>()` per call to
+    // avoid borrowing the partitions plane across the partition-consensus
+    // `.await` inside the loop. Allocs scale with VSR traffic, not with
+    // useful work: a quiet cluster still pays one Vec per heartbeat tick.
+    // Convert to the `namespace_scratch: RefCell<Vec<IggyNamespace>>`
+    // pattern already used by `process_loopback` (see :646-684) so the
+    // scratch is reused across calls. Asserts on entry/exit keep the
+    // "empty on entry, drained on exit" invariant explicit.
+    //
+    // Reproducible in `core/simulator`: sim drives these callbacks via
+    // `tick()` against `IggyShard`, so an allocation-counting variant of
+    // `MemStorage`/test harness can pin the per-VSR-cb alloc count and
+    // fail on regression after the scratch refactor lands.
     #[allow(clippy::future_not_send)]
     async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
     where

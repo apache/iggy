@@ -22,6 +22,7 @@ version = 0
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
 verbose = false
+benchmark = true # Emit per-batch timings on target `iggy_connectors::benchmark`
 
 [[streams]]
 stream = "example_stream"

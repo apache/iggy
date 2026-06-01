@@ -28,11 +28,15 @@ mod offset_storage;
 mod segment;
 mod types;
 
-use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
-pub use iggy_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
+pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
+pub use messages_writer::MessagesWriter;
+pub use segment::Segment;
+use server_common::Message;
+pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
     PollingArgs, PollingConsumer, SendMessagesResult,
