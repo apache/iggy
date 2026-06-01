@@ -19,9 +19,11 @@
 
 mod container;
 mod sink;
+mod source;
 
 pub use container::MongoDbOps;
 pub use sink::{
     MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
+pub use source::MongodbSourcePreCreatedFixture;

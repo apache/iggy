@@ -38,6 +38,8 @@ pub(super) const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub(super) const DEFAULT_TEST_TOPIC: &str = "test_topic";
 pub(super) const DEFAULT_SINK_COLLECTION: &str = "iggy_messages";
 pub(super) const DEFAULT_TEST_DATABASE: &str = "iggy_test";
+pub(super) const DEFAULT_SOURCE_DATABASE: &str = "test_source";
+pub(super) const DEFAULT_SOURCE_COLLECTION: &str = "test_messages";
 
 pub(super) const DEFAULT_POLL_ATTEMPTS: usize = 100;
 pub(super) const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
@@ -66,6 +68,26 @@ pub(super) const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_MONGODB
 pub(super) const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
     "IGGY_CONNECTORS_SINK_MONGODB_STREAMS_0_CONSUMER_GROUP";
 pub(super) const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_MONGODB_PATH";
+
+// Source env vars
+pub(super) const ENV_SOURCE_CONNECTION_URI: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_CONNECTION_URI";
+pub(super) const ENV_SOURCE_DATABASE: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_DATABASE";
+pub(super) const ENV_SOURCE_COLLECTION: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_COLLECTION";
+pub(super) const ENV_SOURCE_POLLING_INTERVAL: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_POLLING_INTERVAL";
+pub(super) const ENV_SOURCE_TIMESTAMP_FIELD: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_TIMESTAMP_FIELD";
+pub(super) const ENV_SOURCE_LIMIT: &str = "IGGY_CONNECTORS_SOURCE_MONGODB_PLUGIN_CONFIG_LIMIT";
+pub(super) const ENV_SOURCE_STREAMS_0_STREAM: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_STREAMS_0_STREAM";
+pub(super) const ENV_SOURCE_STREAMS_0_TOPIC: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_STREAMS_0_TOPIC";
+pub(super) const ENV_SOURCE_STREAMS_0_SCHEMA: &str =
+    "IGGY_CONNECTORS_SOURCE_MONGODB_STREAMS_0_SCHEMA";
+pub(super) const ENV_SOURCE_PATH: &str = "IGGY_CONNECTORS_SOURCE_MONGODB_PATH";
 
 /// Base container management for MongoDB fixtures.
 pub struct MongoDbContainer {
