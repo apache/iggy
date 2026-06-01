@@ -31,7 +31,6 @@
     "require-dev": {
         "phpunit/phpunit": "^10.5"
     },
-    "autoload": {},
     "php-ext": {
         "extension-name": "iggy_php",
         "support-zts": false,
@@ -40,54 +39,6 @@
         "download-url-method": [
             "pre-packaged-binary",
             "composer-default"
-        ]
-    },
-    "archive": {
-        "exclude": [
-            "/.asf.yaml",
-            "/.claude",
-            "/.config",
-            "/.dockerignore",
-            "/.github",
-            "/.gitignore",
-            "/.markdownlint.json",
-            "/.markdownlint.yml",
-            "/.pre-commit-config.yaml",
-            "/.taplo.toml",
-            "/.typos.toml",
-            "/AGENTS.md",
-            "/ASF_LICENSE.txt",
-            "/CLAUDE.md",
-            "/CONTRIBUTING.md",
-            "/Cargo.lock",
-            "/DISCLAIMER",
-            "/Dockerfile",
-            "/PULL_REQUEST_TEMPLATE.md",
-            "/about.hbs",
-            "/about.toml",
-            "/assets",
-            "/bdd",
-            "/cliff.toml",
-            "/codecov.yml",
-            "/core",
-            "/docker-compose.yml",
-            "/examples",
-            "/foreign/csharp",
-            "/foreign/cpp",
-            "/foreign/go",
-            "/foreign/java",
-            "/foreign/node",
-            "/foreign/python",
-            "/helm",
-            "/justfile",
-            "/rust-toolchain.toml",
-            "/web",
-            "/Dockerfile.test",
-            "/docker-compose.test.yml",
-            "/phpunit.xml.dist",
-            "/target",
-            "/tests",
-            "/vendor"
         ]
     },
     "scripts": {
