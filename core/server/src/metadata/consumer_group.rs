@@ -152,18 +152,20 @@ impl ConsumerGroupMeta {
         let mut all_excess: Vec<(PartitionId, usize)> = Vec::new();
 
         for &mid in &member_ids {
-            let effective_count = self
-                .members
-                .get(mid)
-                .map(|m| {
-                    let pending: HashSet<PartitionId> = m
-                        .pending_revocations
-                        .iter()
-                        .map(|revocation| revocation.partition_id)
-                        .collect();
-                    m.partitions.iter().filter(|p| !pending.contains(p)).count()
-                })
-                .unwrap_or(0);
+            let Some(member) = self.members.get(mid) else {
+                continue;
+            };
+
+            let pending: HashSet<PartitionId> = member
+                .pending_revocations
+                .iter()
+                .map(|revocation| revocation.partition_id)
+                .collect();
+            let effective_count = member
+                .partitions
+                .iter()
+                .filter(|p| !pending.contains(p))
+                .count();
 
             let max_allowed = if members_with_remainder > 0 {
                 fair_share + 1
@@ -183,23 +185,13 @@ impl ConsumerGroupMeta {
                 members_with_remainder = members_with_remainder.saturating_sub(1);
             }
 
-            let revocable: Vec<PartitionId> = self
-                .members
-                .get(mid)
-                .map(|m| {
-                    let pending: HashSet<PartitionId> = m
-                        .pending_revocations
-                        .iter()
-                        .map(|revocation| revocation.partition_id)
-                        .collect();
-                    m.partitions
-                        .iter()
-                        .rev()
-                        .filter(|p| !pending.contains(p))
-                        .copied()
-                        .collect()
-                })
-                .unwrap_or_default();
+            let revocable: Vec<PartitionId> = member
+                .partitions
+                .iter()
+                .rev()
+                .filter(|p| !pending.contains(p))
+                .copied()
+                .collect();
 
             for partition_id in revocable.into_iter().take(excess_count) {
                 all_excess.push((partition_id, mid));

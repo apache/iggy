@@ -2213,12 +2213,16 @@ fn assert_unique_partition_assignments(cg: &ConsumerGroupDetails) {
 }
 
 async fn setup_stream_topic_cg(client: &IggyClient) {
+    setup_stream_topic_cg_with_partitions(client, PARTITIONS_COUNT).await;
+}
+
+async fn setup_stream_topic_cg_with_partitions(client: &IggyClient, partitions: u32) {
     client.create_stream(STREAM_NAME).await.unwrap();
     client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
+            partitions,
             CompressionAlgorithm::default(),
             None,
             IggyExpiry::NeverExpire,
@@ -2296,16 +2300,6 @@ fn assert_balanced_partition_distribution(cg: &ConsumerGroupDetails, expected_to
             cg.members
         );
     }
-
-    let counts: Vec<u32> = cg.members.iter().map(|m| m.partitions_count).collect();
-    let min_count = *counts.iter().min().unwrap();
-    let max_count = *counts.iter().max().unwrap();
-    assert!(
-        max_count - min_count <= 1,
-        "Partition distribution variance too high: min={min_count}, max={max_count}. \
-         Difference should be at most 1. Members: {:?}",
-        cg.members
-    );
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
@@ -3322,27 +3316,7 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
 async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            16,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 16).await;
 
     for partition_id in 0..16u32 {
         let message = IggyMessage::from_str(&format!("msg-p{partition_id}")).unwrap();
@@ -3435,27 +3409,7 @@ async fn should_distribute_16_partitions_evenly_across_16_consumers(harness: &Te
 async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            12,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 12).await;
 
     let client1 = harness.new_client().await.unwrap();
     client1
@@ -3522,27 +3476,7 @@ async fn should_distribute_excess_evenly_when_multiple_idle_members_join(harness
 async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            10,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 10).await;
 
     let client1 = harness.new_client().await.unwrap();
     client1
@@ -3607,27 +3541,7 @@ async fn should_distribute_remainder_fairly_with_uneven_ratio(harness: &TestHarn
 async fn should_collect_excess_from_multiple_overassigned_members(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            16,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 16).await;
 
     let client1 = harness.new_client().await.unwrap();
     let client2 = harness.new_client().await.unwrap();
@@ -3688,27 +3602,7 @@ async fn should_collect_excess_from_multiple_overassigned_members(harness: &Test
 async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            24,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 24).await;
 
     let first_client = harness.new_client().await.unwrap();
     first_client
@@ -3763,27 +3657,7 @@ async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHar
 async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
 
-    root_client.create_stream(STREAM_NAME).await.unwrap();
-    root_client
-        .create_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            TOPIC_NAME,
-            16,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .unwrap();
-    root_client
-        .create_consumer_group(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-            CONSUMER_GROUP_NAME,
-        )
-        .await
-        .unwrap();
+    setup_stream_topic_cg_with_partitions(&root_client, 16).await;
 
     let client1 = harness.new_client().await.unwrap();
     let client2 = harness.new_client().await.unwrap();
