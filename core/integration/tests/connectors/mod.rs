@@ -31,6 +31,7 @@ mod postgres;
 mod quickwit;
 mod random;
 mod runtime;
+mod source_suite;
 mod stdout;
 
 use iggy_common::IggyTimestamp;
