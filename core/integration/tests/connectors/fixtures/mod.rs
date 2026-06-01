@@ -17,6 +17,7 @@
  * under the License.
  */
 
+mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
@@ -28,6 +29,9 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+pub use clickhouse::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
