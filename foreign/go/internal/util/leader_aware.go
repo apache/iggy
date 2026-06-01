@@ -21,7 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -31,25 +31,39 @@ import (
 
 // CheckAndRedirectToLeader queries the client for cluster metadata and returns
 // an address to redirect to (empty string means no redirection needed).
-func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddress string, transport iggcon.Protocol) (string, error) {
-	log.Println("Checking cluster metadata for leader detection")
+func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
+	if logger == nil {
+		logger = iggcon.NopLogger()
+	}
+	logger.Debug("Checking cluster metadata for leader detection")
 
 	meta, err := c.GetClusterMetadata(ctx)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return "", err
 		}
-		log.Printf("Failed to get cluster metadata: %v, connection will continue on server node %s\n", err, currentAddress)
+		logger.Warn(
+			"Failed to get cluster metadata, connection will continue on server node",
+			"error", err,
+			"current_address", currentAddress,
+		)
 		return "", nil
 	}
 
-	log.Printf("Got cluster metadata: %d nodes, cluster: %s\n", len(meta.Nodes), meta.Name)
-	return processClusterMetadata(meta, currentAddress, transport)
+	logger.Debug(
+		"Got cluster metadata",
+		"nodes", len(meta.Nodes),
+		"cluster", meta.Name,
+	)
+	return processClusterMetadata(meta, currentAddress, transport, logger)
 }
 
-func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress string, transport iggcon.Protocol) (string, error) {
+func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
 	if len(metadata.Nodes) == 1 {
-		log.Printf("Single-node cluster detected (%s), no leader redirection needed\n", metadata.Nodes[0].Name)
+		logger.Debug(
+			"Single-node cluster detected, no leader redirection needed",
+			"node", metadata.Nodes[0].Name,
+		)
 		return "", nil
 	}
 
@@ -63,7 +77,10 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 	}
 
 	if leader == nil {
-		log.Printf("No active leader found in cluster metadata, connection will continue on server node %s\n", currentAddress)
+		logger.Warn(
+			"No active leader found in cluster metadata, connection will continue on server node",
+			"current_address", currentAddress,
+		)
 		return "", nil
 	}
 
@@ -82,14 +99,23 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 	}
 
 	leaderAddress := net.JoinHostPort(leader.IP, strconv.Itoa(int(leaderPort)))
-	log.Printf("Found leader node: %s at %s (using %s transport)\n", leader.Name, leaderAddress, transport)
+	logger.Info(
+		"Found leader node",
+		"leader", leader.Name,
+		"address", leaderAddress,
+		"transport", transport,
+	)
 
 	if !isSameAddress(currentAddress, leaderAddress) {
-		log.Printf("Current connection to %s is not the leader, will redirect to %s\n", currentAddress, leaderAddress)
+		logger.Info(
+			"Current connection is not the leader, redirecting",
+			"current_address", currentAddress,
+			"leader_address", leaderAddress,
+		)
 		return leaderAddress, nil
 	}
 
-	log.Printf("Already connected to leader at %s\n", currentAddress)
+	logger.Debug("Already connected to leader at", "current_address", currentAddress)
 	return "", nil
 }
 

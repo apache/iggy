@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -39,6 +40,7 @@ type Option func(config *Options)
 
 type Options struct {
 	config config
+	logger *slog.Logger
 }
 
 func GetDefaultOptions() Options {
@@ -51,6 +53,7 @@ type IggyTcpClient struct {
 	conn                   net.Conn
 	mtx                    sync.Mutex
 	config                 config
+	logger                 *slog.Logger
 	MessageCompression     iggcon.IggyMessageCompression
 	leaderRedirectionState iggcon.LeaderRedirectionState
 	clientAddress          string
@@ -156,6 +159,17 @@ func WithServerAddress(address string) Option {
 	}
 }
 
+// WithLogger sets the logger for the TCP transport layer.
+//
+// When the transport is created via client.NewIggyClient, prefer
+// client.WithLogger to configure a single logger for client-level
+// events (such as heartbeats) and transport logging.
+func WithLogger(logger *slog.Logger) Option {
+	return func(opts *Options) {
+		opts.logger = logger
+	}
+}
+
 // TLSOption is a functional option for configuring TLS settings.
 type TLSOption func(cfg *tlsConfig)
 
@@ -203,8 +217,14 @@ func NewIggyTcpClient(options ...Option) *IggyTcpClient {
 		}
 	}
 
+	logger := opts.logger
+	if logger == nil {
+		logger = iggcon.NopLogger()
+	}
+
 	return &IggyTcpClient{
 		config:                 opts.config,
+		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
 		state:                  iggcon.StateDisconnected,

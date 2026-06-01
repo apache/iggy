@@ -20,7 +20,7 @@ package client
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +32,7 @@ import (
 type Options struct {
 	protocol   iggcon.Protocol
 	tcpOptions []tcp.Option
+	logger     *slog.Logger
 
 	heartbeatInterval time.Duration
 }
@@ -47,6 +48,8 @@ func GetDefaultOptions() Options {
 type Option func(*Options)
 
 // WithTcp sets the client protocol to TCP and applies custom TCP options.
+// tcp.WithLogger here only affects the transport; use WithLogger for
+// the client-level heartbeat.
 func WithTcp(tcpOpts ...tcp.Option) Option {
 	return func(opts *Options) {
 		opts.protocol = iggcon.Tcp
@@ -54,8 +57,19 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 	}
 }
 
+// WithLogger sets the logger for the Iggy client and its underlying transport.
+// This logger is used by the heartbeat and forwarded to the transport as a
+// default. A tcp.WithLogger passed via WithTcp overrides only the transport.
+// When no logger is provided, all internal log output is silently discarded.
+func WithLogger(logger *slog.Logger) Option {
+	return func(opts *Options) {
+		opts.logger = logger
+	}
+}
+
 type IggyClient struct {
 	iggcon.Client
+	logger             *slog.Logger
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
 	heartbeatInterval  time.Duration
@@ -72,15 +86,26 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 		opt(&opts)
 	}
 
+	logger := opts.logger
+	if logger == nil {
+		logger = iggcon.NopLogger()
+	}
+
+	// Prepend the logger so the transport inherits it as a default.
+	// A tcp.WithLogger in opts.tcpOptions will override the transport's
+	// copy; the heartbeat keeps using logger above.
+	tcpOpts := append([]tcp.Option{tcp.WithLogger(logger)}, opts.tcpOptions...)
+
 	var cli iggcon.Client
 	switch opts.protocol {
 	case iggcon.Tcp:
-		cli = tcp.NewIggyTcpClient(opts.tcpOptions...)
+		cli = tcp.NewIggyTcpClient(tcpOpts...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)
 	}
 	ic := &IggyClient{
 		Client:            cli,
+		logger:            logger,
 		cancel:            func() {},
 		heartbeatInterval: opts.heartbeatInterval,
 	}
@@ -110,7 +135,7 @@ func (ic *IggyClient) Connect(ctx context.Context) error {
 				case <-ticker.C:
 					pingCtx, pingCancel := context.WithTimeout(lifetimeCtx, ic.heartbeatInterval/2)
 					if err := ic.Ping(pingCtx); err != nil {
-						log.Printf("[WARN] heartbeat failed: %v", err)
+						ic.logger.Warn("heartbeat failed", "error", err)
 					}
 					pingCancel()
 				}
