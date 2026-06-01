@@ -16,10 +16,16 @@
  * under the License.
  */
 
-pub mod avro;
-pub mod bson;
-pub mod flatbuffer;
-pub mod json;
-pub mod proto;
-pub mod raw;
-pub mod text;
+use crate::{Error, Payload, Schema, StreamDecoder};
+
+pub struct BsonStreamDecoder;
+
+impl StreamDecoder for BsonStreamDecoder {
+    fn schema(&self) -> Schema {
+        Schema::Bson
+    }
+
+    fn decode(&self, mut _payload: Vec<u8>) -> Result<Payload, Error> {
+        unimplemented!()
+    }
+}

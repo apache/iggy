@@ -480,6 +480,7 @@ impl ProtoConvert {
                     Err(Error::InvalidPayloadType)
                 }
             }
+            Schema::Bson => self.protobuf_to_bson(payload),
         }
     }
 
@@ -505,7 +506,12 @@ impl ProtoConvert {
                     Err(Error::InvalidPayloadType)
                 }
             }
+            Schema::Bson => self.bson_to_protobuf(payload),
         }
+    }
+
+    fn protobuf_to_bson(&self, _payload: Payload) -> Result<Payload, Error> {
+        unimplemented!()
     }
 
     fn protobuf_to_json(&self, payload: Payload) -> Result<Payload, Error> {
@@ -565,6 +571,10 @@ impl ProtoConvert {
             }
             _other => Err(Error::InvalidPayloadType),
         }
+    }
+
+    fn bson_to_protobuf(&self, _payload: Payload) -> Result<Payload, Error> {
+        unimplemented!()
     }
 
     fn json_to_protobuf(&self, payload: Payload) -> Result<Payload, Error> {

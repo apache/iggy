@@ -96,6 +96,10 @@ impl FlatBufferStreamEncoder {
         }
     }
 
+    fn encode_bson_to_flatbuffer(&self, _bson_value: bson::Bson) -> Result<Vec<u8>, Error> {
+        unimplemented!()
+    }
+
     fn encode_json_to_flatbuffer(
         &self,
         json_value: simd_json::OwnedValue,
@@ -239,6 +243,7 @@ impl StreamEncoder for FlatBufferStreamEncoder {
             Payload::FlatBuffer(data) => Ok(data),
             Payload::Proto(text) => self.encode_text_to_flatbuffer(text),
             Payload::Avro(data) => self.encode_raw_to_flatbuffer(data),
+            Payload::Bson(bson_value) => self.encode_bson_to_flatbuffer(bson_value),
         }
     }
 }
