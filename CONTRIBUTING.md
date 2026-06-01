@@ -10,10 +10,6 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
-## Size Limits
-
-For new contributors we require to keep PRs under 500 lines of code, unless explicitly approved by a maintainer under linked issue.
-
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:

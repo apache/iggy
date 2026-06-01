@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM golang:1.25.0-alpine
+FROM golang:1.26.3-alpine
 
 RUN apk add --no-cache gcc musl-dev
 

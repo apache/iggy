@@ -19,7 +19,7 @@
 
 // Doris fixture. One Doris container is shared across every doris test in this
 // CI job (or local `cargo test` session) via testcontainers' reusable-containers
-// feature: the container is named `iggy-doris-test` and marked
+// feature: the container is named `iggy-test-doris` and marked
 // `ReuseDirective::Always`, so the first test creates it and every subsequent
 // test (in this or any other test process on the same Docker daemon) attaches
 // to it. This is what makes `cargo test` and CI follow the same path — the old
@@ -31,7 +31,7 @@
 //
 // The container outlives the test session by design (that's what enables
 // reuse). CI runners are ephemeral so it dies with them; locally, `docker rm
-// -f iggy-doris-test` forces a fresh boot.
+// -f iggy-test-doris` forces a fresh boot.
 //
 // Two host-level prerequisites cannot live inside the container:
 //   * `vm.max_map_count >= 2_000_000` — Doris 4.0.3's `start_be.sh` hard-exits
@@ -57,7 +57,7 @@ use tokio::time::sleep;
 use tracing::info;
 use uuid::Uuid;
 
-const DORIS_IMAGE: &str = "apache/doris";
+const DORIS_IMAGE: &str = "docker.io/apache/doris";
 // Apache's maintained single-container line is now tagged `<version>-all` /
 // `<version>-all-slim` (the old one-off `doris-all-in-one-2.1.0` was pushed once
 // in 2024 and never refreshed). `-slim` is the smaller base, so it pulls faster
@@ -66,7 +66,7 @@ const DORIS_TAG: &str = "4.0.3-all-slim";
 // Fixed name + `ReuseDirective::Always` is what makes the container survive
 // across nextest's per-test processes. Stable name means every test process
 // inspecting the Docker daemon finds the same one.
-const DORIS_CONTAINER_NAME: &str = "iggy-doris-test";
+const DORIS_CONTAINER_NAME: &str = "iggy-test-doris";
 const FE_HTTP_PORT: u16 = 8030;
 const FE_MYSQL_PORT: u16 = 9030;
 const BE_HTTP_PORT: u16 = 8040;
@@ -232,7 +232,7 @@ impl DorisContainer {
         //
         // `with_container_name` + `with_reuse(Always)` is what makes the
         // container survive across nextest's per-test processes: the first
-        // test creates `iggy-doris-test`, every later test (in any process)
+        // test creates `iggy-test-doris`, every later test (in any process)
         // attaches to it. The 1:1 BE port is therefore held continuously by
         // one container, never racing with itself across container restarts.
         let container = GenericImage::new(DORIS_IMAGE, DORIS_TAG)

@@ -19,3 +19,4 @@
 mod hello_world;
 #[cfg(not(feature = "vsr"))]
 mod producer;
+mod raw;
