@@ -21,48 +21,49 @@ using Apache.Iggy.JsonConverters;
 namespace Apache.Iggy.Messages;
 
 /// <summary>
-///     Header information for a message.
+///     Header information for a message. An immutable value type, so a header cannot be aliased and
+///     mutated across a re-send or a failure snapshot.
 /// </summary>
-public class MessageHeader
+public readonly record struct MessageHeader
 {
     /// <summary>
-    ///     Message checksum.
+    ///     Message checksum. Computed by the server on append and populated on poll; ignored on publish.
     /// </summary>
-    public ulong Checksum { get; set; }
+    public ulong Checksum { get; init; }
 
     /// <summary>
     ///     Message identifier.
     /// </summary>
-    public UInt128 Id { get; set; }
+    public UInt128 Id { get; init; }
 
     /// <summary>
     ///     Message offset.
     /// </summary>
-    public ulong Offset { get; set; }
+    public ulong Offset { get; init; }
 
     /// <summary>
     ///     Message timestamp.
     /// </summary>
     [JsonConverter(typeof(DateTimeOffsetConverter))]
-    public DateTimeOffset Timestamp { get; set; }
+    public DateTimeOffset Timestamp { get; init; }
 
     /// <summary>
     ///     Message origin timestamp.
     /// </summary>
-    public ulong OriginTimestamp { get; set; }
+    public ulong OriginTimestamp { get; init; }
 
     /// <summary>
     ///     Length of the user headers.
     /// </summary>
-    public int UserHeadersLength { get; set; }
+    public int UserHeadersLength { get; init; }
 
     /// <summary>
     ///     Length of the payload.
     /// </summary>
-    public int PayloadLength { get; set; }
+    public int PayloadLength { get; init; }
 
     /// <summary>
     ///     Reserved for future use.
     /// </summary>
-    public ulong Reserved { get; set; }
+    public ulong Reserved { get; init; }
 }
