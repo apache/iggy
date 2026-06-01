@@ -32,7 +32,7 @@ Commands:
 
 Notes:
   - validate requires helm.
-  - smoke requires helm, kubectl, and curl, plus an existing cluster and ingress controller.
+  - smoke requires helm, kubectl, and curl, plus an existing cluster with Gateway API CRDs and Envoy Gateway installed.
   - pass --cleanup with smoke to remove the Helm smoke namespace after a successful run.
   - cleanup-smoke requires kubectl and optionally helm.
   - collect-smoke-diagnostics is best-effort and does not fail on missing resources.
@@ -50,7 +50,8 @@ HELM_SMOKE_REPORT_DIR="${HELM_SMOKE_REPORT_DIR:-reports/helm-smoke}"
 HELM_SMOKE_SERVER_HOST="${HELM_SMOKE_SERVER_HOST:-server.iggy.local}"
 HELM_SMOKE_UI_HOST="${HELM_SMOKE_UI_HOST:-ui.iggy.local}"
 HELM_SMOKE_TIMEOUT="${HELM_SMOKE_TIMEOUT:-5m}"
-HELM_SMOKE_INGRESS_CLASS="${HELM_SMOKE_INGRESS_CLASS:-nginx}"
+HELM_SMOKE_GATEWAY_NAMESPACE="${HELM_SMOKE_GATEWAY_NAMESPACE:-envoy-gateway-system}"
+HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
 HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_SERVER_CPU_ALLOCATION="${HELM_SMOKE_SERVER_CPU_ALLOCATION:-1}"
 
@@ -266,6 +267,58 @@ validate() {
   validate_helm_docs
 }
 
+# PID of the kubectl port-forward process started by get_gateway_base_url.
+# Stored at script scope so smoke() can kill it regardless of exit path.
+HELM_SMOKE_GW_PF_PID=""
+
+get_gateway_base_url() {
+  local svc_selector
+  local svc_name
+  local pf_port=8080
+
+  svc_selector="gateway.envoyproxy.io/owning-gateway-name=${HELM_SMOKE_GATEWAY_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${HELM_SMOKE_GATEWAY_NAMESPACE}"
+
+  svc_name="$(kubectl get svc \
+    --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
+    --selector "$svc_selector" \
+    -o jsonpath='{.items[0].metadata.name}')"
+
+  if [ -z "$svc_name" ]; then
+    echo "Error: could not find Envoy Gateway proxy service" >&2
+    return 1
+  fi
+
+  kubectl port-forward "svc/${svc_name}" "${pf_port}:80" \
+    --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
+    >/dev/null 2>&1 &
+  HELM_SMOKE_GW_PF_PID=$!
+
+  # Wait up to 15 s for the tunnel to accept connections.
+  # curl returns 0 on any HTTP response (even 4xx/5xx); non-zero means ECONNREFUSED.
+  local ready=false
+  for _ in $(seq 1 15); do
+    if curl -s --connect-timeout 1 --max-time 2 \
+        -o /dev/null "http://127.0.0.1:${pf_port}" 2>/dev/null; then
+      ready=true
+      break
+    fi
+    if ! kill -0 "$HELM_SMOKE_GW_PF_PID" 2>/dev/null; then
+      echo "Error: gateway port-forward process exited unexpectedly" >&2
+      return 1
+    fi
+    sleep 1
+  done
+
+  if [ "$ready" = false ]; then
+    echo "Error: gateway port-forward did not become ready within 15 s" >&2
+    kill "$HELM_SMOKE_GW_PF_PID" 2>/dev/null || true
+    HELM_SMOKE_GW_PF_PID=""
+    return 1
+  fi
+
+  echo "http://127.0.0.1:${pf_port}"
+}
+
 smoke() {
   local cleanup_after_success="$1"
   require_command helm
@@ -278,12 +331,13 @@ smoke() {
   local leftover_resources
   local helm_status
   local smoke_values_file
+  local gateway_url
 
   mkdir -p "$HELM_SMOKE_REPORT_DIR"
 
   if ! helm status "$HELM_SMOKE_RELEASE" -n "$HELM_SMOKE_NAMESPACE" >/dev/null 2>&1; then
     leftover_resources="$(
-      kubectl -n "$HELM_SMOKE_NAMESPACE" get deployment,service,ingress,secret,serviceaccount \
+      kubectl -n "$HELM_SMOKE_NAMESPACE" get deployment,service,secret,serviceaccount \
         -l "app.kubernetes.io/instance=${HELM_SMOKE_RELEASE}" \
         -o name 2>/dev/null || true
     )"
@@ -305,14 +359,6 @@ EOF
 
   cat > "$smoke_values_file" <<EOF
 server:
-  ingress:
-    enabled: true
-    className: ${HELM_SMOKE_INGRESS_CLASS}
-    hosts:
-      - host: ${HELM_SMOKE_SERVER_HOST}
-        paths:
-          - path: /
-            pathType: Prefix
   env:
     - name: RUST_LOG
       value: info
@@ -327,14 +373,6 @@ server:
     - name: IGGY_SYSTEM_SHARDING_CPU_ALLOCATION
       value: "${HELM_SMOKE_SERVER_CPU_ALLOCATION}"
 ui:
-  ingress:
-    enabled: true
-    className: ${HELM_SMOKE_INGRESS_CLASS}
-    hosts:
-      - host: ${HELM_SMOKE_UI_HOST}
-        paths:
-          - path: /
-            pathType: Prefix
   image:
     tag: "${ui_image_tag}"
 EOF
@@ -358,16 +396,60 @@ EOF
     return "$helm_status"
   fi
 
+  kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: iggy-server
+  namespace: ${HELM_SMOKE_NAMESPACE}
+spec:
+  parentRefs:
+    - name: ${HELM_SMOKE_GATEWAY_NAME}
+      namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+  hostnames:
+    - "${HELM_SMOKE_SERVER_HOST}"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: ${HELM_SMOKE_RELEASE}
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: iggy-ui
+  namespace: ${HELM_SMOKE_NAMESPACE}
+spec:
+  parentRefs:
+    - name: ${HELM_SMOKE_GATEWAY_NAME}
+      namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+  hostnames:
+    - "${HELM_SMOKE_UI_HOST}"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: ${HELM_SMOKE_RELEASE}-ui
+          port: 3050
+EOF
+
+  gateway_url="$(get_gateway_base_url)"
+
   kubectl version --client=true > "$HELM_SMOKE_REPORT_DIR/kubectl-version.txt"
   kubectl -n "$HELM_SMOKE_NAMESPACE" rollout status "deployment/$HELM_SMOKE_RELEASE" --timeout="$HELM_SMOKE_TIMEOUT"
   kubectl -n "$HELM_SMOKE_NAMESPACE" rollout status "deployment/${HELM_SMOKE_RELEASE}-ui" --timeout="$HELM_SMOKE_TIMEOUT"
-  kubectl -n "$HELM_SMOKE_NAMESPACE" get pods,svc,ingress > "$HELM_SMOKE_REPORT_DIR/resources.txt"
+  kubectl -n "$HELM_SMOKE_NAMESPACE" get pods,svc,httproutes > "$HELM_SMOKE_REPORT_DIR/resources.txt"
 
   for _ in $(seq 1 30); do
     server_ping_status="$(
       curl -sS -o "$HELM_SMOKE_REPORT_DIR/ping.txt" -w '%{http_code}' \
         -H "Host: ${HELM_SMOKE_SERVER_HOST}" \
-        http://127.0.0.1/ping || true
+        "${gateway_url}/ping" || true
     )"
     if [ "$server_ping_status" = "200" ] && grep -qx 'pong' "$HELM_SMOKE_REPORT_DIR/ping.txt"; then
       break
@@ -382,7 +464,7 @@ EOF
     ui_healthz_status="$(
       curl -sS -o "$HELM_SMOKE_REPORT_DIR/ui-healthz.txt" -w '%{http_code}' \
         -H "Host: ${HELM_SMOKE_UI_HOST}" \
-        http://127.0.0.1/healthz || true
+        "${gateway_url}/healthz" || true
     )"
     if [ "$ui_healthz_status" = "200" ]; then
       break
@@ -391,6 +473,9 @@ EOF
   done
 
   test "$ui_healthz_status" = "200"
+
+  kill "${HELM_SMOKE_GW_PF_PID:-}" 2>/dev/null || true
+  HELM_SMOKE_GW_PF_PID=""
 
   if [ "$cleanup_after_success" = true ]; then
     cleanup_smoke
@@ -414,15 +499,15 @@ collect_smoke_diagnostics() {
 
   helm list -A > "$HELM_SMOKE_REPORT_DIR/helm-list.txt" 2>&1 || true
   kubectl get namespaces > "$HELM_SMOKE_REPORT_DIR/namespaces.txt" 2>&1 || true
-  kubectl -n ingress-nginx get all > "$HELM_SMOKE_REPORT_DIR/ingress-nginx.txt" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_GATEWAY_NAMESPACE" get all > "$HELM_SMOKE_REPORT_DIR/envoy-gateway.txt" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" get all > "$HELM_SMOKE_REPORT_DIR/get-all.txt" 2>&1 || true
-  kubectl -n "$HELM_SMOKE_NAMESPACE" get ingress > "$HELM_SMOKE_REPORT_DIR/ingresses.txt" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_NAMESPACE" get httproutes > "$HELM_SMOKE_REPORT_DIR/httproutes.txt" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" describe "deployment/$HELM_SMOKE_RELEASE" > "$HELM_SMOKE_REPORT_DIR/describe-deployment.txt" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" describe "deployment/${HELM_SMOKE_RELEASE}-ui" > "$HELM_SMOKE_REPORT_DIR/describe-ui-deployment.txt" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" describe pods > "$HELM_SMOKE_REPORT_DIR/describe-pods.txt" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" logs "deployment/$HELM_SMOKE_RELEASE" --all-containers=true > "$HELM_SMOKE_REPORT_DIR/server.log" 2>&1 || true
   kubectl -n "$HELM_SMOKE_NAMESPACE" logs "deployment/${HELM_SMOKE_RELEASE}-ui" --all-containers=true > "$HELM_SMOKE_REPORT_DIR/ui.log" 2>&1 || true
-  kubectl -n ingress-nginx logs deployment/ingress-nginx-controller --all-containers=true > "$HELM_SMOKE_REPORT_DIR/ingress-nginx-controller.log" 2>&1 || true
+  kubectl -n "$HELM_SMOKE_GATEWAY_NAMESPACE" logs deployment/envoy-gateway --all-containers=true > "$HELM_SMOKE_REPORT_DIR/envoy-gateway.log" 2>&1 || true
 
   if command -v kind >/dev/null 2>&1; then
     kind export logs "$HELM_SMOKE_REPORT_DIR/kind-logs" --name "$HELM_SMOKE_KIND_NAME" >/dev/null 2>&1 || true
