@@ -20,9 +20,11 @@
 use integration::harness::TestBinaryError;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
+
+use crate::connectors::fixtures;
 use testcontainers_modules::{
     postgres,
-    testcontainers::{ContainerAsync, runners::AsyncRunner},
+    testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
 };
 
 pub(super) const POSTGRES_PORT: u16 = 5432;
@@ -128,12 +130,14 @@ pub struct PostgresContainer {
 
 impl PostgresContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
-        let container = postgres::Postgres::default().start().await.map_err(|e| {
-            TestBinaryError::FixtureSetup {
+        let container = postgres::Postgres::default()
+            .with_container_name(fixtures::unique_container_name("postgres"))
+            .start()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "PostgresContainer".to_string(),
                 message: format!("Failed to start container: {e}"),
-            }
-        })?;
+            })?;
 
         let host_port = container
             .get_host_port_ipv4(POSTGRES_PORT)

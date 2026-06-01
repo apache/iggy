@@ -30,14 +30,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
+use uuid::Uuid;
 
-const SINK_INDEX: &str = "iggy_messages";
+const SINK_INDEX_PREFIX: &str = "iggy_messages";
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
 
 pub struct ElasticsearchSinkFixture {
     container: ElasticsearchContainer,
     http_client: HttpClient,
+    // Unique per fixture so tests sharing one container never collide on the
+    // same index. The connector writes here via ENV_SINK_INDEX.
+    index: String,
 }
 
 impl ElasticsearchOps for ElasticsearchSinkFixture {
@@ -52,7 +56,7 @@ impl ElasticsearchOps for ElasticsearchSinkFixture {
 
 impl ElasticsearchSinkFixture {
     pub async fn get_document_count(&self) -> Result<usize, TestBinaryError> {
-        self.count_documents(SINK_INDEX).await
+        self.count_documents(&self.index).await
     }
 
     pub async fn wait_for_documents(
@@ -60,7 +64,7 @@ impl ElasticsearchSinkFixture {
         expected_count: usize,
     ) -> Result<usize, TestBinaryError> {
         for _ in 0..POLL_ATTEMPTS {
-            match self.count_documents(SINK_INDEX).await {
+            match self.count_documents(&self.index).await {
                 Ok(count) if count >= expected_count => {
                     info!("Found {count} documents in Elasticsearch (expected {expected_count})");
                     return Ok(count);
@@ -71,7 +75,7 @@ impl ElasticsearchSinkFixture {
             sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        let final_count = self.count_documents(SINK_INDEX).await.unwrap_or(0);
+        let final_count = self.count_documents(&self.index).await.unwrap_or(0);
         Err(TestBinaryError::InvalidState {
             message: format!(
                 "Expected at least {expected_count} documents, found {final_count} after {POLL_ATTEMPTS} attempts"
@@ -80,11 +84,11 @@ impl ElasticsearchSinkFixture {
     }
 
     pub async fn search_documents(&self) -> Result<ElasticsearchSearchResponse, TestBinaryError> {
-        self.search_all(SINK_INDEX).await
+        self.search_all(&self.index).await
     }
 
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
-        ElasticsearchOps::refresh_index(self, SINK_INDEX).await
+        ElasticsearchOps::refresh_index(self, &self.index).await
     }
 }
 
@@ -93,19 +97,21 @@ impl TestFixture for ElasticsearchSinkFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = ElasticsearchContainer::start().await?;
         let http_client = create_http_client();
+        let index = format!("{SINK_INDEX_PREFIX}_{}", Uuid::new_v4().simple());
 
         // Container startup already waits for /_cluster/health to return 200
         // via HttpWaitStrategy, so no additional health check is needed.
         Ok(Self {
             container,
             http_client,
+            index,
         })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
         envs.insert(ENV_SINK_URL.to_string(), self.container.base_url.clone());
-        envs.insert(ENV_SINK_INDEX.to_string(), SINK_INDEX.to_string());
+        envs.insert(ENV_SINK_INDEX.to_string(), self.index.clone());
         envs.insert(
             ENV_SINK_STREAMS_0_STREAM.to_string(),
             DEFAULT_TEST_STREAM.to_string(),

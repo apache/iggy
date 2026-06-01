@@ -11,6 +11,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **doris_sink** | Loads JSON messages into Apache Doris tables via the Stream Load HTTP API |
 | **elasticsearch_sink** | Sends messages to Elasticsearch indices for full-text search and analytics |
 | **iceberg_sink** | Writes data to Apache Iceberg tables via REST catalog with S3/GCS/Azure storage |
+| **influxdb_sink** | Writes messages to InfluxDB as line-protocol points; supports both V2 (org/bucket, Flux) and V3 (db, SQL) |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |

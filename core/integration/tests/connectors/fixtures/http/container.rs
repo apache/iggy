@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use std::time::Duration;
 use testcontainers_modules::testcontainers::core::WaitFor::Healthcheck;
@@ -27,7 +28,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 use tokio::time::sleep;
 use tracing::info;
 
-const WIREMOCK_IMAGE: &str = "wiremock/wiremock";
+const WIREMOCK_IMAGE: &str = "docker.io/wiremock/wiremock";
 const WIREMOCK_TAG: &str = "3.13.2";
 const WIREMOCK_PORT: u16 = 8080;
 
@@ -86,6 +87,7 @@ impl HttpSinkWireMockContainer {
                     .to_string(),
                 "/home/wiremock/mappings",
             ))
+            .with_container_name(fixtures::unique_container_name("wiremock-http"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
