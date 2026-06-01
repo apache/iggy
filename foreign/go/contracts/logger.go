@@ -20,20 +20,17 @@ package iggcon
 import (
 	"io"
 	"log/slog"
-	"os"
 )
 
-func NewLogger(level slog.Level, writer io.Writer) *slog.Logger {
+// NewLogger creates a text-format logger that writes to writer at the given minimum level.
+func NewLogger(writer io.Writer, level slog.Level) *slog.Logger {
 	handler := slog.NewTextHandler(writer, &slog.HandlerOptions{
 		Level: level,
 	})
 	return slog.New(handler)
 }
 
-func NewStderrLogger(level slog.Level) *slog.Logger {
-	return NewLogger(level, os.Stderr)
-}
-
+// NopLogger returns a logger that silently discards all output.
 func NopLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }

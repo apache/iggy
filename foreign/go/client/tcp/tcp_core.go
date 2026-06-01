@@ -159,7 +159,11 @@ func WithServerAddress(address string) Option {
 	}
 }
 
-// WithLogger sets the logger for the TCP client.
+// WithLogger sets the logger for the TCP transport layer.
+//
+// When the transport is created via client.NewIggyClient, prefer
+// client.WithLogger to configure a single logger for client-level
+// events (such as heartbeats) and transport logging.
 func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
 		opts.logger = logger

@@ -26,7 +26,7 @@ import (
 
 func TestNewLogger_WritesToProvidedWriter(t *testing.T) {
 	var buf bytes.Buffer
-	logger := NewLogger(slog.LevelInfo, &buf)
+	logger := NewLogger(&buf, slog.LevelInfo)
 
 	logger.Info("hello world")
 
@@ -50,7 +50,7 @@ func TestNewLogger_RespectsLogLevel(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			logger := NewLogger(tt.loggerLevel, &buf)
+			logger := NewLogger(&buf, tt.loggerLevel)
 
 			logger.Log(context.Background(), tt.logAt, "test message")
 
@@ -58,18 +58,6 @@ func TestNewLogger_RespectsLogLevel(t *testing.T) {
 				t.Errorf("expectOutput=%v, got output: %q", tt.expectOutput, buf.String())
 			}
 		})
-	}
-}
-
-func TestNewStderrLogger_RespectsLevel(t *testing.T) {
-	logger := NewStderrLogger(slog.LevelWarn)
-
-	// Verify level filtering without capturing stderr
-	if logger.Enabled(context.Background(), slog.LevelInfo) {
-		t.Error("info should be disabled on a warn-level logger")
-	}
-	if !logger.Enabled(context.Background(), slog.LevelWarn) {
-		t.Error("warn should be enabled on a warn-level logger")
 	}
 }
 

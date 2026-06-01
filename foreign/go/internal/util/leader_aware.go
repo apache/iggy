@@ -32,6 +32,9 @@ import (
 // CheckAndRedirectToLeader queries the client for cluster metadata and returns
 // an address to redirect to (empty string means no redirection needed).
 func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddress string, transport iggcon.Protocol, logger *slog.Logger) (string, error) {
+	if logger == nil {
+		logger = iggcon.NopLogger()
+	}
 	logger.Debug("Checking cluster metadata for leader detection")
 
 	meta, err := c.GetClusterMetadata(ctx)
