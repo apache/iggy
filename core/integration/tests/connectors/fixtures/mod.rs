@@ -22,6 +22,7 @@ mod elasticsearch;
 mod http;
 mod iceberg;
 mod influxdb;
+mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
@@ -41,6 +42,7 @@ pub use influxdb::{
     InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture, InfluxDbSourceFixture,
     InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
+pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
