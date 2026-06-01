@@ -24,6 +24,7 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
@@ -43,6 +44,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BasicMessagingSteps {
@@ -207,6 +209,30 @@ public class BasicMessagingSteps {
 
         String lastPayload = new String(messages.get(messages.size() - 1).payload(), StandardCharsets.UTF_8);
         assertEquals(context.lastSentMessage, lastPayload, "Last message should match sent message");
+    }
+
+    @When("I update the stream name to {string}")
+    public void updateStreamName(String newName) {
+        getClient().streams().updateStream(context.lastStreamId, newName);
+        context.lastStreamName = newName;
+    }
+
+    @Then("the stream name should be updated to {string}")
+    public void streamNameUpdated(String expectedName) {
+        Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
+        assertTrue(stream.isPresent(), "Stream should exist");
+        assertEquals(expectedName, stream.get().name(), "Stream name should be updated");
+    }
+
+    @When("I delete the stream with name {string}")
+    public void deleteStream(String name) {
+        getClient().streams().deleteStream(StreamId.of(name));
+        context.lastStreamId = null;
+    }
+
+    @Then("the stream should be deleted successfully")
+    public void streamDeletedSuccessfully() {
+        assertNull(context.lastStreamId, "Stream should have been deleted");
     }
 
     private IggyBaseClient getClient() {

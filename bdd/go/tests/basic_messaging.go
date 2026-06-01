@@ -39,6 +39,7 @@ type basicMessagingCtx struct {
 	lastPollMessages    *iggcon.PolledMessage
 	lastStreamID        *uint32
 	lastStreamName      *string
+	lastDeletedStreamID *uint32
 	lastTopicID         *uint32
 	lastTopicName       *string
 	lastTopicPartitions *uint32
@@ -214,6 +215,56 @@ func (s basicMessagingSteps) thenLastPolledMessageMatchesSent(ctx context.Contex
 	return nil
 }
 
+func (s basicMessagingSteps) whenUpdateStreamName(ctx context.Context, newName string) error {
+	c := getBasicMessagingCtx(ctx)
+	streamIdentifier, _ := iggcon.NewIdentifier(*c.lastStreamID)
+	if err := c.client.UpdateStream(streamIdentifier, newName); err != nil {
+		return fmt.Errorf("failed to update stream: %w", err)
+	}
+	c.lastStreamName = &newName
+	return nil
+}
+
+func (s basicMessagingSteps) thenStreamNameUpdated(ctx context.Context, expectedName string) error {
+	c := getBasicMessagingCtx(ctx)
+	streamIdentifier, _ := iggcon.NewIdentifier(*c.lastStreamID)
+	stream, err := c.client.GetStream(streamIdentifier)
+	if err != nil {
+		return fmt.Errorf("failed to get stream: %w", err)
+	}
+	if stream.Name != expectedName {
+		return fmt.Errorf("expected stream name %s, got %s", expectedName, stream.Name)
+	}
+	return nil
+}
+
+func (s basicMessagingSteps) whenDeleteStreamByName(ctx context.Context, name string) error {
+	c := getBasicMessagingCtx(ctx)
+	streamIdentifier, err := iggcon.NewIdentifier(name)
+	if err != nil {
+		return fmt.Errorf("invalid stream name %q: %w", name, err)
+	}
+	if err := c.client.DeleteStream(streamIdentifier); err != nil {
+		return fmt.Errorf("failed to delete stream: %w", err)
+	}
+	c.lastDeletedStreamID = c.lastStreamID
+	c.lastStreamID = nil
+	return nil
+}
+
+func (s basicMessagingSteps) thenStreamDeletedSuccessfully(ctx context.Context) error {
+	c := getBasicMessagingCtx(ctx)
+	if c.lastDeletedStreamID == nil {
+		return errors.New("no stream was deleted in this scenario")
+	}
+	streamIdentifier, _ := iggcon.NewIdentifier(*c.lastDeletedStreamID)
+	stream, err := c.client.GetStream(streamIdentifier)
+	if err == nil && stream != nil {
+		return fmt.Errorf("stream %d still exists after deletion", *c.lastDeletedStreamID)
+	}
+	return nil
+}
+
 func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 	client := getBasicMessagingCtx(ctx).client
 	streams, err := client.GetStreams(ctx)
@@ -311,27 +362,42 @@ func initBasicMessagingScenario(sc *godog.ScenarioContext) {
 		return context.WithValue(context.Background(), basicMessagingCtxKey{}, &basicMessagingCtx{}), nil
 	})
 	s := &basicMessagingSteps{}
-	sc.Step(`I have a running Iggy server`, s.givenRunningServer)
-	sc.Step(`I am authenticated as the root user`, s.givenAuthenticationAsRoot)
+	sc.Step(`^I have a running Iggy server$`, s.givenRunningServer)
+	sc.Step(`^I am authenticated as the root user$`, s.givenAuthenticationAsRoot)
 	sc.Step(`^I send (\d+) messages to stream (\d+), topic (\d+), partition (\d+)$`, s.whenSendMessages)
 	sc.Step(`^I poll messages from stream (\d+), topic (\d+), partition (\d+) starting from offset (\d+)$`, s.whenPollMessages)
-	sc.Step(`all messages should be sent successfully`, s.thenMessageSentSuccessfully)
+	sc.Step(`^all messages should be sent successfully$`, s.thenMessageSentSuccessfully)
 	sc.Step(`^I should receive (\d+) messages$`, s.thenShouldReceiveMessages)
 	sc.Step(`^the messages should have sequential offsets from (\d+) to (\d+)$`, s.thenMessagesHaveSequentialOffsets)
-	sc.Step(`each message should have the expected payload content`, s.thenMessagesHaveExpectedPayload)
-	sc.Step(`the last polled message should match the last sent message`, s.thenLastPolledMessageMatchesSent)
+	sc.Step(`^each message should have the expected payload content$`, s.thenMessagesHaveExpectedPayload)
+	sc.Step(`^the last polled message should match the last sent message$`, s.thenLastPolledMessageMatchesSent)
 	sc.Step(`^the stream should have name "([^"]*)"$`, s.thenStreamHasName)
-	sc.Step(`the stream should be created successfully`, s.thenStreamCreatedSuccessfully)
+	sc.Step(`^the stream should be created successfully$`, s.thenStreamCreatedSuccessfully)
 	sc.Step(`^I create a stream with name "([^"]*)"$`, s.whenCreateStream)
-	sc.Step(`I have no streams in the system`, s.givenNoStreams)
+	sc.Step(`^I have no streams in the system$`, s.givenNoStreams)
 	sc.Step(`^I create a topic with name "([^"]*)" in stream (\d+) with (\d+) partitions$`, s.whenCreateTopic)
-	sc.Step(`the topic should be created successfully`, s.thenTopicCreatedSuccessfully)
+	sc.Step(`^the topic should be created successfully$`, s.thenTopicCreatedSuccessfully)
 	sc.Step(`^the topic should have name "([^"]*)"$`, s.thenTopicHasName)
 	sc.Step(`^the topic should have (\d+) partitions$`, s.thenTopicsHasPartitions)
+	sc.Step(`^I update the stream name to "([^"]*)"$`, s.whenUpdateStreamName)
+	sc.Step(`^the stream name should be updated to "([^"]*)"$`, s.thenStreamNameUpdated)
+	sc.Step(`^I delete the stream with name "([^"]*)"$`, s.whenDeleteStreamByName)
+	sc.Step(`^the stream should be deleted successfully$`, s.thenStreamDeletedSuccessfully)
 	sc.After(func(ctx context.Context, sc *godog.Scenario, scErr error) (context.Context, error) {
 		c := getBasicMessagingCtx(ctx)
-		if err := c.client.Close(); err != nil {
-			scErr = errors.Join(scErr, fmt.Errorf("error closing client: %w", err))
+		// Best-effort cleanup: if the scenario left a stream behind (e.g.
+		// failed before the explicit delete step), try to remove it so the
+		// next scenario starts clean. A failure here is intentionally
+		// ignored; for guaranteed teardown across all resource kinds, a
+		// global cleanup script remains the better long-term solution.
+		if c.client != nil && c.lastStreamID != nil {
+			streamIdentifier, _ := iggcon.NewIdentifier(*c.lastStreamID)
+			_ = c.client.DeleteStream(streamIdentifier)
+		}
+		if c.client != nil {
+			if err := c.client.Close(); err != nil {
+				scErr = errors.Join(scErr, fmt.Errorf("error closing client: %w", err))
+			}
 		}
 		return ctx, scErr
 	})
