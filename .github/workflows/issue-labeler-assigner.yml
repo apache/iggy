@@ -15,20 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Issue Labeler
+name: Issue Labeler / Assigner
 
-# Maps the "Affected area / component" dropdown from the bug/feature issue
-# forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters who
-# lack triage permission still get their issue categorized at creation.
+# Two add-only triage steps that run when a reporter opens or edits an issue:
 #
-# Add-only by design: it never removes labels. Reporters rarely deselect,
-# and removing would fight maintainers who labeled by hand. addLabels is
-# idempotent, so re-running on `edited` is harmless.
+# 1. Label: maps the "Affected area / component" dropdown from the bug/feature
+#    issue forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters
+#    who lack triage permission still get their issue categorized at creation.
 #
-# SECURITY: the issue body is attacker-controlled text, but it is parsed
-# only for exact matches against the fixed AREA_LABELS allowlist below, so
-# the only labels this workflow can ever apply are the ones listed here.
-# No checkout, no exec of issue contents, no token export.
+# 2. Assign: if the reporter ticked the "Contribution" checkbox ("I'm willing
+#    to submit a pull request ..."), assign the issue to its author so the
+#    volunteer is on record. addAssignees is idempotent and issue authors are
+#    always assignable, even as outside contributors.
+#
+# Add-only by design: neither step removes anything. Reporters rarely deselect,
+# and removing would fight maintainers who labeled or reassigned by hand. Both
+# API calls are idempotent, so re-running on `edited` is harmless.
+#
+# SECURITY: the issue body is attacker-controlled text. The label step parses
+# it only for exact matches against the fixed AREA_LABELS allowlist below. The
+# assign step uses the body only as a boolean gate; the assignee comes from the
+# trusted `payload.issue.user.login`, never from body content, so the body
+# cannot inject an assignee. No checkout, no exec of issue contents, no token
+# export.
 
 on:
   issues:
@@ -39,7 +48,7 @@ permissions:
   contents: read
 
 jobs:
-  label:
+  triage:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
@@ -102,4 +111,33 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
               labels,
+            });
+
+      - name: Assign author who volunteered to contribute
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // The "Contribution" checkbox in both issue forms renders as a
+            // task-list line. Checked, it reads `- [x] I'm willing to submit a
+            // pull request ...`; the tail differs per template (bug: "to fix
+            // this bug", feature: "to implement this feature"), so match the
+            // shared prefix only.
+            const body = context.payload.issue.body || '';
+            const volunteered =
+              /(^|\n)\s*-\s*\[[xX]\]\s+I'm willing to submit a pull request/.test(body);
+            if (!volunteered) {
+              core.info('author did not volunteer to contribute, nothing to assign');
+              return;
+            }
+
+            // Assignee is the trusted author from the event payload, never the
+            // body. addAssignees is a no-op if already assigned and silently
+            // ignores non-assignable users; issue authors are always assignable.
+            const author = context.payload.issue.user.login;
+            core.info(`assigning volunteering author: ${author}`);
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              assignees: [author],
             });
