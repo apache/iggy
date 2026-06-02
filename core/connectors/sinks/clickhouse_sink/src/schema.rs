@@ -184,10 +184,10 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             .iter()
             .map(|p| {
                 let p = p.trim();
-                if let Some((name, rest)) = strip_named_tuple_field(p) {
-                    if let Ok(ch_type) = parse_type_inner(rest) {
-                        return Ok((Some(name.to_string()), ch_type));
-                    }
+                if let Some((name, rest)) = strip_named_tuple_field(p)
+                    && let Ok(ch_type) = parse_type_inner(rest)
+                {
+                    return Ok((Some(name.to_string()), ch_type));
                 }
                 Ok((None, parse_type_inner(p)?))
             })
@@ -383,9 +383,9 @@ fn split_two_args(s: &str) -> Result<(&str, &str), Error> {
 /// (`` `weird name` Int32 ``). The caller is responsible for validating that
 /// `type_str` actually parses as a type; this function only extracts the split.
 fn strip_named_tuple_field(s: &str) -> Option<(&str, &str)> {
-    if s.starts_with('`') {
+    if let Some(stripped) = s.strip_prefix('`') {
         // Backtick-quoted identifier: `field name` Type
-        let close = s[1..].find('`')? + 1;
+        let close = stripped.find('`')? + 1;
         let name = &s[1..close];
         if name.is_empty() {
             return None;
