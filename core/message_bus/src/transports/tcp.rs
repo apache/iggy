@@ -31,9 +31,9 @@
 use super::{ActorContext, TransportConn, TransportListener};
 use crate::framing;
 use crate::lifecycle::BusMessage;
-use compio::driver::{SharedFd, ToSharedFd};
 use compio::io::AsyncWriteExt;
-use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
+use compio::net::{TcpListener, TcpStream};
+use compio::runtime::fd::PollFd;
 use futures::FutureExt;
 use std::io;
 use std::mem;
@@ -98,13 +98,15 @@ impl TcpTransportConn {
 impl TransportConn for TcpTransportConn {
     #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
-        // Capture a refcounted fd handle BEFORE `into_split` so the
+        // Capture a refcounted poll fd BEFORE `into_split` so the
         // shutdown watchdog can wake the reader's parked io_uring read
         // SQE via `libc::shutdown(SHUT_RD)`. No `select!` over a TCP
         // read on a still-alive connection: the in-flight read returns
         // `Ok(0)` naturally rather than being cancelled (compio's
         // io_uring read is not cancel-safe in the protocol sense).
-        let shared_fd = self.stream.to_shared_fd();
+        // compio 0.19 dropped `TcpStream::to_shared_fd`; `to_poll_fd`
+        // gives an equivalently refcounted fd handle (PollFd: AsRawFd).
+        let poll_fd = self.stream.to_poll_fd().ok();
         let (read_half, write_half) = self.stream.into_split();
         let ActorContext {
             in_tx,
@@ -117,7 +119,9 @@ impl TransportConn for TcpTransportConn {
             peer,
         } = ctx;
 
-        spawn_shutdown_watchdog(shared_fd, shutdown.clone(), label, peer.clone());
+        if let Some(poll_fd) = poll_fd {
+            spawn_shutdown_watchdog(poll_fd, shutdown.clone(), label, peer.clone());
+        }
 
         let writer_shutdown = shutdown;
         let reader_peer = peer.clone();
@@ -156,19 +160,19 @@ impl TransportConn for TcpTransportConn {
 /// shutdown token; the watchdog wakes the parked `io_uring` read instead.
 #[allow(clippy::future_not_send)]
 fn spawn_shutdown_watchdog(
-    shared_fd: SharedFd<socket2::Socket>,
+    poll_fd: PollFd<socket2::Socket>,
     shutdown: crate::lifecycle::FusedShutdown,
     label: &'static str,
     peer: String,
 ) {
     compio::runtime::spawn(async move {
         shutdown.wait().await;
-        // SAFETY: `shared_fd` is a refcounted clone obtained from the
+        // SAFETY: `poll_fd` is a refcounted handle obtained from the
         // still-live `TcpStream` before `into_split`; the matching
         // clones in both owned halves keep the kernel fd open. The
-        // watchdog's clone independently keeps it open across this
+        // watchdog's handle independently keeps it open across this
         // syscall.
-        let raw_fd = shared_fd.as_raw_fd();
+        let raw_fd = poll_fd.as_raw_fd();
         let rc = unsafe { libc::shutdown(raw_fd, libc::SHUT_RD) };
         if rc != 0 {
             let err = io::Error::last_os_error();
@@ -192,7 +196,7 @@ fn spawn_shutdown_watchdog(
 /// iteration.
 #[allow(clippy::future_not_send)]
 async fn reader_loop(
-    mut read_half: OwnedReadHalf<TcpStream>,
+    mut read_half: TcpStream,
     in_tx: async_channel::Sender<server_common::Message<iggy_binary_protocol::GenericHeader>>,
     max_message_size: usize,
     label: &'static str,
@@ -228,7 +232,7 @@ async fn reader_loop(
 /// indefinitely on the live socket.
 #[allow(clippy::future_not_send)]
 async fn writer_loop(
-    mut write_half: OwnedWriteHalf<TcpStream>,
+    mut write_half: TcpStream,
     rx: crate::lifecycle::BusReceiver,
     shutdown: crate::lifecycle::FusedShutdown,
     conn_shutdown: crate::lifecycle::Shutdown,

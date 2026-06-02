@@ -40,6 +40,11 @@ function assert_not_null(mixed $value, string $message = 'expected value not to 
     Assert::assertNotNull($value, $message);
 }
 
+function assert_instance_of(string $expected, mixed $actual, string $message = ''): void
+{
+    Assert::assertInstanceOf($expected, $actual, $message);
+}
+
 function assert_null(mixed $value, string $message = 'expected value to be null'): void
 {
     Assert::assertNull($value, $message);

@@ -107,9 +107,11 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         let ws_config = cfg.ws_config;
         let handshake_grace = cfg.handshake_grace;
         let handle = compio::runtime::spawn(async move {
+            // compio-ws 0.4's `WebSocketStream` accept future is large
+            // (~17 KB); box it to keep this spawned task's frame small.
             let outcome = compio::time::timeout(
                 handshake_grace,
-                compio_ws::accept_async_with_config(stream, ws_config),
+                Box::pin(compio_ws::accept_async_with_config(stream, ws_config)),
             )
             .await;
             match outcome {

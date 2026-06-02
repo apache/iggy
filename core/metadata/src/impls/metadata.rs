@@ -36,7 +36,7 @@ use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopi
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RequestHeader, WireDecode, WireEncode,
+    ReplyHeader, RequestHeader, WireDecode, WireEncode,
 };
 use iggy_common::IggyError;
 use iggy_common::variadic;
@@ -654,7 +654,8 @@ where
             }
         }
 
-        if ack_quorum_reached(consensus, PlaneKind::Metadata, header) {
+        let quorum = ack_quorum_reached(consensus, PlaneKind::Metadata, header);
+        if quorum {
             let journal = self.journal.as_ref().unwrap();
 
             debug!(
@@ -1087,6 +1088,105 @@ where
         }
     }
 
+    /// Submit a replicated client request from in-process and await the
+    /// committed reply.
+    ///
+    /// A peer (home) shard relays a client's replicated request here (shard
+    /// 0 owns the metadata consensus group) and awaits the full committed
+    /// reply over the pipeline subscriber. The home shard then writes the
+    /// reply to the originating socket -- it holds the connection and the
+    /// `vsr -> transport` mapping that this side cannot reconstruct.
+    ///
+    /// Mirrors [`Self::submit_register_in_process`] but: (1) uses
+    /// `request_preflight` (dedup / session check) instead of the register
+    /// gate, (2) returns the committed `Message<ReplyHeader>` (body = state
+    /// machine output) rather than just the commit op.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the
+    /// prepare, `InProgress` / `PipelineFull` on pipeline pressure,
+    /// `Canceled` when preflight absorbed the request (dedup / eviction /
+    /// gap) or the pending prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata
+    /// consensus group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_request_in_process(
+        &self,
+        message: Message<RequestHeader>,
+    ) -> Result<Message<ReplyHeader>, RegisterSubmitError> {
+        let request_header = *message.header();
+        let client_id = request_header.client;
+        let session = request_header.session;
+        let request = request_header.request;
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_request_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    RegisterSubmitError::NotCaughtUp
+                } else {
+                    RegisterSubmitError::NotPrimary
+                },
+            );
+        }
+
+        // Dedup / session / eviction. `false` = absorbed (duplicate cached
+        // reply already resent, or evicted, or gap). Surface as Canceled so
+        // the home shard stays silent and the SDK replays.
+        if !request_preflight(consensus, &self.client_table, client_id, session, request).await {
+            return Err(RegisterSubmitError::Canceled);
+        }
+
+        if consensus.pipeline().borrow().is_full() {
+            return Err(RegisterSubmitError::PipelineFull);
+        }
+
+        let prepare = self
+            .prepare_request(message)
+            .map_err(|_| RegisterSubmitError::Canceled)?;
+
+        consensus.verify_pipeline();
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        debug_assert!(
+            is_caught_up_primary(consensus),
+            "submit_request_in_process: gate flipped between check and dispatch"
+        );
+        self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_request_in_process: view/commit_min advanced across on_replicate await"
+        );
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => warn!(
+                        error = %error,
+                        "dropping malformed PrepareOk from metadata loopback queue"
+                    ),
+                },
+                command => warn!(
+                    ?command,
+                    "dropping unexpected message from metadata loopback queue"
+                ),
+            }
+        }
+
+        receiver
+            .await
+            .map_err(|Canceled| RegisterSubmitError::Canceled)
+    }
+
     pub fn remove_client_session(&self, client_id: u128) -> bool {
         self.client_table.borrow_mut().remove_client(client_id)
     }
@@ -1455,6 +1555,11 @@ where
         client: client_id,
         session: 0,
         request: 0,
+        // Route through the metadata consensus group. The chain-forwarded
+        // prepare is re-routed on each peer by namespace; a `0` here would
+        // hash to a non-zero shard with no metadata consensus and be
+        // silently dropped (see `shard::router::route_typed`).
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         ..RequestHeader::default()
     };
     msg
@@ -1486,6 +1591,8 @@ where
         client: client_id,
         session,
         request,
+        // Metadata consensus group (see `build_register_request_message`).
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         ..RequestHeader::default()
     };
     msg

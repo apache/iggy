@@ -30,6 +30,10 @@ use ext_php_rs::prelude::*;
 
 use crate::client::IggyClient;
 use crate::consumer::{AutoCommit, AutoCommitWhen, IggyConsumer};
+use crate::error::{
+    AuthenticationException, ConnectionException, IggyException, NotFoundException,
+    TransientException,
+};
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
@@ -38,6 +42,13 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        // Parent classes must be registered before subclasses because ext-php-rs resolves
+        // the parent ClassEntry during child registration.
+        .class::<IggyException>()
+        .class::<ConnectionException>()
+        .class::<AuthenticationException>()
+        .class::<NotFoundException>()
+        .class::<TransientException>()
         .class::<IggyClient>()
         .class::<IggyConsumer>()
         .class::<AutoCommit>()

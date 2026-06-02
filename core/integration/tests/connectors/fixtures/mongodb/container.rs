@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use mongodb::{Client, bson::doc, options::ClientOptions};
 use std::time::Duration;
@@ -26,7 +27,7 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 use tokio::time::sleep;
 use tracing::info;
 
-const MONGODB_IMAGE: &str = "mongo";
+const MONGODB_IMAGE: &str = "docker.io/library/mongo";
 const MONGODB_TAG: &str = "7";
 const MONGODB_PORT: u16 = 27017;
 const MONGODB_READY_MSG: &str = "Waiting for connections";
@@ -80,6 +81,7 @@ impl MongoDbContainer {
             .with_exposed_port(MONGODB_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(MONGODB_READY_MSG))
             .with_mapped_port(0, MONGODB_PORT.tcp())
+            .with_container_name(fixtures::unique_container_name("mongodb"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
@@ -121,6 +123,7 @@ impl MongoDbContainer {
             .with_exposed_port(MONGODB_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stdout(MONGODB_READY_MSG))
             .with_mapped_port(0, MONGODB_PORT.tcp())
+            .with_container_name(fixtures::unique_container_name("mongodb-rs"))
             .with_cmd(["--replSet", MONGODB_REPLICA_SET_NAME, "--bind_ip_all"]);
 
         if enable_test_commands {
