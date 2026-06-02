@@ -27,7 +27,6 @@ pub(crate) struct SourceSuiteConfig {
     pub(crate) consumer_name: &'static str,
     pub(crate) min_messages: usize,
     pub(crate) poll_batch: u32,
-    pub(crate) warmup: Duration,
     pub(crate) retry_interval: Duration,
     pub(crate) timeout: Duration,
 }
@@ -38,7 +37,6 @@ impl Default for SourceSuiteConfig {
             consumer_name: "source_suite_consumer",
             min_messages: 1,
             poll_batch: 100,
-            warmup: Duration::from_secs(1),
             retry_interval: Duration::from_millis(100),
             timeout: Duration::from_secs(5),
         }
@@ -49,16 +47,16 @@ pub(crate) async fn poll_until_min_messages(
     harness: &TestHarness,
     config: &SourceSuiteConfig,
 ) -> Vec<IggyMessage> {
-    sleep(config.warmup).await;
-
     let client = harness.root_client().await.expect("root client");
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = config.consumer_name.try_into().unwrap();
 
     let poll = async {
+        let mut messages = Vec::new();
+
         loop {
-            let polled = client
+            if let Ok(mut polled) = client
                 .poll_messages(
                     &stream_id,
                     &topic_id,
@@ -69,19 +67,24 @@ pub(crate) async fn poll_until_min_messages(
                     true,
                 )
                 .await
-                .expect("poll source messages");
+            {
+                messages.append(&mut polled.messages);
 
-            if polled.messages.len() >= config.min_messages {
-                return polled.messages;
+                if messages.len() >= config.min_messages {
+                    return messages;
+                }
             }
 
             sleep(config.retry_interval).await;
         }
     };
 
-    timeout(config.timeout, poll)
-        .await
-        .expect("source suite timed out waiting for messages")
+    timeout(config.timeout, poll).await.unwrap_or_else(|_| {
+        panic!(
+            "source suite timed out after {:?} waiting for {} messages for consumer {}",
+            config.timeout, config.min_messages, config.consumer_name
+        )
+    })
 }
 
 pub(crate) async fn assert_source_produces_messages(harness: &TestHarness) -> Vec<IggyMessage> {
@@ -91,11 +94,4 @@ pub(crate) async fn assert_source_produces_messages(harness: &TestHarness) -> Ve
         "source suite expected at least one message"
     );
     messages
-}
-
-pub(crate) fn config_for_consumer(consumer_name: &'static str) -> SourceSuiteConfig {
-    SourceSuiteConfig {
-        consumer_name,
-        ..SourceSuiteConfig::default()
-    }
 }

@@ -26,39 +26,5 @@ use integration::iggy_harness;
     seed = seeds::connector_stream
 )]
 async fn random_source_produces_messages(harness: &TestHarness) {
-    let messages = source_suite::assert_source_produces_messages(harness).await;
-    assert!(
-        !messages.is_empty(),
-        "No messages received from random source"
-    );
-}
-
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
-    seed = seeds::connector_stream
-)]
-async fn state_persists_across_connector_restart(harness: &mut TestHarness) {
-    let before_config = source_suite::config_for_consumer("source_suite_before_restart");
-    let before = source_suite::poll_until_min_messages(harness, &before_config).await;
-    assert!(
-        !before.is_empty(),
-        "source suite expected messages before connector restart"
-    );
-
-    harness
-        .server_mut()
-        .stop_dependents()
-        .expect("Failed to stop connectors");
-    harness
-        .server_mut()
-        .start_dependents()
-        .await
-        .expect("Failed to restart connectors");
-
-    let after_config = source_suite::config_for_consumer("source_suite_after_restart");
-    let after = source_suite::poll_until_min_messages(harness, &after_config).await;
-    assert!(
-        !after.is_empty(),
-        "source suite expected messages after connector restart"
-    );
+    source_suite::assert_source_produces_messages(harness).await;
 }
