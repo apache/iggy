@@ -81,6 +81,21 @@ where
         .check_request(client_id, session, request);
     match status {
         RequestStatus::Duplicate(cached_reply) => {
+            // TODO(vsr-resend-misroute): `client_id` here is the VSR
+            // consensus id (the random u128 the SDK mints), but
+            // `send_to_client` routes by the top 16 bits, which only carry
+            // home-shard bits for *transport* ids. A VSR id's top bits are
+            // random, so this resend routes to a garbage shard (~never the
+            // owning one, even single-shard) -> no registry slot -> dropped.
+            // The client then never receives the cached reply, retries the
+            // same (client, request), hits Duplicate again, and livelocks
+            // until the session times out. shard 0 cannot reconstruct the
+            // VSR->transport mapping, so the fix is to return the Duplicate
+            // outcome to the home shard and let it resend the cached body by
+            // transport id (mirroring the fresh-commit path in
+            // `submit_request_in_process` / `handle_client_request`). Must
+            // land before VSR client traffic goes past tier-1; not reached by
+            // the single-shard tcp happy path the tier-1 suite covers.
             // Best-effort resend (client may have disconnected). Frozen-backed
             // cache -> refcount handoff, no copy.
             let _ = consensus
@@ -92,6 +107,11 @@ where
         RequestStatus::NoSession => {
             // Session evicted under capacity pressure. SAFETY: catch-up
             // gate makes this replica authoritative for session truth.
+            // TODO(vsr-resend-misroute): `send_eviction_to_client` resends by
+            // the VSR consensus `client_id` and misroutes exactly like the
+            // Duplicate arm above -- the client never learns it was evicted.
+            // Same fix: route the eviction through the home shard by transport
+            // id. See the Duplicate arm for the full rationale.
             send_eviction_to_client(consensus, client_id, EvictionReason::NoSession).await;
             false
         }
@@ -100,6 +120,10 @@ where
             // expected < received: client bug; silent drop, log.
             // SAFETY: catch-up gate makes this replica authoritative.
             if expected > received {
+                // TODO(vsr-resend-misroute): same VSR-id misroute as the
+                // Duplicate / NoSession arms -- the eviction is sent by the
+                // consensus client_id and never reaches the client. See the
+                // Duplicate arm for the full rationale + fix.
                 send_eviction_to_client(consensus, client_id, EvictionReason::SessionTooLow).await;
             } else {
                 // Catch-up gate rules out network race; newer-than-issued

@@ -23,48 +23,63 @@
 //!
 //! # Connection model
 //!
-//! One bidirectional stream per peer (no multiplexing). The connection's
-//! first `accept_bi` pair carries every consensus frame.
+//! One bidirectional stream **per request** (matches the iggy SDK QUIC
+//! client, which opens a fresh `open_bi` per command and `send.finish()`-s
+//! after writing the request). The transport's [`QuicTransportConn::run`]
+//! runs an outer `accept_bi` loop on the connection and serves one bidi
+//! at a time:
 //!
-//! The accept step in [`accept_handshake`] drives the QUIC handshake AND
-//! the first `accept_bi` pair before yielding a fully-set-up
-//! [`QuicTransportConn`]. To avoid a single slow / hostile peer wedging
-//! the entire client plane behind that sequential pair of awaits, the
-//! client listener's accept loop pulls bare [`Incoming`] values via
+//! 1. accept the next bidi (or break on shutdown / connection close);
+//! 2. read exactly one inbound frame from the `RecvStream` and forward it
+//!    to [`ActorContext::in_tx`];
+//! 3. await one outbound frame on [`ActorContext::rx`] (the reply), drain
+//!    any additional immediate replies via `try_recv` (defensive — 1:1 in
+//!    steady state), write each to the `SendStream`, then `finish()` to
+//!    deliver pending data + FIN to the peer;
+//! 4. drop the bidi pair and loop to the next `accept_bi`.
+//!
+//! The `accept_bi` loop is serial by design: the single
+//! [`ActorContext::rx`] channel per connection is unkeyed, so two
+//! concurrent in-flight bidis would race the reply queue with no way to
+//! tell which reply belongs to which bidi. The iggy SDK on a single
+//! connection already serialises via an internal `RwLock`, so this is a
+//! semantic match, not a regression. A future pipelining upgrade would
+//! introduce `request_id`-keyed reply routing and run per-bidi handlers
+//! concurrently.
+//!
+//! The handshake itself is driven by [`accept_handshake`] (no bidi
+//! captured). To avoid a single slow / hostile peer wedging the entire
+//! client plane behind that handshake, the client listener's accept loop
+//! pulls bare [`Incoming`] values via
 //! [`QuicTransportListener::next_incoming`] and spawns one
-//! `accept_handshake` task per incoming. The accept step only obtains
-//! the `(SendStream, RecvStream)` handles; no bytes are read off the
-//! streams.
+//! `accept_handshake` task per incoming.
 //!
 //! # Zero-copy
 //!
 //! `compio_quic::SendStream::write<T: IoBuf>` accepts
-//! `Frozen<MESSAGE_ALIGN>` directly; the writer task loops one `write`
-//! per frame (QUIC has no `sendmmsg` analog). Per-message syscalls are
-//! the documented trade-off versus the TCP `writev` path; small
-//! high-RPS workloads stay on TCP.
+//! `Frozen<MESSAGE_ALIGN>` directly; the per-bidi reply path issues one
+//! `write` per frame (QUIC has no `sendmmsg` analog). Per-message
+//! syscalls are the documented trade-off versus the TCP `writev` path;
+//! small high-RPS workloads stay on TCP.
 //!
 //! # 0-RTT
 //!
 //! 0-RTT is off by default at the rustls layer (`max_early_data_size = 0`).
-//! `RecvStream::is_0rtt()` exists for defense-in-depth; the listener
-//! treats a `true` here as a misconfiguration and refuses the
-//! connection. Per-command 0-RTT enablement requires a per-command
-//! idempotence audit before being turned on.
+//! `RecvStream::is_0rtt()` is checked inside the `accept_bi` loop for
+//! defense in depth; a `true` here closes the connection with
+//! `QUIC_PROTOCOL_VIOLATION`. Per-command 0-RTT enablement requires a
+//! per-command idempotence audit before being turned on.
 
 use super::{ActorContext, TransportConn, TransportListener};
 use crate::config::QuicTuning;
 use crate::framing;
-use crate::lifecycle::{BusReceiver, FusedShutdown};
 use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{
-    Connection, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream, VarInt, congestion,
+    Connection, Endpoint, IdleTimeout, Incoming, VarInt, congestion,
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::GenericHeader;
-use server_common::Message;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -201,23 +216,20 @@ impl TransportListener for QuicTransportListener {
     }
 }
 
-/// Drive the QUIC handshake and the first `accept_bi` pair for one
-/// [`Incoming`].
+/// Drive the QUIC handshake for one [`Incoming`].
 ///
 /// Wraps the inner handshake driver in `compio::time::timeout` so a
 /// slowloris peer cannot pin the per-incoming spawned task beyond
-/// `handshake_grace`. The whole sequence
-/// (`incoming.accept` -> `connecting.await` -> `connection.accept_bi`)
-/// shares one wall-clock budget; on timeout the spawned future is
-/// dropped, which drops the local `Connection` and closes the QUIC
-/// session via its own Drop path.
+/// `handshake_grace`. The sequence
+/// (`incoming.accept` -> `connecting.await`) shares one wall-clock
+/// budget; on timeout the spawned future is dropped, which drops the
+/// local `Connection` and closes the QUIC session via its own Drop path.
 ///
-/// Returns [`Some`] on full success (handshake + first bidi pair, no
-/// 0-RTT). Returns [`None`] for any peer-induced failure
-/// (`incoming.accept` rejection, handshake error, `accept_bi` error,
-/// 0-RTT misconfiguration, handshake-grace exceeded); each non-success
-/// path logs and closes the connection with the matching application
-/// close code.
+/// Returns [`Some`] on a successful handshake (no bidirectional stream
+/// captured; per-request bidis are accepted later inside
+/// [`QuicTransportConn::run`]). Returns [`None`] for any peer-induced
+/// failure (`incoming.accept` rejection, handshake error,
+/// handshake-grace exceeded); each non-success path logs.
 #[allow(clippy::future_not_send)]
 pub async fn accept_handshake(
     incoming: Incoming,
@@ -252,30 +264,8 @@ async fn accept_handshake_inner(incoming: Incoming) -> Option<(QuicTransportConn
         }
     };
     let addr = connection.remote_address();
-
-    let (send, recv) = match connection.accept_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            warn!(%addr, "QUIC accept_bi failed: {e}");
-            connection.close(VarInt::from_u32(QUIC_HANDSHAKE_FAILED), b"accept_bi failed");
-            return None;
-        }
-    };
-
-    if recv.is_0rtt() {
-        warn!(
-            %addr,
-            "QUIC stream accepted in 0-RTT window; refusing"
-        );
-        connection.close(
-            VarInt::from_u32(QUIC_PROTOCOL_VIOLATION),
-            b"0-RTT not permitted",
-        );
-        return None;
-    }
-
-    debug!(%addr, "QUIC connection accepted, first bidi stream ready");
-    Some((QuicTransportConn::new(connection, (send, recv)), addr))
+    debug!(%addr, "QUIC handshake complete; bidi accept deferred to run()");
+    Some((QuicTransportConn::new(connection), addr))
 }
 
 /// Default wall-clock budget for the joint reader+writer drain plus
@@ -286,202 +276,146 @@ async fn accept_handshake_inner(incoming: Incoming) -> Option<(QuicTransportConn
 /// using `MessageBusConfig::close_grace`.
 pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
-/// A single QUIC connection plus its first bidirectional stream.
+/// A single accepted QUIC connection.
 ///
-/// The owned `Connection` handle is retained so graceful shutdown can
-/// fire `Connection::close(QUIC_SHUTDOWN, _)` after the writer drains.
+/// Per-request bidirectional streams are accepted on demand inside
+/// [`Self::run`]; the connection handle is retained so graceful
+/// shutdown can fire `Connection::close(QUIC_SHUTDOWN, _)` once the
+/// accept loop exits.
 pub struct QuicTransportConn {
     connection: Connection,
-    streams: (SendStream, RecvStream),
     close_grace: Duration,
 }
 
 impl QuicTransportConn {
-    /// Construct from an already-established connection + bidi pair.
+    /// Construct from an already-handshaked connection.
     #[must_use]
-    pub const fn new(connection: Connection, streams: (SendStream, RecvStream)) -> Self {
+    pub const fn new(connection: Connection) -> Self {
         Self {
             connection,
-            streams,
             close_grace: DEFAULT_CLOSE_GRACE,
         }
     }
 
-    /// Override the wall-clock bound that covers the joint
-    /// reader+writer drain at the end of `run` plus the trailing
-    /// `Connection::close(QUIC_SHUTDOWN, _)` invocation. The single
-    /// budget protects against a wedged reader (parked on the QUIC
-    /// `RecvStream::read_chunk` after the writer exits) or a wedged
-    /// writer (parked on a backpressured dispatch) holding the run
-    /// future open indefinitely. Intended for tests; the installer
-    /// plumbs `MessageBusConfig::close_grace` in production.
+    /// Override the wall-clock bound applied to the final
+    /// `Connection::close(QUIC_SHUTDOWN, _)` drain. Intended for tests;
+    /// the installer plumbs `MessageBusConfig::close_grace` in
+    /// production.
     #[must_use]
     pub const fn with_close_grace(mut self, close_grace: Duration) -> Self {
         self.close_grace = close_grace;
         self
     }
 
-    /// Deconstruct into the raw `(Connection, (SendStream, RecvStream))`
-    /// tuple, mirror of [`Self::new`].
-    ///
-    /// `client_listener::quic::run` uses this to hand the
-    /// already-accepted connection + first bidi pair to
-    /// [`crate::installer::install_client_quic`] (which then wraps
-    /// them in a fresh `QuicTransportConn` and dispatches via the
-    /// generic install path).
+    /// Deconstruct back to the raw `Connection`. Currently unused by
+    /// production code; retained for symmetry with [`Self::new`] and
+    /// for tests that need to drive the connection directly.
     #[must_use]
-    pub fn into_parts(self) -> (Connection, (SendStream, RecvStream)) {
-        (self.connection, self.streams)
+    pub fn into_inner(self) -> Connection {
+        self.connection
     }
 }
 
 impl TransportConn for QuicTransportConn {
     #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
-        let (send, recv) = self.streams;
         let connection = self.connection;
-        let close_grace = self.close_grace;
         let ActorContext {
             in_tx,
             rx,
             shutdown,
-            conn_shutdown,
+            conn_shutdown: _,
             max_batch: _,
             max_message_size,
             label,
             peer,
         } = ctx;
-        let reader_shutdown = shutdown.clone();
-        let writer_shutdown = shutdown;
-        let reader_peer = peer.clone();
-        let reader_label = label;
-        let reader_handle = compio::runtime::spawn(reader_task(
-            recv,
-            in_tx,
-            reader_shutdown,
-            max_message_size,
-            reader_label,
-            reader_peer,
-        ));
-        let writer_handle = compio::runtime::spawn(writer_task(
-            send,
-            rx,
-            writer_shutdown,
-            conn_shutdown,
-            label,
-            peer,
-        ));
-        // Joint reader+writer drain bounded by `close_grace`. Without
-        // the timeout a stuck reader (parked on a `RecvStream::read_chunk`
-        // after the peer goes silent) or a stuck writer (parked on a
-        // backpressured dispatch) keeps `run` alive indefinitely, and
-        // the peer never sees the CONNECTION_CLOSE frame. On elapse we
-        // fall through to `connection.close(...)` regardless; the
-        // FusedShutdown observer inside both tasks already wakes them
-        // on bus / per-conn shutdown so the elapse path is rare.
-        let _ = compio::time::timeout(close_grace, async move {
-            let _ = reader_handle.await;
-            let _ = writer_handle.await;
-        })
-        .await;
-        connection.close(VarInt::from_u32(QUIC_SHUTDOWN), b"shutdown");
-    }
-}
+        let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
 
-/// Drain inbound consensus frames from `recv` until shutdown or a
-/// read error.
-///
-/// # Cancel-safety
-///
-/// The `select!` arm that wakes on `shutdown` drops a parked
-/// [`crate::framing::read_message`] future. `read_message` is not
-/// cancel-safe across multi-read frames: bytes already pulled into the
-/// in-flight `Owned<MESSAGE_ALIGN>` are lost with the dropped frame and
-/// the stream has already advanced past them. The reader treats this
-/// loss as terminal and exits, which the writer's scopeguard turns into
-/// a clean per-connection close. Reads that complete in a single poll
-/// (full header + body already buffered by the QUIC stack) are
-/// unaffected.
-#[allow(clippy::future_not_send)]
-async fn reader_task(
-    mut recv: RecvStream,
-    in_tx: async_channel::Sender<Message<GenericHeader>>,
-    shutdown: FusedShutdown,
-    max_message_size: usize,
-    label: &'static str,
-    peer: String,
-) {
-    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
-    loop {
-        let read_fut = framing::read_message(&mut recv, max_message_size);
-        let result = futures::select! {
-            () = shutdown_fut.as_mut() => {
-                debug!(%label, %peer, "quic reader: shutdown observed");
-                return;
+        // Outer accept loop: one bidirectional stream per request.
+        loop {
+            let (mut send, mut recv) = futures::select! {
+                () = shutdown_fut.as_mut() => {
+                    debug!(%label, %peer, "quic: shutdown observed at accept_bi");
+                    break;
+                }
+                res = connection.accept_bi().fuse() => match res {
+                    Ok(streams) => streams,
+                    Err(e) => {
+                        debug!(%label, %peer, error = ?e, "quic: accept_bi failed (connection closed)");
+                        break;
+                    }
+                },
+            };
+
+            // Defense-in-depth 0-RTT check (matches the previous handshake-
+            // path guard now that bidi accept is deferred to here).
+            if recv.is_0rtt() {
+                warn!(%label, %peer, "quic: bidi accepted in 0-RTT window; refusing");
+                connection.close(
+                    VarInt::from_u32(QUIC_PROTOCOL_VIOLATION),
+                    b"0-RTT not permitted",
+                );
+                break;
             }
-            res = read_fut.fuse() => res,
-        };
-        match result {
-            Ok(msg) => {
-                if in_tx.send(msg).await.is_err() {
-                    debug!(%label, %peer, "quic reader: inbound queue dropped");
-                    return;
+
+            // Read exactly one inbound frame from this bidi. The SDK
+            // `send.finish()`-s after writing the request, so further
+            // reads on this RecvStream would return ConnectionClosed.
+            let req = match framing::read_message(&mut recv, max_message_size).await {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(%label, %peer, error = ?e, "quic: bidi read error");
+                    continue;
+                }
+            };
+            if in_tx.send(req).await.is_err() {
+                debug!(%label, %peer, "quic: inbound queue dropped");
+                break;
+            }
+
+            // Wait for the matching reply. The single bus rx channel is
+            // unkeyed; serialising one bidi at a time guarantees the
+            // next frame on `rx` is the reply for THIS bidi.
+            // `async_channel::Receiver::recv` and `FusedShutdown` are
+            // both cancel-safe and compio-buffer-free, so select-drop
+            // here cannot poison anything.
+            let first = futures::select! {
+                () = shutdown_fut.as_mut() => {
+                    debug!(%label, %peer, "quic: shutdown during reply wait");
+                    break;
+                }
+                res = rx.recv().fuse() => if let Ok(m) = res {
+                    m
+                } else {
+                    debug!(%label, %peer, "quic: mailbox closed");
+                    break;
+                },
+            };
+
+            // Write the reply, drain any additional immediate replies
+            // (defensive 1:N), then `finish()` so quinn-proto flushes
+            // pending data + a FIN, signalling the SDK that the reply
+            // is complete.
+            let BufResult(result, _frozen) = send.write_all(first).await;
+            if let Err(e) = result {
+                debug!(%label, %peer, error = ?e, "quic: write failed");
+                continue;
+            }
+            while let Ok(more) = rx.try_recv() {
+                let BufResult(result, _frozen) = send.write_all(more).await;
+                if let Err(e) = result {
+                    debug!(%label, %peer, error = ?e, "quic: write failed during burst drain");
+                    break;
                 }
             }
-            Err(e) => {
-                debug!(%label, %peer, "quic reader: read error: {e:?}");
-                let _keep_in_tx_alive = &in_tx;
-                shutdown_fut.await;
-                return;
+            if let Err(e) = send.finish() {
+                debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
             }
+            // (send, recv) drop here -> stream fully closed.
         }
-    }
-}
 
-/// Drain `rx` and write each frame to the QUIC stream.
-///
-/// On exit (clean OR panic via compio's `catch_unwind`) the scopeguard
-/// triggers the per-connection [`crate::lifecycle::Shutdown`]. The
-/// reader's `select!` over `shutdown.wait()` then resolves, which
-/// closes the reader, then `run()` resumes, closes the QUIC
-/// connection, and the installer's `transport_handle` scopeguard
-/// evicts the registry slot. Without this trigger, a writer-task panic
-/// while the peer is silent would leave the reader parked on
-/// `read_message` indefinitely.
-#[allow(clippy::future_not_send)]
-async fn writer_task(
-    mut send: SendStream,
-    rx: BusReceiver,
-    shutdown: FusedShutdown,
-    conn_shutdown: crate::lifecycle::Shutdown,
-    label: &'static str,
-    peer: String,
-) {
-    let _wake_reader = scopeguard::guard(conn_shutdown, |s| s.trigger());
-    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
-    loop {
-        let frozen = futures::select! {
-            () = shutdown_fut.as_mut() => {
-                debug!(%label, %peer, "quic writer: shutdown observed");
-                return;
-            }
-            msg = rx.recv().fuse() => {
-                let Ok(m) = msg else {
-                    debug!(%label, %peer, "quic writer: channel closed");
-                    return;
-                };
-                m
-            }
-        };
-
-        let BufResult(result, _frozen) = send.write_all(frozen).await;
-        if let Err(e) = result {
-            debug!(%label, %peer, "quic writer: write failed: {e}");
-            return;
-        }
-        // No per-frame flush: quinn-proto auto-coalesces STREAM frames
-        // into outbound datagrams. An explicit flush() blocks until the
-        // peer ACKs, serializing every send and killing pipelining.
+        connection.close(VarInt::from_u32(QUIC_SHUTDOWN), b"shutdown");
     }
 }
 
@@ -515,14 +449,14 @@ pub fn server_config_with_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::Shutdown;
+    use crate::lifecycle::{FusedShutdown, Shutdown};
     use async_channel::bounded;
     use compio::io::AsyncWrite;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
+    use server_common::{MESSAGE_ALIGN, Message};
     use std::time::Duration;
 
     fn install_crypto_provider() {
@@ -598,6 +532,11 @@ mod tests {
         (out_tx, in_rx, shutdown, handle)
     }
 
+    /// End-to-end frame delivery via the new accept_bi-per-bidi server
+    /// loop: client opens N bidis sequentially, writing one request per
+    /// bidi; server's loop reads each request, awaits a reply from
+    /// `rx`, writes it, and `finish()`-es the bidi. Verifies inbound
+    /// ordering matches what the client sent.
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn loopback_round_trip_three_frames() {
@@ -609,10 +548,16 @@ mod tests {
         let listener = QuicTransportListener::new(server);
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = listener.accept().await.expect("accept");
-            let (_out_tx, in_rx, shutdown, handle) = drive(conn);
+            let (out_tx, in_rx, shutdown, handle) = drive(conn);
+            // For each accepted bidi the server reads one inbound frame
+            // and then awaits exactly one reply on `rx` before
+            // accepting the next bidi. Feed three replies in step.
             let a = in_rx.recv().await.unwrap();
+            out_tx.send(header_only(Command2::Reply)).await.unwrap();
             let b = in_rx.recv().await.unwrap();
+            out_tx.send(header_only(Command2::Reply)).await.unwrap();
             let c = in_rx.recv().await.unwrap();
+            out_tx.send(header_only(Command2::Reply)).await.unwrap();
             shutdown.trigger();
             let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)
@@ -623,13 +568,14 @@ mod tests {
             .connect(server_addr, "localhost", None)
             .expect("connect");
         let connection = connecting.await.expect("client handshake");
-        let (send, recv) = connection.open_bi_wait().await.expect("open_bi");
-        let conn = QuicTransportConn::new(connection, (send, recv));
-        let (out_tx, _in_rx, shutdown, handle) = drive(conn);
 
-        out_tx.send(header_only(Command2::Ping)).await.unwrap();
-        out_tx.send(header_only(Command2::Prepare)).await.unwrap();
-        out_tx.send(header_only(Command2::Request)).await.unwrap();
+        // Three sequential bidis, one frame each.
+        for command in [Command2::Ping, Command2::Prepare, Command2::Request] {
+            let (mut send, _recv) = connection.open_bi_wait().await.expect("open_bi");
+            let BufResult(result, _) = send.write_all(header_only(command)).await;
+            result.expect("write");
+            send.finish().expect("finish");
+        }
 
         let (a, b, c) = compio::time::timeout(Duration::from_secs(5), server_task)
             .await
@@ -638,11 +584,13 @@ mod tests {
         assert_eq!(a, Command2::Ping);
         assert_eq!(b, Command2::Prepare);
         assert_eq!(c, Command2::Request);
-
-        shutdown.trigger();
-        let _ = handle.await;
     }
 
+    /// An oversize size field in the request header makes
+    /// `framing::read_message` reject the frame. The `accept_bi` loop
+    /// must NOT forward the bad frame to `in_tx`. The test asserts no
+    /// inbound frame surfaces within a small grace, then triggers
+    /// shutdown.
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn read_message_reports_oversize_via_run() {
@@ -655,10 +603,17 @@ mod tests {
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = listener.accept().await.expect("accept");
             let (_out_tx, in_rx, shutdown, handle) = drive(conn);
-            let res = in_rx.recv().await;
+            // The bad frame must NOT appear on `in_rx`. A short timeout
+            // proves the framing layer rejected the read rather than
+            // silently forwarding it: `Ok(Ok(_))` means a frame did
+            // surface (test failure); `Err(Elapsed)` or `Ok(Err(...))`
+            // both mean no frame was delivered.
+            let received = compio::time::timeout(Duration::from_millis(500), in_rx.recv())
+                .await
+                .is_ok_and(|r| r.is_ok());
             shutdown.trigger();
             let _ = handle.await;
-            res
+            received
         });
 
         let client = client_endpoint(cert).await;
@@ -666,7 +621,7 @@ mod tests {
             .connect(server_addr, "localhost", None)
             .expect("connect");
         let connection = connecting.await.expect("handshake");
-        let (mut send, recv) = connection.open_bi_wait().await.expect("open_bi");
+        let (mut send, _recv) = connection.open_bi_wait().await.expect("open_bi");
         // Bogus oversize size field at SIZE_FIELD_OFFSET.
         let mut buf = vec![0u8; HEADER_SIZE];
         let bogus = u32::try_from(framing::MAX_MESSAGE_SIZE + 1)
@@ -675,16 +630,16 @@ mod tests {
         buf[SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4].copy_from_slice(&bogus);
         let BufResult(result, _) = send.write(buf).await;
         result.expect("write");
-        send.flush().await.expect("flush");
-        drop(send); // signal end-of-stream so reader sees the framed bytes
-        drop(recv);
+        send.finish().expect("finish");
 
-        let res = compio::time::timeout(Duration::from_secs(5), server_task)
+        let bad_frame_received = compio::time::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server task within 5s")
             .unwrap();
-        // Framing error inside reader_task closes in_tx; recv resolves to Err.
-        assert!(res.is_err());
+        assert!(
+            !bad_frame_received,
+            "oversize frame must not surface on in_rx",
+        );
     }
 
     #[test]

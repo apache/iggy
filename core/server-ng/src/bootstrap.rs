@@ -32,8 +32,8 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -47,7 +47,12 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
-use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::requests::users::{
+    GetUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
+};
+use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
+use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -59,9 +64,12 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
+use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
+use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, WireName, WirePartitioning,
+    Command2, EvictionReason, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode,
+    WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
@@ -84,7 +92,7 @@ use message_bus::{
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
-use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
+use metadata::impls::metadata::{IggySnapshot, RegisterSubmitError, StreamsFrontend};
 use metadata::impls::recovery::recover;
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
@@ -99,10 +107,11 @@ use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
 use server_common::Message;
+use server_common::bootstrap::create_directories;
+use server_common::executor::create_shard_executor;
 use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use secrecy::ExposeSecret;
-use server::bootstrap::{create_directories, create_shard_executor};
 use server::log::logger::Logging;
 use server::shard_allocator::{ShardAllocator, ShardInfo};
 use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
@@ -1116,12 +1125,14 @@ async fn build_shard_for_thread(
     let shard_handle = Rc::new(RefCell::new(None));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
     let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle);
+    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
         on_replica_message,
         on_client_request,
+        on_metadata_submit,
         metadata,
         partitions,
         senders,
@@ -2186,6 +2197,71 @@ fn make_deferred_client_request_handler(
     })
 }
 
+/// Handler shard 0 runs for an inbound [`shard::MetadataSubmit`]: a peer
+/// shard has verified credentials and owns the session locally, and asks
+/// shard 0 (the metadata consensus owner) to run only the consensus
+/// proposal. Spawns a task so the awaiting peer is woken once the op
+/// commits; replies `None` on transient submit failure so the peer never
+/// blocks forever.
+fn make_metadata_submit_handler(
+    shard_handle: &ServerNgShardHandle,
+) -> shard::MetadataSubmitHandler {
+    let shard_handle = Rc::clone(shard_handle);
+    Rc::new(move |submit| {
+        let shard_handle = Rc::clone(&shard_handle);
+        compio::runtime::spawn(async move {
+            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+                return;
+            };
+            match submit {
+                shard::MetadataSubmit::Register {
+                    vsr_client_id,
+                    reply,
+                } => {
+                    let session = shard
+                        .plane
+                        .metadata()
+                        .submit_register_in_process(vsr_client_id)
+                        .await
+                        .ok();
+                    let _ = reply.try_send(session);
+                }
+                shard::MetadataSubmit::Logout {
+                    vsr_client_id,
+                    session,
+                    request,
+                    reply,
+                } => {
+                    let commit = shard
+                        .plane
+                        .metadata()
+                        .submit_logout_in_process(vsr_client_id, session, request)
+                        .await
+                        .ok();
+                    let _ = reply.try_send(commit);
+                }
+                shard::MetadataSubmit::ClientRequest { request, reply } => {
+                    let committed = match request.try_into_typed::<RequestHeader>() {
+                        Ok(typed) => shard
+                            .plane
+                            .metadata()
+                            .submit_request_in_process(typed)
+                            .await
+                            .ok()
+                            .map(server_common::Message::into_generic),
+                        Err(error) => {
+                            warn!(?error, "ClientRequest submit: undecodable request header");
+                            None
+                        }
+                    };
+                    let _ = reply.try_send(committed);
+                }
+            }
+        })
+        .detach();
+    })
+}
+
 fn enqueue_client_request(
     shard: Rc<ServerNgShard>,
     sessions: Rc<RefCell<SessionManager>>,
@@ -2288,7 +2364,7 @@ async fn handle_client_request(
             );
             return;
         }
-        handle_non_replicated_request(shard, transport_client_id, request).await;
+        handle_non_replicated_request(shard, sessions, transport_client_id, request).await;
         return;
     }
 
@@ -2363,24 +2439,70 @@ async fn handle_client_request(
             new_header.session = bound_session;
         }
     });
-    let request = match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
-        Ok(request) => request,
-        Err(error) => {
+    let (request, raw_pat_token) =
+        match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
+            Ok(rewritten) => rewritten,
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "dropping request with invalid PAT replication context"
+                );
+                return;
+            }
+        };
+    let request_header = *request.header();
+    // Replicated request: run consensus on the metadata owner (shard 0) and
+    // bring the committed reply back here. This shard owns the connection,
+    // so it writes the reply to the socket via the transport client id --
+    // shard 0 can't route by the consensus client id (no home-shard bits).
+    match submit_client_request_on_owner(shard, request).await {
+        Some(reply) => {
+            // The raw PAT token never enters consensus (it is non-deterministic
+            // and secret), so the committed reply body is empty. Substitute the
+            // raw-token response here, on the minting client's home shard, using
+            // the confirmed commit position from the committed reply.
+            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    warn!(
+                        transport_client_id,
+                        error = %error,
+                        "failed to build raw PAT reply"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "failed to deliver committed reply to client"
+                );
+            }
+        }
+        None => {
+            // Transient submit failure (not primary / not caught up / dedup
+            // absorbed). Stay silent; the SDK read-timeout replays.
             warn!(
                 transport_client_id,
-                error = %error,
                 operation = ?header.operation,
-                "dropping request with invalid PAT replication context"
+                "replicated request not committed (transient); client will replay"
             );
-            return;
         }
-    };
-    shard.dispatch(request.into_generic());
+    }
 }
 
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) {
@@ -2405,6 +2527,27 @@ async fn handle_non_replicated_request(
                     error = %error,
                     "failed to send non-replicated ping reply"
                 );
+            }
+        }
+        GET_ME_CODE => {
+            // `get_me` reports the requesting connection's own identity,
+            // which lives in the session manager + transport meta (not in
+            // `IggyMetadata`), so it is built here rather than in
+            // `build_non_replicated_response`.
+            let response = build_get_me_response(shard, sessions, transport_client_id);
+            let commit = current_metadata_commit(shard);
+            let reply = NonReplicatedResponse::Bytes(response.to_bytes()).into_reply(
+                request.header(),
+                request.header().client,
+                request.header().session,
+                commit,
+            );
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(transport_client_id, error = %error, "failed to send get_me reply");
             }
         }
         _ => match build_non_replicated_response(shard, code, request_body(&request)) {
@@ -2441,6 +2584,159 @@ async fn handle_non_replicated_request(
     }
 }
 
+/// Build the `get_me` reply for the requesting connection from its
+/// session (user id) and transport meta (transport kind + peer address).
+/// `consumer_groups` is empty: server-ng does not yet track per-client
+/// consumer-group membership.
+///
+/// TODO(clients-table): the transport kind + peer address are read from
+/// the message-bus `client_meta` here, which couples this metadata read
+/// to the bus's connection bookkeeping. The client identity (id, user,
+/// transport, address, consumer-group membership) should instead live in
+/// a first-class clients table in `IggyMetadata`, populated at Register
+/// time, so `get_me` / `get_client` / `get_clients` all read from one
+/// authoritative source via `frontend()` rather than reaching into the
+/// bus. Rework this API once that table exists.
+fn build_get_me_response(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) -> ClientDetailsResponse {
+    // `get_me` is auth-gated, so a bound session's user id is normally
+    // present. Fall back to the wire "no user" sentinel (`u32::MAX`)
+    // rather than `0`, which is a valid id (server-ng is 0-based, so
+    // root is user id 0) and would otherwise impersonate root.
+    let user_id = sessions
+        .borrow()
+        .get_user_id(transport_client_id)
+        .unwrap_or(u32::MAX);
+    let (transport, address) = shard.bus.client_meta(transport_client_id).map_or_else(
+        || (1u8, String::new()),
+        |meta| {
+            (
+                transport_kind_to_wire(meta.transport),
+                meta.peer_addr.to_string(),
+            )
+        },
+    );
+    ClientDetailsResponse {
+        client: ClientResponse {
+            // The transport client id is a u128 `(shard << 112) | seq`; the
+            // legacy wire `client_id` is the u32 seq tail.
+            #[allow(clippy::cast_possible_truncation)]
+            client_id: transport_client_id as u32,
+            user_id,
+            transport,
+            address,
+            consumer_groups_count: 0,
+        },
+        consumer_groups: Vec::new(),
+    }
+}
+
+/// Map the transport kind to the legacy wire discriminant
+/// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
+/// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
+/// (TCP, TCP-TLS, or a future) variant falls back to TCP.
+const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
+    match kind {
+        ClientTransportKind::Quic => 2,
+        ClientTransportKind::Ws | ClientTransportKind::Wss => 4,
+        _ => 1,
+    }
+}
+
+/// Run the consensus `Register` proposal on the metadata owner (shard 0)
+/// and return the committed session.
+///
+/// Credential verification and session binding stay on the calling (home)
+/// shard -- only this consensus step must execute where the metadata
+/// consensus group lives. On shard 0 it calls in-process directly; on a
+/// peer it forwards a [`shard::MetadataSubmit`] to shard 0 and awaits the
+/// committed op. A dropped reply (shard-0 inbox full / shutdown) maps to a
+/// transient `Canceled`, which the caller wraps so the SDK replays.
+#[allow(clippy::future_not_send)]
+async fn submit_register_on_owner(
+    shard: &Rc<ServerNgShard>,
+    vsr_client_id: u128,
+) -> Result<u64, RegisterSubmitError> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_register_in_process(vsr_client_id)
+            .await;
+    }
+    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::Register {
+        vsr_client_id,
+        reply,
+    });
+    match rx.recv().await {
+        Ok(Some(session)) => Ok(session),
+        _ => Err(RegisterSubmitError::Canceled),
+    }
+}
+
+/// Logout counterpart of [`submit_register_on_owner`].
+#[allow(clippy::future_not_send)]
+async fn submit_logout_on_owner(
+    shard: &Rc<ServerNgShard>,
+    vsr_client_id: u128,
+    session: u64,
+    request: u64,
+) -> Result<u64, RegisterSubmitError> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_logout_in_process(vsr_client_id, session, request)
+            .await;
+    }
+    let (reply, rx) = shard::channel::<Option<u64>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::Logout {
+        vsr_client_id,
+        session,
+        request,
+        reply,
+    });
+    match rx.recv().await {
+        Ok(Some(commit)) => Ok(commit),
+        _ => Err(RegisterSubmitError::Canceled),
+    }
+}
+
+/// Submit a replicated client request to the metadata owner (shard 0) and
+/// return the committed reply.
+///
+/// The metadata consensus group lives on shard 0, but the connection lives
+/// on the home shard (this shard). Run consensus where it belongs and bring
+/// the committed reply back here so the caller can write it to the
+/// originating socket -- shard 0 cannot route the reply by the consensus
+/// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
+/// `None` = transient submit failure (SDK read-timeout replays).
+#[allow(clippy::future_not_send)]
+async fn submit_client_request_on_owner(
+    shard: &Rc<ServerNgShard>,
+    request: Message<RequestHeader>,
+) -> Option<Message<GenericHeader>> {
+    if shard.id == 0 {
+        return shard
+            .plane
+            .metadata()
+            .submit_request_in_process(request)
+            .await
+            .ok()
+            .map(server_common::Message::into_generic);
+    }
+    let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
+    shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
+        request: request.into_generic(),
+        reply,
+    });
+    rx.recv().await.ok().flatten()
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_logout_request(
     shard: &Rc<ServerNgShard>,
@@ -2457,12 +2753,7 @@ async fn handle_logout_request(
     };
 
     let request_id = request.header().request;
-    let commit = match shard
-        .plane
-        .metadata()
-        .submit_logout_in_process(vsr_client_id, session, request_id)
-        .await
-    {
+    let commit = match submit_logout_on_owner(shard, vsr_client_id, session, request_id).await {
         Ok(commit) => commit,
         Err(error) => {
             warn!(transport_client_id, error = %error, "logout/unregister failed");
@@ -2503,17 +2794,18 @@ fn maybe_rewrite_pat_request(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError> {
+) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
     let operation = request.header().operation;
     let user_id = match operation {
         Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
             .borrow()
             .get_user_id(transport_client_id)
             .ok_or(IggyError::Unauthenticated)?,
-        _ => return Ok(request),
+        _ => return Ok((request, None)),
     };
 
     let body = request_body(&request);
+    let mut raw_token = None;
     let rewritten = match operation {
         Operation::CreatePersonalAccessToken => {
             let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
@@ -2521,8 +2813,10 @@ fn maybe_rewrite_pat_request(
             // Primary mints the raw token + hash here and ships the hash
             // through consensus. Replicas decode the hash directly. Doing
             // this inside `CreatePersonalAccessTokenRequest::apply` would
-            // call `ring::rand` per-replica and diverge state.
-            let token_hash = mint_pat_token_hash();
+            // call `ring::rand` per-replica and diverge state. The raw token
+            // is returned to this client only (see `handle_client_request`).
+            let (raw, token_hash) = mint_pat_raw_and_hash();
+            raw_token = Some(raw);
             ReplicatedCreatePersonalAccessTokenRequest {
                 user_id,
                 name: wire.name,
@@ -2543,20 +2837,20 @@ fn maybe_rewrite_pat_request(
         _ => unreachable!(),
     };
 
-    rewrite_request_body(&request, &rewritten)
+    Ok((rewrite_request_body(&request, &rewritten)?, raw_token))
 }
 
-/// Mints a fresh PAT raw token and returns its hex-encoded SHA-256 hash
-/// (64 bytes ASCII) for replication. The raw token is currently dropped --
-/// see the TODO on `CreatePersonalAccessTokenRequest::apply` for the missing
-/// return-to-client path.
-fn mint_pat_token_hash() -> [u8; 64] {
-    let (_raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
+/// Mints a fresh PAT and returns the raw token plus its hex-encoded SHA-256
+/// hash (64 bytes ASCII). Only the hash is replicated; the raw token is
+/// returned to the minting client by the home shard (it cannot be reproduced
+/// by the deterministic `apply` running on every replica).
+fn mint_pat_raw_and_hash() -> (String, [u8; 64]) {
+    let (raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
     let bytes = hash.as_bytes();
     let mut out = [0u8; 64];
     let len = bytes.len().min(64);
     out[..len].copy_from_slice(&bytes[..len]);
-    out
+    (raw, out)
 }
 
 fn rewrite_request_body(
@@ -2611,7 +2905,8 @@ async fn handle_login_register_request(
                 .await
                 {
                     warn!(transport_client_id, error = %error, "login/register failed");
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
                 }
                 return;
             }
@@ -2623,7 +2918,7 @@ async fn handle_login_register_request(
             }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
                 return;
             }
         }
@@ -2647,7 +2942,8 @@ async fn handle_login_register_request(
                         error = %error,
                         "login/register with PAT failed"
                     );
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
                 }
                 return;
             }
@@ -2657,7 +2953,7 @@ async fn handle_login_register_request(
                     error = %error,
                     "login/register with PAT failed"
                 );
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
+                surface_login_failure(shard, transport_client_id, request.header(), &error).await;
                 return;
             }
         }
@@ -2670,13 +2966,37 @@ async fn handle_login_register_request(
     send_login_failure_reply(shard, transport_client_id, request.header()).await;
 }
 
-/// Empty Reply on a failed Register. Without it the SDK -- which only
-/// decodes `Command2::Reply` -- blocks until the socket read timeout fires
-/// for what is really a typed failure. An empty body fails downstream
-/// `LoginRegisterResponse` decoding with `InvalidCommand`, surfacing the
-/// failure to the caller immediately. A future change can switch this to
-/// an Eviction frame with a typed `EvictionReason` once the SDK eviction
-/// decoder lands at every transport.
+/// Decide whether a failed login/register gets a terminal reply or silence.
+///
+/// `Transient` / `InvalidClientId` are `NotEvictable` (see
+/// [`LoginRegisterError`]'s `TryFrom` for `EvictionReason`): the cluster
+/// could not commit *right now* (e.g. a freshly booted primary still
+/// catching up, or a cross-shard submit canceled). Staying silent lets the
+/// SDK read-timeout replay -- a later attempt lands once the primary is
+/// caught up. Replying empty here would instead surface as a hard
+/// `InvalidFormat` decode failure and break the replay.
+///
+/// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
+/// `UserInactive` / `Session`) map to an `EvictionReason`, so we fast-fail
+/// with an empty reply rather than make the client wait for a timeout.
+/// (TODO: ship a typed `Eviction` frame once the SDK eviction decoder lands
+/// on every transport.)
+#[allow(clippy::future_not_send)]
+async fn surface_login_failure(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+    error: &LoginRegisterError,
+) {
+    if EvictionReason::try_from(error).is_ok() {
+        send_login_failure_reply(shard, transport_client_id, request_header).await;
+    }
+}
+
+/// Empty Reply on a terminal failed Register. The SDK only decodes
+/// `Command2::Reply`; an empty body fails `LoginRegisterResponse` decoding
+/// fast instead of hanging until the socket read timeout. Only call for
+/// terminal errors -- see [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
 async fn send_login_failure_reply(
     shard: &Rc<ServerNgShard>,
@@ -2853,6 +3173,18 @@ fn build_non_replicated_response(
                 build_get_topics_response(shard, &request.stream_id)?.to_bytes(),
             ))
         }
+        GET_USERS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_get_users_response(shard)?.to_bytes(),
+        )),
+        GET_USER_CODE => {
+            let request =
+                GetUserRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            build_get_user_response(shard, &request.user_id).map(|response| {
+                response.map_or(NonReplicatedResponse::Empty, |response| {
+                    NonReplicatedResponse::Bytes(response.to_bytes())
+                })
+            })
+        }
         POLL_MESSAGES_CODE => {
             let request =
                 PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -2985,6 +3317,53 @@ fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsRes
             .map(|(_, stream)| stream_response(stream))
             .collect::<Result<Vec<_>, _>>()
             .map(|streams| GetStreamsResponse { streams })
+    })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
+    Ok(UserResponse {
+        id: user.id,
+        created_at: user.created_at.as_micros(),
+        status: user.status.as_code(),
+        username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+    })
+}
+
+fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersResponse, IggyError> {
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        users
+            .items
+            .iter()
+            .map(|(_, user)| user_response(user))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|users| GetUsersResponse { users })
+    })
+}
+
+fn build_get_user_response(
+    shard: &Rc<ServerNgShard>,
+    user_id: &WireIdentifier,
+) -> Result<Option<UserDetailsResponse>, IggyError> {
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        let resolved = match user_id {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
+                users.items.contains(id).then_some(id)
+            }
+            WireIdentifier::String(name) => users.index.get(name.as_str()).map(|&id| id as usize),
+        };
+        let Some(id) = resolved else {
+            return Ok(None);
+        };
+        let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
+        Ok(Some(UserDetailsResponse {
+            user: user_response(user)?,
+            permissions: user
+                .permissions
+                .as_ref()
+                .map(|p| iggy_common::wire_conversions::permissions_to_wire(p)),
+        }))
     })
 }
 
@@ -3198,12 +3577,7 @@ async fn complete_login_register(
             .map_err(LoginRegisterError::Session)?;
     }
 
-    let session = match shard
-        .plane
-        .metadata()
-        .submit_register_in_process(vsr_client_id)
-        .await
-    {
+    let session = match submit_register_on_owner(shard, vsr_client_id).await {
         Ok(session) => session,
         Err(error) => {
             let _ = sessions
@@ -3339,6 +3713,36 @@ fn build_reply_from_bytes(
         body.len(),
         |out| out.copy_from_slice(body),
     )
+}
+
+/// If a raw PAT token was minted (`CreatePersonalAccessToken`), replace the
+/// committed reply -- whose body is empty because the raw token never entered
+/// consensus -- with a `RawPersonalAccessTokenResponse`, reusing the confirmed
+/// commit position from the committed reply. Otherwise the committed reply
+/// passes through unchanged.
+fn build_raw_pat_reply(
+    request_header: &RequestHeader,
+    committed: Message<GenericHeader>,
+    raw_token: Option<String>,
+) -> Result<Message<GenericHeader>, IggyError> {
+    let Some(raw) = raw_token else {
+        return Ok(committed);
+    };
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let committed_header =
+        bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
+            .map_err(|_| IggyError::InvalidFormat)?;
+    let commit = committed_header.commit;
+    let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
+    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let reply = build_reply_from_bytes(
+        request_header,
+        request_header.client,
+        request_header.session,
+        commit,
+        &body,
+    );
+    Ok(reply.into_generic())
 }
 
 fn build_reply_with_body(
