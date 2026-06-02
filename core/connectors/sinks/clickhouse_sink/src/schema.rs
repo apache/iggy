@@ -30,8 +30,10 @@
 //!                  | "Map(" type ", " type ")"
 //!                  | "Tuple(" tuple_fields ")"
 //!
-//! tuple_fields   ::= type ("," type)*            -- unnamed fields
-//!                  | ident type ("," ident type)* -- named fields
+//! tuple_fields   ::= type ("," type)*                    -- unnamed fields
+//!                  | field type ("," field type)*         -- named fields
+//!
+//! field          ::= ident | "`" [^`]* "`"
 //!
 //! parameterised  ::= "FixedString(" n ")"
 //!                  | "DateTime64(" precision ["," tz] ")"
@@ -183,10 +185,11 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             .map(|p| {
                 let p = p.trim();
                 if let Some((name, rest)) = strip_named_tuple_field(p) {
-                    Ok((Some(name.to_string()), parse_type_inner(rest)?))
-                } else {
-                    Ok((None, parse_type_inner(p)?))
+                    if let Ok(ch_type) = parse_type_inner(rest) {
+                        return Ok((Some(name.to_string()), ch_type));
+                    }
                 }
+                Ok((None, parse_type_inner(p)?))
             })
             .collect();
         return Ok(ChType::Tuple(fields?));
@@ -374,12 +377,29 @@ fn split_two_args(s: &str) -> Result<(&str, &str), Error> {
     Ok((parts[0], parts[1]))
 }
 
-/// If `s` starts with an identifier followed by a space and the rest looks
-/// like a type, return `(name, type_str)`. This handles named Tuple fields like
-/// `id Int32`.
+/// If `s` looks like `field_name type_str`, return `(field_name, type_str)`.
+///
+/// Handles both plain identifiers (`id Int32`) and backtick-quoted identifiers
+/// (`` `weird name` Int32 ``). The caller is responsible for validating that
+/// `type_str` actually parses as a type; this function only extracts the split.
 fn strip_named_tuple_field(s: &str) -> Option<(&str, &str)> {
+    if s.starts_with('`') {
+        // Backtick-quoted identifier: `field name` Type
+        let close = s[1..].find('`')? + 1;
+        let name = &s[1..close];
+        if name.is_empty() {
+            return None;
+        }
+        let after = &s[close + 1..];
+        if !after.starts_with(' ') {
+            return None;
+        }
+        let rest = after.trim();
+        return if rest.is_empty() { None } else { Some((name, rest)) };
+    }
+
+    // Unquoted identifier: letters, digits, underscore
     let mut chars = s.char_indices().peekable();
-    // Consume identifier characters (letters, digits, underscore)
     while let Some((_, ch)) = chars.peek() {
         if ch.is_alphanumeric() || *ch == '_' {
             chars.next();
@@ -387,12 +407,13 @@ fn strip_named_tuple_field(s: &str) -> Option<(&str, &str)> {
             break;
         }
     }
-    // Expect a single space after the identifier
     if let Some((idx, ' ')) = chars.next() {
         let name = &s[..idx];
+        if name.is_empty() {
+            return None;
+        }
         let rest = s[idx + 1..].trim();
-        // Sanity: the rest should start with an uppercase letter (type name)
-        if rest.starts_with(|c: char| c.is_uppercase()) {
+        if !rest.is_empty() {
             return Some((name, rest));
         }
     }
@@ -584,6 +605,32 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].0.as_deref(), Some("id"));
         assert_eq!(fields[1].0.as_deref(), Some("name"));
+        assert!(matches!(fields[0].1, ChType::Int32));
+        assert!(matches!(fields[1].1, ChType::String));
+    }
+
+    #[test]
+    fn parses_tuple_backtick_field_names() {
+        let t = parse_type("Tuple(`weird name` Int32, `price USD` Float64)").unwrap();
+        let ChType::Tuple(fields) = t else {
+            panic!("expected Tuple")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.as_deref(), Some("weird name"));
+        assert_eq!(fields[1].0.as_deref(), Some("price USD"));
+        assert!(matches!(fields[0].1, ChType::Int32));
+        assert!(matches!(fields[1].1, ChType::Float64));
+    }
+
+    #[test]
+    fn parses_tuple_mixed_plain_and_backtick_field_names() {
+        let t = parse_type("Tuple(id Int32, `display name` String)").unwrap();
+        let ChType::Tuple(fields) = t else {
+            panic!("expected Tuple")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.as_deref(), Some("id"));
+        assert_eq!(fields[1].0.as_deref(), Some("display name"));
         assert!(matches!(fields[0].1, ChType::Int32));
         assert!(matches!(fields[1].1, ChType::String));
     }
