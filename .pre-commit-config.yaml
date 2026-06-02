@@ -305,10 +305,10 @@ repos:
     hooks:
       - id: helmfmt
         name: helmfmt
-        entry: helmfmt helm/charts/iggy/
+        entry: helmfmt
         language: system
         files: ^helm/charts/.*/templates/.*\.(yaml|tpl)$
-        pass_filenames: false
+        pass_filenames: true
 
       - id: yamllint-helm
         name: yamllint (helm)
