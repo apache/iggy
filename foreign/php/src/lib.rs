@@ -42,6 +42,8 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        // Parent classes must be registered before subclasses because ext-php-rs resolves
+        // the parent ClassEntry during child registration.
         .class::<IggyException>()
         .class::<ConnectionException>()
         .class::<AuthenticationException>()

@@ -21,12 +21,16 @@
 
 declare(strict_types=1);
 
+use Iggy\AutoCommit;
 use Iggy\Client as IggyClient;
 use Iggy\Exception\AuthenticationException;
 use Iggy\Exception\ConnectionException;
 use Iggy\Exception\IggyException;
 use Iggy\Exception\NotFoundException;
 use Iggy\Exception\TransientException;
+use Iggy\PollingStrategy;
+use Iggy\ReceiveMessage;
+use Iggy\SendMessage;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -68,5 +72,55 @@ final class ErrorTest extends TestCase
     public function testTransientExceptionUsesIggyBase(): void
     {
         assert_true(is_subclass_of(TransientException::class, IggyException::class));
+    }
+
+    #[TestDox('Callback exceptions are rethrown without changing their PHP type')]
+    public function testCallbackExceptionIsRethrownAsOriginalException(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('callback-exception-consumer');
+        $streamName = unique_name('callback-exception-stream');
+        $topicName = unique_name('callback-exception-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                0,
+                [new SendMessage('callback exception payload')],
+            );
+
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+
+            $throwable = assert_throws(
+                static fn () => $consumer->consumeMessages(
+                    static function (ReceiveMessage $message): void {
+                        throw new RuntimeException('callback abort');
+                    },
+                    1,
+                ),
+            );
+
+            assert_instance_of(RuntimeException::class, $throwable);
+            assert_same('callback abort', $throwable->getMessage());
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 }

@@ -171,9 +171,9 @@ impl IggyConsumer {
             .get_last_consumed_offset(current_partition_id)
             .is_none()
         {
-            return Err(
-                "'partition_id' is required until at least one message has been polled".into(),
-            );
+            return Err(to_php_exception(
+                "'partition_id' is required until at least one message has been polled",
+            ));
         }
 
         Ok(Some(current_partition_id))
