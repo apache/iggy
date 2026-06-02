@@ -16,12 +16,13 @@
  * under the License.
  */
 
+pub mod bootstrap;
 mod buffer;
 mod certificates;
 mod consensus_message;
 mod deduplication;
 pub mod diagnostics;
-mod executor;
+pub mod executor;
 mod in_flight;
 mod indexes_mut;
 // TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
@@ -45,6 +46,7 @@ mod segment_storage;
 pub mod send_messages2;
 pub mod sharding;
 
+pub use bootstrap::create_directories;
 pub use buffer::PooledBuffer;
 pub use certificates::generate_self_signed_certificate;
 pub use consensus_message::{

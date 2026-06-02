@@ -107,10 +107,11 @@ use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
 use server_common::Message;
+use server_common::bootstrap::create_directories;
+use server_common::executor::create_shard_executor;
 use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use secrecy::ExposeSecret;
-use server::bootstrap::{create_directories, create_shard_executor};
 use server::log::logger::Logging;
 use server::shard_allocator::{ShardAllocator, ShardInfo};
 use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};

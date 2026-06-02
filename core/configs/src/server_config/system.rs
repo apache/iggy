@@ -28,6 +28,7 @@ use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use server_common::bootstrap::SystemPaths;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
@@ -330,5 +331,27 @@ impl SystemConfig {
             IggyExpiry::ServerDefault => self.topic.message_expiry,
             _ => message_expiry,
         }
+    }
+}
+
+impl SystemPaths for SystemConfig {
+    fn get_system_path(&self) -> String {
+        SystemConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        SystemConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        SystemConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        SystemConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        SystemConfig::get_runtime_path(self)
     }
 }
