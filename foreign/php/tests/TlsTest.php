@@ -38,6 +38,8 @@ final class TlsTest extends TestCase
         $client = IggyClient::fromConnectionString($connectionString);
         $client->connect();
         $client->ping();
+
+        assert_true($client instanceof IggyClient, 'TLS client connected and pinged');
     }
 
     public function testProduceAndConsumeOverTls(): void
@@ -81,6 +83,9 @@ final class TlsTest extends TestCase
         }
 
         $client = new IggyClient($address);
-        assert_throws(static fn () => $client->connect());
+        assert_throws(static function () use ($client): void {
+            $client->connect();
+            $client->ping();
+        });
     }
 }
