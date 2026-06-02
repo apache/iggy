@@ -156,14 +156,15 @@ impl MeilisearchSource {
             query.with_sort(&sort_refs);
         }
 
-        let documents = query
-            .execute::<Value>()
-            .await
-            .map_err(map_sdk_error)?
-            .hits
-            .into_iter()
-            .map(|hit| hit.result)
-            .collect();
+        let documents = match query.execute::<Value>().await {
+            Ok(results) => results.hits.into_iter().map(|hit| hit.result).collect(),
+            Err(MeilisearchSdkError::Meilisearch(error))
+                if error.error_code == MeilisearchErrorCode::IndexNotFound =>
+            {
+                Vec::new()
+            }
+            Err(error) => return Err(map_sdk_error(error)),
+        };
         let messages = self.documents_to_messages(offset, documents)?;
 
         let mut state = self.state.lock().await;

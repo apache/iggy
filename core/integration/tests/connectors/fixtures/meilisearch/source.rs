@@ -25,6 +25,8 @@ use std::collections::HashMap;
 
 const ENV_SOURCE_URL: &str = "IGGY_CONNECTORS_SOURCE_MEILISEARCH_PLUGIN_CONFIG_URL";
 const ENV_SOURCE_INDEX: &str = "IGGY_CONNECTORS_SOURCE_MEILISEARCH_PLUGIN_CONFIG_INDEX";
+const ENV_SOURCE_INCLUDE_METADATA: &str =
+    "IGGY_CONNECTORS_SOURCE_MEILISEARCH_PLUGIN_CONFIG_INCLUDE_METADATA";
 const ENV_SOURCE_POLLING_INTERVAL: &str =
     "IGGY_CONNECTORS_SOURCE_MEILISEARCH_PLUGIN_CONFIG_POLLING_INTERVAL";
 const ENV_SOURCE_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SOURCE_MEILISEARCH_STREAMS_0_STREAM";
@@ -63,6 +65,7 @@ impl TestFixture for MeilisearchSourceFixture {
         HashMap::from([
             (ENV_SOURCE_URL.to_string(), self.container.base_url.clone()),
             (ENV_SOURCE_INDEX.to_string(), TEST_INDEX.to_string()),
+            (ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string()),
             (ENV_SOURCE_POLLING_INTERVAL.to_string(), "25ms".to_string()),
             (
                 ENV_SOURCE_STREAMS_0_STREAM.to_string(),
