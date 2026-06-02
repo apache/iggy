@@ -93,9 +93,9 @@ impl StringFormat {
         }
     }
 
-    /// CSV and TSV rows must end with a newline; JSON rows are already delimited.
+    /// All three formats use newline as a row delimiter.
     pub fn requires_newline(&self) -> bool {
-        matches!(self, StringFormat::Csv | StringFormat::Tsv)
+        matches!(self, StringFormat::Csv | StringFormat::Tsv | StringFormat::JsonEachRow)
     }
 }
 
