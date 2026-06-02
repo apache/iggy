@@ -153,7 +153,7 @@ repos:
       - id: typos
         name: typos (spelling check)
         entry: typos
-        args: [ "-w" ]
+        args: ["--force-exclude", "-w"]
         language: system
         types: [ text ]
         pass_filenames: true

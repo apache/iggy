@@ -506,10 +506,10 @@ mod tests {
             .into_iter()
             .collect();
 
-        let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("TEST_ENABLED", &known);
+        let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("TEST_ENABELD", &known);
         assert!(suggestions.contains(&"TEST_ENABLED".to_string()));
 
-        let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("TEST_NAME", &known);
+        let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("TEST_NANE", &known);
         assert!(suggestions.contains(&"TEST_NAME".to_string()));
     }
 
