@@ -22,7 +22,7 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
-use compio::net::{SocketOpts, TcpListener};
+use compio::net::TcpListener;
 use compio::ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
@@ -33,10 +33,8 @@ use std::rc::Rc;
 use tracing::{debug, error, info};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
-    // Required by the thread-per-core model...
-    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
-    let opts = SocketOpts::new().reuse_port(true).reuse_address(true);
-    TcpListener::bind_with_options(addr, &opts).await
+    // Thread-per-core: many sockets bind the same addr+port (SO_REUSEPORT).
+    crate::tcp::bind_reuseport_listener(addr, true, None).await
 }
 
 pub async fn start(

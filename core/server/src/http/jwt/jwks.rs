@@ -21,13 +21,19 @@ use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use std::hash::Hash;
-use std::sync::OnceLock;
 use strum::{Display, EnumString};
 
-static HTTP_CLIENT: OnceLock<cyper::Client> = OnceLock::new();
+thread_local! {
+    // cyper 0.9's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()`
+    // now returns a `Result`, so it can no longer be a global `OnceLock`.
+    // compio is thread-per-core; keep one client per thread. The `Rc`
+    // inner makes cloning cheap, so callers take an owned handle.
+    static HTTP_CLIENT: cyper::Client =
+        cyper::Client::new().expect("failed to build cyper HTTP client for JWKS");
+}
 
-fn get_http_client() -> &'static cyper::Client {
-    HTTP_CLIENT.get_or_init(cyper::Client::new)
+fn get_http_client() -> cyper::Client {
+    HTTP_CLIENT.with(cyper::Client::clone)
 }
 
 /// JWK key type enumeration
@@ -139,6 +145,10 @@ impl JwksClient {
     }
 
     async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {
+        // The cyper client is `!Send` since 0.9; callers reached from axum
+        // middleware wrap this future in `SendWrapper` (see
+        // `http::jwt::middleware::jwt_auth`), so it's free to await cyper
+        // directly here.
         let client = get_http_client();
         let request = client
             .get(jwks_url)

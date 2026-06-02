@@ -4193,6 +4193,11 @@ mod tests {
 
     #[compio::test]
     async fn await_metadata_bundle_aborts_on_shutdown_flag() {
+        // compio 0.19 `JoinHandle` yields `Result<T, JoinError>`; the
+        // `ResumeUnwind` impl re-raises a task panic and maps cancellation
+        // to `None`.
+        use compio::runtime::ResumeUnwind;
+
         let (_bundle_tx, bundle_rx) = crossfire::mpmc::bounded_async::<ServerNgMetadataBundle>(1);
         let flag = Arc::new(AtomicBool::new(false));
 
@@ -4208,7 +4213,8 @@ mod tests {
 
         let err = waiter
             .await
-            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            .resume_unwind()
+            .expect("waiter task was cancelled")
             .expect_err("shutdown flag must abort the bundle wait");
         assert!(
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 1 }),

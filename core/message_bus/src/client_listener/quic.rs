@@ -42,7 +42,6 @@ use crate::lifecycle::ShutdownToken;
 use crate::transports::quic::{QuicTransportListener, accept_handshake};
 use crate::{AcceptedQuicClientFn, AcceptedQuicConn};
 use compio::net::UdpSocket;
-use compio::runtime::JoinHandle;
 use compio_quic::{Endpoint, EndpointConfig, ServerConfig};
 use futures::FutureExt;
 use iggy_common::IggyError;
@@ -139,17 +138,7 @@ pub async fn run(
     );
 
     let listener = QuicTransportListener::new(endpoint);
-    let mut handshake_handles: Vec<JoinHandle<()>> = Vec::new();
     loop {
-        // Drop completed handles before blocking on the next incoming so
-        // the vector stays bounded under sustained QUIC connect attempts.
-        // Without this sweep, every accepted connection's `JoinHandle`
-        // would persist for the listener's lifetime, leaking task-table
-        // slots + scopeguard state proportional to total accepted
-        // connections since boot. Dropping a finished `Task` is a no-op
-        // (no in-flight work to cancel).
-        handshake_handles.retain(|h| !h.is_finished());
-
         futures::select! {
             () = token.wait().fuse() => {
                 debug!("Client listener (QUIC) shutting down");
@@ -159,7 +148,13 @@ pub async fn run(
                 match result {
                     Ok(incoming) => {
                         let on_accepted = on_accepted.clone();
-                        let handle = compio::runtime::spawn(async move {
+                        // Fire-and-forget: compio 0.19's `JoinHandle` has no
+                        // `is_finished`, so the prior bounded-handle sweep is
+                        // gone. `detach()` lets each handshake task self-manage
+                        // (no Vec to grow). On shutdown the listener drops the
+                        // `Endpoint`, which fails any in-flight handshake so
+                        // the detached task exits.
+                        compio::runtime::spawn(async move {
                             let Some((conn, peer_addr)) =
                                 accept_handshake(incoming, handshake_grace).await
                             else {
@@ -168,8 +163,8 @@ pub async fn run(
                             debug!(%peer_addr, "QUIC client accepted, handing to installer");
                             let connection = conn.into_inner();
                             on_accepted(AcceptedQuicConn::new(connection));
-                        });
-                        handshake_handles.push(handle);
+                        })
+                        .detach();
                     }
                     Err(e) => {
                         // Endpoint-fatal (e.g. endpoint closed). The
@@ -181,9 +176,5 @@ pub async fn run(
                 }
             }
         }
-    }
-
-    for handle in handshake_handles {
-        let _ = handle.await;
     }
 }
