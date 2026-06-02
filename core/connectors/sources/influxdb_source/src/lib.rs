@@ -16,696 +16,415 @@
  * under the License.
  */
 
+mod common;
+mod row;
+mod v2;
+mod v3;
+
+use crate::common::{
+    is_timestamp_after, query_has_cursor_placeholder, query_has_cursor_placeholder_flux,
+    query_has_offset_placeholder, strip_block_comments,
+};
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose};
-use csv::StringRecord;
-use iggy_common::serde_secret::serialize_secret;
-use iggy_common::{DateTime, Utc};
+use chrono::{DateTime, Utc};
+use common::{
+    InfluxDbSourceConfig, PayloadFormat, PersistedState, V2State, V3State, validate_cursor,
+    validate_cursor_field,
+};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
 };
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
 };
-use regex::Regex;
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
-use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
+use secrecy::{ExposeSecret, SecretBox};
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{error, info, warn};
 
 source_connector!(InfluxDbSource);
 
 const CONNECTOR_NAME: &str = "InfluxDB source";
-const DEFAULT_MAX_RETRIES: u32 = 3;
+const MAX_STATE_SERIALIZE_FAILURES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_POLL_INTERVAL: &str = "5s";
 const DEFAULT_TIMEOUT: &str = "10s";
-const DEFAULT_CURSOR: &str = "1970-01-01T00:00:00Z";
-// Maximum attempts for open() connectivity retries
-const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
-// Cap for exponential backoff in open() — never wait longer than this
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
-// Cap for exponential backoff on per-query retries — kept short so a
-// transient InfluxDB blip does not stall polling for too long
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
-// How many consecutive poll failures open the circuit breaker
-const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-// How long the circuit stays open before allowing a probe attempt
 const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 
-/// RFC 3339 / ISO 8601 datetime pattern.
-/// Matches the forms InfluxDB stores in `_time`:
-///   "2024-01-15T10:30:00Z"
-///   "2024-01-15T10:30:00.123456789Z"
-///   "2024-01-15T10:30:00+05:30"
-/// Intentionally strict: only digits, T, Z, colon, dot, plus, hyphen.
-/// Any Flux syntax character (pipe, quote, paren, space, slash) is rejected.
-static CURSOR_RE: OnceLock<Regex> = OnceLock::new();
+// ── Connector state ───────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// Main connector structs
-// ---------------------------------------------------------------------------
+#[derive(Debug)]
+enum VersionState {
+    V2(Mutex<V2State>),
+    V3(Mutex<V3State>),
+}
+
+// ── Connector struct ──────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct InfluxDbSource {
-    pub id: u32,
+    id: u32,
     config: InfluxDbSourceConfig,
-    /// `None` until `open()` is called. Wraps `reqwest::Client` with
-    /// [`HttpRetryMiddleware`] so retry/back-off/jitter is handled
-    /// transparently by the middleware stack instead of a hand-rolled loop.
     client: Option<ClientWithMiddleware>,
-    state: Mutex<State>,
-    verbose: bool,
-    retry_delay: Duration,
-    poll_interval: Duration,
-    /// Resolved once in `new()` — avoids a `to_ascii_lowercase()` allocation
-    /// on every message in the hot path.
+    version_state: VersionState,
     payload_format: PayloadFormat,
+    poll_interval: Duration,
+    retry_delay: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
-    /// Set when a persisted `ConnectorState` was provided to `new()` but could
-    /// not be deserialized into `State` (e.g. schema changed after an upgrade).
-    /// `open()` refuses to start when this is `true` so operators are not
-    /// surprised by a silent cursor reset and full re-delivery.
-    state_restore_failed: bool,
+    auth_header: Option<SecretBox<String>>,
+    /// `Some(cause)` when state restore was rejected; `None` means restore succeeded.
+    state_restore_error: Option<String>,
+    /// Consecutive `ConnectorState::serialize` failures since last success.
+    state_serialize_failures: AtomicU32,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InfluxDbSourceConfig {
-    pub url: String,
-    pub org: String,
-    #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-    pub query: String,
-    pub poll_interval: Option<String>,
-    pub batch_size: Option<u32>,
-    pub cursor_field: Option<String>,
-    pub initial_offset: Option<String>,
-    pub payload_column: Option<String>,
-    pub payload_format: Option<String>,
-    pub include_metadata: Option<bool>,
-    pub verbose_logging: Option<bool>,
-    pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
-    pub timeout: Option<String>,
-    // How many times open() will retry before giving up
-    pub max_open_retries: Option<u32>,
-    // Upper cap on open() backoff delay — can be set high (e.g. "60s") for
-    // patient startup without affecting per-query retry behaviour
-    pub open_retry_max_delay: Option<String>,
-    // Upper cap on per-query retry backoff — kept short so a transient blip
-    // does not stall polling; independent of open_retry_max_delay
-    pub retry_max_delay: Option<String>,
-    // Circuit breaker configuration
-    pub circuit_breaker_threshold: Option<u32>,
-    pub circuit_breaker_cool_down: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum PayloadFormat {
-    #[default]
-    Json,
-    Text,
-    Raw,
-}
-
-impl PayloadFormat {
-    fn from_config(value: Option<&str>) -> Self {
-        match value.map(|v| v.to_ascii_lowercase()).as_deref() {
-            Some("text") | Some("utf8") => PayloadFormat::Text,
-            Some("raw") | Some("base64") => PayloadFormat::Raw,
-            Some("json") => PayloadFormat::Json,
-            other => {
-                warn!(
-                    "Unrecognized payload_format value {:?}, falling back to JSON. \
-                     Valid values are: \"json\", \"text\", \"utf8\", \"base64\", \"raw\".",
-                    other
-                );
-                PayloadFormat::Json
-            }
-        }
-    }
-
-    fn schema(self) -> Schema {
-        match self {
-            PayloadFormat::Json => Schema::Json,
-            PayloadFormat::Text => Schema::Text,
-            PayloadFormat::Raw => Schema::Raw,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct State {
-    last_poll_time: DateTime<Utc>,
-    last_timestamp: Option<String>,
-    processed_rows: u64,
-    /// How many rows at `last_timestamp` have already been delivered downstream.
-    ///
-    /// When the user's Flux query uses `>= $cursor`, consecutive polls may
-    /// return the same rows for the current cursor timestamp.  This counter
-    /// lets `poll_messages` skip those already-delivered rows and inflate
-    /// `$limit` accordingly, preventing both duplicates and data loss at
-    /// batch boundaries where multiple rows share the same timestamp.
-    ///
-    /// `#[serde(default)]` keeps existing persisted state files forward-compatible:
-    /// the field defaults to 0 when the state was saved by an older version.
-    #[serde(default)]
-    cursor_row_count: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn parse_scalar(value: &str) -> serde_json::Value {
-    if value.is_empty() {
-        return serde_json::Value::Null;
-    }
-    if let Ok(v) = value.parse::<bool>() {
-        return serde_json::Value::Bool(v);
-    }
-    if let Ok(v) = value.parse::<i64>() {
-        return serde_json::Value::Number(v.into());
-    }
-    if let Ok(v) = value.parse::<f64>()
-        && let Some(number) = serde_json::Number::from_f64(v)
-    {
-        return serde_json::Value::Number(number);
-    }
-    serde_json::Value::String(value.to_string())
-}
-
-/// Recognise an InfluxDB CSV header row.
-///
-/// A header row must contain a `_time` column. The `_value` column is
-/// intentionally **not** required: Flux aggregation queries (`count()`,
-/// `mean()`, `group()`) produce result tables with columns like `_count` or
-/// `_mean` instead of `_value`. Requiring `_value` would cause those header
-/// rows to be missed, silently skipping all subsequent data rows until the
-/// next recognised header.
-///
-/// InfluxDB annotation rows (`#group`, `#datatype`, `#default`) are already
-/// filtered out earlier in `parse_csv_rows` by the leading-`#` check, so
-/// they will never reach this function.
-fn is_header_record(record: &StringRecord) -> bool {
-    record.iter().any(|v| v == "_time")
-}
-
-/// Compare two RFC 3339 timestamp strings chronologically.
-///
-/// InfluxDB strips trailing fractional-second zeros, producing timestamps like
-/// `"2026-03-18T12:00:00.60952Z"` (= 609520µs).  A naïve `>` string comparison
-/// treats this as *greater* than `"2026-03-18T12:00:00.609521Z"` because `'Z'`
-/// (ASCII 90) > `'1'` (ASCII 49), even though the former is chronologically
-/// *earlier*.  Always parse to `DateTime<Utc>` so the comparison is correct.
-fn is_timestamp_after(a: &str, b: &str) -> bool {
-    match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
-        (Ok(dt_a), Ok(dt_b)) => dt_a > dt_b,
-        _ => a > b,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// InfluxDbSource implementation
-// ---------------------------------------------------------------------------
 
 impl InfluxDbSource {
     pub fn new(id: u32, config: InfluxDbSourceConfig, state: Option<ConnectorState>) -> Self {
-        let verbose = config.verbose_logging.unwrap_or(false);
-        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-        let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
-        let payload_format = PayloadFormat::from_config(config.payload_format.as_deref());
+        let retry_delay = parse_duration(config.retry_delay(), DEFAULT_RETRY_DELAY);
+        let poll_interval = parse_duration(config.poll_interval(), DEFAULT_POLL_INTERVAL);
+        let payload_format = PayloadFormat::from_config(config.payload_format());
 
-        // Build circuit breaker from config
-        let cb_threshold = config
-            .circuit_breaker_threshold
-            .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD);
+        let cb_threshold = config.circuit_breaker_threshold();
         let cb_cool_down = parse_duration(
-            config.circuit_breaker_cool_down.as_deref(),
+            config.circuit_breaker_cool_down(),
             DEFAULT_CIRCUIT_COOL_DOWN,
         );
+        let circuit_breaker = Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down));
 
-        // Distinguish "no prior state" (fresh start, expected) from "state
-        // existed but could not be deserialized" (schema mismatch after an
-        // upgrade, unexpected).  Collapsing both into None via and_then() would
-        // silently reset the cursor to the epoch and cause a full re-delivery.
-        let (restored_state, state_restore_failed) = match state {
-            None => (None, false),
-            Some(s) => match s.deserialize::<State>(CONNECTOR_NAME, id) {
-                Some(state) => {
-                    info!(
-                        "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
-                         Last timestamp: {:?}, processed rows: {}",
-                        state.last_timestamp, state.processed_rows
-                    );
-                    (Some(state), false)
-                }
-                None => {
-                    // ConnectorState::deserialize already logs at warn level;
-                    // escalate to error here so the operator sees the connector
-                    // ID and understands the cursor will NOT be silently reset.
-                    error!(
-                        "InfluxDB source ID: {id} — persisted state exists but could not \
-                         be deserialized (possible schema change after upgrade). \
-                         Refusing to start to prevent silent cursor reset and full \
-                         re-delivery. Clear or migrate the connector state to proceed."
-                    );
-                    (None, true)
-                }
-            },
+        let (version_state, state_restore_error) = match &config {
+            InfluxDbSourceConfig::V2(_) => {
+                let (s, err) = restore_v2_state(id, state);
+                (VersionState::V2(Mutex::new(s)), err)
+            }
+            InfluxDbSourceConfig::V3(_) => {
+                let (s, err) = restore_v3_state(id, state);
+                (VersionState::V3(Mutex::new(s)), err)
+            }
         };
 
         InfluxDbSource {
             id,
             config,
             client: None,
-            state: Mutex::new(restored_state.unwrap_or(State {
-                last_poll_time: Utc::now(),
-                last_timestamp: None,
-                processed_rows: 0,
-                cursor_row_count: 0,
-            })),
-            verbose,
-            retry_delay,
-            poll_interval,
+            version_state,
             payload_format,
-            circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
-            state_restore_failed,
+            poll_interval,
+            retry_delay,
+            circuit_breaker,
+            auth_header: None,
+            state_restore_error,
+            state_serialize_failures: AtomicU32::new(0),
         }
-    }
-
-    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
-        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
-    }
-
-    fn payload_format(&self) -> PayloadFormat {
-        self.payload_format
-    }
-
-    fn cursor_field(&self) -> &str {
-        self.config.cursor_field.as_deref().unwrap_or("_time")
-    }
-
-    fn get_max_retries(&self) -> u32 {
-        self.config
-            .max_retries
-            .unwrap_or(DEFAULT_MAX_RETRIES)
-            .max(1)
-    }
-
-    fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
-        let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))
     }
 
     fn get_client(&self) -> Result<&ClientWithMiddleware, Error> {
         self.client
             .as_ref()
-            .ok_or_else(|| Error::Connection("InfluxDB client is not initialized".to_string()))
-    }
-
-    fn build_health_url(&self) -> Result<Url, Error> {
-        let base = self.config.url.trim_end_matches('/');
-        Url::parse(&format!("{base}/health"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
-    }
-
-    fn build_query_url(&self) -> Result<Url, Error> {
-        let base = self.config.url.trim_end_matches('/');
-        let mut url = Url::parse(&format!("{base}/api/v2/query"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
-        url.query_pairs_mut().append_pair("org", &self.config.org);
-        Ok(url)
-    }
-
-    fn cursor_re() -> &'static Regex {
-        CURSOR_RE.get_or_init(|| {
-            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
-                .expect("hardcoded regex is valid")
-        })
-    }
-
-    fn validate_cursor(cursor: &str) -> Result<(), Error> {
-        if Self::cursor_re().is_match(cursor) {
-            Ok(())
-        } else {
-            Err(Error::InvalidConfigValue(format!(
-                "cursor value {:?} is not a valid RFC 3339 timestamp; \
-             refusing substitution to prevent Flux query injection",
-                cursor
-            )))
-        }
-    }
-
-    /// Reject cursor fields that would produce incorrect results.
-    ///
-    /// Cursor advancement compares values as `String`s (lexicographic order).
-    /// This is correct for ISO 8601 / RFC 3339 timestamps — the default
-    /// `cursor_field` of `"_time"` — because their fixed-width format makes
-    /// lexicographic and chronological order identical.
-    fn validate_cursor_field(field: &str) -> Result<(), Error> {
-        match field {
-            "_time" | "time" => Ok(()),
-            other => Err(Error::InvalidConfigValue(format!(
-                "cursor_field {:?} is not supported — cursor values are compared as strings \
-                 (lexicographic order), which is only correct for ISO 8601 timestamp columns. \
-                 Use the default \"_time\" column, or omit cursor_field entirely.",
-                other
-            ))),
-        }
-    }
-
-    fn query_with_params(&self, cursor: &str, already_seen: u64) -> Result<String, Error> {
-        // Reject anything that is not a well-formed RFC 3339 timestamp.
-        // This prevents a crafted or corrupted _time value (e.g. containing
-        // Flux syntax like `") |> drop() //`) from being injected into the
-        // query string before it is sent to /api/v2/query.
-        // Note: InfluxDB OSS v2 does not support the `params` JSON field for
-        // parameterized queries (Cloud-only feature), so substitution is
-        // unavoidable for OSS — validation is the correct mitigation here.
-        Self::validate_cursor(cursor)?;
-        // Inflate the limit so that after skipping `already_seen` rows at the
-        // cursor timestamp we still return a full batch of new rows.  This is
-        // a no-op when `already_seen == 0` (first poll or `>` queries).
-        let batch_size = self.config.batch_size.unwrap_or(500) as u64;
-        let limit = batch_size.saturating_add(already_seen).to_string();
-        let mut query = self.config.query.clone();
-        if query.contains("$cursor") {
-            query = query.replace("$cursor", cursor);
-        }
-        if query.contains("$limit") {
-            query = query.replace("$limit", &limit);
-        }
-        Ok(query)
-    }
-
-    /// Execute a Flux query against `/api/v2/query` and return the raw CSV
-    /// response body. Retry/back-off is handled transparently by the
-    /// `ClientWithMiddleware` stack (see `build_retry_client`).
-    async fn run_query(&self, query: &str) -> Result<String, Error> {
-        let client = self.get_client()?;
-        let url = self.build_query_url()?;
-        let token = self.config.token.expose_secret().to_owned();
-
-        let body = json!({
-            "query": query,
-            "dialect": {
-                "annotations": [],
-                "delimiter": ",",
-                "header": true,
-                "commentPrefix": "#"
-            }
-        });
-
-        let response = client
-            .post(url)
-            .header("Authorization", format!("Token {token}"))
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/csv")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| Error::Storage(format!("InfluxDB query failed: {e}")))?;
-
-        let status = response.status();
-        if status.is_success() {
-            return response
-                .text()
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to read query response: {e}")));
-        }
-
-        let body_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "failed to read response body".to_string());
-
-        // Use PermanentHttpError for non-transient 4xx (400 Bad Request, 401
-        // Unauthorized, etc.) so poll() can skip the circuit breaker for these
-        // — they indicate a config/data issue, not an infrastructure failure.
-        if iggy_connector_sdk::retry::is_transient_status(status) {
-            Err(Error::Storage(format!(
-                "InfluxDB query failed with status {status}: {body_text}"
-            )))
-        } else {
-            Err(Error::PermanentHttpError(format!(
-                "InfluxDB query failed with status {status}: {body_text}"
-            )))
-        }
-    }
-
-    fn parse_csv_rows(&self, csv_text: &str) -> Result<Vec<HashMap<String, String>>, Error> {
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(csv_text.as_bytes());
-
-        let mut headers: Option<StringRecord> = None;
-        let mut rows = Vec::new();
-
-        for result in reader.records() {
-            let record = result
-                .map_err(|e| Error::InvalidRecordValue(format!("Invalid CSV record: {e}")))?;
-
-            if record.is_empty() {
-                continue;
-            }
-
-            if let Some(first) = record.get(0)
-                && first.starts_with('#')
-            {
-                continue;
-            }
-
-            if is_header_record(&record) {
-                headers = Some(record.clone());
-                continue;
-            }
-
-            let Some(active_headers) = headers.as_ref() else {
-                continue;
-            };
-
-            if record == *active_headers {
-                continue;
-            }
-
-            let mut mapped = HashMap::new();
-            for (idx, key) in active_headers.iter().enumerate() {
-                if key.is_empty() {
-                    continue;
-                }
-                let value = record.get(idx).unwrap_or("").to_string();
-                mapped.insert(key.to_string(), value);
-            }
-
-            if !mapped.is_empty() {
-                rows.push(mapped);
-            }
-        }
-
-        Ok(rows)
-    }
-
-    fn build_payload(
-        &self,
-        row: &HashMap<String, String>,
-        include_metadata: bool,
-    ) -> Result<Vec<u8>, Error> {
-        if let Some(payload_column) = self.config.payload_column.as_deref() {
-            let raw_value = row.get(payload_column).cloned().ok_or_else(|| {
-                Error::InvalidRecordValue(format!("Missing payload column '{payload_column}'"))
-            })?;
-
-            return match self.payload_format() {
-                PayloadFormat::Json => {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&raw_value).map_err(|e| {
-                            Error::InvalidRecordValue(format!(
-                                "Payload column '{payload_column}' is not valid JSON: {e}"
-                            ))
-                        })?;
-                    serde_json::to_vec(&value).map_err(|e| {
-                        Error::Serialization(format!("JSON serialization failed: {e}"))
-                    })
-                }
-                PayloadFormat::Text => Ok(raw_value.into_bytes()),
-                PayloadFormat::Raw => general_purpose::STANDARD
-                    .decode(raw_value.as_bytes())
-                    .map_err(|e| {
-                        Error::InvalidRecordValue(format!(
-                            "Failed to decode payload as base64: {e}"
-                        ))
-                    }),
-            };
-        }
-
-        let mut json_row = serde_json::Map::new();
-        for (key, value) in row {
-            if include_metadata || key == "_value" || key == "_time" || key == "_measurement" {
-                json_row.insert(key.clone(), parse_scalar(value));
-            }
-        }
-
-        let wrapped = json!({
-            "measurement": row.get("_measurement").cloned().unwrap_or_default(),
-            "field": row.get("_field").cloned().unwrap_or_default(),
-            "timestamp": row.get("_time").cloned().unwrap_or_default(),
-            "value": row.get("_value").map(|v| parse_scalar(v)).unwrap_or(serde_json::Value::Null),
-            "row": json_row,
-        });
-
-        serde_json::to_vec(&wrapped)
-            .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
-    }
-
-    /// Returns `(messages, max_cursor, rows_at_max_cursor, skipped)`.
-    ///
-    /// `rows_at_max_cursor` is the count of delivered messages whose cursor
-    /// field value equals `max_cursor`.  The caller stores this in
-    /// [`State::cursor_row_count`] so the next poll can skip those rows when
-    /// the query uses `>= $cursor`.
-    ///
-    /// `skipped` is the number of rows that were elided because they fell
-    /// within the already-seen window.  When the caller observes zero
-    /// delivered messages but `skipped > 0`, it means every row the query
-    /// returned was at the current cursor timestamp and had already been
-    /// delivered.  In that case `skipped` equals the true row count at that
-    /// timestamp, so the caller can correct any over-inflated
-    /// `cursor_row_count` rather than getting permanently stuck.
-    async fn poll_messages(
-        &self,
-    ) -> Result<(Vec<ProducedMessage>, Option<String>, u64, u64), Error> {
-        // Read cursor and already_seen atomically from the same lock acquisition
-        // so the two values are always consistent with each other.
-        let (cursor, already_seen) = {
-            let state = self.state.lock().await;
-            let c = state
-                .last_timestamp
-                .clone()
-                .or_else(|| self.config.initial_offset.clone())
-                .unwrap_or_else(|| DEFAULT_CURSOR.to_string());
-            (c, state.cursor_row_count)
-        };
-
-        let query = self.query_with_params(&cursor, already_seen).map_err(|e| {
-            error!(
-                "InfluxDB source ID: {} — invalid cursor, skipping poll: {e}",
-                self.id
-            );
-            e
-        })?;
-        let csv_data = self.run_query(&query).await?;
-
-        let rows = self.parse_csv_rows(&csv_data)?;
-        let include_metadata = self.config.include_metadata.unwrap_or(true);
-        let cursor_field = self.cursor_field().to_string();
-
-        let mut messages = Vec::with_capacity(rows.len());
-        let mut max_cursor: Option<String> = None;
-        let mut rows_at_max_cursor = 0u64;
-        let mut skipped = 0u64;
-
-        for row in rows {
-            // Skip rows at the current cursor that were already delivered in a
-            // previous batch.  This deduplicate rows when the query uses
-            // `>= $cursor` and a batch boundary landed inside a group of rows
-            // sharing the same timestamp.
-            if let Some(cv) = row.get(&cursor_field)
-                && cv == &cursor
-                && skipped < already_seen
-            {
-                skipped += 1;
-                continue;
-            }
-
-            // Track the new max cursor and how many delivered rows share it.
-            if let Some(cv) = row.get(&cursor_field) {
-                match &max_cursor {
-                    None => {
-                        max_cursor = Some(cv.clone());
-                        rows_at_max_cursor = 1;
-                    }
-                    Some(current) => {
-                        if is_timestamp_after(cv, current) {
-                            max_cursor = Some(cv.clone());
-                            rows_at_max_cursor = 1;
-                        } else if cv == current {
-                            rows_at_max_cursor += 1;
-                        }
-                    }
-                }
-            }
-
-            let payload = self.build_payload(&row, include_metadata)?;
-            // Capture once so timestamp and origin_timestamp are guaranteed identical
-            // and we make exactly one syscall regardless of how many fields use it.
-            let now_micros = Utc::now().timestamp_micros() as u64;
-
-            messages.push(ProducedMessage {
-                id: Some(Uuid::new_v4().as_u128()),
-                checksum: None,
-                timestamp: Some(now_micros),
-                origin_timestamp: Some(now_micros),
-                headers: None,
-                payload,
-            });
-        }
-
-        Ok((messages, max_cursor, rows_at_max_cursor, skipped))
+            .ok_or_else(|| Error::Connection("InfluxDB client not initialized".to_string()))
     }
 }
 
-// ---------------------------------------------------------------------------
-// Source trait implementation
-// ---------------------------------------------------------------------------
+// ── State restore helpers ─────────────────────────────────────────────────────
+
+fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<String>) {
+    let Some(cs) = state else {
+        return (V2State::default(), None);
+    };
+    // Move bytes out so the None arm can consume them directly without a second clone.
+    // The first attempt uses a clone; on the happy path bytes is dropped unused.
+    let bytes = cs.0;
+    match ConnectorState(bytes.clone()).deserialize::<PersistedState>(CONNECTOR_NAME, id) {
+        Some(PersistedState::V2(s)) => {
+            if let Some(ref ts) = s.last_timestamp
+                && let Err(e) = validate_cursor(ts)
+            {
+                let cause = format!(
+                    "persisted V2 cursor {ts:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V2State::default(), Some(cause));
+            }
+
+            info!(
+                "{CONNECTOR_NAME} ID {id}: restored V2 state — \
+                 last_timestamp={:?}, processed_rows={}",
+                s.last_timestamp, s.processed_rows
+            );
+            (s, None)
+        }
+        Some(PersistedState::V3(_)) => {
+            let cause = "persisted state is V3 but connector is configured as V2. \
+                 Refusing to start to prevent cursor reset. \
+                 Clear or migrate the connector state to proceed.";
+
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V2State::default(), Some(cause.to_string()))
+        }
+        None => {
+            // PersistedState deserialization failed. Try the legacy format: direct V2State
+            // bytes without the PersistedState wrapper, written by an older connector version.
+            if let Some(s) = ConnectorState(bytes).deserialize::<V2State>(CONNECTOR_NAME, id) {
+                if let Some(ref ts) = s.last_timestamp
+                    && let Err(e) = validate_cursor(ts)
+                {
+                    let cause = format!(
+                        "legacy V2 cursor {ts:?} failed validation: {e}. \
+                             Clear or migrate the connector state to recover."
+                    );
+                    error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                    return (V2State::default(), Some(cause));
+                }
+                info!(
+                    "{CONNECTOR_NAME} ID {id}: restored V2 state from legacy format — \
+                     last_timestamp={:?}, processed_rows={}",
+                    s.last_timestamp, s.processed_rows
+                );
+                return (s, None);
+            }
+            let cause = "persisted state exists but could not be deserialized. \
+                         Refusing to start to prevent silent cursor reset."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V2State::default(), Some(cause))
+        }
+    }
+}
+
+fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, Option<String>) {
+    let Some(cs) = state else {
+        return (V3State::default(), None);
+    };
+    match cs.deserialize::<PersistedState>(CONNECTOR_NAME, id) {
+        Some(PersistedState::V3(s)) => {
+            if let Some(ref ts) = s.last_timestamp
+                && let Err(e) = validate_cursor(ts)
+            {
+                let cause = format!(
+                    "persisted V3 cursor {ts:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V3State::default(), Some(cause));
+            }
+            if let Some(ref sc) = s.stuck_cursor
+                && let Err(e) = validate_cursor(sc)
+            {
+                let cause = format!(
+                    "persisted V3 stuck_cursor {sc:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V3State::default(), Some(cause));
+            }
+
+            info!(
+                "{CONNECTOR_NAME} ID {id}: restored V3 state — \
+                 last_timestamp={:?}, processed_rows={}",
+                s.last_timestamp, s.processed_rows
+            );
+            (s, None)
+        }
+        Some(PersistedState::V2(_)) => {
+            let cause = "persisted state is V2 but connector is configured as V3. \
+                 Refusing to start to prevent cursor reset. \
+                 Clear or migrate the connector state to proceed.";
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V3State::default(), Some(cause.to_string()))
+        }
+        None => {
+            let cause = "persisted state exists but could not be deserialized. \
+                         Refusing to start to prevent silent cursor reset."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V3State::default(), Some(cause))
+        }
+    }
+}
+
+// ── Source trait ──────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl Source for InfluxDbSource {
     async fn open(&mut self) -> Result<(), Error> {
-        if self.state_restore_failed {
-            return Err(Error::InvalidState);
+        if let Some(ref cause) = self.state_restore_error {
+            return Err(Error::InitError(format!("state restore failed: {cause}")));
         }
 
+        let ver = self.config.version_label();
         info!(
-            "Opening InfluxDB source connector with ID: {}. Org: {}",
-            self.id, self.config.org
+            "Opening {CONNECTOR_NAME} with ID: {} (version={ver})",
+            self.id
         );
 
-        // Build the raw client first and use it for the startup connectivity
-        // check. The connectivity retry loop uses separate delay bounds
-        // (open_retry_max_delay) from the per-query middleware retries, so
-        // we keep them independent.
-        let raw_client = self.build_raw_client()?;
+        validate_cursor_field(self.config.cursor_field(), self.config.version_label())?;
+        if let Some(offset) = self.config.initial_offset() {
+            validate_cursor(offset)?;
+        }
+        if let Some(fmt) = self.config.payload_format() {
+            PayloadFormat::validate(fmt)?;
+        }
 
-        // Validate cursor_field before touching the network: string comparison
-        // is only safe for timestamp columns. See validate_cursor_field for details.
-        Self::validate_cursor_field(self.cursor_field())?;
+        // #10 — non-empty required fields
+        match &self.config {
+            InfluxDbSourceConfig::V2(c) if c.org.trim().is_empty() => {
+                return Err(Error::InvalidConfigValue(
+                    "V2 source config requires a non-empty 'org'".into(),
+                ));
+            }
+            InfluxDbSourceConfig::V3(c) if c.db.trim().is_empty() => {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source config requires a non-empty 'db'".into(),
+                ));
+            }
+            _ => {}
+        }
 
-        let health_url = self.build_health_url()?;
+        // #11 — $cursor placeholder must be present; without it apply_query_params
+        // never substitutes the cursor and the same rows are re-delivered every poll.
+        // V2 Flux uses // for line comments; V3 SQL uses --.
+        let has_cursor = match &self.config {
+            InfluxDbSourceConfig::V2(c) => query_has_cursor_placeholder_flux(&c.query),
+            InfluxDbSourceConfig::V3(c) => query_has_cursor_placeholder(&c.query),
+        };
+        if !has_cursor {
+            return Err(Error::InvalidConfigValue(
+                "query must contain the '$cursor' placeholder — without it the connector \
+                 cannot advance and will re-deliver the same rows on every poll."
+                    .into(),
+            ));
+        }
+
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && let Some(cap) = cfg.stuck_batch_cap_factor
+            && cap > v3::MAX_STUCK_CAP_FACTOR
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "stuck_batch_cap_factor {cap} exceeds maximum of {}; \
+                 reduce it to avoid querying up to {cap}×batch_size rows per poll.",
+                v3::MAX_STUCK_CAP_FACTOR
+            )));
+        }
+
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && cfg.stuck_batch_cap_factor == Some(1)
+        {
+            return Err(Error::InvalidConfigValue(
+                "stuck_batch_cap_factor 1 is invalid — cap equals base_batch so \
+                 the connector trips the circuit breaker on the first stuck poll \
+                 with no inflation at all; use 0 to disable stuck detection or >= 2."
+                    .into(),
+            ));
+        }
+
+        // V3 stuck-batch inflation writes last_timestamp_row_offset to state and
+        // passes it as `$offset` on the next poll so already-seen rows at the same
+        // timestamp are skipped. If the query template lacks `$offset`, apply_query_params
+        // silently no-ops and the same head rows are re-fetched and re-emitted on
+        // every poll — duplicate delivery with no error.
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config {
+            let cap = cfg
+                .stuck_batch_cap_factor
+                .unwrap_or(v3::DEFAULT_STUCK_CAP_FACTOR);
+            if cap > 0 && !query_has_offset_placeholder(&cfg.query) {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must contain the '$offset' placeholder when \
+                     stuck_batch_cap_factor > 0 (the default). Add 'OFFSET $offset' \
+                     to your query to prevent duplicate delivery during stuck-batch \
+                     inflation. For simple queries add it at the top level: \
+                     \"WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset\". \
+                     For queries with subqueries or CTEs, $offset must appear on the \
+                     innermost SELECT that filters by time."
+                        .into(),
+                ));
+            }
+            // DataFusion does not guarantee stable row ordering for tied timestamps
+            // unless ORDER BY is present. OFFSET-based dedup relies on consistent ordering:
+            // without it, different rows may be skipped on each poll, causing silent data
+            // loss or re-delivery.
+            if cap > 0 && !query_has_order_by(&cfg.query) {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must contain an ORDER BY clause when \
+                     stuck_batch_cap_factor > 0 (the default). DataFusion does not \
+                     guarantee stable row ordering for tied timestamps without ORDER BY; \
+                     OFFSET-based dedup relies on consistent ordering. Add \
+                     'ORDER BY <cursor_field>' to your query, for example: \
+                     \"SELECT * FROM <measurement> WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset\"."
+                        .into(),
+                ));
+            }
+            if cap > 0 && query_has_desc_order(&cfg.query) {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must use ascending ORDER BY on the cursor column. \
+                     ORDER BY ... DESC causes silent data loss: after advancing the cursor \
+                     to the highest timestamp in a batch, all older rows in that batch are \
+                     below the new cursor and are never re-fetched. \
+                     Use 'ORDER BY time' (ascending) instead of 'ORDER BY time DESC'."
+                        .into(),
+                ));
+            }
+        }
+
+        // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
+        // query uses `>=` semantics (inclusive cursor) without an explicit sort,
+        // InfluxDB may return rows in storage order, causing skip-N to silently
+        // skip the wrong rows and produce incorrect output. Hard-error so operators
+        // don't discover this only after data loss. Queries using strict `>` do not
+        // need skip-N and are not affected.
+        if let InfluxDbSourceConfig::V2(cfg) = &self.config
+            && query_has_inclusive_cursor(&cfg.query, "//")
+            && !query_has_sort_call(&cfg.query)
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "{CONNECTOR_NAME} ID: {}: V2 query uses '>=' (inclusive cursor) but does \
+                 not contain `|> sort(columns: [\"_time\"])`. Skip-N dedup is \
+                 order-dependent; without sorting, InfluxDB may return rows in storage \
+                 order and the wrong rows will be silently skipped. \
+                 Add `|> sort(columns: [\"_time\"])` before `|> limit(...)` in your query.",
+                self.id
+            )));
+        }
+
+        // #12 — V3 uses strict `> $cursor` semantics. If the query uses
+        // `>= '$cursor'`, rows at the cursor timestamp are re-fetched and
+        // re-delivered on the next poll (there is no skip-N dedup for V3).
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && query_has_inclusive_cursor(&cfg.query, "--")
+        {
+            return Err(Error::InvalidConfigValue(
+                "V3 source query uses '>= $cursor' (inclusive). V3 uses strict \
+                 '> $cursor' semantics — an inclusive cursor causes rows at the \
+                 cursor timestamp to be re-delivered on the next poll. \
+                 Change '>=' to '>' in your query."
+                    .into(),
+            ));
+        }
+
+        let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
+        let raw_client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))?;
+
+        let health_url = Url::parse(&format!("{}/health", self.config.base_url()))
+            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
+
         check_connectivity_with_retry(
             &raw_client,
             health_url,
-            "InfluxDB source",
+            CONNECTOR_NAME,
             self.id,
             &ConnectivityConfig {
-                max_open_retries: self
-                    .config
-                    .max_open_retries
-                    .unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
+                max_open_retries: self.config.max_open_retries(),
                 open_retry_max_delay: parse_duration(
-                    self.config.open_retry_max_delay.as_deref(),
+                    self.config.open_retry_max_delay(),
                     DEFAULT_OPEN_RETRY_MAX_DELAY,
                 ),
                 retry_delay: self.retry_delay,
@@ -713,37 +432,52 @@ impl Source for InfluxDbSource {
         )
         .await?;
 
-        // Wrap in the retry middleware for all subsequent query operations.
-        // The middleware handles transient 429 / 5xx retries with
-        // exponential back-off, jitter, and Retry-After header support.
-        let max_retries = self.get_max_retries();
-        let query_retry_max_delay = parse_duration(
-            self.config.retry_max_delay.as_deref(),
-            DEFAULT_RETRY_MAX_DELAY,
-        );
+        let query_retry_max_delay =
+            parse_duration(self.config.retry_max_delay(), DEFAULT_RETRY_MAX_DELAY);
         self.client = Some(build_retry_client(
             raw_client,
-            max_retries,
+            self.config.max_retries(),
             self.retry_delay,
             query_retry_max_delay,
             "InfluxDB",
         ));
 
+        let token = self.config.token_secret().expose_secret();
+        self.auth_header = Some(SecretBox::new(Box::new(match &self.config {
+            InfluxDbSourceConfig::V2(_) => format!("Token {token}"),
+            InfluxDbSourceConfig::V3(_) => format!("Bearer {token}"),
+        })));
+
         info!(
-            "InfluxDB source connector with ID: {} opened successfully",
+            "{CONNECTOR_NAME} ID: {} opened successfully (version={ver})",
             self.id
         );
         Ok(())
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        // Skip query if circuit breaker is open; sleep so the runtime does not
-        // spin-call poll() in a hot loop while the circuit is held open.
+        let level = if self.config.verbose_logging() {
+            tracing::Level::INFO
+        } else {
+            tracing::Level::DEBUG
+        };
+        macro_rules! poll_event {
+            ($($tt:tt)+) => {
+                if level == tracing::Level::INFO {
+                    tracing::info!($($tt)+)
+                } else {
+                    tracing::debug!($($tt)+)
+                }
+            };
+        }
         if self.circuit_breaker.is_open().await {
             warn!(
-                "InfluxDB source ID: {} — circuit breaker is OPEN. Skipping poll.",
+                "{CONNECTOR_NAME} ID: {} — circuit breaker is OPEN. Skipping poll.",
                 self.id
             );
+            // TODO: sleep for the CB's remaining cool-down duration rather than
+            // poll_interval to avoid wakeup churn. Requires CircuitBreaker to
+            // expose a remaining_cool_down() method (SDK change).
             tokio::time::sleep(self.poll_interval).await;
             return Ok(ProducedMessages {
                 schema: Schema::Json,
@@ -751,119 +485,395 @@ impl Source for InfluxDbSource {
                 state: None,
             });
         }
+        tokio::time::sleep(self.poll_interval).await;
 
-        match self.poll_messages().await {
-            Ok((messages, max_cursor, rows_at_max_cursor, skipped)) => {
-                // Successful poll — reset circuit breaker
-                self.circuit_breaker.record_success();
-
-                let mut state = self.state.lock().await;
-                state.last_poll_time = Utc::now();
-                state.processed_rows += messages.len() as u64;
-                match max_cursor {
-                    Some(ref new_cursor)
-                        if state.last_timestamp.as_deref() != Some(new_cursor.as_str()) =>
-                    {
-                        // Cursor advanced to a new timestamp — reset the row counter.
-                        state.last_timestamp = max_cursor.clone();
-                        state.cursor_row_count = rows_at_max_cursor;
-                    }
-                    Some(_) => {
-                        // Cursor stayed at the same timestamp — accumulate so the
-                        // next poll skips all already-delivered rows at this timestamp.
-                        state.cursor_row_count =
-                            state.cursor_row_count.saturating_add(rows_at_max_cursor);
-                    }
-                    None => {
-                        // No rows delivered.  If we skipped some rows it means
-                        // every row in the result was at the current cursor
-                        // timestamp and had already been seen.  `skipped` is
-                        // therefore the true row count at that timestamp for
-                        // this query result, so we correct cursor_row_count to
-                        // that value.  This prevents a permanently-inflated
-                        // counter (e.g. after rows are deleted or compacted in
-                        // InfluxDB) from causing the skip logic to over-skip on
-                        // every subsequent poll and stall the connector.
-                        if skipped > 0 {
-                            state.cursor_row_count = skipped;
-                        }
-                    }
-                }
-
-                if self.verbose {
-                    info!(
-                        "InfluxDB source ID: {} produced {} messages. \
-                         Total processed: {}. Cursor: {:?}",
-                        self.id,
-                        messages.len(),
-                        state.processed_rows,
-                        state.last_timestamp
-                    );
-                } else {
-                    debug!(
-                        "InfluxDB source ID: {} produced {} messages. \
-                         Total processed: {}. Cursor: {:?}",
-                        self.id,
-                        messages.len(),
-                        state.processed_rows,
-                        state.last_timestamp
-                    );
-                }
-
-                let schema = if self.config.payload_column.is_some() {
-                    self.payload_format().schema()
-                } else {
-                    Schema::Json
+        let client = self.get_client()?;
+        let auth = self
+            .auth_header
+            .as_ref()
+            .map(|s| s.expose_secret().as_str())
+            .ok_or_else(|| {
+                Error::Connection("auth_header not initialised -- was open() called?".to_string())
+            })?;
+        match &self.version_state {
+            VersionState::V2(state_mu) => {
+                let InfluxDbSourceConfig::V2(cfg) = &self.config else {
+                    return Err(Error::InvalidState);
                 };
 
-                let persisted_state = self.serialize_state(&state);
+                let state_snap = state_mu.lock().await.clone();
+                match v2::poll(
+                    client,
+                    cfg,
+                    auth,
+                    &state_snap,
+                    self.payload_format,
+                    self.config.include_metadata(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        self.circuit_breaker.record_success();
+                        let messages = result.messages;
+                        let schema = result.schema;
+                        let state_snap = {
+                            let mut state = state_mu.lock().await;
+                            state.processed_rows += messages.len() as u64;
+                            apply_v2_cursor_advance(
+                                &mut state,
+                                result.max_cursor,
+                                result.rows_at_max_cursor,
+                                result.skipped,
+                            );
 
-                Ok(ProducedMessages {
-                    schema,
-                    messages,
-                    state: persisted_state,
-                })
-            }
-            Err(e) => {
-                // Only count transient/connectivity failures toward the
-                // circuit breaker. PermanentHttpError (400, 401, etc.) are
-                // config/data issues that retrying will not fix.
-                if !matches!(e, Error::PermanentHttpError(_)) {
-                    self.circuit_breaker.record_failure().await;
+                            poll_event!(
+                                skipped = result.skipped,
+                                "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
+                                 Total: {}. Cursor: {:?}",
+                                self.id,
+                                messages.len(),
+                                state.processed_rows,
+                                state.last_timestamp.as_deref()
+                            );
+                            state.clone()
+                            // lock released here
+                        };
+
+                        let persisted = ConnectorState::serialize(
+                            &PersistedState::V2(state_snap),
+                            CONNECTOR_NAME,
+                            self.id,
+                        );
+                        match &persisted {
+                            Some(_) => {
+                                // Relaxed: the SDK drives poll() from a single select! loop —
+                                // no concurrent poll() calls exist, so no cross-thread ordering
+                                // guarantee is needed here.
+                                self.state_serialize_failures.store(0, Ordering::Relaxed);
+                            }
+                            None => {
+                                let failures = self
+                                    .state_serialize_failures
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if failures >= MAX_STATE_SERIALIZE_FAILURES {
+                                    // Trip the CB to surface the persistence fault, but
+                                    // still deliver messages to maintain at-least-once.
+                                    // state:None means disk cursor lags; a process restart
+                                    // will re-deliver from the last successfully persisted cursor.
+                                    self.circuit_breaker.record_failure().await;
+                                    return Ok(ProducedMessages {
+                                        schema,
+                                        messages,
+                                        state: None,
+                                    });
+                                }
+                                warn!(
+                                    "{CONNECTOR_NAME} ID: {} — state serialization failed \
+                                     ({failures}/{MAX_STATE_SERIALIZE_FAILURES}); \
+                                     cursor will not be persisted. Messages were emitted; \
+                                     restart may cause re-delivery.",
+                                    self.id
+                                );
+                            }
+                        }
+
+                        Ok(ProducedMessages {
+                            schema,
+                            messages,
+                            state: persisted,
+                        })
+                    }
+                    Err(e) => self.handle_poll_error(e).await,
                 }
-                error!(
-                    "InfluxDB source ID: {} poll failed: {e}. \
-                     Consecutive failures tracked by circuit breaker.",
-                    self.id
-                );
-                tokio::time::sleep(self.poll_interval).await;
-                Err(e)
+            }
+
+            VersionState::V3(state_mu) => {
+                let InfluxDbSourceConfig::V3(cfg) = &self.config else {
+                    return Err(Error::InvalidState);
+                };
+
+                let state_snap = state_mu.lock().await.clone();
+                match v3::poll(
+                    client,
+                    cfg,
+                    auth,
+                    &state_snap,
+                    self.payload_format,
+                    self.config.include_metadata(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if result.trip_circuit_breaker {
+                            self.circuit_breaker.record_failure().await;
+                        } else if !result.is_stuck {
+                            // Stuck polls (batch inflating) are neutral: query succeeded
+                            // but cursor did not advance. Don't record success — it would
+                            // reset the failure counter and mask prior transient errors.
+                            self.circuit_breaker.record_success();
+                        }
+
+                        let new = result.new_state;
+                        let messages = result.messages;
+                        let schema = result.schema;
+                        let msg_count = messages.len();
+                        // Clone before acquiring the lock so the String allocation is
+                        // outside the critical section; the original is moved into
+                        // the mutex, the clone is used for serialization.
+                        let for_serialize = new.clone();
+                        {
+                            let mut state = state_mu.lock().await;
+                            *state = new;
+                            poll_event!(
+                                "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
+                                 Total: {}. Cursor: {:?}",
+                                self.id,
+                                msg_count,
+                                state.processed_rows,
+                                state.last_timestamp.as_deref()
+                            );
+                            // lock released here
+                        }
+
+                        let persisted = ConnectorState::serialize(
+                            &PersistedState::V3(for_serialize),
+                            CONNECTOR_NAME,
+                            self.id,
+                        );
+                        match &persisted {
+                            Some(_) => {
+                                // Relaxed: the SDK drives poll() from a single select! loop —
+                                // no concurrent poll() calls exist, so no cross-thread ordering
+                                // guarantee is needed here.
+                                self.state_serialize_failures.store(0, Ordering::Relaxed);
+                            }
+                            None => {
+                                let failures = self
+                                    .state_serialize_failures
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if failures >= MAX_STATE_SERIALIZE_FAILURES {
+                                    self.circuit_breaker.record_failure().await;
+                                    return Ok(ProducedMessages {
+                                        schema,
+                                        messages,
+                                        state: None,
+                                    });
+                                }
+                                warn!(
+                                    "{CONNECTOR_NAME} ID: {} — state serialization failed \
+                                     ({failures}/{MAX_STATE_SERIALIZE_FAILURES}); \
+                                     cursor will not be persisted. Messages were emitted; \
+                                     restart may cause re-delivery.",
+                                    self.id
+                                );
+                            }
+                        }
+
+                        Ok(ProducedMessages {
+                            schema,
+                            messages,
+                            state: persisted,
+                        })
+                    }
+                    Err(e) => self.handle_poll_error(e).await,
+                }
             }
         }
     }
 
     async fn close(&mut self) -> Result<(), Error> {
         self.client = None;
-        let state = self.state.lock().await;
+        let processed = match &self.version_state {
+            VersionState::V2(mu) => mu.lock().await.processed_rows,
+            VersionState::V3(mu) => mu.lock().await.processed_rows,
+        };
         info!(
-            "InfluxDB source connector ID: {} closed. Total rows processed: {}",
-            self.id, state.processed_rows
+            "{CONNECTOR_NAME} ID: {} closed. Total rows processed: {processed}",
+            self.id
         );
         Ok(())
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
+impl InfluxDbSource {
+    async fn handle_poll_error(&self, e: Error) -> Result<ProducedMessages, Error> {
+        // Record failure for all errors including PermanentHttpError. A permanently
+        // broken query (e.g. 400 Bad Request) would loop forever at poll_interval
+        // without CB protection if we exempt it; the operator needs the CB to trip.
+        self.circuit_breaker.record_failure().await;
+        error!("{CONNECTOR_NAME} ID: {} poll failed: {e}", self.id);
+        Err(e)
+    }
+}
+
+// ── Query structure heuristics ────────────────────────────────────────────────
+
+/// Return `true` if `query` contains an `ORDER BY` clause (case-insensitive).
+///
+/// DataFusion (used by InfluxDB 3 Core) does not guarantee stable row ordering
+/// for tied timestamps unless `ORDER BY` is present. V3 OFFSET-based dedup relies
+/// on consistent ordering - without `ORDER BY`, different rows may be skipped on
+/// each poll, causing silent data loss or re-delivery.
+///
+/// `/* */` block comments are stripped first; `--` line comments are stripped
+/// per-line. `ORDER BY` appearing only inside a comment does NOT satisfy the check.
+fn query_has_order_by(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        code.to_ascii_uppercase().contains("ORDER BY")
+    })
+}
+
+/// Return `true` if `query` contains `ORDER BY ... DESC` (case-insensitive).
+///
+/// Scans for `ORDER BY` in non-comment code, then tokenises the text that
+/// follows to detect a standalone `DESC` keyword. `DESCRIBE` and other
+/// identifiers that start with `DESC` are excluded by the word-boundary check.
+fn query_has_desc_order(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let upper = code.to_ascii_uppercase();
+        if let Some(ob_pos) = upper.find("ORDER BY") {
+            let after = &upper[ob_pos + "ORDER BY".len()..];
+            after
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .any(|token| token == "DESC")
+        } else {
+            false
+        }
+    })
+}
+
+/// Return `true` if `query` contains a `sort(` call that is not part of a longer
+/// identifier (e.g. `mysort(` is excluded; `|> sort(` and bare `sort(` are included).
+/// Best-effort check: warns if `sort(` does not appear outside
+/// line comments. Not a full parser; documents its limitations.
+fn query_has_sort_call(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("//") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        // Find all occurrences of "sort(" and verify none are preceded by a
+        // word character (letter, digit, underscore) — that would mean the
+        // "sort" is part of a longer identifier like "mysort" or "do_sort".
+        let mut search = code;
+        while let Some(pos) = search.find("sort(") {
+            let preceded_by_word_char = search[..pos]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if !preceded_by_word_char {
+                return true;
+            }
+            search = &search[pos + 5..]; // skip past "sort("
+        }
+        false
+    })
+}
+
+/// Returns `true` if a V3 SQL `query` contains a `>= $cursor` comparison in any
+/// quoting style (`'$cursor'`, `"$cursor"`, or bare `$cursor`) outside of comments.
+///
+/// Returns `true` if a V2 Flux `query` contains a `>= $cursor` comparison outside of
+/// comments. Flux uses `//` for line comments and `/* */` for block comments.
+///
+/// Checks for the bare and quoted forms (`$cursor`, `'$cursor'`, `"$cursor"`) to
+/// avoid false positives on unrelated `>=` comparisons (e.g. `r.val >= 0`).
+fn query_has_inclusive_cursor(query: &str, comment_char: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find(comment_char) {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let mut rest = code;
+        while let Some(pos) = rest.find(">=") {
+            let after = rest[pos + 2..].trim_start_matches([' ', '\t']);
+            let inner = after
+                .strip_prefix('\'')
+                .or_else(|| after.strip_prefix('"'))
+                .unwrap_or(after);
+            if inner.starts_with("$cursor")
+                && !inner["$cursor".len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return true;
+            }
+            rest = &rest[pos + 2..];
+        }
+        false
+    })
+}
+
+// ── V2 cursor advance logic ───────────────────────────────────────────────────
+
+/// Update V2 polling state after a successful poll.
+///
+/// V2 uses `>= $cursor` semantics, so the first batch after a cursor advance
+/// will include rows already delivered at the previous max timestamp. The
+/// `cursor_row_count` tracks how many such rows to skip on the next poll.
+///
+/// - New cursor → store it with the count of rows that landed at that timestamp.
+/// - Same cursor → accumulate: more rows at this timestamp were delivered.
+/// - No new cursor (all skipped) → correct `cursor_row_count` to `skipped`
+///   so the skip counter reflects reality rather than a stale inflated value.
+fn apply_v2_cursor_advance(
+    state: &mut V2State,
+    max_cursor: Option<String>,
+    rows_at_max_cursor: u64,
+    skipped: u64,
+) {
+    if let Some(ref new_cursor) = max_cursor {
+        let should_advance = match state.last_timestamp.as_deref() {
+            None => true,
+            Some(old) => match old.parse::<DateTime<Utc>>() {
+                Ok(dt) => is_timestamp_after(new_cursor, dt),
+                Err(e) => {
+                    // Persisted cursor is corrupt — the server-supplied new_cursor is
+                    // authoritative. Advance unconditionally so the connector un-stucks
+                    // itself rather than accumulating cursor_row_count indefinitely.
+                    error!(
+                        "V2 source: persisted cursor {old:?} failed RFC 3339 parse ({e}); \
+                         advancing to server cursor {new_cursor:?} to recover."
+                    );
+                    true
+                }
+            },
+        };
+        if should_advance {
+            state.last_timestamp = Some(new_cursor.clone());
+            state.cursor_row_count = rows_at_max_cursor;
+        } else {
+            // Cursor stayed at same timestamp — accumulate new rows for the offset tiebreaker.
+            state.cursor_row_count += rows_at_max_cursor;
+        }
+    } else if skipped > 0 {
+        // max_cursor is None (all rows were at or before the current cursor and were
+        // skipped). Reset the counter to `skipped` to correct an over-inflated offset.
+        state.cursor_row_count = skipped;
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use common::{V2SourceConfig, V3SourceConfig};
+    use secrecy::SecretString;
 
-    fn make_config() -> InfluxDbSourceConfig {
-        InfluxDbSourceConfig {
+    fn make_v2_config() -> InfluxDbSourceConfig {
+        InfluxDbSourceConfig::V2(V2SourceConfig {
             url: "http://localhost:8086".to_string(),
             org: "test_org".to_string(),
             token: SecretString::from("test_token"),
@@ -884,516 +894,1226 @@ mod tests {
             retry_max_delay: Some("1s".to_string()),
             circuit_breaker_threshold: Some(5),
             circuit_breaker_cool_down: Some("30s".to_string()),
-        }
+        })
     }
 
-    fn make_source() -> InfluxDbSource {
-        InfluxDbSource::new(1, make_config(), None)
-    }
-
-    // ── validate_cursor ──────────────────────────────────────────────────
-
-    #[test]
-    fn validate_cursor_accepts_valid_rfc3339() {
-        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00Z").is_ok());
-        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00.123456789Z").is_ok());
-        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00+05:30").is_ok());
-        assert!(InfluxDbSource::validate_cursor("1970-01-01T00:00:00Z").is_ok());
-    }
-
-    #[test]
-    fn validate_cursor_rejects_flux_injection_characters() {
-        // pipe, quote, parenthesis, space, slash are Flux syntax characters
-        assert!(InfluxDbSource::validate_cursor(r#"") |> drop() //"#).is_err());
-        assert!(InfluxDbSource::validate_cursor("2024-01-15 10:30:00Z").is_err());
-        assert!(InfluxDbSource::validate_cursor("2024/01/15T10:30:00Z").is_err());
-        assert!(InfluxDbSource::validate_cursor("not-a-timestamp").is_err());
-    }
-
-    #[test]
-    fn validate_cursor_rejects_empty_string() {
-        assert!(InfluxDbSource::validate_cursor("").is_err());
-    }
-
-    #[test]
-    fn validate_cursor_rejects_date_only() {
-        // Missing time component
-        assert!(InfluxDbSource::validate_cursor("2024-01-15").is_err());
-    }
-
-    // ── validate_cursor_field ────────────────────────────────────────────
-
-    #[test]
-    fn validate_cursor_field_accepts_time_columns() {
-        assert!(InfluxDbSource::validate_cursor_field("_time").is_ok());
-        assert!(InfluxDbSource::validate_cursor_field("time").is_ok());
+    fn make_v3_config() -> InfluxDbSourceConfig {
+        InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:8181".to_string(),
+            db: "test_db".to_string(),
+            token: SecretString::from("test_token"),
+            query: "SELECT time, val FROM tbl WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+                .to_string(),
+            poll_interval: Some("1s".to_string()),
+            batch_size: Some(100),
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(3),
+            retry_delay: Some("100ms".to_string()),
+            timeout: Some("5s".to_string()),
+            max_open_retries: Some(3),
+            open_retry_max_delay: Some("5s".to_string()),
+            retry_max_delay: Some("1s".to_string()),
+            circuit_breaker_threshold: Some(5),
+            circuit_breaker_cool_down: Some("30s".to_string()),
+            stuck_batch_cap_factor: Some(10),
+        })
     }
 
     #[test]
-    fn validate_cursor_field_rejects_non_timestamp_columns() {
-        assert!(InfluxDbSource::validate_cursor_field("_value").is_err());
-        assert!(InfluxDbSource::validate_cursor_field("sensor_id").is_err());
-        assert!(InfluxDbSource::validate_cursor_field("temperature").is_err());
-        assert!(InfluxDbSource::validate_cursor_field("").is_err());
-    }
-
-    // ── parse_scalar ─────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_scalar_empty_is_null() {
-        assert_eq!(parse_scalar(""), serde_json::Value::Null);
+    fn v2_source_new_creates_v2_state() {
+        let source = InfluxDbSource::new(1, make_v2_config(), None);
+        assert!(matches!(source.version_state, VersionState::V2(_)));
+        assert!(source.state_restore_error.is_none());
     }
 
     #[test]
-    fn parse_scalar_booleans() {
-        assert_eq!(parse_scalar("true"), serde_json::Value::Bool(true));
-        assert_eq!(parse_scalar("false"), serde_json::Value::Bool(false));
+    fn v3_source_new_creates_v3_state() {
+        let source = InfluxDbSource::new(1, make_v3_config(), None);
+        assert!(matches!(source.version_state, VersionState::V3(_)));
+        assert!(source.state_restore_error.is_none());
     }
 
-    #[test]
-    fn parse_scalar_integers() {
-        assert_eq!(parse_scalar("42"), serde_json::Value::Number(42.into()));
-        assert_eq!(
-            parse_scalar("-7"),
-            serde_json::Value::Number((-7i64).into())
-        );
-    }
-
-    #[test]
-    fn parse_scalar_floats() {
-        match parse_scalar("1.5") {
-            serde_json::Value::Number(n) => {
-                let v = n.as_f64().unwrap();
-                assert!((v - 1.5).abs() < 1e-10);
-            }
-            other => panic!("expected Number, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_scalar_strings() {
-        assert_eq!(
-            parse_scalar("hello"),
-            serde_json::Value::String("hello".to_string())
-        );
-        // "True" is not a bool (case-sensitive)
-        assert_eq!(
-            parse_scalar("True"),
-            serde_json::Value::String("True".to_string())
-        );
-    }
-
-    // ── is_timestamp_after ───────────────────────────────────────────────
-
-    #[test]
-    fn is_timestamp_after_compares_chronologically_not_lexicographically() {
-        // "2026-03-18T12:00:00.60952Z" = 609520µs (chronologically earlier)
-        // "2026-03-18T12:00:00.609521Z" = 609521µs (chronologically later)
-        // A naive string compare would say the first is > second (Z > 1).
-        let earlier = "2026-03-18T12:00:00.60952Z";
-        let later = "2026-03-18T12:00:00.609521Z";
+    #[tokio::test]
+    async fn state_restore_fails_on_version_mismatch() {
+        // Persist a V2 state, then try to open a V3 connector
+        let v2_state = PersistedState::V2(V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            processed_rows: 42,
+            cursor_row_count: 0,
+        });
+        let persisted = ConnectorState::serialize(&v2_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
         assert!(
-            is_timestamp_after(later, earlier),
-            "later timestamp should be after earlier"
+            source.state_restore_error.is_some(),
+            "V3 connector must refuse V2 persisted state"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_returns_init_error_when_restore_failed() {
+        // open() uses Error::InitError (which carries a String) so the cause
+        // is visible to callers without requiring log access.
+        let garbage = ConnectorState(vec![0xFF, 0xFE, 0xFD]);
+        let mut source = InfluxDbSource::new(1, make_v2_config(), Some(garbage));
+        assert!(source.state_restore_error.is_some());
+        let result = source.open().await;
+        assert!(
+            matches!(result, Err(Error::InitError(_))),
+            "open() must fail with InitError on restore failure"
+        );
+        // The error message must include the cause so operators can diagnose the problem.
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("persisted state exists but could not be deserialized"),
+            "error message must include the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_corrupt_cursor_marks_restore_error() {
+        // A state that deserializes successfully but contains a corrupt cursor
+        // must be rejected (state_restore_error set) so open() fails fast.
+        let bad_state = PersistedState::V2(V2State {
+            last_timestamp: Some("not-a-timestamp".to_string()),
+            processed_rows: 5,
+            cursor_row_count: 0,
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt cursor in persisted V2 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad cursor value: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v3_state_with_corrupt_cursor_marks_restore_error() {
+        let bad_state = PersistedState::V3(V3State {
+            last_timestamp: Some("not-a-timestamp".to_string()),
+            processed_rows: 5,
+            effective_batch_size: 500,
+            last_timestamp_row_offset: 0,
+            stuck_cursor: None,
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt cursor in persisted V3 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad cursor value: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_valid_cursor_succeeds() {
+        // A well-formed V2 state with a valid cursor must restore without error.
+        let good_state = PersistedState::V2(V2State {
+            last_timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            processed_rows: 100,
+            cursor_row_count: 2,
+        });
+        let persisted = ConnectorState::serialize(&good_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_none(),
+            "valid cursor must not produce restore error"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_none_cursor_succeeds() {
+        // last_timestamp = None (fresh start) must also restore without error.
+        let state = PersistedState::V2(V2State {
+            last_timestamp: None,
+            processed_rows: 0,
+            cursor_row_count: 0,
+        });
+        let persisted = ConnectorState::serialize(&state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(source.state_restore_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_initial_offset() {
+        // Validates initial_offset before attempting any network connection.
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            initial_offset: Some("not-a-timestamp".to_string()),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for bad initial_offset, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_timezone_free_initial_offset() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            initial_offset: Some("2024-01-15T10:30:00".to_string()),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "initial_offset without timezone must be rejected"
+        );
+    }
+
+    // ── #10: org / db non-empty validation ────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_v2_rejects_empty_org() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "".to_string(),
+            token: SecretString::from("t"),
+            query: "q WHERE time > '$cursor'".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "empty org must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_empty_db() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "empty db must be rejected"
+        );
+    }
+
+    // ── #11: $cursor placeholder ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_rejects_query_missing_cursor_placeholder() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "myorg".to_string(),
+            token: SecretString::from("t"),
+            query: "from(bucket:\"b\") |> range(start: -1h) |> limit(n: $limit)".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$cursor")),
+            "query without $cursor must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_query_with_cursor_as_prefix_of_longer_identifier() {
+        // "$cursor_field" contains "$cursor" as a substring but is NOT a bare
+        // $cursor placeholder; apply_query_params will not substitute it, so
+        // open() must reject it the same as a missing placeholder.
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "myorg".to_string(),
+            token: SecretString::from("t"),
+            query: "from(bucket:\"b\") |> range(start: $cursor_field) |> limit(n: $limit)"
+                .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$cursor")),
+            "$cursor_field must not satisfy the $cursor placeholder check: {err:?}"
+        );
+    }
+
+    // ── #12: V3 >= guard ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_v3_rejects_inclusive_cursor_operator() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query:
+                "SELECT * FROM t WHERE time >= '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+                    .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains(">=")),
+            "V3 query with >= '$cursor' must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_allows_other_gte_in_query() {
+        // `>=` that does not apply to $cursor (e.g. a value filter) must be allowed.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query:
+                "SELECT * FROM t WHERE time > '$cursor' AND val >= 0 ORDER BY time LIMIT $limit OFFSET $offset"
+                    .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        // Must fail on connectivity, NOT on the >= or ORDER BY checks.
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains(">=")),
+            "query with >= on non-cursor field must not be rejected for >=: {err:?}"
         );
         assert!(
-            !is_timestamp_after(earlier, later),
-            "earlier should not be after later"
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "query with ORDER BY must not be rejected for ORDER BY: {err:?}"
         );
     }
-
-    #[test]
-    fn is_timestamp_after_equal_timestamps() {
-        let ts = "2024-01-15T10:30:00Z";
-        assert!(!is_timestamp_after(ts, ts));
-    }
-
-    // ── parse_csv_rows ───────────────────────────────────────────────────
-
-    #[test]
-    fn parse_csv_rows_empty_string_returns_empty() {
-        let source = make_source();
-        let rows = source.parse_csv_rows("").unwrap();
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn parse_csv_rows_skips_annotation_rows() {
-        let source = make_source();
-        // Annotation rows must have the same field count as data rows for the CSV
-        // reader to accept them.  InfluxDB always emits uniformly-wide rows.
-        let csv = "#group,false\n#datatype,string\n_time,_value\n2024-01-01T00:00:00Z,42\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
-    }
-
-    #[test]
-    fn parse_csv_rows_skips_blank_lines() {
-        let source = make_source();
-        // Two data records separated by a blank line (multi-table CSV format)
-        let csv = "_time,_value\n2024-01-01T00:00:00Z,1\n\n_time,_value\n2024-01-01T00:00:01Z,2\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
-        // Both data rows should be parsed (second header line is skipped)
-        assert_eq!(rows.len(), 2, "expected 2 data rows, got {}", rows.len());
-    }
-
-    #[test]
-    fn parse_csv_rows_skips_repeated_header_rows() {
-        let source = make_source();
-        // Same header appears twice (InfluxDB multi-table result format)
-        let csv = "_time,_value\n2024-01-01T00:00:00Z,10\n_time,_value\n2024-01-01T00:00:01Z,20\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn parse_csv_rows_handles_empty_value_columns() {
-        let source = make_source();
-        // Data row with an empty field value (column present but blank).
-        // The CSV reader requires uniform field counts, so we keep all 3 columns.
-        let csv = "_time,_value,_measurement\n2024-01-01T00:00:00Z,42,\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
-        assert_eq!(rows.len(), 1);
-        // _measurement is present but empty
-        assert_eq!(
-            rows[0].get("_measurement").map(String::as_str),
-            Some(""),
-            "empty column value should be stored as empty string"
-        );
-    }
-
-    // ── build_payload ────────────────────────────────────────────────────
-
-    #[test]
-    fn build_payload_missing_column_returns_error() {
-        let mut config = make_config();
-        config.payload_column = Some("data".to_string());
-        let source = InfluxDbSource::new(1, config, None);
-
-        let row: HashMap<String, String> =
-            [("_time".to_string(), "2024-01-01T00:00:00Z".to_string())]
-                .into_iter()
-                .collect();
-
-        let result = source.build_payload(&row, true);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("data") || err.contains("Missing"),
-            "error should mention missing column: {err}"
-        );
-    }
-
-    #[test]
-    fn build_payload_invalid_base64_returns_error() {
-        let mut config = make_config();
-        config.payload_column = Some("data".to_string());
-        config.payload_format = Some("raw".to_string()); // raw = base64 decode
-        let source = InfluxDbSource::new(1, config, None);
-
-        let row: HashMap<String, String> =
-            [("data".to_string(), "not-valid-base64!!!".to_string())]
-                .into_iter()
-                .collect();
-
-        let result = source.build_payload(&row, true);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("base64") || err.contains("decode"),
-            "error should mention base64: {err}"
-        );
-    }
-
-    #[test]
-    fn build_payload_invalid_json_returns_error() {
-        let mut config = make_config();
-        config.payload_column = Some("data".to_string());
-        config.payload_format = Some("json".to_string());
-        let source = InfluxDbSource::new(1, config, None);
-
-        let row: HashMap<String, String> = [("data".to_string(), "{{not valid json}}".to_string())]
-            .into_iter()
-            .collect();
-
-        let result = source.build_payload(&row, true);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("JSON") || err.contains("json"),
-            "error should mention JSON: {err}"
-        );
-    }
-
-    #[test]
-    fn build_payload_valid_base64_decodes_correctly() {
-        let mut config = make_config();
-        config.payload_column = Some("data".to_string());
-        config.payload_format = Some("raw".to_string());
-        let source = InfluxDbSource::new(1, config, None);
-
-        // base64("hello") = "aGVsbG8="
-        let row: HashMap<String, String> = [("data".to_string(), "aGVsbG8=".to_string())]
-            .into_iter()
-            .collect();
-
-        let result = source.build_payload(&row, true).unwrap();
-        assert_eq!(result, b"hello");
-    }
-
-    #[test]
-    fn build_payload_text_column_returns_bytes() {
-        let mut config = make_config();
-        config.payload_column = Some("data".to_string());
-        config.payload_format = Some("text".to_string());
-        let source = InfluxDbSource::new(1, config, None);
-
-        let row: HashMap<String, String> = [("data".to_string(), "hello world".to_string())]
-            .into_iter()
-            .collect();
-
-        let result = source.build_payload(&row, true).unwrap();
-        assert_eq!(result, b"hello world");
-    }
-
-    #[test]
-    fn build_payload_whole_row_wraps_measurement_and_value() {
-        let source = make_source(); // no payload_column
-        let row: HashMap<String, String> = [
-            ("_measurement".to_string(), "temperature".to_string()),
-            ("_field".to_string(), "v".to_string()),
-            ("_time".to_string(), "2024-01-01T00:00:00Z".to_string()),
-            ("_value".to_string(), "21.5".to_string()),
-        ]
-        .into_iter()
-        .collect();
-
-        let bytes = source.build_payload(&row, true).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed["measurement"], "temperature");
-        assert_eq!(parsed["timestamp"], "2024-01-01T00:00:00Z");
-        // _value "21.5" → parsed as f64
-        assert!(parsed["value"].is_number());
-    }
-
-    #[test]
-    fn build_payload_include_metadata_false_filters_fields() {
-        let source = make_source();
-        let row: HashMap<String, String> = [
-            ("_measurement".to_string(), "temp".to_string()),
-            ("_field".to_string(), "v".to_string()),
-            ("_time".to_string(), "2024-01-01T00:00:00Z".to_string()),
-            ("_value".to_string(), "42".to_string()),
-            ("host".to_string(), "server1".to_string()), // extra annotation column
-        ]
-        .into_iter()
-        .collect();
-
-        let bytes = source.build_payload(&row, false).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // With include_metadata=false, only _value/_time/_measurement go into row
-        let row_obj = parsed["row"].as_object().unwrap();
-        // "host" is an annotation column — should be excluded
-        assert!(
-            !row_obj.contains_key("host"),
-            "annotation columns should be excluded when include_metadata=false"
-        );
-        // Core columns should still be present
-        assert!(row_obj.contains_key("_value") || row_obj.contains_key("_time"));
-    }
-
-    // ── circuit breaker integration ──────────────────────────────────────
 
     #[tokio::test]
     async fn poll_returns_empty_when_circuit_is_open() {
-        let mut config = make_config();
-        config.circuit_breaker_threshold = Some(1);
-        config.circuit_breaker_cool_down = Some("60s".to_string());
-        // Use a short poll_interval so the circuit-open sleep does not stall
-        // the test suite for a full second.
-        config.poll_interval = Some("1ms".to_string());
+        let config = match make_v2_config() {
+            InfluxDbSourceConfig::V2(mut c) => {
+                c.circuit_breaker_threshold = Some(1);
+                c.circuit_breaker_cool_down = Some("60s".to_string());
+                c.poll_interval = Some("1ms".to_string());
+                InfluxDbSourceConfig::V2(c)
+            }
+            other => other,
+        };
         let source = InfluxDbSource::new(1, config, None);
-
-        // Force the circuit open
         source.circuit_breaker.record_failure().await;
         assert!(source.circuit_breaker.is_open().await);
 
         let result = source.poll().await;
-        assert!(result.is_ok(), "poll should return Ok when circuit is open");
-        let produced = result.unwrap();
-        assert!(
-            produced.messages.is_empty(),
-            "no messages should be produced when circuit is open"
-        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().messages.is_empty());
     }
-
-    // ── query_with_params — limit inflation ──────────────────────────────
-
-    #[test]
-    fn query_with_params_inflates_limit_by_already_seen() {
-        let mut config = make_config();
-        config.batch_size = Some(10);
-        config.query =
-            "from(bucket:\"b\") |> range(start: $cursor) |> limit(n: $limit)".to_string();
-        let source = InfluxDbSource::new(1, config, None);
-
-        // With already_seen=5, limit should be 10+5=15
-        let q = source.query_with_params("2024-01-01T00:00:00Z", 5).unwrap();
-        assert!(q.contains("limit(n: 15)"), "inflated limit not found: {q}");
-    }
-
-    #[test]
-    fn query_with_params_no_inflation_when_already_seen_is_zero() {
-        let mut config = make_config();
-        config.batch_size = Some(100);
-        config.query =
-            "from(bucket:\"b\") |> range(start: $cursor) |> limit(n: $limit)".to_string();
-        let source = InfluxDbSource::new(1, config, None);
-
-        let q = source.query_with_params("2024-01-01T00:00:00Z", 0).unwrap();
-        assert!(
-            q.contains("limit(n: 100)"),
-            "limit should be batch_size: {q}"
-        );
-    }
-
-    // ── close() ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn close_drops_client() {
-        let mut source = make_source();
+    async fn close_clears_client() {
+        let mut source = InfluxDbSource::new(1, make_v2_config(), None);
         let result = source.close().await;
         assert!(result.is_ok());
-        assert!(source.client.is_none(), "client should be None after close");
+        assert!(source.client.is_none());
     }
 
-    // ── cursor_row_count correction (fix: inflated counter reset) ────────
-
-    #[tokio::test]
-    async fn cursor_row_count_corrected_when_inflated_above_actual_row_count_at_cursor() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener as StdTcpListener;
-
-        // The server returns 3 rows, all at the cursor timestamp.
-        // The source starts with cursor_row_count = 5 (inflated – e.g. rows
-        // deleted from InfluxDB after delivery).  All 3 returned rows will be
-        // skipped (skipped=3 < already_seen=5).  The None branch must correct
-        // cursor_row_count to 3 instead of leaving it at the inflated 5.
-        let t = "2024-01-01T00:00:00Z";
-        let csv = format!("_time,_value\n{t},1\n{t},2\n{t},3\n");
-        let http_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-            csv.len(),
-            csv
+    #[test]
+    fn apply_v2_cursor_advance_moves_cursor() {
+        let mut state = V2State::default();
+        apply_v2_cursor_advance(&mut state, Some("2024-01-01T00:00:01Z".to_string()), 3, 0);
+        assert_eq!(
+            state.last_timestamp.as_deref(),
+            Some("2024-01-01T00:00:01Z")
         );
+        assert_eq!(state.cursor_row_count, 3);
+    }
 
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(http_response.as_bytes());
-            }
-        });
-
-        let initial_state = State {
-            last_poll_time: Utc::now(),
-            last_timestamp: Some(t.to_string()),
+    #[test]
+    fn apply_v2_cursor_advance_accumulates_same_cursor() {
+        let mut state = V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            cursor_row_count: 3,
             processed_rows: 0,
-            cursor_row_count: 5, // inflated: actual rows at T are only 3
         };
-        let persisted = ConnectorState::serialize(&initial_state, CONNECTOR_NAME, 1).unwrap();
-
-        let mut config = make_config();
-        config.url = format!("http://127.0.0.1:{port}");
-        config.batch_size = Some(10);
-        let mut source = InfluxDbSource::new(1, config, Some(persisted));
-
-        // Inject a real HTTP client directly, bypassing open()'s health check.
-        let raw = source.build_raw_client().unwrap();
-        source.client = Some(build_retry_client(
-            raw,
-            0,
-            Duration::from_millis(0),
-            Duration::from_millis(0),
-            "InfluxDB",
-        ));
-
-        assert_eq!(
-            source.state.lock().await.cursor_row_count,
-            5,
-            "pre-condition: cursor_row_count starts at inflated value"
-        );
-
-        // poll() → server returns 3 rows at T, all skipped (already_seen=5 > 3)
-        // → (messages=[], max_cursor=None, rows_at_max_cursor=0, skipped=3)
-        // → None branch corrects cursor_row_count to skipped (3).
-        let result = source.poll().await;
-        assert!(result.is_ok(), "poll should succeed: {:?}", result);
-        assert!(
-            result.unwrap().messages.is_empty(),
-            "all rows were already seen – no messages expected"
-        );
-
-        assert_eq!(
-            source.state.lock().await.cursor_row_count,
-            3,
-            "cursor_row_count must be corrected to actual row count (3), not left at inflated (5)"
-        );
+        apply_v2_cursor_advance(&mut state, Some("2024-01-01T00:00:00Z".to_string()), 2, 0);
+        assert_eq!(state.cursor_row_count, 5);
     }
 
-    // ── state restore failure (fix: deserialization failure fails open) ──
+    #[test]
+    fn apply_v2_cursor_advance_corrects_inflated_counter() {
+        let mut state = V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            cursor_row_count: 10,
+            processed_rows: 0,
+        };
+        // None + skipped=3 → correction
+        apply_v2_cursor_advance(&mut state, None, 0, 3);
+        assert_eq!(state.cursor_row_count, 3);
+    }
 
     #[tokio::test]
-    async fn open_returns_invalid_state_when_persisted_state_cannot_be_deserialized() {
-        // Garbage bytes will cause ConnectorState::deserialize to fail.
-        // new() must set state_restore_failed=true, and open() must return
-        // Err(InvalidState) before attempting any network calls, so the
-        // operator sees a hard failure instead of a silent cursor reset.
-        let garbage = ConnectorState(vec![0xFF, 0xFE, 0xFD, 0xAA, 0xBB]);
-        let mut source = InfluxDbSource::new(1, make_config(), Some(garbage));
-
-        let result = source.open().await;
+    async fn open_v3_rejects_query_without_offset_when_stuck_cap_active() {
+        // Default stuck_batch_cap_factor is 10 (> 0), so any V3 query without
+        // '$offset' must be rejected at open() to prevent duplicate delivery.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            // deliberately missing $offset
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None, // uses default (10 > 0)
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
         assert!(
-            matches!(result, Err(Error::InvalidState)),
-            "open() must return Err(InvalidState) on state deserialization failure, got: {:?}",
-            result
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue when $offset missing in V3 query, got {err:?}"
         );
     }
 
-    #[test]
-    fn fresh_start_with_no_prior_state_does_not_set_restore_failed() {
-        // When no prior ConnectorState is supplied (first boot), state_restore_failed
-        // must be false so that open() is not blocked on a normal first run.
-        let source = InfluxDbSource::new(1, make_config(), None);
+    #[tokio::test]
+    async fn open_v3_accepts_query_with_offset_placeholder() {
+        // A query with $offset and ORDER BY (and a URL that fails health check) must NOT be
+        // rejected for the offset or ORDER BY reason — it must proceed to the connectivity check.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query:
+                "SELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+                    .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        // Must NOT be InvalidConfigValue for offset or ORDER BY reasons; connectivity fails instead.
         assert!(
-            !source.state_restore_failed,
-            "state_restore_failed must be false when no prior state exists"
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
+            "open() must not reject a query that contains $offset; got {err:?}"
+        );
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "open() must not reject a query that contains ORDER BY; got {err:?}"
         );
     }
 
-    // ── payload_format ───────────────────────────────────────────────────
+    #[tokio::test]
+    async fn open_v3_with_zero_stuck_cap_skips_offset_check() {
+        // stuck_batch_cap_factor = 0 disables the stuck-cap feature; $offset is
+        // not required because no inflation will ever happen.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(0), // explicitly disabled
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
+            "open() must not check $offset when stuck_batch_cap_factor=0; got {err:?}"
+        );
+    }
 
-    #[test]
-    fn payload_format_aliases() {
-        assert_eq!(
-            PayloadFormat::from_config(Some("utf8")),
-            PayloadFormat::Text
+    #[tokio::test]
+    async fn open_v3_rejects_query_without_order_by_when_stuck_cap_active() {
+        // $offset present but no ORDER BY — DataFusion ordering is unstable for tied
+        // timestamps, so OFFSET-based dedup may skip different rows each poll.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None, // default 10 > 0
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "V3 query without ORDER BY must be rejected when stuck detection active: {err:?}"
         );
-        assert_eq!(
-            PayloadFormat::from_config(Some("base64")),
-            PayloadFormat::Raw
+    }
+
+    #[tokio::test]
+    async fn open_v3_with_zero_stuck_cap_skips_order_by_check() {
+        // stuck_batch_cap_factor=0 disables stuck detection; ORDER BY is not required.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(0),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "ORDER BY check must be skipped when stuck_batch_cap_factor=0; got {err:?}"
         );
-        assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Json);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_stuck_batch_cap_factor_above_max() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(v3::MAX_STUCK_CAP_FACTOR + 1),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for oversized stuck_batch_cap_factor, got {err:?}"
+        );
     }
 
     #[test]
-    fn payload_format_schema_mapping() {
-        assert_eq!(PayloadFormat::Json.schema(), Schema::Json);
-        assert_eq!(PayloadFormat::Text.schema(), Schema::Text);
-        assert_eq!(PayloadFormat::Raw.schema(), Schema::Raw);
+    fn config_accessors_v2() {
+        let cfg = make_v2_config();
+        assert_eq!(cfg.version_label(), "v2");
+        assert_eq!(cfg.cursor_field(), "_time");
+        assert_eq!(cfg.batch_size(), 100);
+    }
+
+    #[test]
+    fn config_accessors_v3() {
+        let cfg = make_v3_config();
+        assert_eq!(cfg.version_label(), "v3");
+        assert_eq!(cfg.cursor_field(), "time");
+        assert_eq!(cfg.batch_size(), 100);
+    }
+
+    // ── query_has_sort_call heuristic ─────────────────────────────────────────
+
+    #[test]
+    fn sort_call_detected_in_flux_pipeline() {
+        assert!(query_has_sort_call(
+            r#"from(bucket:"b") |> range(start: -1h) |> sort(columns: ["_time"])"#
+        ));
+    }
+
+    #[test]
+    fn sort_call_detected_without_pipe() {
+        assert!(query_has_sort_call("sort(columns: [\"_time\"])"));
+    }
+
+    #[test]
+    fn sort_call_not_detected_when_absent() {
+        assert!(!query_has_sort_call(
+            r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#
+        ));
+    }
+
+    #[test]
+    fn sort_call_not_false_positive_on_identifier_prefix() {
+        // `mysort(` must NOT be treated as a sort call — it is a different function name.
+        assert!(!query_has_sort_call("mysort(columns: [\"_time\"])"));
+        assert!(!query_has_sort_call("do_sort(x)"));
+    }
+
+    #[test]
+    fn sort_call_detected_at_start_of_string() {
+        assert!(query_has_sort_call(
+            "sort(columns: [\"_time\"]) |> limit(n: 10)"
+        ));
+    }
+
+    #[test]
+    fn sort_call_not_detected_with_space_before_paren() {
+        // `sort (` with a space is not valid Flux syntax; the heuristic searches
+        // for the literal token `sort(` and does not match this form. The warning
+        // is therefore not emitted, which is acceptable: a query written this way
+        // would fail at the InfluxDB level for a different reason.
+        assert!(!query_has_sort_call("sort (columns: [\"_time\"])"));
+    }
+
+    #[test]
+    fn sort_call_in_line_comment_is_ignored() {
+        // sort( appearing only in a // comment must NOT trigger the heuristic.
+        assert!(!query_has_sort_call(
+            "from(bucket:\"b\") // sort(columns:[\"_time\"]) not real"
+        ));
+        // But sort( before the comment on the same line is still detected.
+        assert!(query_has_sort_call(
+            "sort(columns:[\"_time\"]) // also present"
+        ));
+    }
+
+    #[test]
+    fn sort_call_in_block_comment_is_ignored() {
+        assert!(!query_has_sort_call(
+            "/* sort(columns: [\"_time\"]) */ from(bucket:\"b\")"
+        ));
+        assert!(!query_has_sort_call(
+            "/*\n sort(columns: [\"_time\"])\n*/ from(bucket:\"b\")"
+        ));
+        // sort( after the block comment must still be detected
+        assert!(query_has_sort_call(
+            "/* comment */ sort(columns: [\"_time\"])"
+        ));
+    }
+
+    // ── query_has_order_by heuristic ──────────────────────────────────────────
+
+    #[test]
+    fn order_by_detected_in_sql_query() {
+        assert!(query_has_order_by(
+            "SELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+        ));
+        assert!(query_has_order_by("SELECT 1 order by id"));
+        assert!(query_has_order_by("SELECT 1 Order By x DESC"));
+    }
+
+    #[test]
+    fn order_by_not_detected_when_absent() {
+        assert!(!query_has_order_by(
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+    }
+
+    #[test]
+    fn order_by_in_sql_comment_is_ignored() {
+        // "ORDER BY" only in a -- comment must NOT trigger the check — the query
+        // executes without ORDER BY and DataFusion ordering is unstable.
+        assert!(!query_has_order_by(
+            "-- ORDER BY legacy behavior\nSELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+        // ORDER BY before the comment on the same line must still be detected.
+        assert!(query_has_order_by(
+            "SELECT * FROM t ORDER BY time -- sort by time\nLIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn order_by_in_block_comment_is_ignored() {
+        // "ORDER BY" only inside /* */ must NOT satisfy the check.
+        assert!(!query_has_order_by(
+            "/* ORDER BY example */\nSELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+        // Multi-line block comment spanning ORDER BY must also be ignored.
+        assert!(!query_has_order_by(
+            "/* this is\n   ORDER BY a comment */\nSELECT * FROM t LIMIT $limit"
+        ));
+        // Real ORDER BY with an unrelated block comment must still be detected.
+        assert!(query_has_order_by(
+            "/* header */\nSELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+        ));
+    }
+
+    // ── query_has_inclusive_cursor_flux ──────────────────────────────────────
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_for_unrelated_gte() {
+        // >= on a non-cursor field must NOT trigger: would wrongly reject valid queries
+        assert!(!query_has_inclusive_cursor(
+            r#"from(bucket:"b") |> range(start: $cursor) |> filter(fn: (r) => r.val >= 10)"#,
+            "//"
+        ));
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r.v >= 5) // inclusive",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_bare() {
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor)",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_single_quote() {
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= '$cursor')",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_double_quote() {
+        assert!(query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= \"$cursor\")",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_when_only_in_line_comment() {
+        // >= $cursor inside a // comment must not trigger
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") // r._time >= $cursor\n|> range(start: $cursor)",
+            "//"
+        ));
+        // unrelated >= in comment: also no trigger
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") // batch_size >= 100\n|> range(start: $cursor)",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_when_only_in_block_comment() {
+        assert!(!query_has_inclusive_cursor(
+            "/* use >= '$cursor' for inclusive */ from(bucket:\"b\") |> range(start: $cursor)",
+            "//"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_for_extended_identifier() {
+        assert!(!query_has_inclusive_cursor(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor_start)",
+            "//"
+        ));
+    }
+
+    // ── query_has_inclusive_cursor ────────────────────────────────────────────
+
+    #[test]
+    fn inclusive_cursor_detected_single_quote() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit",
+            "--"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >='$cursor' LIMIT $limit",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_detected_double_quote() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= \"$cursor\" LIMIT $limit",
+            "--"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >=\"$cursor\" LIMIT $limit",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_detected_bare() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= $cursor LIMIT $limit",
+            "--"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >=$cursor LIMIT $limit",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_for_strict_gt() {
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_for_extended_identifier() {
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= '$cursor_field' LIMIT $limit",
+            "--"
+        ));
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= $cursor_field LIMIT $limit",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_when_only_in_sql_comment() {
+        assert!(!query_has_inclusive_cursor(
+            "-- use >= '$cursor' for inclusive\nSELECT * FROM t WHERE time > '$cursor'",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_when_only_in_block_comment() {
+        assert!(!query_has_inclusive_cursor(
+            "/* example: time >= '$cursor' */ SELECT * FROM t WHERE time > '$cursor'",
+            "--"
+        ));
+    }
+
+    #[test]
+    fn apply_v2_cursor_advance_no_new_cursor_no_skipped_is_noop() {
+        let mut state = V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            cursor_row_count: 7,
+            processed_rows: 0,
+        };
+        apply_v2_cursor_advance(&mut state, None, 0, 0);
+        // Neither max_cursor nor skipped — state must not change.
+        assert_eq!(state.cursor_row_count, 7);
+        assert_eq!(
+            state.last_timestamp.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+    }
+
+    // ── restore_v2_state / restore_v3_state paths ─────────────────────────────
+
+    #[test]
+    fn restore_v2_state_with_v2_persisted_restores_successfully() {
+        // V2 config + V2 persisted state → state is restored with state_restore_failed=false.
+        let v2_state = PersistedState::V2(V2State {
+            last_timestamp: Some("2024-06-01T00:00:00Z".to_string()),
+            processed_rows: 99,
+            cursor_row_count: 3,
+        });
+        let persisted = ConnectorState::serialize(&v2_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_none(),
+            "V2 state on V2 connector must succeed"
+        );
+        if let VersionState::V2(mu) = &source.version_state {
+            let state = mu.blocking_lock();
+            assert_eq!(
+                state.last_timestamp.as_deref(),
+                Some("2024-06-01T00:00:00Z")
+            );
+            assert_eq!(state.processed_rows, 99);
+        } else {
+            panic!("expected V2 version state");
+        }
+    }
+
+    #[test]
+    fn restore_v2_state_with_v3_persisted_marks_restore_failed() {
+        // V2 config + V3 persisted state → mismatch must be rejected.
+        let v3_state = PersistedState::V3(V3State {
+            last_timestamp: Some("2024-06-01T00:00:00Z".to_string()),
+            processed_rows: 10,
+            effective_batch_size: 500,
+            last_timestamp_row_offset: 0,
+            stuck_cursor: None,
+        });
+        let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "V3 state on V2 connector must set state_restore_error"
+        );
+    }
+
+    #[test]
+    fn restore_v3_state_with_v3_persisted_restores_successfully() {
+        // V3 config + V3 persisted state → state is restored with state_restore_failed=false.
+        let v3_state = PersistedState::V3(V3State {
+            last_timestamp: Some("2024-07-15T12:00:00Z".to_string()),
+            processed_rows: 500,
+            effective_batch_size: 1000,
+            last_timestamp_row_offset: 5,
+            stuck_cursor: None,
+        });
+        let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_none(),
+            "V3 state on V3 connector must succeed"
+        );
+        if let VersionState::V3(mu) = &source.version_state {
+            let state = mu.blocking_lock();
+            assert_eq!(
+                state.last_timestamp.as_deref(),
+                Some("2024-07-15T12:00:00Z")
+            );
+            assert_eq!(state.processed_rows, 500);
+            assert_eq!(state.effective_batch_size, 1000);
+        } else {
+            panic!("expected V3 version state");
+        }
+    }
+
+    // ── get_client() uncalled open() ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_returns_connection_error_when_client_not_initialized() {
+        // Calling poll() without open() means client is None; get_client() must
+        // return a Connection error rather than panicking.
+        let source = InfluxDbSource::new(1, make_v2_config(), None);
+        let result = source.poll().await;
+        assert!(
+            matches!(result, Err(Error::Connection(_))),
+            "expected Connection error when client not initialized, got {result:?}"
+        );
+    }
+
+    // ── Warning 3: legacy V2 state without version tag ───────────────────────
+
+    #[test]
+    fn restore_v2_state_with_legacy_format_succeeds() {
+        // State persisted before PersistedState was introduced contains only
+        // V2State fields with no version tag. Must restore without error.
+        let old_v2 = V2State {
+            last_timestamp: Some("2024-06-01T00:00:00Z".to_string()),
+            processed_rows: 42,
+            cursor_row_count: 3,
+        };
+        // Serialize V2State directly (not wrapped in PersistedState) to simulate old format.
+        let cs = ConnectorState::serialize(&old_v2, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(cs));
+        assert!(
+            source.state_restore_error.is_none(),
+            "legacy V2 state without version tag must restore without error"
+        );
+        if let VersionState::V2(mu) = &source.version_state {
+            let state = mu.blocking_lock();
+            assert_eq!(state.processed_rows, 42);
+            assert_eq!(state.cursor_row_count, 3);
+        } else {
+            panic!("expected V2 version state");
+        }
+    }
+
+    #[test]
+    fn restore_v3_state_with_invalid_stuck_cursor_marks_restore_error() {
+        // A state with a valid last_timestamp but corrupt stuck_cursor must be rejected —
+        // an invalid stuck_cursor could advance the cursor to a garbage value on the
+        // next empty poll, causing data loss or query errors.
+        let bad_state = PersistedState::V3(V3State {
+            last_timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            processed_rows: 5,
+            effective_batch_size: 500,
+            last_timestamp_row_offset: 3,
+            stuck_cursor: Some("not-a-timestamp".to_string()),
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt stuck_cursor in persisted V3 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad stuck_cursor value: {msg}"
+        );
+    }
+
+    // ── restore_v3_state — None deserialization path ─────────────────────────
+
+    #[test]
+    fn restore_v3_state_with_garbage_data_marks_restore_error() {
+        // Garbage bytes that cannot be deserialized must set state_restore_error
+        // on a V3 connector (mirrors the existing V2 test for coverage of the
+        // None branch in restore_v3_state at source/lib.rs:202-206).
+        let garbage = ConnectorState(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(garbage));
+        assert!(
+            source.state_restore_error.is_some(),
+            "garbage state for V3 connector must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("could not be deserialized"),
+            "error message must explain the cause: {msg}"
+        );
+    }
+
+    // ── apply_v2_cursor_advance — corrupt cursor parse failure ───────────────
+
+    #[test]
+    fn apply_v2_cursor_advance_corrupt_cursor_advances_to_server_cursor() {
+        // When the persisted cursor is not valid RFC 3339, the server-supplied
+        // new_cursor is authoritative. The connector advances to it so it can
+        // un-stuck itself rather than accumulating cursor_row_count indefinitely.
+        let mut state = V2State {
+            last_timestamp: Some("this-is-not-a-timestamp".to_string()),
+            cursor_row_count: 3,
+            processed_rows: 0,
+        };
+        apply_v2_cursor_advance(&mut state, Some("2024-06-01T00:00:00Z".to_string()), 1, 0);
+        assert_eq!(
+            state.last_timestamp.as_deref(),
+            Some("2024-06-01T00:00:00Z"),
+            "corrupt old cursor: advance to server cursor to recover"
+        );
+        assert_eq!(
+            state.cursor_row_count, 1,
+            "cursor_row_count reset to rows_at_max_cursor for new cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_stuck_cap_factor_of_one() {
+        // cap_factor=1 means cap = base_batch × 1 = base_batch.
+        // next_stuck_batch_size(base, base, 1) returns None immediately so the CB
+        // trips on the very first stuck poll with zero inflation — an infinite CB loop.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(1),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "stuck_batch_cap_factor=1 must be rejected — use 0 to disable or >= 2; got {err:?}"
+        );
     }
 }

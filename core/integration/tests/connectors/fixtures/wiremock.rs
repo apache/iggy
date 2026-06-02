@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::connectors::fixtures;
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
@@ -26,7 +27,7 @@ use testcontainers_modules::testcontainers::core::{IntoContainerPort, Mount};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-const WIREMOCK_IMAGE: &str = "wiremock/wiremock";
+const WIREMOCK_IMAGE: &str = "docker.io/wiremock/wiremock";
 const WIREMOCK_TAG: &str = "3.13.2";
 const WIREMOCK_PORT: u16 = 8080;
 
@@ -62,6 +63,7 @@ impl WireMockContainer {
                     .to_string(),
                 "/home/wiremock/__files",
             ))
+            .with_container_name(fixtures::unique_container_name("wiremock"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
