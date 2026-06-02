@@ -26,6 +26,7 @@ use axum::{
     response::Response,
 };
 use err_trail::ErrContext;
+use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
@@ -75,16 +76,16 @@ pub async fn jwt_auth(
             format!("{COMPONENT} (error: {e}) - failed to decode JWT header")
         })
         .map_err(|_| UNAUTHORIZED)?;
-    let jwt_claims = state
-        .jwt_manager
-        .decode(jwt_token, token_header.alg)
+    // `decode` may fetch JWKS via the cyper client, which is `!Send` since
+    // cyper 0.9 (`Rc`-backed). axum requires this middleware's future to be
+    // `Send`, so wrap the `!Send` sub-futures in `SendWrapper` -- the same
+    // pattern the rest of the HTTP layer uses for compio shard ops.
+    // Sound under compio's thread-per-core model: the future is never
+    // polled from another thread.
+    let jwt_claims = SendWrapper::new(state.jwt_manager.decode(jwt_token, token_header.alg))
         .await
         .map_err(|_| UNAUTHORIZED)?;
-    if state
-        .jwt_manager
-        .is_token_revoked(&jwt_claims.claims.jti)
-        .await
-    {
+    if SendWrapper::new(state.jwt_manager.is_token_revoked(&jwt_claims.claims.jti)).await {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

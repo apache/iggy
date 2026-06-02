@@ -28,6 +28,8 @@ use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     UpdateUserRequest,
 };
+use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
+use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
     GlobalPermissions, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
@@ -271,7 +273,6 @@ impl WireDecode for DeletePersonalAccessTokenRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. assigned user ID) instead of empty Bytes.
 impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
@@ -305,7 +306,19 @@ impl StateHandler for CreateUserRequest {
         state
             .personal_access_tokens
             .insert(id as UserId, AHashMap::default());
-        Bytes::new()
+
+        // Reply body: the SDK `create_user` decodes a `UserDetailsResponse`.
+        // Serialization local to this state machine.
+        UserDetailsResponse {
+            user: UserResponse {
+                id: id as u32,
+                created_at: timestamp.as_micros(),
+                status: self.status,
+                username: self.username.clone(),
+            },
+            permissions: self.permissions.clone(),
+        }
+        .to_bytes()
     }
 }
 

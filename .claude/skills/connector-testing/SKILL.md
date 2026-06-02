@@ -184,6 +184,23 @@ core/integration/tests/connectors/
 └── api/                          HTTP control plane tests
 ```
 
+### Container naming + cleanup
+
+Every test container MUST be named with the `iggy-test-` prefix so a single
+`docker ps -aqf 'name=^iggy-test-'` sweep reaps them (`just clean-test-containers`,
+alias `ctc`; the `test`/`nextest` recipes also reap on exit). New fixtures get
+this for free by naming through `fixtures::unique_container_name("<svc>")`, which
+appends a uuid for parallel-safe ephemeral containers. Reuse fixtures use a fixed
+`iggy-test-<svc>` literal instead, because the stable name is what lets later
+nextest processes attach to the same container via `ReuseDirective::Always`. Do
+not hand-roll a different prefix - the sweep only finds `iggy-test-*`.
+
+As of now only `elasticsearch` and `doris` share a container. Both have a slow
+boot (JVM / Doris FE+BE, tens of seconds), so reusing one across the whole
+regression beats spinning a fresh one per test. Every other fixture boots a
+fresh, ephemeral container per test - cheap enough that the isolation is worth
+more than the reuse.
+
 ### The `#[iggy_harness]` proc macro
 
 Each integration test is annotated with this macro from the `integration` crate. It boots an in-process Iggy server (and optionally the connectors runtime) for the duration of the test, runs the seeds, then injects a `&TestHarness` and your fixture.

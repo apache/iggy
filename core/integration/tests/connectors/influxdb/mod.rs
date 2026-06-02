@@ -19,7 +19,9 @@
 
 mod influxdb_sink;
 mod influxdb_sink_formats;
+mod influxdb_sink_v3;
 mod influxdb_source;
 mod influxdb_source_formats;
+mod influxdb_source_v3;
 
 const TEST_MESSAGE_COUNT: usize = 3;

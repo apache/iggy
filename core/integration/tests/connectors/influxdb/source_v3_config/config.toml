@@ -1,0 +1,48 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Connector config for InfluxDB V3 source integration tests.
+# Contains only V3 fields — no V2-only fields (org).
+# All placeholder values are overridden at test time via env vars.
+
+type = "source"
+key = "influxdb"
+enabled = true
+version = 0
+name = "InfluxDB V3 source"
+path = "../../target/debug/libiggy_connector_influxdb_source"
+verbose = false
+
+[[streams]]
+stream = "test_stream"
+topic = "test_topic"
+schema = "json"
+batch_length = 100
+
+[plugin_config]
+version = "v3"
+url = "http://localhost:8181"
+db = "iggy-test-db"
+token = "placeholder"
+query = "SELECT * FROM sensor_readings WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+poll_interval = "100ms"
+batch_size = 100
+cursor_field = "time"
+payload_format = "json"
+max_retries = 3
+retry_delay = "200ms"
+timeout = "10s"

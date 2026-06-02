@@ -152,9 +152,39 @@ runs:
         IGGY_PASSWORD: iggy
       run: ./scripts/test.sh
 
-    - name: Stop Iggy server
+    - name: Stop Iggy server (plain)
       if: always() && inputs.task == 'test'
       uses: ./.github/actions/utils/server-stop
       with:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Start Iggy server (TLS)
+      if: inputs.task == 'test'
+      id: iggy-tls
+      uses: ./.github/actions/utils/server-start
+      with:
+        pid-file: ${{ runner.temp }}/iggy-server-tls.pid
+        log-file: ${{ runner.temp }}/iggy-server-tls.log
+      env:
+        IGGY_TCP_TLS_ENABLED: "true"
+        IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
+        IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
+
+    - name: Run PHP SDK TLS tests
+      if: inputs.task == 'test'
+      shell: bash
+      working-directory: foreign/php
+      env:
+        IGGY_HOST: 127.0.0.1
+        IGGY_PORT: 8090
+        IGGY_TLS_CONNECTION_STRING: iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=${{ github.workspace }}/core/certs/iggy_ca_cert.pem
+        IGGY_TLS_PLAINTEXT_ADDRESS: 127.0.0.1:8090
+      run: ./scripts/test.sh tests/TlsTest.php
+
+    - name: Stop Iggy server (TLS)
+      if: always() && inputs.task == 'test'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
+        log-file: ${{ steps.iggy-tls.outputs.log_file }}

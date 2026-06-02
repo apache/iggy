@@ -21,6 +21,7 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
 use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
@@ -30,6 +31,9 @@ use iggy_binary_protocol::requests::streams::{
 use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
+use iggy_binary_protocol::responses::streams::StreamResponse;
+use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
+use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
 };
@@ -349,9 +353,9 @@ impl Streams {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. assigned stream ID) instead of empty Bytes.
 impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if state.index.contains_key(&name_arc) {
@@ -372,7 +376,22 @@ impl StateHandler for CreateStreamRequest {
             stream.id = id;
         }
         state.index.insert(name_arc, id);
-        Bytes::new()
+
+        // Reply body: a freshly created stream has no topics. The SDK
+        // `create_stream` decodes a `GetStreamResponse`. Serialization is
+        // local to this state machine (it owns the committed shape).
+        GetStreamResponse {
+            stream: StreamResponse {
+                id: id as u32,
+                created_at: timestamp.as_micros(),
+                topics_count: 0,
+                size_bytes: 0,
+                messages_count: 0,
+                name: self.name.clone(),
+            },
+            topics: Vec::new(),
+        }
+        .to_bytes()
     }
 }
 
@@ -425,9 +444,9 @@ impl StateHandler for PurgeStreamRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. assigned topic ID) instead of empty Bytes.
 impl StateHandler for CreateTopicWithAssignmentsRequest {
     type State = StreamsInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
@@ -478,7 +497,38 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         }
 
         stream.topic_index.insert(name_arc, topic_id);
-        Bytes::new()
+
+        // Reply body: the SDK `create_topic` decodes a `GetTopicResponse`. A
+        // freshly created topic has empty/zeroed segment stats; each assigned
+        // partition is reported at offset 0.
+        let partitions = self
+            .partitions
+            .iter()
+            .map(|partition| PartitionResponse {
+                id: partition.partition_id,
+                created_at: timestamp.as_micros(),
+                segments_count: 0,
+                current_offset: 0,
+                size_bytes: 0,
+                messages_count: 0,
+            })
+            .collect();
+        GetTopicResponse {
+            topic: TopicHeader {
+                id: topic_id as u32,
+                created_at: timestamp.as_micros(),
+                partitions_count: self.partitions.len() as u32,
+                message_expiry: self.request.message_expiry,
+                compression_algorithm: self.request.compression_algorithm,
+                max_topic_size: self.request.max_topic_size,
+                replication_factor,
+                size_bytes: 0,
+                messages_count: 0,
+                name: self.request.name.clone(),
+            },
+            partitions,
+        }
+        .to_bytes()
     }
 }
 
