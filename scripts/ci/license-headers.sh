@@ -143,17 +143,52 @@ find_duplicate_license_headers() {
     fi
 
     if awk '
+      function count_keyword() {
+        if (index($0, "Licensed to the Apache Software Foundation")) {
+          count++
+        }
+      }
+
       NR > 120 { exit }
       /^[[:space:]]*$/ { next }
       NR == 1 && /^#!/ { next }
       NR == 1 && /^<\?(php|xml)/ { next }
-      /^[[:space:]]*(#|\/\/|\/\*|\*|<!--|-->)/ {
-        if (index($0, "Licensed to the Apache Software Foundation")) {
-          count++
+
+      in_xml_comment {
+        count_keyword()
+        if ($0 ~ /-->/) {
+          in_xml_comment = 0
         }
         next
       }
+
+      in_slashstar_comment {
+        count_keyword()
+        if ($0 ~ /\*\//) {
+          in_slashstar_comment = 0
+        }
+        next
+      }
+
+      /^[[:space:]]*<!--/ {
+        in_xml_comment = ($0 !~ /-->/)
+        count_keyword()
+        next
+      }
+
+      /^[[:space:]]*\/\*/ {
+        in_slashstar_comment = ($0 !~ /\*\//)
+        count_keyword()
+        next
+      }
+
+      /^[[:space:]]*(#|\/\/|\*|-->)/ {
+        count_keyword()
+        next
+      }
+
       { exit }
+
       END { exit count > 1 ? 0 : 1 }
     ' "$path"; then
       printf './%s\n' "$path" >> "$output_file"
