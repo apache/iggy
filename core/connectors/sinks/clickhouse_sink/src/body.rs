@@ -79,7 +79,7 @@ pub(crate) fn build_row_binary_body(
 
 /// Build a raw string body for CSV / TSV / JSONEachRow string passthrough.
 /// Each `Payload::Text` message is written as-is with a trailing newline
-/// appended for CSV/TSV if not already present.
+/// appended if not already present.
 pub(crate) fn build_string_body(
     messages: &[ConsumedMessage],
     string_format: StringFormat,
@@ -207,12 +207,56 @@ mod tests {
     }
 
     #[test]
-    fn string_body_json_each_row_does_not_append_newline() {
-        // JSONEachRow strings are already self-delimiting; no newline should be added.
+    fn string_body_json_each_row_appends_newline_when_missing() {
         let messages = vec![msg(Payload::Text("{\"k\":1}".into()))];
         assert_eq!(
             build_string_body(&messages, StringFormat::JsonEachRow),
-            b"{\"k\":1}"
+            b"{\"k\":1}\n"
+        );
+    }
+
+    #[test]
+    fn string_body_json_each_row_does_not_double_newline() {
+        let messages = vec![msg(Payload::Text("{\"k\":1}\n".into()))];
+        assert_eq!(
+            build_string_body(&messages, StringFormat::JsonEachRow),
+            b"{\"k\":1}\n"
+        );
+    }
+
+    #[test]
+    fn string_body_json_each_row_multi_message_newline_delimited() {
+        let messages = vec![
+            msg(Payload::Text("{\"a\":1}".into())),
+            msg(Payload::Text("{\"b\":2}".into())),
+        ];
+        assert_eq!(
+            build_string_body(&messages, StringFormat::JsonEachRow),
+            b"{\"a\":1}\n{\"b\":2}\n"
+        );
+    }
+
+    #[test]
+    fn string_body_csv_multi_message_newline_delimited() {
+        let messages = vec![
+            msg(Payload::Text("a,b,c".into())),
+            msg(Payload::Text("d,e,f".into())),
+        ];
+        assert_eq!(
+            build_string_body(&messages, StringFormat::Csv),
+            b"a,b,c\nd,e,f\n"
+        );
+    }
+
+    #[test]
+    fn string_body_tsv_multi_message_newline_delimited() {
+        let messages = vec![
+            msg(Payload::Text("a\tb\tc".into())),
+            msg(Payload::Text("d\te\tf".into())),
+        ];
+        assert_eq!(
+            build_string_body(&messages, StringFormat::Tsv),
+            b"a\tb\tc\nd\te\tf\n"
         );
     }
 
