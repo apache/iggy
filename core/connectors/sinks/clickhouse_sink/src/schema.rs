@@ -395,7 +395,11 @@ fn strip_named_tuple_field(s: &str) -> Option<(&str, &str)> {
             return None;
         }
         let rest = after.trim();
-        return if rest.is_empty() { None } else { Some((name, rest)) };
+        return if rest.is_empty() {
+            None
+        } else {
+            Some((name, rest))
+        };
     }
 
     // Unquoted identifier: letters, digits, underscore

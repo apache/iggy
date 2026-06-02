@@ -95,7 +95,10 @@ impl StringFormat {
 
     /// All three formats use newline as a row delimiter.
     pub fn requires_newline(&self) -> bool {
-        matches!(self, StringFormat::Csv | StringFormat::Tsv | StringFormat::JsonEachRow)
+        matches!(
+            self,
+            StringFormat::Csv | StringFormat::Tsv | StringFormat::JsonEachRow
+        )
     }
 }
 
