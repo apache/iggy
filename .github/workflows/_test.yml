@@ -104,6 +104,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload PHP coverage to Codecov
+        if: inputs.component == 'sdk-php' && inputs.task == 'test'
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/php-coverage.lcov
+          disable_search: true
+          flags: php
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Node SDK
       - name: Run Node SDK task
         if: inputs.component == 'sdk-node'
