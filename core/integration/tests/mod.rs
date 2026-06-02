@@ -39,6 +39,16 @@ mod cluster;
 mod config_provider;
 #[cfg(not(feature = "vsr"))]
 mod connectors;
+// TODO(vsr): enable the `data_integrity` suite under the `vsr` feature once
+// the full VSR path is done. Tier 1 (`verify_user_login_after_restart`,
+// `verify_no_plaintext_credentials_on_disk`) is server-side ready (create_user
+// reply body, get_users/get_user via `frontend()`, change_password, cross-shard
+// committed-reply routing) -- proven by `sdk::hello_world::replicated_*` under
+// vsr. Blocked on: (1) these tests use `[Tcp, Http, Quic, WebSocket]` but only
+// Tcp works under vsr today (Http does no VSR framing; WebSocket/Quic hit the
+// compio `buffer.rs:83` bug); (2) the module also carries
+// `verify_after_server_restart` + `verify_consumer_group_partition_assignment`,
+// which need send/poll messages + consumer groups (out of Tier 1 scope).
 #[cfg(not(feature = "vsr"))]
 mod data_integrity;
 #[cfg(not(feature = "vsr"))]
