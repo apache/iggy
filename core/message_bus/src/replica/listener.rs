@@ -86,7 +86,6 @@ use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
 use compio::net::{TcpListener, TcpStream};
-use compio::runtime::JoinHandle;
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use iggy_common::IggyError;
@@ -156,14 +155,7 @@ pub async fn run(
         "Replica listener accepting on {:?}",
         listener.local_addr().ok()
     );
-    let mut handshake_handles: Vec<JoinHandle<()>> = Vec::new();
     loop {
-        // Drop completed handles before blocking on the next accept so the
-        // vector stays bounded under sustained inbound traffic. Dropping
-        // an already-finished `Task` is a no-op (no in-flight work to
-        // cancel).
-        handshake_handles.retain(|h| !h.is_finished());
-
         futures::select! {
             () = token.wait().fuse() => {
                 debug!("Replica listener shutting down");
@@ -173,7 +165,12 @@ pub async fn run(
                 match result {
                     Ok((stream, peer_addr)) => {
                         let on_accepted = on_accepted.clone();
-                        let handle = compio::runtime::spawn(async move {
+                        // Fire-and-forget: compio 0.19's `JoinHandle` has no
+                        // `is_finished`, so the prior bounded-handle sweep is
+                        // gone. `detach()` lets each handshake task self-manage;
+                        // on shutdown the listener drops, failing in-flight
+                        // handshakes so detached tasks exit.
+                        compio::runtime::spawn(async move {
                             let mut stream = stream;
                             let res = compio::time::timeout(
                                 handshake_grace,
@@ -201,8 +198,8 @@ pub async fn run(
                                     );
                                 }
                             }
-                        });
-                        handshake_handles.push(handle);
+                        })
+                        .detach();
                     }
                     Err(e) => {
                         error!("Replica listener accept failed: {e}");
@@ -210,10 +207,6 @@ pub async fn run(
                 }
             }
         }
-    }
-
-    for handle in handshake_handles {
-        let _ = handle.await;
     }
 }
 

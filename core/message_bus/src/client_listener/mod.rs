@@ -86,6 +86,9 @@
 //! timeouts and the bus-wide [`crate::installer`] backpressure budget.
 
 use crate::{GenericHeader, Message};
+use compio::net::{TcpListener, TcpSocket};
+use iggy_common::IggyError;
+use std::net::SocketAddr;
 use std::rc::Rc;
 
 pub mod quic;
@@ -93,6 +96,43 @@ pub mod tcp;
 pub mod tcp_tls;
 pub mod ws;
 pub mod wss;
+
+/// Bind a TCP listener with `TCP_NODELAY` set, the shared shape used by
+/// the plain-TCP and WS pre-upgrade client listeners.
+///
+/// compio 0.19 replaced `TcpListener::bind_with_options(addr, SocketOpts)`
+/// with the `TcpSocket` builder; this preserves the prior `nodelay(true)`
+/// bind. `SO_REUSEPORT` is intentionally not set: only shard 0 binds the
+/// client listeners (see each caller).
+///
+/// # Errors
+///
+/// Returns [`IggyError::CannotBindToSocket`] if the bind/listen fails.
+#[allow(clippy::future_not_send)]
+pub async fn bind_nodelay_listener(
+    addr: SocketAddr,
+) -> Result<(TcpListener, SocketAddr), IggyError> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4().await,
+        SocketAddr::V6(_) => TcpSocket::new_v6().await,
+    }
+    .map_err(|e| IggyError::IoError(e.to_string()))?;
+    socket
+        .set_nodelay(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    socket
+        .bind(addr)
+        .await
+        .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
+    let listener = socket
+        .listen(128)
+        .await
+        .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
+    let actual = listener
+        .local_addr()
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    Ok((listener, actual))
+}
 
 /// Callback for the owning-shard install path in [`crate::installer`].
 /// Dispatches `(client_id, request_message)` into the shard's pipeline.

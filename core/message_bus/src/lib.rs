@@ -906,8 +906,15 @@ impl IggyMessageBus {
     /// in a loop until empty, so a task pushed mid-shutdown is still
     /// awaited.
     pub fn track_background(&self, handle: JoinHandle<()>) {
+        use futures::FutureExt;
         let mut tasks = self.background_tasks.borrow_mut();
-        tasks.retain(|h| !h.is_finished());
+        // compio 0.19's `JoinHandle` dropped `is_finished`; poll each
+        // handle once (it is `Unpin` + a `Future`) and reap the ones that
+        // have already resolved. `now_or_never` on `&mut h` polls without
+        // consuming; `Some` means the task finished (drop it), `None`
+        // means still running (keep). Single-threaded runtime, so no flip
+        // between this poll and the drop.
+        tasks.retain_mut(|h| h.now_or_never().is_none());
         tasks.push(handle);
     }
 
