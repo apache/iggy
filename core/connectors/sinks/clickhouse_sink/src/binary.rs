@@ -341,12 +341,18 @@ pub(crate) fn serialize_value(
                 error!("Expected JSON object for Map type, got: {value:?}");
                 Error::InvalidRecord
             })?;
-            write_varint(obj.len() as u64, buf);
-            for (k, v) in obj {
+            let mut entries: Vec<(&str, &OwnedValue)> =
+                obj.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+            // Simple string-key sort; serialized-key sorting would differ for
+            // non-string key types (e.g. Int32 "10" < "2" by bytes but not by string),
+            // but non-string-keyed maps are uncommon in practice.
+            entries.sort_unstable_by_key(|(k, _)| *k);
+            write_varint(entries.len() as u64, buf);
+            for (k, v) in entries {
                 match key_type.as_ref() {
                     ChType::String => write_string(k.as_bytes(), buf),
                     _ => {
-                        let key_val = OwnedValue::String(k.clone());
+                        let key_val = OwnedValue::String(k.to_owned());
                         serialize_value(&key_val, key_type, buf)?;
                     }
                 }
@@ -1479,6 +1485,35 @@ mod tests {
         assert_eq!(buf[1], 1); // varint: key length 1
         assert_eq!(buf[2], b'k');
         assert_eq!(&buf[3..7], 1i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_map_entries_written_in_sorted_key_order() {
+        // Keys inserted out of order; output must be in lexicographic string order.
+        // "10" sorts before "a" (string order), not after "1" in numeric order.
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("z".into(), json_i64(3));
+        obj.insert("m".into(), json_i64(2));
+        obj.insert("a".into(), json_i64(1));
+        obj.insert("10".into(), json_i64(4));
+        let value = OwnedValue::Object(Box::new(obj));
+        let mut buf = vec![];
+        serialize_value(
+            &value,
+            &ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            &mut buf,
+        )
+        .unwrap();
+        let mut expected = vec![4u8]; // varint: 4 entries
+        expected.extend_from_slice(&[2, b'1', b'0']); // key "10"
+        expected.extend_from_slice(&4i32.to_le_bytes());
+        expected.extend_from_slice(&[1, b'a']); // key "a"
+        expected.extend_from_slice(&1i32.to_le_bytes());
+        expected.extend_from_slice(&[1, b'm']); // key "m"
+        expected.extend_from_slice(&2i32.to_le_bytes());
+        expected.extend_from_slice(&[1, b'z']); // key "z"
+        expected.extend_from_slice(&3i32.to_le_bytes());
+        assert_eq!(buf, expected);
     }
 
     #[test]
