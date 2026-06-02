@@ -54,6 +54,10 @@ jobs:
         with:
           # Also warms the GitHub Actions build cache for subsequent PR builds
           save-cache: "true"
+          # llvm-cov instrumentation roughly doubles object sizes; the light
+          # cleanup leaves too little headroom (build hit "No space left on
+          # device" at ~34 MB free).
+          free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2.79.3
