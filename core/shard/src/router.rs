@@ -411,6 +411,13 @@ where
                 );
                 (self.on_metadata_submit)(submit);
             }
+            LifecycleFrame::ListClients { reply } => {
+                // Every shard handles this (not shard-0-only): each replies
+                // with the clients whose connections it homes. The handler
+                // (wired by server-ng) reads this shard's `SessionManager`
+                // and pushes the list over `reply`.
+                (self.on_list_clients)(reply);
+            }
         }
     }
 }

@@ -20,7 +20,7 @@
 use crate::config_writer::write_current_config;
 use crate::login_register::LoginRegisterError;
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ClientRecord, SessionManager};
 use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use configs::sharding::{
@@ -32,8 +32,9 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
-    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -46,12 +47,14 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
+use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::{
     GetUserRequest, LoginRegisterRequest, LoginRegisterWithPatRequest,
 };
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
@@ -123,8 +126,9 @@ use shard::builder::IggyShardBuilder;
 use shard::metrics::ShardMetrics;
 use shard::shards_table::{PapayaShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
+    ConnectedClientInfo, CoordinatorConfig, IggyShard, ListClientsHandler,
+    PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender,
+    channel, shard_mesh_channels,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -814,7 +818,7 @@ async fn shard_main(
     );
 
     let shard_metrics = ShardMetrics::for_shard();
-    let shard = build_shard_for_thread(
+    let (shard, sessions) = build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -873,7 +877,7 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        let on_client_request = make_client_request_handler(&shard);
+        let on_client_request = make_client_request_handler(&shard, &sessions);
         let accepted_replica = make_delegating_replica_accept_fn(Rc::clone(&coord));
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
 
@@ -1028,7 +1032,7 @@ async fn build_shard_for_thread(
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
-) -> Result<Rc<ServerNgShard>, ServerNgError> {
+) -> Result<(Rc<ServerNgShard>, Rc<RefCell<SessionManager>>), ServerNgError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
@@ -1123,9 +1127,14 @@ async fn build_shard_for_thread(
     }
 
     let shard_handle = Rc::new(RefCell::new(None));
+    // One per-shard SessionManager, shared by the client-request handler
+    // (binds sessions) and the get_clients handler (reads them). Created
+    // here so both wirings reference the same instance.
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle);
+    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
     let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
+    let on_list_clients = make_list_clients_handler(&sessions);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -1133,6 +1142,7 @@ async fn build_shard_for_thread(
         on_replica_message,
         on_client_request,
         on_metadata_submit,
+        on_list_clients,
         metadata,
         partitions,
         senders,
@@ -1147,7 +1157,7 @@ async fn build_shard_for_thread(
 
     let shard = Rc::new(built.shard);
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-    Ok(shard)
+    Ok((shard, sessions))
 }
 
 fn restore_metadata_consensus(
@@ -2079,9 +2089,12 @@ async fn start_manual_runtime(
 type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
-fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
+fn make_client_request_handler(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+) -> RequestHandler {
     let shard = Rc::clone(shard);
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let sessions = Rc::clone(sessions);
     let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
     let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
     let sessions_for_disconnect = Rc::clone(&sessions);
@@ -2139,6 +2152,30 @@ fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
     })
 }
 
+/// Build the per-shard [`ListClientsHandler`]: on a `ListClients`
+/// broadcast, serialize this shard's locally-homed connected clients from
+/// its `SessionManager` and push them back over the reply sender. The
+/// aggregation across all shards happens in
+/// [`shard::IggyShard::list_all_clients`].
+fn make_list_clients_handler(sessions: &Rc<RefCell<SessionManager>>) -> ListClientsHandler {
+    let sessions = Rc::clone(sessions);
+    Rc::new(move |reply| {
+        let clients: Vec<ConnectedClientInfo> = sessions
+            .borrow()
+            .iter_clients()
+            .map(|record| ConnectedClientInfo {
+                client_id: record.client_id,
+                user_id: record.user_id,
+                transport: record.transport,
+                address: record.address,
+            })
+            .collect();
+        // Best-effort: the gather side bounds itself by count + timeout, so
+        // a dropped reply (receiver gone) just means this shard is omitted.
+        let _ = reply.try_send(clients);
+    })
+}
+
 fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> MessageHandler {
     let shard_handle = Rc::clone(shard_handle);
     Rc::new(move |_replica_id, message| {
@@ -2151,9 +2188,10 @@ fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> 
 fn make_deferred_client_request_handler(
     bus: &Rc<IggyMessageBus>,
     shard_handle: &ServerNgShardHandle,
+    sessions: &Rc<RefCell<SessionManager>>,
 ) -> RequestHandler {
     let shard_handle = Rc::clone(shard_handle);
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let sessions = Rc::clone(sessions);
     let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
     let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
     let sessions_for_disconnect = Rc::clone(&sessions);
@@ -2531,24 +2569,55 @@ async fn handle_non_replicated_request(
         }
         GET_ME_CODE => {
             // `get_me` reports the requesting connection's own identity,
-            // which lives in the session manager + transport meta (not in
-            // `IggyMetadata`), so it is built here rather than in
+            // sourced from this shard's `SessionManager` (not `IggyMetadata`),
+            // so it is built here rather than in
             // `build_non_replicated_response`.
-            let response = build_get_me_response(shard, sessions, transport_client_id);
-            let commit = current_metadata_commit(shard);
-            let reply = NonReplicatedResponse::Bytes(response.to_bytes()).into_reply(
-                request.header(),
-                request.header().client,
-                request.header().session,
-                commit,
-            );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(transport_client_id, error = %error, "failed to send get_me reply");
-            }
+            let response = build_get_me_response(sessions, transport_client_id);
+            send_non_replicated_bytes(
+                shard,
+                &request,
+                transport_client_id,
+                response.to_bytes(),
+                "get_me",
+            )
+            .await;
+        }
+        GET_CLIENTS_CODE => {
+            // Shared-nothing: each shard knows only its own connections, so
+            // gather across all shards (scatter-gather over the mesh).
+            let infos = shard.list_all_clients().await;
+            let response = GetClientsResponse {
+                clients: infos.iter().map(connected_client_to_response).collect(),
+            };
+            send_non_replicated_bytes(
+                shard,
+                &request,
+                transport_client_id,
+                response.to_bytes(),
+                "get_clients",
+            )
+            .await;
+        }
+        GET_CLIENT_CODE => {
+            // No reverse map from the wire u32 id to a u128 transport id /
+            // home shard (the u32 is just the seq tail), so gather all and
+            // filter -- same fan-out as `get_clients`.
+            let target = GetClientRequest::decode_from(request_body(&request))
+                .ok()
+                .map(|req| req.client_id);
+            let infos = shard.list_all_clients().await;
+            #[allow(clippy::cast_possible_truncation)]
+            let found = target.and_then(|id| infos.iter().find(|info| info.client_id as u32 == id));
+            // The SDK decodes an empty body as `None` (client not found).
+            let bytes = found.map_or_else(Bytes::new, |info| {
+                ClientDetailsResponse {
+                    client: connected_client_to_response(info),
+                    consumer_groups: Vec::new(),
+                }
+                .to_bytes()
+            });
+            send_non_replicated_bytes(shard, &request, transport_client_id, bytes, "get_client")
+                .await;
         }
         _ => match build_non_replicated_response(shard, code, request_body(&request)) {
             Ok(response) => {
@@ -2584,53 +2653,100 @@ async fn handle_non_replicated_request(
     }
 }
 
-/// Build the `get_me` reply for the requesting connection from its
-/// session (user id) and transport meta (transport kind + peer address).
-/// `consumer_groups` is empty: server-ng does not yet track per-client
-/// consumer-group membership.
-///
-/// TODO(clients-table): the transport kind + peer address are read from
-/// the message-bus `client_meta` here, which couples this metadata read
-/// to the bus's connection bookkeeping. The client identity (id, user,
-/// transport, address, consumer-group membership) should instead live in
-/// a first-class clients table in `IggyMetadata`, populated at Register
-/// time, so `get_me` / `get_client` / `get_clients` all read from one
-/// authoritative source via `frontend()` rather than reaching into the
-/// bus. Rework this API once that table exists.
+/// Build the `get_me` reply for the requesting connection, sourced
+/// entirely from the per-shard [`SessionManager`] (`user_id`, transport
+/// kind, peer address) -- no message-bus lookup. `consumer_groups` is
+/// empty (see [`client_record_to_response`]).
 fn build_get_me_response(
-    shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) -> ClientDetailsResponse {
-    // `get_me` is auth-gated, so a bound session's user id is normally
-    // present. Fall back to the wire "no user" sentinel (`u32::MAX`)
-    // rather than `0`, which is a valid id (server-ng is 0-based, so
-    // root is user id 0) and would otherwise impersonate root.
-    let user_id = sessions
+    let client = sessions
         .borrow()
-        .get_user_id(transport_client_id)
-        .unwrap_or(u32::MAX);
-    let (transport, address) = shard.bus.client_meta(transport_client_id).map_or_else(
-        || (1u8, String::new()),
-        |meta| {
-            (
-                transport_kind_to_wire(meta.transport),
-                meta.peer_addr.to_string(),
-            )
-        },
-    );
+        .client_record(transport_client_id)
+        .map_or_else(
+            || {
+                // No session record (shouldn't happen on an auth-gated
+                // read). Report the connection id with the "no user"
+                // sentinel + TCP default rather than impersonating root
+                // (user id 0 is a real user; server-ng is 0-based).
+                #[allow(clippy::cast_possible_truncation)]
+                ClientResponse {
+                    client_id: transport_client_id as u32,
+                    user_id: u32::MAX,
+                    transport: 1,
+                    address: String::new(),
+                    consumer_groups_count: 0,
+                }
+            },
+            |record| client_record_to_response(&record),
+        );
     ClientDetailsResponse {
-        client: ClientResponse {
-            // The transport client id is a u128 `(shard << 112) | seq`; the
-            // legacy wire `client_id` is the u32 seq tail.
-            #[allow(clippy::cast_possible_truncation)]
-            client_id: transport_client_id as u32,
-            user_id,
-            transport,
-            address,
-            consumer_groups_count: 0,
-        },
+        client,
         consumer_groups: Vec::new(),
+    }
+}
+
+/// Convert a [`ClientRecord`] (per-shard session state) into the wire
+/// [`ClientResponse`]. Shared by `get_me` and the `get_clients` gather.
+///
+/// TODO(consumer-group-membership): `consumer_groups_count` is always 0
+/// -- server-ng does not yet track which consumer groups a connection
+/// joined. Populate once the partition-reconciliation / consumer-group
+/// rebalancing work lands; until then `get_me` / `get_clients` report no
+/// memberships.
+fn client_record_to_response(record: &ClientRecord) -> ClientResponse {
+    // The transport client id is a u128 `(shard << 112) | seq`; the wire
+    // `client_id` is the u32 seq tail.
+    #[allow(clippy::cast_possible_truncation)]
+    ClientResponse {
+        client_id: record.client_id as u32,
+        user_id: record.user_id.unwrap_or(u32::MAX),
+        transport: transport_kind_to_wire(record.transport),
+        address: record.address.to_string(),
+        consumer_groups_count: 0,
+    }
+}
+
+/// Convert a gathered [`ConnectedClientInfo`] (one shard's view of a
+/// connected client) into the wire [`ClientResponse`] for `get_clients` /
+/// `get_client`. Same `consumer_groups_count: 0` caveat as
+/// [`client_record_to_response`].
+fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
+    #[allow(clippy::cast_possible_truncation)]
+    ClientResponse {
+        client_id: info.client_id as u32,
+        user_id: info.user_id.unwrap_or(u32::MAX),
+        transport: transport_kind_to_wire(info.transport),
+        address: info.address.to_string(),
+        consumer_groups_count: 0,
+    }
+}
+
+/// Send a non-replicated reply body to a client, stamping the current
+/// metadata commit. Shared by the `get_me` / `get_clients` / `get_client`
+/// arms.
+#[allow(clippy::future_not_send)]
+async fn send_non_replicated_bytes(
+    shard: &Rc<ServerNgShard>,
+    request: &Message<RequestHeader>,
+    transport_client_id: u128,
+    bytes: Bytes,
+    label: &'static str,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = NonReplicatedResponse::Bytes(bytes).into_reply(
+        request.header(),
+        request.header().client,
+        request.header().session,
+        commit,
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(transport_client_id, label, error = %error, "failed to send non-replicated reply");
     }
 }
 
@@ -2787,7 +2903,7 @@ fn ensure_transport_connection(
     };
     sessions
         .borrow_mut()
-        .ensure_connection(transport_client_id, meta.peer_addr);
+        .ensure_connection(transport_client_id, meta.peer_addr, meta.transport);
 }
 
 fn maybe_rewrite_pat_request(

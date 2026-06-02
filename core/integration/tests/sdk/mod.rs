@@ -16,6 +16,8 @@
  * under the License.
  */
 
+#[cfg(feature = "vsr")]
+mod clients;
 mod hello_world;
 #[cfg(not(feature = "vsr"))]
 mod producer;
