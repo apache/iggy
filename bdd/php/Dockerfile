@@ -46,7 +46,6 @@ COPY core/ ./core/
 
 COPY foreign/php/Cargo.toml ./foreign/php/
 COPY foreign/php/composer.json ./foreign/php/
-COPY foreign/php/composer.lock ./foreign/php/
 COPY foreign/php/phpunit.xml.dist ./foreign/php/
 COPY foreign/php/README.md foreign/php/LICENSE foreign/php/NOTICE ./foreign/php/
 COPY foreign/php/.cargo/ ./foreign/php/.cargo/

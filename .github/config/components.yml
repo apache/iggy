@@ -225,7 +225,6 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/php/**"
-      - "bdd/php/**"
     tasks: ["lint", "test", "build"]
 
   sdk-node:
