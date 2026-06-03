@@ -1,0 +1,66 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+FROM rust:1.95-slim-trixie
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    clang \
+    composer \
+    curl \
+    git \
+    libclang-dev \
+    libssl-dev \
+    php-cli \
+    php-dev \
+    php-mbstring \
+    php-xml \
+    pkg-config \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PHP=/usr/bin/php
+ENV PHP_CONFIG=/usr/bin/php-config
+ENV IGGY_HOST=iggy-server
+ENV IGGY_PORT=8090
+ENV BDD_FEATURE_FILE=/app/features/basic_messaging.feature
+
+WORKDIR /workspace
+
+COPY Cargo.toml Cargo.lock ./
+COPY core/ ./core/
+
+COPY foreign/php/Cargo.toml ./foreign/php/
+COPY foreign/php/composer.json ./foreign/php/
+COPY foreign/php/composer.lock ./foreign/php/
+COPY foreign/php/phpunit.xml.dist ./foreign/php/
+COPY foreign/php/README.md foreign/php/LICENSE foreign/php/NOTICE ./foreign/php/
+COPY foreign/php/.cargo/ ./foreign/php/.cargo/
+COPY foreign/php/src/ ./foreign/php/src/
+COPY foreign/php/tests/ ./foreign/php/tests/
+COPY foreign/php/scripts/ ./foreign/php/scripts/
+
+COPY bdd/php/ ./bdd/php/
+
+WORKDIR /workspace/foreign/php
+
+RUN cargo install cargo-php --locked
+RUN composer install --no-interaction --prefer-dist
+RUN cargo php install --yes
+RUN chmod +x ./scripts/test.sh
+
+CMD ["./scripts/test.sh", "--configuration", "/workspace/bdd/php/phpunit.xml.dist", "/workspace/bdd/php/tests"]

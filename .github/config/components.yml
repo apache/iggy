@@ -225,6 +225,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/php/**"
+      - "bdd/php/**"
     tasks: ["lint", "test", "build"]
 
   sdk-node:
@@ -306,6 +307,18 @@ components:
       - "bdd/python/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-python"]
+
+  bdd-php:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-php"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/php/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-php"]
 
   bdd-go:
     depends_on:
