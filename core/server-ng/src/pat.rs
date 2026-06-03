@@ -97,9 +97,11 @@ pub(crate) fn maybe_rewrite_pat_request(
 fn mint_pat_raw_and_hash() -> (String, [u8; 64]) {
     let (raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
     let bytes = hash.as_bytes();
+    // The hash is blake3 hex -- always exactly 64 ASCII chars. `copy_from_slice`
+    // pins that invariant (panics on a length mismatch) rather than silently
+    // shipping a wrong-length hash.
     let mut out = [0u8; 64];
-    let len = bytes.len().min(64);
-    out[..len].copy_from_slice(&bytes[..len]);
+    out.copy_from_slice(bytes);
     (raw, out)
 }
 

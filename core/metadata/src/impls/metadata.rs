@@ -1009,7 +1009,12 @@ where
             .as_ref()
             .expect("submit_logout_in_process: consensus only exists on shard 0");
 
-        if self.client_table.borrow().get_session(client_id).is_none() {
+        // Session guard: only propose a Logout when the slot still holds the
+        // exact session this logout targets. A late disconnect-logout for a
+        // reused client id (slot since rebound to a newer session) carries the
+        // stale session and is dropped here, so it can never wipe the fresh
+        // registration. A missing slot also fails the match and short-circuits.
+        if self.client_table.borrow().get_session(client_id) != Some(session) {
             return Ok(consensus.commit_min());
         }
 
@@ -1206,10 +1211,6 @@ where
             .await
             .map(server_common::Message::into_generic)
             .map_err(|Canceled| RegisterSubmitError::Canceled)
-    }
-
-    pub fn remove_client_session(&self, client_id: u128) -> bool {
-        self.client_table.borrow_mut().remove_client(client_id)
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after

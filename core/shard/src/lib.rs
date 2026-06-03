@@ -617,8 +617,23 @@ where
 
         let mut clients = Vec::new();
         let mut received = 0usize;
+        // One deadline across the whole gather: each `recv` waits only the
+        // remaining budget, so total wall time is bounded by
+        // LIST_CLIENTS_GATHER_TIMEOUT (not expected * timeout), while the
+        // partial results gathered so far are still returned on expiry.
+        let deadline = std::time::Instant::now() + LIST_CLIENTS_GATHER_TIMEOUT;
         while received < expected {
-            match compio::time::timeout(LIST_CLIENTS_GATHER_TIMEOUT, reply_rx.recv()).await {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    shard = self.id,
+                    received,
+                    expected,
+                    "list_all_clients: gather budget exhausted; returning partial result"
+                );
+                break;
+            }
+            match compio::time::timeout(remaining, reply_rx.recv()).await {
                 Ok(Ok(batch)) => {
                     clients.extend(batch);
                     received += 1;

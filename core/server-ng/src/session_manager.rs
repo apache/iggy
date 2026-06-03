@@ -28,6 +28,7 @@
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
 use message_bus::installer::conn_info::ClientTransportKind;
+use shard::ConnectedClientInfo;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -63,24 +64,6 @@ pub struct Connection {
     pub address: SocketAddr,
     pub transport: ClientTransportKind,
     pub state: ConnectionState,
-}
-
-/// Flattened view of one connected client for the `get_me` /
-/// `get_clients` reads.
-///
-/// Holds everything those responses need from a single per-shard source,
-/// so the caller no longer also consults the message bus. `consumer_groups`
-/// membership is not modelled yet (see the TODO in the `get_clients`
-/// response builder); it ships empty until the partition-reconciliation /
-/// consumer-group-rebalancing work lands.
-#[derive(Debug, Clone)]
-pub struct ClientRecord {
-    /// Transport (coordinator-minted) client id; top 16 bits are the home
-    /// shard. The wire `client_id` is the `u32` seq tail.
-    pub client_id: u128,
-    pub user_id: Option<u32>,
-    pub transport: ClientTransportKind,
-    pub address: SocketAddr,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -127,14 +110,17 @@ impl SessionManager {
 
     /// Remove a connection (disconnect). Cleans up the reverse index if bound.
     ///
-    /// Returns the bound consensus client id when the removed connection had
-    /// one, so callers can release the corresponding client-table slot.
-    pub fn remove_connection(&mut self, connection_id: u128) -> Option<u128> {
+    /// Returns the bound `(client_id, session)` when the removed connection had
+    /// one, so the caller can submit a session-matched `Logout` (the committed
+    /// apply releases the client-table slot cluster-wide).
+    pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
         if let Some(conn) = self.connections.remove(&connection_id)
-            && let ConnectionState::Bound { client_id, .. } = conn.state
+            && let ConnectionState::Bound {
+                client_id, session, ..
+            } = conn.state
         {
             self.client_to_connection.remove(&client_id);
-            return Some(client_id);
+            return Some((client_id, session));
         }
         None
     }
@@ -239,48 +225,25 @@ impl SessionManager {
         }
     }
 
-    /// Look up the connection ID for a client (for routing consensus replies).
-    #[must_use]
-    pub fn connection_for_client(&self, client_id: u128) -> Option<u128> {
-        self.client_to_connection.get(&client_id).copied()
-    }
-
-    /// Get connection metadata.
-    #[must_use]
-    pub fn get_connection(&self, connection_id: u128) -> Option<&Connection> {
-        self.connections.get(&connection_id)
-    }
-
-    /// Flatten one connection into a [`ClientRecord`] for `get_me`.
+    /// Flatten one connection into a [`ConnectedClientInfo`] for `get_me`.
     ///
     /// This is the single per-shard source for the client-info reads:
     /// `user_id`, `transport`, and `address` all come from the local
     /// `SessionManager`, so the caller no longer consults the message
     /// bus's `client_meta`.
     #[must_use]
-    pub fn client_record(&self, connection_id: u128) -> Option<ClientRecord> {
+    pub fn client_record(&self, connection_id: u128) -> Option<ConnectedClientInfo> {
         let conn = self.connections.get(&connection_id)?;
         Some(record_from(connection_id, conn))
     }
 
-    /// Iterate every locally-homed connected client as a [`ClientRecord`].
-    /// The per-shard half of the `get_clients` scatter-gather.
-    pub fn iter_clients(&self) -> impl Iterator<Item = ClientRecord> + '_ {
+    /// Iterate every locally-homed connected client as a
+    /// [`ConnectedClientInfo`]. The per-shard half of the `get_clients`
+    /// scatter-gather.
+    pub fn iter_clients(&self) -> impl Iterator<Item = ConnectedClientInfo> + '_ {
         self.connections
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
-    }
-
-    /// Number of active connections.
-    #[must_use]
-    pub fn connection_count(&self) -> usize {
-        self.connections.len()
-    }
-
-    /// Number of bound (registered) sessions.
-    #[must_use]
-    pub fn bound_count(&self) -> usize {
-        self.client_to_connection.len()
     }
 }
 
@@ -318,15 +281,15 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// Flatten a connection + its id into a [`ClientRecord`].
-const fn record_from(connection_id: u128, conn: &Connection) -> ClientRecord {
+/// Flatten a connection + its id into a [`ConnectedClientInfo`].
+const fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
     let user_id = match conn.state {
         ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
             Some(user_id)
         }
         ConnectionState::Connected => None,
     };
-    ClientRecord {
+    ConnectedClientInfo {
         client_id: connection_id,
         user_id,
         transport: conn.transport,
@@ -357,7 +320,7 @@ mod tests {
 
         let conn = 1;
         mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-        assert_eq!(mgr.connection_count(), 1);
+        assert_eq!(mgr.iter_clients().count(), 1);
         assert!(mgr.get_session(conn).is_none());
 
         // Login
@@ -370,14 +333,11 @@ mod tests {
         mgr.bind_session(conn, client_id, session).unwrap();
 
         assert_eq!(mgr.get_session(conn), Some((client_id, session)));
-        assert_eq!(mgr.connection_for_client(client_id), Some(conn));
-        assert_eq!(mgr.bound_count(), 1);
 
-        // Disconnect
-        mgr.remove_connection(conn);
-        assert_eq!(mgr.connection_count(), 0);
-        assert_eq!(mgr.bound_count(), 0);
-        assert!(mgr.connection_for_client(client_id).is_none());
+        // Disconnect returns the bound (client_id, session) and clears state.
+        assert_eq!(mgr.remove_connection(conn), Some((client_id, session)));
+        assert_eq!(mgr.iter_clients().count(), 0);
+        assert!(mgr.get_session(conn).is_none());
     }
 
     #[test]
@@ -410,7 +370,7 @@ mod tests {
         mgr.ensure_connection(conn1, addr(5000), ClientTransportKind::Tcp);
         mgr.login(conn1, 1).unwrap();
         mgr.bind_session(conn1, 99, 10).unwrap();
-        assert_eq!(mgr.connection_for_client(99), Some(conn1));
+        assert_eq!(mgr.get_session(conn1), Some((99, 10)));
 
         // Second connection binds to same client_id. Evicts conn1.
         let conn2 = 2;
@@ -418,8 +378,8 @@ mod tests {
         mgr.login(conn2, 1).unwrap();
         mgr.bind_session(conn2, 99, 20).unwrap();
 
-        assert_eq!(mgr.connection_for_client(99), Some(conn2));
-        // conn1 reverted to Connected.
+        // conn2 now owns client 99; conn1 reverted to Connected.
+        assert_eq!(mgr.get_session(conn2), Some((99, 20)));
         assert!(mgr.get_session(conn1).is_none());
     }
 
@@ -450,11 +410,10 @@ mod tests {
 
         assert_eq!(mgr.get_session(c1), Some((100, 10)));
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
-        assert_eq!(mgr.bound_count(), 2);
+        assert_eq!(mgr.iter_clients().count(), 2);
 
-        mgr.remove_connection(c1);
-        assert_eq!(mgr.bound_count(), 1);
-        assert!(mgr.connection_for_client(100).is_none());
-        assert_eq!(mgr.connection_for_client(200), Some(c2));
+        assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
+        assert!(mgr.get_session(c1).is_none());
+        assert_eq!(mgr.get_session(c2), Some((200, 20)));
     }
 }

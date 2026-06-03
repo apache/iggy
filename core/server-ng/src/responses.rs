@@ -26,7 +26,7 @@
 //! resolvers.
 
 use crate::bootstrap::ServerNgShard;
-use crate::session_manager::{ClientRecord, SessionManager};
+use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
@@ -98,7 +98,7 @@ pub(crate) fn build_get_me_response(
                     consumer_groups_count: 0,
                 }
             },
-            |record| client_record_to_response(&record),
+            |record| connected_client_to_response(&record),
         );
     ClientDetailsResponse {
         client,
@@ -106,32 +106,18 @@ pub(crate) fn build_get_me_response(
     }
 }
 
-/// Convert a [`ClientRecord`] (per-shard session state) into the wire
-/// [`ClientResponse`]. Shared by `get_me` and the `get_clients` gather.
+/// Convert a [`ConnectedClientInfo`] (one connected client, from the local
+/// `SessionManager` or a `get_clients` gather) into the wire
+/// [`ClientResponse`]. Shared by `get_me`, `get_clients`, and `get_client`.
 ///
 /// TODO(consumer-group-membership): `consumer_groups_count` is always 0
 /// -- server-ng does not yet track which consumer groups a connection
 /// joined. Populate once the partition-reconciliation / consumer-group
 /// rebalancing work lands; until then `get_me` / `get_clients` report no
 /// memberships.
-fn client_record_to_response(record: &ClientRecord) -> ClientResponse {
+pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
     // The transport client id is a u128 `(shard << 112) | seq`; the wire
     // `client_id` is the u32 seq tail.
-    #[allow(clippy::cast_possible_truncation)]
-    ClientResponse {
-        client_id: record.client_id as u32,
-        user_id: record.user_id.unwrap_or(u32::MAX),
-        transport: transport_kind_to_wire(record.transport),
-        address: record.address.to_string(),
-        consumer_groups_count: 0,
-    }
-}
-
-/// Convert a gathered [`ConnectedClientInfo`] (one shard's view of a
-/// connected client) into the wire [`ClientResponse`] for `get_clients` /
-/// `get_client`. Same `consumer_groups_count: 0` caveat as
-/// [`client_record_to_response`].
-pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
     #[allow(clippy::cast_possible_truncation)]
     ClientResponse {
         client_id: info.client_id as u32,
@@ -688,6 +674,16 @@ pub(crate) fn build_raw_pat_reply(
     let Some(raw) = raw_token else {
         return Ok(committed);
     };
+    // `submit_request_in_process` hands back an `EvictionHeader`-backed message
+    // on the evict outcome (e.g. a `CreatePersonalAccessToken` whose session
+    // was evicted between bind and request). Its byte pattern is a valid
+    // `ReplyHeader`, so the checked cast below would silently pass and we would
+    // both swallow the eviction and ship a raw token whose hash never
+    // committed. Only rewrite a genuine committed `Reply`; pass anything else
+    // (the eviction) through untouched so the client learns its session died.
+    if committed.header().command != Command2::Reply {
+        return Ok(committed);
+    }
     let header_len = std::mem::size_of::<ReplyHeader>();
     let committed_header =
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])

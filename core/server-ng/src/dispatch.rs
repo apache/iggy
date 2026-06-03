@@ -76,42 +76,11 @@ pub(crate) fn make_client_request_handler(
     shard
         .bus
         .set_client_connection_lost_fn(Rc::new(move |client_id| {
-            if let Some(vsr_client_id) = sessions_for_disconnect
+            if let Some((vsr_client_id, session)) = sessions_for_disconnect
                 .borrow_mut()
                 .remove_connection(client_id)
             {
-                // Local-table reclaim happens here; then spawn a detached
-                // task to submit a cluster-replicated `Logout` so peer
-                // replicas drop the slot too. Without this, an
-                // already-committed `Register` lingers on every backup
-                // until they evict the client themselves -- a
-                // local-vs-cluster divergence observable across view
-                // changes. `submit_logout_in_process` requires shard 0
-                // consensus, which this handler always runs on.
-                shard_for_disconnect
-                    .plane
-                    .metadata()
-                    .remove_client_session(vsr_client_id);
-                let shard = Rc::clone(&shard_for_disconnect);
-                compio::runtime::spawn(async move {
-                    // request_id 0 + session 0: synthetic disconnect
-                    // logout; `submit_logout_in_process` short-circuits to
-                    // current commit when no session entry exists, so a
-                    // race with the explicit logout path is a no-op.
-                    if let Err(error) = shard
-                        .plane
-                        .metadata()
-                        .submit_logout_in_process(vsr_client_id, 0, 0)
-                        .await
-                    {
-                        warn!(
-                            vsr_client_id,
-                            ?error,
-                            "disconnect logout submit failed; peer slots may linger until eviction"
-                        );
-                    }
-                })
-                .detach();
+                submit_disconnect_logout(Rc::clone(&shard_for_disconnect), vsr_client_id, session);
             }
         }));
     Rc::new(move |client_id, message| {
@@ -136,16 +105,7 @@ pub(crate) fn make_list_clients_handler(
 ) -> ListClientsHandler {
     let sessions = Rc::clone(sessions);
     Rc::new(move |reply| {
-        let clients: Vec<ConnectedClientInfo> = sessions
-            .borrow()
-            .iter_clients()
-            .map(|record| ConnectedClientInfo {
-                client_id: record.client_id,
-                user_id: record.user_id,
-                transport: record.transport,
-                address: record.address,
-            })
-            .collect();
+        let clients: Vec<ConnectedClientInfo> = sessions.borrow().iter_clients().collect();
         // Best-effort: the gather side bounds itself by count + timeout, so
         // a dropped reply (receiver gone) just means this shard is omitted.
         let _ = reply.try_send(clients);
@@ -175,32 +135,12 @@ pub(crate) fn make_deferred_client_request_handler(
     let sessions_for_disconnect = Rc::clone(&sessions);
     let shard_handle_for_disconnect = Rc::clone(&shard_handle);
     bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
-        if let Some(vsr_client_id) = sessions_for_disconnect
+        if let Some((vsr_client_id, session)) = sessions_for_disconnect
             .borrow_mut()
             .remove_connection(client_id)
             && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
         {
-            // Local reader-copy reclaim, then route a synthetic Logout to
-            // the metadata consensus owner so the replicated session slot
-            // is dropped cluster-wide instead of lingering until the peer
-            // is evicted. This handler may run on a shard > 0 (no local
-            // consensus), so it goes through `submit_logout_on_owner`
-            // (forwards to shard 0) -- `submit_logout_in_process` would
-            // panic here. request_id 0 + session 0: synthetic disconnect
-            // logout; `submit_logout_in_process` short-circuits to the
-            // current commit when no session entry exists, so a race with
-            // the explicit logout path is a no-op.
-            shard.plane.metadata().remove_client_session(vsr_client_id);
-            compio::runtime::spawn(async move {
-                if let Err(error) = submit_logout_on_owner(&shard, vsr_client_id, 0, 0).await {
-                    warn!(
-                        vsr_client_id,
-                        ?error,
-                        "disconnect logout submit failed; peer slots may linger until eviction"
-                    );
-                }
-            })
-            .detach();
+            submit_disconnect_logout(shard, vsr_client_id, session);
         }
     }));
     Rc::new(move |client_id, message| {
@@ -379,11 +319,7 @@ async fn handle_client_request(
         // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
         // MUST go through Register first, since server-ng has no
         // per-resource authz layer.
-        let nr_code = u32::from_le_bytes(
-            request.header().reserved[..4]
-                .try_into()
-                .unwrap_or_default(),
-        );
+        let nr_code = u32::from_le_bytes(request.header().reserved[..4].try_into().unwrap());
         let allowed_pre_auth = matches!(nr_code, PING_CODE | GET_CLUSTER_METADATA_CODE);
         if !allowed_pre_auth && sessions.borrow().get_session(transport_client_id).is_none() {
             warn!(
@@ -459,10 +395,11 @@ async fn handle_client_request(
     };
     let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
         *new_header = header;
-        new_header.client = transport_client_id;
         if let Some(namespace) = resolved_namespace {
             new_header.namespace = namespace;
         }
+        // `bound` is always Some here (unbound transports early-return above);
+        // this sets the consensus client id + session for the replicated op.
         if let Some((bound_client_id, bound_session)) = bound {
             new_header.client = bound_client_id;
             new_header.session = bound_session;
@@ -729,6 +666,32 @@ async fn submit_logout_on_owner(
         Ok(Some(commit)) => Ok(commit),
         _ => Err(RegisterSubmitError::Canceled),
     }
+}
+
+/// Disconnect cleanup: the local `SessionManager` connection is already
+/// dropped by the caller; this submits a session-matched `Logout` so the
+/// committed apply releases the `ClientTable` slot on every replica (shard 0
+/// included, since shard 0 is itself a replica).
+///
+/// Deliberately does NOT drop the local `ClientTable` slot first:
+/// `submit_logout_*` short-circuits when the slot is already gone, so a
+/// pre-emptive local removal would suppress the `Logout` and leave peer
+/// replicas with an orphaned session until they evict it themselves -- the
+/// exact divergence this avoids. `submit_logout_on_owner` runs in-process on
+/// shard 0 and forwards for peer-homed connections; its session guard drops a
+/// stale logout for a reused client id.
+#[allow(clippy::future_not_send)]
+fn submit_disconnect_logout(shard: Rc<ServerNgShard>, vsr_client_id: u128, session: u64) {
+    compio::runtime::spawn(async move {
+        if let Err(error) = submit_logout_on_owner(&shard, vsr_client_id, session, 0).await {
+            warn!(
+                vsr_client_id,
+                ?error,
+                "disconnect logout submit failed; peer slots may linger until eviction"
+            );
+        }
+    })
+    .detach();
 }
 
 /// Submit a replicated client request to the metadata owner (shard 0) and

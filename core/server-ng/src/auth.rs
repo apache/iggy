@@ -29,7 +29,7 @@ use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
 use crate::session_manager::SessionManager;
 use consensus::MetadataHandle;
-use iggy_binary_protocol::{EvictionReason, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use iggy_common::{IggyTimestamp, PersonalAccessToken, UserStatus};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -166,19 +166,17 @@ pub(crate) async fn complete_login_register(
 
 /// Decide whether a failed login/register gets a terminal reply or silence.
 ///
-/// `Transient` / `InvalidClientId` are `NotEvictable` (see
-/// [`LoginRegisterError`]'s `TryFrom` for `EvictionReason`): the cluster
-/// could not commit *right now* (e.g. a freshly booted primary still
-/// catching up, or a cross-shard submit canceled). Staying silent lets the
-/// SDK read-timeout replay -- a later attempt lands once the primary is
-/// caught up. Replying empty here would instead surface as a hard
-/// `InvalidFormat` decode failure and break the replay.
+/// A transient consensus failure ([`LoginRegisterError::is_terminal`] is
+/// `false`) means the cluster could not commit *right now* (a freshly booted
+/// primary still catching up, or a cross-shard submit canceled). Staying
+/// silent lets the SDK read-timeout replay once the primary is caught up;
+/// replying empty would surface as a hard `InvalidFormat` decode failure and
+/// break the replay.
 ///
 /// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
-/// `UserInactive` / `Session`) map to an `EvictionReason`, so we fast-fail
-/// with an empty reply rather than make the client wait for a timeout.
-/// (TODO: ship a typed `Eviction` frame once the SDK eviction decoder lands
-/// on every transport.)
+/// `UserInactive` / `Session`) fast-fail with an empty reply rather than make
+/// the client wait for a timeout. (TODO: ship a typed `Eviction` frame once
+/// the SDK eviction decoder lands on every transport.)
 #[allow(clippy::future_not_send)]
 pub(crate) async fn surface_login_failure(
     shard: &Rc<ServerNgShard>,
@@ -186,7 +184,7 @@ pub(crate) async fn surface_login_failure(
     request_header: &RequestHeader,
     error: &LoginRegisterError,
 ) {
-    if EvictionReason::try_from(error).is_ok() {
+    if error.is_terminal() {
         send_login_failure_reply(shard, transport_client_id, request_header).await;
     }
 }
