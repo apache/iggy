@@ -1399,20 +1399,24 @@ fn format_pg_interval(interval: &PgInterval) -> String {
     if years != 0 {
         parts.push(format!(
             "{years} year{}",
-            if years.abs() != 1 { "s" } else { "" }
+            if years.unsigned_abs() != 1 { "s" } else { "" }
         ));
     }
     if months != 0 {
         parts.push(format!(
             "{months} mon{}",
-            if months.abs() != 1 { "s" } else { "" }
+            if months.unsigned_abs() != 1 { "s" } else { "" }
         ));
     }
     if interval.days != 0 {
         parts.push(format!(
             "{} day{}",
             interval.days,
-            if interval.days.abs() != 1 { "s" } else { "" }
+            if interval.days.unsigned_abs() != 1 {
+                "s"
+            } else {
+                ""
+            }
         ));
     }
     if interval.microseconds != 0 || parts.is_empty() {
