@@ -82,7 +82,7 @@ runs:
       run: |
         "${PHP}" -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
         cargo fmt --manifest-path foreign/php/Cargo.toml -- --check
-        cargo install cargo-php --locked
+        cargo install cargo-php --locked --version 0.1.21
         cargo build --manifest-path foreign/php/Cargo.toml
         extension="$(find "${CARGO_TARGET_DIR}/debug" -maxdepth 1 -name 'libiggy_php.so' -print -quit)"
         if [ -z "$extension" ]; then
