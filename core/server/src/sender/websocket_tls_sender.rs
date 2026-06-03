@@ -20,7 +20,6 @@ use super::Sender;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
-use compio::tls::TlsStream;
 use compio::ws::WebSocketStream;
 use compio::ws::tungstenite::{Error as TungsteniteError, Message};
 use iggy_common::IggyError;
@@ -33,13 +32,13 @@ const WRITE_BUFFER_CAPACITY: usize = 8192;
 const STATUS_OK: &[u8] = &[0; 4];
 
 pub struct WebSocketTlsSender {
-    pub(crate) stream: WebSocketStream<TlsStream<TcpStream>>,
+    pub(crate) stream: WebSocketStream<TcpStream>,
     pub(crate) read_buffer: BytesMut,
     pub(crate) write_buffer: BytesMut,
 }
 
 impl WebSocketTlsSender {
-    pub fn new(stream: WebSocketStream<TlsStream<TcpStream>>) -> Self {
+    pub fn new(stream: WebSocketStream<TcpStream>) -> Self {
         Self {
             stream,
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),

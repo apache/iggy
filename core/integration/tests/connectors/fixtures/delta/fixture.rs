@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use crate::connectors::fixtures;
 use async_trait::async_trait;
 use deltalake::kernel::{DataType, PrimitiveType, StructField};
 use deltalake::operations::create::CreateBuilder;
@@ -44,7 +45,7 @@ const ENV_SINK_AWS_S3_ENDPOINT_URL: &str =
 const ENV_SINK_AWS_S3_ALLOW_HTTP: &str =
     "IGGY_CONNECTORS_SINK_DELTA_PLUGIN_CONFIG_AWS_S3_ALLOW_HTTP";
 
-const MINIO_IMAGE: &str = "minio/minio";
+const MINIO_IMAGE: &str = "docker.io/minio/minio";
 const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 const MINIO_PORT: u16 = 9000;
 const MINIO_CONSOLE_PORT: u16 = 9001;
@@ -348,7 +349,7 @@ impl TestFixture for DeltaS3Fixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let id = Uuid::new_v4();
         let network = format!("iggy-delta-s3-{id}");
-        let minio_name = format!("minio-delta-{id}");
+        let minio_name = fixtures::unique_container_name("minio-delta");
 
         let (minio, minio_endpoint) = Self::start_minio(&network, &minio_name).await?;
         Self::create_bucket(&minio_endpoint).await?;

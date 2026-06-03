@@ -348,14 +348,14 @@ impl IggyClient {
                 );
             }
             (Some(_), None) => {
-                return Err(
-                    "'init_retry_interval_micros' is required if 'init_retries' is set".into(),
-                );
+                return Err(to_php_exception(
+                    "'init_retry_interval_micros' is required if 'init_retries' is set",
+                ));
             }
             (None, Some(_)) => {
-                return Err(
-                    "'init_retries' is required if 'init_retry_interval_micros' is set".into(),
-                );
+                return Err(to_php_exception(
+                    "'init_retries' is required if 'init_retry_interval_micros' is set",
+                ));
             }
             (None, None) => {}
         }
@@ -381,7 +381,9 @@ impl IggyClient {
 
 fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<IggyDuration> {
     if micros == 0 {
-        return Err(format!("'{field}' must be greater than 0 microseconds").into());
+        return Err(to_php_exception(format!(
+            "'{field}' must be greater than 0 microseconds"
+        )));
     }
 
     Ok(IggyDuration::from(micros))

@@ -475,3 +475,25 @@ namespace Iggy {
         public function __construct() {}
     }
 }
+
+namespace Iggy\Exception {
+    class AuthenticationException extends Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+
+    class ConnectionException extends Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+
+    class IggyException extends \Exception {
+        public function __construct() {}
+    }
+
+    class NotFoundException extends Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+
+    class TransientException extends Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+}

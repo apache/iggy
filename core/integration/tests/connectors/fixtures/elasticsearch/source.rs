@@ -28,13 +28,17 @@ use iggy_common::IggyTimestamp;
 use integration::harness::{TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use std::collections::HashMap;
+use uuid::Uuid;
 
-const TEST_INDEX: &str = "test_documents";
+const TEST_INDEX_PREFIX: &str = "test_documents";
 
 /// Elasticsearch source fixture for basic document polling.
 pub struct ElasticsearchSourceFixture {
     container: ElasticsearchContainer,
     http_client: HttpClient,
+    // Unique per fixture so tests sharing one container never collide on the
+    // same index. The connector reads from here via ENV_SOURCE_INDEX.
+    index: String,
 }
 
 impl ElasticsearchOps for ElasticsearchSourceFixture {
@@ -50,11 +54,11 @@ impl ElasticsearchOps for ElasticsearchSourceFixture {
 impl ElasticsearchSourceFixture {
     #[allow(dead_code)]
     pub fn index_name(&self) -> &str {
-        TEST_INDEX
+        &self.index
     }
 
     pub async fn setup_index(&self) -> Result<(), TestBinaryError> {
-        self.create_index(TEST_INDEX).await
+        self.create_index(&self.index).await
     }
 
     pub async fn insert_document(
@@ -70,7 +74,7 @@ impl ElasticsearchSourceFixture {
             "value": value,
             "timestamp": timestamp
         });
-        self.index_document(TEST_INDEX, &doc_id.to_string(), &document)
+        self.index_document(&self.index, &doc_id.to_string(), &document)
             .await
     }
 
@@ -84,11 +88,11 @@ impl ElasticsearchSourceFixture {
     }
 
     pub async fn get_document_count(&self) -> Result<usize, TestBinaryError> {
-        self.count_documents(TEST_INDEX).await
+        self.count_documents(&self.index).await
     }
 
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
-        ElasticsearchOps::refresh_index(self, TEST_INDEX).await
+        ElasticsearchOps::refresh_index(self, &self.index).await
     }
 }
 
@@ -97,19 +101,21 @@ impl TestFixture for ElasticsearchSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = ElasticsearchContainer::start().await?;
         let http_client = create_http_client();
+        let index = format!("{TEST_INDEX_PREFIX}_{}", Uuid::new_v4().simple());
 
         // Container startup already waits for /_cluster/health to return 200
         // via HttpWaitStrategy, so no additional health check is needed.
         Ok(Self {
             container,
             http_client,
+            index,
         })
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
         envs.insert(ENV_SOURCE_URL.to_string(), self.container.base_url.clone());
-        envs.insert(ENV_SOURCE_INDEX.to_string(), TEST_INDEX.to_string());
+        envs.insert(ENV_SOURCE_INDEX.to_string(), self.index.clone());
         envs.insert(ENV_SOURCE_POLLING_INTERVAL.to_string(), "100ms".to_string());
         envs.insert(ENV_SOURCE_BATCH_SIZE.to_string(), "100".to_string());
         envs.insert(
