@@ -31,7 +31,7 @@ crate-type = ["cdylib"]
 [dependencies]
 bytes = "1.11.1"
 futures = "0.3.32"
-ext-php-rs = "0.15.13"
+ext-php-rs = "=0.15.14"
 iggy = { path = "../../core/sdk" }
 tokio = "1.52.3"
 
