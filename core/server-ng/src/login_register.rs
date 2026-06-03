@@ -17,206 +17,16 @@
  * under the License.
  */
 
-//! Combined login + register handler.
+//! Login/register failure taxonomy and its mapping to a wire `EvictionReason`.
 //!
-//! One client command, two phases:
-//! 1. Local credential verify (Argon2). Not consensus.
-//! 2. `Operation::Register` through consensus -> `ClientTable` entry on all replicas.
-//!
-//! Trait-based for mocking.
+//! The login/register flow itself lives in `dispatch` + `auth`; this module
+//! owns the error type those handlers return and the
+//! `TryFrom<&LoginRegisterError>` triage that decides terminal eviction vs
+//! silent close (recoverable failures stay silent so the SDK replays).
 
-use crate::session_manager::{SessionError, SessionManager};
-use consensus::VsrConsensus;
-use iggy_binary_protocol::{
-    EvictionReason, PrepareHeader,
-    requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest},
-    responses::users::LoginRegisterResponse,
-};
-use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
-use metadata::{
-    IggyMetadata, RegisterSubmitError, impls::metadata::StreamsFrontend, stm::StateMachine,
-};
-use secrecy::ExposeSecret;
-use server_common::Message;
-
-/// Credential verifier. Real impl: metadata user store + Argon2.
-pub trait CredentialVerifier {
-    /// Verify username/password. Returns `user_id`.
-    ///
-    /// # Errors
-    /// `LoginRegisterError` on invalid credentials.
-    fn verify(&self, username: &str, password: &str) -> Result<u32, LoginRegisterError>;
-}
-
-/// PAT verifier. Real impl: hash lookup + expiry check.
-pub trait TokenVerifier {
-    /// Verify PAT. Returns `user_id`.
-    ///
-    /// # Errors
-    /// `LoginRegisterError` on invalid/expired token.
-    fn verify_token(&self, token: &str) -> Result<u32, LoginRegisterError>;
-}
-
-/// Bounds for [`IggyMetadata`] threaded through the login/register handlers.
-///
-/// Re-stated rather than aliased so the public handler signatures stay
-/// readable at call sites that already type their metadata instance.
-type LoginMetadata<'a, B, J, S, M> = IggyMetadata<VsrConsensus<B>, J, S, M>;
-
-/// Handle login + register (username/password).
-/// Validate -> local credential verify → Register through consensus →
-/// `user_id` + `session`.
-///
-/// # Errors
-/// Auth, consensus, or session state error.
-#[allow(clippy::future_not_send)]
-pub async fn handle_login_register<V, B, J, S, M>(
-    request: &LoginRegisterRequest,
-    verifier: &V,
-    metadata: &LoginMetadata<'_, B, J, S, M>,
-    session_manager: &mut SessionManager,
-    connection_id: u128,
-) -> Result<LoginRegisterResponse, LoginRegisterError>
-where
-    V: CredentialVerifier,
-    B: MessageBus,
-    J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StreamsFrontend
-        + StateMachine<
-            Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
-            Error = iggy_common::IggyError,
-        >,
-{
-    if connection_id == 0 {
-        return Err(LoginRegisterError::InvalidClientId);
-    }
-
-    // Phase 1: local verify (not replicated).
-    let user_id = verifier.verify(request.username.as_str(), request.password.expose_secret())?;
-
-    // Phase 2: Register through consensus.
-    complete_register(connection_id, user_id, metadata, session_manager).await
-}
-
-/// PAT variant of [`handle_login_register`]; Phase 1 verifies token.
-///
-/// # Errors
-/// Token, consensus, or session state error.
-#[allow(clippy::future_not_send)]
-pub async fn handle_login_register_with_pat<T, B, J, S, M>(
-    request: &LoginRegisterWithPatRequest,
-    token_verifier: &T,
-    metadata: &LoginMetadata<'_, B, J, S, M>,
-    session_manager: &mut SessionManager,
-    connection_id: u128,
-) -> Result<LoginRegisterResponse, LoginRegisterError>
-where
-    T: TokenVerifier,
-    B: MessageBus,
-    J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StreamsFrontend
-        + StateMachine<
-            Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
-            Error = iggy_common::IggyError,
-        >,
-{
-    if connection_id == 0 {
-        return Err(LoginRegisterError::InvalidClientId);
-    }
-
-    // Phase 1: token verify (local, not replicated).
-    let user_id = token_verifier.verify_token(request.token.expose_secret())?;
-
-    // Phase 2: Register through consensus.
-    complete_register(connection_id, user_id, metadata, session_manager).await
-}
-
-/// Phase 2: transition session state, submit Register. Shared by password + PAT handlers.
-///
-/// The `connection_id` doubles as the VSR `client_id`; the transport assigns
-/// one per connection (so `transport_client_id == vsr_client_id` at this
-/// handler), and the request body no longer carries a separate field.
-#[allow(clippy::future_not_send)]
-async fn complete_register<B, J, S, M>(
-    connection_id: u128,
-    user_id: u32,
-    metadata: &LoginMetadata<'_, B, J, S, M>,
-    session_manager: &mut SessionManager,
-) -> Result<LoginRegisterResponse, LoginRegisterError>
-where
-    B: MessageBus,
-    J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StreamsFrontend
-        + StateMachine<
-            Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
-            Error = iggy_common::IggyError,
-        >,
-{
-    // Transition: Connected -> Authenticated.
-    session_manager
-        .login(connection_id, user_id)
-        .map_err(LoginRegisterError::Session)?;
-
-    // Submit Register. All RegisterSubmitError variants are transient by
-    // contract (see [`RegisterSubmitError`] docs); wrap into Transient so
-    // TryFrom<&LoginRegisterError> for EvictionReason returns NotEvictable
-    // and the network layer can't ship a wire-terminal Eviction for a
-    // recoverable failure. SDK read-timeout replays.
-    let session = match metadata.submit_register_in_process(connection_id).await {
-        Ok(session) => session,
-        Err(e) => {
-            triage_submit_error(&e);
-            // Rollback Authenticated -> Connected so client can retry full flow.
-            let _ = session_manager.reset_to_connected(connection_id);
-            return Err(LoginRegisterError::Transient(e));
-        }
-    };
-
-    // Transition: Authenticated -> Bound.
-    session_manager
-        .bind_session(connection_id, connection_id, session)
-        .map_err(LoginRegisterError::Session)?;
-
-    Ok(LoginRegisterResponse { user_id, session })
-}
-
-/// Surface unclassified [`RegisterSubmitError`] variants in debug builds.
-///
-/// `RegisterSubmitError` is `#[non_exhaustive]`; the wildcard arm guards
-/// against a new variant slipping through without an explicit decision
-/// about wire-eviction safety. Today every variant is transient, so the
-/// wildcard never fires; if metadata adds a terminal variant the
-/// `debug_assert` flags it so the dev wires a proper `EvictionReason`.
-//
-// TODO(absorb-silently): trait wants transient absorbed via bounded
-// retry; today they surface as Transient; arms will collapse once
-// retry lands.
-fn triage_submit_error(e: &RegisterSubmitError) {
-    match e {
-        RegisterSubmitError::NotPrimary
-        | RegisterSubmitError::NotCaughtUp
-        | RegisterSubmitError::PipelineFull
-        | RegisterSubmitError::InProgress
-        | RegisterSubmitError::Canceled => {}
-        other => {
-            tracing::warn!(
-                error = ?other,
-                "triage_submit_error: unclassified RegisterSubmitError; default Transient, add explicit arm"
-            );
-            debug_assert!(
-                false,
-                "triage_submit_error: unclassified RegisterSubmitError {other:?}"
-            );
-        }
-    }
-}
+use crate::session_manager::SessionError;
+use iggy_binary_protocol::EvictionReason;
+use metadata::RegisterSubmitError;
 
 /// Login/register failure.
 ///
@@ -239,7 +49,7 @@ pub enum LoginRegisterError {
     InvalidToken,
     UserInactive,
     Session(SessionError),
-    /// Recoverable consensus failure. Caller rolls back to `Connected`;
+    /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays. `TryFrom` -> `Err(NotEvictable)`.
     Transient(RegisterSubmitError),
 }
@@ -263,8 +73,8 @@ impl std::error::Error for LoginRegisterError {}
 /// no wire mapping exists. Caller closes silently / lets client retry.
 ///
 /// - `InvalidClientId`: `client_id == 0`, no addressable client.
-/// - `Transient`: wire-terminal Eviction would contradict the absorb-silently
-///   contract; failure is recoverable.
+/// - `Transient`: wire-terminal Eviction would contradict the recoverable
+///   contract; the failure is recoverable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotEvictable;
 
@@ -295,7 +105,7 @@ impl TryFrom<&LoginRegisterError> for EvictionReason {
         Ok(match err {
             // No client_id to address,  close silently. See variant doc.
             LoginRegisterError::InvalidClientId => return Err(NotEvictable),
-            // Recoverable: caller rolls back to Connected; SDK retries.
+            // Recoverable: the connection stays Connected; SDK retries.
             // Wire Eviction would erase a recoverable session.
             LoginRegisterError::Transient(_) => return Err(NotEvictable),
             LoginRegisterError::InvalidCredentials => Self::InvalidCredentials,
@@ -339,7 +149,7 @@ mod tests {
     }
 
     // Transient must NOT be wireable, point of the variant. Callers rely
-    // on NotEvictable to roll back instead of shipping a terminal frame.
+    // on NotEvictable to stay silent instead of shipping a terminal frame.
     #[test]
     fn transient_is_not_evictable() {
         let err = LoginRegisterError::Transient(RegisterSubmitError::PipelineFull);
@@ -374,22 +184,5 @@ mod tests {
         assert_eq!(header.size as usize, HEADER_SIZE);
         // validate accepts.
         assert!(header.validate().is_ok());
-    }
-
-    // triage_submit_error must not debug_assert on any classified variant.
-    // If metadata adds a new RegisterSubmitError variant, the wildcard arm
-    // fires here and the dev wires it through explicitly.
-    #[test]
-    fn triage_submit_error_accepts_all_known_variants() {
-        let known = [
-            RegisterSubmitError::NotPrimary,
-            RegisterSubmitError::NotCaughtUp,
-            RegisterSubmitError::PipelineFull,
-            RegisterSubmitError::InProgress,
-            RegisterSubmitError::Canceled,
-        ];
-        for variant in &known {
-            triage_submit_error(variant);
-        }
     }
 }

@@ -161,32 +161,6 @@ impl SessionManager {
         }
     }
 
-    /// Reset a connection back to `Connected` state.
-    ///
-    /// Used to roll back a failed register attempt so the client can retry
-    /// the full login+register flow on the same connection without
-    /// reconnecting.
-    ///
-    /// # Errors
-    /// Returns `Err` if the connection doesn't exist or isn't `Authenticated`.
-    pub fn reset_to_connected(&mut self, connection_id: u128) -> Result<(), SessionError> {
-        let conn = self
-            .connections
-            .get_mut(&connection_id)
-            .ok_or(SessionError::ConnectionNotFound(connection_id))?;
-        match conn.state {
-            ConnectionState::Authenticated { .. } => {
-                conn.state = ConnectionState::Connected;
-                Ok(())
-            }
-            _ => Err(SessionError::InvalidTransition {
-                connection_id,
-                from: state_name(&conn.state),
-                to: "Connected",
-            }),
-        }
-    }
-
     /// Transition to `Bound` after register commits through consensus.
     ///
     /// The `client_id` is the ephemeral u128 the client generated.
@@ -459,26 +433,6 @@ mod tests {
     fn login_nonexistent_connection_errors() {
         let mut mgr = SessionManager::new();
         assert!(mgr.login(999, 1).is_err());
-    }
-
-    #[test]
-    fn reset_to_connected_from_authenticated() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-        mgr.login(conn, 1).unwrap();
-        mgr.reset_to_connected(conn).unwrap();
-        // Back to Connected. Can login again.
-        mgr.login(conn, 2).unwrap();
-    }
-
-    #[test]
-    fn reset_to_connected_rejects_wrong_state() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-        // Connected - reset should fail.
-        assert!(mgr.reset_to_connected(conn).is_err());
     }
 
     #[test]
