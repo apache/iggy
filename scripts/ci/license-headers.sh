@@ -58,7 +58,7 @@ if ! command -v jq &> /dev/null; then
   exit 1
 fi
 
-HAWKEYE_VERSION="6.5.1"
+HAWKEYE_VERSION="$(cat .github/config/hawkeye.version)"
 
 # Check if HawkEye is available
 if ! command -v hawkeye &> /dev/null; then
@@ -76,6 +76,55 @@ fi
 
 run_hawkeye() {
   hawkeye "$@"
+}
+
+load_license_excludes() {
+  awk '
+    /^[[:space:]]*excludes[[:space:]]*=/ {
+      in_excludes = 1
+      next
+    }
+    in_excludes && /^[[:space:]]*\]/ {
+      exit
+    }
+    in_excludes {
+      sub(/[[:space:]]*#.*/, "")
+      gsub(/^[[:space:]]*"/, "")
+      gsub(/",[[:space:]]*$/, "")
+      if (length($0) > 0) {
+        print
+      }
+    }
+  ' licenserc.toml
+}
+
+is_license_excluded() {
+  local path="$1"
+  local pattern
+  local root_pattern
+
+  for pattern in "${LICENSE_EXCLUDES[@]}"; do
+    # Match the gitignore-style glob patterns from licenserc.toml intentionally.
+    # shellcheck disable=SC2254
+    case "$path" in
+      $pattern)
+        return 0
+        ;;
+    esac
+
+    if [[ "${pattern:0:3}" == "**/" ]]; then
+      root_pattern="${pattern#**/}"
+      # Match the root-level form of **/ globs intentionally.
+      # shellcheck disable=SC2254
+      case "$path" in
+        $root_pattern)
+          return 0
+          ;;
+      esac
+    fi
+  done
+
+  return 1
 }
 
 extract_hawkeye_paths() {
@@ -136,8 +185,13 @@ find_duplicate_license_headers() {
   local path
 
   : > "$output_file"
+  mapfile -t LICENSE_EXCLUDES < <(load_license_excludes)
 
   while IFS= read -r -d '' path; do
+    if is_license_excluded "$path"; then
+      continue
+    fi
+
     if ! LC_ALL=C grep -Iq . "$path"; then
       continue
     fi
@@ -233,7 +287,7 @@ if [ "$MODE" = "fix" ]; then
     exit 1
   fi
 
-  if [ ! -s "$MISSING_FILE" ] && [ ! -s "$UNKNOWN_FILE" ]; then
+  if [ ! -s "$MISSING_FILE" ]; then
     echo "✅ No license header changes needed"
   else
     echo "✅ License header fix completed"

@@ -76,9 +76,7 @@ excludes = [
     "**/.env",
     "**/.gitkeep",
     "**/META-INF/services/**",
-    "web/src/app.html",
-    "core/bench/dashboard/frontend/index.dev.html",
-    "core/bench/dashboard/frontend/index.prod.html",
+    ".github/config/hawkeye.version",
 ]
 
 [mapping.DOUBLESLASH_STYLE]
