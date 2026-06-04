@@ -36,7 +36,7 @@ use axum::extract::connect_info::Connected;
 use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
-use compio::net::{SocketOpts, TcpListener};
+use compio::net::TcpListener;
 use err_trail::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
@@ -137,8 +137,11 @@ pub async fn start_http_server(
     }
 
     if !config.tls.enabled {
-        let opts = SocketOpts::new().reuse_port(true).reuse_address(true);
-        let listener = TcpListener::bind_with_options(config.address.clone(), &opts)
+        let bind_addr: SocketAddr = config
+            .address
+            .parse()
+            .unwrap_or_else(|_| panic!("Failed to parse HTTP address {}", config.address));
+        let listener = crate::tcp::bind_reuseport_listener(bind_addr, true, None)
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
         let address = listener

@@ -284,27 +284,25 @@ pub type AcceptedClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 /// SemVer-major change for `iggy_message_bus`.
 pub struct AcceptedQuicConn {
     connection: compio_quic::Connection,
-    streams: (compio_quic::SendStream, compio_quic::RecvStream),
 }
 
 impl AcceptedQuicConn {
-    /// Bundle a freshly-accepted QUIC connection and its first
-    /// bidirectional stream pair.
+    /// Bundle a freshly-accepted QUIC connection.
     ///
     /// `pub(crate)` by design: the constructor's signature mentions
-    /// `compio_quic::Connection`, `SendStream`, and `RecvStream`, all
-    /// kept off the bus's public `SemVer` surface for the same reason
-    /// [`Self::into_parts`] is crate-private. The QUIC listener in
-    /// [`crate::client_listener::quic`] is the only mint site.
+    /// `compio_quic::Connection`, kept off the bus's public `SemVer`
+    /// surface for the same reason [`Self::into_parts`] is crate-private.
+    /// The QUIC listener in [`crate::client_listener::quic`] is the only
+    /// mint site.
+    ///
+    /// Subsequent bidirectional streams are accepted on demand by the
+    /// transport's `accept_bi` loop (see `QuicTransportConn::run`); the
+    /// iggy SDK opens a fresh bidi per request, so eagerly capturing the
+    /// first one at handshake time would lock the transport to a
+    /// long-lived bidi pattern the SDK does not use.
     #[must_use]
-    pub(crate) const fn new(
-        connection: compio_quic::Connection,
-        streams: (compio_quic::SendStream, compio_quic::RecvStream),
-    ) -> Self {
-        Self {
-            connection,
-            streams,
-        }
+    pub(crate) const fn new(connection: compio_quic::Connection) -> Self {
+        Self { connection }
     }
 
     /// Remote peer address of this accepted QUIC connection.
@@ -323,25 +321,22 @@ impl AcceptedQuicConn {
     /// surface so a `compio_quic` version bump does not constitute a
     /// `SemVer`-major change for `iggy_message_bus`.
     #[must_use]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        compio_quic::Connection,
-        (compio_quic::SendStream, compio_quic::RecvStream),
-    ) {
-        (self.connection, self.streams)
+    pub(crate) fn into_parts(self) -> compio_quic::Connection {
+        self.connection
     }
 }
 
 /// Callback invoked on every accepted SDK QUIC client connection.
 ///
-/// Fires after shard 0's QUIC listener drives the handshake to
-/// completion AND accepts the first bidirectional stream pair, so the
-/// callback receives a ready-for-traffic [`AcceptedQuicConn`]. The
-/// callback mints a client id and forwards the conn straight into
-/// [`installer::install_client_quic`] on the local bus, which unwraps
-/// internally; no caller-side `into_parts` is needed (and the helper
-/// is `pub(crate)` for that reason).
+/// Fires after shard 0's QUIC listener drives the QUIC handshake to
+/// completion. The callback receives a ready-for-traffic
+/// [`AcceptedQuicConn`] that does NOT carry any pre-accepted
+/// bidirectional stream; subsequent bidis are accepted on demand by
+/// the transport's `accept_bi` loop (the iggy SDK opens a new bidi per
+/// request). The callback mints a client id and forwards the conn
+/// straight into [`installer::install_client_quic`] on the local bus,
+/// which unwraps internally; no caller-side `into_parts` is needed (and
+/// the helper is `pub(crate)` for that reason).
 ///
 /// QUIC stays shard-0 terminal: shard 0 owns the
 /// `compio_quic::Endpoint`, which demuxes incoming UDP packets to
@@ -911,8 +906,15 @@ impl IggyMessageBus {
     /// in a loop until empty, so a task pushed mid-shutdown is still
     /// awaited.
     pub fn track_background(&self, handle: JoinHandle<()>) {
+        use futures::FutureExt;
         let mut tasks = self.background_tasks.borrow_mut();
-        tasks.retain(|h| !h.is_finished());
+        // compio 0.19's `JoinHandle` dropped `is_finished`; poll each
+        // handle once (it is `Unpin` + a `Future`) and reap the ones that
+        // have already resolved. `now_or_never` on `&mut h` polls without
+        // consuming; `Some` means the task finished (drop it), `None`
+        // means still running (keep). Single-threaded runtime, so no flip
+        // between this poll and the drop.
+        tasks.retain_mut(|h| h.now_or_never().is_none());
         tasks.push(handle);
     }
 

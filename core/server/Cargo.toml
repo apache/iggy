@@ -69,7 +69,6 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
-metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }

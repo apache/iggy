@@ -19,8 +19,13 @@
 
 #![allow(clippy::future_not_send)]
 
+pub mod auth;
 pub mod bootstrap;
 pub mod config_writer;
+pub mod dispatch;
 pub mod login_register;
+pub mod pat;
+pub mod responses;
 pub mod server_error;
 pub mod session_manager;
+pub mod wire;

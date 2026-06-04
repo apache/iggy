@@ -38,7 +38,7 @@ use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
-use message_bus::installer::conn_info::ClientConnMeta;
+use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
@@ -99,6 +99,71 @@ pub type Receiver<T> = crossfire::AsyncRx<crossfire::mpsc::Array<T>>;
 pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     crossfire::mpsc::bounded_blocking_async(capacity)
 }
+
+/// Cross-shard metadata consensus submit.
+///
+/// The metadata consensus group lives only on shard 0. When a client
+/// connection homes on a peer shard, that shard verifies credentials and
+/// owns the session locally, but the consensus proposal (`Register` /
+/// `Logout`) must execute on shard 0. The peer hands just that step here
+/// and awaits the committed op number over `reply` (`None` = transient
+/// submit failure; all `RegisterSubmitError` variants are transient by
+/// contract, so the caller retries rather than distinguishing them).
+pub enum MetadataSubmit {
+    Register {
+        vsr_client_id: u128,
+        reply: Sender<Option<u64>>,
+    },
+    Logout {
+        vsr_client_id: u128,
+        session: u64,
+        request: u64,
+        reply: Sender<Option<u64>>,
+    },
+    /// A peer (home) shard relays a client's replicated request to shard 0
+    /// and awaits the committed reply over `reply` (`None` on a transient
+    /// submit failure). The home shard then writes the reply to the
+    /// originating socket -- it owns the connection and the
+    /// `vsr -> transport` mapping, which shard 0 cannot reconstruct from the
+    /// consensus client id.
+    ClientRequest {
+        request: Message<GenericHeader>,
+        reply: Sender<Option<Message<GenericHeader>>>,
+    },
+}
+
+/// Handler shard 0 runs for an inbound [`MetadataSubmit`].
+///
+/// server-ng wires it to `submit_register_in_process` /
+/// `submit_logout_in_process` / `submit_request_in_process` and sends the
+/// result back over the frame's `reply` sender. A peer shard (no consensus)
+/// must never receive this frame.
+pub type MetadataSubmitHandler = Rc<dyn Fn(MetadataSubmit)>;
+
+/// One connected client's identity, as seen by the shard that homes it.
+///
+/// Gathered from every shard for `get_clients` (shared-nothing: each shard
+/// knows only its own connections, so the full list requires a broadcast
+/// -- see [`IggyShard::list_all_clients`]).
+#[derive(Debug, Clone)]
+pub struct ConnectedClientInfo {
+    /// Transport (coordinator-minted) client id; top 16 bits are the home
+    /// shard. The wire `client_id` is the `u32` seq tail.
+    pub client_id: u128,
+    pub user_id: Option<u32>,
+    pub transport: ClientTransportKind,
+    pub address: std::net::SocketAddr,
+}
+
+/// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
+/// server-ng wires it to read the shard's `SessionManager` and push its
+/// connected clients back over the carried reply sender.
+pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
+
+/// Per-shard reply budget for the `list_all_clients` gather. A shard that
+/// doesn't answer within this window is skipped (partial result) so one
+/// wedged shard can't hang the read.
+const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Create a bounded inter-shard channel whose sender is tagged with the
 /// owning shard.
@@ -291,6 +356,19 @@ pub enum LifecycleFrame {
         client_id: u128,
         msg: Frozen<MESSAGE_ALIGN>,
     },
+    /// A peer shard hands a metadata consensus submit (login/logout) to
+    /// shard 0, the metadata consensus owner. The committed op returns over
+    /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
+    /// shard 0; processing it on a peer is a routing bug.
+    MetadataSubmit(MetadataSubmit),
+    /// Broadcast query for `get_clients`: every shard replies with the
+    /// clients whose connections it homes, over `reply`. Unlike
+    /// [`MetadataSubmit`] this is sent to ALL shards (shared-nothing: each
+    /// shard knows only its own connections). See
+    /// [`IggyShard::list_all_clients`].
+    ListClients {
+        reply: Sender<Vec<ConnectedClientInfo>>,
+    },
 }
 
 /// Inter-shard channel envelope.
@@ -364,6 +442,18 @@ where
     /// this shard. Invoked for each inbound `Request` frame.
     on_client_request: RequestHandler,
 
+    /// Handler for inbound [`MetadataSubmit`] frames. Only shard 0 receives
+    /// these (it owns the metadata consensus group); peers send them here
+    /// via [`Self::forward_metadata_submit`]. Defaults to a no-op for the
+    /// simulator stub ctor.
+    on_metadata_submit: MetadataSubmitHandler,
+
+    /// Handler for inbound [`LifecycleFrame::ListClients`] broadcast
+    /// queries. Every shard receives these (not just shard 0); server-ng
+    /// wires it to its per-shard `SessionManager`. Defaults to a no-op for
+    /// the simulator stub ctor.
+    on_list_clients: ListClientsHandler,
+
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
@@ -434,6 +524,8 @@ where
         bus: B,
         on_replica_message: MessageHandler,
         on_client_request: RequestHandler,
+        on_metadata_submit: MetadataSubmitHandler,
+        on_list_clients: ListClientsHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
         senders: Vec<TaggedSender>,
@@ -457,6 +549,8 @@ where
             bus,
             on_replica_message,
             on_client_request,
+            on_metadata_submit,
+            on_list_clients,
             senders,
             shard_count,
             inbox,
@@ -465,6 +559,98 @@ where
             coordinator,
             metrics,
         })
+    }
+
+    /// Hand a metadata consensus submit (login/logout) to shard 0.
+    ///
+    /// Sends a [`LifecycleFrame::MetadataSubmit`] into shard 0's inbox. The
+    /// caller owns the matching [`Receiver`] (paired with the `reply` sender
+    /// inside `submit`) and awaits the committed op there. On a full /
+    /// disconnected shard-0 inbox the frame is dropped; the dropped `reply`
+    /// sender then surfaces as a recv error the caller maps to a transient
+    /// failure.
+    pub fn forward_metadata_submit(&self, submit: MetadataSubmit) {
+        let frame = ShardFrame::lifecycle(LifecycleFrame::MetadataSubmit(submit));
+        if let Err(error) = self.senders[0].try_send(frame) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::CONSENSUS,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            tracing::warn!(
+                shard = self.id,
+                "forward_metadata_submit: shard-0 inbox rejected frame: {error:?}"
+            );
+        }
+    }
+
+    /// Gather every shard's connected clients (the `get_clients`
+    /// scatter-gather). Broadcasts [`LifecycleFrame::ListClients`] to all
+    /// shards -- including self, so the local shard answers over the same
+    /// channel path -- and collects their replies.
+    ///
+    /// Bounded: a shard that doesn't reply within
+    /// [`LIST_CLIENTS_GATHER_TIMEOUT`] is skipped and the partial result is
+    /// logged, so one wedged shard cannot hang the read. Callers should
+    /// treat the result as best-effort-complete.
+    #[allow(clippy::future_not_send)]
+    pub async fn list_all_clients(&self) -> Vec<ConnectedClientInfo> {
+        let shard_count = self.shard_count as usize;
+        let (reply_tx, reply_rx) = channel::<Vec<ConnectedClientInfo>>(shard_count.max(1));
+        let mut expected = 0usize;
+        for sender in &self.senders {
+            let frame = ShardFrame::lifecycle(LifecycleFrame::ListClients {
+                reply: reply_tx.clone(),
+            });
+            if let Err(error) = sender.try_send(frame) {
+                tracing::warn!(
+                    shard = self.id,
+                    target = sender.shard_id(),
+                    "list_all_clients: inbox rejected ListClients frame: {error:?}"
+                );
+            } else {
+                expected += 1;
+            }
+        }
+        // Drop the local handle so `recv` returns `Err` once every shard's
+        // reply sender is dropped (defensive; we also bound by count).
+        drop(reply_tx);
+
+        let mut clients = Vec::new();
+        let mut received = 0usize;
+        // One deadline across the whole gather: each `recv` waits only the
+        // remaining budget, so total wall time is bounded by
+        // LIST_CLIENTS_GATHER_TIMEOUT (not expected * timeout), while the
+        // partial results gathered so far are still returned on expiry.
+        let deadline = std::time::Instant::now() + LIST_CLIENTS_GATHER_TIMEOUT;
+        while received < expected {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    shard = self.id,
+                    received,
+                    expected,
+                    "list_all_clients: gather budget exhausted; returning partial result"
+                );
+                break;
+            }
+            match compio::time::timeout(remaining, reply_rx.recv()).await {
+                Ok(Ok(batch)) => {
+                    clients.extend(batch);
+                    received += 1;
+                }
+                Ok(Err(_)) => break, // all reply senders dropped
+                Err(_) => {
+                    tracing::warn!(
+                        shard = self.id,
+                        received,
+                        expected,
+                        "list_all_clients: gather timed out; returning partial result"
+                    );
+                    break;
+                }
+            }
+        }
+        clients
     }
 
     /// Return a clone of the shard-0 coordinator handle, if attached.
@@ -503,6 +689,8 @@ where
             bus,
             on_replica_message: std::rc::Rc::new(|_, _| {}),
             on_client_request: std::rc::Rc::new(|_, _| {}),
+            on_metadata_submit: std::rc::Rc::new(|_| {}),
+            on_list_clients: std::rc::Rc::new(|_| {}),
             plane,
             coordinator: None,
             senders: Vec::new(),
