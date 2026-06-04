@@ -57,7 +57,8 @@ COPY bdd/php/ ./bdd/php/
 
 WORKDIR /workspace/foreign/php
 
-RUN cargo install cargo-php --locked
+RUN cargo install cargo-php --locked --version 0.1.21 \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 RUN composer install --no-interaction --prefer-dist
 RUN cargo php install --yes
 RUN chmod +x ./scripts/test.sh
