@@ -40,7 +40,6 @@ type Option func(config *Options)
 
 type Options struct {
 	config config
-	logger *slog.Logger
 }
 
 func GetDefaultOptions() Options {
@@ -159,17 +158,6 @@ func WithServerAddress(address string) Option {
 	}
 }
 
-// WithLogger sets the logger for the TCP transport layer.
-//
-// When the transport is created via client.NewIggyClient, prefer
-// client.WithLogger to configure a single logger for client-level
-// events (such as heartbeats) and transport logging.
-func WithLogger(logger *slog.Logger) Option {
-	return func(opts *Options) {
-		opts.logger = logger
-	}
-}
-
 // TLSOption is a functional option for configuring TLS settings.
 type TLSOption func(cfg *tlsConfig)
 
@@ -209,17 +197,12 @@ func WithTLSValidateCertificate(validate bool) TLSOption {
 
 // NewIggyTcpClient creates a new Iggy TCP client with the given options.
 // warning: don't use this function directly, use iggycli.NewIggyClient with iggycli.WithTcp instead.
-func NewIggyTcpClient(options ...Option) *IggyTcpClient {
+func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 	opts := GetDefaultOptions()
 	for _, opt := range options {
 		if opt != nil {
 			opt(&opts)
 		}
-	}
-
-	logger := opts.logger
-	if logger == nil {
-		logger = iggcon.NopLogger()
 	}
 
 	return &IggyTcpClient{

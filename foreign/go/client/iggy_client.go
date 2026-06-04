@@ -41,6 +41,7 @@ func GetDefaultOptions() Options {
 	return Options{
 		protocol:          iggcon.Tcp,
 		tcpOptions:        nil,
+		logger:            slog.New(slog.DiscardHandler),
 		heartbeatInterval: 5 * time.Second,
 	}
 }
@@ -48,8 +49,6 @@ func GetDefaultOptions() Options {
 type Option func(*Options)
 
 // WithTcp sets the client protocol to TCP and applies custom TCP options.
-// tcp.WithLogger here only affects the transport; use WithLogger for
-// the client-level heartbeat.
 func WithTcp(tcpOpts ...tcp.Option) Option {
 	return func(opts *Options) {
 		opts.protocol = iggcon.Tcp
@@ -59,8 +58,8 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 
 // WithLogger sets the logger for the Iggy client and its underlying transport.
 // This logger is used by the heartbeat and forwarded to the transport as a
-// default. A tcp.WithLogger passed via WithTcp overrides only the transport.
-// When no logger is provided, all internal log output is silently discarded.
+// default. When no logger is provided, all internal log output is silently
+// discarded.
 func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
 		opts.logger = logger
@@ -86,26 +85,16 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 		opt(&opts)
 	}
 
-	logger := opts.logger
-	if logger == nil {
-		logger = iggcon.NopLogger()
-	}
-
-	// Prepend the logger so the transport inherits it as a default.
-	// A tcp.WithLogger in opts.tcpOptions will override the transport's
-	// copy; the heartbeat keeps using logger above.
-	tcpOpts := append([]tcp.Option{tcp.WithLogger(logger)}, opts.tcpOptions...)
-
 	var cli iggcon.Client
 	switch opts.protocol {
 	case iggcon.Tcp:
-		cli = tcp.NewIggyTcpClient(tcpOpts...)
+		cli = tcp.NewIggyTcpClient(opts.logger, opts.tcpOptions...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)
 	}
 	ic := &IggyClient{
 		Client:            cli,
-		logger:            logger,
+		logger:            opts.logger,
 		cancel:            func() {},
 		heartbeatInterval: opts.heartbeatInterval,
 	}
