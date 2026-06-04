@@ -27,7 +27,12 @@ import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.apache.iggy.bench.models.common.generator.DataBatch;
 import org.apache.iggy.bench.models.common.provision.ProvisionedResources;
+import org.apache.iggy.bench.models.report.metrics.GroupMetrics;
+import org.apache.iggy.bench.models.report.metrics.IndividualMetrics;
+import org.apache.iggy.bench.report.GroupMetricsCalculator;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 public final class TcpAsyncPinnedProducer {
@@ -36,6 +41,8 @@ public final class TcpAsyncPinnedProducer {
     private final PinnedProducerCliArgs pinnedProducerCliArgs;
     private final ResourceProvisioner resourceProvisioner;
     private ProvisionedResources provisionedResources;
+    private List<GroupMetrics> groupMetrics = List.of();
+    private List<IndividualMetrics> individualMetrics;
 
     TcpAsyncPinnedProducer(
             GlobalCliArgs globalCliArgs,
@@ -55,10 +62,19 @@ public final class TcpAsyncPinnedProducer {
     }
 
     public void run() {
-        runBenchmark().join();
+        individualMetrics = runBenchmark().join();
+        groupMetrics = new GroupMetricsCalculator(individualMetrics, globalCliArgs.movingAverageWindow()).calculate();
     }
 
-    private CompletableFuture<Void> runBenchmark() {
+    public List<IndividualMetrics> individualMetrics() {
+        return individualMetrics == null ? List.of() : List.copyOf(individualMetrics);
+    }
+
+    public List<GroupMetrics> groupMetrics() {
+        return List.copyOf(groupMetrics);
+    }
+
+    private CompletableFuture<List<IndividualMetrics>> runBenchmark() {
         try {
             if (provisionedResources == null) {
                 throw new BenchmarkException("Benchmark resources must be provisioned before running.");
@@ -71,7 +87,7 @@ public final class TcpAsyncPinnedProducer {
             long targetMessageBatches = globalCliArgs.totalData() > 0L ? 0L : globalCliArgs.messageBatches();
             long targetDataBytes =
                     globalCliArgs.totalData() > 0L ? globalCliArgs.totalData() / pinnedProducerCliArgs.producers() : 0L;
-            var actorRuns = new CompletableFuture<?>[pinnedProducerCliArgs.producers()];
+            var actorRuns = new ArrayList<CompletableFuture<IndividualMetrics>>(pinnedProducerCliArgs.producers());
 
             for (int index = 0; index < pinnedProducerCliArgs.producers(); index++) {
                 String streamName = provisionedResources.streamNames().get(index);
@@ -83,10 +99,17 @@ public final class TcpAsyncPinnedProducer {
                         fullBatch,
                         targetMessageBatches,
                         targetDataBytes);
-                actorRuns[index] = actor.run();
+                actorRuns.add(actor.run());
             }
 
-            return CompletableFuture.allOf(actorRuns);
+            return CompletableFuture.allOf(actorRuns.toArray(CompletableFuture[]::new))
+                    .thenApply(ignored -> {
+                        var results = new ArrayList<IndividualMetrics>(actorRuns.size());
+                        for (CompletableFuture<IndividualMetrics> actorRun : actorRuns) {
+                            results.add(actorRun.join());
+                        }
+                        return results;
+                    });
         } catch (RuntimeException exception) {
             return CompletableFuture.failedFuture(exception);
         }
