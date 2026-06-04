@@ -30,8 +30,8 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
+mod random_source_liveness;
 mod runtime;
-mod source_suite;
 mod stdout;
 
 use iggy_common::IggyTimestamp;

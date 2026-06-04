@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use crate::connectors::source_suite;
+use crate::connectors::random_source_liveness;
 use integration::harness::seeds;
 use integration::iggy_harness;
 
@@ -26,5 +26,5 @@ use integration::iggy_harness;
     seed = seeds::connector_stream
 )]
 async fn random_source_produces_messages(harness: &TestHarness) {
-    source_suite::assert_source_produces_messages(harness).await;
+    random_source_liveness::assert_produces_messages(harness).await;
 }
