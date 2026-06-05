@@ -46,8 +46,11 @@ use tracing::{info, warn};
 sink_connector!(MeilisearchSink);
 
 const DEFAULT_PRIMARY_KEY: &str = "iggy_id";
+const DEFAULT_CREATE_INDEX_IF_NOT_EXISTS: bool = true;
+const DEFAULT_INCLUDE_METADATA: bool = true;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 const DEFAULT_TIMEOUT: &str = "30s";
+const DEFAULT_WAIT_FOR_TASKS: bool = true;
 const DEFAULT_TASK_TIMEOUT: &str = "30s";
 const DEFAULT_TASK_POLL_INTERVAL: &str = "100ms";
 const DEFAULT_RETRY_DELAY: &str = "500ms";
@@ -96,7 +99,16 @@ pub struct MeilisearchSinkConfig {
 #[derive(Debug)]
 pub struct MeilisearchSink {
     id: u32,
-    config: MeilisearchSinkConfig,
+    config: ResolvedMeilisearchSinkConfig,
+    client: Option<Client>,
+    state: Mutex<State>,
+}
+
+#[derive(Debug)]
+struct ResolvedMeilisearchSinkConfig {
+    url: String,
+    index: String,
+    api_key: Option<SecretString>,
     primary_key: String,
     document_action: MeilisearchDocumentAction,
     create_index_if_not_exists: bool,
@@ -110,23 +122,22 @@ pub struct MeilisearchSink {
     retry_delay: Duration,
     max_retry_delay: Duration,
     max_open_retries: u32,
-    client: Option<Client>,
-    state: Mutex<State>,
 }
 
-impl MeilisearchSink {
-    pub fn new(id: u32, config: MeilisearchSinkConfig) -> Self {
+impl From<MeilisearchSinkConfig> for ResolvedMeilisearchSinkConfig {
+    fn from(config: MeilisearchSinkConfig) -> Self {
         let primary_key = config
             .primary_key
-            .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_PRIMARY_KEY.to_string());
         let document_action = config.document_action.unwrap_or_default();
-        let create_index_if_not_exists = config.create_index_if_not_exists.unwrap_or(true);
-        let include_metadata = config.include_metadata.unwrap_or(true);
+        let create_index_if_not_exists = config
+            .create_index_if_not_exists
+            .unwrap_or(DEFAULT_CREATE_INDEX_IF_NOT_EXISTS);
+        let include_metadata = config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA);
         let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
         let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        let wait_for_tasks = config.wait_for_tasks.unwrap_or(true);
+        let wait_for_tasks = config.wait_for_tasks.unwrap_or(DEFAULT_WAIT_FOR_TASKS);
         let task_timeout = parse_duration(config.task_timeout.as_deref(), DEFAULT_TASK_TIMEOUT);
         let task_poll_interval = parse_duration(
             config.task_poll_interval.as_deref(),
@@ -142,8 +153,9 @@ impl MeilisearchSink {
             .max(1);
 
         Self {
-            id,
-            config,
+            url: config.url,
+            index: config.index,
+            api_key: config.api_key,
             primary_key,
             document_action,
             create_index_if_not_exists,
@@ -157,6 +169,15 @@ impl MeilisearchSink {
             retry_delay,
             max_retry_delay,
             max_open_retries,
+        }
+    }
+}
+
+impl MeilisearchSink {
+    pub fn new(id: u32, config: MeilisearchSinkConfig) -> Self {
+        Self {
+            id,
+            config: config.into(),
             client: None,
             state: Mutex::new(State {
                 invocations_count: 0,
@@ -195,7 +216,7 @@ impl MeilisearchSink {
                 info!("Meilisearch index '{}' already exists", self.config.index);
                 Ok(())
             }
-            None if self.create_index_if_not_exists => self.create_index(client).await,
+            None if self.config.create_index_if_not_exists => self.create_index(client).await,
             None => Err(Error::InitError(format!(
                 "Meilisearch index '{}' does not exist and create_index_if_not_exists=false",
                 self.config.index
@@ -204,7 +225,7 @@ impl MeilisearchSink {
     }
 
     async fn get_index_if_exists(&self, client: &Client) -> Result<Option<Index>, Error> {
-        let max_attempts = self.max_open_retries.max(1);
+        let max_attempts = self.config.max_open_retries.max(1);
         let mut attempt = 0u32;
 
         loop {
@@ -218,9 +239,9 @@ impl MeilisearchSink {
                         return Err(map_sdk_error(error));
                     }
                     let delay = jitter(exponential_backoff(
-                        self.retry_delay,
+                        self.config.retry_delay,
                         attempt,
-                        self.max_retry_delay,
+                        self.config.max_retry_delay,
                     ));
                     warn!(
                         "Meilisearch get index '{}' failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:?}...",
@@ -235,15 +256,15 @@ impl MeilisearchSink {
     async fn create_index(&self, client: &Client) -> Result<(), Error> {
         info!(
             "Creating Meilisearch index '{}' with primary key '{}'",
-            self.config.index, self.primary_key
+            self.config.index, self.config.primary_key
         );
 
         let task = self
             .retry_sdk_operation("create index", || {
-                client.create_index(&self.config.index, Some(&self.primary_key))
+                client.create_index(&self.config.index, Some(&self.config.primary_key))
             })
             .await?;
-        self.wait_for_task(client, task, true).await?;
+        self.wait_for_index_creation_task(client, task).await?;
 
         info!("Created Meilisearch index '{}'", self.config.index);
         Ok(())
@@ -254,7 +275,7 @@ impl MeilisearchSink {
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         message: ConsumedMessage,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>, Error> {
         let generated_id = generated_document_id(topic_metadata, messages_metadata, &message);
         let ConsumedMessage {
             id,
@@ -286,8 +307,10 @@ impl MeilisearchSink {
                 "data_type": "text",
             }),
             _ => {
-                warn!("Unsupported payload format: {}", messages_metadata.schema);
-                return None;
+                return Err(Error::InvalidRecordValue(format!(
+                    "Unsupported payload format for Meilisearch sink: {}",
+                    messages_metadata.schema
+                )));
             }
         };
 
@@ -296,45 +319,50 @@ impl MeilisearchSink {
             .expect("document_from_json_value always returns an object");
 
         object
-            .entry(self.primary_key.clone())
+            .entry(self.config.primary_key.clone())
             .or_insert_with(|| Value::String(generated_id.clone()));
 
-        if self.include_metadata {
+        if self.config.include_metadata {
             object
                 .entry(DEFAULT_PRIMARY_KEY.to_string())
                 .or_insert_with(|| Value::String(generated_id));
-            object.insert("iggy_message_id".to_string(), Value::String(id.to_string()));
-            object.insert("iggy_offset".to_string(), Value::from(offset));
-            object.insert(
-                "iggy_stream".to_string(),
+            insert_metadata_field(object, "iggy_message_id", Value::String(id.to_string()));
+            insert_metadata_field(object, "iggy_offset", Value::from(offset));
+            insert_metadata_field(
+                object,
+                "iggy_stream",
                 Value::from(topic_metadata.stream.as_str()),
             );
-            object.insert(
-                "iggy_topic".to_string(),
+            insert_metadata_field(
+                object,
+                "iggy_topic",
                 Value::from(topic_metadata.topic.as_str()),
             );
-            object.insert(
-                "iggy_partition".to_string(),
+            insert_metadata_field(
+                object,
+                "iggy_partition",
                 Value::from(messages_metadata.partition_id),
             );
-            object.insert("iggy_checksum".to_string(), Value::from(checksum));
-            object.insert("iggy_timestamp".to_string(), Value::from(timestamp));
-            object.insert(
-                "iggy_origin_timestamp".to_string(),
+            insert_metadata_field(object, "iggy_checksum", Value::from(checksum));
+            insert_metadata_field(object, "iggy_timestamp", Value::from(timestamp));
+            insert_metadata_field(
+                object,
+                "iggy_origin_timestamp",
                 Value::from(origin_timestamp),
             );
-            object.insert(
-                "iggy_ingested_at".to_string(),
+            insert_metadata_field(
+                object,
+                "iggy_ingested_at",
                 Value::from(IggyTimestamp::now().as_millis() as i64),
             );
             if let Some(headers) = &headers
                 && let Ok(headers_value) = serde_json::to_value(headers)
             {
-                object.insert("iggy_headers".to_string(), headers_value);
+                insert_metadata_field(object, "iggy_headers", headers_value);
             }
         }
 
-        Some(document)
+        Ok(Some(document))
     }
 
     fn document_from_json_value(value: Value) -> Value {
@@ -354,7 +382,7 @@ impl MeilisearchSink {
         documents: Vec<Value>,
     ) -> Result<usize, Error> {
         let mut accepted = 0usize;
-        for chunk in documents.chunks(self.batch_size) {
+        for chunk in documents.chunks(self.config.batch_size) {
             accepted += self.index_document_chunk(client, chunk).await?;
         }
         Ok(accepted)
@@ -370,39 +398,42 @@ impl MeilisearchSink {
         }
 
         let index = client.index(&self.config.index);
-        let task = match self.document_action {
+        let task = match self.config.document_action {
             MeilisearchDocumentAction::Replace => {
                 self.retry_sdk_operation("add or replace documents", || {
-                    index.add_or_replace(documents, Some(&self.primary_key))
+                    index.add_or_replace(documents, Some(&self.config.primary_key))
                 })
                 .await?
             }
             MeilisearchDocumentAction::Update => {
                 self.retry_sdk_operation("add or update documents", || {
-                    index.add_or_update(documents, Some(&self.primary_key))
+                    index.add_or_update(documents, Some(&self.config.primary_key))
                 })
                 .await?
             }
         };
-        self.wait_for_task(client, task, false).await?;
+        self.wait_for_task(client, task).await?;
         Ok(documents.len())
     }
 
-    async fn wait_for_task(
-        &self,
-        client: &Client,
-        task: TaskInfo,
-        allow_index_already_exists: bool,
-    ) -> Result<(), Error> {
-        if !self.wait_for_tasks {
+    async fn wait_for_task(&self, client: &Client, task: TaskInfo) -> Result<(), Error> {
+        if !self.config.wait_for_tasks {
             return Ok(());
         }
 
+        self.wait_for_task_completion(client, task).await
+    }
+
+    async fn wait_for_index_creation_task(
+        &self,
+        client: &Client,
+        task: TaskInfo,
+    ) -> Result<(), Error> {
         let task = task
             .wait_for_completion(
                 client,
-                Some(self.task_poll_interval),
-                Some(self.task_timeout),
+                Some(self.config.task_poll_interval),
+                Some(self.config.task_timeout),
             )
             .await
             .map_err(map_sdk_error)?;
@@ -413,11 +444,36 @@ impl MeilisearchSink {
 
         if task.is_failure() {
             let failure = task.unwrap_failure();
-            if allow_index_already_exists
-                && failure.error_code == MeilisearchErrorCode::IndexAlreadyExists
-            {
+            if failure.error_code == MeilisearchErrorCode::IndexAlreadyExists {
                 return Ok(());
             }
+            return Err(Error::PermanentHttpError(format!(
+                "Meilisearch task failed: {}",
+                failure
+            )));
+        }
+
+        Err(Error::HttpRequestFailed(
+            "Meilisearch task did not reach a terminal state".to_string(),
+        ))
+    }
+
+    async fn wait_for_task_completion(&self, client: &Client, task: TaskInfo) -> Result<(), Error> {
+        let task = task
+            .wait_for_completion(
+                client,
+                Some(self.config.task_poll_interval),
+                Some(self.config.task_timeout),
+            )
+            .await
+            .map_err(map_sdk_error)?;
+
+        if task.is_success() {
+            return Ok(());
+        }
+
+        if task.is_failure() {
+            let failure = task.unwrap_failure();
             return Err(Error::PermanentHttpError(format!(
                 "Meilisearch task failed: {}",
                 failure
@@ -438,11 +494,11 @@ impl MeilisearchSink {
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        let max_attempts = self.max_retries.max(1);
+        let max_attempts = self.config.max_retries.max(1);
         let mut attempt = 0u32;
 
         loop {
-            let result = tokio::time::timeout(self.timeout, operation_fn()).await;
+            let result = tokio::time::timeout(self.config.timeout, operation_fn()).await;
             match result {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => {
@@ -452,9 +508,9 @@ impl MeilisearchSink {
                         return Err(map_sdk_error(error));
                     }
                     let delay = jitter(exponential_backoff(
-                        self.retry_delay,
+                        self.config.retry_delay,
                         attempt,
-                        self.max_retry_delay,
+                        self.config.max_retry_delay,
                     ));
                     warn!(
                         "Meilisearch {operation} failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:?}..."
@@ -466,17 +522,17 @@ impl MeilisearchSink {
                     if attempt >= max_attempts {
                         return Err(Error::HttpRequestFailed(format!(
                             "Meilisearch {operation} timed out after {:?}",
-                            self.timeout
+                            self.config.timeout
                         )));
                     }
                     let delay = jitter(exponential_backoff(
-                        self.retry_delay,
+                        self.config.retry_delay,
                         attempt,
-                        self.max_retry_delay,
+                        self.config.max_retry_delay,
                     ));
                     warn!(
                         "Meilisearch {operation} timed out after {:?} (attempt {attempt}/{max_attempts}). Retrying in {delay:?}...",
-                        self.timeout
+                        self.config.timeout
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -541,12 +597,14 @@ impl Sink for MeilisearchSink {
             .ok_or_else(|| Error::Connection("Meilisearch client not initialized".to_string()))?;
 
         let messages_count = messages.len();
-        let documents = messages
-            .into_iter()
-            .filter_map(|message| {
-                self.prepare_document(topic_metadata, &messages_metadata, message)
-            })
-            .collect::<Vec<_>>();
+        let mut documents = Vec::with_capacity(messages.len());
+        for message in messages {
+            if let Some(document) =
+                self.prepare_document(topic_metadata, &messages_metadata, message)?
+            {
+                documents.push(document);
+            }
+        }
 
         if documents.is_empty() {
             return Ok(());
@@ -556,7 +614,7 @@ impl Sink for MeilisearchSink {
             Ok(accepted) => {
                 let mut state = self.state.lock().await;
                 state.documents_enqueued += accepted;
-                if self.wait_for_tasks {
+                if self.config.wait_for_tasks {
                     state.documents_indexed += accepted;
                 }
                 info!(
@@ -595,32 +653,26 @@ fn generated_document_id(
     messages_metadata: &MessagesMetadata,
     message: &ConsumedMessage,
 ) -> String {
-    format!(
-        "{}_{}_{}_{}_{}",
-        sanitize_identifier_component(&topic_metadata.stream),
-        sanitize_identifier_component(&topic_metadata.topic),
+    let components = json!([
+        topic_metadata.stream.as_str(),
+        topic_metadata.topic.as_str(),
         messages_metadata.partition_id,
         message.offset,
         message.id
-    )
+    ]);
+    let encoded = serde_json::to_vec(&components)
+        .map(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        .expect("generated ID components are always JSON-serializable");
+    format!("iggy_{encoded}")
 }
 
-fn sanitize_identifier_component(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-
-    if sanitized.is_empty() {
-        "_".to_string()
+fn insert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Value) {
+    if object.contains_key(field) {
+        warn!(
+            "Document already contains Meilisearch metadata field '{field}', preserving original value"
+        );
     } else {
-        sanitized
+        object.insert(field.to_string(), value);
     }
 }
 
@@ -639,7 +691,19 @@ fn sanitize_url_for_log(raw: &str) -> String {
 }
 
 fn normalize_host(raw: &str) -> Result<String, Error> {
-    let url = Url::parse(raw)
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Connection(
+            "Invalid Meilisearch URL: host cannot be empty".to_string(),
+        ));
+    }
+
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let url = Url::parse(&with_scheme)
         .map_err(|error| Error::Connection(format!("Invalid Meilisearch URL: {error}")))?;
     let mut host = url.to_string();
     while host.ends_with('/') {
@@ -669,31 +733,46 @@ fn is_transient_sdk_error(error: &MeilisearchSdkError) -> bool {
     }
 }
 
-fn map_sdk_error(error: MeilisearchSdkError) -> Error {
-    match error {
-        MeilisearchSdkError::Meilisearch(meilisearch_error) => {
-            if meilisearch_error.error_type == MeilisearchErrorType::Internal {
-                Error::HttpRequestFailed(meilisearch_error.to_string())
-            } else {
-                Error::PermanentHttpError(meilisearch_error.to_string())
-            }
-        }
-        MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
-            if communication_error.status_code == 429 || communication_error.status_code >= 500 {
-                Error::HttpRequestFailed(communication_error.to_string())
-            } else {
-                Error::PermanentHttpError(communication_error.to_string())
-            }
-        }
-        MeilisearchSdkError::ParseError(error) => {
-            Error::Serialization(format!("Invalid Meilisearch response: {error}"))
-        }
-        MeilisearchSdkError::Timeout => {
-            Error::HttpRequestFailed("Meilisearch task timed out".to_string())
-        }
-        MeilisearchSdkError::HttpError(error) => Error::HttpRequestFailed(error.to_string()),
-        other => Error::HttpRequestFailed(other.to_string()),
+struct SinkSdkError(MeilisearchSdkError);
+
+impl From<MeilisearchSdkError> for SinkSdkError {
+    fn from(error: MeilisearchSdkError) -> Self {
+        Self(error)
     }
+}
+
+impl From<SinkSdkError> for Error {
+    fn from(error: SinkSdkError) -> Self {
+        match error.0 {
+            MeilisearchSdkError::Meilisearch(meilisearch_error) => {
+                if meilisearch_error.error_type == MeilisearchErrorType::Internal {
+                    Error::HttpRequestFailed(meilisearch_error.to_string())
+                } else {
+                    Error::PermanentHttpError(meilisearch_error.to_string())
+                }
+            }
+            MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
+                if communication_error.status_code == 429 || communication_error.status_code >= 500
+                {
+                    Error::HttpRequestFailed(communication_error.to_string())
+                } else {
+                    Error::PermanentHttpError(communication_error.to_string())
+                }
+            }
+            MeilisearchSdkError::ParseError(error) => {
+                Error::Serialization(format!("Invalid Meilisearch response: {error}"))
+            }
+            MeilisearchSdkError::Timeout => {
+                Error::HttpRequestFailed("Meilisearch task timed out".to_string())
+            }
+            MeilisearchSdkError::HttpError(error) => Error::HttpRequestFailed(error.to_string()),
+            other => Error::HttpRequestFailed(other.to_string()),
+        }
+    }
+}
+
+fn map_sdk_error(error: MeilisearchSdkError) -> Error {
+    Error::from(SinkSdkError::from(error))
 }
 
 #[cfg(test)]
@@ -761,11 +840,36 @@ mod tests {
             &message(Payload::Text("x".to_string())),
         );
 
-        assert_eq!(id, "orders_stream_created_topic_7_11_42");
+        assert!(id.starts_with("iggy_"));
         assert!(
             id.chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         );
+    }
+
+    #[test]
+    fn generated_ids_do_not_collapse_sanitized_names() {
+        let first_topic = TopicMetadata {
+            stream: "orders.stream".to_string(),
+            topic: "created/topic".to_string(),
+        };
+        let second_topic = TopicMetadata {
+            stream: "orders/stream".to_string(),
+            topic: "created.topic".to_string(),
+        };
+
+        let first = generated_document_id(
+            &first_topic,
+            &messages_metadata(),
+            &message(Payload::Text("x".to_string())),
+        );
+        let second = generated_document_id(
+            &second_topic,
+            &messages_metadata(),
+            &message(Payload::Text("x".to_string())),
+        );
+
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -774,13 +878,16 @@ mod tests {
         let payload = Payload::Json(simd_json::json!({
             "name": "Alice"
         }));
+        let message = message(payload);
+        let expected_id = generated_document_id(&topic_metadata(), &messages_metadata(), &message);
 
         let document = sink
-            .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document")
             .expect("document");
 
         assert_eq!(document["name"], "Alice");
-        assert_eq!(document["iggy_id"], "orders_stream_created_topic_7_11_42");
+        assert_eq!(document["iggy_id"], expected_id);
         assert_eq!(document["iggy_offset"], 11);
         assert_eq!(document["iggy_stream"], "orders.stream");
         assert_eq!(document["iggy_topic"], "created/topic");
@@ -795,29 +902,49 @@ mod tests {
             "id": "existing",
             "name": "Alice"
         }));
+        let message = message(payload);
+        let expected_id = generated_document_id(&topic_metadata(), &messages_metadata(), &message);
 
         let document = sink
-            .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document")
             .expect("document");
 
         assert_eq!(document["id"], "existing");
-        assert_eq!(document["iggy_id"], "orders_stream_created_topic_7_11_42");
+        assert_eq!(document["iggy_id"], expected_id);
+    }
+
+    #[test]
+    fn preserves_existing_metadata_fields() {
+        let sink = sink_with_config(base_config());
+        let payload = Payload::Json(simd_json::json!({
+            "name": "Alice",
+            "iggy_offset": 999,
+            "iggy_stream": "user-stream"
+        }));
+
+        let document = sink
+            .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
+            .expect("prepare document")
+            .expect("document");
+
+        assert_eq!(document["iggy_offset"], 999);
+        assert_eq!(document["iggy_stream"], "user-stream");
     }
 
     #[test]
     fn wraps_non_object_json_payloads() {
         let sink = sink_with_config(base_config());
+        let message = message(Payload::Json(simd_json::json!(["a", "b"])));
+        let expected_id = generated_document_id(&topic_metadata(), &messages_metadata(), &message);
 
         let document = sink
-            .prepare_document(
-                &topic_metadata(),
-                &messages_metadata(),
-                message(Payload::Json(simd_json::json!(["a", "b"]))),
-            )
+            .prepare_document(&topic_metadata(), &messages_metadata(), message)
+            .expect("prepare document")
             .expect("document");
 
         assert_eq!(document["value"], json!(["a", "b"]));
-        assert_eq!(document["iggy_id"], "orders_stream_created_topic_7_11_42");
+        assert_eq!(document["iggy_id"], expected_id);
     }
 
     #[test]
@@ -830,9 +957,24 @@ mod tests {
                 &messages_metadata(),
                 message(Payload::Raw(vec![0, 1, 2, 3])),
             )
+            .expect("prepare document")
             .expect("document");
 
         assert_eq!(document["data"], "AAECAw==");
         assert_eq!(document["data_encoding"], ENCODING_BASE64);
+    }
+
+    #[test]
+    fn unsupported_payloads_return_error() {
+        let sink = sink_with_config(base_config());
+        let error = sink
+            .prepare_document(
+                &topic_metadata(),
+                &messages_metadata(),
+                message(Payload::Avro(vec![1, 2, 3])),
+            )
+            .expect_err("unsupported payload should fail");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
     }
 }
