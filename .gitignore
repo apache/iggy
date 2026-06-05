@@ -42,3 +42,4 @@ go.work
 core/bench/dashboard/frontend/dist
 LICENSE-binary
 **/LICENSE-binary
+gateways/kafka/tools/kafka-tool/kafka_messages/
