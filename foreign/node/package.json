@@ -60,7 +60,7 @@
     "@swc-node/register": "1.11.1",
     "@types/debug": "4.1.13",
     "@types/node": "24.10.1",
-    "c8": "^10.1.0",
+    "c8": "^11.0.0",
     "husky": "9.1.7",
     "typescript": "6.0.3",
     "typescript-eslint": "^8.47.0"
