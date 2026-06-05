@@ -83,6 +83,7 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
         CLUSTER,
         0,
         1,
+        None,
         vec![],
         accepted_replica,
         accepted_client,

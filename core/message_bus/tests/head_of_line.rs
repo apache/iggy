@@ -56,6 +56,7 @@ async fn slow_peer_does_not_block_other_peers() {
             CLUSTER,
             1,
             3,
+            None,
             accept_a,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -90,6 +91,8 @@ async fn slow_peer_does_not_block_other_peers() {
         CLUSTER,
         0,
         vec![(1, addr_a), (2, addr_b)],
+        None,
+        Duration::from_secs(5),
         dial_delegate,
         DEFAULT_RECONNECT_PERIOD,
     )

@@ -103,6 +103,10 @@ pub struct LoggingConfig {
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
+    // skip_serializing keeps the key out of the runtime current_config.toml (and
+    // the diagnostic snapshot that cats it). The live key is read from env /
+    // on-disk config at boot, never from the snapshot.
+    #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub key: String,
 }
@@ -352,5 +356,27 @@ impl SystemPaths for SystemConfig {
 
     fn get_runtime_path(&self) -> String {
         SystemConfig::get_runtime_path(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_key_is_never_serialized() {
+        // current_config.toml (and the diagnostic snapshot that cats it) is
+        // produced by serializing this struct, so the key must not survive a
+        // serialize. skip_serializing is format-agnostic, so a JSON dump proves
+        // the toml path too.
+        let config = EncryptionConfig {
+            enabled: true,
+            key: "encryption-key-MUST-NOT-be-persisted".to_owned(),
+        };
+        let serialized = serde_json::to_string(&config).expect("serialize encryption config");
+        assert!(
+            !serialized.contains("MUST-NOT-be-persisted"),
+            "encryption key leaked into serialized config: {serialized}"
+        );
     }
 }
