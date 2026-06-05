@@ -31,7 +31,7 @@ func TestWithLogger_Nil(t *testing.T) {
 	}
 	ic := cli.(*IggyClient)
 	if ic.logger.Handler() != slog.DiscardHandler {
-		t.Errorf("expected slog.DiscardHandler, get %v", ic.logger.Handler())
+		t.Errorf("expected slog.DiscardHandler, got %v", ic.logger.Handler())
 	}
 }
 
