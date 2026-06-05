@@ -24,18 +24,27 @@ if [ $# -gt 0 ]; then
   case "$1" in
     --check)
       MODE="check"
+      shift
       ;;
     --fix)
       MODE="fix"
+      shift
       ;;
     *)
-      echo "Usage: $0 [--check|--fix]"
+      echo "Usage: $0 [--check|--fix] [file...]"
       echo "  --check  Check files for Apache license headers (default)"
       echo "  --fix    Add Apache license headers to files missing them"
+      echo "  file...  Scope the duplicate-header scan to these paths"
       exit 1
       ;;
   esac
 fi
+
+# Remaining args are explicit paths that scope the (slow) duplicate-header
+# scan. pre-commit passes the staged files here; with none (CI) the scan
+# covers the whole tree. HawkEye itself always scans the whole repo: it is
+# fast (~tens of ms with [git] ignore = "auto") and the authoritative check.
+FILES=("$@")
 
 # Get the repository root
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -247,7 +256,13 @@ find_duplicate_license_headers() {
     ' "$path"; then
       printf './%s\n' "$path" >> "$output_file"
     fi
-  done < <(git ls-files -z)
+  done < <(
+    if [ "${#FILES[@]}" -gt 0 ]; then
+      printf '%s\0' "${FILES[@]}"
+    else
+      git ls-files -z
+    fi
+  )
 
   sort -o "$output_file" "$output_file"
 }
