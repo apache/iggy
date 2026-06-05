@@ -16,25 +16,25 @@
 // under the License.
 
 //! End-to-end: a real QUIC client connects to the consensus QUIC client
-//! listener, sends a Request, the handler echoes a Reply back via
-//! `bus.send_to_client`, the client reads the Reply.
+//! listener, opens a bidi per request (matching the iggy SDK pattern),
+//! sends a Request, the handler echoes a Reply back via
+//! `bus.send_to_client`, the client reads the Reply off the same bidi.
 
 mod common;
 
 use async_channel::bounded;
 use common::{header_only, install_quic_clients_locally, loopback};
+use compio::BufResult;
+use compio::io::AsyncWriteExt;
 use compio_quic::{ClientBuilder, Endpoint};
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::GenericHeader;
 use message_bus::QuicTuning;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::quic::{bind, run};
 use message_bus::framing;
-use message_bus::transports::quic::{QuicTransportConn, server_config_with_cert};
-use message_bus::transports::{ActorContext, TransportConn};
-use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown};
+use message_bus::transports::quic::server_config_with_cert;
+use message_bus::{IggyMessageBus, MessageBus};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -97,37 +97,26 @@ async fn request_reply_round_trip() {
         .connect(server_addr, "localhost", None)
         .expect("connect");
     let connection = connecting.await.expect("client handshake");
-    let (send, recv) = connection.open_bi_wait().await.expect("open_bi");
 
-    // Drive the client side of the QUIC conn through `TransportConn::run`.
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
-    let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
-    let (client_shutdown, client_token) = Shutdown::new();
-    let ctx = ActorContext {
-        in_tx,
-        rx: out_rx,
-        shutdown: FusedShutdown::single(client_token),
-        conn_shutdown: client_shutdown.clone(),
-        max_batch: 16,
-        max_message_size: framing::MAX_MESSAGE_SIZE,
-        label: "test-client",
-        peer: "test-client".to_owned(),
-    };
-    let conn = QuicTransportConn::new(connection, (send, recv));
-    let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
-
+    // One bidi per request: open, write Request, finish, read Reply.
+    // Matches the iggy QUIC SDK's `open_bi -> write_all -> finish -> read`
+    // pattern; the server's accept_bi loop accepts the bidi, dispatches
+    // the request, writes the Reply, `finish()`-es the send half.
+    let (mut send, mut recv) = connection.open_bi_wait().await.expect("open_bi");
     let request = header_only(Command2::Request, 42, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
+    let BufResult(result, _) = send.write_all(request).await;
+    result.expect("client write request");
+    send.finish().expect("client finish");
 
-    let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
-        .await
-        .expect("client must receive reply within 5 s")
-        .expect("reply frame");
+    let reply = compio::time::timeout(
+        Duration::from_secs(5),
+        framing::read_message(&mut recv, framing::MAX_MESSAGE_SIZE),
+    )
+    .await
+    .expect("client must receive reply within 5 s")
+    .expect("reply frame");
     assert_eq!(reply.header().command, Command2::Reply);
     assert_eq!(reply.header().cluster, 42);
-
-    client_shutdown.trigger();
-    let _ = client_handle.await;
 
     let outcome = bus.shutdown(Duration::from_secs(2)).await;
     assert_eq!(
@@ -137,12 +126,14 @@ async fn request_reply_round_trip() {
 }
 
 /// Regression test for the QUIC accept-loop head-of-line block. Before
-/// the fix, `accept_one` ran handshake + first `accept_bi` sequentially
-/// inside the listener's accept loop, so a single peer that completed
-/// the handshake but never opened a bidi stream wedged every subsequent
-/// accept until the 30 s idle timeout fired. The fix spawns one
-/// handshake task per [`Incoming`]; this test asserts the wedged peer
-/// no longer blocks a fast peer's request from being processed.
+/// the fix, the listener ran handshake + first `accept_bi` sequentially
+/// inside its accept loop, so a single peer that completed the handshake
+/// but never opened a bidi stream wedged every subsequent accept until
+/// the 30 s idle timeout fired. The fix spawns one handshake task per
+/// [`Incoming`] and now also defers `accept_bi` entirely to the
+/// per-connection `run()`, so a connected-but-silent peer can never
+/// block the listener. This test asserts the wedged peer does not block
+/// a fast peer's request from being processed.
 #[compio::test]
 async fn slow_handshake_does_not_block_subsequent_accept() {
     install_crypto_provider();
@@ -169,8 +160,9 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
     bus.track_background(accept_handle);
 
     // Slow client: completes the QUIC handshake but never opens a bidi
-    // stream. Without the fix, the server's accept loop blocks here
-    // inside `accept_bi().await` and never moves on to the fast client.
+    // stream. Without the listener-side fix, the accept loop blocked on
+    // this peer's `accept_bi().await` and never moved on to the fast
+    // client.
     let slow_client = client_endpoint(cert.clone()).await;
     let slow_connecting = slow_client
         .connect(server_addr, "localhost", None)
@@ -191,30 +183,16 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
         .await
         .expect("fast client handshake within 2 s")
         .expect("fast client handshake");
-    let (send, recv) =
+    let (mut send, _recv) =
         compio::time::timeout(Duration::from_secs(2), fast_connection.open_bi_wait())
             .await
             .expect("fast client open_bi within 2 s")
             .expect("open_bi");
 
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
-    let (in_tx, _in_rx) = bounded::<Message<GenericHeader>>(8);
-    let (fast_shutdown, fast_token) = Shutdown::new();
-    let ctx = ActorContext {
-        in_tx,
-        rx: out_rx,
-        shutdown: FusedShutdown::single(fast_token),
-        conn_shutdown: fast_shutdown.clone(),
-        max_batch: 16,
-        max_message_size: framing::MAX_MESSAGE_SIZE,
-        label: "fast-client",
-        peer: "fast-client".to_owned(),
-    };
-    let conn = QuicTransportConn::new(fast_connection, (send, recv));
-    let fast_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
-
     let request = header_only(Command2::Request, 1, 0).into_frozen();
-    out_tx.send(request).await.expect("fast client send");
+    let BufResult(result, _) = send.write_all(request).await;
+    result.expect("fast client write request");
+    send.finish().expect("fast client finish");
 
     compio::time::timeout(Duration::from_secs(2), request_rx.recv())
         .await
@@ -222,8 +200,5 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
         .expect("server-side request channel");
 
     drop(slow_connection);
-    fast_shutdown.trigger();
-    let _ = fast_handle.await;
-
     let _ = bus.shutdown(Duration::from_secs(2)).await;
 }

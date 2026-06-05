@@ -30,6 +30,7 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
+mod random_source_liveness;
 mod runtime;
 mod stdout;
 

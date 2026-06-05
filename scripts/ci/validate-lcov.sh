@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,26 +16,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "iggy-php"
-version = "0.1.0"
-edition = "2024"
-authors = ["Iggy Committers <dev@iggy.apache.org>"]
-license = "Apache-2.0"
-description = "PHP extension bindings for Apache Iggy."
-documentation = "https://iggy.apache.org/docs/"
-repository = "https://github.com/apache/iggy"
+set -euo pipefail
 
-[lib]
-crate-type = ["cdylib"]
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $0 <lcov-file>"
+  exit 2
+fi
 
-[dependencies]
-bytes = "1.11.1"
-futures = "0.3.32"
-ext-php-rs = "=0.15.14"
-iggy = { path = "../../core/sdk" }
-tokio = "1.52.3"
+lcov_file="$1"
 
-[profile.release]
-strip = "debuginfo"
-lto = "thin"
+if [ ! -s "$lcov_file" ]; then
+  echo "LCOV report is missing or empty: $lcov_file"
+  exit 1
+fi
+
+source_file_count="$(grep -c '^SF:' "$lcov_file" || true)"
+line_data_count="$(grep -c '^DA:' "$lcov_file" || true)"
+
+if [ "$source_file_count" -eq 0 ]; then
+  echo "LCOV report has no source file records: $lcov_file"
+  exit 1
+fi
+
+if [ "$line_data_count" -eq 0 ]; then
+  echo "LCOV report has no line data records: $lcov_file"
+  exit 1
+fi
+
+echo "LCOV report valid: $lcov_file (${source_file_count} SF, ${line_data_count} DA)"

@@ -182,6 +182,7 @@ runs:
         sed -i 's|^SF:src/|SF:foreign/python/src/|' ../../reports/python-coverage.lcov
 
         echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+        ../../scripts/ci/validate-lcov.sh ../../reports/python-coverage.lcov
       shell: bash
 
     - name: Upload test artifacts

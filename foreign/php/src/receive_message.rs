@@ -21,6 +21,8 @@ use iggy::prelude::{
     IggyMessage as RustReceiveMessage, IggyMessageHeader, PollingStrategy as RustPollingStrategy,
 };
 
+use crate::error::to_php_exception;
+
 /// A PHP class representing a received message.
 ///
 /// This class wraps a Rust message, allowing PHP code to access its payload and metadata.
@@ -136,7 +138,7 @@ impl PollingStrategy {
     /// Poll messages at or after a UNIX timestamp expressed in seconds.
     pub fn timestamp_seconds(value: u64) -> PhpResult<Self> {
         let Some(micros) = value.checked_mul(1_000_000) else {
-            return Err("timestamp seconds value is too large".into());
+            return Err(to_php_exception("timestamp seconds value is too large"));
         };
 
         Ok(Self::timestamp_micros(micros))
