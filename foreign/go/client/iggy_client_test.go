@@ -24,10 +24,14 @@ import (
 	"testing"
 )
 
-func TestGetDefaultOptions_ProvidesLogger(t *testing.T) {
-	opts := GetDefaultOptions()
-	if opts.logger == nil {
-		t.Fatal("expected default options to include a non-nil logger")
+func TestWithLogger_Nil(t *testing.T) {
+	cli, err := NewIggyClient(WithLogger(nil))
+	if err != nil {
+		t.Fatalf("unexpected error creating client: %v", err)
+	}
+	ic := cli.(*IggyClient)
+	if ic.logger.Handler() != slog.DiscardHandler {
+		t.Errorf("expected slog.DiscardHandler, get %v", ic.logger.Handler())
 	}
 }
 
@@ -42,10 +46,7 @@ func TestWithLogger_SetsClientLogger(t *testing.T) {
 		t.Fatalf("unexpected error creating client: %v", err)
 	}
 
-	ic, ok := cli.(*IggyClient)
-	if !ok {
-		t.Fatal("expected *IggyClient from NewIggyClient")
-	}
+	ic := cli.(*IggyClient)
 
 	ic.logger.Info("probe message", "key", "value")
 

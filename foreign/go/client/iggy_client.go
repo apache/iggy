@@ -62,6 +62,9 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 // discarded.
 func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
+		if logger == nil {
+			return
+		}
 		opts.logger = logger
 	}
 }
