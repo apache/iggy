@@ -22,6 +22,7 @@ package org.apache.iggy.bench.report;
 import org.apache.iggy.bench.common.enums.ActorKind;
 import org.apache.iggy.bench.common.enums.GroupKind;
 import org.apache.iggy.bench.common.enums.TimeSeriesKind;
+import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.report.metrics.DistributionPercentiles;
 import org.apache.iggy.bench.models.report.metrics.GroupMetrics;
 import org.apache.iggy.bench.models.report.metrics.GroupMetricsSummary;
@@ -44,7 +45,7 @@ public final class GroupMetricsCalculator {
     private static final double RANGE_FACTOR = 1.5;
 
     private final List<IndividualMetrics> individualMetrics;
-    private final int movingAverageWindow;
+    private final GlobalCliArgs globalCliArgs;
     private GroupKind groupKind;
     private final List<TimeSeries> throughputMbSeries;
     private final List<TimeSeries> throughputMsgSeries;
@@ -63,9 +64,9 @@ public final class GroupMetricsCalculator {
     private double minLatencyMs;
     private double maxLatencyMs;
 
-    public GroupMetricsCalculator(List<IndividualMetrics> individualMetrics, int movingAverageWindow) {
+    public GroupMetricsCalculator(List<IndividualMetrics> individualMetrics, GlobalCliArgs globalCliArgs) {
         this.individualMetrics = individualMetrics;
-        this.movingAverageWindow = movingAverageWindow;
+        this.globalCliArgs = globalCliArgs;
         this.throughputMbSeries = new ArrayList<>();
         this.throughputMsgSeries = new ArrayList<>();
         this.latencySeries = new ArrayList<>();
@@ -81,11 +82,13 @@ public final class GroupMetricsCalculator {
         collectMetrics();
 
         TimeSeries avgThroughputMbTs = StatsHelper.applyMovingAverage(
-                aggregateTimeSeries(throughputMbSeries, TimeSeriesKind.THROUGHPUT_MB, false), movingAverageWindow);
+                aggregateTimeSeries(throughputMbSeries, TimeSeriesKind.THROUGHPUT_MB, false),
+                globalCliArgs.movingAverageWindow());
         TimeSeries avgThroughputMsgTs = StatsHelper.applyMovingAverage(
-                aggregateTimeSeries(throughputMsgSeries, TimeSeriesKind.THROUGHPUT_MSG, false), movingAverageWindow);
+                aggregateTimeSeries(throughputMsgSeries, TimeSeriesKind.THROUGHPUT_MSG, false),
+                globalCliArgs.movingAverageWindow());
         TimeSeries avgLatencyTs = StatsHelper.applyMovingAverage(
-                aggregateTimeSeries(latencySeries, TimeSeriesKind.LATENCY, true), movingAverageWindow);
+                aggregateTimeSeries(latencySeries, TimeSeriesKind.LATENCY, true), globalCliArgs.movingAverageWindow());
 
         double count = individualMetrics.size();
         double stdDevLatencyMs = StatsHelper.stdDev(avgLatencyTs).orElse(0.0);

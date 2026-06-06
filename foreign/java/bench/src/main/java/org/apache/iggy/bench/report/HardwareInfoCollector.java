@@ -86,8 +86,6 @@ public final class HardwareInfoCollector {
         return System.getProperty("os.name");
     }
 
-    // Report the total number of logical CPUs on the machine, not only the CPUs
-    // currently assigned to the benchmark process via taskset or affinity.
     private int detectCpuCores() {
         try {
             List<String> lines = Files.readAllLines(CPU_INFO_PATH);

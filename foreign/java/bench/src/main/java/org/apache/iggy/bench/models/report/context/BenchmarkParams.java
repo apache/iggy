@@ -33,9 +33,9 @@ public record BenchmarkParams(
         Optional<String> extraInfo,
         Optional<String> gitref,
         Optional<String> gitrefDate,
-        BenchmarkNumericParameter messagesPerBatch,
+        int messagesPerBatch,
         long messageBatches,
-        BenchmarkNumericParameter messageSize,
+        int messageSize,
         int producers,
         int consumers,
         int streams,
@@ -54,8 +54,6 @@ public record BenchmarkParams(
         extraInfo = Objects.requireNonNull(extraInfo, "extraInfo");
         gitref = Objects.requireNonNull(gitref, "gitref");
         gitrefDate = Objects.requireNonNull(gitrefDate, "gitrefDate");
-        messagesPerBatch = Objects.requireNonNull(messagesPerBatch, "messagesPerBatch");
-        messageSize = Objects.requireNonNull(messageSize, "messageSize");
         rateLimit = Objects.requireNonNull(rateLimit, "rateLimit");
         prettyName = Objects.requireNonNull(prettyName, "prettyName");
         benchCommand = Objects.requireNonNull(benchCommand, "benchCommand");

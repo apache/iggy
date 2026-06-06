@@ -26,7 +26,6 @@ import org.apache.iggy.bench.common.enums.BenchmarkKind;
 import org.apache.iggy.bench.common.enums.TransportKind;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
-import org.apache.iggy.bench.models.report.context.BenchmarkNumericParameter;
 import org.apache.iggy.bench.models.report.context.BenchmarkParams;
 import org.apache.iggy.bench.report.FinalReportBuilder;
 import org.apache.iggy.bench.report.HardwareInfoCollector;
@@ -52,9 +51,6 @@ import java.util.concurrent.Callable;
 public final class PinnedProducerCommand implements Callable<Integer> {
 
     private static final Logger log = LoggerFactory.getLogger(PinnedProducerCommand.class);
-    private static final long DEFAULT_MAX_TOPIC_SIZE = 0L;
-    private static final long DEFAULT_MESSAGE_EXPIRY = 0L;
-    private static final String DEFAULT_SERVER_ADDRESS = "127.0.0.1:8090";
 
     @ParentCommand
     private IggyBenchCommand rootCommand;
@@ -71,19 +67,19 @@ public final class PinnedProducerCommand implements Callable<Integer> {
             names = {"--producers", "-p"},
             defaultValue = "8",
             description = "Number of producers.")
-    private int producers = 8;
+    private int producers;
 
     @Option(
             names = {"--max-topic-size", "-T"},
             defaultValue = "0",
             description = "Max topic size in bytes. Use 0 for the server default.")
-    private long maxTopicSize = DEFAULT_MAX_TOPIC_SIZE;
+    private long maxTopicSize;
 
     @Option(
             names = {"--message-expiry", "-e"},
             defaultValue = "0",
             description = "Topic message expiry in microseconds. Use 0 to never expire.")
-    private long messageExpiry = DEFAULT_MESSAGE_EXPIRY;
+    private long messageExpiry;
 
     @Override
     public Integer call() {
@@ -150,23 +146,27 @@ public final class PinnedProducerCommand implements Callable<Integer> {
         long messageBatches = globalCliArgs.totalData() > 0L
                 ? 0L
                 : Math.multiplyExact((long) globalCliArgs.messageBatches(), producers);
+        String serverAddress = "127.0.0.1:8090";
+        int consumers = 0;
+        int partitions = 1;
+        int consumerGroups = 0;
 
         return new BenchmarkParams(
                 BenchmarkKind.PINNED_PRODUCER,
                 TransportKind.TCP,
-                DEFAULT_SERVER_ADDRESS,
+                serverAddress,
                 Optional.empty(),
                 Optional.empty(),
                 Optional.of(versionInfo.getVersion()),
                 Optional.of(versionInfo.getBuildTime()),
-                BenchmarkNumericParameter.ofValue(globalCliArgs.messagesPerBatch()),
+                globalCliArgs.messagesPerBatch(),
                 messageBatches,
-                BenchmarkNumericParameter.ofValue(globalCliArgs.messageSize()),
+                globalCliArgs.messageSize(),
                 producers,
-                0,
+                consumers,
                 streams,
-                1,
-                0,
+                partitions,
+                consumerGroups,
                 globalCliArgs.rateLimit() > 0L
                         ? Optional.of(Long.toString(globalCliArgs.rateLimit()))
                         : Optional.empty(),
@@ -182,9 +182,9 @@ public final class PinnedProducerCommand implements Callable<Integer> {
                         dataVolumeIdentifier,
                         Integer.toString(globalCliArgs.messageSize()),
                         Integer.toString(producers),
-                        "0",
+                        Integer.toString(consumers),
                         Integer.toString(streams),
-                        "1",
-                        "0"));
+                        Integer.toString(partitions),
+                        Integer.toString(consumerGroups)));
     }
 }

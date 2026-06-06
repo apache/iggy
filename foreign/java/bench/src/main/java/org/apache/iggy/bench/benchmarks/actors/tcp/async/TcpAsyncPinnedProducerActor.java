@@ -35,7 +35,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -129,7 +128,6 @@ public final class TcpAsyncPinnedProducerActor {
                                     var summary = metrics.summary();
 
                                     log.info(String.format(
-                                            Locale.US,
                                             "Producer #%d \u2192 sent %s messages in %s batches of %d messages in %.2f s, total size: %s, "
                                                     + "average throughput: %.2f MB/s, p50 latency: %.2f ms, p90 latency: %.2f ms, "
                                                     + "p95 latency: %.2f ms, p99 latency: %.2f ms, p999 latency: %.2f ms, "

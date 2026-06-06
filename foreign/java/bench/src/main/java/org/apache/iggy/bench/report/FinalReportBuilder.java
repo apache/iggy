@@ -19,6 +19,7 @@
 
 package org.apache.iggy.bench.report;
 
+import org.apache.iggy.bench.common.enums.BenchmarkKind;
 import org.apache.iggy.bench.models.report.FinalReport;
 import org.apache.iggy.bench.models.report.context.BenchmarkHardware;
 import org.apache.iggy.bench.models.report.context.BenchmarkParams;
@@ -36,7 +37,10 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -45,6 +49,10 @@ import java.util.UUID;
 public final class FinalReportBuilder {
 
     private static final String DEFAULT_REPORT_FILE_NAME = "report.json";
+    private static final DateTimeFormatter RFC3339_UTC_FORMATTER = new DateTimeFormatterBuilder()
+            .append(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+            .appendOffset("+HH:MM", "+00:00")
+            .toFormatter();
     private static final ObjectMapper MAPPER = JsonMapper.builder()
             .enable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
             .enable(EnumFeature.WRITE_ENUMS_USING_TO_STRING)
@@ -72,7 +80,7 @@ public final class FinalReportBuilder {
     }
 
     public FinalReport buildReport() {
-        String timestamp = Instant.now().toString();
+        String timestamp = OffsetDateTime.now(ZoneOffset.UTC).format(RFC3339_UTC_FORMATTER);
         BenchmarkParams reportParams = params.gitrefDate().isPresent()
                 ? params
                 : new BenchmarkParams(
@@ -139,30 +147,20 @@ public final class FinalReportBuilder {
 
     private static void printBenchmarkSummary(
             BenchmarkParams reportParams, long totalMessages, long totalBytes, long totalMessageBatches) {
-        String totalDataText = formatDataSize(totalBytes);
-
-        boolean producingConsumers = reportParams.benchmarkKind()
-                        == org.apache.iggy.bench.common.enums.BenchmarkKind.END_TO_END_PRODUCING_CONSUMER
-                || reportParams.benchmarkKind()
-                        == org.apache.iggy.bench.common.enums.BenchmarkKind.END_TO_END_PRODUCING_CONSUMER_GROUP;
+        String totalDataText = totalBytes + " bytes";
+        boolean producingConsumers = reportParams.benchmarkKind() == BenchmarkKind.END_TO_END_PRODUCING_CONSUMER
+                || reportParams.benchmarkKind() == BenchmarkKind.END_TO_END_PRODUCING_CONSUMER_GROUP;
         String producersText = "";
         if (reportParams.producers() > 0) {
             producersText = reportParams.producers() + (producingConsumers ? " producing consumers, " : " producers, ");
         }
-
         String consumersText = reportParams.consumers() > 0 ? reportParams.consumers() + " consumers, " : "";
         String partitionsText =
                 reportParams.partitions() > 0 ? reportParams.partitions() + " partitions per topic, " : "";
         String consumerGroupsText =
                 reportParams.consumerGroups() > 0 ? reportParams.consumerGroups() + " consumer groups, " : "";
-        var messagesPerBatch = reportParams.messagesPerBatch();
-        var messageSize = reportParams.messageSize();
-        String messagesPerBatchText = messagesPerBatch.min() == messagesPerBatch.max()
-                ? Integer.toString(messagesPerBatch.min())
-                : messagesPerBatch.min() + ".." + messagesPerBatch.max();
-        String messageSizeText = messageSize.min() == messageSize.max()
-                ? Integer.toString(messageSize.min())
-                : messageSize.min() + ".." + messageSize.max();
+        String messagesPerBatchText = Integer.toString(reportParams.messagesPerBatch());
+        String messageSizeText = Integer.toString(reportParams.messageSize());
 
         LoggerFactory.getLogger("bench_report::prints")
                 .info(
@@ -215,28 +213,6 @@ public final class FinalReportBuilder {
                 metrics.summary().maxLatencyMs(),
                 metrics.summary().stdDevLatencyMs(),
                 totalTimeSeconds));
-    }
-
-    private static String formatDataSize(long totalBytes) {
-        if (totalBytes < 1000L) {
-            return totalBytes + "B";
-        }
-
-        double scaledBytes = totalBytes;
-        String[] units = {"B", "kB", "MB", "GB", "TB", "PB", "EB"};
-        int unitIndex = 0;
-        while (scaledBytes >= 1000.0 && unitIndex < units.length - 1) {
-            scaledBytes /= 1000.0;
-            unitIndex += 1;
-        }
-
-        double rounded = Math.round(scaledBytes * 100.0) / 100.0;
-        String scaledText = Math.abs(rounded - Math.rint(rounded)) < 0.000001
-                ? Long.toString(Math.round(rounded))
-                : Math.abs(rounded * 10.0 - Math.rint(rounded * 10.0)) < 0.000001
-                        ? String.format("%.1f", rounded)
-                        : String.format("%.2f", rounded);
-        return scaledText + units[unitIndex];
     }
 
     private static String groupPrefix(GroupMetrics metrics) {

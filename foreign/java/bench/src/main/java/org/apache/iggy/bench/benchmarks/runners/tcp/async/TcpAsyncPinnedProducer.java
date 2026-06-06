@@ -42,7 +42,7 @@ public final class TcpAsyncPinnedProducer {
     private final ResourceProvisioner resourceProvisioner;
     private ProvisionedResources provisionedResources;
     private List<GroupMetrics> groupMetrics = List.of();
-    private List<IndividualMetrics> individualMetrics;
+    private List<IndividualMetrics> individualMetrics = List.of();
 
     TcpAsyncPinnedProducer(
             GlobalCliArgs globalCliArgs,
@@ -62,56 +62,44 @@ public final class TcpAsyncPinnedProducer {
     }
 
     public void run() {
-        individualMetrics = runBenchmark().join();
-        groupMetrics = new GroupMetricsCalculator(individualMetrics, globalCliArgs.movingAverageWindow()).calculate();
+        individualMetrics = runBenchmark();
+        groupMetrics = new GroupMetricsCalculator(individualMetrics, globalCliArgs).calculate();
     }
 
     public List<IndividualMetrics> individualMetrics() {
-        return individualMetrics == null ? List.of() : List.copyOf(individualMetrics);
+        return List.copyOf(individualMetrics);
     }
 
     public List<GroupMetrics> groupMetrics() {
         return List.copyOf(groupMetrics);
     }
 
-    private CompletableFuture<List<IndividualMetrics>> runBenchmark() {
-        try {
-            if (provisionedResources == null) {
-                throw new BenchmarkException("Benchmark resources must be provisioned before running.");
-            }
-
-            String topicName = provisionedResources.topicNames().get(0);
-            var batchGenerator =
-                    new BenchmarkBatchGenerator(globalCliArgs.messageSize(), globalCliArgs.messagesPerBatch());
-            DataBatch fullBatch = batchGenerator.generateBatch();
-            long targetMessageBatches = globalCliArgs.totalData() > 0L ? 0L : globalCliArgs.messageBatches();
-            long targetDataBytes =
-                    globalCliArgs.totalData() > 0L ? globalCliArgs.totalData() / pinnedProducerCliArgs.producers() : 0L;
-            var actorRuns = new ArrayList<CompletableFuture<IndividualMetrics>>(pinnedProducerCliArgs.producers());
-
-            for (int index = 0; index < pinnedProducerCliArgs.producers(); index++) {
-                String streamName = provisionedResources.streamNames().get(index);
-                var actor = new TcpAsyncPinnedProducerActor(
-                        globalCliArgs,
-                        index + 1,
-                        streamName,
-                        topicName,
-                        fullBatch,
-                        targetMessageBatches,
-                        targetDataBytes);
-                actorRuns.add(actor.run());
-            }
-
-            return CompletableFuture.allOf(actorRuns.toArray(CompletableFuture[]::new))
-                    .thenApply(ignored -> {
-                        var results = new ArrayList<IndividualMetrics>(actorRuns.size());
-                        for (CompletableFuture<IndividualMetrics> actorRun : actorRuns) {
-                            results.add(actorRun.join());
-                        }
-                        return results;
-                    });
-        } catch (RuntimeException exception) {
-            return CompletableFuture.failedFuture(exception);
+    private List<IndividualMetrics> runBenchmark() {
+        if (provisionedResources == null) {
+            throw new BenchmarkException("Benchmark resources must be provisioned before running.");
         }
+
+        String topicName = provisionedResources.topicNames().get(0);
+        var batchGenerator = new BenchmarkBatchGenerator(globalCliArgs.messageSize(), globalCliArgs.messagesPerBatch());
+        DataBatch fullBatch = batchGenerator.generateBatch();
+        long targetMessageBatches = globalCliArgs.totalData() > 0L ? 0L : globalCliArgs.messageBatches();
+        long targetDataBytes =
+                globalCliArgs.totalData() > 0L ? globalCliArgs.totalData() / pinnedProducerCliArgs.producers() : 0L;
+        var actorRuns = new ArrayList<CompletableFuture<IndividualMetrics>>(pinnedProducerCliArgs.producers());
+
+        for (int index = 0; index < pinnedProducerCliArgs.producers(); index++) {
+            String streamName = provisionedResources.streamNames().get(index);
+            var actor = new TcpAsyncPinnedProducerActor(
+                    globalCliArgs, index + 1, streamName, topicName, fullBatch, targetMessageBatches, targetDataBytes);
+            actorRuns.add(actor.run());
+        }
+
+        CompletableFuture.allOf(actorRuns.toArray(CompletableFuture[]::new)).join();
+
+        var results = new ArrayList<IndividualMetrics>(actorRuns.size());
+        for (CompletableFuture<IndividualMetrics> actorRun : actorRuns) {
+            results.add(actorRun.join());
+        }
+        return results;
     }
 }
