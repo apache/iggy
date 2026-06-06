@@ -152,6 +152,12 @@ impl QuicClientConfigBuilder {
         self
     }
 
+    /// Sets the per-request timeout for send/receive operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config.request_timeout = request_timeout;
+        self
+    }
+
     /// Finalizes the builder and returns the `QuicClientConfig`.
     pub fn build(mut self) -> Result<QuicClientConfig, IggyError> {
         self.config.server_address = self.config.server_address.trim().to_owned();
@@ -164,6 +170,7 @@ impl QuicClientConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn build_should_trim_and_validate_server_address() {
@@ -192,5 +199,17 @@ mod tests {
             .build();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn with_request_timeout_should_override_default() {
+        let config = QuicClientConfigBuilder::default()
+            .with_request_timeout(IggyDuration::from_str("60s").unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.request_timeout,
+            IggyDuration::from_str("60s").unwrap()
+        );
     }
 }

@@ -190,6 +190,9 @@ pub struct Args {
 
     #[arg(long, default_value = "false")]
     pub websocket_tls_validate_certificate: bool,
+
+    #[arg(long, default_value = "300s")]
+    pub request_timeout: String,
 }
 
 impl Args {
@@ -262,6 +265,7 @@ impl Default for Args {
             websocket_tls_domain: "localhost".to_string(),
             websocket_tls_ca_file: None,
             websocket_tls_validate_certificate: false,
+            request_timeout: "300s".to_string(),
         }
     }
 }
@@ -373,6 +377,7 @@ impl Args {
             websocket_tls_domain: self.websocket_tls_domain.clone(),
             websocket_tls_ca_file: self.websocket_tls_ca_file.clone(),
             websocket_tls_validate_certificate: self.websocket_tls_validate_certificate,
+            request_timeout: self.request_timeout.clone(),
         }
     }
 

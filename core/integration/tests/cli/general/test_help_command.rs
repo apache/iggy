@@ -190,6 +190,11 @@ Options:
 {CLAP_INDENT}
           [default: "1s"]
 
+      --request-timeout <REQUEST_TIMEOUT>
+          The optional per-request timeout for send/receive operations
+{CLAP_INDENT}
+          [default: "300s"]
+
   -q, --quiet
           Quiet mode (disabled stdout printing)
 

@@ -120,6 +120,7 @@ impl ClientProviderConfig {
                     keep_alive_interval: args.quic_keep_alive_interval,
                     max_idle_timeout: args.quic_max_idle_timeout,
                     validate_certificate: args.quic_validate_certificate,
+                    request_timeout: IggyDuration::from_str(&args.request_timeout).unwrap(),
                 }));
             }
             TransportProtocol::Http => {
@@ -148,6 +149,7 @@ impl ClientProviderConfig {
                         )
                         .unwrap(),
                     },
+                    request_timeout: IggyDuration::from_str(&args.request_timeout).unwrap(),
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
                             args.username,
@@ -181,6 +183,7 @@ impl ClientProviderConfig {
                     } else {
                         AutoLogin::Disabled
                     },
+                    request_timeout: IggyDuration::from_str(&args.request_timeout).unwrap(),
                     ws_config: WebSocketConfig::default(),
                     tls_enabled: args.websocket_tls_enabled,
                     tls_domain: args.websocket_tls_domain,
