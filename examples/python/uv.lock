@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [[package]]
 name = "apache-iggy"
-version = "0.8.1.dev1"
+version = "0.8.1.dev2"
 source = { directory = "../../foreign/python" }
 
 [package.metadata]
@@ -19,10 +19,10 @@ requires-dist = [
     { name = "pyrefly", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "pytest", marker = "extra == 'all'", specifier = ">=9.0.3,<10.0" },
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=9.0.3,<10.0" },
-    { name = "pytest-asyncio", marker = "extra == 'all'", specifier = ">=0.24.0,<2.0" },
-    { name = "pytest-asyncio", marker = "extra == 'testing'", specifier = ">=0.24.0,<2.0" },
-    { name = "pytest-cov", marker = "extra == 'all'", specifier = ">=4.0,<7.0" },
-    { name = "pytest-cov", marker = "extra == 'testing'", specifier = ">=4.0,<7.0" },
+    { name = "pytest-asyncio", marker = "extra == 'all'", specifier = ">=1.4.0,<2.0" },
+    { name = "pytest-asyncio", marker = "extra == 'testing'", specifier = ">=1.4.0,<2.0" },
+    { name = "pytest-cov", marker = "extra == 'all'", specifier = ">=4.0,<8.0" },
+    { name = "pytest-cov", marker = "extra == 'testing'", specifier = ">=4.0,<8.0" },
     { name = "pytest-timeout", marker = "extra == 'all'", specifier = ">=2.0,<3.0" },
     { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.0,<3.0" },
     { name = "pytest-xdist", marker = "extra == 'all'", specifier = ">=3.0,<4.0" },

@@ -14,14 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-//! End-to-end bootstrap: `replica::io::start_on_shard_zero` binds the
-//! WSS plane (alongside replica + client TCP listeners) and the
-//! caller dials the listener address surfaced via
-//! [`message_bus::replica::io::BoundPlanes::wss`]. Mirrors the
-//! `wss_client_listener.rs` listener-level test one level up the
-//! stack: the validator, paired-presence trio, and `BoundPlanes`
-//! growth all participate.
 
 mod common;
 
