@@ -22,8 +22,14 @@ This module provides pytest fixtures for setting up test environments
 and connecting to Iggy servers in various configurations.
 """
 
+# TODO(slbotbm): Create text fixture for clean up after
+# delete_stream() has been implemented.
+
 import asyncio
 import os
+import secrets
+import string
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +71,18 @@ async def iggy_client() -> IggyClient:
     return client
 
 
+@pytest.fixture
+def unique_name():
+    """Return a factory for generating unique test names."""
+
+    def make_name() -> str:
+        length = secrets.randbelow(248) + 8
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length))
+
+    return make_name
+
+
 @pytest.fixture(scope="session", autouse=True)
 def configure_asyncio():
     """Configure asyncio settings for tests."""
@@ -84,7 +102,9 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(items):
     """Modify test collection to add markers automatically."""
+    integration_modules = {
+        path.name for path in Path(__file__).parent.glob("test_*.py")
+    }
     for item in items:
-        # Mark all tests in test_iggy_sdk.py as integration tests
-        if "test_iggy_sdk" in item.nodeid or "test_tls" in item.nodeid:
+        if any(module in item.nodeid for module in integration_modules):
             item.add_marker(pytest.mark.integration)

@@ -18,12 +18,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
     AutoCommitWhen as RustAutoCommitWhen, *,
 };
 use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
+use pyo3::exceptions::PyStopIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
 use pyo3::prelude::*;
@@ -36,7 +38,6 @@ use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
 use crate::identifier::PyIdentifier;
-use crate::iterator::ReceiveMessageIterator;
 use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
@@ -78,13 +79,15 @@ impl IggyConsumer {
     }
 
     /// Gets the name of the stream this consumer group is configured for.
-    fn stream(&self) -> PyIdentifier {
-        self.inner.blocking_lock().stream().into()
+    fn stream(&self) -> PyResult<PyIdentifier> {
+        let guard = self.inner.blocking_lock();
+        PyIdentifier::try_from(guard.stream())
     }
 
     /// Gets the name of the topic this consumer group is configured for.
-    fn topic(&self) -> PyIdentifier {
-        self.inner.blocking_lock().topic().into()
+    fn topic(&self) -> PyResult<PyIdentifier> {
+        let guard = self.inner.blocking_lock();
+        PyIdentifier::try_from(guard.topic())
     }
 
     /// Stores the provided offset for the provided partition id or if none is specified
@@ -211,6 +214,37 @@ impl IggyConsumer {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
             Ok(())
         })
+    }
+}
+
+#[pyclass]
+pub struct ReceiveMessageIterator {
+    pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+}
+
+#[pymethods]
+impl ReceiveMessageIterator {
+    pub fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut inner = inner.lock().await;
+            if let Some(message) = inner.next().await {
+                Ok(message
+                    .map(|m| ReceiveMessage {
+                        inner: m.message,
+                        partition_id: m.partition_id,
+                    })
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                    })?)
+            } else {
+                Err(PyStopIteration::new_err("No more messages"))
+            }
+        })
+    }
+
+    pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
     }
 }
 

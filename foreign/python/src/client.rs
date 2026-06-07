@@ -55,15 +55,15 @@ impl IggyClient {
     #[pyo3(signature = (conn=None))]
     fn new(
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
             .build()
-            .unwrap();
-        IggyClient {
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+        Ok(IggyClient {
             inner: Arc::new(client),
-        }
+        })
     }
 
     /// Constructs a new IggyClient from a connection string.
@@ -153,7 +153,7 @@ impl IggyClient {
         py: Python<'a>,
         stream_id: PyIdentifier,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::from(stream_id);
+        let stream_id = Identifier::try_from(stream_id)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -201,7 +201,7 @@ impl IggyClient {
 
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
 
-        let stream = Identifier::from(stream);
+        let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -230,8 +230,8 @@ impl IggyClient {
         stream_id: PyIdentifier,
         topic_id: PyIdentifier,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::from(stream_id);
-        let topic_id = Identifier::from(topic_id);
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -266,8 +266,8 @@ impl IggyClient {
             .map(|message| message.inner)
             .collect::<Vec<_>>();
 
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
         let partitioning = Partitioning::partition_id(partitioning);
         let inner = self.inner.clone();
 
@@ -295,8 +295,8 @@ impl IggyClient {
         auto_commit: bool,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::default();
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
         let strategy: RustPollingStrategy = polling_strategy.into();
 
         let inner = self.inner.clone();
