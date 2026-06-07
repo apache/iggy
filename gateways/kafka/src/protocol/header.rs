@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![allow(
+    clippy::pedantic,
+    clippy::missing_const_for_fn,
+    clippy::match_same_arms
+)]
+
 use bytes::Bytes;
 
 use crate::error::{KafkaProtocolError, Result};

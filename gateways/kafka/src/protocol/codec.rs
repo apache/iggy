@@ -15,9 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Low-level Kafka primitive encoders/decoders (ported wire codec).
+
+#![allow(clippy::pedantic, clippy::missing_const_for_fn)]
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{KafkaProtocolError, Result};
+
+/// Upper bound for Kafka array/collection element counts decoded from the wire.
+pub const MAX_COLLECTION_LEN: usize = 65_536;
 
 pub struct Decoder {
     bytes: Bytes,
@@ -69,6 +76,9 @@ impl Decoder {
         let mut shift = 0u32;
         loop {
             let byte = self.read_u8()?;
+            if shift == 63 && byte & 0x7E != 0 {
+                return Err(KafkaProtocolError::InvalidVarint);
+            }
             result |= ((byte & 0x7F) as u64) << shift;
             if byte & 0x80 == 0 {
                 return Ok(result);
@@ -78,6 +88,41 @@ impl Decoder {
                 return Err(KafkaProtocolError::InvalidVarint);
             }
         }
+    }
+
+    /// Legacy array length: signed i32 count (must be non-negative).
+    pub fn read_i32_array_count(&mut self) -> Result<usize> {
+        let n = self.read_i32()?;
+        if n < 0 {
+            return Err(KafkaProtocolError::InvalidArrayLength(n));
+        }
+        let count = usize::try_from(n).map_err(|_| KafkaProtocolError::CollectionTooLarge {
+            count: n as usize,
+            max: MAX_COLLECTION_LEN,
+        })?;
+        if count > MAX_COLLECTION_LEN {
+            return Err(KafkaProtocolError::CollectionTooLarge {
+                count,
+                max: MAX_COLLECTION_LEN,
+            });
+        }
+        Ok(count)
+    }
+
+    /// Compact array length: unsigned varint holding `element_count + 1`.
+    pub fn read_compact_array_count(&mut self) -> Result<usize> {
+        let n = self.read_varint()?;
+        if n == 0 {
+            return Err(KafkaProtocolError::InvalidCompactArrayLength(0));
+        }
+        let count = (n - 1) as usize;
+        if count > MAX_COLLECTION_LEN {
+            return Err(KafkaProtocolError::CollectionTooLarge {
+                count,
+                max: MAX_COLLECTION_LEN,
+            });
+        }
+        Ok(count)
     }
 
     /// Legacy nullable string: i16 length prefix (-1 = null).
@@ -138,7 +183,17 @@ impl Decoder {
     /// Skip over a tagged-fields section.  Each field is: tag (varint) + size (varint) + bytes.
     /// A count of 0 is the common case (single byte 0x00).
     pub fn read_tagged_fields(&mut self) -> Result<()> {
-        let count = self.read_varint()? as usize;
+        let count = self.read_varint()?;
+        let count = usize::try_from(count).map_err(|_| KafkaProtocolError::CollectionTooLarge {
+            count: count as usize,
+            max: MAX_COLLECTION_LEN,
+        })?;
+        if count > MAX_COLLECTION_LEN {
+            return Err(KafkaProtocolError::CollectionTooLarge {
+                count,
+                max: MAX_COLLECTION_LEN,
+            });
+        }
         for _ in 0..count {
             self.read_varint()?; // tag number
             let size = self.read_varint()? as usize;
@@ -206,14 +261,18 @@ impl Encoder {
     }
 
     /// Legacy nullable string: i16 length prefix, -1 for null.
-    pub fn write_nullable_string(&mut self, v: Option<&str>) {
+    pub fn write_nullable_string(&mut self, v: Option<&str>) -> Result<()> {
         match v {
             None => self.write_i16(-1),
             Some(s) => {
-                self.write_i16(s.len() as i16);
+                if s.len() > i16::MAX as usize {
+                    return Err(KafkaProtocolError::StringTooLong { length: s.len() });
+                }
+                self.write_i16(i16::try_from(s.len()).expect("checked above"));
                 self.bytes.put_slice(s.as_bytes());
             }
         }
+        Ok(())
     }
 
     /// Compact nullable string (flexible versions): varint(len+1), 0 for null.

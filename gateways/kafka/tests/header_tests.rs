@@ -28,7 +28,7 @@ fn request_header_v1_decodes() {
     enc.write_i16(18); // api_key: ApiVersions
     enc.write_i16(2); // api_version
     enc.write_i32(101);
-    enc.write_nullable_string(Some("kafka-cli"));
+    enc.write_nullable_string(Some("kafka-cli")).unwrap();
     let bytes = enc.freeze();
 
     let header = RequestHeader::decode(bytes, 1).expect("decode should succeed");
@@ -44,7 +44,7 @@ fn request_header_v1_null_client_id() {
     enc.write_i16(18);
     enc.write_i16(1);
     enc.write_i32(5);
-    enc.write_nullable_string(None);
+    enc.write_nullable_string(None).unwrap();
     let bytes = enc.freeze();
 
     let header = RequestHeader::decode(bytes, 1).unwrap();

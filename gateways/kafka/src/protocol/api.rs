@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 
 use crate::protocol::codec::{Decoder, Encoder};
@@ -61,6 +63,37 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
 
+#[derive(Debug, Clone)]
+pub struct BrokerAdvertise {
+    pub host: String,
+    pub port: i32,
+}
+
+impl BrokerAdvertise {
+    #[must_use]
+    pub fn from_bind_addr(bind_addr: &str) -> Self {
+        bind_addr.parse::<SocketAddr>().map_or_else(
+            |_| Self {
+                host: "127.0.0.1".to_string(),
+                port: 9093,
+            },
+            |addr| Self {
+                host: addr.ip().to_string(),
+                port: i32::from(addr.port()),
+            },
+        )
+    }
+}
+
+impl Default for BrokerAdvertise {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 9093,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ApiVersionRange {
     pub api_key: i16,
@@ -68,42 +101,50 @@ pub struct ApiVersionRange {
     pub max_version: i16,
 }
 
-pub fn supported_api_ranges() -> Vec<ApiVersionRange> {
-    vec![
-        ApiVersionRange {
-            api_key: API_KEY_PRODUCE,
-            min_version: 3,
-            max_version: 9,
-        },
-        ApiVersionRange {
-            api_key: API_KEY_FETCH,
-            min_version: 4,
-            max_version: 12,
-        },
-        ApiVersionRange {
-            api_key: API_KEY_LIST_OFFSETS,
-            min_version: 1,
-            max_version: 6,
-        },
-        ApiVersionRange {
-            api_key: API_KEY_METADATA,
-            min_version: 0,
-            max_version: 9,
-        },
-        ApiVersionRange {
-            api_key: API_KEY_API_VERSIONS,
-            min_version: 0,
-            max_version: 3,
-        },
-        ApiVersionRange {
-            api_key: API_KEY_CREATE_TOPICS,
-            min_version: 2,
-            max_version: 5,
-        },
-    ]
+static SUPPORTED_RANGES: &[ApiVersionRange] = &[
+    ApiVersionRange {
+        api_key: API_KEY_PRODUCE,
+        min_version: 3,
+        max_version: 9,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_FETCH,
+        min_version: 4,
+        max_version: 12,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_LIST_OFFSETS,
+        min_version: 1,
+        max_version: 6,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_METADATA,
+        min_version: 0,
+        max_version: 9,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_API_VERSIONS,
+        min_version: 0,
+        max_version: 3,
+    },
+    ApiVersionRange {
+        api_key: API_KEY_CREATE_TOPICS,
+        min_version: 2,
+        max_version: 5,
+    },
+];
+
+#[must_use]
+pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
+    SUPPORTED_RANGES
 }
 
-pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
+pub fn handle_request(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+) -> Bytes {
     match api_key {
         API_KEY_API_VERSIONS => {
             if is_supported_version(api_key, api_version) {
@@ -114,15 +155,15 @@ pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
         }
         API_KEY_METADATA => {
             if is_supported_version(api_key, api_version) {
-                encode_metadata_response(api_version, body, ERROR_NONE)
+                encode_metadata_response(api_version, body, broker, ERROR_NONE)
             } else {
-                encode_metadata_response(0, body, ERROR_UNSUPPORTED_VERSION)
+                encode_metadata_response(0, body, broker, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_PRODUCE => {
             if is_supported_version(api_key, api_version) {
                 match decode_produce_request(api_version, body) {
-                    Ok(req) => encode_produce_response(api_version, req),
+                    Ok(req) => encode_produce_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode Produce request: {:?}", e);
                         encode_error_only_response(ERROR_CORRUPT_MESSAGE)
@@ -135,7 +176,7 @@ pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
         API_KEY_FETCH => {
             if is_supported_version(api_key, api_version) {
                 match decode_fetch_request(api_version, body) {
-                    Ok(req) => encode_fetch_response(api_version, req),
+                    Ok(req) => encode_fetch_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode Fetch request: {:?}", e);
                         encode_error_only_response(ERROR_CORRUPT_MESSAGE)
@@ -148,7 +189,7 @@ pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
         API_KEY_LIST_OFFSETS => {
             if is_supported_version(api_key, api_version) {
                 match decode_list_offsets_request(api_version, body) {
-                    Ok(req) => encode_list_offsets_response(api_version, req),
+                    Ok(req) => encode_list_offsets_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode ListOffsets request: {:?}", e);
                         encode_error_only_response(ERROR_CORRUPT_MESSAGE)
@@ -161,7 +202,7 @@ pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
         API_KEY_CREATE_TOPICS => {
             if is_supported_version(api_key, api_version) {
                 match decode_create_topics_request(api_version, body) {
-                    Ok(req) => encode_create_topics_response(api_version, req),
+                    Ok(req) => encode_create_topics_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode CreateTopics request: {:?}", e);
                         encode_error_only_response(ERROR_CORRUPT_MESSAGE)
@@ -175,31 +216,32 @@ pub fn handle_request(api_key: i16, api_version: i16, body: Bytes) -> Bytes {
     }
 }
 
+#[must_use]
 pub fn is_supported_version(api_key: i16, api_version: i16) -> bool {
-    supported_api_ranges()
-        .into_iter()
+    SUPPORTED_RANGES
+        .iter()
         .find(|r| r.api_key == api_key)
         .is_some_and(|r| api_version >= r.min_version && api_version <= r.max_version)
 }
 
 fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
     let flexible = api_version >= 3;
-    let ranges = supported_api_ranges();
+    let ranges = SUPPORTED_RANGES;
     let mut e = Encoder::with_capacity(128);
 
     e.write_i16(error_code);
 
     if flexible {
         e.write_varint((ranges.len() + 1) as u64);
-        for r in &ranges {
+        for r in ranges {
             e.write_i16(r.api_key);
             e.write_i16(r.min_version);
             e.write_i16(r.max_version);
             e.write_empty_tagged_fields();
         }
     } else {
-        e.write_i32(ranges.len() as i32);
-        for r in &ranges {
+        e.write_i32(i32::try_from(ranges.len()).expect("supported range table is small"));
+        for r in ranges {
             e.write_i16(r.api_key);
             e.write_i16(r.min_version);
             e.write_i16(r.max_version);
@@ -217,37 +259,82 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
     e.freeze()
 }
 
-fn encode_metadata_response(_api_version: i16, body: Bytes, top_level_error_code: i16) -> Bytes {
+fn encode_metadata_response(
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+    top_level_error_code: i16,
+) -> Bytes {
+    let flexible = api_version >= 9;
+    let topics_count = split_metadata_request_topics(body, api_version);
+    let topic_error = if top_level_error_code == ERROR_NONE {
+        ERROR_UNKNOWN_TOPIC_OR_PARTITION
+    } else {
+        top_level_error_code
+    };
+
     let mut e = Encoder::with_capacity(256);
 
-    e.write_i32(1);
-    e.write_i32(1);
-    e.write_nullable_string(Some("127.0.0.1"));
-    e.write_i32(9093);
-
-    let topics_count = split_metadata_request_topics(body);
-    e.write_i32(topics_count as i32);
-    for _ in 0..topics_count {
-        e.write_i16(if top_level_error_code == ERROR_NONE {
-            ERROR_UNKNOWN_TOPIC_OR_PARTITION
-        } else {
-            top_level_error_code
-        });
-        e.write_nullable_string(Some("unknown-topic"));
-        e.write_i32(0);
+    if api_version >= 1 {
+        e.write_i32(0); // throttle_time_ms
     }
 
-    e.write_i32(1);
+    if flexible {
+        e.write_varint(2); // one broker (N+1)
+        e.write_i32(1);
+        e.write_compact_nullable_string(Some(&broker.host));
+        e.write_i32(broker.port);
+        e.write_compact_nullable_string(None); // rack
+        e.write_empty_tagged_fields();
+
+        if api_version >= 2 {
+            e.write_compact_nullable_string(None); // cluster_id
+        }
+        e.write_i32(1); // controller_id
+
+        e.write_varint((topics_count + 1) as u64);
+        for _ in 0..topics_count {
+            e.write_i16(topic_error);
+            e.write_compact_nullable_string(Some("unknown-topic"));
+            e.write_varint(1); // empty partitions array
+            if api_version >= 4 {
+                e.write_bool(false); // is_internal
+            }
+            e.write_empty_tagged_fields();
+        }
+        e.write_empty_tagged_fields();
+    } else {
+        e.write_i32(1);
+        e.write_i32(1);
+        let _ = e.write_nullable_string(Some(&broker.host));
+        e.write_i32(broker.port);
+
+        e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
+        for _ in 0..topics_count {
+            e.write_i16(topic_error);
+            let _ = e.write_nullable_string(Some("unknown-topic"));
+            e.write_i32(0);
+        }
+
+        e.write_i32(1); // controller_id
+    }
+
     e.freeze()
 }
 
-fn encode_error_only_response(error_code: i16) -> Bytes {
+#[must_use]
+pub fn encode_error_only_response(error_code: i16) -> Bytes {
     let mut e = Encoder::with_capacity(2);
     e.write_i16(error_code);
     e.freeze()
 }
 
-pub fn split_metadata_request_topics(body: Bytes) -> usize {
+#[must_use]
+pub fn split_metadata_request_topics(body: Bytes, api_version: i16) -> usize {
     let mut d = Decoder::new(body);
-    d.read_i32().unwrap_or_default().max(0) as usize
+    if api_version >= 9 {
+        d.read_compact_array_count().unwrap_or(0)
+    } else {
+        d.read_i32_array_count().unwrap_or(0)
+    }
 }

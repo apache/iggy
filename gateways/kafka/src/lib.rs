@@ -17,15 +17,6 @@
 
 //! Kafka wire protocol gateway foundation for Apache Iggy.
 
-// Ported wire codec from spike; pedantic clippy cleanup is a follow-up.
-#![allow(
-    clippy::pedantic,
-    clippy::missing_const_for_fn,
-    clippy::wildcard_imports,
-    clippy::match_same_arms,
-    clippy::needless_pass_by_value
-)]
-
 pub mod error;
 pub mod protocol;
 pub mod server;

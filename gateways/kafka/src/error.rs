@@ -34,6 +34,14 @@ pub enum KafkaProtocolError {
     InvalidVarint,
     #[error("unsupported request header version: {0}")]
     UnsupportedHeaderVersion(i16),
+    #[error("invalid array length: {0}")]
+    InvalidArrayLength(i32),
+    #[error("invalid compact array length: encoded value must be >= 1, got {0}")]
+    InvalidCompactArrayLength(u64),
+    #[error("collection length {count} exceeds maximum {max}")]
+    CollectionTooLarge { count: usize, max: usize },
+    #[error("string length {length} exceeds i16::MAX")]
+    StringTooLong { length: usize },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
