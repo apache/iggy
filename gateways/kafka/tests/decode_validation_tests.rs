@@ -113,7 +113,7 @@ fn produce_response_encodes_for_all_supported_versions() {
         let body = load_body(0, "Produce", version);
         let req = decode_produce_request(version, body)
             .unwrap_or_else(|e| panic!("Produce v{version} decode failed: {e}"));
-        let resp = encode_produce_response(version, req);
+        let resp = encode_produce_response(version, &req);
         assert!(
             !resp.is_empty(),
             "Produce v{version}: response must not be empty"
@@ -126,7 +126,7 @@ fn produce_response_v3_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(0, "Produce", 3);
     let req = decode_produce_request(3, body).unwrap();
-    let resp = encode_produce_response(3, req);
+    let resp = encode_produce_response(3, &req);
 
     let mut d = Decoder::new(resp);
     let topic_count = d.read_i32().unwrap();
@@ -153,7 +153,7 @@ fn produce_response_v8_includes_record_errors() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(0, "Produce", 8);
     let req = decode_produce_request(8, body).unwrap();
-    let resp = encode_produce_response(8, req);
+    let resp = encode_produce_response(8, &req);
 
     let mut d = Decoder::new(resp);
     let topic_count = d.read_i32().unwrap();
@@ -217,7 +217,7 @@ fn fetch_response_encodes_for_all_supported_versions() {
         let body = load_body(1, "Fetch", version);
         let req = decode_fetch_request(version, body)
             .unwrap_or_else(|e| panic!("Fetch v{version} decode failed: {e}"));
-        let resp = encode_fetch_response(version, req);
+        let resp = encode_fetch_response(version, &req);
         assert!(
             !resp.is_empty(),
             "Fetch v{version}: response must not be empty"
@@ -230,7 +230,7 @@ fn fetch_response_v7_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(1, "Fetch", 7);
     let req = decode_fetch_request(7, body).unwrap();
-    let resp = encode_fetch_response(7, req);
+    let resp = encode_fetch_response(7, &req);
 
     let mut d = Decoder::new(resp);
     let throttle_ms = d.read_i32().unwrap(); // v1+
@@ -289,7 +289,7 @@ fn list_offsets_response_encodes_for_all_supported_versions() {
         let body = load_body(2, "ListOffsets", version);
         let req = decode_list_offsets_request(version, body)
             .unwrap_or_else(|e| panic!("ListOffsets v{version} decode failed: {e}"));
-        let resp = encode_list_offsets_response(version, req);
+        let resp = encode_list_offsets_response(version, &req);
         assert!(
             !resp.is_empty(),
             "ListOffsets v{version}: response must not be empty"
@@ -302,7 +302,7 @@ fn list_offsets_response_v1_no_leader_epoch() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(2, "ListOffsets", 1);
     let req = decode_list_offsets_request(1, body).unwrap();
-    let resp = encode_list_offsets_response(1, req);
+    let resp = encode_list_offsets_response(1, &req);
 
     let mut d = Decoder::new(resp);
     // v1: no throttle_time_ms
@@ -329,7 +329,7 @@ fn list_offsets_response_v4_has_leader_epoch() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(2, "ListOffsets", 4);
     let req = decode_list_offsets_request(4, body).unwrap();
-    let resp = encode_list_offsets_response(4, req);
+    let resp = encode_list_offsets_response(4, &req);
 
     let mut d = Decoder::new(resp);
     let _throttle = d.read_i32().unwrap(); // v2+
@@ -387,7 +387,7 @@ fn create_topics_response_encodes_for_all_supported_versions() {
         let body = load_body(19, "CreateTopics", version);
         let req = decode_create_topics_request(version, body)
             .unwrap_or_else(|e| panic!("CreateTopics v{version} decode failed: {e}"));
-        let resp = encode_create_topics_response(version, req);
+        let resp = encode_create_topics_response(version, &req);
         assert!(
             !resp.is_empty(),
             "CreateTopics v{version}: response must not be empty"
@@ -401,7 +401,7 @@ fn create_topics_response_v2_roundtrip() {
     let body = load_body(19, "CreateTopics", 2);
     let req = decode_create_topics_request(2, body).unwrap();
     let topic_name = req.topics[0].name.clone();
-    let resp = encode_create_topics_response(2, req);
+    let resp = encode_create_topics_response(2, &req);
 
     let mut d = Decoder::new(resp);
     let _throttle = d.read_i32().unwrap(); // v2+
@@ -421,7 +421,7 @@ fn create_topics_response_v5_has_topic_config_error_code() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(19, "CreateTopics", 5);
     let req = decode_create_topics_request(5, body).unwrap();
-    let resp = encode_create_topics_response(5, req);
+    let resp = encode_create_topics_response(5, &req);
 
     let mut d = Decoder::new(resp);
     let _throttle = d.read_i32().unwrap(); // v2+

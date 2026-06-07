@@ -17,6 +17,8 @@
 
 //! Kafka request decoders for critical API keys
 
+#![allow(clippy::pedantic)]
+
 use crate::error::Result;
 use crate::protocol::codec::Decoder;
 use bytes::Bytes;
@@ -62,9 +64,9 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> Result<ProduceReques
 
     // topics array
     let topics_count = if flexible {
-        (d.read_varint()? - 1) as usize
+        d.read_compact_array_count()?
     } else {
-        d.read_i32()? as usize
+        d.read_i32_array_count()?
     };
 
     let mut topics = Vec::with_capacity(topics_count);
@@ -76,9 +78,9 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> Result<ProduceReques
         };
 
         let partitions_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
 
         let mut partitions = Vec::with_capacity(partitions_count);
@@ -160,9 +162,9 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
 
     // topics array
     let topics_count = if flexible {
-        (d.read_varint()? - 1) as usize
+        d.read_compact_array_count()?
     } else {
-        d.read_i32()? as usize
+        d.read_i32_array_count()?
     };
 
     let mut topics = Vec::with_capacity(topics_count);
@@ -174,9 +176,9 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
         };
 
         let partitions_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
 
         let mut partitions = Vec::with_capacity(partitions_count);
@@ -219,21 +221,21 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
     // forgotten_topics_data (v7+) — skip
     if version >= 7 {
         let forgotten_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
         for _ in 0..forgotten_count {
             if flexible {
                 d.read_compact_nullable_string()?;
-                let partitions_count = (d.read_varint()? - 1) as usize;
+                let partitions_count = d.read_compact_array_count()?;
                 for _ in 0..partitions_count {
                     d.read_i32()?;
                 }
                 d.read_tagged_fields()?;
             } else {
                 d.read_nullable_string()?;
-                let partitions_count = d.read_i32()? as usize;
+                let partitions_count = d.read_i32_array_count()?;
                 for _ in 0..partitions_count {
                     d.read_i32()?;
                 }
@@ -291,9 +293,9 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
     let isolation_level = if version >= 2 { d.read_i8()? } else { 0 };
 
     let topics_count = if flexible {
-        (d.read_varint()? - 1) as usize
+        d.read_compact_array_count()?
     } else {
-        d.read_i32()? as usize
+        d.read_i32_array_count()?
     };
 
     let mut topics = Vec::with_capacity(topics_count);
@@ -305,9 +307,9 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
         };
 
         let partitions_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
 
         let mut partitions = Vec::with_capacity(partitions_count);
@@ -370,9 +372,9 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
     let flexible = version >= 5;
 
     let topics_count = if flexible {
-        (d.read_varint()? - 1) as usize
+        d.read_compact_array_count()?
     } else {
-        d.read_i32()? as usize
+        d.read_i32_array_count()?
     };
 
     let mut topics = Vec::with_capacity(topics_count);
@@ -388,16 +390,16 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
 
         // assignments (COMPACT_ARRAY or ARRAY) — skip
         let assignments_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
         for _ in 0..assignments_count {
             d.read_i32()?; // partition_index
             let replicas_count = if flexible {
-                (d.read_varint()? - 1) as usize
+                d.read_compact_array_count()?
             } else {
-                d.read_i32()? as usize
+                d.read_i32_array_count()?
             };
             for _ in 0..replicas_count {
                 d.read_i32()?; // broker_id
@@ -409,9 +411,9 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
 
         // configs (COMPACT_ARRAY or ARRAY) — skip
         let configs_count = if flexible {
-            (d.read_varint()? - 1) as usize
+            d.read_compact_array_count()?
         } else {
-            d.read_i32()? as usize
+            d.read_i32_array_count()?
         };
         for _ in 0..configs_count {
             if flexible {
