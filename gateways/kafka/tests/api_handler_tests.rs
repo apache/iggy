@@ -18,16 +18,20 @@
 use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_METADATA, ERROR_UNSUPPORTED_VERSION, handle_request,
-    is_supported_version, split_metadata_request_topics, supported_api_ranges,
+    API_KEY_API_VERSIONS, API_KEY_METADATA, BrokerAdvertise, ERROR_UNSUPPORTED_VERSION,
+    handle_request, is_supported_version, split_metadata_request_topics, supported_api_ranges,
 };
+
+fn test_broker() -> BrokerAdvertise {
+    BrokerAdvertise::default()
+}
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
 #[test]
 fn api_versions_v1_response_non_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new());
+    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker());
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -51,7 +55,7 @@ fn api_versions_v1_response_non_flexible_format() {
 
 #[test]
 fn api_versions_v3_response_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new());
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker());
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -81,7 +85,7 @@ fn api_versions_v3_response_flexible_format() {
 
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
-    let body = handle_request(API_KEY_METADATA, 0, Bytes::new());
+    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker());
     let mut d = Decoder::new(body);
 
     let broker_count = d.read_i32().unwrap();
@@ -101,7 +105,7 @@ fn metadata_response_has_broker_array_and_topic_array() {
 fn unsupported_version_returns_protocol_error() {
     let mut req = Vec::new();
     req.extend_from_slice(&1_i32.to_be_bytes());
-    let body = handle_request(API_KEY_METADATA, 99, Bytes::from(req));
+    let body = handle_request(API_KEY_METADATA, 99, Bytes::from(req), &test_broker());
     let mut d = Decoder::new(body);
     let _broker_count = d.read_i32().unwrap();
     let _ = d.read_i32().unwrap();
@@ -123,7 +127,7 @@ fn unsupported_version_returns_protocol_error() {
 
 #[test]
 fn unknown_api_key_returns_error_only_payload() {
-    let body = handle_request(999, 0, Bytes::new());
+    let body = handle_request(999, 0, Bytes::new(), &test_broker());
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
@@ -132,7 +136,7 @@ fn unknown_api_key_returns_error_only_payload() {
 fn metadata_topic_split_reads_array_count() {
     let mut raw = Vec::new();
     raw.extend_from_slice(&2_i32.to_be_bytes());
-    assert_eq!(split_metadata_request_topics(Bytes::from(raw)), 2);
+    assert_eq!(split_metadata_request_topics(Bytes::from(raw), 0), 2);
 }
 
 #[test]

@@ -17,12 +17,15 @@
 
 use bytes::Bytes;
 
-use iggy_gateway_kafka::protocol::api::{API_KEY_API_VERSIONS, API_KEY_METADATA, handle_request};
+use iggy_gateway_kafka::protocol::api::{
+    API_KEY_API_VERSIONS, API_KEY_METADATA, BrokerAdvertise, handle_request,
+};
 use iggy_gateway_kafka::protocol::codec::Encoder;
 
 #[test]
 fn golden_apiversions_v1_response_fixture() {
-    let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new());
+    let broker = BrokerAdvertise::default();
+    let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker);
 
     // error_code=0, api_count=6
     // key 0  (Produce)      min=3  max=9
@@ -52,7 +55,7 @@ fn golden_metadata_v0_single_topic_response_fixture() {
     request.write_i32(1); // one topic
     let req_bytes = request.freeze();
 
-    let actual = handle_request(API_KEY_METADATA, 0, req_bytes);
+    let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default());
 
     // brokers[1]: node_id=1, host=127.0.0.1, port=9093
     // topics[1]: topic_error=3, topic_name=unknown-topic, partitions[0]

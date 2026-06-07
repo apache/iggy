@@ -41,7 +41,7 @@ async fn read_frame_reads_valid_payload() {
     enc.write_i16(18);
     enc.write_i16(3);
     enc.write_i32(123);
-    enc.write_nullable_string(Some("test-client"));
+    enc.write_nullable_string(Some("test-client")).unwrap();
     let payload = enc.freeze();
 
     let mut frame = BytesMut::with_capacity(4 + payload.len());

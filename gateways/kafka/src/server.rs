@@ -24,10 +24,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::api::handle_request;
+use crate::protocol::api::{
+    BrokerAdvertise, ERROR_INVALID_REQUEST, encode_error_only_response, handle_request,
+};
 use crate::protocol::codec::Decoder;
 use crate::protocol::header::{
     RequestHeader, ResponseHeader, request_header_version, response_header_version,
@@ -57,30 +60,49 @@ pub struct KafkaServer {
 }
 
 impl KafkaServer {
+    #[must_use]
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config: Arc::new(config),
         }
     }
 
+    /// Accept Kafka wire connections until `shutdown` fires, then drain in-flight tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding fails or a non-transient `accept()` error occurs.
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
         let listener = TcpListener::bind(&self.config.bind_addr).await?;
         info!("kafka listener bound on {}", self.config.bind_addr);
+
+        let tracker = TaskTracker::new();
+        let broker = BrokerAdvertise::from_bind_addr(&self.config.bind_addr);
 
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
                     info!("kafka listener shutdown requested");
+                    tracker.close();
+                    tracker.wait().await;
                     break;
                 }
                 accept_result = listener.accept() => {
-                    let (stream, peer) = accept_result?;
-                    let cfg = Arc::clone(&self.config);
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_connection(stream, cfg, peer).await {
-                            warn!(%peer, "connection closed with error: {err}");
+                    match accept_result {
+                        Ok((stream, peer)) => {
+                            let cfg = Arc::clone(&self.config);
+                            let broker = broker.clone();
+                            tracker.spawn(async move {
+                                if let Err(err) = handle_connection(stream, cfg, peer, broker).await {
+                                    warn!(%peer, "connection closed with error: {err}");
+                                }
+                            });
                         }
-                    });
+                        Err(e) if is_transient_accept_error(&e) => {
+                            warn!(%e, "transient accept error, continuing");
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 }
             }
         }
@@ -88,10 +110,24 @@ impl KafkaServer {
     }
 }
 
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        err.kind(),
+        ErrorKind::Interrupted | ErrorKind::ConnectionAborted | ErrorKind::WouldBlock
+    ) || matches!(
+        err.raw_os_error(),
+        // EMFILE / ENFILE are common across Unix platforms when fd limits are hit.
+        Some(23 | 24)
+    )
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<ServerConfig>,
     peer: SocketAddr,
+    broker: BrokerAdvertise,
 ) -> Result<()> {
     info!(%peer, "connection accepted");
 
@@ -119,9 +155,26 @@ async fn handle_connection(
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let req_hdr_ver = request_header_version(api_key, api_version);
         let resp_hdr_ver = response_header_version(api_key, api_version);
+        let correlation_id = correlation_id_from_frame(&frame);
 
         let mut decoder = Decoder::new(frame);
-        let req = RequestHeader::decode_from(&mut decoder, req_hdr_ver)?;
+        let req = match RequestHeader::decode_from(&mut decoder, req_hdr_ver) {
+            Ok(req) => req,
+            Err(KafkaProtocolError::UnsupportedHeaderVersion(_)) => {
+                warn!(%peer, api_key, api_version, "unsupported request header version");
+                let body_response = encode_error_only_response(ERROR_INVALID_REQUEST);
+                let resp_header = ResponseHeader { correlation_id };
+                let encoded_header = resp_header.encode(0);
+                let mut payload =
+                    BytesMut::with_capacity(encoded_header.len() + body_response.len());
+                payload.put_slice(&encoded_header);
+                payload.put_slice(&body_response);
+                write_frame(&mut stream, &payload, config.write_timeout).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
         info!(
             %peer,
             api_key = req.api_key,
@@ -132,7 +185,7 @@ async fn handle_connection(
         );
 
         let body = decoder.read_bytes(decoder.remaining())?;
-        let body_response = handle_request(req.api_key, req.api_version, body);
+        let body_response = handle_request(req.api_key, req.api_version, body, &broker);
 
         let resp_header = ResponseHeader {
             correlation_id: req.correlation_id,
@@ -146,6 +199,19 @@ async fn handle_connection(
     }
 }
 
+fn correlation_id_from_frame(frame: &bytes::Bytes) -> i32 {
+    if frame.len() >= 8 {
+        i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
+    } else {
+        0
+    }
+}
+
+/// Read one length-prefixed Kafka frame from `stream`.
+///
+/// # Errors
+///
+/// Returns an error on timeout, invalid length, or I/O failure.
 pub async fn read_frame(
     stream: &mut TcpStream,
     max_frame_size: usize,
@@ -156,12 +222,16 @@ pub async fn read_frame(
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
 
-    let frame_len = i32::from_be_bytes(len_buf);
-    if frame_len <= 0 {
-        return Err(KafkaProtocolError::InvalidFrameLength(frame_len));
+    let frame_len_i32 = i32::from_be_bytes(len_buf);
+    if frame_len_i32 <= 0 {
+        return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
     }
 
-    let frame_len = frame_len as usize;
+    let frame_len =
+        usize::try_from(frame_len_i32).map_err(|_| KafkaProtocolError::FrameTooLarge {
+            max_bytes: max_frame_size,
+            actual_bytes: u32::MAX as usize,
+        })?;
     if frame_len > max_frame_size {
         return Err(KafkaProtocolError::FrameTooLarge {
             max_bytes: max_frame_size,
@@ -176,6 +246,11 @@ pub async fn read_frame(
     Ok(bytes::Bytes::from(data))
 }
 
+/// Write one length-prefixed Kafka frame to `stream`.
+///
+/// # Errors
+///
+/// Returns an error on timeout, oversize payload, or I/O failure.
 pub async fn write_frame(
     stream: &mut TcpStream,
     payload: &[u8],
@@ -189,7 +264,11 @@ pub async fn write_frame(
         });
     }
     let mut frame = BytesMut::with_capacity(4 + len);
-    frame.put_i32(len as i32);
+    let len_i32 = i32::try_from(len).map_err(|_| KafkaProtocolError::FrameTooLarge {
+        max_bytes: i32::MAX as usize,
+        actual_bytes: len,
+    })?;
+    frame.put_i32(len_i32);
     frame.extend_from_slice(payload);
     timeout(write_timeout, stream.write_all(&frame))
         .await

@@ -26,8 +26,8 @@ fn codec_round_trip_primitives_and_nullable_fields() {
     enc.write_i16(42);
     enc.write_i32(123_456);
     enc.write_i64(9_999_999);
-    enc.write_nullable_string(Some("client-a"));
-    enc.write_nullable_string(None);
+    enc.write_nullable_string(Some("client-a")).unwrap();
+    enc.write_nullable_string(None).unwrap();
     enc.write_nullable_bytes(Some(&[1, 2, 3]));
     enc.write_nullable_bytes(None);
     let bytes = enc.freeze();
