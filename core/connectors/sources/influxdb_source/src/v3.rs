@@ -534,6 +534,7 @@ pub(crate) async fn poll(
     if cap_factor > 0
         && full_batch
         && !all_same_timestamp
+        && result.rows_at_max_cursor > 1
         && let Some(penultimate) = result.penultimate_cursor
     {
         let safe_count = result.safe_message_count;
