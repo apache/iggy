@@ -160,17 +160,25 @@ func TestSendAndFetchResponse_CancelDuringIO(t *testing.T) {
 // and writes back a response with the given status code and payload.
 func serverRespond(t *testing.T, serverConn net.Conn, status uint32, payload []byte) {
 	t.Helper()
+	_ = serverRespondCapture(t, serverConn, status, payload)
+}
+
+// serverRespondCapture is like serverRespond but returns the request bytes
+// (4-byte command code followed by the marshaled body) it read off the pipe.
+// Returns nil if the read or write fails.
+func serverRespondCapture(t *testing.T, serverConn net.Conn, status uint32, payload []byte) []byte {
+	t.Helper()
 
 	var lengthBuf [RequestInitialBytesLength]byte
 	if _, err := serverConn.Read(lengthBuf[:]); err != nil {
 		t.Errorf("server: read request length: %v", err)
-		return
+		return nil
 	}
 	reqLen := int(binary.LittleEndian.Uint32(lengthBuf[:]))
-	discard := make([]byte, reqLen)
-	if _, err := serverConn.Read(discard); err != nil {
+	req := make([]byte, reqLen)
+	if _, err := serverConn.Read(req); err != nil {
 		t.Errorf("server: read request body: %v", err)
-		return
+		return nil
 	}
 
 	resp := make([]byte, 8+len(payload))
@@ -179,7 +187,9 @@ func serverRespond(t *testing.T, serverConn net.Conn, status uint32, payload []b
 	copy(resp[8:], payload)
 	if _, err := serverConn.Write(resp); err != nil {
 		t.Errorf("server: write response: %v", err)
+		return nil
 	}
+	return req
 }
 
 func TestSendAndFetchResponse_ErrorStatus(t *testing.T) {

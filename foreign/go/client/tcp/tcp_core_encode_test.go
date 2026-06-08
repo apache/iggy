@@ -62,7 +62,7 @@ func newTestPollCmd() *command.PollMessages {
 	}
 }
 
-func TestEncodeWireRequest_AppenderPath_MatchesCreatePayload(t *testing.T) {
+func TestEncodeWireRequest_AppenderPathMatchesCreatePayload(t *testing.T) {
 	cmd := newTestPollCmd()
 
 	// reference: the legacy MarshalBinary + createPayload pipeline.
@@ -93,7 +93,7 @@ func TestEncodeWireRequest_AppenderPath_MatchesCreatePayload(t *testing.T) {
 	}
 }
 
-func TestEncodeWireRequest_FallbackPath_MatchesCreatePayload(t *testing.T) {
+func TestEncodeWireRequest_FallbackPathMatchesCreatePayload(t *testing.T) {
 	cmd := &fakeMarshalOnlyCmd{
 		body: []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03},
 		code: command.Code(42),
@@ -110,7 +110,7 @@ func TestEncodeWireRequest_FallbackPath_MatchesCreatePayload(t *testing.T) {
 	}
 }
 
-func TestEncodeWireRequest_FallbackPath_PropagatesMarshalError(t *testing.T) {
+func TestEncodeWireRequest_FallbackPropagatesMarshalError(t *testing.T) {
 	sentinel := errors.New("marshal failed")
 	cmd := &fakeMarshalOnlyCmd{code: command.Code(1), wantErr: sentinel}
 	if _, err := encodeWireRequest(nil, cmd); !errors.Is(err, sentinel) {
@@ -171,33 +171,13 @@ func TestRequestBufPool_OversizedBufferDropped(t *testing.T) {
 	releaseRequestBuf(bp)
 }
 
-func TestDo_PollMessages_EndToEnd(t *testing.T) {
+func TestDo_PollMessagesEndToEnd(t *testing.T) {
 	c, serverConn := newTestClient(t)
 	cmd := newTestPollCmd()
 
-	// Server: read the wire request, echo back a success status with empty body.
-	done := make(chan []byte, 1)
+	captured := make(chan []byte, 1)
 	go func() {
-		var hdr [RequestInitialBytesLength]byte
-		if _, err := serverConn.Read(hdr[:]); err != nil {
-			done <- nil
-			return
-		}
-		reqLen := int(binary.LittleEndian.Uint32(hdr[:]))
-		req := make([]byte, reqLen)
-		if _, err := serverConn.Read(req); err != nil {
-			done <- nil
-			return
-		}
-		// Echo back: status=0, body length=0 (handled as empty success).
-		var resp [ResponseInitialBytesLength]byte
-		binary.LittleEndian.PutUint32(resp[0:4], 0)
-		binary.LittleEndian.PutUint32(resp[4:8], 0)
-		if _, err := serverConn.Write(resp[:]); err != nil {
-			done <- nil
-			return
-		}
-		done <- req
+		captured <- serverRespondCapture(t, serverConn, 0, nil)
 	}()
 
 	out, err := c.do(context.Background(), cmd)
@@ -208,7 +188,7 @@ func TestDo_PollMessages_EndToEnd(t *testing.T) {
 		t.Errorf("expected empty response body, got %d bytes", len(out))
 	}
 
-	got := <-done
+	got := <-captured
 	if got == nil {
 		t.Fatalf("server side failed to receive request")
 	}
