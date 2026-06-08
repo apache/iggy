@@ -17,18 +17,33 @@
 
 use super::{LocalIdx, ShardId};
 
-/// Location of a partition: which shard owns it and its local index within that shard.
+/// `local_idx = None` on non-owning rows so peer-shard inserts can't
+/// clobber the owner's real index via unconditional papaya insert.
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionLocation {
     pub shard_id: ShardId,
-    pub local_idx: LocalIdx,
+    pub local_idx: Option<LocalIdx>,
+    /// `Partition::created_revision` from the committed metadata at the
+    /// time this row was written. The reconciler compares it
+    /// against the STM's current value to detect a stale local partition
+    /// after a delete+recreate reused the same slab-key namespace tuple.
+    pub epoch: u64,
 }
 
 impl PartitionLocation {
-    pub fn new(shard_id: ShardId, local_idx: LocalIdx) -> Self {
+    pub fn owned(shard_id: ShardId, local_idx: LocalIdx, epoch: u64) -> Self {
         Self {
             shard_id,
-            local_idx,
+            local_idx: Some(local_idx),
+            epoch,
+        }
+    }
+
+    pub fn routed(shard_id: ShardId, epoch: u64) -> Self {
+        Self {
+            shard_id,
+            local_idx: None,
+            epoch,
         }
     }
 }

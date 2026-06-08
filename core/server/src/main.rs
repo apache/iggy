@@ -47,7 +47,7 @@ use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
 use server_common::MemoryPool;
-use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -343,8 +343,8 @@ fn main() -> Result<(), ServerError> {
                             &ns,
                             shard_assignment.len() as u32,
                         ));
-                        // TODO(hubcio): LocalIdx is 0 until IggyPartitions is integrated
-                        let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+                        // epoch is reconciler-only; unused by legacy server.
+                        let location = PartitionLocation::routed(shard_id, 0);
                         shards_table.insert(ns, location);
                     }
                 }

@@ -22,8 +22,8 @@ use super::server::{
 };
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use super::sharding::{
-    CpuAllocation, INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
-    ShardingConfig,
+    CpuAllocation, INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
+    SHUTDOWN_POLL_INTERVAL_MAX, ShardingConfig,
 };
 use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
@@ -436,6 +436,23 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
                  the shutdown flag effectively unobservable)",
                 poll, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let reconcile = self.reconcile_periodic_interval.get_duration();
+        if reconcile.is_zero() {
+            eprintln!(
+                "Invalid sharding configuration: reconcile_periodic_interval must be > 0 (a zero \
+                 cadence busy-loops the partition reconciler on every shard)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if reconcile > RECONCILE_PERIODIC_INTERVAL_MAX {
+            eprintln!(
+                "Invalid sharding configuration: reconcile_periodic_interval {:?} exceeds the \
+                 {:?} cap (a long tick makes post-failure convergence latency operator-visible)",
+                reconcile, RECONCILE_PERIODIC_INTERVAL_MAX
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }

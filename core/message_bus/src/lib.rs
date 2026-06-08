@@ -507,6 +507,14 @@ pub trait MessageBus {
     /// Panics on a second install on the same bus, same one-shot
     /// `OnceCell` invariant as [`Self::set_replica_forward_fn`].
     fn set_client_forward_fn(&self, f: ClientForwardFn);
+
+    /// Register a detached `compio::runtime::spawn` handle so
+    /// [`shutdown`](IggyMessageBus::shutdown) can await it before the
+    /// runtime drops. Production [`IggyMessageBus`] pushes onto a
+    /// `RefCell<Vec<JoinHandle>>` drained on shutdown; test stubs can
+    /// leave the no-op default (their tasks are short-lived + don't
+    /// need orderly drain).
+    fn track_background(&self, _handle: JoinHandle<()>) {}
 }
 
 /// Production message bus backed by real TCP connections.
@@ -1024,6 +1032,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn set_client_forward_fn(&self, f: ClientForwardFn) {
         (**self).set_client_forward_fn(f);
     }
+
+    fn track_background(&self, handle: JoinHandle<()>) {
+        (**self).track_background(handle);
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1108,6 +1120,10 @@ impl MessageBus for IggyMessageBus {
 
     fn set_client_forward_fn(&self, f: ClientForwardFn) {
         Self::set_client_forward_fn(self, f);
+    }
+
+    fn track_background(&self, handle: JoinHandle<()>) {
+        Self::track_background(self, handle);
     }
 }
 
