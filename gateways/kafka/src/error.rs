@@ -42,6 +42,8 @@ pub enum KafkaProtocolError {
     CollectionTooLarge { count: usize, max: usize },
     #[error("string length {length} exceeds i16::MAX")]
     StringTooLong { length: usize },
+    #[error("null topic name in request")]
+    NullTopicName,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -57,10 +57,10 @@ fn golden_metadata_v0_single_topic_response_fixture() {
 
     let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default());
 
+    // Metadata v0 layout: brokers[], topics[]  (no controller_id — added in v1)
     // brokers[1]: node_id=1, host=127.0.0.1, port=9093
     // topics[1]: topic_error=3, topic_name=unknown-topic, partitions[0]
-    // controller_id=1 (included by this implementation baseline)
-    let expected: [u8; 52] = [
+    let expected: [u8; 48] = [
         0x00, 0x00, 0x00, 0x01, // broker count
         0x00, 0x00, 0x00, 0x01, // node id
         0x00, 0x09, // host len
@@ -72,7 +72,6 @@ fn golden_metadata_v0_single_topic_response_fixture() {
         0x75, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x2d, 0x74, 0x6f, 0x70, 0x69,
         0x63, // unknown-topic
         0x00, 0x00, 0x00, 0x00, // partition count
-        0x00, 0x00, 0x00, 0x01, // controller id
     ];
     assert_eq!(actual.as_ref(), &expected);
 }

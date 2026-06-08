@@ -21,7 +21,7 @@
     clippy::match_same_arms
 )]
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::{Decoder, Encoder};
@@ -193,5 +193,19 @@ impl ResponseHeader {
             e.write_empty_tagged_fields();
         }
         e.freeze()
+    }
+
+    /// Write this header directly into an existing buffer (avoids a separate heap alloc).
+    pub fn encode_into(&self, buf: &mut bytes::BytesMut, header_version: i16) {
+        buf.put_i32(self.correlation_id);
+        if header_version >= 1 {
+            buf.put_u8(0); // empty tagged fields
+        }
+    }
+
+    /// Byte size of the encoded header for a given version.
+    #[must_use]
+    pub fn encoded_size(header_version: i16) -> usize {
+        if header_version >= 1 { 5 } else { 4 }
     }
 }
