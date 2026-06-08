@@ -47,88 +47,281 @@ if [ ! -f "ASF_LICENSE.txt" ]; then
   exit 1
 fi
 
-# Common patterns to ignore (build artifacts, dependencies, IDE files)
-IGNORE_PATTERNS=(
-  "**/target/**"
-  "target/**"
-  "**/node_modules/**"
-  "node_modules/**"
-  "**/.venv/**"
-  ".venv/**"
-  "**/venv/**"
-  "venv/**"
-  "**/dist/**"
-  "dist/**"
-  "**/build/**"
-  "build/**"
-  "**/.idea/**"
-  ".idea/**"
-  "**/.vscode/**"
-  ".vscode/**"
-  "**/.gradle/**"
-  ".gradle/**"
-  "**/.svelte-kit/**"
-  ".svelte-kit/**"
-  "**/bin/**"
-  "**/obj/**"
-  "**/local_data*/**"
-  "**/performance_results*/**"
-)
-
-# Determine how to run addlicense: prefer local binary, fall back to Docker
-USE_DOCKER=false
-ADDLICENSE_CMD=""
-
-if command -v addlicense &> /dev/null; then
-  ADDLICENSE_CMD="addlicense"
-  echo "Using local addlicense binary"
-elif command -v docker &> /dev/null; then
-  USE_DOCKER=true
-  echo "Local addlicense not found, using Docker fallback"
-  echo "Pulling addlicense Docker image..."
-  docker pull ghcr.io/google/addlicense:latest >/dev/null 2>&1
-else
-  echo "❌ Neither addlicense nor docker command found"
-  echo "💡 Install addlicense: go install github.com/google/addlicense@latest"
-  echo "   Or install Docker to use the containerized version"
+if [ ! -f "licenserc.toml" ]; then
+  echo "❌ licenserc.toml not found in repository root"
   exit 1
 fi
 
-# Build ignore flags for addlicense
-IGNORE_FLAGS=()
-for pattern in "${IGNORE_PATTERNS[@]}"; do
-  IGNORE_FLAGS+=("-ignore" "$pattern")
-done
+if ! command -v jq &> /dev/null; then
+  echo "❌ jq command not found"
+  echo "💡 Install jq: https://jqlang.github.io/jq/download/"
+  exit 1
+fi
 
-run_addlicense() {
-  local extra_args=("$@")
+HAWKEYE_VERSION="$(cat .github/config/hawkeye.version)"
 
-  if [ "$USE_DOCKER" = true ]; then
-    docker run --rm -v "$REPO_ROOT:/src" -w /src \
-      ghcr.io/google/addlicense:latest \
-      -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" "${extra_args[@]}"
-  else
-    "$ADDLICENSE_CMD" -f ASF_LICENSE.txt "${IGNORE_FLAGS[@]}" "${extra_args[@]}"
+# Check if HawkEye is available
+if ! command -v hawkeye &> /dev/null; then
+  echo "❌ hawkeye command not found"
+  echo "💡 Install HawkEye: cargo install hawkeye --version $HAWKEYE_VERSION --locked"
+  exit 1
+fi
+
+INSTALLED_HAWKEYE_VERSION="$(hawkeye -V | awk '{print $2}')"
+if [ "$INSTALLED_HAWKEYE_VERSION" != "$HAWKEYE_VERSION" ]; then
+  echo "❌ hawkeye $HAWKEYE_VERSION is required, found ${INSTALLED_HAWKEYE_VERSION:-unknown}"
+  echo "💡 Install HawkEye: cargo install hawkeye --version $HAWKEYE_VERSION --locked --force"
+  exit 1
+fi
+
+run_hawkeye() {
+  hawkeye "$@"
+}
+
+load_license_excludes() {
+  awk '
+    /^[[:space:]]*excludes[[:space:]]*=/ {
+      in_excludes = 1
+      next
+    }
+    in_excludes && /^[[:space:]]*\]/ {
+      exit
+    }
+    in_excludes {
+      sub(/[[:space:]]*#.*/, "")
+      gsub(/^[[:space:]]*"/, "")
+      gsub(/",[[:space:]]*$/, "")
+      if (length($0) > 0) {
+        print
+      }
+    }
+  ' licenserc.toml
+}
+
+is_license_excluded() {
+  local path="$1"
+  local pattern
+  local root_pattern
+
+  for pattern in "${LICENSE_EXCLUDES[@]}"; do
+    # Match the gitignore-style glob patterns from licenserc.toml intentionally.
+    # shellcheck disable=SC2254
+    case "$path" in
+      $pattern)
+        return 0
+        ;;
+    esac
+
+    if [[ "${pattern:0:3}" == "**/" ]]; then
+      root_pattern="${pattern#**/}"
+      # Match the root-level form of **/ globs intentionally.
+      # shellcheck disable=SC2254
+      case "$path" in
+        $root_pattern)
+          return 0
+          ;;
+      esac
+    fi
+  done
+
+  return 1
+}
+
+extract_hawkeye_paths() {
+  local key="$1"
+  local file="$2"
+
+  jq -r --arg key "$key" '.[$key] // [] | .[]' "$file" \
+    | awk -v root="$REPO_ROOT" '
+        NF {
+          if (index($0, root "/") == 1) {
+            print "./" substr($0, length(root) + 2)
+          } else {
+            print $0
+          }
+        }
+      ' \
+    | sort
+}
+
+append_hawkeye_section() {
+  local title="$1"
+  local paths_file="$2"
+
+  if [ ! -s "$paths_file" ]; then
+    return
   fi
+
+  local count
+  count=$(wc -l < "$paths_file" | tr -d ' ')
+
+  echo "$title ($count):"
+  sed 's/^/  - /' "$paths_file"
+  echo ""
+}
+
+write_hawkeye_report() {
+  local json_file="$1"
+  local report_file="$2"
+  local missing_file
+  local unknown_file
+
+  missing_file=$(mktemp)
+  unknown_file=$(mktemp)
+
+  extract_hawkeye_paths missing "$json_file" > "$missing_file"
+  extract_hawkeye_paths unknown "$json_file" > "$unknown_file"
+
+  {
+    append_hawkeye_section "Missing license headers" "$missing_file"
+    append_hawkeye_section "Unknown file types" "$unknown_file"
+  } > "$report_file"
+
+  rm -f "$missing_file" "$unknown_file"
+}
+
+find_duplicate_license_headers() {
+  local output_file="$1"
+  local path
+
+  : > "$output_file"
+  mapfile -t LICENSE_EXCLUDES < <(load_license_excludes)
+
+  while IFS= read -r -d '' path; do
+    if is_license_excluded "$path"; then
+      continue
+    fi
+
+    if ! LC_ALL=C grep -Iq . "$path"; then
+      continue
+    fi
+
+    if awk '
+      function count_keyword() {
+        if (index($0, "Licensed to the Apache Software Foundation")) {
+          count++
+        }
+      }
+
+      NR > 120 { exit }
+      /^[[:space:]]*$/ { next }
+      NR == 1 && /^#!/ { next }
+      NR == 1 && /^<\?(php|xml)/ { next }
+
+      in_xml_comment {
+        count_keyword()
+        if ($0 ~ /-->/) {
+          in_xml_comment = 0
+        }
+        next
+      }
+
+      in_slashstar_comment {
+        count_keyword()
+        if ($0 ~ /\*\//) {
+          in_slashstar_comment = 0
+        }
+        next
+      }
+
+      /^[[:space:]]*<!--/ {
+        in_xml_comment = ($0 !~ /-->/)
+        count_keyword()
+        next
+      }
+
+      /^[[:space:]]*\/\*/ {
+        in_slashstar_comment = ($0 !~ /\*\//)
+        count_keyword()
+        next
+      }
+
+      /^[[:space:]]*(#|\/\/|\*|-->)/ {
+        count_keyword()
+        next
+      }
+
+      { exit }
+
+      END { exit count > 1 ? 0 : 1 }
+    ' "$path"; then
+      printf './%s\n' "$path" >> "$output_file"
+    fi
+  done < <(git ls-files -z)
+
+  sort -o "$output_file" "$output_file"
 }
 
 if [ "$MODE" = "fix" ]; then
   echo "🔧 Adding license headers to files..."
-  run_addlicense .
-  echo "✅ License headers have been added to files"
+  TEMP_FILE=$(mktemp)
+  MISSING_FILE=$(mktemp)
+  UNKNOWN_FILE=$(mktemp)
+  DUPLICATE_FILE=$(mktemp)
+  LOG_FILE=$(mktemp)
+  trap 'rm -f "$TEMP_FILE" "$MISSING_FILE" "$UNKNOWN_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
+
+  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || true
+  extract_hawkeye_paths missing "$TEMP_FILE" > "$MISSING_FILE"
+  extract_hawkeye_paths unknown "$TEMP_FILE" > "$UNKNOWN_FILE"
+
+  if [ -s "$UNKNOWN_FILE" ]; then
+    echo "❌ Cannot add license headers to unknown file types:"
+    echo ""
+    append_hawkeye_section "Unknown file types" "$UNKNOWN_FILE"
+    exit 1
+  fi
+
+  run_hawkeye format --config licenserc.toml --fail-if-updated false --fail-if-unknown
+  find_duplicate_license_headers "$DUPLICATE_FILE"
+
+  if [ -s "$MISSING_FILE" ]; then
+    append_hawkeye_section "Updated license headers" "$MISSING_FILE"
+  fi
+
+  if [ -s "$DUPLICATE_FILE" ]; then
+    echo "❌ Found duplicate license headers after fixing:"
+    echo ""
+    append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE"
+    echo "💡 Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+    exit 1
+  fi
+
+  if [ ! -s "$MISSING_FILE" ]; then
+    echo "✅ No license header changes needed"
+  else
+    echo "✅ License header fix completed"
+  fi
 else
   echo "🔍 Checking license headers..."
 
   TEMP_FILE=$(mktemp)
-  trap 'rm -f "$TEMP_FILE"' EXIT
+  REPORT_FILE=$(mktemp)
+  DUPLICATE_FILE=$(mktemp)
+  LOG_FILE=$(mktemp)
+  trap 'rm -f "$TEMP_FILE" "$REPORT_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
 
-  if run_addlicense -check . > "$TEMP_FILE" 2>&1; then
+  HAWKEYE_STATUS=0
+  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || HAWKEYE_STATUS=$?
+  find_duplicate_license_headers "$DUPLICATE_FILE"
+
+  if [ "$HAWKEYE_STATUS" -eq 0 ] && [ ! -s "$DUPLICATE_FILE" ]; then
     echo "✅ All files have proper license headers"
   else
-    file_count=$(wc -l < "$TEMP_FILE")
-    echo "❌ Found $file_count files missing license headers:"
+    write_hawkeye_report "$TEMP_FILE" "$REPORT_FILE"
+
+    echo "❌ Found files with missing or inconsistent license headers:"
     echo ""
-    sed 's/^/  • /' < "$TEMP_FILE"
+    if [ -s "$REPORT_FILE" ]; then
+      sed 's/^/  /' < "$REPORT_FILE"
+    fi
+    if [ -s "$DUPLICATE_FILE" ]; then
+      append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE" | sed 's/^/  /'
+      echo "  💡 Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+    fi
+    if [ ! -s "$REPORT_FILE" ] && [ ! -s "$DUPLICATE_FILE" ]; then
+      sed 's/^/  /' < "$LOG_FILE"
+    fi
     echo ""
     echo "💡 Run '$0 --fix' to add license headers automatically"
 
@@ -136,9 +329,18 @@ else
       {
         echo "## ❌ License Headers Missing"
         echo ""
-        echo "The following files are missing Apache license headers:"
+        echo "HawkEye reported the following license header issues:"
         echo '```'
-        cat "$TEMP_FILE"
+        if [ -s "$REPORT_FILE" ]; then
+          cat "$REPORT_FILE"
+        fi
+        if [ -s "$DUPLICATE_FILE" ]; then
+          append_hawkeye_section "Duplicate license headers" "$DUPLICATE_FILE"
+          echo "Remove duplicate license headers and keep a single header using the comment style configured for the file in licenserc.toml"
+        fi
+        if [ ! -s "$REPORT_FILE" ] && [ ! -s "$DUPLICATE_FILE" ]; then
+          cat "$LOG_FILE"
+        fi
         echo '```'
         echo "Please run \`./scripts/ci/license-headers.sh --fix\` to fix automatically."
       } >> "$GITHUB_STEP_SUMMARY"

@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::cache_indexes::CacheIndexesConfig;
 use super::server::MemoryPoolConfig;
@@ -28,6 +27,7 @@ use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use server_common::bootstrap::SystemPaths;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
@@ -330,5 +330,27 @@ impl SystemConfig {
             IggyExpiry::ServerDefault => self.topic.message_expiry,
             _ => message_expiry,
         }
+    }
+}
+
+impl SystemPaths for SystemConfig {
+    fn get_system_path(&self) -> String {
+        SystemConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        SystemConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        SystemConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        SystemConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        SystemConfig::get_runtime_path(self)
     }
 }

@@ -399,6 +399,25 @@ where
                     );
                 }
             }
+            LifecycleFrame::MetadataSubmit(submit) => {
+                // Only shard 0 owns the metadata consensus group, and
+                // `forward_metadata_submit` always addresses shard 0, so a
+                // non-zero shard here is a routing bug. The handler (wired
+                // by server-ng) replies `None` on the carried sender if it
+                // cannot submit, so the awaiting peer never blocks forever.
+                debug_assert_eq!(
+                    self.id, 0,
+                    "MetadataSubmit must only be processed on shard 0"
+                );
+                (self.on_metadata_submit)(submit);
+            }
+            LifecycleFrame::ListClients { reply } => {
+                // Every shard handles this (not shard-0-only): each replies
+                // with the clients whose connections it homes. The handler
+                // (wired by server-ng) reads this shard's `SessionManager`
+                // and pushes the list over `reply`.
+                (self.on_list_clients)(reply);
+            }
         }
     }
 }

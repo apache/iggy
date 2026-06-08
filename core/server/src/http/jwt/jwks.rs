@@ -1,33 +1,38 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use dashmap::DashMap;
 use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use std::hash::Hash;
-use std::sync::OnceLock;
 use strum::{Display, EnumString};
 
-static HTTP_CLIENT: OnceLock<cyper::Client> = OnceLock::new();
+thread_local! {
+    // cyper 0.9's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()`
+    // now returns a `Result`, so it can no longer be a global `OnceLock`.
+    // compio is thread-per-core; keep one client per thread. The `Rc`
+    // inner makes cloning cheap, so callers take an owned handle.
+    static HTTP_CLIENT: cyper::Client =
+        cyper::Client::new().expect("failed to build cyper HTTP client for JWKS");
+}
 
-fn get_http_client() -> &'static cyper::Client {
-    HTTP_CLIENT.get_or_init(cyper::Client::new)
+fn get_http_client() -> cyper::Client {
+    HTTP_CLIENT.with(cyper::Client::clone)
 }
 
 /// JWK key type enumeration
@@ -139,6 +144,10 @@ impl JwksClient {
     }
 
     async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {
+        // The cyper client is `!Send` since 0.9; callers reached from axum
+        // middleware wrap this future in `SendWrapper` (see
+        // `http::jwt::middleware::jwt_auth`), so it's free to await cyper
+        // directly here.
         let client = get_http_client();
         let request = client
             .get(jwks_url)

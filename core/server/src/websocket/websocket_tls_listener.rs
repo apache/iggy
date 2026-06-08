@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::configs::websocket::WebSocketConfig;
 use crate::sender::{SenderKind, WebSocketTlsSender};
@@ -22,8 +21,8 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
-use compio::net::{SocketOpts, TcpListener};
-use compio::tls::TlsAcceptor;
+use compio::net::TcpListener;
+use compio::tls::{MaybeTlsStream, TlsAcceptor};
 use compio::ws::accept_async_with_config;
 use err_trail::ErrContext;
 use futures::FutureExt;
@@ -38,10 +37,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
-    // Required by the thread-per-core model...
-    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
-    let opts = SocketOpts::new().reuse_port(true).reuse_address(true);
-    TcpListener::bind_with_options(addr, &opts).await
+    // Thread-per-core: many sockets bind the same addr+port (SO_REUSEPORT).
+    crate::tcp::bind_reuseport_listener(addr, true, None).await
 }
 
 pub async fn start(
@@ -195,6 +192,10 @@ async fn accept_loop(
                                 Ok(tls_stream) => {
                                     info!("TLS handshake successful for {}, performing WebSocket upgrade...", remote_addr);
 
+                                    // compio-ws 0.4 drives TLS via `MaybeTlsStream<TcpStream>`
+                                    // (`TlsStream` is not `Splittable`); wrap the handshaked
+                                    // stream so the WS layer owns it.
+                                    let tls_stream = MaybeTlsStream::new_tls(tls_stream);
                                     match accept_async_with_config(tls_stream, Some(ws_config_clone)).await {
                                         Ok(websocket) => {
                                             info!("WebSocket TLS handshake successful from: {}", remote_addr);

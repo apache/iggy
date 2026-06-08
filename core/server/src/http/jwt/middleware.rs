@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::{AppState, RequestDetails};
@@ -26,6 +25,7 @@ use axum::{
     response::Response,
 };
 use err_trail::ErrContext;
+use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
@@ -75,16 +75,16 @@ pub async fn jwt_auth(
             format!("{COMPONENT} (error: {e}) - failed to decode JWT header")
         })
         .map_err(|_| UNAUTHORIZED)?;
-    let jwt_claims = state
-        .jwt_manager
-        .decode(jwt_token, token_header.alg)
+    // `decode` may fetch JWKS via the cyper client, which is `!Send` since
+    // cyper 0.9 (`Rc`-backed). axum requires this middleware's future to be
+    // `Send`, so wrap the `!Send` sub-futures in `SendWrapper` -- the same
+    // pattern the rest of the HTTP layer uses for compio shard ops.
+    // Sound under compio's thread-per-core model: the future is never
+    // polled from another thread.
+    let jwt_claims = SendWrapper::new(state.jwt_manager.decode(jwt_token, token_header.alg))
         .await
         .map_err(|_| UNAUTHORIZED)?;
-    if state
-        .jwt_manager
-        .is_token_revoked(&jwt_claims.claims.jti)
-        .await
-    {
+    if SendWrapper::new(state.jwt_manager.is_token_revoked(&jwt_claims.claims.jti)).await {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

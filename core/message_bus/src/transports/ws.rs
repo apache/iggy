@@ -32,38 +32,28 @@
 //!    and `ws.read()`.
 //! 3. On shutdown the task sends a WS Close frame, flushes, and drops.
 //!
-//! # Cancel safety (`compio_ws` 0.3.1 narrow hazard)
+//! # Cancel safety
 //!
-//! `WebSocketStream::read` in 0.3.1 awaits on two paths:
+//! The pump is a concurrent duplex `select_biased!` over shutdown, the
+//! outbound mailbox (`rx`), and an inbound `ws.read()`; the losing arm's
+//! future is dropped each iteration. This is safe on `compio_ws` 0.4 /
+//! `compio-io >= 0.10`:
 //!
-//! 1. `fill_read_buf` (more bytes needed). Cancel-safe: bytes already in
-//!    the underlying `compio_io::compat::SyncStream` buffer plus
-//!    tungstenite's frame-parser state both live inside the
-//!    `WebSocketStream` struct and survive a future drop.
-//! 2. `flush` after a successful sync decode (drains tungstenite's write
-//!    buffer, e.g. auto-Pong replies). The decoded `Message` lives on
-//!    the `read()` stack frame; dropping the future during this flush
-//!    park drops the message with it, and tungstenite's parser has
-//!    already advanced past the frame.
+//! * `WebSocketStream::read` lifts the decoded `Message` into the
+//!   stream's `next_item` cancel-buffer before any flush await, so a
+//!   dropped `read()` never loses an already-decoded frame.
+//! * `compio-io 0.10`'s `SyncStream` restores its read buffer on drop,
+//!   fixing the 0.9.1 bug where a cancelled `fill_read_buf` left the
+//!   buffer `None` and the next read panicked
+//!   `"buffer was submitted for io and never returned"`.
 //!
-//! The path-2 window collapses for pure consensus traffic: the write
-//! buffer is empty (no inbound Pings, no auto-Pong queued), so `flush`
-//! resolves synchronously and the await never parks. Real-world bite
-//! needs the compound: inbound Ping interleaved with our consensus frame
-//! AND TCP write-buffer pressure on the auto-Pong AND the mailbox /
-//! shutdown arm winning the `select_biased!` race.
+//! (History: under the 0.3.1 / 0.9.1 stack the read was NOT cancel-safe,
+//! so this pump had to run serialized request->reply with an out-of-band
+//! `libc::shutdown(SHUT_RD)` watchdog to avoid ever dropping the read.
+//! The 0.4 bump removed both workarounds.)
 //!
-//! TODO(hubcio): structural fix is a reader / writer task split, but
-//! `compio_ws` 0.3.1 exposes no native `split()`. The
-//! `Rc<RefCell<WebSocketStream>>` design panics on the second
-//! `borrow_mut()` while the reader still holds its borrow across
-//! `read().await`. `compio_ws` 0.4 adds `Sink + Stream` impls (so
-//! `futures_util::stream::split` works) and a `next_item` cancel-buffer
-//! that lifts the decoded `Message` into struct state before the flush.
-//! Bump the workspace pin and reinstate the split.
-//!
-//! Sends are run to completion outside any `select!`. The token signals
-//! the *start* of close, never cancels an in-flight send.
+//! `rx.recv()` and the shutdown future are likewise cancel-safe. Sends
+//! run to completion outside the `select!`.
 //!
 //! # Pings
 //!
@@ -178,6 +168,20 @@ enum PumpAction {
 
 /// Drive the WS connection until shutdown, peer Close, or an
 /// unrecoverable error.
+///
+/// Concurrent duplex pump: a single `select_biased!` races the shutdown
+/// token, the outbound mailbox (`rx`), and an inbound `ws.read()`. The
+/// losing arm's future is dropped each iteration.
+///
+/// Cancel safety: `compio_ws::WebSocketStream::read` (0.4) is cancel-safe
+/// -- it lifts the decoded `Message` into the stream's `next_item`
+/// buffer before any flush await, and the underlying `compio-io >= 0.10`
+/// `SyncStream` restores its read buffer on drop. Dropping the read
+/// future when the `recv`/`shutdown` arm wins therefore neither loses a
+/// decoded frame nor poisons the buffer (the 0.9.1 panic this transport
+/// previously had to serialize around). `rx.recv()` and the shutdown
+/// future are likewise cancel-safe. Sends run to completion outside the
+/// `select!`.
 #[allow(clippy::future_not_send)]
 async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
     let ActorContext {
@@ -229,9 +233,6 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
-                // `drain(..)` consumes the batch in FIFO order while
-                // preserving the Vec's allocation for the next
-                // iteration; `into_iter()` would move the buffer out.
                 #[allow(clippy::iter_with_drain)]
                 for msg in batch.drain(..) {
                     if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
@@ -261,8 +262,7 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 }
                 WsMessage::Ping(_) | WsMessage::Pong(_) => {
                     // Tungstenite queues an auto-Pong for inbound Pings;
-                    // `compio_ws::WebSocketStream::read` flushes before
-                    // delivery so no explicit reply needed.
+                    // `read()` flushes before delivery so no explicit reply.
                 }
                 WsMessage::Close(_) => {
                     debug!(%label, %peer, "ws reader: peer initiated close");
@@ -307,6 +307,9 @@ async fn drive_close(
 }
 
 #[cfg(test)]
+// compio-ws 0.4's `WebSocketStream` read/send futures are large (~17 KB);
+// the test driver awaits them directly. Not worth boxing in tests.
+#[allow(clippy::large_futures)]
 mod tests {
     use super::*;
     use crate::framing;
@@ -396,40 +399,59 @@ mod tests {
         (out_tx, in_rx, shutdown, handle)
     }
 
+    /// Raw-send a consensus frame over a client `WebSocketStream` (the
+    /// production WS transport is server-role only, so tests drive the
+    /// client side directly rather than through `run()`).
+    #[allow(clippy::future_not_send)]
+    async fn raw_send(ws: &mut WebSocketStream<TcpStream>, frame: Frozen<MESSAGE_ALIGN>) {
+        ws.send(WsMessage::Binary(Bytes::from_owner(frame)))
+            .await
+            .expect("client raw send");
+    }
+
+    /// Raw-read one consensus frame from a client `WebSocketStream`.
+    #[allow(clippy::future_not_send)]
+    async fn raw_recv(ws: &mut WebSocketStream<TcpStream>) -> Message<GenericHeader> {
+        loop {
+            match ws.read().await.expect("client raw read") {
+                WsMessage::Binary(bytes) => {
+                    return decode_consensus_frame(&bytes, framing::MAX_MESSAGE_SIZE)
+                        .expect("decode client frame");
+                }
+                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                other => panic!("unexpected client ws frame: {other:?}"),
+            }
+        }
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn ws_loopback_round_trip() {
-        let (client_ws, server_ws) = ws_pair().await;
+        let (mut client_ws, server_ws) = ws_pair().await;
         let server_conn = WsTransportConn::new_server(server_ws);
-        let client_conn = WsTransportConn::new_client(client_ws);
-
         let (server_out, server_in, server_shutdown, server_handle) = drive(server_conn);
-        let (client_out, client_in, client_shutdown, client_handle) = drive(client_conn);
 
-        client_out
-            .send(header_only(Command2::Request))
-            .await
-            .expect("client send");
+        // Client raw-sends a Request; the server pump reads it.
+        raw_send(&mut client_ws, header_only(Command2::Request)).await;
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
             .await
             .expect("server recv within 5 s")
             .expect("server frame");
         assert_eq!(received.header().command, Command2::Request);
 
+        // Server replies via its outbound mailbox; the serial pump writes
+        // the reply on the same bidi the request arrived on, client reads.
         server_out
             .send(header_only(Command2::Reply))
             .await
             .expect("server send");
-        let reply = compio::time::timeout(Duration::from_secs(5), client_in.recv())
+        let reply = compio::time::timeout(Duration::from_secs(5), raw_recv(&mut client_ws))
             .await
-            .expect("client recv within 5 s")
-            .expect("client frame");
+            .expect("client recv within 5 s");
         assert_eq!(reply.header().command, Command2::Reply);
 
         server_shutdown.trigger();
-        client_shutdown.trigger();
         let _ = compio::time::timeout(Duration::from_secs(5), server_handle).await;
-        let _ = compio::time::timeout(Duration::from_secs(5), client_handle).await;
     }
 
     #[compio::test]
@@ -438,17 +460,11 @@ mod tests {
         const BODY_SIZE: usize = 1024 * 1024;
         let total = HEADER_SIZE + BODY_SIZE;
 
-        let (client_ws, server_ws) = ws_pair().await;
+        let (mut client_ws, server_ws) = ws_pair().await;
         let server_conn = WsTransportConn::new_server(server_ws);
-        let client_conn = WsTransportConn::new_client(client_ws);
-
         let (_server_out, server_in, server_shutdown, server_handle) = drive(server_conn);
-        let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
 
-        client_out
-            .send(padded(Command2::Request, total))
-            .await
-            .expect("client send 1 MiB");
+        raw_send(&mut client_ws, padded(Command2::Request, total)).await;
         let received = compio::time::timeout(Duration::from_secs(15), server_in.recv())
             .await
             .expect("server recv within 15 s")
@@ -457,9 +473,7 @@ mod tests {
         assert_eq!(received.header().size as usize, total);
 
         server_shutdown.trigger();
-        client_shutdown.trigger();
         let _ = compio::time::timeout(Duration::from_secs(10), server_handle).await;
-        let _ = compio::time::timeout(Duration::from_secs(10), client_handle).await;
     }
 
     #[compio::test]
@@ -468,19 +482,12 @@ mod tests {
         const CUSTOM_CAP: usize = HEADER_SIZE + 1024;
         const OVER_CAP: usize = HEADER_SIZE + 64 * 1024;
 
-        let (client_ws, server_ws) = ws_pair().await;
+        let (mut client_ws, server_ws) = ws_pair().await;
         let server_conn = WsTransportConn::new_server(server_ws);
-        let client_conn = WsTransportConn::new_client(client_ws);
-
         let (_server_out, server_in, _server_shutdown, server_handle) =
             drive_with_cap(server_conn, CUSTOM_CAP);
-        let (client_out, _client_in, _client_shutdown, client_handle) =
-            drive_with_cap(client_conn, framing::MAX_MESSAGE_SIZE);
 
-        client_out
-            .send(padded(Command2::Request, OVER_CAP))
-            .await
-            .expect("client send oversize");
+        raw_send(&mut client_ws, padded(Command2::Request, OVER_CAP)).await;
 
         // Decode rejection tears the server pump down; join must complete
         // within the grace window and no frame must surface to in_rx.
@@ -494,8 +501,6 @@ mod tests {
             recv_res.is_err() || recv_res.expect("timeout outer").is_err(),
             "no frame should surface above the configured cap"
         );
-
-        let _ = compio::time::timeout(Duration::from_secs(2), client_handle).await;
     }
 
     #[compio::test]

@@ -14,18 +14,20 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## Contents
 
-- [STOP and ask the user before](#stop-and-ask-the-user-before)
-- [Quick reference](#quick-reference)
-- [Structure](#structure)
-- [Where to look](#where-to-look)
-- [Skills](#skills)
-- [Repo-wide principles](#repo-wide-principles)
-- [Tooling](#tooling)
-- [Testing](#testing)
-- [Pitfalls](#pitfalls)
-- [Local state directories](#local-state-directories)
-- [Commits, PRs, releases](#commits-prs-releases)
-- [Discussion and support](#discussion-and-support)
+- [Apache Iggy Agent Guidelines](#apache-iggy-agent-guidelines)
+  - [Contents](#contents)
+  - [STOP and ask the user before](#stop-and-ask-the-user-before)
+  - [Quick reference](#quick-reference)
+  - [Structure](#structure)
+  - [Where to look](#where-to-look)
+  - [Skills](#skills)
+  - [Repo-wide principles](#repo-wide-principles)
+  - [Tooling](#tooling)
+  - [Testing](#testing)
+  - [Pitfalls](#pitfalls)
+  - [Local state directories](#local-state-directories)
+  - [Commits, PRs, releases](#commits-prs-releases)
+  - [Discussion and support](#discussion-and-support)
 
 ## STOP and ask the user before
 
@@ -134,7 +136,7 @@ description). Load `connectors-overview` first as router.
 
 ## Repo-wide principles
 
-1. **Apache 2.0 header on every new source file.** `.rs` uses `/* ... */`, `Cargo.toml` and shell use `# ...`. Enforced by `./scripts/ci/license-headers.sh`.
+1. **Apache 2.0 header on every new source file:** Follow the comment style configured in `licenserc.toml`; common examples: .rs uses // ..., Cargo.toml and shell use # ....
 2. **Verification order:** `fmt --all` -> `sort --no-format --workspace` -> `clippy --all-features --all-targets -- -D warnings` -> `test`. Plus `taplo.sh --check`. CI enforces all.
 3. **Always pass `--no-format` to `cargo sort`.** Without it multi-line feature arrays flatten and `taplo` re-expands them, churning the workspace.
 4. **Avoid LLM-slop tells: em dashes, gratuitous semicolons, hedging narrative, trailing summaries.** Defaults, not absolute bans. Same rule for code, comments, commits, PR descriptions.
@@ -151,20 +153,20 @@ description). Load `connectors-overview` first as router.
 
 ## Tooling
 
-| Tool                                          | Where                                         |
-| --------------------------------------------- | --------------------------------------------- |
-| `cargo fmt`, `cargo sort`, `cargo clippy`     | pre-commit + CI                               |
-| `cargo machete`                               | CI `machete` task                             |
-| `cargo nextest` + `cargo-rail`                | CI `test-*` DAG-scoped                        |
-| `cargo llvm-cov`                              | CI coverage                                   |
-| `cargo http-registry`                         | CI `verify-publish`                           |
-| Miri                                          | CI `miri` (`binary_protocol` + `consensus`)   |
-| `taplo`, `markdownlint-cli`, `shellcheck`     | pre-commit + CI                               |
-| `typos`                                       | pre-commit                                    |
-| `cargo about` + `license-checker-rseidelsohn` | `scripts/ci/third-party-licenses.sh`          |
-| Apache RAT / `license-headers.sh`             | pre-commit + CI                               |
-| `uv`, `ruff`                                  | pre-commit (Python)                           |
-| `golangci-lint`                               | pre-push (Go)                                 |
+| Tool                                          | Where                                       |
+| --------------------------------------------- | ------------------------------------------- |
+| `cargo fmt`, `cargo sort`, `cargo clippy`     | pre-commit + CI                             |
+| `cargo machete`                               | CI `machete` task                           |
+| `cargo nextest` + `cargo-rail`                | CI `test-*` DAG-scoped                      |
+| `cargo llvm-cov`                              | CI coverage                                 |
+| `cargo http-registry`                         | CI `verify-publish`                         |
+| Miri                                          | CI `miri` (`binary_protocol` + `consensus`) |
+| `taplo`, `markdownlint-cli`, `shellcheck`     | pre-commit + CI                             |
+| `typos`                                       | pre-commit                                  |
+| `cargo about` + `license-checker-rseidelsohn` | `scripts/ci/third-party-licenses.sh`        |
+| HawkEye / `license-headers.sh`                | pre-commit + CI                             |
+| `uv`, `ruff`                                  | pre-commit (Python)                         |
+| `golangci-lint`                               | pre-push (Go)                               |
 
 ## Testing
 
