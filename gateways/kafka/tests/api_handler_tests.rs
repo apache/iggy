@@ -107,10 +107,11 @@ fn unsupported_version_returns_protocol_error() {
     req.extend_from_slice(&1_i32.to_be_bytes());
     let body = handle_request(API_KEY_METADATA, 99, Bytes::from(req), &test_broker());
     let mut d = Decoder::new(body);
+    // Metadata v0: brokers[], topics[] — no controller_id (added in v1)
     let _broker_count = d.read_i32().unwrap();
-    let _ = d.read_i32().unwrap();
-    let _ = d.read_nullable_string().unwrap();
-    let _ = d.read_i32().unwrap();
+    let _ = d.read_i32().unwrap(); // node_id
+    let _ = d.read_nullable_string().unwrap(); // host
+    let _ = d.read_i32().unwrap(); // port
     let topic_count = d.read_i32().unwrap();
     assert_eq!(topic_count, 1);
     let topic_error = d.read_i16().unwrap();
@@ -119,8 +120,6 @@ fn unsupported_version_returns_protocol_error() {
     assert_eq!(topic_name, "unknown-topic");
     let partitions_count = d.read_i32().unwrap();
     assert_eq!(partitions_count, 0);
-    let controller_id = d.read_i32().unwrap();
-    assert_eq!(controller_id, 1);
 }
 
 // ── Misc ────────────────────────────────────────────────────────────────────

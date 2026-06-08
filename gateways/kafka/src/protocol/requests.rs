@@ -19,7 +19,7 @@
 
 #![allow(clippy::pedantic)]
 
-use crate::error::Result;
+use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::Decoder;
 use bytes::Bytes;
 
@@ -72,9 +72,11 @@ pub fn decode_produce_request(version: i16, body: Bytes) -> Result<ProduceReques
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
         let topic = if flexible {
-            d.read_compact_nullable_string()?.unwrap_or_default()
+            d.read_compact_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         } else {
-            d.read_nullable_string()?.unwrap_or_default()
+            d.read_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         };
 
         let partitions_count = if flexible {
@@ -170,9 +172,11 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
         let topic = if flexible {
-            d.read_compact_nullable_string()?.unwrap_or_default()
+            d.read_compact_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         } else {
-            d.read_nullable_string()?.unwrap_or_default()
+            d.read_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         };
 
         let partitions_count = if flexible {
@@ -301,9 +305,11 @@ pub fn decode_list_offsets_request(version: i16, body: Bytes) -> Result<ListOffs
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
         let topic = if flexible {
-            d.read_compact_nullable_string()?.unwrap_or_default()
+            d.read_compact_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         } else {
-            d.read_nullable_string()?.unwrap_or_default()
+            d.read_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         };
 
         let partitions_count = if flexible {
@@ -380,9 +386,11 @@ pub fn decode_create_topics_request(version: i16, body: Bytes) -> Result<CreateT
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
         let name = if flexible {
-            d.read_compact_nullable_string()?.unwrap_or_default()
+            d.read_compact_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         } else {
-            d.read_nullable_string()?.unwrap_or_default()
+            d.read_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
         };
 
         let num_partitions = d.read_i32()?;

@@ -33,19 +33,8 @@ pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
-pub const API_KEY_OFFSET_COMMIT: i16 = 8;
-pub const API_KEY_OFFSET_FETCH: i16 = 9;
-pub const API_KEY_FIND_COORDINATOR: i16 = 10;
-pub const API_KEY_JOIN_GROUP: i16 = 11;
-pub const API_KEY_HEARTBEAT: i16 = 12;
-pub const API_KEY_LEAVE_GROUP: i16 = 13;
-pub const API_KEY_SYNC_GROUP: i16 = 14;
-pub const API_KEY_DESCRIBE_GROUPS: i16 = 15;
-pub const API_KEY_LIST_GROUPS: i16 = 16;
-pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
-pub const API_KEY_DELETE_TOPICS: i16 = 20;
 
 pub const ERROR_NONE: i16 = 0;
 pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
@@ -296,27 +285,38 @@ fn encode_metadata_response(
         for _ in 0..topics_count {
             e.write_i16(topic_error);
             e.write_compact_nullable_string(Some("unknown-topic"));
-            e.write_varint(1); // empty partitions array
-            if api_version >= 4 {
-                e.write_bool(false); // is_internal
+            if api_version >= 1 {
+                e.write_bool(false); // is_internal — must come before partitions array
             }
+            e.write_varint(1); // empty partitions array
             e.write_empty_tagged_fields();
         }
         e.write_empty_tagged_fields();
     } else {
-        e.write_i32(1);
-        e.write_i32(1);
+        e.write_i32(1); // brokers array length
+        e.write_i32(1); // node_id
         let _ = e.write_nullable_string(Some(&broker.host));
         e.write_i32(broker.port);
+        if api_version >= 1 {
+            let _ = e.write_nullable_string(None); // rack
+        }
+
+        if api_version >= 2 {
+            let _ = e.write_nullable_string(None); // cluster_id
+        }
+        if api_version >= 1 {
+            e.write_i32(1); // controller_id — must come before topics array
+        }
 
         e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
         for _ in 0..topics_count {
             e.write_i16(topic_error);
             let _ = e.write_nullable_string(Some("unknown-topic"));
-            e.write_i32(0);
+            if api_version >= 1 {
+                e.write_bool(false); // is_internal
+            }
+            e.write_i32(0); // partitions array (empty)
         }
-
-        e.write_i32(1); // controller_id
     }
 
     e.freeze()
