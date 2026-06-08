@@ -14,17 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-//! End-to-end: a WSS client connects to the consensus WSS client
-//! listener on shard 0; the listener's callback hands the raw stream +
-//! shared `Arc<rustls::ServerConfig>` to `install_client_wss`,
-//! which drives both the rustls handshake and the WS HTTP-Upgrade on
-//! its own task before installing reader / writer tasks. The handler
-//! echoes a Reply back via `bus.send_to_client`, the client reads the
-//! Reply.
-//!
-//! The WSS client side is built from the same `WssTransportConn` the
-//! server uses, in client role, mirroring the in-file unit test pattern.
 
 mod common;
 
