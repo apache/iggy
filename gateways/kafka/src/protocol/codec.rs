@@ -110,10 +110,12 @@ impl Decoder {
     }
 
     /// Compact array length: unsigned varint holding `element_count + 1`.
+    /// Per the Kafka spec, varint=0 encodes a null (absent) array; treat as empty (0 elements)
+    /// so optional fields like `forgotten_topics` are skipped rather than rejected.
     pub fn read_compact_array_count(&mut self) -> Result<usize> {
         let n = self.read_varint()?;
         if n == 0 {
-            return Err(KafkaProtocolError::InvalidCompactArrayLength(0));
+            return Ok(0);
         }
         let count = (n - 1) as usize;
         if count > MAX_COLLECTION_LEN {
@@ -133,10 +135,11 @@ impl Decoder {
         }
         let len = len as usize;
         self.ensure(len)?;
-        let chunk = self.bytes.copy_to_bytes(len);
-        String::from_utf8(chunk.to_vec())
-            .map(Some)
-            .map_err(|_| KafkaProtocolError::InvalidUtf8)
+        let s = std::str::from_utf8(&self.bytes.chunk()[..len])
+            .map_err(|_| KafkaProtocolError::InvalidUtf8)?
+            .to_owned();
+        self.bytes.advance(len);
+        Ok(Some(s))
     }
 
     /// Compact nullable string (flexible versions): varint(len+1) prefix, 0 = null.
@@ -147,10 +150,11 @@ impl Decoder {
         }
         let len = (len_plus_one - 1) as usize;
         self.ensure(len)?;
-        let chunk = self.bytes.copy_to_bytes(len);
-        String::from_utf8(chunk.to_vec())
-            .map(Some)
-            .map_err(|_| KafkaProtocolError::InvalidUtf8)
+        let s = std::str::from_utf8(&self.bytes.chunk()[..len])
+            .map_err(|_| KafkaProtocolError::InvalidUtf8)?
+            .to_owned();
+        self.bytes.advance(len);
+        Ok(Some(s))
     }
 
     /// Legacy nullable bytes: i32 length prefix (-1 = null).
@@ -184,16 +188,13 @@ impl Decoder {
     /// A count of 0 is the common case (single byte 0x00).
     pub fn read_tagged_fields(&mut self) -> Result<()> {
         let count = self.read_varint()?;
-        let count = usize::try_from(count).map_err(|_| KafkaProtocolError::CollectionTooLarge {
-            count: count as usize,
-            max: MAX_COLLECTION_LEN,
-        })?;
-        if count > MAX_COLLECTION_LEN {
+        if count > MAX_COLLECTION_LEN as u64 {
             return Err(KafkaProtocolError::CollectionTooLarge {
-                count,
+                count: count as usize,
                 max: MAX_COLLECTION_LEN,
             });
         }
+        let count = count as usize;
         for _ in 0..count {
             self.read_varint()?; // tag number
             let size = self.read_varint()? as usize;
@@ -291,6 +292,11 @@ impl Encoder {
         match v {
             None => self.write_i32(-1),
             Some(b) => {
+                debug_assert!(
+                    b.len() <= i32::MAX as usize,
+                    "byte slice length {} exceeds i32::MAX",
+                    b.len()
+                );
                 self.write_i32(b.len() as i32);
                 self.bytes.put_slice(b);
             }

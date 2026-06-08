@@ -194,7 +194,7 @@ pub fn encode_list_offsets_response(version: i16, req: &ListOffsetsRequest) -> B
 
             let offset = 0i64;
             if version >= 1 {
-                e.write_i64(1_700_000_000_000);
+                e.write_i64(-1); // -1 = timestamp not available (Kafka sentinel)
             }
             e.write_i64(offset);
             if version >= 4 {

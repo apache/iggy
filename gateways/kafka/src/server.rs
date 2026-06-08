@@ -35,6 +35,7 @@ use crate::protocol::codec::Decoder;
 use crate::protocol::header::{
     RequestHeader, ResponseHeader, request_header_version, response_header_version,
 };
+use std::io;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -77,7 +78,7 @@ impl KafkaServer {
         info!("kafka listener bound on {}", self.config.bind_addr);
 
         let tracker = TaskTracker::new();
-        let broker = BrokerAdvertise::from_bind_addr(&self.config.bind_addr);
+        let broker = Arc::new(BrokerAdvertise::from_bind_addr(&self.config.bind_addr));
 
         loop {
             tokio::select! {
@@ -91,7 +92,7 @@ impl KafkaServer {
                     match accept_result {
                         Ok((stream, peer)) => {
                             let cfg = Arc::clone(&self.config);
-                            let broker = broker.clone();
+                            let broker = Arc::clone(&broker);
                             tracker.spawn(async move {
                                 if let Err(err) = handle_connection(stream, cfg, peer, broker).await {
                                     warn!(%peer, "connection closed with error: {err}");
@@ -127,7 +128,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<ServerConfig>,
     peer: SocketAddr,
-    broker: BrokerAdvertise,
+    broker: Arc<BrokerAdvertise>,
 ) -> Result<()> {
     info!(%peer, "connection accepted");
 
@@ -164,12 +165,14 @@ async fn handle_connection(
                 warn!(%peer, api_key, api_version, "unsupported request header version");
                 let body_response = encode_error_only_response(ERROR_INVALID_REQUEST);
                 let resp_header = ResponseHeader { correlation_id };
-                let encoded_header = resp_header.encode(0);
-                let mut payload =
-                    BytesMut::with_capacity(encoded_header.len() + body_response.len());
-                payload.put_slice(&encoded_header);
-                payload.put_slice(&body_response);
-                write_frame(&mut stream, &payload, config.write_timeout).await?;
+                send_response(
+                    &mut stream,
+                    &resp_header,
+                    0,
+                    &body_response,
+                    config.write_timeout,
+                )
+                .await?;
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -190,13 +193,42 @@ async fn handle_connection(
         let resp_header = ResponseHeader {
             correlation_id: req.correlation_id,
         };
-        let encoded_header = resp_header.encode(resp_hdr_ver);
-        let mut payload = BytesMut::with_capacity(encoded_header.len() + body_response.len());
-        payload.put_slice(&encoded_header);
-        payload.put_slice(&body_response);
-
-        write_frame(&mut stream, &payload, config.write_timeout).await?;
+        send_response(
+            &mut stream,
+            &resp_header,
+            resp_hdr_ver,
+            &body_response,
+            config.write_timeout,
+        )
+        .await?;
     }
+}
+
+/// Write a single length-prefixed Kafka frame using one allocation.
+/// Avoids the separate header-encode + payload-concat + length-prefix allocations.
+async fn send_response(
+    stream: &mut TcpStream,
+    header: &ResponseHeader,
+    header_version: i16,
+    body: &[u8],
+    write_timeout: Duration,
+) -> Result<()> {
+    let header_size = ResponseHeader::encoded_size(header_version);
+    let payload_size = header_size + body.len();
+    if payload_size > i32::MAX as usize {
+        return Err(KafkaProtocolError::FrameTooLarge {
+            max_bytes: i32::MAX as usize,
+            actual_bytes: payload_size,
+        });
+    }
+    let mut frame = BytesMut::with_capacity(4 + payload_size);
+    frame.put_i32(payload_size as i32);
+    header.encode_into(&mut frame, header_version);
+    frame.put_slice(body);
+    timeout(write_timeout, stream.write_all(&frame))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
+    Ok(())
 }
 
 fn correlation_id_from_frame(frame: &bytes::Bytes) -> i32 {
@@ -239,11 +271,22 @@ pub async fn read_frame(
         });
     }
 
-    let mut data = vec![0u8; frame_len];
-    timeout(read_timeout, stream.read_exact(&mut data))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
-    Ok(bytes::Bytes::from(data))
+    // read_buf fills BytesMut spare capacity without zero-initializing it first.
+    let mut data = BytesMut::with_capacity(frame_len);
+    timeout(read_timeout, async {
+        while data.len() < frame_len {
+            if stream.read_buf(&mut data).await? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
+            }
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timeout"))??;
+    Ok(data.freeze())
 }
 
 /// Write one length-prefixed Kafka frame to `stream`.
