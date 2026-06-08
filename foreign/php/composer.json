@@ -21,6 +21,7 @@
         }
     ],
     "support": {
+        "chat": "https://discord.gg/apache-iggy",
         "docs": "https://iggy.apache.org/docs/",
         "issues": "https://github.com/apache/iggy/issues",
         "source": "https://github.com/apache/iggy/tree/master/foreign/php"
