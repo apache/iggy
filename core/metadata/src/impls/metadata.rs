@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use crate::MuxStateMachine;
 use crate::stm::consumer_group::ConsumerGroups;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
@@ -21,9 +22,10 @@ use crate::stm::stream::Streams;
 use crate::stm::user::Users;
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
-    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, Pipeline, PipelineEntry,
-    Plane, PlaneIdentity, PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer,
-    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_reply_message,
+    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, EvictionContext, Pipeline,
+    PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
+    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
     drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
     replicate_preflight, replicate_to_next_in_chain, request_preflight,
@@ -36,7 +38,7 @@ use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopi
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, WireDecode, WireEncode,
+    RequestHeader, WireDecode, WireEncode,
 };
 use iggy_common::IggyError;
 use iggy_common::variadic;
@@ -279,9 +281,6 @@ impl<M> SnapshotCoordinator<M> {
 /// Failures for [`IggyMetadata::submit_register_in_process`]. All transient;
 /// the login/register handler wraps every variant in
 /// `LoginRegisterError::Transient` so SDK read-timeout replays.
-//
-// TODO(pipeline-backpressure, canceled-retry): absorb-silently loop will
-// make transients internal-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterSubmitError {
@@ -418,13 +417,17 @@ where
         let operation = message.header().operation;
 
         // Preflight first: dedup, eviction sends, cached-reply replay all
-        // must run regardless of pipeline pressure.
-        let preflight = if operation == Operation::Register {
+        // must run regardless of pipeline pressure. Wire-path ingress has no
+        // home-shard transport context, so resends fall back to the
+        // consensus-plane (best-effort by VSR id).
+        let dispatch = if operation == Operation::Register {
             register_preflight(consensus, &self.client_table, client_id).await
         } else {
-            request_preflight(consensus, &self.client_table, client_id, session, request).await
+            let outcome =
+                request_preflight(consensus, &self.client_table, client_id, session, request);
+            apply_preflight_consensus_plane(consensus, outcome, client_id).await
         };
-        if !preflight {
+        if !dispatch {
             return;
         }
 
@@ -1007,7 +1010,12 @@ where
             .as_ref()
             .expect("submit_logout_in_process: consensus only exists on shard 0");
 
-        if self.client_table.borrow().get_session(client_id).is_none() {
+        // Session guard: only propose a Logout when the slot still holds the
+        // exact session this logout targets. A late disconnect-logout for a
+        // reused client id (slot since rebound to a newer session) carries the
+        // stale session and is dropped here, so it can never wipe the fresh
+        // registration. A missing slot also fails the match and short-circuits.
+        if self.client_table.borrow().get_session(client_id) != Some(session) {
             return Ok(consensus.commit_min());
         }
 
@@ -1099,8 +1107,10 @@ where
     ///
     /// Mirrors [`Self::submit_register_in_process`] but: (1) uses
     /// `request_preflight` (dedup / session check) instead of the register
-    /// gate, (2) returns the committed `Message<ReplyHeader>` (body = state
-    /// machine output) rather than just the commit op.
+    /// gate, (2) returns the committed reply as a `Message<GenericHeader>`
+    /// (body = state machine output) rather than just the commit op. A
+    /// `Duplicate`/eviction preflight outcome is returned here as the reply
+    /// frame so the home shard resends it by transport id.
     ///
     /// # Errors
     /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the
@@ -1115,7 +1125,7 @@ where
     pub async fn submit_request_in_process(
         &self,
         message: Message<RequestHeader>,
-    ) -> Result<Message<ReplyHeader>, RegisterSubmitError> {
+    ) -> Result<Message<GenericHeader>, RegisterSubmitError> {
         let request_header = *message.header();
         let client_id = request_header.client;
         let session = request_header.session;
@@ -1136,11 +1146,27 @@ where
             );
         }
 
-        // Dedup / session / eviction. `false` = absorbed (duplicate cached
-        // reply already resent, or evicted, or gap). Surface as Canceled so
-        // the home shard stays silent and the SDK replays.
-        if !request_preflight(consensus, &self.client_table, client_id, session, request).await {
-            return Err(RegisterSubmitError::Canceled);
+        // Dedup / session / eviction. shard 0 cannot route by the VSR
+        // consensus `client_id` (its top bits are random, not home-shard
+        // routing), so a Replay/Evict is returned to the home shard as the
+        // reply -- `handle_client_request` writes it to the originating socket
+        // by transport id, exactly like a fresh commit. Drop surfaces as
+        // Canceled so the home shard stays silent and the SDK replays.
+        match request_preflight(consensus, &self.client_table, client_id, session, request) {
+            PreflightOutcome::Dispatch => {}
+            PreflightOutcome::Replay(reply) => {
+                return server_common::Message::<GenericHeader>::try_from(
+                    server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(
+                        reply.as_slice(),
+                    ),
+                )
+                .map_err(|_| RegisterSubmitError::Canceled);
+            }
+            PreflightOutcome::Evict(reason) => {
+                let ctx = EvictionContext::from_consensus(consensus);
+                return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+            }
+            PreflightOutcome::Drop => return Err(RegisterSubmitError::Canceled),
         }
 
         if consensus.pipeline().borrow().is_full() {
@@ -1184,11 +1210,8 @@ where
 
         receiver
             .await
+            .map(server_common::Message::into_generic)
             .map_err(|Canceled| RegisterSubmitError::Canceled)
-    }
-
-    pub fn remove_client_session(&self, client_id: u128) -> bool {
-        self.client_table.borrow_mut().remove_client(client_id)
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after
@@ -1209,12 +1232,14 @@ where
             let session = req.message.header().session;
             let request = req.message.header().request;
             let operation = req.message.header().operation;
-            let preflight = if operation == Operation::Register {
+            let dispatch = if operation == Operation::Register {
                 register_preflight(consensus, &self.client_table, client_id).await
             } else {
-                request_preflight(consensus, &self.client_table, client_id, session, request).await
+                let outcome =
+                    request_preflight(consensus, &self.client_table, client_id, session, request);
+                apply_preflight_consensus_plane(consensus, outcome, client_id).await
             };
-            if !preflight {
+            if !dispatch {
                 continue;
             }
 
