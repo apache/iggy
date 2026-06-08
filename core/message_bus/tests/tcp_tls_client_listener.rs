@@ -14,13 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-//! End-to-end: a real rustls client connects to the consensus TCP-TLS
-//! client listener on shard 0; the listener's callback hands the raw
-//! stream + shared `Arc<rustls::ServerConfig>` to
-//! `install_client_tcp_tls`, which drives the rustls handshake on its
-//! own task before installing reader / writer tasks. The handler echoes
-//! a Reply back via `bus.send_to_client`, the client reads the Reply.
 
 mod common;
 

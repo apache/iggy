@@ -153,7 +153,7 @@ repos:
       - id: typos
         name: typos (spelling check)
         entry: typos
-        args: [ "-w" ]
+        args: ["--force-exclude", "-w"]
         language: system
         types: [ text ]
         pass_filenames: true
@@ -263,7 +263,7 @@ repos:
     hooks:
       - id: node-eslint
         name: node eslint
-        entry: bash -c 'for dir in foreign/node examples/node; do [ -f "$dir/package.json" ] && (cd "$dir" && npm run lint); done'
+        entry: bash -c 'for dir in foreign/node examples/node; do [ -f "$dir/package.json" ] && (cd "$dir" && { [ -x node_modules/.bin/eslint ] || npm ci --ignore-scripts; } && npm run lint); done'
         language: system
         files: ^(foreign|examples)/node/.*\.ts$
         pass_filenames: false
@@ -273,7 +273,7 @@ repos:
     hooks:
       - id: web-lint
         name: web lint
-        entry: bash -c 'cd web && npm run lint'
+        entry: bash -c 'cd web && { [ -x node_modules/.bin/eslint ] && [ -x node_modules/.bin/prettier ] || npm ci; } && npm run lint'
         language: system
         files: ^web/.*\.(ts|js|svelte)$
         pass_filenames: false
