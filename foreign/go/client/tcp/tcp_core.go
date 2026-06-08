@@ -221,20 +221,54 @@ const (
 	MaxPartitionCount          = 1000
 )
 
-func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
-	var totalRead int
-	buffer := make([]byte, expectedSize)
+// requestBufPool reuses wire-payload buffers across RPCs.
+var requestBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
 
-	for totalRead < expectedSize {
-		readSize := expectedSize - totalRead
-		n, err := c.conn.Read(buffer[totalRead : totalRead+readSize])
+func acquireRequestBuf() *[]byte {
+	return requestBufPool.Get().(*[]byte)
+}
+
+func releaseRequestBuf(bp *[]byte) {
+	const maxPooled = 64 * 1024
+	if cap(*bp) > maxPooled {
+		return
+	}
+	*bp = (*bp)[:0]
+	requestBufPool.Put(bp)
+}
+
+// appender lets a command encode directly into a pooled buffer.
+type appender interface {
+	MarshalledSize() int
+	AppendBinary([]byte) ([]byte, error)
+}
+
+func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
+	buffer := make([]byte, expectedSize)
+	n, err := c.readInto(buffer)
+	if err != nil {
+		return n, buffer[:n], err
+	}
+	return n, buffer, nil
+}
+
+// readInto reads exactly len(buf) bytes from the connection into buf.
+func (c *IggyTcpClient) readInto(buf []byte) (int, error) {
+	var totalRead int
+	expected := len(buf)
+	for totalRead < expected {
+		n, err := c.conn.Read(buf[totalRead:])
 		if err != nil {
-			return totalRead, buffer[:totalRead], err
+			return totalRead, err
 		}
 		totalRead += n
 	}
-
-	return totalRead, buffer, nil
+	return totalRead, nil
 }
 
 func (c *IggyTcpClient) write(payload []byte) (int, error) {
@@ -250,16 +284,64 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 	return totalWritten, nil
 }
 
-// do sends the command to the Iggy server and returns the response.
+// do sends the command and returns the response body. Commands implementing
+// the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
-	data, err := cmd.MarshalBinary()
+	bp := acquireRequestBuf()
+	buf, err := encodeWireRequest(*bp, cmd)
+	if err != nil {
+		releaseRequestBuf(bp)
+		return nil, err
+	}
+	*bp = buf
+
+	resp, err := c.sendWireAndFetchResponse(ctx, buf)
+	releaseRequestBuf(bp)
+	return resp, err
+}
+
+// encodeWireRequest writes the wire-format request (4-byte length, 4-byte
+// code, then body) into buf, growing it as needed.
+func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
+	buf = buf[:0]
+	if a, ok := cmd.(appender); ok {
+		bodySize := a.MarshalledSize()
+		total := 8 + bodySize
+		if cap(buf) < total {
+			buf = make([]byte, 8, total)
+		} else {
+			buf = buf[:8]
+		}
+		// total wire message length = body + 4-byte command code
+		binary.LittleEndian.PutUint32(buf[0:4], uint32(bodySize+4))
+		binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
+		return a.AppendBinary(buf)
+	}
+	body, err := cmd.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
-	return c.sendAndFetchResponse(ctx, data, cmd.Code())
+	total := 8 + len(body)
+	if cap(buf) < total {
+		buf = make([]byte, 0, total)
+	}
+	buf = buf[:8]
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(body)+4))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
+	buf = append(buf, body...)
+	return buf, nil
 }
 
+// sendAndFetchResponse wraps a bare command body with the wire header and
+// sends it. Kept for callers/tests that build payloads from a body + code.
 func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte, command command.Code) ([]byte, error) {
+	wire := createPayload(message, command)
+	return c.sendWireAndFetchResponse(ctx, wire)
+}
+
+// sendWireAndFetchResponse sends a pre-built wire payload (length header,
+// command code, body) and returns the response body.
+func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayload []byte) ([]byte, error) {
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
@@ -276,7 +358,7 @@ func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte
 
 	// fast path for non-cancellable ctx.
 	if ctx.Done() == nil {
-		return c.sendLocked(message, command)
+		return c.sendLocked(wirePayload)
 	}
 
 	conn := c.conn
@@ -295,7 +377,7 @@ func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte
 	})
 	defer stop()
 
-	result, err := c.sendLocked(message, command)
+	result, err := c.sendLocked(wirePayload)
 
 	// clear the deadline of connection.
 	deadlineMu.Lock()
@@ -312,34 +394,28 @@ func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte
 	return result, nil
 }
 
-func (c *IggyTcpClient) sendLocked(message []byte, command command.Code) ([]byte, error) {
-	payload := createPayload(message, command)
-	if _, err := c.write(payload); err != nil {
+func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
+	if _, err := c.write(wirePayload); err != nil {
 		c.invalidateConnLocked()
 		return nil, err
 	}
 
-	readBytes, buffer, err := c.read(ResponseInitialBytesLength)
-	if err != nil {
+	var header [ResponseInitialBytesLength]byte
+	if _, err := c.readInto(header[:]); err != nil {
 		c.invalidateConnLocked()
 		return nil, err
 	}
 
-	if readBytes != ResponseInitialBytesLength {
-		c.invalidateConnLocked()
-		return nil, fmt.Errorf("received an invalid or empty response: %w", ierror.EmptyResponse{})
-	}
-
-	if status := ierror.Code(binary.LittleEndian.Uint32(buffer[0:4])); status != 0 {
+	if status := ierror.Code(binary.LittleEndian.Uint32(header[0:4])); status != 0 {
 		return nil, ierror.FromCode(status)
 	}
 
-	length := int(binary.LittleEndian.Uint32(buffer[4:]))
+	length := int(binary.LittleEndian.Uint32(header[4:]))
 	if length <= 1 {
 		return []byte{}, nil
 	}
 
-	_, buffer, err = c.read(length)
+	_, buffer, err := c.read(length)
 	if err != nil {
 		c.invalidateConnLocked()
 		return nil, err
@@ -356,6 +432,8 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	c.state = iggcon.StateDisconnected
 }
 
+// createPayload builds wire-format request bytes; the hot path uses
+// encodeWireRequest with a pooled buffer instead.
 func createPayload(message []byte, command command.Code) []byte {
 	messageLength := len(message) + 4
 	messageBytes := make([]byte, RequestInitialBytesLength+messageLength)

@@ -80,3 +80,61 @@ func TestSerializeIdentifier_EmptyStringId(t *testing.T) {
 		t.Errorf("Expected error: %v, got: %v", ierror.ErrInvalidIdentifier, err)
 	}
 }
+
+// TestIdentifier_MarshalledSizeMatchesAppendBinary guards against drift
+// between the size-computation and encode paths — they're implicitly
+// coupled by the request encoder (PollMessages pre-sizes its buffer via
+// MarshalledSize, then writes via AppendBinary).
+func TestIdentifier_MarshalledSizeMatchesAppendBinary(t *testing.T) {
+	mkLongString := func(n int) string {
+		s := make([]byte, n)
+		for i := range s {
+			s[i] = 'a'
+		}
+		return string(s)
+	}
+	cases := []struct {
+		name string
+		make func() Identifier
+	}{
+		{"numeric", func() Identifier { id, _ := NewIdentifier(uint32(42)); return id }},
+		{"string-short", func() Identifier { id, _ := NewIdentifier("hi"); return id }},
+		{"string-long", func() Identifier { id, _ := NewIdentifier(mkLongString(200)); return id }},
+		{"zero-value-numeric", func() Identifier {
+			return Identifier{Kind: NumericId, Length: 4, Value: []byte{1, 2, 3, 4}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := tc.make()
+			out, err := id.AppendBinary(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(out) != id.MarshalledSize() {
+				t.Fatalf("AppendBinary wrote %d bytes, MarshalledSize=%d", len(out), id.MarshalledSize())
+			}
+		})
+	}
+}
+
+// TestIdentifier_ValueMutationDoesNotCorruptEncoded guards that mutating
+// the exported Value field after construction leaves the cached wire bytes
+// intact.
+func TestIdentifier_ValueMutationDoesNotCorruptEncoded(t *testing.T) {
+	id, _ := NewIdentifier("hello")
+	before, err := id.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range id.Value {
+		id.Value[i] ^= 0xFF
+	}
+	after, err := id.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("encoded bytes changed after mutating Value: before=%v after=%v", before, after)
+	}
+}

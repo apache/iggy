@@ -27,6 +27,9 @@ type Identifier struct {
 	Kind   IdKind
 	Length int
 	Value  []byte
+	// encoded caches the wire bytes; populated by NewIdentifier, empty for
+	// zero-value Identifiers (marshalers fall back to Kind/Length/Value).
+	encoded []byte
 }
 
 type IdKind uint8
@@ -51,10 +54,12 @@ func NewIdentifier[T uint32 | string](value T) (Identifier, error) {
 func newNumericIdentifier(value uint32) (Identifier, error) {
 	val := make([]byte, 4)
 	binary.LittleEndian.PutUint32(val, value)
+	encoded := []byte{byte(NumericId), 4, val[0], val[1], val[2], val[3]}
 	return Identifier{
-		Kind:   NumericId,
-		Length: 4,
-		Value:  val,
+		Kind:    NumericId,
+		Length:  4,
+		Value:   val,
+		encoded: encoded,
 	}, nil
 }
 
@@ -64,10 +69,16 @@ func newStringIdentifier(value string) (Identifier, error) {
 	if length == 0 || length > 255 {
 		return Identifier{}, ierror.ErrInvalidIdentifier
 	}
+	val := []byte(value)
+	encoded := make([]byte, 2+length)
+	encoded[0] = byte(StringId)
+	encoded[1] = byte(length)
+	copy(encoded[2:], val)
 	return Identifier{
-		Kind:   StringId,
-		Length: len(value),
-		Value:  []byte(value),
+		Kind:    StringId,
+		Length:  length,
+		Value:   val,
+		encoded: encoded,
 	}, nil
 }
 
@@ -89,6 +100,14 @@ func (id Identifier) String() (string, error) {
 	return string(id.Value), nil
 }
 
+// MarshalledSize returns the byte length of the AppendBinary encoding.
+func (id Identifier) MarshalledSize() int {
+	if len(id.encoded) > 0 {
+		return len(id.encoded)
+	}
+	return 2 + id.Length
+}
+
 func (id Identifier) MarshalBinary() ([]byte, error) {
 	bytes := make([]byte, id.Length+2)
 	bytes[0] = byte(id.Kind)
@@ -98,6 +117,9 @@ func (id Identifier) MarshalBinary() ([]byte, error) {
 }
 
 func (id Identifier) AppendBinary(b []byte) ([]byte, error) {
+	if len(id.encoded) > 0 {
+		return append(b, id.encoded...), nil
+	}
 	b = append(b, byte(id.Kind), byte(id.Length))
 	b = append(b, id.Value...)
 	return b, nil
