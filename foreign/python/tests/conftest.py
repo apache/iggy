@@ -75,10 +75,35 @@ async def iggy_client() -> IggyClient:
 def unique_name():
     """Return a factory for generating unique test names."""
 
-    def make_name() -> str:
-        length = secrets.randbelow(248) + 8
+    def make_name(
+        prefix: str = "",
+        *,
+        min_bytes: int = 8,
+        max_bytes: int = 255,
+    ) -> str:
+        if min_bytes < 0:
+            raise ValueError("min_bytes must be non-negative")
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if max_bytes < min_bytes:
+            raise ValueError("max_bytes must be greater than or equal to min_bytes")
+
+        prefix_bytes = len(prefix.encode())
+        if prefix_bytes > max_bytes:
+            raise ValueError("prefix exceeds max_bytes")
+
+        min_suffix_bytes = max(0, min_bytes - prefix_bytes)
+        max_suffix_bytes = max_bytes - prefix_bytes
+        if min_suffix_bytes > max_suffix_bytes:
+            raise ValueError("prefix leaves insufficient room within byte bounds")
+
         alphabet = string.ascii_lowercase + string.digits
-        return "".join(secrets.choice(alphabet) for _ in range(length))
+        suffix_bytes = (
+            secrets.randbelow(max_suffix_bytes - min_suffix_bytes + 1)
+            + min_suffix_bytes
+        )
+        suffix = "".join(secrets.choice(alphabet) for _ in range(suffix_bytes))
+        return f"{prefix}{suffix}"
 
     return make_name
 

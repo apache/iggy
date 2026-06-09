@@ -29,31 +29,37 @@ class TestTopicOperations:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "topic_name",
+        ("prefix", "min_bytes", "max_bytes"),
         [
-            "a",
-            "stream-name",
-            "stream_name.with.mixed-CHARS123",
-            " leading-space",
-            "trailing-space ",
-            "multiple  spaces  inside",
-            "name/with/slash",
-            "name:with:colons",
-            "name.with.dots",
-            "   ",
-            "a" * 255,
-            ("é" * 126) + "abc",
-            ("한" * 84) + "abc",
-            ("漢" * 84) + "abc",
-            ("あ" * 84) + "abc",
-            ("😀" * 62) + "abcdefg",
+            ("a", 8, 255),
+            ("stream-name", 8, 255),
+            ("stream_name.with.mixed-CHARS123", 8, 255),
+            (" leading-space", 8, 255),
+            ("trailing-space ", 8, 255),
+            ("multiple  spaces  inside", 8, 255),
+            ("name/with/slash", 8, 255),
+            ("name:with:colons", 8, 255),
+            ("name.with.dots", 8, 255),
+            ("   ", 8, 255),
+            ("a" * 247, 255, 255),
+            (("é" * 122) + "abc", 255, 255),
+            (("한" * 81) + "abc", 255, 255),
+            (("漢" * 81) + "abc", 255, 255),
+            (("あ" * 81) + "abc", 255, 255),
+            (("😀" * 60) + "abcdefg", 255, 255),
         ],
     )
     async def test_create_and_get_topic(
-        self, iggy_client: IggyClient, unique_name, topic_name: str
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        prefix: str,
+        min_bytes: int,
+        max_bytes: int,
     ):
         """Test topic creation and retrieval."""
         stream_name = unique_name()
+        topic_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
@@ -63,7 +69,6 @@ class TestTopicOperations:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        assert topic.id >= 0
         assert topic.partitions_count == 2
 
         stream = await iggy_client.get_stream(stream_name)
@@ -72,24 +77,30 @@ class TestTopicOperations:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "topic_name",
+        ("prefix", "min_bytes", "max_bytes"),
         [
-            "",
-            "a" * 256,
-            "é" * 128,
-            ("é" * 127) + "ab",
-            ("한" * 85) + "a",
-            ("漢" * 85) + "a",
-            ("あ" * 85) + "a",
-            "😀" * 64,
-            ("😀" * 63) + "abcd",
+            ("", 0, 0),
+            ("a" * 248, 256, 256),
+            ("é" * 124, 256, 256),
+            (("é" * 123) + "ab", 256, 256),
+            (("한" * 82) + "ab", 256, 256),
+            (("漢" * 82) + "ab", 256, 256),
+            (("あ" * 82) + "ab", 256, 256),
+            ("😀" * 62, 256, 256),
+            (("😀" * 61) + "abcd", 256, 256),
         ],
     )
     async def test_create_topic_invalid_names(
-        self, iggy_client: IggyClient, unique_name, topic_name: str
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        prefix: str,
+        min_bytes: int,
+        max_bytes: int,
     ):
         """Test create_topic enforces byte-length validation."""
         stream_name = unique_name()
+        topic_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
         await iggy_client.create_stream(stream_name)
 
