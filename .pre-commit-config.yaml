@@ -85,11 +85,11 @@ repos:
         entry: ./scripts/ci/license-headers.sh
         args: ["--fix"]
         language: system
-        pass_filenames: false
+        pass_filenames: true
 
       - id: rust-version-sync
         name: rust version sync
-        entry: ./scripts/ci/sync-rust-version.sh
+        entry: ./scripts/ci/sync-rustc-version.sh
         args: ["--fix"]
         language: system
         files: ^rust-toolchain\.toml$
@@ -105,10 +105,10 @@ repos:
 
       - id: python-interpreter-version-sync
         name: python interpreter version sync
-        entry: ./scripts/ci/sync-python-version.sh
+        entry: ./scripts/ci/sync-python-interpreter-version.sh
         args: ["--fix"]
         language: system
-        files: ^(scripts/ci/sync-python-version\.sh|foreign/python/(pyproject\.toml|pylock\.toml|Dockerfile\.test|README\.md|\.devcontainer/Dockerfile)|bdd/python/(pyproject\.toml|pylock\.toml)|examples/python/(pyproject\.toml|pylock\.toml)|\.github/actions/python-maturin/pre-merge/action\.yml|\.github/workflows/(_build_python_wheels|_test_examples|coverage-baseline)\.yml)$
+        files: ^(scripts/ci/sync-python-interpreter-version\.sh|foreign/python/(pyproject\.toml|pylock\.toml|Dockerfile\.test|README\.md|\.devcontainer/Dockerfile)|bdd/python/(pyproject\.toml|pylock\.toml)|examples/python/(pyproject\.toml|pylock\.toml)|\.github/actions/python-maturin/pre-merge/action\.yml|\.github/workflows/(_build_python_wheels|_test_examples|coverage-baseline)\.yml)$
         pass_filenames: false
 
       - id: uv-lock-check
@@ -305,10 +305,10 @@ repos:
     hooks:
       - id: helmfmt
         name: helmfmt
-        entry: helmfmt
+        entry: helmfmt --check helm/charts/iggy
         language: system
         files: ^helm/charts/.*/templates/.*\.(yaml|tpl)$
-        pass_filenames: true
+        pass_filenames: false
 
       - id: yamllint-helm
         name: yamllint (helm)

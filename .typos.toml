@@ -21,6 +21,8 @@
 NdJson = "NdJson"
 # Valid Python package name used in dependency metadata and lockfiles
 certifi = "certifi"
+# Rust serialization framework in CamelCase ("Ser" misread as "Set")
+SerDe = "SerDe"
 
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]
@@ -40,6 +42,10 @@ Strat = "Strat"
 strin = "strin"
 # Valid Rust crate name (part of ICU4X)
 writeable = "writeable"
+# .NET dependency manager (proper noun, not "Packet")
+Paket = "Paket"
+# Visual Studio dockerignore glob "[Pp]ublish.xml" tokenizes to "ublish"
+ublish = "ublish"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
