@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -57,6 +58,10 @@ type IggyTcpClient struct {
 	currentServerAddress   string
 	connectedAt            time.Time
 	state                  iggcon.State
+	// respHeader is reused across RPCs to read the 8-byte response status
+	// header without allocating. Safe because sendLocked holds c.mtx, so
+	// only one RPC at a time accesses this field.
+	respHeader [ResponseInitialBytesLength]byte
 }
 
 type config struct {
@@ -242,12 +247,6 @@ func releaseRequestBuf(bp *[]byte) {
 	requestBufPool.Put(bp)
 }
 
-// appender lets a command encode directly into a pooled buffer.
-type appender interface {
-	MarshalledSize() int
-	AppendBinary([]byte) ([]byte, error)
-}
-
 func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
 	buffer := make([]byte, expectedSize)
 	n, err := c.readInto(buffer)
@@ -301,42 +300,28 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 }
 
 // encodeWireRequest writes the wire-format request (4-byte length, 4-byte
-// code, then body) into buf, growing it as needed.
+// code, then body) into buf, growing it as needed. The length prefix is
+// written from the realized body length, so a buggy or unimplemented
+// AppendBinary can never mis-size the wire frame (which would desync the
+// persistent TCP stream — there is no per-request resync).
 func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
-	buf = buf[:0]
-	if a, ok := cmd.(appender); ok {
-		bodySize := a.MarshalledSize()
-		total := 8 + bodySize
-		if cap(buf) < total {
-			buf = make([]byte, 8, total)
-		} else {
-			buf = buf[:8]
+	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
+	if a, ok := cmd.(encoding.BinaryAppender); ok {
+		out, err := a.AppendBinary(buf)
+		if err != nil {
+			return nil, err
 		}
-		// total wire message length = body + 4-byte command code
-		binary.LittleEndian.PutUint32(buf[0:4], uint32(bodySize+4))
-		binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
-		return a.AppendBinary(buf)
+		binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)-4))
+		return out, nil
 	}
 	body, err := cmd.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
-	total := 8 + len(body)
-	if cap(buf) < total {
-		buf = make([]byte, 0, total)
-	}
-	buf = buf[:8]
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(body)+4))
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
 	buf = append(buf, body...)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf)-4))
 	return buf, nil
-}
-
-// sendAndFetchResponse wraps a bare command body with the wire header and
-// sends it. Kept for callers/tests that build payloads from a body + code.
-func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte, command command.Code) ([]byte, error) {
-	wire := createPayload(message, command)
-	return c.sendWireAndFetchResponse(ctx, wire)
 }
 
 // sendWireAndFetchResponse sends a pre-built wire payload (length header,
@@ -400,17 +385,16 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	var header [ResponseInitialBytesLength]byte
-	if _, err := c.readInto(header[:]); err != nil {
+	if _, err := c.readInto(c.respHeader[:]); err != nil {
 		c.invalidateConnLocked()
 		return nil, err
 	}
 
-	if status := ierror.Code(binary.LittleEndian.Uint32(header[0:4])); status != 0 {
+	if status := ierror.Code(binary.LittleEndian.Uint32(c.respHeader[0:4])); status != 0 {
 		return nil, ierror.FromCode(status)
 	}
 
-	length := int(binary.LittleEndian.Uint32(header[4:]))
+	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
 	if length <= 1 {
 		return []byte{}, nil
 	}

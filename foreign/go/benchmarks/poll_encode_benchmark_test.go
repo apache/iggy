@@ -24,6 +24,11 @@ import (
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
+// benchSink prevents the compiler from eliminating allocations in benchmarks
+// whose results would otherwise not escape. Assign the encoded slice to
+// benchSink in every loop iteration.
+var benchSink []byte
+
 func newPollRequest(b *testing.B) *command.PollMessages {
 	b.Helper()
 	consumerId, _ := iggcon.NewIdentifier(uint32(42))
@@ -52,7 +57,7 @@ func BenchmarkPollMessagesMarshalBinary(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = out
+		benchSink = out
 	}
 }
 
@@ -60,7 +65,7 @@ func BenchmarkPollMessagesMarshalBinary(b *testing.B) {
 // a caller-owned, reusable buffer.
 func BenchmarkPollMessagesAppendBinary(b *testing.B) {
 	req := newPollRequest(b)
-	buf := make([]byte, 0, req.MarshalledSize())
+	buf := make([]byte, 0, 64)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -83,7 +88,7 @@ func BenchmarkIdentifierMarshalBinary(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_ = out
+		benchSink = out
 	}
 }
 
@@ -91,7 +96,7 @@ func BenchmarkIdentifierMarshalBinary(b *testing.B) {
 // cached wire bytes set in NewIdentifier.
 func BenchmarkIdentifierAppendBinary(b *testing.B) {
 	id, _ := iggcon.NewIdentifier("test_stream_id")
-	buf := make([]byte, 0, id.MarshalledSize())
+	buf := make([]byte, 0, 32)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

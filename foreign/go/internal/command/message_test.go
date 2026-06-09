@@ -88,43 +88,6 @@ func areBytesEqual(a, b []byte) bool {
 	return true
 }
 
-// TestPollMessages_MarshalledSizeMatchesAppendBinary guards against drift
-// between size computation and the encoder. The TCP client pre-sizes a
-// pooled buffer via MarshalledSize then writes via AppendBinary; a mismatch
-// produces a corrupt wire-message length header.
-func TestPollMessages_MarshalledSizeMatchesAppendBinary(t *testing.T) {
-	consumerId, _ := iggcon.NewIdentifier(uint32(42))
-	streamId, _ := iggcon.NewIdentifier("test_stream_id")
-	topicId, _ := iggcon.NewIdentifier("test_topic_id")
-	pid := uint32(7)
-	cases := []struct {
-		name string
-		req  PollMessages
-	}{
-		{"with-partition", PollMessages{
-			Consumer: iggcon.NewSingleConsumer(consumerId), StreamId: streamId,
-			TopicId: topicId, PartitionId: &pid,
-			Strategy: iggcon.NextPollingStrategy(), Count: 100, AutoCommit: true,
-		}},
-		{"no-partition", PollMessages{
-			Consumer: iggcon.NewSingleConsumer(consumerId), StreamId: streamId,
-			TopicId: topicId, PartitionId: nil,
-			Strategy: iggcon.OffsetPollingStrategy(42), Count: 50, AutoCommit: false,
-		}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			out, err := tc.req.AppendBinary(nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(out) != tc.req.MarshalledSize() {
-				t.Fatalf("AppendBinary wrote %d bytes, MarshalledSize=%d", len(out), tc.req.MarshalledSize())
-			}
-		})
-	}
-}
-
 func TestSerialize_SendMessagesRequest(t *testing.T) {
 	message1 := generateTestMessage("data1")
 	streamId, _ := iggcon.NewIdentifier("test_stream_id")

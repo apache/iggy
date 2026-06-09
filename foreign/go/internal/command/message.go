@@ -165,13 +165,6 @@ func (m *PollMessages) Code() Code {
 	return PollMessagesCode
 }
 
-func (m *PollMessages) MarshalledSize() int {
-	return 1 + m.Consumer.Id.MarshalledSize() +
-		m.StreamId.MarshalledSize() +
-		m.TopicId.MarshalledSize() +
-		partitionStrategySize + offsetSize + commitFlagSize
-}
-
 func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
 	b = append(b, byte(m.Consumer.Kind))
 	var err error
@@ -202,6 +195,5 @@ func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
 }
 
 func (m *PollMessages) MarshalBinary() ([]byte, error) {
-	out := make([]byte, 0, m.MarshalledSize())
-	return m.AppendBinary(out)
+	return m.AppendBinary(nil)
 }

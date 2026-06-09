@@ -120,15 +120,18 @@ func TestEncodeWireRequest_FallbackPropagatesMarshalError(t *testing.T) {
 
 func TestEncodeWireRequest_GrowsUndersizedBuffer(t *testing.T) {
 	cmd := newTestPollCmd()
-	// Start with a cap=4 buffer — far smaller than the encoded request needs.
-	buf := make([]byte, 0, 4)
-	got, err := encodeWireRequest(buf, cmd)
+	// Reference: full wire bytes when starting from a generous buffer.
+	want, err := encodeWireRequest(make([]byte, 0, 256), cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	expectedLen := 8 + cmd.MarshalledSize()
-	if len(got) != expectedLen {
-		t.Errorf("encoded len=%d, want %d", len(got), expectedLen)
+	// Start with a cap=4 buffer — far smaller than the encoded request needs.
+	got, err := encodeWireRequest(make([]byte, 0, 4), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("undersized buf produced different bytes\nwant: %v\n got: %v", want, got)
 	}
 	// Fallback branch should also grow.
 	fb := &fakeMarshalOnlyCmd{body: bytes.Repeat([]byte{0xAB}, 64), code: command.Code(9)}

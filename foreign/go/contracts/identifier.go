@@ -100,14 +100,6 @@ func (id Identifier) String() (string, error) {
 	return string(id.Value), nil
 }
 
-// MarshalledSize returns the byte length of the AppendBinary encoding.
-func (id Identifier) MarshalledSize() int {
-	if len(id.encoded) > 0 {
-		return len(id.encoded)
-	}
-	return 2 + id.Length
-}
-
 func (id Identifier) MarshalBinary() ([]byte, error) {
 	bytes := make([]byte, id.Length+2)
 	bytes[0] = byte(id.Kind)

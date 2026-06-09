@@ -56,7 +56,7 @@ func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 
 func TestSendAndFetchResponse_NilContext(t *testing.T) {
 	c, _ := newTestClient(t)
-	_, err := c.sendAndFetchResponse(nil, []byte{}, command.Code(0)) //nolint:staticcheck
+	_, err := c.sendWireAndFetchResponse(nil, createPayload([]byte{}, command.Code(0))) //nolint:staticcheck
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -95,7 +95,7 @@ func TestSendAndFetchResponse_ContextErrors(t *testing.T) {
 
 			// server does not respond, but it doesn't matter.
 			// ctx.Err() should fire before any I/O is attempted.
-			_, err := c.sendAndFetchResponse(tt.ctx, []byte{}, command.Code(0))
+			_, err := c.sendWireAndFetchResponse(tt.ctx, createPayload([]byte{}, command.Code(0)))
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -114,7 +114,7 @@ func TestSendAndFetchResponse_DeadlineTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err := c.sendAndFetchResponse(ctx, []byte{}, command.Code(0))
+	_, err := c.sendWireAndFetchResponse(ctx, createPayload([]byte{}, command.Code(0)))
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
@@ -142,7 +142,7 @@ func TestSendAndFetchResponse_CancelDuringIO(t *testing.T) {
 	}()
 
 	// Server does not respond, so the client blocks until the context is cancelled.
-	_, err := c.sendAndFetchResponse(ctx, []byte{}, command.Code(0))
+	_, err := c.sendWireAndFetchResponse(ctx, createPayload([]byte{}, command.Code(0)))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -197,7 +197,7 @@ func TestSendAndFetchResponse_ErrorStatus(t *testing.T) {
 
 	go serverRespond(t, serverConn, uint32(ierror.UnauthenticatedCode), nil)
 
-	_, err := c.sendAndFetchResponse(context.Background(), []byte{}, command.Code(0))
+	_, err := c.sendWireAndFetchResponse(context.Background(), createPayload([]byte{}, command.Code(0)))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -217,7 +217,7 @@ func TestSendAndFetchResponse_SuccessEmptyBody(t *testing.T) {
 
 	go serverRespond(t, serverConn, 0, nil)
 
-	result, err := c.sendAndFetchResponse(context.Background(), []byte{}, command.Code(0))
+	result, err := c.sendWireAndFetchResponse(context.Background(), createPayload([]byte{}, command.Code(0)))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestSendAndFetchResponse_SuccessWithBody(t *testing.T) {
 	body := []byte("hello iggy")
 	go serverRespond(t, serverConn, 0, body)
 
-	result, err := c.sendAndFetchResponse(context.Background(), []byte{}, command.Code(0))
+	result, err := c.sendWireAndFetchResponse(context.Background(), createPayload([]byte{}, command.Code(0)))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
