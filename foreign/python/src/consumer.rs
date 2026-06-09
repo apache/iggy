@@ -165,16 +165,17 @@ impl IggyConsumer {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume = get_runtime().spawn(scope(task_locals, async move {
-                let task_locals =
-                    Python::attach(pyo3_async_runtimes::tokio::get_current_locals).unwrap();
-                let consumer = PyCallbackConsumer {
-                    callback: Arc::new(callback),
-                    task_locals: Arc::new(Mutex::new(task_locals)),
-                };
-                let mut inner = inner.lock().await;
-                inner.consume_messages(&consumer, shutdown_rx).await
-            }));
+            let handle_consume: JoinHandle<PyResult<Result<(), IggyError>>> =
+                get_runtime().spawn(scope(task_locals, async move {
+                    let task_locals =
+                        Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
+                    let consumer = PyCallbackConsumer {
+                        callback: Arc::new(callback),
+                        task_locals: Arc::new(Mutex::new(task_locals)),
+                    };
+                    let mut inner = inner.lock().await;
+                    Ok(inner.consume_messages(&consumer, shutdown_rx).await)
+                }));
             let consume_result;
 
             if let Some(shutdown_event) = shutdown_event {
@@ -184,13 +185,7 @@ impl IggyConsumer {
                     shutdown_tx: Sender<()>,
                 ) -> PyResult<()> {
                     Python::attach(|py| {
-                        into_future(
-                            shutdown_event
-                                .bind(py)
-                                .as_any()
-                                .call_method0("wait")
-                                .unwrap(),
-                        )
+                        into_future(shutdown_event.bind(py).as_any().call_method0("wait")?)
                     })?
                     .await?;
                     shutdown_tx.send(()).map_err(|e| {
@@ -204,13 +199,15 @@ impl IggyConsumer {
                 ));
                 let shutdown_result;
                 (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
-                shutdown_result.unwrap()?;
+                shutdown_result.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                })??;
             } else {
                 consume_result = handle_consume.await;
             }
 
             consume_result
-                .unwrap()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))??
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
             Ok(())
         })
