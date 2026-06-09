@@ -60,7 +60,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.79.12
+        uses: taiki-e/install-action@v2.81.2
         with:
           tool: cargo-llvm-cov
 
@@ -97,7 +97,7 @@ jobs:
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
@@ -140,7 +140,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml
@@ -212,7 +212,7 @@ jobs:
           dotnet-coverage merge ./reports/**/*.cobertura.xml -f cobertura -o ./reports/coverage.cobertura.xml
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/csharp/reports/coverage.cobertura.xml
@@ -238,7 +238,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.79.12
+        uses: taiki-e/install-action@v2.81.2
         with:
           tool: cargo-llvm-cov
 
@@ -305,7 +305,7 @@ jobs:
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/python-coverage.lcov
@@ -326,7 +326,7 @@ jobs:
           task: test
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/php-coverage.lcov
@@ -390,7 +390,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
@@ -464,7 +464,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v6.0.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/go-coverage.out
