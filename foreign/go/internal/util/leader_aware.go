@@ -96,10 +96,10 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 	}
 
 	leaderAddress := net.JoinHostPort(leader.IP, strconv.Itoa(int(leaderPort)))
-	logger.Info(
+	logger.Debug(
 		"Found leader node",
 		"leader", leader.Name,
-		"address", leaderAddress,
+		"leader_address", leaderAddress,
 		"transport", transport,
 	)
 
@@ -112,7 +112,7 @@ func processClusterMetadata(metadata *iggcon.ClusterMetadata, currentAddress str
 		return leaderAddress, nil
 	}
 
-	logger.Debug("Already connected to leader at", "current_address", currentAddress)
+	logger.Debug("Already connected to leader", "current_address", currentAddress)
 	return "", nil
 }
 

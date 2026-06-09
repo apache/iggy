@@ -198,6 +198,9 @@ func WithTLSValidateCertificate(validate bool) TLSOption {
 // NewIggyTcpClient creates a new Iggy TCP client with the given options.
 // warning: don't use this function directly, use iggycli.NewIggyClient with iggycli.WithTcp instead.
 func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	opts := GetDefaultOptions()
 	for _, opt := range options {
 		if opt != nil {

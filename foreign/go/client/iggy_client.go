@@ -57,9 +57,8 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 }
 
 // WithLogger sets the logger for the Iggy client and its underlying transport.
-// This logger is used by the heartbeat and forwarded to the transport as a
-// default. When no logger is provided, all internal log output is silently
-// discarded.
+// This logger is used by the heartbeat and forwarded to the transport.
+// When no logger is provided, all internal log output is silently discarded.
 func WithLogger(logger *slog.Logger) Option {
 	return func(opts *Options) {
 		if logger == nil {
