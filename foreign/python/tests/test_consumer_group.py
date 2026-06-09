@@ -250,7 +250,10 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        with pytest.raises(RuntimeError, match=r"ConsumerOffsetNotFound\(0\)"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"Consumer offset for consumer with ID: 0 was not found\.",
+        ):
             await consumer.delete_offset(partition_id)
         assert consumer.get_last_stored_offset(partition_id) is None
 
@@ -1161,8 +1164,8 @@ class TestConsumerGroup:
     @pytest.mark.parametrize(
         ("create_stream", "expected_error"),
         [
-            (False, "StreamNameNotFound"),
-            (True, "TopicNameNotFound"),
+            (False, "Stream with name:"),
+            (True, "Topic with name:"),
         ],
     )
     async def test_consumer_group_missing_stream_or_topic_fails(
@@ -1207,7 +1210,7 @@ class TestConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError, match="ConsumerGroupNameNotFound"):
+        with pytest.raises(RuntimeError, match="Consumer group with name:"):
             await iggy_client.consumer_group(
                 unique_name(),
                 stream_name,

@@ -398,7 +398,9 @@ class TestMessageOperations:
             messages=[Message(f"Partition test - {unique_name()}")],
         )
 
-        with pytest.raises(RuntimeError, match=r"PartitionNotFound\("):
+        with pytest.raises(
+            RuntimeError, match=r"Partition with ID: 1 .* was not found\."
+        ):
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,

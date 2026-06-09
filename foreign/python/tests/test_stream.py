@@ -149,7 +149,7 @@ class TestStreamOperations:
         with pytest.raises(RuntimeError) as exc_info:
             await iggy_client.create_stream(stream_name)
 
-        assert "StreamNameAlreadyExists" in str(exc_info.value)
+        assert "already exists" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_stream(self, iggy_client: IggyClient, unique_name):

@@ -64,14 +64,14 @@ impl SendMessage {
     pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
         let inner = match data {
             PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{e:?}")))?,
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{e}")))?,
             PyMessagePayload::Bytes(data) => {
                 let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
                 RustIggyMessage::builder()
                     .payload(bytes)
                     .build()
                     .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{e:?}"))
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("{e}"))
                     })?
             }
         };

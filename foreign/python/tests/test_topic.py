@@ -175,7 +175,7 @@ class TestTopicOperations:
                 stream=stream_name, name=topic_name, partitions_count=1
             )
 
-        assert "TopicNameAlreadyExists" in str(exc_info.value)
+        assert "already exists" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_topic(self, iggy_client: IggyClient, unique_name):
@@ -457,7 +457,7 @@ class TestTopicOperations:
                 stream=stream_name, name=topic_name, partitions_count=partitions_count
             )
 
-        assert "TooManyPartitions" in str(exc_info.value)
+        assert "Too many partitions" in str(exc_info.value)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("partitions_count", [0, 1, 1000])

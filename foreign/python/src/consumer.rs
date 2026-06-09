@@ -108,7 +108,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))
         })
     }
 
@@ -129,7 +129,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))
         })
     }
 
@@ -188,8 +188,10 @@ impl IggyConsumer {
                         into_future(shutdown_event.bind(py).as_any().call_method0("wait")?)
                     })?
                     .await?;
-                    shutdown_tx.send(()).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                    shutdown_tx.send(()).map_err(|_| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            "Failed to signal shutdown",
+                        )
                     })?;
                     Ok(())
                 }
@@ -200,15 +202,15 @@ impl IggyConsumer {
                 let shutdown_result;
                 (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
                 shutdown_result.map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}"))
                 })??;
             } else {
                 consume_result = handle_consume.await;
             }
 
             consume_result
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))??
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))??
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
             Ok(())
         })
     }
@@ -232,7 +234,7 @@ impl ReceiveMessageIterator {
                         partition_id: m.partition_id,
                     })
                     .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}"))
                     })?)
             } else {
                 Err(PyStopAsyncIteration::new_err("No more messages"))
