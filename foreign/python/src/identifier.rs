@@ -38,10 +38,11 @@ impl TryFrom<PyIdentifier> for Identifier {
 
     fn try_from(py_identifier: PyIdentifier) -> Result<Self, Self::Error> {
         match py_identifier {
-            PyIdentifier::String(s) => Identifier::from_str(&s)
-                .map_err(|e| PyErr::new::<PyValueError, _>(format!("{e}"))),
+            PyIdentifier::String(s) => {
+                Identifier::from_str(&s).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
+            }
             PyIdentifier::Int(i) => {
-                Identifier::numeric(i).map_err(|e| PyErr::new::<PyValueError, _>(format!("{e}")))
+                Identifier::numeric(i).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
             }
         }
     }
@@ -55,11 +56,11 @@ impl TryFrom<&Identifier> for PyIdentifier {
             IdKind::String => val
                 .get_string_value()
                 .map(PyIdentifier::String)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("{e}"))),
+                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
             IdKind::Numeric => val
                 .get_u32_value()
                 .map(PyIdentifier::Int)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(format!("{e}"))),
+                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
         }
     }
 }

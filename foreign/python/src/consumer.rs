@@ -108,7 +108,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 
@@ -129,7 +129,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 
@@ -202,15 +202,15 @@ impl IggyConsumer {
                 let shutdown_result;
                 (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
                 shutdown_result.map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}"))
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })??;
             } else {
                 consume_result = handle_consume.await;
             }
 
             consume_result
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))??
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -234,7 +234,7 @@ impl ReceiveMessageIterator {
                         partition_id: m.partition_id,
                     })
                     .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}"))
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                     })?)
             } else {
                 Err(PyStopAsyncIteration::new_err("No more messages"))
