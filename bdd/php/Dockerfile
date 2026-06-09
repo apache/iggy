@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.95-slim-trixie
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     clang \
     composer \
@@ -25,24 +26,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libclang-dev \
     libssl-dev \
-    php-cli \
-    php-dev \
-    php-mbstring \
-    php-xml \
+    php8.3-cli \
+    php8.3-dev \
+    php8.3-mbstring \
+    php8.3-xml \
     pkg-config \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PHP=/usr/bin/php
-ENV PHP_CONFIG=/usr/bin/php-config
+ENV PATH=/root/.cargo/bin:$PATH
+ENV PHP=/usr/bin/php8.3
+ENV PHP_CONFIG=/usr/bin/php-config8.3
 ENV IGGY_HOST=iggy-server
 ENV IGGY_PORT=8090
 ENV BDD_FEATURE_FILE=/app/features/basic_messaging.feature
 
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.95.0 \
+    && cargo install cargo-php --locked --version 0.1.21 \
+    && rm -rf /root/.cargo/registry /root/.cargo/git
+
 WORKDIR /workspace
 
 COPY Cargo.toml Cargo.lock ./
-COPY core/ ./core/
+COPY core/binary_protocol/ ./core/binary_protocol/
+COPY core/common/ ./core/common/
+COPY core/sdk/ ./core/sdk/
 
 COPY foreign/php/Cargo.toml ./foreign/php/
 COPY foreign/php/composer.json ./foreign/php/
@@ -54,13 +63,12 @@ COPY foreign/php/tests/ ./foreign/php/tests/
 COPY foreign/php/scripts/ ./foreign/php/scripts/
 
 COPY bdd/php/ ./bdd/php/
+COPY bdd/scenarios/ ./bdd/scenarios/
 
 WORKDIR /workspace/foreign/php
 
-RUN cargo install cargo-php --locked --version 0.1.21 \
-    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 RUN composer install --no-interaction --prefer-dist
 RUN cargo php install --yes
 RUN chmod +x ./scripts/test.sh
 
-CMD ["./scripts/test.sh", "--configuration", "/workspace/bdd/php/phpunit.xml.dist", "/workspace/bdd/php/tests"]
+CMD ["./scripts/test.sh", "--configuration", "/workspace/bdd/php/phpunit.xml.dist"]

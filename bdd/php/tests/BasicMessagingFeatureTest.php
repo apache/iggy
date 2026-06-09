@@ -1,29 +1,27 @@
 <?php
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 declare(strict_types=1);
 
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\SendMessage;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -38,10 +36,13 @@ final class BasicMessagingFeatureTest extends TestCase
     private array $sentPayloads = [];
     private ?int $lastSentMessageCount = null;
 
+    #[DataProvider('scenarioCases')]
     #[TestDox('Basic messaging shared BDD scenario passes for the PHP SDK')]
-    public function testBasicMessagingScenario(): void
+    public function testBasicMessagingScenario(string $scenarioName, array $steps): void
     {
-        foreach ($this->scenarioSteps() as $step) {
+        assert_true($scenarioName !== '', 'scenario name must not be empty');
+
+        foreach ($steps as $step) {
             $this->runStep($step);
         }
     }
@@ -59,43 +60,81 @@ final class BasicMessagingFeatureTest extends TestCase
         parent::tearDown();
     }
 
-    private function scenarioSteps(): array
+    public static function scenarioCases(): array
     {
         $featureFile = getenv('BDD_FEATURE_FILE') ?: __DIR__ . '/../../scenarios/basic_messaging.feature';
-        assert_true(is_file($featureFile), "feature file not found at {$featureFile}");
+        if (!is_file($featureFile)) {
+            throw new RuntimeException("feature file not found at {$featureFile}");
+        }
 
         $lines = file($featureFile, FILE_IGNORE_NEW_LINES);
-        assert_true($lines !== false, "failed to read feature file at {$featureFile}");
+        if ($lines === false) {
+            throw new RuntimeException("failed to read feature file at {$featureFile}");
+        }
 
-        $steps = [];
-        $insideTargetScenario = false;
+        $backgroundSteps = [];
+        $scenarios = [];
+        $currentScenario = null;
+        $currentSteps = [];
+        $section = null;
         foreach ($lines as $line) {
             $line = trim($line);
-            if ($line === '') {
+            if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '@')) {
+                continue;
+            }
+
+            if ($line === 'Background:') {
+                $section = 'background';
                 continue;
             }
 
             if (str_starts_with($line, 'Scenario:')) {
-                $insideTargetScenario = $line === 'Scenario: Create stream and send messages';
+                if ($currentScenario !== null) {
+                    $scenarios[$currentScenario] = $currentSteps;
+                }
+
+                $currentScenario = trim(substr($line, strlen('Scenario:')));
+                $currentSteps = [];
+                $section = 'scenario';
                 continue;
             }
 
-            if (!$insideTargetScenario) {
+            if (preg_match('/^(Given|When|Then|And|But|\*) (.+)$/', $line, $matches) !== 1) {
                 continue;
             }
 
-            if (preg_match('/^(Given|When|Then|And) (.+)$/', $line, $matches) === 1) {
-                $steps[] = $matches[2];
+            if ($section === 'background') {
+                $backgroundSteps[] = $matches[2];
+                continue;
+            }
+
+            if ($section === 'scenario' && $currentScenario !== null) {
+                $currentSteps[] = $matches[2];
             }
         }
 
-        assert_true($steps !== [], 'no BDD steps were loaded from the basic messaging scenario');
+        if ($currentScenario !== null) {
+            $scenarios[$currentScenario] = $currentSteps;
+        }
 
-        return [
-            'I have a running Iggy server',
-            'I am authenticated as the root user',
-            ...$steps,
-        ];
+        if ($backgroundSteps === []) {
+            throw new RuntimeException('no BDD background steps were loaded from the feature');
+        }
+
+        if ($scenarios === []) {
+            throw new RuntimeException('no BDD scenarios were loaded from the feature');
+        }
+
+        $cases = [];
+        foreach ($scenarios as $scenarioName => $scenarioSteps) {
+            if ($scenarioSteps === []) {
+                throw new RuntimeException("scenario has no steps: {$scenarioName}");
+            }
+
+            $cases[$scenarioName] = [$scenarioName, [...$backgroundSteps, ...$scenarioSteps]];
+        }
+
+        return $cases;
     }
 
     private function runStep(string $step): void
@@ -211,7 +250,7 @@ final class BasicMessagingFeatureTest extends TestCase
                 (int) $matches[2],
                 (int) $matches[3],
                 PollingStrategy::offset((int) $matches[4]),
-                10,
+                $this->requireSentMessageCount(),
                 true,
             );
 
@@ -274,5 +313,12 @@ final class BasicMessagingFeatureTest extends TestCase
         assert_not_null($this->lastTopicName, 'topic name has not been captured');
 
         return $this->lastTopicName;
+    }
+
+    private function requireSentMessageCount(): int
+    {
+        assert_not_null($this->lastSentMessageCount, 'sent message count has not been captured');
+
+        return $this->lastSentMessageCount;
     }
 }

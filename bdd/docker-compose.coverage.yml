@@ -45,6 +45,24 @@ services:
         pytest tests/ -v
         --cov --cov-report=xml:/reports/python-bdd-coverage.xml
 
+  php-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - bash
+      - -lc
+      - >-
+        cargo install cargo-llvm-cov --locked
+        && cd /workspace/foreign/php
+        && source <(cargo llvm-cov show-env --sh)
+        && export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+        && cargo llvm-cov clean --workspace
+        && cargo php install --yes
+        && ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist
+        && cargo llvm-cov report --lcov
+        --ignore-filename-regex='(\.cargo/|/rustc/|/core/)'
+        --output-path /reports/php-bdd-coverage.lcov
+
   go-bdd:
     volumes:
       - ../reports:/reports

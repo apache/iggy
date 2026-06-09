@@ -76,7 +76,6 @@ excludes = [
     "**/.env",
     "**/.gitkeep",
     "**/META-INF/services/**",
-    "bdd/php/tests/BasicMessagingFeatureTest.php",
     ".github/config/hawkeye.version",
 ]
 

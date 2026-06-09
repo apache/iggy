@@ -58,7 +58,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        shared-key: php
+        shared-key: dev
         save-cache: "false"
 
     - name: Use shared Cargo target directory

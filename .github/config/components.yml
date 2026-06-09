@@ -316,7 +316,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "bdd/php/**"
-      - "bdd/scenarios/**"
+      - "bdd/scenarios/basic_messaging.feature"
     tasks: ["bdd-php"]
 
   bdd-go:

@@ -194,10 +194,7 @@ find_duplicate_license_headers() {
   local path
 
   : > "$output_file"
-  LICENSE_EXCLUDES=()
-  while IFS= read -r pattern; do
-    LICENSE_EXCLUDES+=("$pattern")
-  done < <(load_license_excludes)
+  mapfile -t LICENSE_EXCLUDES < <(load_license_excludes)
 
   while IFS= read -r -d '' path; do
     if is_license_excluded "$path"; then
