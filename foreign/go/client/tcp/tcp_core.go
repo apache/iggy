@@ -58,9 +58,7 @@ type IggyTcpClient struct {
 	currentServerAddress   string
 	connectedAt            time.Time
 	state                  iggcon.State
-	// respHeader is reused across RPCs to read the 8-byte response status
-	// header without allocating. Safe because sendLocked holds c.mtx, so
-	// only one RPC at a time accesses this field.
+	// respHeader is the reused response-status read buffer; guarded by c.mtx.
 	respHeader [ResponseInitialBytesLength]byte
 }
 
