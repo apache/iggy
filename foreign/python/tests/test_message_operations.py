@@ -152,7 +152,7 @@ class TestMessageOperations:
     )
     async def test_empty_payload_is_rejected(self, payload):
         """Test empty string and bytes payloads are rejected."""
-        with pytest.raises(ValueError, match="InvalidMessagePayloadLength"):
+        with pytest.raises(ValueError, match="Invalid message payload length"):
             Message(payload)
 
     @pytest.mark.asyncio
@@ -367,7 +367,7 @@ class TestMessageOperations:
             messages=[Message(message) for message in test_messages],
         )
 
-        with pytest.raises(RuntimeError, match="InvalidMessagesCount"):
+        with pytest.raises(RuntimeError, match="Invalid messages count"):
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
@@ -399,7 +399,11 @@ class TestMessageOperations:
         )
 
         with pytest.raises(
-            RuntimeError, match=r"Partition with ID: 1 .* was not found\."
+            RuntimeError,
+            match=(
+                r"Partition with ID: 0 for topic with ID: 0 "
+                r"for stream with ID: 0 was not found\."
+            ),
         ):
             await iggy_client.poll_messages(
                 stream=stream_name,
