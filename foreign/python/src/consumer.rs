@@ -25,7 +25,7 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, *,
 };
 use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
-use pyo3::exceptions::PyStopIteration;
+use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
 use pyo3::prelude::*;
@@ -235,7 +235,7 @@ impl ReceiveMessageIterator {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
                     })?)
             } else {
-                Err(PyStopIteration::new_err("No more messages"))
+                Err(PyStopAsyncIteration::new_err("No more messages"))
             }
         })
     }
