@@ -35,7 +35,15 @@ TEST_F(LowLevelE2E_Stream, CreateStreamAfterLogin) {
     RecordProperty("description", "Creates a stream successfully after authenticating.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW({
+        const auto stream_details = client->create_stream(stream_name);
+        EXPECT_EQ(stream_details.name, stream_name);
+        EXPECT_GT(stream_details.created_at, 0u);
+        EXPECT_EQ(stream_details.size_bytes, 0u);
+        EXPECT_EQ(stream_details.messages_count, 0u);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+        EXPECT_TRUE(stream_details.topics.empty());
+    });
     TrackStream(stream_name);
 }
 
@@ -43,7 +51,11 @@ TEST_F(LowLevelE2E_Stream, CreateDuplicateStreamThrows) {
     RecordProperty("description", "Rejects creating the same stream twice.");
     const std::string stream_name = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW({
+        const auto stream_details = client->create_stream(stream_name);
+        EXPECT_EQ(stream_details.name, stream_name);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+    });
     TrackStream(stream_name);
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
 }
@@ -73,7 +85,12 @@ TEST_F(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
     }
 
     const std::string max_length_name(255, 'a');
-    ASSERT_NO_THROW(client->create_stream(max_length_name));
+    ASSERT_NO_THROW({
+        const auto stream_details = client->create_stream(max_length_name);
+        EXPECT_EQ(stream_details.name, max_length_name);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+        EXPECT_TRUE(stream_details.topics.empty());
+    });
     TrackStream(max_length_name);
 }
 
@@ -82,7 +99,12 @@ TEST_F(LowLevelE2E_Stream, CreateStreamWithEmojiName) {
     const std::string stream_name = "🚀🚀🚀🚀Apache Iggy🚀🚀🚀🚀";
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW({
+        const auto stream_details = client->create_stream(stream_name);
+        EXPECT_EQ(stream_details.name, stream_name);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+        EXPECT_TRUE(stream_details.topics.empty());
+    });
     TrackStream(stream_name);
     ASSERT_NO_THROW({
         const auto stream_details              = client->get_stream(make_string_identifier(stream_name));

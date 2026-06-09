@@ -211,13 +211,14 @@ impl Client {
         })
     }
 
-    pub fn create_stream(&self, stream_name: String) -> Result<(), String> {
+    pub fn create_stream(&self, stream_name: String) -> Result<ffi::StreamDetails, String> {
         RUNTIME.block_on(async {
-            self.inner
+            let stream_details = self
+                .inner
                 .create_stream(&stream_name)
                 .await
                 .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
-            Ok(())
+            Ok(ffi::StreamDetails::from(stream_details))
         })
     }
 
@@ -407,7 +408,7 @@ impl Client {
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
-    ) -> Result<(), String> {
+    ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
         let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
@@ -444,7 +445,8 @@ impl Client {
         };
 
         RUNTIME.block_on(async {
-            self.inner
+            let topic_details = self
+                .inner
                 .create_topic(
                     &rust_stream_id,
                     &topic_name,
@@ -460,7 +462,7 @@ impl Client {
                         "Could not create topic '{topic_name}' on stream '{rust_stream_id}': {error}"
                     )
                 })?;
-            Ok(())
+            Ok(ffi::TopicDetails::from(topic_details))
         })
     }
 
