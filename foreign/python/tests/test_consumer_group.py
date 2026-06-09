@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# TODO(slbotbm): make a helper function for create_stream + create_topic
+# + consumer_group setup once test fixture is in place.
+
 import asyncio
 from datetime import timedelta
 
