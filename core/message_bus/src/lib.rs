@@ -99,7 +99,7 @@ pub use lifecycle::{
 };
 pub use transports::tls::TlsServerCredentials;
 
-use compio::runtime::JoinHandle;
+pub use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
 use iggy_binary_protocol::GenericHeader;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
@@ -511,10 +511,10 @@ pub trait MessageBus {
     /// Register a detached `compio::runtime::spawn` handle so
     /// [`shutdown`](IggyMessageBus::shutdown) can await it before the
     /// runtime drops. Production [`IggyMessageBus`] pushes onto a
-    /// `RefCell<Vec<JoinHandle>>` drained on shutdown; test stubs can
-    /// leave the no-op default (their tasks are short-lived + don't
-    /// need orderly drain).
-    fn track_background(&self, _handle: JoinHandle<()>) {}
+    /// `RefCell<Vec<JoinHandle>>` drained on shutdown. Required (no default)
+    /// so a new impl cannot silently drop detached handles by omission; a
+    /// stub that spawns nothing implements it as a no-op.
+    fn track_background(&self, handle: JoinHandle<()>);
 }
 
 /// Production message bus backed by real TCP connections.

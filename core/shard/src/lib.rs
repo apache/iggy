@@ -47,7 +47,7 @@ use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use partitions::{IggyPartition, IggyPartitions};
-use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::RefCell;
@@ -858,12 +858,6 @@ where
         };
         let self_shard_id = self.id;
         let partitions = self.plane.partitions();
-        // Partitions whose on-disk data is already unlinked; their fsync +
-        // blocking close is handed to a single detached drain task after the
-        // loop. Collected rather than spawned per op because
-        // `track_background` reaps its handle vec on every push and this loop
-        // never yields, so K per-op registrations would be O(K²).
-        let mut drained: Vec<IggyPartition<B>> = Vec::new();
         let mut confirmed_remove = false;
         for op in staged {
             match op {
@@ -883,19 +877,15 @@ where
                     // segment writers leak and `len` inflates). The discarded
                     // build is a fresh empty incarnation over the same on-disk
                     // path the kept one owns, so dropping it just closes a few
-                    // fds (no fsync: that lives in `drain_and_shutdown`).
+                    // fds.
                     if partitions.contains(&namespace) {
                         drop(partition);
                         continue;
                     }
-                    let local_idx = partitions.insert(namespace, *partition);
+                    partitions.insert(namespace, *partition);
                     self.shards_table.insert(
                         namespace,
-                        PartitionLocation::owned(
-                            ShardId::new(self_shard_id),
-                            LocalIdx::new(*local_idx),
-                            epoch,
-                        ),
+                        PartitionLocation::new(ShardId::new(self_shard_id), epoch),
                     );
                     self.metrics.record_partition_materialised();
                 }
@@ -905,24 +895,22 @@ where
                     epoch,
                 } => {
                     self.shards_table
-                        .insert(namespace, PartitionLocation::routed(owner, epoch));
+                        .insert(namespace, PartitionLocation::new(owner, epoch));
                 }
                 ReconcileOp::ConfirmRemove { namespace } => {
-                    // Tombstone bit set + shards_table row removed
-                    // synchronously by the reconciler before this op was
-                    // enqueued, so no in-flight frame can reach the
-                    // partition between `remove` and the eventual drop on
-                    // the detached task.
+                    // Tombstone bit set + shards_table row removed synchronously
+                    // by the reconciler before this op was enqueued, so no
+                    // in-flight frame can reach the partition between `remove`
+                    // and the drop here. Teardown already unlinked the on-disk
+                    // hierarchy via `delete_partitions_from_disk`, so the
+                    // partition drops inline: its compio file handles close
+                    // through io_uring without blocking, and no fsync is wanted
+                    // on data that is already gone.
                     let removed = partitions.remove(&namespace);
                     partitions.untombstone(&namespace);
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
-                    if let Some(partition) = removed {
-                        // Defer fsync + close off the pump; drained as a batch
-                        // after the loop (see below) so the pump never stalls
-                        // on per-segment fdatasync + blocking close.
-                        drained.push(partition);
-                    } else {
+                    if removed.is_none() {
                         tracing::trace!(
                             shard = self_shard_id,
                             namespace_raw = namespace.inner(),
@@ -944,21 +932,6 @@ where
             // a per-op wake would coalesce anyway; firing once avoids K
             // redundant handler borrows on a bulk DeleteStream.
             self.signal_reconcile_wake();
-        }
-
-        if !drained.is_empty() {
-            // One detached task drains every just-removed partition
-            // concurrently (io_uring keeps the per-segment fdatasync ops in
-            // flight), registered once via `track_background` so
-            // `bus.shutdown` awaits completion instead of the runtime
-            // cancelling it at drop. A bulk DeleteStream of K partitions thus
-            // costs one handle and one reap, not K of each.
-            let handle = compio::runtime::spawn(async move {
-                futures::future::join_all(drained.iter().map(IggyPartition::drain_and_shutdown))
-                    .await;
-                drop(drained);
-            });
-            self.bus.track_background(handle);
         }
     }
 }
@@ -1143,13 +1116,14 @@ where
         total
     }
 
-    /// Simulator-only. Production uses `load_partition` in server-ng
-    /// bootstrap. VSR replica id comes from `PartitionConsensusConfig`,
-    /// not `self.id` (the local shard index).
-    ///
-    /// Gated behind the `simulator` feature so production builds can't
-    /// reach it: it bypasses the reconciler's `ReconcileOp::InsertOwned`
-    /// funnel and mutates `IggyPartitions` outside the pump task.
+    /// Simulator-only. Mutates `IggyPartitions` off the pump task,
+    /// bypassing the reconciler's `ReconcileOp::InsertOwned` funnel (the
+    /// production runtime path; bootstrap recovery uses `load_partition`),
+    /// so it must never run in production. VSR replica id comes from
+    /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
+    /// `-p iggy-server-ng` build excludes the `simulator` feature and this
+    /// method; `cargo build --workspace` compiles it in but with no
+    /// production caller.
     #[cfg(any(test, feature = "simulator"))]
     pub fn init_partition(&self, namespace: IggyNamespace)
     where

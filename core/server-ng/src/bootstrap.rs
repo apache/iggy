@@ -66,7 +66,7 @@ use partitions::{
 };
 use server_common::bootstrap::create_directories;
 use server_common::executor::create_shard_executor;
-use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use server::log::logger::Logging;
 use server::shard_allocator::{ShardAllocator, ShardInfo};
@@ -1094,7 +1094,7 @@ async fn build_shard_for_thread(
                     } else {
                         shards_table.insert(
                             namespace,
-                            PartitionLocation::routed(
+                            PartitionLocation::new(
                                 ShardId::new(owning_shard),
                                 partition.created_revision,
                             ),
@@ -1124,14 +1124,10 @@ async fn build_shard_for_thread(
             Rc::clone(&bus),
         )
         .await?;
-        let local_idx = partitions.insert(namespace, partition);
+        partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
-            PartitionLocation::owned(
-                ShardId::new(shard_id),
-                LocalIdx::new(*local_idx),
-                partition_metadata.created_revision,
-            ),
+            PartitionLocation::new(ShardId::new(shard_id), partition_metadata.created_revision),
         );
     }
 
@@ -2232,9 +2228,15 @@ fn make_metadata_commit_notifier(
     })
 }
 
-/// Filter at broadcast site, keeping unrelated ops off the SDK reply path.
-/// Includes both public and `*WithAssignments` variants for
-/// defense-in-depth. Any new partition-shape op must be added here.
+/// Filter at the broadcast site, keeping unrelated ops off the SDK reply
+/// path. Any new partition-shape op must be added here.
+///
+/// The bare `CreateTopic` / `CreatePartitions` arms are unreachable: the
+/// leader's prepare-builder in `IggyMetadata` rewrites both into their
+/// `*WithAssignments` form, stamping each partition's `consensus_group_id`
+/// before journaling, so a committed prepare only ever carries the
+/// assignment-bearing variant. Kept as defense-in-depth against a future
+/// commit path that emits a bare op.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
     matches!(
         op,

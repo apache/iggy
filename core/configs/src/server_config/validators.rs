@@ -443,8 +443,10 @@ impl Validatable<ConfigurationError> for ShardingConfig {
         let reconcile = self.reconcile_periodic_interval.get_duration();
         if reconcile.is_zero() {
             eprintln!(
-                "Invalid sharding configuration: reconcile_periodic_interval must be > 0 (a zero \
-                 cadence busy-loops the partition reconciler on every shard)"
+                "Invalid sharding configuration: reconcile_periodic_interval resolves to zero. \
+                 Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero. The \
+                 periodic reconcile tick is a safety net for dropped commit-wakes and cannot be \
+                 turned off; set a positive duration (default \"1s\", max {RECONCILE_PERIODIC_INTERVAL_MAX:?})."
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }

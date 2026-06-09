@@ -669,29 +669,6 @@ impl<B> IggyPartition<B>
 where
     B: MessageBus,
 {
-    /// Fsync every writer before reconciler-driven teardown drops the
-    /// partition + unlinks its on-disk hierarchy. Errors logged + swallowed.
-    pub async fn drain_and_shutdown(&self) {
-        for writer in self.log.messages_writers().iter().flatten() {
-            if let Err(err) = writer.fsync().await {
-                tracing::warn!(
-                    namespace_raw = self.consensus.namespace(),
-                    error = ?err,
-                    "messages writer fsync failed",
-                );
-            }
-        }
-        for writer in self.log.index_writers().iter().flatten() {
-            if let Err(err) = writer.fsync().await {
-                tracing::warn!(
-                    namespace_raw = self.consensus.namespace(),
-                    error = ?err,
-                    "index writer fsync failed",
-                );
-            }
-        }
-    }
-
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
         IggyNamespace::from_raw(self.consensus.namespace())

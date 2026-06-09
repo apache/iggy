@@ -103,7 +103,7 @@ impl IggyShard {
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;
             // epoch is reconciler-only; unused by legacy server.
-            let location = PartitionLocation::routed(shard_id, 0);
+            let location = PartitionLocation::new(shard_id, 0);
             self.insert_shard_table_record(ns, location);
 
             if is_current_shard {

@@ -569,6 +569,10 @@ async fn tear_down_owned_partition(
 /// lazily in [`fetch_topic_stats`] only for namespaces actually built.
 fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        // TODO(krishna): O(committed partitions) per non-skipped pass (here +
+        // reconcile_removals). The revision fast-skip hides this in steady
+        // state but not under sustained churn; switch to an incremental diff
+        // keyed on the changed namespaces if it bottlenecks large clusters.
         let mut entries = Vec::new();
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {

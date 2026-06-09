@@ -344,7 +344,7 @@ fn main() -> Result<(), ServerError> {
                             shard_assignment.len() as u32,
                         ));
                         // epoch is reconciler-only; unused by legacy server.
-                        let location = PartitionLocation::routed(shard_id, 0);
+                        let location = PartitionLocation::new(shard_id, 0);
                         shards_table.insert(ns, location);
                     }
                 }
