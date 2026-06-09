@@ -353,10 +353,11 @@ class TestConsumerGroup:
             [Message(message) for message in test_messages],
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message.payload().decode())
-            if len(received_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message.payload().decode())
+                if len(received_messages) == len(test_messages):
+                    break
 
         assert received_messages == test_messages
 
@@ -399,10 +400,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message.payload().decode())
-            if len(received_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message.payload().decode())
+                if len(received_messages) == len(test_messages):
+                    break
 
         assert received_messages == test_messages
 
@@ -443,9 +445,10 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message)
-            break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message)
+                break
 
         assert [message.payload().decode() for message in received_messages] == [
             test_messages[-1]
@@ -492,10 +495,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message.payload().decode())
-            if len(received_messages) == 2:
-                break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message.payload().decode())
+                if len(received_messages) == 2:
+                    break
 
         assert received_messages == test_messages[-2:]
 
@@ -588,10 +592,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in first_consumer.iter_messages():
-            initial_messages.append(message)
-            if len(initial_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in first_consumer.iter_messages():
+                initial_messages.append(message)
+                if len(initial_messages) == len(test_messages):
+                    break
 
         start_offset = initial_messages[2].offset()
 
@@ -606,10 +611,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in offset_consumer.iter_messages():
-            offset_messages.append(message)
-            if len(offset_messages) == len(test_messages) - 2:
-                break
+        async with asyncio.timeout(5):
+            async for message in offset_consumer.iter_messages():
+                offset_messages.append(message)
+                if len(offset_messages) == len(test_messages) - 2:
+                    break
 
         assert offset_messages[0].offset() == start_offset
         assert [
@@ -658,10 +664,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in first_consumer.iter_messages():
-            initial_messages.append(message)
-            if len(initial_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in first_consumer.iter_messages():
+                initial_messages.append(message)
+                if len(initial_messages) == len(test_messages):
+                    break
 
         start_offset = initial_messages[2].offset()
 
@@ -733,10 +740,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in first_consumer.iter_messages():
-            initial_messages.append(message)
-            if len(initial_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in first_consumer.iter_messages():
+                initial_messages.append(message)
+                if len(initial_messages) == len(test_messages):
+                    break
 
         start_timestamp = initial_messages[1].timestamp()
 
@@ -751,10 +759,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in timestamp_consumer.iter_messages():
-            timestamp_messages.append(message)
-            if len(timestamp_messages) == len(test_messages) - 1:
-                break
+        async with asyncio.timeout(5):
+            async for message in timestamp_consumer.iter_messages():
+                timestamp_messages.append(message)
+                if len(timestamp_messages) == len(test_messages) - 1:
+                    break
 
         assert timestamp_messages[0].timestamp() >= start_timestamp
         assert [
@@ -807,10 +816,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in first_consumer.iter_messages():
-            initial_messages.append(message)
-            if len(initial_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in first_consumer.iter_messages():
+                initial_messages.append(message)
+                if len(initial_messages) == len(test_messages):
+                    break
 
         start_timestamp = initial_messages[1].timestamp()
 
@@ -881,20 +891,22 @@ class TestConsumerGroup:
         )
 
         iterator = consumer.iter_messages()
-        async for message in iterator:
-            received_messages.append(message)
-            if len(received_messages) == 2:
-                break
+        async with asyncio.timeout(5):
+            async for message in iterator:
+                received_messages.append(message)
+                if len(received_messages) == 2:
+                    break
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
             == received_messages[-1].offset()
         )
 
-        async for message in iterator:
-            received_messages.append(message)
-            if len(received_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in iterator:
+                received_messages.append(message)
+                if len(received_messages) == len(test_messages):
+                    break
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
@@ -938,10 +950,11 @@ class TestConsumerGroup:
             poll_interval=timedelta(milliseconds=25),
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message.payload().decode())
-            if len(received_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message.payload().decode())
+                if len(received_messages) == len(test_messages):
+                    break
 
         assert received_messages == test_messages
 
@@ -988,10 +1001,11 @@ class TestConsumerGroup:
             [Message(message) for message in test_messages],
         )
 
-        async for message in consumer.iter_messages():
-            received_messages.append(message)
-            if len(received_messages) == len(test_messages):
-                break
+        async with asyncio.timeout(5):
+            async for message in consumer.iter_messages():
+                received_messages.append(message)
+                if len(received_messages) == len(test_messages):
+                    break
 
         offsets = [message.offset() for message in received_messages]
 
@@ -1015,9 +1029,10 @@ class TestConsumerGroup:
         )
 
         if allow_replay:
-            async for message in replay_consumer.iter_messages():
-                replayed_messages.append(message.payload().decode())
-                break
+            async with asyncio.timeout(5):
+                async for message in replay_consumer.iter_messages():
+                    replayed_messages.append(message.payload().decode())
+                    break
             assert replayed_messages == [test_messages[-1]]
         else:
             with pytest.raises(asyncio.TimeoutError):
