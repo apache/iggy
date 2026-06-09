@@ -300,7 +300,7 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 // encodeWireRequest writes the wire-format request (4-byte length, 4-byte
 // code, then body) into buf, growing it as needed. The length prefix is
 // written from the realized body length, so a buggy or unimplemented
-// AppendBinary can never mis-size the wire frame (which would desync the
+// AppendBinary can never corrupt the wire frame (which would desync the
 // persistent TCP stream — there is no per-request resync).
 func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
 	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
