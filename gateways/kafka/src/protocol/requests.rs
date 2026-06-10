@@ -156,7 +156,7 @@ pub fn decode_fetch_request(version: i16, body: Bytes) -> Result<FetchRequest> {
 
     let isolation_level = if version >= 4 { d.read_i8()? } else { 0 };
 
-    // session_id and session_epoch (v7+) — we'll skip for now
+    // session_id and session_epoch (v7+) — read and discard (stub path)
     if version >= 7 {
         d.read_i32()?; // session_id
         d.read_i32()?; // session_epoch

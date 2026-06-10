@@ -25,6 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
+mod response;
+
 #[derive(Parser)]
 #[command(
     name = "kafka-message-gen",
@@ -65,13 +67,30 @@ enum Command {
         version: Option<i16>,
         #[arg(long, default_value = "5000")]
         timeout_ms: u64,
+        /// Compact one-line output (default is verbose decoded response)
+        #[arg(long)]
+        quiet: bool,
     },
-    /// Send all messages and report pass/fail — exit code 1 if any fail
     Verify {
         #[arg(long, default_value = "127.0.0.1:9092")]
         host: String,
+        /// Limit to these API keys (repeatable). Defaults to all gateway-scoped keys.
+        #[arg(long, action = clap::ArgAction::Append)]
+        api_key: Vec<i16>,
+        /// Limit to a single protocol version
+        #[arg(long)]
+        version: Option<i16>,
+        #[arg(long, default_value = "5000")]
+        timeout_ms: u64,
+        /// Stop on the first failure
         #[arg(long)]
         fail_fast: bool,
+        /// Use the full Kafka 4.1 registry (for real brokers), not the Iggy gateway scope
+        #[arg(long)]
+        all_apis: bool,
+        /// Compact one-line output (default is verbose decoded response)
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -143,6 +162,16 @@ const API_REGISTRY: &[(i16, &str, i16, i16)] = &[
     (74, "AssignReplicasToDirs", 0, 0),
     (75, "DescribeTopicPartitions", 0, 0),
     (76, "ListClientMetricsResources", 0, 0),
+];
+
+/// Iggy Kafka gateway #3421 scope — mirrors `SUPPORTED_RANGES` in `iggy_gateway_kafka`.
+const GATEWAY_REGISTRY: &[(i16, &str, i16, i16)] = &[
+    (0, "Produce", 3, 9),
+    (1, "Fetch", 4, 12),
+    (2, "ListOffsets", 1, 6),
+    (3, "Metadata", 0, 9),
+    (18, "ApiVersions", 0, 3),
+    (19, "CreateTopics", 2, 5),
 ];
 
 // ── Flexible version table ────────────────────────────────────────────────────
@@ -224,10 +253,34 @@ fn first_flexible_version(api_key: i16) -> Option<i16> {
 //   [api_key: i16]
 //   [api_version: i16]
 //   [correlation_id: i32]
-//   [client_id_len: i16]       -1 = null
-//   [client_id: bytes]
-//   [tagged_fields: u8(0)]     only present for flexible versions
+//   header v1: [client_id: NULLABLE_STRING]
+//   header v2: [client_id: COMPACT_NULLABLE_STRING] [request_header_tagged_fields]
 //   [payload: bytes]
+
+fn write_unsigned_varint(buf: &mut BytesMut, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.put_u8(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn write_compact_nullable_string(buf: &mut BytesMut, value: Option<&str>) {
+    match value {
+        None => write_unsigned_varint(buf, 0),
+        Some(s) => {
+            write_unsigned_varint(buf, (s.len() + 1) as u64);
+            buf.put_slice(s.as_bytes());
+        }
+    }
+}
+
 fn frame_request(
     api_key: i16,
     api_version: i16,
@@ -236,19 +289,22 @@ fn frame_request(
     payload: &[u8],
     flexible: bool,
 ) -> Bytes {
-    let cid = client_id.as_bytes();
-    let hlen = 2 + 2 + 4 + 2 + cid.len() + if flexible { 1 } else { 0 };
-    let blen = hlen + payload.len();
-    let mut buf = BytesMut::with_capacity(4 + blen);
-    buf.put_i32(blen as i32);
-    buf.put_i16(api_key);
-    buf.put_i16(api_version);
-    buf.put_i32(correlation_id);
-    buf.put_i16(cid.len() as i16);
-    buf.put_slice(cid);
+    let mut header = BytesMut::new();
+    header.put_i16(api_key);
+    header.put_i16(api_version);
+    header.put_i32(correlation_id);
     if flexible {
-        buf.put_u8(0x00);
+        write_compact_nullable_string(&mut header, Some(client_id));
+        header.put_u8(0); // empty request-header tagged fields
+    } else {
+        header.put_i16(i16::try_from(client_id.len()).expect("client_id fits i16"));
+        header.put_slice(client_id.as_bytes());
     }
+
+    let blen = header.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(4 + blen);
+    buf.put_i32(i32::try_from(blen).expect("frame fits i32"));
+    buf.put_slice(&header);
     buf.put_slice(payload);
     buf.freeze()
 }
@@ -669,23 +725,53 @@ async fn cmd_generate(
     Ok(())
 }
 
+async fn connect(host: &str) -> Result<TcpStream> {
+    TcpStream::connect(host)
+        .await
+        .with_context(|| format!("Cannot connect to {host}"))
+}
+
+async fn read_kafka_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut lb = [0u8; 4];
+    stream.read_exact(&mut lb).await?;
+    let frame_len = i32::from_be_bytes(lb);
+    if frame_len <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid response frame length: {frame_len}"),
+        ));
+    }
+    let mut body = vec![
+        0u8;
+        usize::try_from(frame_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "response frame length does not fit usize",
+            )
+        })?
+    ];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
 async fn run_send(
     host: &str,
-    fk: Option<i16>,
+    registry: &[(i16, &str, i16, i16)],
+    filter_keys: &[i16],
     fv: Option<i16>,
     toms: u64,
+    fail_fast: bool,
+    quiet: bool,
 ) -> Result<(usize, usize)> {
-    let mut stream = TcpStream::connect(host)
-        .await
-        .with_context(|| format!("Cannot connect to {host}"))?;
+    let mut stream = connect(host).await?;
     info!("Connected to {host}");
     let (mut ok, mut fail, mut corr) = (0usize, 0usize, 1i32);
-    for &(ak, name, min, max) in API_REGISTRY {
-        if fk.is_some_and(|k| k != ak) {
+    'outer: for &(ak, name, min, max) in registry {
+        if !filter_keys.is_empty() && !filter_keys.contains(&ak) {
             continue;
         }
         for v in min..=max {
-            if fv.is_some_and(|fv| fv != v) {
+            if fv.is_some_and(|wanted| wanted != v) {
                 continue;
             }
             let msg = match build_framed(ak, v, corr) {
@@ -693,39 +779,50 @@ async fn run_send(
                 Err(e) => {
                     warn!("Build {} v{}: {e}", name, v);
                     fail += 1;
+                    if fail_fast {
+                        break 'outer;
+                    }
                     continue;
                 }
             };
-            stream
-                .write_all(&msg)
-                .await
-                .with_context(|| format!("Write {} v{}", name, v))?;
-            let res = tokio::time::timeout(std::time::Duration::from_millis(toms), async {
-                let mut lb = [0u8; 4];
-                stream.read_exact(&mut lb).await?;
-                let mut body = vec![0u8; i32::from_be_bytes(lb) as usize];
-                stream.read_exact(&mut body).await?;
-                Ok::<Vec<u8>, std::io::Error>(body)
-            })
+            if let Err(e) = stream.write_all(&msg).await {
+                println!("✗ {name} v{v} → write error: {e}");
+                fail += 1;
+                stream = connect(host).await?;
+                if fail_fast {
+                    break 'outer;
+                }
+                corr += 1;
+                continue;
+            }
+
+            let res = tokio::time::timeout(
+                std::time::Duration::from_millis(toms),
+                read_kafka_response(&mut stream),
+            )
             .await;
+
             match res {
                 Ok(Ok(r)) => {
-                    let ec = if r.len() >= 6 {
-                        i16::from_be_bytes(r[4..6].try_into().unwrap())
-                    } else {
-                        -1
-                    };
-                    let sym = if ec <= 0 { "✓" } else { "⚠" };
-                    println!("{sym} {} v{} → {} bytes  ec={ec}", name, v, r.len());
+                    let summary = response::analyze_response(ak, v, corr, &r);
+                    summary.print(name, v, quiet);
                     ok += 1;
                 }
                 Ok(Err(e)) => {
-                    println!("✗ {} v{} → IO error: {e}", name, v);
+                    println!("✗ {name} v{v} → IO error: {e}");
                     fail += 1;
+                    stream = connect(host).await?;
+                    if fail_fast {
+                        break 'outer;
+                    }
                 }
                 Err(_) => {
-                    println!("✗ {} v{} → timeout ({}ms)", name, v, toms);
+                    println!("✗ {name} v{v} → timeout ({toms}ms)");
                     fail += 1;
+                    stream = connect(host).await?;
+                    if fail_fast {
+                        break 'outer;
+                    }
                 }
             }
             corr += 1;
@@ -754,12 +851,39 @@ async fn main() -> Result<()> {
             api_key,
             version,
             timeout_ms,
+            quiet,
         } => {
-            let (ok, fail) = run_send(&host, api_key, version, timeout_ms).await?;
+            let filter_keys: Vec<i16> = api_key.into_iter().collect();
+            let (ok, fail) = run_send(
+                &host,
+                API_REGISTRY,
+                &filter_keys,
+                version,
+                timeout_ms,
+                false,
+                quiet,
+            )
+            .await?;
             println!("\nResult: {ok} OK  {fail} failed");
         }
-        Command::Verify { host, .. } => {
-            let (ok, fail) = run_send(&host, None, None, 5000).await?;
+        Command::Verify {
+            host,
+            api_key,
+            version,
+            timeout_ms,
+            fail_fast,
+            all_apis,
+            quiet,
+        } => {
+            let registry = if all_apis {
+                API_REGISTRY
+            } else {
+                GATEWAY_REGISTRY
+            };
+            let (ok, fail) = run_send(
+                &host, registry, &api_key, version, timeout_ms, fail_fast, quiet,
+            )
+            .await?;
             println!("\n=== Verify: {ok} passed  {fail} failed ===");
             if fail > 0 {
                 std::process::exit(1);
