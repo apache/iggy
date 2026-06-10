@@ -19,7 +19,7 @@ use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_METADATA, BrokerAdvertise, ERROR_UNSUPPORTED_VERSION,
-    handle_request, is_supported_version, split_metadata_request_topics, supported_api_ranges,
+    handle_request, is_supported_version, supported_api_ranges,
 };
 
 fn test_broker() -> BrokerAdvertise {
@@ -63,7 +63,7 @@ fn api_versions_v3_response_flexible_format() {
     // Flexible: varint(len+1) compact array
     let count_plus_one = d.read_varint().unwrap();
     assert!(count_plus_one >= 3); // at least 2 entries → varint = 3+
-    let count = (count_plus_one - 1) as i32;
+    let count = i32::try_from(count_plus_one - 1).expect("api count fits i32");
 
     let mut keys = Vec::new();
     for _ in 0..count {
@@ -132,16 +132,20 @@ fn unknown_api_key_returns_error_only_payload() {
 }
 
 #[test]
-fn metadata_topic_split_reads_array_count() {
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&2_i32.to_be_bytes());
-    assert_eq!(split_metadata_request_topics(Bytes::from(raw), 0), 2);
-}
-
-#[test]
 fn version_support_table_is_applied() {
     assert!(is_supported_version(API_KEY_API_VERSIONS, 3));
     assert!(!is_supported_version(API_KEY_API_VERSIONS, 10));
     assert!(is_supported_version(API_KEY_METADATA, 1));
     assert!(!is_supported_version(API_KEY_METADATA, -1));
+}
+
+#[test]
+fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
+    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker());
+    // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 — no throttle_time_ms.
+    assert_eq!(body.len(), 42);
+    let mut d = Decoder::new(body);
+    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(d.read_i32().unwrap(), 6);
+    assert_eq!(d.remaining(), 36);
 }

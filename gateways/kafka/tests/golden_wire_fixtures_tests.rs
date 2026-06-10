@@ -28,7 +28,7 @@ fn golden_apiversions_v1_response_fixture() {
     let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker);
 
     // error_code=0, api_count=6
-    // key 0  (Produce)      min=3  max=9
+    // key 0  (Produce)      min=0  max=9 (KAFKA-18659 advertise min=0)
     // key 1  (Fetch)        min=4  max=12
     // key 2  (ListOffsets)  min=1  max=6
     // key 3  (Metadata)     min=0  max=9
@@ -38,7 +38,7 @@ fn golden_apiversions_v1_response_fixture() {
     let expected: [u8; 46] = [
         0x00, 0x00, // error_code
         0x00, 0x00, 0x00, 0x06, // api count = 6
-        0x00, 0x00, 0x00, 0x03, 0x00, 0x09, // key 0:  Produce      3–9
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, // key 0:  Produce      0–9 (advertised)
         0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, // key 1:  Fetch        4–12
         0x00, 0x02, 0x00, 0x01, 0x00, 0x06, // key 2:  ListOffsets  1–6
         0x00, 0x03, 0x00, 0x00, 0x00, 0x09, // key 3:  Metadata     0–9

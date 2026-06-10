@@ -25,7 +25,20 @@ use iggy_gateway_kafka::{KafkaServer, ServerConfig};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
-    let config = ServerConfig::default();
+    let mut config = ServerConfig::default();
+    if let Ok(bind_addr) = std::env::var("KAFKA_BIND_ADDR") {
+        config.bind_addr = bind_addr;
+    }
+    if let Ok(advertised_host) = std::env::var("KAFKA_ADVERTISED_HOST") {
+        config.advertised_host = Some(advertised_host);
+    }
+    if let Ok(advertised_port) = std::env::var("KAFKA_ADVERTISED_PORT") {
+        config.advertised_port = Some(
+            advertised_port
+                .parse()
+                .map_err(|e| format!("invalid KAFKA_ADVERTISED_PORT `{advertised_port}`: {e}"))?,
+        );
+    }
     let server = KafkaServer::new(config);
 
     let (tx, rx) = broadcast::channel(1);

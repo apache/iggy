@@ -19,6 +19,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum KafkaProtocolError {
+    #[error("invalid server configuration: {0}")]
+    InvalidConfig(String),
     #[error("buffer underflow: needed {needed} bytes, remaining {remaining}")]
     BufferUnderflow { needed: usize, remaining: usize },
     #[error("invalid frame length: {0}")]
@@ -36,8 +38,6 @@ pub enum KafkaProtocolError {
     UnsupportedHeaderVersion(i16),
     #[error("invalid array length: {0}")]
     InvalidArrayLength(i32),
-    #[error("invalid compact array length: encoded value must be >= 1, got {0}")]
-    InvalidCompactArrayLength(u64),
     #[error("collection length {count} exceeds maximum {max}")]
     CollectionTooLarge { count: usize, max: usize },
     #[error("string length {length} exceeds i16::MAX")]

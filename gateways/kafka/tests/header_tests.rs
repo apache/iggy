@@ -131,6 +131,17 @@ fn response_header_version_apiversions_always_zero() {
 }
 
 #[test]
+fn share_group_api_keys_use_flexible_header_from_v0() {
+    for key in [77, 78, 79, 80] {
+        assert_eq!(
+            request_header_version(key, 0),
+            2,
+            "api_key {key} must use flexible header v2"
+        );
+    }
+}
+
+#[test]
 fn response_header_version_flexible_non_apiversions() {
     // Metadata v9+ is flexible → response header v1
     assert_eq!(response_header_version(3, 9), 1);

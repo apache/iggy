@@ -24,6 +24,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{KafkaProtocolError, Result};
 
 /// Upper bound for Kafka array/collection element counts decoded from the wire.
+/// Matches typical broker limits and prevents OOM from adversarial length prefixes.
 pub const MAX_COLLECTION_LEN: usize = 65_536;
 
 pub struct Decoder {
@@ -117,7 +118,10 @@ impl Decoder {
         if n == 0 {
             return Ok(0);
         }
-        let count = (n - 1) as usize;
+        let count = usize::try_from(n - 1).map_err(|_| KafkaProtocolError::CollectionTooLarge {
+            count: MAX_COLLECTION_LEN + 1,
+            max: MAX_COLLECTION_LEN,
+        })?;
         if count > MAX_COLLECTION_LEN {
             return Err(KafkaProtocolError::CollectionTooLarge {
                 count,
@@ -148,7 +152,12 @@ impl Decoder {
         if len_plus_one == 0 {
             return Ok(None);
         }
-        let len = (len_plus_one - 1) as usize;
+        let len = usize::try_from(len_plus_one - 1).map_err(|_| {
+            KafkaProtocolError::CollectionTooLarge {
+                count: MAX_COLLECTION_LEN + 1,
+                max: MAX_COLLECTION_LEN,
+            }
+        })?;
         self.ensure(len)?;
         let s = std::str::from_utf8(&self.bytes.chunk()[..len])
             .map_err(|_| KafkaProtocolError::InvalidUtf8)?
@@ -174,7 +183,12 @@ impl Decoder {
         if len_plus_one == 0 {
             return Ok(None);
         }
-        let len = (len_plus_one - 1) as usize;
+        let len = usize::try_from(len_plus_one - 1).map_err(|_| {
+            KafkaProtocolError::CollectionTooLarge {
+                count: MAX_COLLECTION_LEN + 1,
+                max: MAX_COLLECTION_LEN,
+            }
+        })?;
         self.ensure(len)?;
         Ok(Some(self.bytes.copy_to_bytes(len)))
     }
@@ -197,7 +211,12 @@ impl Decoder {
         let count = count as usize;
         for _ in 0..count {
             self.read_varint()?; // tag number
-            let size = self.read_varint()? as usize;
+            let size = usize::try_from(self.read_varint()?).map_err(|_| {
+                KafkaProtocolError::CollectionTooLarge {
+                    count: MAX_COLLECTION_LEN + 1,
+                    max: MAX_COLLECTION_LEN,
+                }
+            })?;
             self.ensure(size)?;
             self.bytes.advance(size);
         }
@@ -288,19 +307,21 @@ impl Encoder {
     }
 
     /// Legacy nullable bytes: i32 length prefix, -1 for null.
-    pub fn write_nullable_bytes(&mut self, v: Option<&[u8]>) {
+    pub fn write_nullable_bytes(&mut self, v: Option<&[u8]>) -> Result<()> {
         match v {
             None => self.write_i32(-1),
             Some(b) => {
-                debug_assert!(
-                    b.len() <= i32::MAX as usize,
-                    "byte slice length {} exceeds i32::MAX",
-                    b.len()
-                );
-                self.write_i32(b.len() as i32);
+                if b.len() > i32::MAX as usize {
+                    return Err(KafkaProtocolError::CollectionTooLarge {
+                        count: b.len(),
+                        max: i32::MAX as usize,
+                    });
+                }
+                self.write_i32(i32::try_from(b.len()).expect("checked above"));
                 self.bytes.put_slice(b);
             }
         }
+        Ok(())
     }
 
     /// Compact nullable bytes (flexible versions): varint(len+1), 0 for null.

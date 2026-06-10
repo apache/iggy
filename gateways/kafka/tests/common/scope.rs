@@ -15,10 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Kafka wire protocol gateway foundation for Apache Iggy.
+//! Shared scope constants — compiled into each integration test binary via `#[path]`.
+#![allow(dead_code)]
 
-pub mod error;
-pub mod protocol;
-pub mod server;
+use iggy_gateway_kafka::protocol::api::BrokerAdvertise;
 
-pub use server::{KafkaServer, ServerConfig};
+/// Scoped API keys exercised by the #3421 regression suite.
+pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
+    (0, "Produce", 3, 9),
+    (1, "Fetch", 4, 12),
+    (2, "ListOffsets", 1, 6),
+    (3, "Metadata", 0, 9),
+    (18, "ApiVersions", 0, 3),
+    (19, "CreateTopics", 2, 5),
+];
+
+pub fn default_broker() -> BrokerAdvertise {
+    BrokerAdvertise::default()
+}

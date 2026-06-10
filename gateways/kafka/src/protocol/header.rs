@@ -114,6 +114,10 @@ pub fn request_header_version(api_key: i16, api_version: i16) -> i16 {
         74 => 0,        // AssignReplicasToDirs — always flexible
         75 => 0,        // DescribeTopicPartitions — always flexible
         76 => 0,        // ListClientMetricsResources — always flexible
+        77 => 0,        // ShareGroupHeartbeat — always flexible (Kafka 4.0)
+        78 => 0,        // ShareGroupDescribe — always flexible
+        79 => 0,        // ShareFetch — always flexible
+        80 => 0,        // ShareAcknowledge — always flexible
         _ => i16::MAX,  // Unknown API — assume non-flexible
     };
     if api_version >= flexible_from { 2 } else { 1 }

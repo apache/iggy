@@ -17,12 +17,12 @@
 
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use iggy_gateway_kafka::protocol::codec::Encoder;
-use iggy_gateway_kafka::server::{read_frame, write_frame};
+use iggy_gateway_kafka::server::read_frame;
 
 async fn tcp_pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -31,6 +31,23 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
     let (server, _) = listener.accept().await.unwrap();
     let client = client.await.unwrap();
     (client, server)
+}
+
+/// Raw length-prefixed write (no Kafka response header) — mirrors `server::write_frame`.
+async fn write_length_prefixed(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    write_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let len = payload.len();
+    assert!(i32::try_from(len).is_ok());
+    let mut frame = BytesMut::with_capacity(4 + len);
+    frame.put_i32(i32::try_from(len).expect("len fits i32"));
+    frame.extend_from_slice(payload);
+    tokio::time::timeout(write_timeout, stream.write_all(&frame))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -45,7 +62,11 @@ async fn read_frame_reads_valid_payload() {
     let payload = enc.freeze();
 
     let mut frame = BytesMut::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+    frame.extend_from_slice(
+        &i32::try_from(payload.len())
+            .expect("test payload fits i32")
+            .to_be_bytes(),
+    );
     frame.extend_from_slice(&payload);
     client.write_all(&frame).await.unwrap();
 
@@ -59,13 +80,13 @@ async fn read_frame_reads_valid_payload() {
 async fn write_frame_writes_length_prefixed_payload() {
     let (mut client, mut server) = tcp_pair().await;
     let payload = b"abc123";
-    write_frame(&mut server, payload, Duration::from_secs(1))
+    write_length_prefixed(&mut server, payload, Duration::from_secs(1))
         .await
         .unwrap();
 
     let mut len = [0u8; 4];
     client.read_exact(&mut len).await.unwrap();
-    let len = i32::from_be_bytes(len) as usize;
+    let len = usize::try_from(i32::from_be_bytes(len)).expect("positive frame length");
     assert_eq!(len, payload.len());
 
     let mut body = vec![0u8; len];
@@ -97,7 +118,7 @@ async fn read_frame_rejects_invalid_lengths() {
 #[tokio::test]
 async fn write_frame_length_prefix_is_big_endian() {
     let (mut client, mut server) = tcp_pair().await;
-    write_frame(&mut server, &[1, 2, 3, 4], Duration::from_secs(1))
+    write_length_prefixed(&mut server, &[1, 2, 3, 4], Duration::from_secs(1))
         .await
         .unwrap();
 

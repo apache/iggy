@@ -23,9 +23,9 @@ use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
@@ -40,6 +40,11 @@ use std::io;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_addr: String,
+    /// Hostname or IP advertised in Metadata (`KAFKA_ADVERTISED_HOST`). Required when `bind_addr`
+    /// uses a wildcard address (`0.0.0.0` / `::`).
+    pub advertised_host: Option<String>,
+    /// Port advertised in Metadata (`KAFKA_ADVERTISED_PORT`). Defaults to the bind port.
+    pub advertised_port: Option<u16>,
     pub max_frame_size: usize,
     pub read_timeout: Duration,
     pub write_timeout: Duration,
@@ -49,10 +54,49 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9093".to_string(),
+            advertised_host: None,
+            advertised_port: None,
             max_frame_size: 8 * 1024 * 1024,
             read_timeout: Duration::from_secs(15),
             write_timeout: Duration::from_secs(10),
         }
+    }
+}
+
+impl BrokerAdvertise {
+    /// Resolve the broker endpoint advertised in Metadata from listener config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `bind_addr` is invalid, `advertised_host` is empty, or the listener
+    /// binds to a wildcard address without an explicit advertised host.
+    pub fn from_server_config(config: &ServerConfig) -> std::result::Result<Self, String> {
+        let bind = config
+            .bind_addr
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("invalid bind address `{}`: {e}", config.bind_addr))?;
+
+        let port = config
+            .advertised_port
+            .map_or_else(|| i32::from(bind.port()), i32::from);
+
+        let host = if let Some(ref advertised) = config.advertised_host {
+            let trimmed = advertised.trim();
+            if trimmed.is_empty() {
+                return Err("KAFKA_ADVERTISED_HOST must not be empty".into());
+            }
+            trimmed.to_string()
+        } else if bind.ip().is_unspecified() {
+            return Err(
+                "binding to a wildcard address (0.0.0.0 or ::) requires KAFKA_ADVERTISED_HOST \
+                 to be set to a reachable hostname or IP for Metadata broker advertisement"
+                    .into(),
+            );
+        } else {
+            bind.ip().to_string()
+        };
+
+        Ok(Self { host, port })
     }
 }
 
@@ -74,19 +118,42 @@ impl KafkaServer {
     ///
     /// Returns an error if binding fails or a non-transient `accept()` error occurs.
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+        let broker = Arc::new(
+            BrokerAdvertise::from_server_config(&self.config)
+                .map_err(KafkaProtocolError::InvalidConfig)?,
+        );
         let listener = TcpListener::bind(&self.config.bind_addr).await?;
-        info!("kafka listener bound on {}", self.config.bind_addr);
+        info!(
+            "kafka listener bound on {} (advertised as {}:{})",
+            self.config.bind_addr, broker.host, broker.port
+        );
 
         let tracker = TaskTracker::new();
-        let broker = Arc::new(BrokerAdvertise::from_bind_addr(&self.config.bind_addr));
+        let broker = Arc::clone(&broker);
 
         loop {
             tokio::select! {
-                _ = shutdown.recv() => {
-                    info!("kafka listener shutdown requested");
-                    tracker.close();
-                    tracker.wait().await;
-                    break;
+                result = shutdown.recv() => {
+                    match result {
+                        Ok(()) => {
+                            info!("kafka listener shutdown requested");
+                            tracker.close();
+                            tracker.wait().await;
+                            break;
+                        }
+                        // Capacity-1 channel: lagged means a signal was sent before we polled — treat as shutdown.
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            info!("kafka listener shutdown requested (lagged)");
+                            tracker.close();
+                            tracker.wait().await;
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracker.close();
+                            tracker.wait().await;
+                            break;
+                        }
+                    }
                 }
                 accept_result = listener.accept() => {
                     match accept_result {
@@ -130,7 +197,7 @@ async fn handle_connection(
     peer: SocketAddr,
     broker: Arc<BrokerAdvertise>,
 ) -> Result<()> {
-    info!(%peer, "connection accepted");
+    debug!(%peer, "connection accepted");
 
     loop {
         let frame = match read_frame(&mut stream, config.max_frame_size, config.read_timeout).await
@@ -146,9 +213,9 @@ async fn handle_connection(
             Err(e) => return Err(e),
         };
 
-        if frame.len() < 4 {
+        if frame.len() < 8 {
             return Err(KafkaProtocolError::BufferUnderflow {
-                needed: 4,
+                needed: 8,
                 remaining: frame.len(),
             });
         }
@@ -178,7 +245,7 @@ async fn handle_connection(
             Err(e) => return Err(e),
         };
 
-        info!(
+        debug!(
             %peer,
             api_key = req.api_key,
             api_version = req.api_version,
@@ -215,14 +282,13 @@ async fn send_response(
 ) -> Result<()> {
     let header_size = ResponseHeader::encoded_size(header_version);
     let payload_size = header_size + body.len();
-    if payload_size > i32::MAX as usize {
-        return Err(KafkaProtocolError::FrameTooLarge {
+    let payload_len_i32 =
+        i32::try_from(payload_size).map_err(|_| KafkaProtocolError::FrameTooLarge {
             max_bytes: i32::MAX as usize,
             actual_bytes: payload_size,
-        });
-    }
+        })?;
     let mut frame = BytesMut::with_capacity(4 + payload_size);
-    frame.put_i32(payload_size as i32);
+    frame.put_i32(payload_len_i32);
     header.encode_into(&mut frame, header_version);
     frame.put_slice(body);
     timeout(write_timeout, stream.write_all(&frame))
@@ -232,11 +298,7 @@ async fn send_response(
 }
 
 fn correlation_id_from_frame(frame: &bytes::Bytes) -> i32 {
-    if frame.len() >= 8 {
-        i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
-    } else {
-        0
-    }
+    i32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]])
 }
 
 /// Read one length-prefixed Kafka frame from `stream`.
@@ -262,7 +324,8 @@ pub async fn read_frame(
     let frame_len =
         usize::try_from(frame_len_i32).map_err(|_| KafkaProtocolError::FrameTooLarge {
             max_bytes: max_frame_size,
-            actual_bytes: u32::MAX as usize,
+            // Positive i32 that does not fit in `usize` (e.g. 16-bit targets).
+            actual_bytes: usize::MAX,
         })?;
     if frame_len > max_frame_size {
         return Err(KafkaProtocolError::FrameTooLarge {
@@ -272,51 +335,23 @@ pub async fn read_frame(
     }
 
     // read_buf fills BytesMut spare capacity without zero-initializing it first.
+    // Single deadline for the entire body so a slow-drip sender can't stall indefinitely
+    // by delivering one byte per timeout window.
+    let deadline = tokio::time::Instant::now() + read_timeout;
     let mut data = BytesMut::with_capacity(frame_len);
-    timeout(read_timeout, async {
-        while data.len() < frame_len {
-            if stream.read_buf(&mut data).await? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ));
+    while data.len() < frame_len {
+        match timeout_at(deadline, stream.read_buf(&mut data)).await {
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout").into()),
+            Ok(Ok(0)) => {
+                return Err(
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed").into(),
+                );
             }
+            Ok(Err(e)) => return Err(e.into()),
+            Ok(Ok(_)) => {}
         }
-        Ok::<_, io::Error>(())
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read timeout"))??;
-    Ok(data.freeze())
-}
-
-/// Write one length-prefixed Kafka frame to `stream`.
-///
-/// # Errors
-///
-/// Returns an error on timeout, oversize payload, or I/O failure.
-pub async fn write_frame(
-    stream: &mut TcpStream,
-    payload: &[u8],
-    write_timeout: Duration,
-) -> Result<()> {
-    let len = payload.len();
-    if len > i32::MAX as usize {
-        return Err(KafkaProtocolError::FrameTooLarge {
-            max_bytes: i32::MAX as usize,
-            actual_bytes: len,
-        });
     }
-    let mut frame = BytesMut::with_capacity(4 + len);
-    let len_i32 = i32::try_from(len).map_err(|_| KafkaProtocolError::FrameTooLarge {
-        max_bytes: i32::MAX as usize,
-        actual_bytes: len,
-    })?;
-    frame.put_i32(len_i32);
-    frame.extend_from_slice(payload);
-    timeout(write_timeout, stream.write_all(&frame))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))??;
-    Ok(())
+    Ok(data.freeze())
 }
 
 pub fn init_tracing() {
