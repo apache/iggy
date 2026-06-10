@@ -15,7 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[toolchain]
-channel = "1.96.0"
-components = ["rustfmt", "clippy"]
-profile = "default"
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/Dockerfile.test export-ignore
+/composer.lock export-ignore
+/docker-compose.test.yml export-ignore
+/phpunit.xml.dist export-ignore
+/target export-ignore
+/target/** export-ignore
+/tests export-ignore
+/tests/** export-ignore
+/vendor export-ignore
+/vendor/** export-ignore
