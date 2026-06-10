@@ -101,7 +101,7 @@ for dockerfile in $DOCKERFILES; do
         EXPECTED_VERSION="$RUST_VERSION_SHORT"
     elif grep -qE "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" 2>/dev/null; then
         SOURCE="from"
-        CURRENT_VERSION=$(grep -E "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" | head -1 | sed -nE 's/.*\brust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')
+        CURRENT_VERSION=$(grep -E "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" | head -1 | sed -nE 's/.*rust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')
         # Preserve the file's precision: full patch (1.96.0) or short (1.96).
         if [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             EXPECTED_VERSION="$RUST_VERSION"
@@ -126,7 +126,7 @@ for dockerfile in $DOCKERFILES; do
             if [ "$SOURCE" = "arg" ]; then
                 sed -i "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
             else
-                sed -i -E "s/(\brust:)[0-9]+\.[0-9]+(\.[0-9]+)?/\1$EXPECTED_VERSION/g" "$dockerfile"
+                sed -i -E "s/(rust:)[0-9]+\.[0-9]+(\.[0-9]+)?/\1$EXPECTED_VERSION/g" "$dockerfile"
             fi
             FIXED_FILES=$((FIXED_FILES + 1))
             echo -e "${GREEN}Fixed${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} -> ${GREEN}$EXPECTED_VERSION${NC}"

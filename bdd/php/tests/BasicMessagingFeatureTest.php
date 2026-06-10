@@ -31,7 +31,6 @@ final class BasicMessagingFeatureTest extends TestCase
     private ?int $lastStreamId = null;
     private ?string $lastStreamName = null;
     private ?string $lastTopicName = null;
-    private ?int $lastTopicPartitions = null;
     private array $lastPolledMessages = [];
     private array $sentPayloads = [];
     private ?int $lastSentMessageCount = null;
@@ -77,6 +76,7 @@ final class BasicMessagingFeatureTest extends TestCase
         $currentScenario = null;
         $currentSteps = [];
         $section = null;
+        $stepPattern = '/^(Given|When|Then|And|But|\*) (.+)$/';
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '@')) {
@@ -99,8 +99,12 @@ final class BasicMessagingFeatureTest extends TestCase
                 continue;
             }
 
-            if (preg_match('/^(Given|When|Then|And|But|\*) (.+)$/', $line, $matches) !== 1) {
+            if (preg_match($stepPattern, $line, $matches) !== 1) {
                 continue;
+            }
+
+            if ($section === null) {
+                throw new RuntimeException("BDD step appears before Background or Scenario: {$line}");
             }
 
             if ($section === 'background') {
@@ -191,7 +195,6 @@ final class BasicMessagingFeatureTest extends TestCase
             $topic = $this->requireClient()->getTopic($streamId, $topicName);
             assert_not_null($topic);
             $this->lastTopicName = $topicName;
-            $this->lastTopicPartitions = $partitions;
 
             return;
         }
@@ -214,7 +217,6 @@ final class BasicMessagingFeatureTest extends TestCase
             $topic = $this->requireClient()->getTopic($this->requireStreamId(), $this->requireTopicName());
             assert_not_null($topic);
             assert_same((int) $matches[1], $topic->partitions_count);
-            assert_same((int) $matches[1], $this->lastTopicPartitions);
 
             return;
         }

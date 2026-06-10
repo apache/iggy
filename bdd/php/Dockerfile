@@ -15,7 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+ARG RUST_VERSION=1.96
+FROM rust:${RUST_VERSION}-slim-trixie AS rust-toolchain
+
 FROM ubuntu:24.04
+
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -34,17 +40,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PATH=/root/.cargo/bin:$PATH
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
 ENV PHP=/usr/bin/php8.3
 ENV PHP_CONFIG=/usr/bin/php-config8.3
 ENV IGGY_HOST=iggy-server
 ENV IGGY_PORT=8090
 ENV BDD_FEATURE_FILE=/app/features/basic_messaging.feature
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain 1.95.0 \
+RUN rustup component add llvm-tools-preview \
     && cargo install cargo-php --locked --version 0.1.21 \
-    && rm -rf /root/.cargo/registry /root/.cargo/git
+    && cargo install cargo-llvm-cov --locked
 
 WORKDIR /workspace
 

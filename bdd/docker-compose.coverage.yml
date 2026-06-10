@@ -52,8 +52,7 @@ services:
       - bash
       - -lc
       - >-
-        cargo install cargo-llvm-cov --locked
-        && cd /workspace/foreign/php
+        cd /workspace/foreign/php
         && source <(cargo llvm-cov show-env --sh)
         && export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
         && cargo llvm-cov clean --workspace
