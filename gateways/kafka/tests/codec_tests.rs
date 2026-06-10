@@ -28,8 +28,8 @@ fn codec_round_trip_primitives_and_nullable_fields() {
     enc.write_i64(9_999_999);
     enc.write_nullable_string(Some("client-a")).unwrap();
     enc.write_nullable_string(None).unwrap();
-    enc.write_nullable_bytes(Some(&[1, 2, 3]));
-    enc.write_nullable_bytes(None);
+    enc.write_nullable_bytes(Some(&[1, 2, 3])).unwrap();
+    enc.write_nullable_bytes(None).unwrap();
     let bytes = enc.freeze();
 
     let mut dec = Decoder::new(bytes);
@@ -72,7 +72,17 @@ fn codec_u8_and_bool() {
 
 #[test]
 fn varint_round_trip_small_values() {
-    for v in [0u64, 1, 127, 128, 255, 300, 16383, 16384, u32::MAX as u64] {
+    for v in [
+        0u64,
+        1,
+        127,
+        128,
+        255,
+        300,
+        16383,
+        16384,
+        u64::from(u32::MAX),
+    ] {
         let mut enc = Encoder::with_capacity(16);
         enc.write_varint(v);
         let mut dec = Decoder::new(enc.freeze());

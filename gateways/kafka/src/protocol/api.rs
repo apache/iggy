@@ -25,8 +25,9 @@ use crate::protocol::requests::{
     decode_produce_request,
 };
 use crate::protocol::responses::{
-    encode_create_topics_response, encode_fetch_response, encode_list_offsets_response,
-    encode_produce_response,
+    encode_create_topics_error_response, encode_create_topics_response,
+    encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
+    encode_list_offsets_response, encode_produce_error_response, encode_produce_response,
 };
 
 pub const API_KEY_PRODUCE: i16 = 0;
@@ -51,6 +52,9 @@ pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
+
+/// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
+const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 
 #[derive(Debug, Clone)]
 pub struct BrokerAdvertise {
@@ -139,7 +143,8 @@ pub fn handle_request(
             if is_supported_version(api_key, api_version) {
                 encode_api_versions_response(api_version, ERROR_NONE)
             } else {
-                encode_api_versions_response(1, ERROR_UNSUPPORTED_VERSION)
+                // KIP-511: reply with v0 when the requested version is not understood.
+                encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_METADATA => {
@@ -155,11 +160,11 @@ pub fn handle_request(
                     Ok(req) => encode_produce_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode Produce request: {:?}", e);
-                        encode_error_only_response(ERROR_CORRUPT_MESSAGE)
+                        encode_produce_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                encode_error_only_response(ERROR_UNSUPPORTED_VERSION)
+                encode_produce_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_FETCH => {
@@ -168,11 +173,11 @@ pub fn handle_request(
                     Ok(req) => encode_fetch_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode Fetch request: {:?}", e);
-                        encode_error_only_response(ERROR_CORRUPT_MESSAGE)
+                        encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                encode_error_only_response(ERROR_UNSUPPORTED_VERSION)
+                encode_fetch_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_LIST_OFFSETS => {
@@ -181,11 +186,11 @@ pub fn handle_request(
                     Ok(req) => encode_list_offsets_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode ListOffsets request: {:?}", e);
-                        encode_error_only_response(ERROR_CORRUPT_MESSAGE)
+                        encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                encode_error_only_response(ERROR_UNSUPPORTED_VERSION)
+                encode_list_offsets_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_CREATE_TOPICS => {
@@ -194,11 +199,11 @@ pub fn handle_request(
                     Ok(req) => encode_create_topics_response(api_version, &req),
                     Err(e) => {
                         tracing::error!("Failed to decode CreateTopics request: {:?}", e);
-                        encode_error_only_response(ERROR_CORRUPT_MESSAGE)
+                        encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                encode_error_only_response(ERROR_UNSUPPORTED_VERSION)
+                encode_create_topics_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         _ => encode_error_only_response(ERROR_UNSUPPORTED_VERSION),
@@ -213,6 +218,19 @@ pub fn is_supported_version(api_key: i16, api_version: i16) -> bool {
         .is_some_and(|r| api_version >= r.min_version && api_version <= r.max_version)
 }
 
+/// Min version advertised in `ApiVersions` (may differ from the firewall min).
+///
+/// Produce must advertise min=0 per KAFKA-18659 / `PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION`
+/// even though this gateway only accepts Produce v3+.
+#[must_use]
+pub const fn advertised_min_version(api_key: i16, firewall_min: i16) -> i16 {
+    if api_key == API_KEY_PRODUCE {
+        0
+    } else {
+        firewall_min
+    }
+}
+
 fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
     let flexible = api_version >= 3;
     let ranges = SUPPORTED_RANGES;
@@ -224,7 +242,7 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
         e.write_varint((ranges.len() + 1) as u64);
         for r in ranges {
             e.write_i16(r.api_key);
-            e.write_i16(r.min_version);
+            e.write_i16(advertised_min_version(r.api_key, r.min_version));
             e.write_i16(r.max_version);
             e.write_empty_tagged_fields();
         }
@@ -232,7 +250,7 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
         e.write_i32(i32::try_from(ranges.len()).expect("supported range table is small"));
         for r in ranges {
             e.write_i16(r.api_key);
-            e.write_i16(r.min_version);
+            e.write_i16(advertised_min_version(r.api_key, r.min_version));
             e.write_i16(r.max_version);
         }
     }
@@ -264,8 +282,8 @@ fn encode_metadata_response(
 
     let mut e = Encoder::with_capacity(256);
 
-    if api_version >= 1 {
-        e.write_i32(0); // throttle_time_ms
+    if api_version >= 3 {
+        e.write_i32(0); // throttle_time_ms (Metadata v3+)
     }
 
     if flexible {
@@ -276,21 +294,19 @@ fn encode_metadata_response(
         e.write_compact_nullable_string(None); // rack
         e.write_empty_tagged_fields();
 
-        if api_version >= 2 {
-            e.write_compact_nullable_string(None); // cluster_id
-        }
-        e.write_i32(1); // controller_id
+        e.write_compact_nullable_string(None); // cluster_id (v2+)
+        e.write_i32(1); // controller_id (v1+)
 
         e.write_varint((topics_count + 1) as u64);
         for _ in 0..topics_count {
             e.write_i16(topic_error);
             e.write_compact_nullable_string(Some("unknown-topic"));
-            if api_version >= 1 {
-                e.write_bool(false); // is_internal — must come before partitions array
-            }
+            e.write_bool(false); // is_internal (v1+)
             e.write_varint(1); // empty partitions array
+            e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations (v8+)
             e.write_empty_tagged_fields();
         }
+        e.write_i32(AUTHORIZED_OPS_UNKNOWN); // cluster_authorized_operations (v8+)
         e.write_empty_tagged_fields();
     } else {
         e.write_i32(1); // brokers array length
@@ -316,6 +332,12 @@ fn encode_metadata_response(
                 e.write_bool(false); // is_internal
             }
             e.write_i32(0); // partitions array (empty)
+            if api_version >= 8 {
+                e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations
+            }
+        }
+        if api_version >= 8 {
+            e.write_i32(AUTHORIZED_OPS_UNKNOWN); // cluster_authorized_operations
         }
     }
 
@@ -330,7 +352,7 @@ pub fn encode_error_only_response(error_code: i16) -> Bytes {
 }
 
 #[must_use]
-pub fn split_metadata_request_topics(body: Bytes, api_version: i16) -> usize {
+pub(crate) fn split_metadata_request_topics(body: Bytes, api_version: i16) -> usize {
     let mut d = Decoder::new(body);
     if api_version >= 9 {
         d.read_compact_array_count().unwrap_or(0)

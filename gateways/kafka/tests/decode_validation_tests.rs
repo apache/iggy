@@ -20,16 +20,17 @@
 //!
 //! Frame layout written by kafka-tool (all versions):
 //!   [4-byte length prefix]
-//!   [api_key i16][api_version i16][correlation_id i32]
-//!   [client_id_len i16][client_id bytes]      ← always legacy i16, even for flexible APIs
-//!   [0x00 tagged-fields byte]                  ← only for flexible API versions
+//!   [`api_key` i16][`api_version` i16][`correlation_id` i32]
+//!   header v1: [`client_id`] `NULLABLE_STRING`
+//!   header v2: [`client_id`] `COMPACT_NULLABLE_STRING` + request-header tagged fields
 //!   [request body]                             ← properly encoded per spec (flexible or not)
 
 use std::path::PathBuf;
 
 use bytes::Bytes;
 
-use iggy_gateway_kafka::protocol::header::request_header_version;
+use iggy_gateway_kafka::protocol::codec::Decoder;
+use iggy_gateway_kafka::protocol::header::{RequestHeader, request_header_version};
 use iggy_gateway_kafka::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
     decode_produce_request,
@@ -45,31 +46,19 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/kafka-tool/kafka_messages")
 }
 
-/// Load a kafka-tool .bin file and return just the request body bytes, correctly
-/// skipping the outer Kafka frame header (api_key, api_version, correlation_id,
-/// legacy-i16 client_id, and — for flexible versions — the 0x00 tagged-fields byte).
+/// Load a kafka-tool `.bin` file and return just the request body bytes.
 fn load_body(api_key: i16, api_name: &str, version: i16) -> Bytes {
-    let filename = format!("{:03}_{}_v{}.bin", api_key, api_name, version);
+    let filename = format!("{api_key:03}_{api_name}_v{version}.bin");
     let path = fixtures_dir().join(&filename);
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {filename}: {e}"));
 
-    // Skip 4-byte length prefix → frame starts here
-    let frame = &data[4..];
-
-    // Bytes 0-7: api_key(2) + api_version(2) + correlation_id(4)
-    // Bytes 8-9: client_id_len (legacy i16)
-    let client_id_len = i16::from_be_bytes([frame[8], frame[9]]) as usize;
-    let body_start_after_client_id = 10 + client_id_len;
-
-    // kafka-tool appends a 0x00 tagged-fields byte for flexible-version APIs
-    let is_flexible = request_header_version(api_key, version) >= 2;
-    let body_start = if is_flexible {
-        body_start_after_client_id + 1
-    } else {
-        body_start_after_client_id
-    };
-
-    Bytes::copy_from_slice(&frame[body_start..])
+    let frame = Bytes::copy_from_slice(&data[4..]);
+    let hdr_ver = request_header_version(api_key, version);
+    let mut decoder = Decoder::new(frame);
+    RequestHeader::decode_from(&mut decoder, hdr_ver).expect("fixture request header must decode");
+    decoder
+        .read_bytes(decoder.remaining())
+        .expect("fixture request body must decode")
 }
 
 // ── Produce (API key 0) ───────────────────────────────────────────────────────
@@ -417,7 +406,7 @@ fn create_topics_response_v2_roundtrip() {
 }
 
 #[test]
-fn create_topics_response_v5_has_topic_config_error_code() {
+fn create_topics_response_v5_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(19, "CreateTopics", 5);
     let req = decode_create_topics_request(5, body).unwrap();
@@ -432,11 +421,6 @@ fn create_topics_response_v5_has_topic_config_error_code() {
     let error_code = d.read_i16().unwrap();
     assert_eq!(error_code, 0);
     let _error_msg = d.read_compact_nullable_string().unwrap(); // v1+
-    let topic_config_err = d.read_i16().unwrap(); // v5+: MUST be present
-    assert_eq!(
-        topic_config_err, 0,
-        "v5 must include topic_config_error_code"
-    );
     let num_partitions = d.read_i32().unwrap();
     assert_eq!(num_partitions, 1);
     let replication_factor = d.read_i16().unwrap();
