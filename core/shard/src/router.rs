@@ -22,7 +22,7 @@ use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
 use journal::{Journal, JournalHandle};
-use message_bus::{ConnectionInstaller, MessageBus};
+use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
@@ -74,7 +74,7 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
 /// pump), preventing concurrent access from independent async tasks.
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
-    B: MessageBus + ConnectionInstaller + 'static,
+    B: MessageBus + ConnectionInstaller + Clone + 'static,
     T: ShardsTable,
 {
     /// Network-receive entry point. Classifies the raw
@@ -337,21 +337,58 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
     {
         match payload {
-            LifecycleFrame::ReplicaConnectionSetup { fd, replica_id } => {
+            LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
+                tracing::info!(
+                    shard = self.id,
+                    slot,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing blind-delegated inbound replica fd"
+                );
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ReleaseSlot(slot));
+                self.bus
+                    .install_replica_inbound_fd(fd, self.on_replica_message.clone(), on_done);
+            }
+            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id } => {
                 tracing::info!(
                     shard = self.id,
                     replica_id,
                     raw_fd = fd.as_raw_fd(),
-                    "installing delegated replica fd"
+                    "installing delegated outbound replica fd"
                 );
-                self.bus
-                    .install_replica_tcp_fd(fd, replica_id, self.on_replica_message.clone());
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ClearDial(replica_id));
+                self.bus.install_replica_outbound_fd(
+                    fd,
+                    replica_id,
+                    self.on_replica_message.clone(),
+                    on_done,
+                );
+            }
+            LifecycleFrame::ReplicaInboundHandshakeDone { slot } => {
+                // Only shard 0 tracks in-flight handshake slots; a
+                // non-zero owning shard's ack closure addresses senders[0]
+                // (shard 0 itself releases inline, no frame).
+                debug_assert_eq!(
+                    self.id, 0,
+                    "ReplicaInboundHandshakeDone routed to shard {}",
+                    self.id
+                );
+                self.bus.release_replica_handshake_slot(slot);
+            }
+            LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id } => {
+                debug_assert_eq!(
+                    self.id, 0,
+                    "ReplicaOutboundHandshakeDone routed to shard {}",
+                    self.id
+                );
+                self.bus.clear_replica_dial_pending(replica_id);
             }
             LifecycleFrame::ClientConnectionSetup { fd, meta } => {
                 tracing::info!(
@@ -443,4 +480,61 @@ where
             }
         }
     }
+
+    /// Build the one-shot ack a delegated replica handshake fires when it
+    /// finishes, releasing the in-flight cap slot (inbound) or clearing
+    /// the pending-dial entry (outbound). When this shard IS shard 0 the
+    /// closure releases inline on the local bus (infallible, no frame in
+    /// flight); otherwise it `try_send`s the outcome frame to shard 0,
+    /// where a full or disconnected inbox is log-only: shard 0's
+    /// deadline expiry covers the lost ack.
+    fn replica_handshake_done_fn(
+        &self,
+        outcome: ReplicaHandshakeOutcome,
+    ) -> ReplicaHandshakeDoneFn {
+        if self.id == 0 {
+            let bus = self.bus.clone();
+            return Box::new(move || match outcome {
+                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
+                    bus.release_replica_handshake_slot(slot);
+                }
+                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
+                    bus.clear_replica_dial_pending(replica_id);
+                }
+            });
+        }
+        let to_shard_zero = self.senders[0].clone();
+        let metrics = self.metrics.clone();
+        let shard = self.id;
+        Box::new(move || {
+            let frame = match outcome {
+                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
+                    LifecycleFrame::ReplicaInboundHandshakeDone { slot }
+                }
+                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
+                    LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id }
+                }
+            };
+            if let Err(e) = to_shard_zero.try_send(ShardFrame::lifecycle(frame)) {
+                metrics.record_frame_drop(
+                    frame_drop_variant::REPLICA_HANDSHAKE_ACK,
+                    crate::coordinator::classify_try_send_err(&e),
+                );
+                tracing::debug!(
+                    shard,
+                    "replica handshake outcome ack dropped (shard-0 expiry covers): {e:?}"
+                );
+            }
+        })
+    }
+}
+
+/// Outcome a delegated replica handshake reports back to shard 0:
+/// release the in-flight cap slot (inbound) or clear the pending-dial
+/// entry (outbound). Becomes a [`LifecycleFrame`] only on the
+/// cross-shard send leg; shard 0 applies it inline.
+#[derive(Clone, Copy)]
+enum ReplicaHandshakeOutcome {
+    ReleaseSlot(u64),
+    ClearDial(u8),
 }

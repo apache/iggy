@@ -31,10 +31,19 @@
 //! 3. `ReplicaFinish`    dialer -> acceptor: `mac_d` (dialer direction).
 //!
 //! Each MAC is `keyed_hash(key, DOMAIN_TAG || cluster_id || dialer_id ||
-//! acceptor_id || nonce_d || nonce_a || dir)`. Binding both nonces, the
-//! ordered peer pair, and a direction byte defeats replay and reflection.
-//! The MAC key is a subkey derived from the configured shared secret, so
-//! the raw secret never reaches the wire transcript.
+//! acceptor_id || nonce_d || nonce_a || mode || tls_exporter || dir)`.
+//! Binding both nonces, the ordered peer pair, and a direction byte
+//! defeats replay and reflection. The MAC key is a subkey derived from
+//! the configured shared secret, so the raw secret never reaches the
+//! wire transcript.
+//!
+//! `mode || tls_exporter` is the channel binding ([`ChannelBinding`]).
+//! On a TLS link both ends derive the exporter from the session's master
+//! secret, so a MAC only verifies inside the SAME TLS session: a relay
+//! MITM terminating two separate TLS sessions (possible in the
+//! accept-any `cluster.tls.self_signed` mode) produces two different
+//! exporter values and both MACs fail. The mode byte domain-separates
+//! plaintext transcripts (exporter zeroed) from TLS ones.
 
 use blake3::Hash;
 use iggy_binary_protocol::RESERVED_COMMAND_LEN;
@@ -46,6 +55,10 @@ use zeroize::Zeroizing;
 pub const NONCE_LEN: usize = 32;
 /// Length of each handshake MAC, in bytes.
 pub const MAC_LEN: usize = 32;
+/// Length of the TLS exporter value bound into the MAC transcript, in bytes.
+pub const EXPORTER_LEN: usize = 32;
+/// rustls `export_keying_material` label for the replica channel binding.
+pub const EXPORTER_LABEL: &[u8] = b"iggy replica psk binding";
 /// Offset of the `status` byte in a `ReplicaChallenge` frame's `reserved_command`.
 ///
 /// Past the nonce (`[0..32]`) and MAC (`[32..64]`) regions a successful
@@ -176,6 +189,38 @@ pub const fn read_status(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> Hands
     }
 }
 
+/// Channel binding folded into every handshake MAC.
+///
+/// `Tls` carries the rustls exporter value for the session the
+/// handshake frames flow over. Both ends derive it from the TLS master
+/// secret (same label, empty context), so a MAC bound to it verifies
+/// only inside that exact session; a relay MITM terminates two distinct
+/// sessions and both directions' MACs fail. `Plaintext` contributes a
+/// zeroed exporter; the mode byte keeps the two domains separate.
+#[derive(Clone, Copy)]
+pub enum ChannelBinding {
+    /// Plaintext replica link; nothing to bind.
+    Plaintext,
+    /// TLS link with the session's exporter value.
+    Tls([u8; EXPORTER_LEN]),
+}
+
+impl ChannelBinding {
+    const fn mode(self) -> u8 {
+        match self {
+            Self::Plaintext => 0,
+            Self::Tls(_) => 1,
+        }
+    }
+
+    const fn exporter(&self) -> &[u8; EXPORTER_LEN] {
+        match self {
+            Self::Plaintext => &[0u8; EXPORTER_LEN],
+            Self::Tls(exporter) => exporter,
+        }
+    }
+}
+
 /// The fields bound into a handshake MAC. Identical on both peers.
 pub struct Transcript {
     pub cluster_id: u128,
@@ -183,6 +228,7 @@ pub struct Transcript {
     pub acceptor_id: u8,
     pub nonce_d: [u8; NONCE_LEN],
     pub nonce_a: [u8; NONCE_LEN],
+    pub binding: ChannelBinding,
 }
 
 /// Cluster-wide replica authentication context.
@@ -236,6 +282,8 @@ impl ReplicaAuth {
         hasher.update(&[transcript.dialer_id, transcript.acceptor_id]);
         hasher.update(&transcript.nonce_d);
         hasher.update(&transcript.nonce_a);
+        hasher.update(&[transcript.binding.mode()]);
+        hasher.update(transcript.binding.exporter());
         hasher.update(&[dir]);
         hasher.finalize()
     }
@@ -254,6 +302,7 @@ mod tests {
             acceptor_id: 1,
             nonce_d: [0x11; NONCE_LEN],
             nonce_a: [0x22; NONCE_LEN],
+            binding: ChannelBinding::Plaintext,
         }
     }
 
@@ -306,6 +355,38 @@ mod tests {
             ..transcript()
         };
         assert!(!auth.verify_dialer_mac(&swapped, &mac));
+    }
+
+    #[test]
+    fn different_tls_sessions_are_rejected() {
+        // The MITM-relay defence: a MAC bound to one TLS session's
+        // exporter must not verify against another session's exporter.
+        let auth = ReplicaAuth::new(SECRET);
+        let session_a = Transcript {
+            binding: ChannelBinding::Tls([0xAA; EXPORTER_LEN]),
+            ..transcript()
+        };
+        let session_b = Transcript {
+            binding: ChannelBinding::Tls([0xBB; EXPORTER_LEN]),
+            ..transcript()
+        };
+        let mac = auth.dialer_mac(&session_a);
+        assert!(auth.verify_dialer_mac(&session_a, &mac));
+        assert!(!auth.verify_dialer_mac(&session_b, &mac));
+    }
+
+    #[test]
+    fn zeroed_exporter_does_not_alias_plaintext() {
+        // Mode byte domain separation: a TLS transcript whose exporter is
+        // all zeroes must still differ from the plaintext transcript.
+        let auth = ReplicaAuth::new(SECRET);
+        let plaintext = transcript();
+        let tls_zeroed = Transcript {
+            binding: ChannelBinding::Tls([0u8; EXPORTER_LEN]),
+            ..transcript()
+        };
+        let mac = auth.dialer_mac(&plaintext);
+        assert!(!auth.verify_dialer_mac(&tls_zeroed, &mac));
     }
 
     #[test]

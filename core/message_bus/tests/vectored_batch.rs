@@ -20,7 +20,10 @@
 
 mod common;
 
-use common::{header_only, install_replicas_locally, loopback};
+use common::{
+    header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
+    set_replica_ctx,
+};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
@@ -45,39 +48,20 @@ async fn writer_batches_pipelined_sends_in_order() {
         assert_eq!(seq, prev, "messages must arrive in order");
         received_for_handler.set(prev + 1);
     });
+    set_replica_ctx(&bus1, CLUSTER, 1, 2, None);
     let (l1, addr1) = bind(loopback()).await.unwrap();
     let token_for_l1 = bus1.token();
     let accept_1 = install_replicas_locally(bus1.clone(), on_message.clone());
     let l1_handle = compio::runtime::spawn(async move {
-        run(
-            l1,
-            token_for_l1,
-            CLUSTER,
-            1,
-            2,
-            None,
-            accept_1,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(l1, token_for_l1, accept_1).await;
     });
     bus1.track_background(l1_handle);
 
     let bus0 = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
     let on_reply: MessageHandler = Rc::new(|_, _| {});
-    let dial_0 = install_replicas_locally(bus0.clone(), on_reply);
-    start_connector(
-        &bus0,
-        CLUSTER,
-        0,
-        vec![(1, addr1)],
-        None,
-        Duration::from_secs(5),
-        dial_0,
-        DEFAULT_RECONNECT_PERIOD,
-    )
-    .await;
+    let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_reply);
+    start_connector(&bus0, 0, vec![(1, addr1)], dial_0, DEFAULT_RECONNECT_PERIOD).await;
 
     // Wait for connect.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
