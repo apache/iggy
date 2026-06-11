@@ -23,22 +23,44 @@ use crate::client_table::{ClientTable, REGISTER_REQUEST_ID, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
 use iggy_binary_protocol::{EvictionHeader, EvictionReason, HEADER_SIZE};
 use message_bus::MessageBus;
-use server_common::Message;
+use server_common::iobuf::Frozen;
+use server_common::{MESSAGE_ALIGN, Message};
 use std::cell::RefCell;
+
+/// What [`request_preflight`] decided, without touching the wire itself.
+///
+/// The preflight runs on shard 0 (the metadata owner), but the client's
+/// transport connection lives on its home shard. Sending a resend/eviction
+/// from here would route by the VSR consensus `client_id`, whose top bits are
+/// random and carry no home-shard routing -- so it (almost) never reaches the
+/// client. Returning the decision instead lets the home shard
+/// (`submit_request_in_process` -> `handle_client_request`) emit the frame by
+/// transport id, exactly like a fresh commit.
+pub enum PreflightOutcome {
+    /// New (client, request): dispatch a fresh prepare through consensus.
+    Dispatch,
+    /// Duplicate retry: resend this cached committed reply (wire bytes).
+    Replay(Frozen<MESSAGE_ALIGN>),
+    /// Session gone (`NoSession`) or rotated past the retry (`SessionTooLow`):
+    /// the client must be told with an eviction frame.
+    Evict(EvictionReason),
+    /// Absorbed with nothing to send: in-flight prepare, not-caught-up
+    /// primary, stale/gap retry, or a client-bug newer session.
+    Drop,
+}
 
 /// Request preflight (metadata only): session validation, dedup, in-flight check.
 ///
-/// # Returns
-/// `true` -> dispatch through consensus. `false` -> absorbed here
-/// (cached reply resent / duplicate dropped / eviction sent).
-#[allow(clippy::future_not_send)]
-pub async fn request_preflight<B, P>(
+/// Pure decision -- emits no frames (see [`PreflightOutcome`]). Callers turn
+/// the outcome into a reply: the home-shard path resends by transport id, the
+/// message-plane paths fall back to [`apply_preflight_consensus_plane`].
+pub fn request_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_table: &RefCell<ClientTable>,
     client_id: u128,
     session: u64,
     request: u64,
-) -> bool
+) -> PreflightOutcome
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -55,7 +77,7 @@ where
             request,
             "request_preflight: in-flight prepare, drop"
         );
-        return false;
+        return PreflightOutcome::Drop;
     }
 
     // Catch-up gate: stale ClientTable on a new primary could return `New`
@@ -73,53 +95,82 @@ where
             commit_max = consensus.commit_max(),
             "request_preflight: not caught up, drop"
         );
-        return false;
+        return PreflightOutcome::Drop;
     }
 
     let status = client_table
         .borrow()
         .check_request(client_id, session, request);
     match status {
+        // Frozen-backed cache -> refcount handoff to the home shard, no copy.
         RequestStatus::Duplicate(cached_reply) => {
-            // Best-effort resend (client may have disconnected). Frozen-backed
-            // cache -> refcount handoff, no copy.
-            let _ = consensus
-                .message_bus()
-                .send_to_client(client_id, cached_reply.into_wire_bytes())
-                .await;
-            false
+            PreflightOutcome::Replay(cached_reply.into_wire_bytes())
         }
-        RequestStatus::NoSession => {
-            // Session evicted under capacity pressure. SAFETY: catch-up
-            // gate makes this replica authoritative for session truth.
-            send_eviction_to_client(consensus, client_id, EvictionReason::NoSession).await;
-            false
-        }
+        // Session evicted under capacity pressure. SAFETY: catch-up gate makes
+        // this replica authoritative for session truth.
+        RequestStatus::NoSession => PreflightOutcome::Evict(EvictionReason::NoSession),
         RequestStatus::SessionMismatch { expected, received } => {
             // expected > received: stale session (rotated post-eviction) -> terminal eviction.
             // expected < received: client bug; silent drop, log.
             // SAFETY: catch-up gate makes this replica authoritative.
             if expected > received {
-                send_eviction_to_client(consensus, client_id, EvictionReason::SessionTooLow).await;
+                PreflightOutcome::Evict(EvictionReason::SessionTooLow)
             } else {
                 // Catch-up gate rules out network race; newer-than-issued
-                // session = client bug. Error log,
-                // no eviction (transient bug must not kill session), no
-                // rate limit (per-event).
+                // session = client bug. Error log, no eviction (transient bug
+                // must not kill session), no rate limit (per-event).
                 tracing::error!(
                     client_id,
                     expected,
                     received,
                     "request_preflight: ignoring newer session (client bug)"
                 );
+                PreflightOutcome::Drop
             }
-            false
         }
         // Client bug; recovered by client retry. Silent drop.
         RequestStatus::Stale
         | RequestStatus::RequestGap { .. }
-        | RequestStatus::AlreadyRegistered { .. } => false,
-        RequestStatus::New => true,
+        | RequestStatus::AlreadyRegistered { .. } => PreflightOutcome::Drop,
+        RequestStatus::New => PreflightOutcome::Dispatch,
+    }
+}
+
+/// Message-plane fallback for [`request_preflight`]: best-effort resend by the
+/// consensus `client_id`.
+///
+/// The wire-path ingress (`on_request`) and the queued retry drain have no
+/// home-shard transport context to route through, so they apply the outcome
+/// here. Returns `true` iff the caller should dispatch a fresh prepare.
+///
+/// Delivery is best-effort: a VSR consensus id's top bits are random, so
+/// `send_to_client` may not reach the client. The in-process client path
+/// (`submit_request_in_process`) instead carries the outcome back to the home
+/// shard and resends by transport id.
+#[allow(clippy::future_not_send)]
+pub async fn apply_preflight_consensus_plane<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    outcome: PreflightOutcome,
+    client_id: u128,
+) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    match outcome {
+        PreflightOutcome::Dispatch => true,
+        PreflightOutcome::Replay(reply) => {
+            let _ = consensus
+                .message_bus()
+                .send_to_client(client_id, reply)
+                .await;
+            false
+        }
+        PreflightOutcome::Evict(reason) => {
+            send_eviction_to_client(consensus, client_id, reason).await;
+            false
+        }
+        PreflightOutcome::Drop => false,
     }
 }
 
@@ -315,7 +366,6 @@ mod tests {
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
     use iggy_binary_protocol::{Command2, Operation, ReplyHeader};
     use message_bus::SendError;
-    use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
     /// Production-sized `ClientTable`.
     fn fresh_client_table() -> RefCell<ClientTable> {
@@ -440,12 +490,16 @@ mod tests {
 
         let client_id: u128 = 0xCAFE;
 
-        let result = futures::executor::block_on(request_preflight(
+        let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            &client_table,
+            request_preflight(
+                &consensus,
+                &client_table,
+                client_id,
+                10, // session
+                1,  // request
+            ),
             client_id,
-            10, // session
-            1,  // request
         ));
         assert!(!result, "NoSession short-circuits");
 
@@ -479,12 +533,10 @@ mod tests {
             .commit_register(client_id, initial_reply, |_| false);
 
         // Older retry (17 < 99): stale-session case.
-        let result = futures::executor::block_on(request_preflight(
+        let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            &client_table,
+            request_preflight(&consensus, &client_table, client_id, 17, 1),
             client_id,
-            17,
-            1,
         ));
         assert!(!result, "SessionMismatch short-circuits");
 
@@ -517,12 +569,10 @@ mod tests {
             .commit_register(client_id, initial_reply, |_| false);
 
         // Client claims newer session (99 > 17), client bug.
-        let result = futures::executor::block_on(request_preflight(
+        let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            &client_table,
+            request_preflight(&consensus, &client_table, client_id, 99, 1),
             client_id,
-            99,
-            1,
         ));
         assert!(!result, "SessionMismatch short-circuits");
 
@@ -545,12 +595,16 @@ mod tests {
 
         let client_id: u128 = 0xCAFE;
 
-        let result = futures::executor::block_on(request_preflight(
+        let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            &client_table,
+            request_preflight(
+                &consensus,
+                &client_table,
+                client_id,
+                10, // session
+                1,  // request
+            ),
             client_id,
-            10, // session
-            1,  // request
         ));
         assert!(!result, "NoSession short-circuits");
 
@@ -581,12 +635,10 @@ mod tests {
             .borrow_mut()
             .commit_reply(client_id, session, advanced);
 
-        let result = futures::executor::block_on(request_preflight(
+        let result = futures::executor::block_on(apply_preflight_consensus_plane(
             &consensus,
-            &client_table,
+            request_preflight(&consensus, &client_table, client_id, session, 3), // stale
             client_id,
-            session,
-            3, // stale
         ));
         assert!(!result);
 

@@ -221,15 +221,13 @@ jobs:
             const WELCOME_MARKER = '<!-- iggy-pr-triage-welcome -->';
             const WELCOME_BODY = [
               WELCOME_MARKER,
-              'Thanks for the pull request. It is now waiting for review, labeled `S-waiting-on-review`.',
+              'Thanks for the PR. It is labeled `S-waiting-on-review` and queued for review.',
               '',
-              'You can update that label as the review goes back and forth, with slash commands - each on its own line, in a regular PR comment (not an inline review reply):',
+              'Slash commands (own line, regular comment) move it around the queue:',
               '',
-              '- `/ready` - mark it `S-waiting-on-review` again, after addressing feedback',
-              '- `/author` - mark it `S-waiting-on-author` (maintainers, or anyone who has had a PR merged before)',
-              '- `/request-review @user ...` - request reviewers (`@user` or `@org/team`)',
-              '',
-              'Commands take up to ~90s to apply. If no reaction (👍 or 😕) appears on your comment, the apply step likely failed - check the repo\'s Actions tab for the `PR Triage Apply` run. Commands posted inside a review body (rather than a normal comment) cannot be reacted to, so they stay log-only.',
+              '- `/ready` - back to `S-waiting-on-review` after addressing feedback',
+              '- `/author` - flip to `S-waiting-on-author` while you finish changes',
+              '- `/request-review @user-or-team` - request a reviewer',
               '',
               'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#pr-triage-commands) for details.',
             ].join('\n');

@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
@@ -25,14 +23,20 @@ use serde::Deserialize;
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, GenericImage, ImageExt, ReuseDirective,
+};
 use tracing::info;
-use uuid::Uuid;
 
-const ELASTICSEARCH_IMAGE: &str = "elasticsearch";
+const ELASTICSEARCH_IMAGE: &str = "docker.io/library/elasticsearch";
 const ELASTICSEARCH_TAG: &str = "9.3.0";
 const ELASTICSEARCH_PORT: u16 = 9200;
 const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
+// Fixed name + ReuseDirective::Always shares one container across nextest's
+// per-test processes: the first test creates it, every later test attaches by
+// name. Per-test isolation comes from a unique index per fixture, not a fresh
+// container.
+const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -88,6 +92,8 @@ pub struct ElasticsearchHit {
 }
 
 pub struct ElasticsearchContainer {
+    // Held so testcontainers' Drop runs on test exit; ReuseDirective::Always
+    // makes that Drop leave the container running for the next test to attach.
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub base_url: String,
@@ -95,8 +101,6 @@ pub struct ElasticsearchContainer {
 
 impl ElasticsearchContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
-        let unique_network = format!("iggy-elasticsearch-source-{}", Uuid::new_v4());
-
         let container = GenericImage::new(ELASTICSEARCH_IMAGE, ELASTICSEARCH_TAG)
             .with_exposed_port(ELASTICSEARCH_PORT.tcp())
             .with_wait_for(WaitFor::http(
@@ -104,11 +108,13 @@ impl ElasticsearchContainer {
                     .with_port(ELASTICSEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_network(unique_network)
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .with_env_var("discovery.type", "single-node")
             .with_env_var("xpack.security.enabled", "false")
             .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
             .with_mapped_port(0, ELASTICSEARCH_PORT.tcp())
+            .with_container_name(ELASTICSEARCH_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {

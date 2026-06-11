@@ -59,6 +59,9 @@ flag_management:
     - name: python
       paths:
         - foreign/python/
+    - name: php
+      paths:
+        - foreign/php/
     - name: node
       paths:
         - foreign/node/
@@ -69,11 +72,11 @@ flag_management:
 component_management:
   individual_components:
     - component_id: rust
-      name: Rust Core
+      name: "Rust Core"
       paths:
         - core/
     - component_id: java
-      name: Java SDK
+      name: "Java SDK"
       paths:
         - foreign/java/
     - component_id: csharp
@@ -81,15 +84,19 @@ component_management:
       paths:
         - foreign/csharp/
     - component_id: python
-      name: Python SDK
+      name: "Python SDK"
       paths:
         - foreign/python/
+    - component_id: php
+      name: "PHP SDK"
+      paths:
+        - foreign/php/
     - component_id: node
-      name: Node SDK
+      name: "Node SDK"
       paths:
         - foreign/node/
     - component_id: go
-      name: Go SDK
+      name: "Go SDK"
       paths:
         - foreign/go/
 

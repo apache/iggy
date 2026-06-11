@@ -205,7 +205,7 @@ jobs:
 
   # Final status check
   finalize_pr:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:

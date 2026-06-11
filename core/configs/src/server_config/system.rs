@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::cache_indexes::CacheIndexesConfig;
 use super::server::MemoryPoolConfig;
@@ -28,6 +27,7 @@ use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use server_common::bootstrap::SystemPaths;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
@@ -103,6 +103,10 @@ pub struct LoggingConfig {
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct EncryptionConfig {
     pub enabled: bool,
+    // skip_serializing keeps the key out of the runtime current_config.toml (and
+    // the diagnostic snapshot that cats it). The live key is read from env /
+    // on-disk config at boot, never from the snapshot.
+    #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub key: String,
 }
@@ -330,5 +334,49 @@ impl SystemConfig {
             IggyExpiry::ServerDefault => self.topic.message_expiry,
             _ => message_expiry,
         }
+    }
+}
+
+impl SystemPaths for SystemConfig {
+    fn get_system_path(&self) -> String {
+        SystemConfig::get_system_path(self)
+    }
+
+    fn get_state_path(&self) -> String {
+        SystemConfig::get_state_path(self)
+    }
+
+    fn get_state_messages_file_path(&self) -> String {
+        SystemConfig::get_state_messages_file_path(self)
+    }
+
+    fn get_streams_path(&self) -> String {
+        SystemConfig::get_streams_path(self)
+    }
+
+    fn get_runtime_path(&self) -> String {
+        SystemConfig::get_runtime_path(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_key_is_never_serialized() {
+        // current_config.toml (and the diagnostic snapshot that cats it) is
+        // produced by serializing this struct, so the key must not survive a
+        // serialize. skip_serializing is format-agnostic, so a JSON dump proves
+        // the toml path too.
+        let config = EncryptionConfig {
+            enabled: true,
+            key: "encryption-key-MUST-NOT-be-persisted".to_owned(),
+        };
+        let serialized = serde_json::to_string(&config).expect("serialize encryption config");
+        assert!(
+            !serialized.contains("MUST-NOT-be-persisted"),
+            "encryption key leaked into serialized config: {serialized}"
+        );
     }
 }

@@ -24,6 +24,7 @@ pub(crate) mod configuration;
 pub(crate) mod consumer;
 pub(crate) mod diagnostic;
 pub(crate) mod either;
+pub(crate) mod http;
 pub(crate) mod identifier;
 pub(crate) mod message;
 pub(crate) mod partition;

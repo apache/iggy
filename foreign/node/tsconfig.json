@@ -14,8 +14,10 @@
     "declarationMap": true,
     
     "baseUrl": ".",
+    "rootDir": "./src",
     "outDir": "./dist",
-    "sourceMap": true
+    "sourceMap": true,
+    "ignoreDeprecations": "6.0"
   },
   "include": ["./src/**/*"],
   "exclude": ["node_modules", "dist"],

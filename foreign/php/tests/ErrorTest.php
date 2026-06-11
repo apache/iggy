@@ -1,0 +1,123 @@
+<?php
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+declare(strict_types=1);
+
+use Iggy\AutoCommit;
+use Iggy\Client as IggyClient;
+use Iggy\Exception\AuthenticationException;
+use Iggy\Exception\ConnectionException;
+use Iggy\Exception\IggyException;
+use Iggy\Exception\NotFoundException;
+use Iggy\Exception\TransientException;
+use Iggy\PollingStrategy;
+use Iggy\ReceiveMessage;
+use Iggy\SendMessage;
+use PHPUnit\Framework\Attributes\TestDox;
+use PHPUnit\Framework\TestCase;
+
+final class ErrorTest extends TestCase
+{
+    #[TestDox('Connection configuration errors use the typed connection exception')]
+    public function testConnectionConfigurationErrorsUseTypedException(): void
+    {
+        $throwable = assert_throws(static fn () => new IggyClient('127.0.0.1'));
+
+        assert_instance_of(ConnectionException::class, $throwable);
+        assert_instance_of(IggyException::class, $throwable);
+    }
+
+    #[TestDox('Authentication failures use the typed authentication exception')]
+    public function testAuthenticationErrorsUseTypedException(): void
+    {
+        $client = new IggyClient(server_host() . ':' . server_port());
+        $client->connect();
+
+        $throwable = assert_throws(static fn () => $client->loginUser('iggy', 'wrong-password'));
+
+        assert_instance_of(AuthenticationException::class, $throwable);
+        assert_instance_of(IggyException::class, $throwable);
+    }
+
+    #[TestDox('Missing resources use the typed not-found exception')]
+    public function testNotFoundErrorsUseTypedException(): void
+    {
+        $client = new_client();
+
+        $throwable = assert_throws(static fn () => $client->deleteStream(unique_name('missing-stream')));
+
+        assert_instance_of(NotFoundException::class, $throwable);
+        assert_instance_of(IggyException::class, $throwable);
+    }
+
+    #[TestDox('Transient exceptions share the Iggy exception base class')]
+    public function testTransientExceptionUsesIggyBase(): void
+    {
+        assert_true(is_subclass_of(TransientException::class, IggyException::class));
+    }
+
+    #[TestDox('Callback exceptions are rethrown without changing their PHP type')]
+    public function testCallbackExceptionIsRethrownAsOriginalException(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('callback-exception-consumer');
+        $streamName = unique_name('callback-exception-stream');
+        $topicName = unique_name('callback-exception-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                0,
+                [new SendMessage('callback exception payload')],
+            );
+
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+
+            $throwable = assert_throws(
+                static fn () => $consumer->consumeMessages(
+                    static function (ReceiveMessage $message): void {
+                        throw new RuntimeException('callback abort');
+                    },
+                    1,
+                ),
+            );
+
+            assert_instance_of(RuntimeException::class, $throwable);
+            assert_same('callback abort', $throwable->getMessage());
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+}

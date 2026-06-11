@@ -31,6 +31,7 @@ publish = false
 [dependencies]
 ahash = { workspace = true }
 async-channel = { workspace = true }
+blake3 = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 compio-quic = { workspace = true }
@@ -41,6 +42,7 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+ring = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 scopeguard = { workspace = true }
@@ -48,6 +50,7 @@ server_common = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

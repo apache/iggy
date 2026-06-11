@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
@@ -47,10 +45,9 @@ use crate::{
         stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
         users::user::User,
-        utils::{crypto, file::overwrite},
+        utils::crypto,
     },
 };
-use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
 use iggy_common::SemanticVersion;
 use iggy_common::{
@@ -61,7 +58,7 @@ use iggy_common::{
     },
 };
 use slab::Slab;
-use std::{env, path::Path, sync::Arc};
+use std::{env, sync::Arc};
 use tracing::{info, warn};
 
 pub fn create_shard_connections(
@@ -88,42 +85,6 @@ pub fn create_shard_connections(
 pub async fn load_config() -> Result<ServerConfig, ServerError> {
     let config = ServerConfig::load().await?;
     Ok(config)
-}
-
-pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> {
-    let system_path = config.get_system_path();
-    if !Path::new(&system_path).exists() && create_dir_all(&system_path).await.is_err() {
-        return Err(IggyError::CannotCreateBaseDirectory(system_path));
-    }
-
-    let state_path = config.get_state_path();
-    if !Path::new(&state_path).exists() && create_dir_all(&state_path).await.is_err() {
-        return Err(IggyError::CannotCreateStateDirectory(state_path));
-    }
-    let state_log = config.get_state_messages_file_path();
-    if !Path::new(&state_log).exists() && (overwrite(&state_log).await).is_err() {
-        return Err(IggyError::CannotCreateStateDirectory(state_log));
-    }
-
-    let streams_path = config.get_streams_path();
-    if !Path::new(&streams_path).exists() && create_dir_all(&streams_path).await.is_err() {
-        return Err(IggyError::CannotCreateStreamsDirectory(streams_path));
-    }
-
-    let runtime_path = config.get_runtime_path();
-    if Path::new(&runtime_path).exists() && fs_utils::remove_dir_all(&runtime_path).await.is_err() {
-        return Err(IggyError::CannotRemoveRuntimeDirectory(runtime_path));
-    }
-
-    if create_dir_all(&runtime_path).await.is_err() {
-        return Err(IggyError::CannotCreateRuntimeDirectory(runtime_path));
-    }
-
-    info!(
-        "Initializing system, data will be stored at: {}",
-        config.get_system_path()
-    );
-    Ok(())
 }
 
 pub fn create_root_user() -> User {
@@ -170,43 +131,7 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-// Shard executors require IORING_SETUP_COOP_TASKRUN for predictable latency.
-// Falling back to default flags would silently degrade shard performance -
-// do not add a retry with reduced flags here.
-pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
-    // TODO: The event interval tick, could be configured based on the fact
-    // How many clients we expect to have connected.
-    // This roughly estimates the number of tasks we will create.
-    let mut proactor = compio::driver::ProactorBuilder::new();
-
-    // Each shard reserves io_uring SQ + CQ entries against `RLIMIT_MEMLOCK`.
-    // The multi-node integration tests spawn N nodes * M shards in a single
-    // process tree under a memlock budget that's often capped to 8 MiB on
-    // dev machines; the 4096-entry default blows past that and the OS
-    // returns `Cannot allocate memory` (EAGAIN/ENOMEM) during ring setup.
-    // The env knob lets the test harness shrink the per-ring footprint
-    // without compiling a separate test build. Production keeps the
-    // higher default for throughput.
-    let capacity = std::env::var("IGGY_SHARD_RUNTIME_CAPACITY")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(4096);
-    proactor
-        .capacity(capacity)
-        .coop_taskrun(true)
-        .taskrun_flag(true);
-
-    // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
-    // This causes a freeze on macOS with compio fs operations
-    // see https://github.com/compio-rs/compio/issues/446
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    proactor.thread_pool_limit(0);
-
-    compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor.to_owned())
-        .event_interval(128)
-        .build()
-}
+pub use server_common::{create_directories, create_shard_executor};
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
     match enforce_fsync {

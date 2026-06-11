@@ -53,6 +53,9 @@ iggy = { workspace = true }
 iggy-cli = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+# Path-dep only so the Doris integration test can reuse the connector's pure
+# `build_label` function — keeping the test and production label format in lock-step.
+iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
 keyring-core = { workspace = true }
@@ -82,6 +85,7 @@ sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
+testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
@@ -90,7 +94,7 @@ tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 zip = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]

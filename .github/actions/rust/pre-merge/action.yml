@@ -37,23 +37,35 @@ runs:
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
         shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
-        print-cache-status: ${{ startsWith(inputs.task, 'test-') }}
+        # fmt/sort/machete never build into target/, so the multi-GB cache
+        # restore is pure overhead. Compiling legs (check/clippy/doctest/test-*)
+        # keep it; a cold cache there recompiles the whole dep tree.
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete') && 'false' || 'true' }}
+        # Light legs fit in the runner's ~89 GiB default headroom; skip the
+        # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
+        # images on test-*, cross-builds, miri, verify-publish) keep it.
+        free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
+    - name: Install cargo-sort
+      if: inputs.task == 'sort'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-sort
+
+    - name: Install cargo-machete
+      if: inputs.task == 'machete'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-machete
+
+    # cargo-http-registry has no prebuilt artifact in taiki-e/install-action,
+    # so it stays a source build. verify-publish is a low-frequency task.
     - name: Install tools for specific tasks
+      if: inputs.task == 'verify-publish'
       run: |
-        case "${{ inputs.task }}" in
-          sort)
-            cargo install cargo-sort --locked
-            ;;
-          machete)
-            cargo install cargo-machete --locked
-            ;;
-          verify-publish)
-            if ! command -v cargo-http-registry >/dev/null 2>&1; then
-              cargo install cargo-http-registry --locked
-            fi
-            ;;
-        esac
+        if ! command -v cargo-http-registry >/dev/null 2>&1; then
+          cargo install cargo-http-registry --locked
+        fi
       shell: bash
 
     # DAG-based test scoping: use cargo-rail to compute affected crates from the
@@ -157,7 +169,7 @@ runs:
     - name: Install dependencies for Rust tests
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
-        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
+        sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
       shell: bash
 
@@ -206,6 +218,16 @@ runs:
         fi
 
         source <(cargo llvm-cov show-env --export-prefix)
+
+        # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
+        # This kernel param can only be set on the host (no container can raise it),
+        # so we raise it here. Everything else about booting Doris — image, heap/mem
+        # caps, port mappings, BE-alive wait — lives in the testcontainers fixture
+        # at core/integration/tests/connectors/fixtures/doris/container.rs, so
+        # `cargo test` and CI follow exactly the same path.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          sudo sysctl -w vm.max_map_count=2000000 || true
+        fi
 
         bins_start=$(date +%s)
         if [[ -n "$PACKAGE_FLAGS" ]]; then

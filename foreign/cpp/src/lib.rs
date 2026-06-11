@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 mod client;
 mod consumer_group;
 mod identifier;
@@ -194,7 +195,7 @@ mod ffi {
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        // fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
+        fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         #[allow(clippy::too_many_arguments)]
         fn create_topic(
             self: &Client,
@@ -207,7 +208,7 @@ mod ffi {
             message_expiry_value: u64,
             max_topic_size: String,
         ) -> Result<()>;
-        // fn purge_topic(&self, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,

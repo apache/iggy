@@ -16,7 +16,8 @@
 // under the License.
 
 use async_trait::async_trait;
-use iggy_common::{IdentityInfo, IggyError};
+use bytes::Bytes;
+use iggy_common::{HttpMethod, IdentityInfo, IggyError};
 use reqwest::{Response, Url};
 use serde::Serialize;
 
@@ -58,6 +59,15 @@ pub trait HttpTransport {
         path: &str,
         query: &T,
     ) -> Result<Response, IggyError>;
+
+    /// Invoke an arbitrary HTTP endpoint with the client's bearer auth and
+    /// return the raw response bytes.
+    async fn send_http_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<Bytes, IggyError>;
 
     /// Returns true if the client is authenticated.
     async fn is_authenticated(&self) -> bool;

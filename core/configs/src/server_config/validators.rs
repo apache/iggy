@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
@@ -486,6 +484,11 @@ impl Validatable<ConfigurationError> for ShardingConfig {
     }
 }
 
+/// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
+/// is KDF-derived from these bytes at use-site, so any encoding clearing this
+/// length is accepted.
+const MIN_SHARED_SECRET_LEN: usize = 32;
+
 impl Validatable<ConfigurationError> for ClusterConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         if !self.enabled {
@@ -586,6 +589,25 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             }
         }
 
+        // Replica-auth PSK (only reached when the cluster is enabled; the early
+        // return above skips these while it is disabled). When auth is enabled
+        // the key is mandatory; any configured key must clear the length floor -
+        // a typo guard that fires with auth off too, though only while the
+        // cluster itself is enabled.
+        let secret_len = self.auth.shared_secret.len();
+        if self.auth.enabled && self.auth.shared_secret.is_empty() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.auth.shared_secret must be set when cluster.auth.enabled is true"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if !self.auth.shared_secret.is_empty() && secret_len < MIN_SHARED_SECRET_LEN {
+            eprintln!(
+                "Invalid cluster configuration: cluster.auth.shared_secret must be >= {MIN_SHARED_SECRET_LEN} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         Ok(())
     }
 }
@@ -593,7 +615,9 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 #[cfg(test)]
 mod cluster_validate_tests {
     use super::*;
-    use crate::server_config::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
+    use crate::server_config::cluster::{
+        ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, TransportPorts,
+    };
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
@@ -609,6 +633,7 @@ mod cluster_validate_tests {
             enabled: true,
             name: "iggy-cluster".to_string(),
             nodes,
+            auth: ClusterAuthConfig::default(),
         }
     }
 
@@ -721,6 +746,44 @@ mod cluster_validate_tests {
         n1.ports = ports;
         let c = cfg(vec![n1]);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_empty_secret_when_auth_disabled() {
+        // Default: no secret, auth off -> legacy mode, must pass.
+        let c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_missing_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_short_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_short_secret_even_when_auth_disabled() {
+        // Typo guard: a configured-but-short key fails even with auth off.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        assert!(c.validate().is_ok());
     }
 }
 

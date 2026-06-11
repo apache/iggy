@@ -67,7 +67,7 @@ use crate::lifecycle::BusMessage;
 use bytes::Bytes;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
-use compio::tls::{TlsAcceptor, TlsConnector, TlsStream};
+use compio::tls::{MaybeTlsStream, TlsAcceptor, TlsConnector, TlsStream};
 use compio::ws::tungstenite::{self, Message as WsMessage, protocol::WebSocketConfig};
 use compio::ws::{WebSocketStream, accept_async_with_config, client_async_with_config};
 use futures::FutureExt;
@@ -278,12 +278,19 @@ async fn ws_handshake(
     is_server: bool,
     peer: &str,
     ws_config: WebSocketConfig,
-) -> Result<WebSocketStream<TlsStream<TcpStream>>, tungstenite::Error> {
+) -> Result<WebSocketStream<TcpStream>, tungstenite::Error> {
+    // compio-ws 0.4 owns the TLS layer via `MaybeTlsStream<S: Splittable>`
+    // (`TlsStream` itself is not `Splittable`, so it cannot be the WS
+    // stream's `S`). Wrap the already-handshaked server/client `TlsStream`
+    // as the `Tls` variant and let the WS layer drive it; the resulting
+    // stream is `WebSocketStream<TcpStream>`, the same type the plaintext
+    // WS transport uses.
+    let stream = MaybeTlsStream::new_tls(tls_stream);
     if is_server {
-        accept_async_with_config(tls_stream, ws_config).await
+        accept_async_with_config(stream, ws_config).await
     } else {
         let request = client_request(peer)?;
-        let (ws, _resp) = client_async_with_config(request, tls_stream, ws_config).await?;
+        let (ws, _resp) = client_async_with_config(request, stream, ws_config).await?;
         Ok(ws)
     }
 }
@@ -320,7 +327,7 @@ enum PumpAction {
 /// Drive the WSS connection until shutdown, peer Close, or an
 /// unrecoverable error.
 #[allow(clippy::future_not_send)]
-async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorContext) {
+async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
     let ActorContext {
         in_tx,
         rx,
@@ -428,7 +435,7 @@ async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorCont
 /// Shutdown is a transaction (no `select!` racing against the token).
 #[allow(clippy::future_not_send)]
 async fn drive_close(
-    ws: &mut WebSocketStream<TlsStream<TcpStream>>,
+    ws: &mut WebSocketStream<TcpStream>,
     close_grace: Duration,
     label: &'static str,
     peer: &str,

@@ -1,29 +1,27 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_ORG,
     ENV_SOURCE_PATH, ENV_SOURCE_PAYLOAD_COLUMN, ENV_SOURCE_PAYLOAD_FORMAT,
     ENV_SOURCE_POLL_INTERVAL, ENV_SOURCE_QUERY, ENV_SOURCE_STREAMS_0_SCHEMA,
     ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TOKEN, ENV_SOURCE_URL,
-    HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET, INFLUXDB_ORG, INFLUXDB_TOKEN,
-    InfluxDbContainer, InfluxDbOps, create_http_client,
+    ENV_SOURCE_VERSION, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET,
+    INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer, InfluxDbOps, create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -129,6 +127,7 @@ impl TestFixture for InfluxDbSourceFixture {
         };
 
         let mut envs = HashMap::new();
+        envs.insert(ENV_SOURCE_VERSION.to_string(), "v2".to_string());
         envs.insert(ENV_SOURCE_URL.to_string(), self.container.base_url.clone());
         envs.insert(ENV_SOURCE_ORG.to_string(), INFLUXDB_ORG.to_string());
         envs.insert(ENV_SOURCE_TOKEN.to_string(), INFLUXDB_TOKEN.to_string());

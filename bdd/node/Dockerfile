@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM node:24-slim
+FROM node:26-slim
 
 COPY ./foreign/node .
 COPY ./bdd/scenarios/basic_messaging.feature ./bdd/
