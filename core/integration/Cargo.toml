@@ -38,6 +38,7 @@ assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bon = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }

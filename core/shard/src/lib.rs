@@ -200,6 +200,13 @@ pub struct ConnectedClientInfo {
     pub user_id: Option<u32>,
     pub transport: ClientTransportKind,
     pub address: std::net::SocketAddr,
+    /// SDK identity from the login version prefix; `None` pre-login.
+    /// In-memory only: the `get_clients` wire response is shared with the
+    /// legacy server, so exposing these on the wire is a follow-up.
+    pub sdk_name: Option<String>,
+    pub sdk_version: Option<String>,
+    /// Packed protocol version, see `iggy_binary_protocol::ProtocolVersion`.
+    pub protocol_version: Option<u32>,
 }
 
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].

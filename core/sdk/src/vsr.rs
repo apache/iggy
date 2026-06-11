@@ -24,8 +24,8 @@ use iggy_binary_protocol::codes::{
     STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
-    Command2, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
-    read_size_field, result_code, result_section_len,
+    Command2, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
+    RequestHeader, read_size_field, result_code, result_section_len,
 };
 use iggy_binary_protocol::namespace::{
     MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE, PARTITION_MASK,
@@ -37,6 +37,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
 use iggy_common::IggyError;
 
@@ -168,32 +169,21 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
         return Err(IggyError::EmptyResponse);
     }
 
-    // Session-terminal Eviction frames map to typed errors, mirroring
-    // `decode_response_split` (the TCP/WS path) so every transport
-    // surfaces e.g. `Unauthenticated` instead of `InvalidCommand`.
     let header_bytes: &[u8; HEADER_SIZE] = response[..HEADER_SIZE]
         .try_into()
         .map_err(|_| IggyError::InvalidCommand)?;
-    if peek_command(header_bytes) == Command2::Eviction {
-        if let Ok(header) = bytemuck::checked::try_from_bytes::<EvictionHeader>(header_bytes) {
-            return Err(map_eviction_reason(header.reason));
+    match peek_command(header_bytes) {
+        Command2::Eviction => Err(decode_eviction(header_bytes)),
+        Command2::Reply => {
+            let total_size = response_size(header_bytes)?;
+            if response.len() < total_size {
+                return Err(IggyError::InvalidCommand);
+            }
+            let operation = read_operation(header_bytes)?;
+            split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
         }
-        return Err(IggyError::Unauthenticated);
+        _ => Err(IggyError::InvalidCommand),
     }
-
-    let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(&response[..HEADER_SIZE])
-        .map_err(|_| IggyError::InvalidCommand)?;
-    if header.command != Command2::Reply {
-        return Err(IggyError::InvalidCommand);
-    }
-
-    let total_size = header.size as usize;
-    if total_size < HEADER_SIZE || response.len() < total_size {
-        return Err(IggyError::InvalidCommand);
-    }
-
-    let operation = header.operation;
-    split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
 }
 
 /// Decode a reply when the header and body have been read into separate
@@ -209,29 +199,32 @@ pub(crate) fn decode_response_split(
     header_bytes: &[u8; HEADER_SIZE],
     body: Bytes,
 ) -> Result<Bytes, IggyError> {
-    let command = peek_command(header_bytes);
-    if command == Command2::Eviction {
-        if let Ok(header) = bytemuck::checked::try_from_bytes::<EvictionHeader>(header_bytes) {
-            return Err(map_eviction_reason(header.reason));
+    match peek_command(header_bytes) {
+        Command2::Eviction => Err(decode_eviction(header_bytes)),
+        Command2::Reply => {
+            let expected_body = response_size(header_bytes)? - HEADER_SIZE;
+            if body.len() < expected_body {
+                return Err(IggyError::InvalidCommand);
+            }
+            let operation = read_operation(header_bytes)?;
+            split_metadata_result(operation, body.slice(..expected_body))
         }
-        return Err(IggyError::Unauthenticated);
+        _ => Err(IggyError::InvalidCommand),
     }
+}
 
-    let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(header_bytes)
-        .map_err(|_| IggyError::InvalidCommand)?;
-    if header.command != Command2::Reply {
-        return Err(IggyError::InvalidCommand);
-    }
-
-    let total_size = header.size as usize;
-    if total_size < HEADER_SIZE {
-        return Err(IggyError::InvalidCommand);
-    }
-    let expected_body = total_size - HEADER_SIZE;
-    if body.len() < expected_body {
-        return Err(IggyError::InvalidCommand);
-    }
-    split_metadata_result(header.operation, body.slice(..expected_body))
+/// Read the [`Operation`] discriminant from a reply header by wire offset.
+/// Mirrors [`peek_command`]: a full `ReplyHeader` struct cast is avoided
+/// because the response buffers are not 16-aligned, so the leading `u128`
+/// fields would make `try_from_bytes::<ReplyHeader>` fail on an unlucky
+/// placement. One validated byte is enough to drive `split_metadata_result`.
+fn read_operation(header_bytes: &[u8; HEADER_SIZE]) -> Result<Operation, IggyError> {
+    const OPERATION_OFFSET: usize = std::mem::offset_of!(ReplyHeader, operation);
+    bytemuck::checked::try_from_bytes::<Operation>(
+        &header_bytes[OPERATION_OFFSET..=OPERATION_OFFSET],
+    )
+    .copied()
+    .map_err(|_| IggyError::InvalidCommand)
 }
 
 /// Interpret the committed result section that leads a metadata reply body.
@@ -265,9 +258,9 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
 
 /// `Command2` lives at a fixed offset shared by every consensus header
 /// (Reply, Eviction, Prepare, ...), so a byte read is enough to discriminate
-/// the frame before paying for full `bytemuck` validation.
+/// the frame.
 fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command2 {
-    const COMMAND_OFFSET: usize = 60;
+    const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
     match header_bytes[COMMAND_OFFSET] {
         x if x == Command2::Reply as u8 => Command2::Reply,
         x if x == Command2::Eviction as u8 => Command2::Eviction,
@@ -275,18 +268,49 @@ fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command2 {
     }
 }
 
-fn map_eviction_reason(reason: EvictionReason) -> IggyError {
+/// Map a session-terminal Eviction frame to a typed error. Fields are read
+/// by wire offset instead of an `EvictionHeader` struct cast: the response
+/// buffers are not 16-aligned (the header holds `u128`s, so the cast would
+/// fail on an unlucky buffer placement), and reading raw lets the SDK apply
+/// the same window sanity check as `EvictionHeader::validate` rather than
+/// trusting the remote frame.
+fn decode_eviction(header_bytes: &[u8; HEADER_SIZE]) -> IggyError {
+    const REASON_OFFSET: usize = std::mem::offset_of!(EvictionHeader, reason);
+    const VERSION_OFFSET: usize = std::mem::offset_of!(EvictionHeader, server_protocol_version);
+    const VERSION_MIN_OFFSET: usize =
+        std::mem::offset_of!(EvictionHeader, server_protocol_version_min);
+
+    let Ok(&reason) = bytemuck::checked::try_from_bytes::<EvictionReason>(
+        &header_bytes[REASON_OFFSET..=REASON_OFFSET],
+    ) else {
+        return IggyError::Unauthenticated;
+    };
     match reason {
         EvictionReason::InvalidCredentials => IggyError::InvalidCredentials,
         EvictionReason::InvalidToken => IggyError::InvalidPersonalAccessToken,
-        EvictionReason::UserInactive => IggyError::Unauthenticated,
-        EvictionReason::SessionError
+        EvictionReason::UserInactive
+        | EvictionReason::SessionError
         | EvictionReason::NoSession
         | EvictionReason::SessionTooLow
         | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
         EvictionReason::StaleClient => IggyError::StaleClient,
+        EvictionReason::IncompatibleProtocol => {
+            let server_max = read_window_field(header_bytes, VERSION_OFFSET);
+            let server_min = read_window_field(header_bytes, VERSION_MIN_OFFSET);
+            if server_min == 0 || server_max < server_min {
+                return IggyError::Unauthenticated;
+            }
+            IggyError::IncompatibleProtocolVersion(IGGY_PROTOCOL_VERSION, server_min, server_max)
+        }
+        EvictionReason::MalformedLogin => IggyError::InvalidFormat,
         _ => IggyError::InvalidCommand,
     }
+}
+
+fn read_window_field(header_bytes: &[u8; HEADER_SIZE], offset: usize) -> u32 {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&header_bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
 }
 
 fn namespace_for_request(
@@ -416,7 +440,7 @@ mod tests {
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
-    use iggy_binary_protocol::{WireEncode, WireName};
+    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
@@ -427,9 +451,13 @@ mod tests {
     fn register_request_uses_zero_request_and_session() {
         let mut session = ConsensusSession::with_client_id(7);
         let request = LoginRegisterRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("rust-sdk").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("secret"),
-            version: None,
             client_context: None,
         };
 
@@ -445,6 +473,54 @@ mod tests {
         // Register is routed to the metadata replica (shard 0). The router's
         // namespace==METADATA short-circuit needs the sentinel, not 0.
         assert_eq!(header.namespace, METADATA_CONSENSUS_NAMESPACE);
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_decodes_to_typed_error() {
+        use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION_MIN;
+
+        // Header lands at a guaranteed-misaligned address (aligned start +1):
+        // eviction decode reads fields by offset and must not care.
+        #[repr(C, align(16))]
+        struct Misaligner([u8; HEADER_SIZE + 1]);
+
+        let header = EvictionHeader::incompatible_protocol(
+            0,
+            0,
+            0,
+            0xCAFE,
+            IGGY_PROTOCOL_VERSION,
+            IGGY_PROTOCOL_VERSION_MIN,
+        );
+        let mut raw = Misaligner([0; HEADER_SIZE + 1]);
+        raw.0[1..].copy_from_slice(bytemuck::bytes_of(&header));
+        let shifted: &[u8; HEADER_SIZE] = raw.0[1..].try_into().unwrap();
+
+        let result = decode_response_split(shifted, Bytes::new());
+        assert!(matches!(
+            result,
+            Err(IggyError::IncompatibleProtocolVersion(client, min, max))
+                if client == IGGY_PROTOCOL_VERSION
+                    && min == IGGY_PROTOCOL_VERSION_MIN
+                    && max == IGGY_PROTOCOL_VERSION
+        ));
+    }
+
+    #[test]
+    fn eviction_with_invalid_window_degrades_to_unauthenticated() {
+        for (server_max, server_min) in [(1, 0), (1, 2)] {
+            let mut header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 1, 1);
+            header.server_protocol_version = server_max;
+            header.server_protocol_version_min = server_min;
+            let mut buf = [0u8; HEADER_SIZE];
+            buf.copy_from_slice(bytemuck::bytes_of(&header));
+
+            let result = decode_response_split(&buf, Bytes::new());
+            assert!(
+                matches!(result, Err(IggyError::Unauthenticated)),
+                "window [{server_min}, {server_max}] must not surface as typed error"
+            );
+        }
     }
 
     #[test]

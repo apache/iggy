@@ -50,6 +50,10 @@ impl WireEncode for CreateUserRequest {
 
     fn encode(&self, buf: &mut BytesMut) {
         self.username.encode(buf);
+        debug_assert!(
+            u8::try_from(self.password.len()).is_ok(),
+            "password exceeds u8 length prefix; callers must validate before encoding"
+        );
         #[allow(clippy::cast_possible_truncation)]
         buf.put_u8(self.password.len() as u8);
         buf.put_slice(self.password.as_bytes());

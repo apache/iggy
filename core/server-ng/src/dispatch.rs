@@ -42,7 +42,10 @@ use crate::session_manager::SessionManager;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 use bytes::Bytes;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{
+    EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
+    build_incompatible_protocol_eviction_message,
+};
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
@@ -59,7 +62,8 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::{
-    GenericHeader, KIND_CONSUMER_GROUP, Operation, RequestHeader, WireDecode, WireEncode,
+    ClientVersionInfo, EvictionReason, GenericHeader, KIND_CONSUMER_GROUP, Operation,
+    ProtocolVersion, RequestHeader, WireDecode, WireEncode, is_protocol_compatible,
 };
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
@@ -1560,7 +1564,7 @@ fn ensure_transport_connection(
         .ensure_connection(transport_client_id, meta.peer_addr, meta.transport);
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_login_register_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -1570,7 +1574,47 @@ async fn handle_login_register_request(
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
-    if let Ok(wire_request) = LoginRegisterRequest::decode_from(body) {
+    // Both login-register shapes share the ClientVersionInfo prefix, so the
+    // protocol gate decodes it once and runs before any credential work; the
+    // body shapes below parse from past the prefix. Clients from before the
+    // header relayout never reach this gate: their command byte sits at the
+    // old offset, so the typed-header decode drops the frame earlier.
+    let Ok((version_info, prefix_len)) = ClientVersionInfo::decode(body) else {
+        warn!(
+            transport_client_id,
+            "rejecting login: body has no decodable version prefix"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+        )
+        .await;
+        return;
+    };
+    if !is_protocol_compatible(version_info.protocol_version) {
+        warn!(
+            transport_client_id,
+            client_protocol_version = %ProtocolVersion(version_info.protocol_version),
+            sdk_name = %version_info.sdk_name,
+            sdk_version = %version_info.sdk_version,
+            "rejecting login: incompatible protocol version"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::IncompatibleProtocol,
+        )
+        .await;
+        return;
+    }
+
+    let body_tail = &body[prefix_len..];
+    if let Ok((wire_request, _)) =
+        LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
+    {
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
@@ -1584,6 +1628,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1607,7 +1652,9 @@ async fn handle_login_register_request(
         }
     }
 
-    if let Ok(wire_request) = LoginRegisterWithPatRequest::decode_from(body) {
+    if let Ok((wire_request, _)) =
+        LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
+    {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
             Ok(user_id) => {
                 if let Err(error) = complete_login_register(
@@ -1617,6 +1664,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1647,6 +1695,46 @@ async fn handle_login_register_request(
         "dropping register request with unsupported payload shape"
     );
     send_login_failure_reply(shard, transport_client_id, request.header()).await;
+}
+
+/// Best-effort login-rejection eviction. Terminal one-way frame; a gone
+/// connection has nothing to recover, so the send error is logged and
+/// dropped. Consensus context (cluster/view/replica) is stamped on the
+/// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
+/// plus the protocol window on `IncompatibleProtocol`.
+#[allow(clippy::future_not_send)]
+async fn send_login_eviction(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    vsr_client_id: u128,
+    reason: EvictionReason,
+) {
+    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
+        EvictionContext {
+            cluster: 0,
+            view: 0,
+            replica: 0,
+        },
+        EvictionContext::from_consensus,
+    );
+    let eviction = match reason {
+        EvictionReason::IncompatibleProtocol => {
+            build_incompatible_protocol_eviction_message(ctx, vsr_client_id)
+        }
+        _ => build_eviction_message(ctx, vsr_client_id, reason),
+    };
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            reason = ?reason,
+            "failed to send login eviction"
+        );
+    }
 }
 
 pub(crate) fn upgrade_shard_handle(
