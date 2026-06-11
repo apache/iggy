@@ -58,12 +58,9 @@ class TestMessageOperations:
             auto_commit=True,
         )
 
-        assert len(polled_messages) >= len(test_messages)
-
-        for i, expected_msg in enumerate(test_messages):
-            if i < len(polled_messages):
-                actual_payload = polled_messages[i].payload().decode("utf-8")
-                assert actual_payload == expected_msg
+        assert [message.payload().decode() for message in polled_messages] == (
+            test_messages
+        )
 
     @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(
@@ -98,12 +95,9 @@ class TestMessageOperations:
             auto_commit=True,
         )
 
-        assert len(polled_messages) >= len(test_messages)
-
-        for i, expected_msg in enumerate(test_messages):
-            if i < len(polled_messages):
-                actual_payload = polled_messages[i].payload().decode("utf-8")
-                assert actual_payload == expected_msg
+        assert [message.payload().decode() for message in polled_messages] == (
+            test_messages
+        )
 
     @pytest.mark.asyncio
     async def test_message_properties(self, iggy_client: IggyClient, unique_name):
