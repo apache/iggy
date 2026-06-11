@@ -31,6 +31,7 @@ mod random;
 mod random_source_liveness;
 mod runtime;
 mod stdout;
+mod surrealdb;
 
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};

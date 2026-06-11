@@ -87,7 +87,7 @@ EOF
 }
 
 RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk rust-mcp rust-bench rust-bench-dashboard-frontend rust-bench-dashboard-server rust-bench-report"
-CONNECTOR_SINK_COMPONENTS="rust-connector-delta-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-stdout-sink"
+CONNECTOR_SINK_COMPONENTS="rust-connector-delta-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-stdout-sink rust-connector-surrealdb-sink"
 CONNECTOR_SOURCE_COMPONENTS="rust-connector-elasticsearch-source rust-connector-influxdb-source rust-connector-postgres-source rust-connector-random-source"
 CONNECTOR_COMPONENTS="rust-connector-runtime ${CONNECTOR_SINK_COMPONENTS} ${CONNECTOR_SOURCE_COMPONENTS}"
 SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java"

@@ -109,6 +109,7 @@ jobs:
             - `iggy_connector_quickwit_sink`
             - `iggy_connector_random_source`
             - `iggy_connector_stdout_sink`
+            - `iggy_connector_surrealdb_sink`
 
             ## Downloads
 
