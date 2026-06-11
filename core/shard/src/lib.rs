@@ -24,14 +24,17 @@ pub mod shards_table;
 
 pub use config::CoordinatorConfig;
 
+#[cfg(any(test, feature = "simulator"))]
+use consensus::LocalPipeline;
 use consensus::{
-    LocalPipeline, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
-    Sequencer, VsrAction, VsrConsensus,
+    MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer, VsrAction,
+    VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+#[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
@@ -44,10 +47,13 @@ use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use partitions::{IggyPartition, IggyPartitions};
-use server_common::sharding::IggyNamespace;
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
+#[cfg(any(test, feature = "simulator"))]
 use std::sync::Arc;
 
 pub type ShardPlane<B, J, S, M> =
@@ -70,8 +76,31 @@ where
     B: MessageBus,
 {
     pub cluster_id: u128,
+    /// Cluster-wide VSR replica id; independent of `IggyShard::id`.
+    pub self_replica_id: u8,
     pub replica_count: u8,
     pub bus: B,
+}
+
+/// Replica id + count bundle.
+///
+/// Adjacent `u8` params (`self_replica_id`, `replica_count`) were a
+/// silent-swap hazard at the call site; the named struct gives the type
+/// system a chance to catch a misorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaTopology {
+    pub self_replica_id: u8,
+    pub replica_count: u8,
+}
+
+impl ReplicaTopology {
+    #[must_use]
+    pub const fn new(self_replica_id: u8, replica_count: u8) -> Self {
+        Self {
+            self_replica_id,
+            replica_count,
+        }
+    }
 }
 
 impl<B> PartitionConsensusConfig<B>
@@ -79,10 +108,11 @@ where
     B: MessageBus,
 {
     #[must_use]
-    pub const fn new(cluster_id: u128, replica_count: u8, bus: B) -> Self {
+    pub const fn new(cluster_id: u128, topology: ReplicaTopology, bus: B) -> Self {
         Self {
             cluster_id,
-            replica_count,
+            self_replica_id: topology.self_replica_id,
+            replica_count: topology.replica_count,
             bus,
         }
     }
@@ -369,6 +399,48 @@ pub enum LifecycleFrame {
     ListClients {
         reply: Sender<Vec<ConnectedClientInfo>>,
     },
+    /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
+    /// the per-shard reconciler. No payload: reconciler re-reads target
+    /// state. Drops covered by the periodic safety tick.
+    MetadataCommitTick,
+    /// Wake marker for the reconciler-to-pump funnel. Pump drains the
+    /// shard's `reconcile_queue` on receipt; tail drain on every frame
+    /// catches dropped markers.
+    ReconcileApply,
+}
+
+/// Reconciler-staged partition mutation.
+///
+/// Funnelling through the pump keeps `IggyPartitions` single-writer:
+/// without it the cooperative `.await` scheduler would race
+/// `insert` / `remove` against the pump's live `&mut IggyPartition` (UB).
+pub enum ReconcileOp<B>
+where
+    B: MessageBus,
+{
+    /// Materialise an owned partition. Boxed to keep variants size-balanced
+    /// (`clippy::large_enum_variant`). `epoch` is the committed
+    /// `Partition::created_revision`, stored on the routing row so a later
+    /// reconcile pass can detect a slab-key-reused stale partition.
+    InsertOwned {
+        namespace: IggyNamespace,
+        partition: Box<IggyPartition<B>>,
+        epoch: u64,
+    },
+    /// Seed a routing row for a partition owned by a peer shard.
+    InsertRouted {
+        namespace: IggyNamespace,
+        owner: ShardId,
+        epoch: u64,
+    },
+    /// Final phase of teardown: drop the `IggyPartition` value and clear
+    /// the tombstone. The reconciler sets the tombstone + removes the
+    /// `shards_table` row synchronously *before* awaiting the disk delete
+    /// (writers are fenced via [`IggyPartitions::is_tombstoned`]), so by
+    /// the time this op runs the disk hierarchy is already gone.
+    ConfirmRemove { namespace: IggyNamespace },
+    /// Drop a routing row (peer's partition gone from committed metadata).
+    RemoveRouted { namespace: IggyNamespace },
 }
 
 /// Inter-shard channel envelope.
@@ -475,6 +547,10 @@ where
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
+    /// Stored for `init_partition` (simulator-only). Production materialises
+    /// VSR replicas through `partition_helpers::build_partition_fresh`, which
+    /// passes the topology + cluster id directly.
+    #[cfg_attr(not(any(test, feature = "simulator")), allow(dead_code))]
     partition_consensus: PartitionConsensusConfig<B>,
 
     /// Shard 0 coordinator, supplied at construction. Holds round-robin
@@ -485,11 +561,19 @@ where
     /// Per-shard observability counters. Cloned at metric increment sites,
     /// so cheap (`Arc` clone) regardless of label cardinality.
     metrics: crate::metrics::ShardMetrics,
+
+    /// Late-bound `MetadataCommitTick` handler. `None` until reconciler
+    /// wires it; pre-wire ticks drop with a metric bump.
+    metadata_tick_handler: RefCell<Option<Rc<dyn Fn()>>>,
+
+    /// Reconciler → pump funnel. Borrow discipline: every push / drain
+    /// runs without `.await` inside the borrow.
+    reconcile_queue: RefCell<VecDeque<ReconcileOp<B>>>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
-    B: MessageBus,
+    B: MessageBus + 'static,
     T: ShardsTable,
 {
     /// Create a new shard with channel links and a shards table.
@@ -558,6 +642,8 @@ where
             partition_consensus,
             coordinator,
             metrics,
+            metadata_tick_handler: RefCell::new(None),
+            reconcile_queue: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -705,12 +791,148 @@ where
             shards_table,
             partition_consensus,
             metrics: crate::metrics::ShardMetrics::for_shard(),
+            metadata_tick_handler: RefCell::new(None),
+            reconcile_queue: RefCell::new(VecDeque::new()),
         }
     }
 
     #[must_use]
     pub const fn shards_table(&self) -> &T {
         &self.shards_table
+    }
+
+    #[must_use]
+    pub const fn metrics(&self) -> &crate::metrics::ShardMetrics {
+        &self.metrics
+    }
+
+    /// `None` removes the handler; subsequent ticks drop with a metric bump.
+    pub fn set_metadata_tick_handler(&self, handler: Option<Rc<dyn Fn()>>) {
+        *self.metadata_tick_handler.borrow_mut() = handler;
+    }
+
+    /// Returns `true` if a handler ran. Pump bumps the drop metric on `false`.
+    pub fn dispatch_metadata_commit_tick(&self) -> bool {
+        self.signal_reconcile_wake()
+    }
+
+    /// Internal: invoke the installed wake handler (same channel the
+    /// metadata commit tick uses). Called from `ConfirmRemove` so the
+    /// reconciler re-runs immediately after the pump drops a tombstoned
+    /// partition, tightening the delete-recreate-same-ns latency window
+    /// from one `reconcile_periodic_interval` to one pump-iter.
+    fn signal_reconcile_wake(&self) -> bool {
+        let handler = self.metadata_tick_handler.borrow().clone();
+        handler.is_some_and(|handler| {
+            handler();
+            true
+        })
+    }
+
+    /// Stage a partition mutation for the pump.
+    ///
+    /// Marker `try_send` is best-effort; the pump's tail drain on every
+    /// frame catches dropped markers, so the queue never strands ops.
+    pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B>) {
+        self.reconcile_queue.borrow_mut().push_back(op);
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply));
+    }
+
+    /// Drain and apply staged [`ReconcileOp`]s on the pump task.
+    /// Synchronous: every arm is in-memory only. `ConfirmRemove`'s fsync +
+    /// blocking close is offloaded to a detached task so the pump doesn't
+    /// stall on bulk teardown.
+    pub fn apply_reconcile_ops(&self)
+    where
+        B: MessageBus + 'static,
+    {
+        let staged: Vec<ReconcileOp<B>> = {
+            let mut q = self.reconcile_queue.borrow_mut();
+            if q.is_empty() {
+                return;
+            }
+            q.drain(..).collect()
+        };
+        let self_shard_id = self.id;
+        let partitions = self.plane.partitions();
+        let mut confirmed_remove = false;
+        for op in staged {
+            match op {
+                ReconcileOp::InsertOwned {
+                    namespace,
+                    partition,
+                    epoch,
+                } => {
+                    // Idempotent apply, mirroring `ConfirmRemove` (idempotent
+                    // via `remove`'s `None` early-return). The reconciler
+                    // stages this from a task separate from the pump, so under
+                    // a commit burst two passes can each observe
+                    // `!contains(ns)` and build the same namespace before
+                    // either drains here. A second unconditional `insert`
+                    // would push a duplicate partition and overwrite the
+                    // `ns -> idx` entry, orphaning the first (its VSR group +
+                    // segment writers leak and `len` inflates). The discarded
+                    // build is a fresh empty incarnation over the same on-disk
+                    // path the kept one owns, so dropping it just closes a few
+                    // fds.
+                    if partitions.contains(&namespace) {
+                        drop(partition);
+                        continue;
+                    }
+                    partitions.insert(namespace, *partition);
+                    self.shards_table.insert(
+                        namespace,
+                        PartitionLocation::new(ShardId::new(self_shard_id), epoch),
+                    );
+                    self.metrics.record_partition_materialised();
+                }
+                ReconcileOp::InsertRouted {
+                    namespace,
+                    owner,
+                    epoch,
+                } => {
+                    self.shards_table
+                        .insert(namespace, PartitionLocation::new(owner, epoch));
+                }
+                ReconcileOp::ConfirmRemove { namespace } => {
+                    // Tombstone bit set + shards_table row removed synchronously
+                    // by the reconciler before this op was enqueued, so no
+                    // in-flight frame can reach the partition between `remove`
+                    // and the drop here. Teardown already unlinked the on-disk
+                    // hierarchy via `delete_partitions_from_disk`, so the
+                    // partition drops inline: its compio file handles close
+                    // through io_uring without blocking, and no fsync is wanted
+                    // on data that is already gone.
+                    let removed = partitions.remove(&namespace);
+                    partitions.untombstone(&namespace);
+                    self.metrics.record_partition_removed();
+                    confirmed_remove = true;
+                    if removed.is_none() {
+                        tracing::trace!(
+                            shard = self_shard_id,
+                            namespace_raw = namespace.inner(),
+                            "ConfirmRemove with no in-memory partition (retry after disk-delete failure)"
+                        );
+                    }
+                }
+                ReconcileOp::RemoveRouted { namespace } => {
+                    self.shards_table.remove(&namespace);
+                }
+            }
+        }
+
+        if confirmed_remove {
+            // Re-wake the reconciler once per drain batch so a delete→recreate
+            // of a namespace that landed in STM while the unlink was in-flight
+            // materialises within one pump-iter, not one
+            // `reconcile_periodic_interval`. The wake channel is capacity-1, so
+            // a per-op wake would coalesce anyway; firing once avoids K
+            // redundant handler borrows on a bulk DeleteStream.
+            self.signal_reconcile_wake();
+        }
     }
 }
 
@@ -874,11 +1096,12 @@ where
 
         namespace_scratch.extend(planes.1.0.namespaces().copied());
         for namespace in namespace_scratch.drain(..) {
-            let partition = planes
-                .1
-                .0
-                .get_by_ns(&namespace)
-                .expect("partition namespace must resolve during loopback drain");
+            // `get_by_ns` returns `None` for tombstoned namespaces: skip
+            // draining their loopback queue so we don't surface PrepareOk
+            // frames targeting a partition the reconciler is tearing down.
+            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
+                continue;
+            };
             partition.consensus().drain_loopback_into(buf);
         }
         let count = buf.len();
@@ -893,33 +1116,27 @@ where
         total
     }
 
-    /// Initializes a partition and its dedicated consensus instance on this shard.
-    ///
-    /// Used only by the `simulator` crate to seed partitions on the
-    /// in-process replica array. Production boots via the
-    /// `load_partition` helper in `server-ng` bootstrap, which takes the
-    /// cluster `self_replica_id` explicitly from `topology` and never
-    /// folds the local shard id into the consensus replica space.
-    ///
-    /// # Panics
-    /// Panics if `self.id > u8::MAX` (256+). The simulator currently
-    /// caps replica count at `MAX_REPLICAS = 256`, so the cast always
-    /// succeeds in the only caller; the constraint is recorded here so
-    /// any future caller in production code reads it before the cast.
-    pub fn init_partition(&mut self, namespace: IggyNamespace)
+    /// Simulator-only. Mutates `IggyPartitions` off the pump task,
+    /// bypassing the reconciler's `ReconcileOp::InsertOwned` funnel (the
+    /// production runtime path; bootstrap recovery uses `load_partition`),
+    /// so it must never run in production. VSR replica id comes from
+    /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
+    /// `-p iggy-server-ng` build excludes the `simulator` feature and this
+    /// method; `cargo build --workspace` compiles it in but with no
+    /// production caller.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn init_partition(&self, namespace: IggyNamespace)
     where
         B: MessageBus + Clone,
     {
-        let partitions = self.plane.partitions_mut();
+        let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
             return;
         }
 
-        let replica_id =
-            u8::try_from(self.id).expect("shard id must fit in u8 for partition consensus");
         let consensus = VsrConsensus::new(
             self.partition_consensus.cluster_id,
-            replica_id,
+            self.partition_consensus.self_replica_id,
             self.partition_consensus.replica_count,
             namespace.inner(),
             self.partition_consensus.bus.clone(),

@@ -20,21 +20,22 @@ use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
 };
+use crate::partition_helpers::{
+    configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
+};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
 use configs::server_ng::ServerNgConfig;
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
-use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
+use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
-use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, PartitionStats, TopicStats,
-    variadic,
-};
+use iggy_binary_protocol::Operation;
+use iggy_common::{IggyByteSize, PartitionStats, TopicStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
@@ -65,20 +66,19 @@ use partitions::{
 };
 use server_common::bootstrap::create_directories;
 use server_common::executor::create_shard_executor;
-use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use server::log::logger::Logging;
 use server::shard_allocator::{ShardAllocator, ShardInfo};
-use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
-use server::streaming::segments::storage::create_segment_storage;
 use server::streaming::users::user::User as LegacyUser;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
-use shard::metrics::ShardMetrics;
-use shard::shards_table::{PapayaShardsTable, calculate_shard_assignment};
+use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
+    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig,
+    Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
+    shard_mesh_channels,
 };
 use std::cell::RefCell;
 use std::env;
@@ -632,7 +632,12 @@ fn run_shard_thread(
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
     let result = runtime.block_on(async move {
-        shard_main(
+        // `shard_main`'s future grows past clippy's `large_futures` cap
+        // (it ferries the metadata handoff, bus, builders, and inflight
+        // I/O in one state machine). Heap-pin it so the top-level
+        // `block_on` future stays small; one allocation per startup buys
+        // the stack budget back.
+        Box::pin(shard_main(
             shard_id,
             total_shards,
             replica_id,
@@ -642,7 +647,7 @@ fn run_shard_thread(
             shutdown_flag,
             metadata_handoff,
             owner_table,
-        )
+        ))
         .await
     });
 
@@ -770,6 +775,9 @@ async fn shard_main(
     );
 
     let shard_metrics = ShardMetrics::for_shard();
+    // Notifier install deferred until after tick handler wires below.
+    let senders_for_notifier = senders.clone();
+    let metrics_for_notifier = shard_metrics.clone();
     let (shard, sessions) = build_shard_for_thread(
         shard_id,
         total_shards,
@@ -807,12 +815,54 @@ async fn shard_main(
         return Ok(());
     }
 
+    // Tick handler must install before the notifier so early commits
+    // do not broadcast ticks whose handler slot is still `None`.
+    let (reconcile_wake_tx, reconcile_wake_rx) = channel::<()>(1);
+    let (reconcile_stop_tx, reconcile_stop_rx) = channel::<()>(1);
+    crate::partition_reconciler::install_tick_handler(&shard, reconcile_wake_tx);
+
+    // Only shard 0 commits metadata.
+    if shard_id == 0 {
+        let notifier = make_metadata_commit_notifier(senders_for_notifier, metrics_for_notifier);
+        shard.plane.metadata().set_commit_notifier(Some(notifier));
+    } else {
+        drop(senders_for_notifier);
+        drop(metrics_for_notifier);
+    }
+
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
     let pump_handle = compio::runtime::spawn(async move {
         pump_shard.run_message_pump(stop_rx).await;
     });
     bus.track_background(pump_handle);
+
+    let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
+        Rc::clone(&shard),
+        total_shards,
+        Rc::new(config.clone()),
+        topology.cluster_id,
+        topology.self_replica_id,
+        topology.replica_count,
+    ));
+    let reconcile_periodic = config
+        .system
+        .sharding
+        .reconcile_periodic_interval
+        .get_duration();
+    let reconciler_handle = compio::runtime::spawn({
+        let ctx = Rc::clone(&reconciler_ctx);
+        async move {
+            crate::partition_reconciler::run_reconciler(
+                ctx,
+                reconcile_wake_rx,
+                reconcile_stop_rx,
+                reconcile_periodic,
+            )
+            .await;
+        }
+    });
+    bus.track_background(reconciler_handle);
 
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
@@ -837,12 +887,14 @@ async fn shard_main(
             start_tcp_runtime(&shard, config, &topology, accepted_replica, accepted_client).await
         {
             let _ = stop_tx.try_send(());
+            let _ = reconcile_stop_tx.try_send(());
             return Err(error);
         }
     }
 
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
+    let _ = reconcile_stop_tx.try_send(());
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
@@ -1009,7 +1061,7 @@ async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
-    let mut partitions = IggyPartitions::with_capacity(
+    let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: config.system.partition.messages_required_to_save,
@@ -1040,12 +1092,12 @@ async fn build_shard_for_thread(
                     if owning_shard == shard_id {
                         owned.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
                     } else {
-                        // Non-owning entry: only `shard_id` is consulted
-                        // by the router; `local_idx` is meaningful only on
-                        // the owning shard, so a sentinel `0` is safe.
                         shards_table.insert(
                             namespace,
-                            PartitionLocation::new(ShardId::new(owning_shard), LocalIdx::new(0)),
+                            PartitionLocation::new(
+                                ShardId::new(owning_shard),
+                                partition.created_revision,
+                            ),
                         );
                     }
                 }
@@ -1059,7 +1111,7 @@ async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, topic_stats, partition_metadata) in owned {
-        validate_recovered_namespace(config, stream_id, topic_id, partition_metadata.id)?;
+        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = load_partition(
             config,
@@ -1072,10 +1124,10 @@ async fn build_shard_for_thread(
             Rc::clone(&bus),
         )
         .await?;
-        let local_idx = partitions.insert(namespace, partition);
+        partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
-            PartitionLocation::new(ShardId::new(shard_id), LocalIdx::new(*local_idx)),
+            PartitionLocation::new(ShardId::new(shard_id), partition_metadata.created_revision),
         );
     }
 
@@ -1101,7 +1153,11 @@ async fn build_shard_for_thread(
         senders,
         inbox,
         shards_table,
-        PartitionConsensusConfig::new(topology.cluster_id, topology.replica_count, Rc::clone(&bus)),
+        PartitionConsensusConfig::new(
+            topology.cluster_id,
+            shard::ReplicaTopology::new(topology.self_replica_id, topology.replica_count),
+            Rc::clone(&bus),
+        ),
         CoordinatorConfig::default(),
         metrics,
     )
@@ -1171,30 +1227,6 @@ fn restore_metadata_consensus(
     }
 
     consensus
-}
-
-const fn validate_recovered_namespace(
-    config: &ServerNgConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerNgError> {
-    let namespace = &config.extra.namespace;
-    if stream_id < namespace.max_streams
-        && topic_id < namespace.max_topics
-        && partition_id < namespace.max_partitions
-    {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredNamespaceOutOfBounds {
-        stream_id,
-        topic_id,
-        partition_id,
-        max_streams: namespace.max_streams,
-        max_topics: namespace.max_topics,
-        max_partitions: namespace.max_partitions,
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1459,222 +1491,6 @@ async fn load_segment_max_timestamp(
             source
         })?;
     Ok(indexes_max_timestamp(&indexes))
-}
-
-fn configure_consumer_offsets(
-    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerNgConfig,
-    namespace: IggyNamespace,
-    current_offset: u64,
-) -> Result<(), ServerNgError> {
-    let stream_id = namespace.stream_id();
-    let topic_id = namespace.topic_id();
-    let partition_id = namespace.partition_id();
-    let consumer_offsets_path =
-        config
-            .system
-            .get_consumer_offsets_path(stream_id, topic_id, partition_id);
-    let consumer_group_offsets_path =
-        config
-            .system
-            .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-
-    let loaded_consumer_offsets = load_partition_consumer_offsets(
-        &consumer_offsets_path,
-        "consumer",
-        stream_id,
-        topic_id,
-        partition_id,
-    )?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
-    {
-        let guard = consumer_offsets.pin();
-        for offset in loaded_consumer_offsets {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer",
-                    consumer_id: offset.consumer_id as usize,
-                    offset: recovered_offset,
-                    current_offset,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                });
-            }
-            guard.insert(offset.consumer_id as usize, offset);
-        }
-    }
-
-    let loaded_group_offsets = load_partition_consumer_group_offsets(
-        &consumer_group_offsets_path,
-        stream_id,
-        topic_id,
-        partition_id,
-    )?;
-    let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
-    {
-        let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in loaded_group_offsets {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer group",
-                    consumer_id: group_id.0,
-                    offset: recovered_offset,
-                    current_offset,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                });
-            }
-            guard.insert(group_id, offset);
-        }
-    }
-
-    partition.configure_consumer_offset_storage(
-        consumer_offsets_path,
-        consumer_group_offsets_path,
-        consumer_offsets,
-        consumer_group_offsets,
-        config.system.partition.enforce_fsync,
-    );
-    Ok(())
-}
-
-fn load_partition_consumer_offsets(
-    path: &str,
-    consumer_kind: &'static str,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<Vec<iggy_common::ConsumerOffset>, ServerNgError> {
-    if !Path::new(path).exists() {
-        return Ok(Vec::new());
-    }
-
-    load_consumer_offsets(path).or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
-        {
-            return Ok(Vec::new());
-        }
-
-        Err(ServerNgError::ConsumerOffsetsLoad {
-            consumer_kind,
-            stream_id,
-            topic_id,
-            partition_id,
-            path: path.to_string(),
-            source: Box::new(source),
-        })
-    })
-}
-
-fn load_partition_consumer_group_offsets(
-    path: &str,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerNgError> {
-    if !Path::new(path).exists() {
-        return Ok(Vec::new());
-    }
-
-    load_consumer_group_offsets(path).or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
-        {
-            return Ok(Vec::new());
-        }
-
-        Err(ServerNgError::ConsumerOffsetsLoad {
-            consumer_kind: "consumer group",
-            stream_id,
-            topic_id,
-            partition_id,
-            path: path.to_string(),
-            source: Box::new(source),
-        })
-    })
-}
-
-async fn ensure_initial_segment(
-    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerNgConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerNgError> {
-    if partition.log.has_segments() {
-        return Ok(());
-    }
-
-    // TODO: decouple segment storage creation from the `server` crate.
-    let storage =
-        create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to create initial segment storage"
-                );
-                source
-            })?;
-    let messages_path = config
-        .system
-        .get_messages_file_path(stream_id, topic_id, partition_id, 0);
-    let index_path = config
-        .system
-        .get_index_path(stream_id, topic_id, partition_id, 0);
-    partition.log.add_persisted_segment(
-        Segment::new(0, config.system.segment.size),
-        storage,
-        Some(Rc::new(
-            MessagesWriter::new(
-                &messages_path,
-                Rc::new(AtomicU64::new(0)),
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %messages_path,
-                    error = %source,
-                    "failed to initialize initial messages writer"
-                );
-                source
-            })?,
-        )),
-        Some(Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(AtomicU64::new(0)),
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %index_path,
-                    error = %source,
-                    "failed to initialize initial sparse index writer"
-                );
-                source
-            })?,
-        )),
-    );
-    partition.stats.increment_segments_count(1);
-
-    Ok(())
 }
 
 fn resolve_tcp_topology(
@@ -2372,6 +2188,66 @@ fn socket_addr_from_parts(
             source,
         })?;
     Ok(SocketAddr::new(ip, port))
+}
+
+/// Build the closure that broadcasts a
+/// [`LifecycleFrame::MetadataCommitTick`] to every shard's inbox after a
+/// partition-shaped metadata operation commits on shard 0.
+///
+/// The receiver-side partition reconciliation loop listens for these
+/// wake-ups; coalescing is intentional, so `Full` is recorded as a metric
+/// and dropped (the periodic tick recovers). Installed via
+/// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
+/// sole writer of the metadata state machine.
+fn make_metadata_commit_notifier(
+    senders: Vec<TaggedSender>,
+    metrics: ShardMetrics,
+) -> metadata::CommitNotifier {
+    Rc::new(move |operation: Operation| {
+        if !operation_triggers_partition_reconcile(operation) {
+            return;
+        }
+        for sender in &senders {
+            let frame = ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick);
+            match sender.try_send(frame) {
+                Ok(()) => {}
+                Err(crossfire::TrySendError::Full(_)) => {
+                    metrics.record_frame_drop(
+                        frame_drop_variant::METADATA_COMMIT_TICK,
+                        frame_drop_reason::FULL,
+                    );
+                }
+                Err(crossfire::TrySendError::Disconnected(_)) => {
+                    metrics.record_frame_drop(
+                        frame_drop_variant::METADATA_COMMIT_TICK,
+                        frame_drop_reason::DISCONNECTED,
+                    );
+                }
+            }
+        }
+    })
+}
+
+/// Filter at the broadcast site, keeping unrelated ops off the SDK reply
+/// path. Any new partition-shape op must be added here.
+///
+/// The bare `CreateTopic` / `CreatePartitions` arms are unreachable: the
+/// leader's prepare-builder in `IggyMetadata` rewrites both into their
+/// `*WithAssignments` form, stamping each partition's `consensus_group_id`
+/// before journaling, so a committed prepare only ever carries the
+/// assignment-bearing variant. Kept as defense-in-depth against a future
+/// commit path that emits a bare op.
+const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
+    matches!(
+        op,
+        Operation::CreateTopic
+            | Operation::CreateTopicWithAssignments
+            | Operation::CreatePartitions
+            | Operation::CreatePartitionsWithAssignments
+            | Operation::DeleteTopic
+            | Operation::DeleteStream
+            | Operation::DeletePartitions
+    )
 }
 
 #[cfg(test)]

@@ -318,6 +318,7 @@ mod tests {
 
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
+            revision: 0,
             items: vec![(
                 0,
                 StreamSnapshot {
@@ -348,6 +349,7 @@ mod tests {
                                 id: 0,
                                 consensus_group_id: 33,
                                 created_at: ts,
+                                created_revision: 0,
                             }],
                             round_robin_counter: 0,
                         },
@@ -424,6 +426,7 @@ mod tests {
         };
 
         let streams_snap = StreamsSnapshot {
+            revision: 0,
             items: vec![
                 (
                     0,
