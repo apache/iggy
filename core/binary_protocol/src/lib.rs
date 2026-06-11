@@ -72,8 +72,8 @@ pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
-    read_size_field,
+    RESERVED_COMMAND_LEN, ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
+    StartViewHeader, read_size_field,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

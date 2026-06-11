@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use std::{str::FromStr, sync::Arc};
 
@@ -348,14 +347,14 @@ impl IggyClient {
                 );
             }
             (Some(_), None) => {
-                return Err(
-                    "'init_retry_interval_micros' is required if 'init_retries' is set".into(),
-                );
+                return Err(to_php_exception(
+                    "'init_retry_interval_micros' is required if 'init_retries' is set",
+                ));
             }
             (None, Some(_)) => {
-                return Err(
-                    "'init_retries' is required if 'init_retry_interval_micros' is set".into(),
-                );
+                return Err(to_php_exception(
+                    "'init_retries' is required if 'init_retry_interval_micros' is set",
+                ));
             }
             (None, None) => {}
         }
@@ -381,7 +380,9 @@ impl IggyClient {
 
 fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<IggyDuration> {
     if micros == 0 {
-        return Err(format!("'{field}' must be greater than 0 microseconds").into());
+        return Err(to_php_exception(format!(
+            "'{field}' must be greater than 0 microseconds"
+        )));
     }
 
     Ok(IggyDuration::from(micros))

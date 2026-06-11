@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #![allow(clippy::future_not_send)]
 
@@ -28,21 +26,18 @@ use server_ng::server_error::ServerNgError;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
-    // TODO(hubcio): decouple runtime creation from the `server` crate and
-    // move the shared compio executor setup into a lower-level crate/module
-    // used by both binaries.
-    let bootstrap_runtime = match server::bootstrap::create_shard_executor() {
+    let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {
             match e.kind() {
                 std::io::ErrorKind::InvalidInput => {
-                    server::diagnostics::print_invalid_io_uring_args_info();
+                    server_common::diagnostics::print_invalid_io_uring_args_info();
                 }
                 std::io::ErrorKind::OutOfMemory => {
-                    server::diagnostics::print_locked_memory_limit_info();
+                    server_common::diagnostics::print_locked_memory_limit_info();
                 }
                 std::io::ErrorKind::PermissionDenied => {
-                    server::diagnostics::print_io_uring_permission_info();
+                    server_common::diagnostics::print_io_uring_permission_info();
                 }
                 _ => {}
             }

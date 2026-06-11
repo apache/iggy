@@ -30,19 +30,41 @@
 
 mod common;
 
-use async_channel::bounded;
+use bytes::Bytes;
 use common::{header_only, install_ws_clients_locally, loopback};
 use compio::net::TcpStream;
+use compio_ws::WebSocketStream;
+use compio_ws::tungstenite::Message as WsMessage;
 use iggy_binary_protocol::Command2;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::ws::{bind, run};
-use message_bus::transports::ws::WsTransportConn;
-use message_bus::transports::{ActorContext, TransportConn};
-use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use message_bus::{IggyMessageBus, MessageBus};
+use server_common::iobuf::Owned;
+use server_common::{MESSAGE_ALIGN, Message};
 use std::rc::Rc;
 use std::time::Duration;
+
+/// Decode one consensus frame from a raw WS Binary payload. Mirrors the
+/// transport's internal `decode_consensus_frame`, reimplemented here
+/// because that helper is crate-private and the production WS transport
+/// is server-role only (tests drive the client side with raw ws ops).
+fn decode_frame(body: &[u8]) -> Message<GenericHeader> {
+    let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(body);
+    Message::<GenericHeader>::try_from(owned).expect("decode client frame")
+}
+
+/// Raw-read one consensus frame off a client `WebSocketStream`.
+#[allow(clippy::future_not_send)]
+async fn raw_recv(ws: &mut WebSocketStream<TcpStream>) -> Message<GenericHeader> {
+    loop {
+        match ws.read().await.expect("client raw read") {
+            WsMessage::Binary(bytes) => return decode_frame(&bytes),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+            other => panic!("unexpected client ws frame: {other:?}"),
+        }
+    }
+}
 
 #[compio::test]
 async fn handshake_succeeds_and_round_trip_completes() {
@@ -75,42 +97,25 @@ async fn handshake_succeeds_and_round_trip_completes() {
     bus.track_background(accept_handle);
 
     // Dial as a real WS client; no subprotocol negotiation required.
+    // The production WS transport is server-role only, so drive the
+    // client side with raw ws ops: send one Request, read the Reply.
     let client_tcp = TcpStream::connect(server_addr).await.unwrap();
     let url = format!("ws://{server_addr}/");
-    let (ws_client, _resp) = compio_ws::client_async(url, client_tcp)
+    let (mut ws_client, _resp) = compio_ws::client_async(url, client_tcp)
         .await
         .expect("ws handshake");
 
-    // Drive the client side of the WS conn through the unified
-    // `TransportConn::run` shape: spawn the actor, push outbound
-    // requests through `out_tx`, observe inbound replies on `in_rx`.
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
-    let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
-    let (client_shutdown, client_token) = Shutdown::new();
-    let ctx = ActorContext {
-        in_tx,
-        rx: out_rx,
-        shutdown: FusedShutdown::single(client_token),
-        conn_shutdown: client_shutdown.clone(),
-        max_batch: 16,
-        max_message_size: framing::MAX_MESSAGE_SIZE,
-        label: "test-client",
-        peer: "test-client".to_owned(),
-    };
-    let conn = WsTransportConn::new_client(ws_client);
-    let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
-
     let request = header_only(Command2::Request, 42, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
-
-    let reply = compio::time::timeout(Duration::from_secs(2), in_rx.recv())
+    ws_client
+        .send(WsMessage::Binary(Bytes::from_owner(request)))
         .await
-        .expect("client must receive reply within 2 s")
-        .expect("reply frame");
+        .expect("client send");
+
+    let reply = compio::time::timeout(Duration::from_secs(2), raw_recv(&mut ws_client))
+        .await
+        .expect("client must receive reply within 2 s");
     assert_eq!(reply.header().command, Command2::Reply);
 
-    client_shutdown.trigger();
-    let _ = client_handle.await;
     bus.shutdown(Duration::from_secs(2)).await;
 }
 

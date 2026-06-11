@@ -1,27 +1,26 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::args::CliOptions;
 use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
-use iggy_cli::commands::binary_system::session::ServerSession;
+use iggy_cli::commands::binary_system::session::{ServerSession, ensure_default_store};
 use passterm::{Stream, isatty, prompt_password_tty};
 use secrecy::{ExposeSecret, SecretString};
 use std::env::var;
@@ -29,7 +28,7 @@ use std::env::var;
 #[cfg(feature = "login-session")]
 mod credentials_login_session {
     pub(crate) use iggy_cli::commands::cli_command::PRINT_TARGET;
-    pub(crate) use keyring::Entry;
+    pub(crate) use keyring_core::Entry;
     pub(crate) use tracing::{Level, event};
 }
 
@@ -91,6 +90,7 @@ impl<'a> IggyCredentials<'a> {
                     let server_address = format!("iggy:{server_address}");
                     event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
                     server_address, token_name);
+                    ensure_default_store()?;
                     let entry = Entry::new(&server_address, token_name)?;
                     let token = entry.get_password()?;
 

@@ -15,7 +15,8 @@ bdd/
 ├── python/                     # Python SDK BDD implementation
 │   ├── Dockerfile              # Python BDD test container
 │   ├── tests/
-│   └── requirements.txt
+│   ├── pyproject.toml
+│   └── uv.lock
 ├── node/                       # Node SDK BDD implementation
 │   └── Dockerfile              # Node BDD test container
 ├── csharp/                     # csharp SDK BDD implementation

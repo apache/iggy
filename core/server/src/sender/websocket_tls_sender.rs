@@ -1,26 +1,24 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::Sender;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
-use compio::tls::TlsStream;
 use compio::ws::WebSocketStream;
 use compio::ws::tungstenite::{Error as TungsteniteError, Message};
 use iggy_common::IggyError;
@@ -33,13 +31,13 @@ const WRITE_BUFFER_CAPACITY: usize = 8192;
 const STATUS_OK: &[u8] = &[0; 4];
 
 pub struct WebSocketTlsSender {
-    pub(crate) stream: WebSocketStream<TlsStream<TcpStream>>,
+    pub(crate) stream: WebSocketStream<TcpStream>,
     pub(crate) read_buffer: BytesMut,
     pub(crate) write_buffer: BytesMut,
 }
 
 impl WebSocketTlsSender {
-    pub fn new(stream: WebSocketStream<TlsStream<TcpStream>>) -> Self {
+    pub fn new(stream: WebSocketStream<TcpStream>) -> Self {
         Self {
             stream,
             read_buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),

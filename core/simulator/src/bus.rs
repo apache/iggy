@@ -108,6 +108,8 @@ impl SimOutbox {
 }
 
 impl MessageBus for SimOutbox {
+    fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
     async fn send_to_client(
         &self,
         client_id: u128,
@@ -163,6 +165,10 @@ impl Deref for SharedSimOutbox {
 }
 
 impl MessageBus for SharedSimOutbox {
+    fn track_background(&self, handle: message_bus::JoinHandle<()>) {
+        self.0.track_background(handle);
+    }
+
     async fn send_to_client(
         &self,
         client_id: u128,

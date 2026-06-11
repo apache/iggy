@@ -18,9 +18,7 @@
 import argparse
 import asyncio
 import typing
-import urllib
 import urllib.parse
-from collections import namedtuple
 
 from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
 from loguru import logger
@@ -32,9 +30,13 @@ TOPIC_ID = 0
 PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
-ArgNamespace = namedtuple(
-    "ArgNamespace", ["tcp_server_address", "tls", "tls_ca_file", "username", "password"]
-)
+
+class ArgNamespace(typing.NamedTuple):
+    tcp_server_address: str
+    tls: bool
+    tls_ca_file: str
+    username: str
+    password: str
 
 
 class ValidateUrl(argparse.Action):
@@ -42,7 +44,7 @@ class ValidateUrl(argparse.Action):
         self,
         parser: argparse.ArgumentParser,
         namespace: argparse.Namespace,
-        values: list[typing.Any],
+        values: str,
         _option_string: str | None = None,
     ):
         parsed_url: urllib.parse.ParseResult = urllib.parse.urlparse("//" + values)
@@ -51,7 +53,7 @@ class ValidateUrl(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
-def parse_args():
+def parse_args() -> ArgNamespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tcp-server-address",

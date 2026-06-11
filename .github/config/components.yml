@@ -402,6 +402,18 @@ components:
       - "scripts/utils.sh"
     tasks: ["examples-python"]
 
+  examples-php:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-php"
+      - "ci-infrastructure"
+    paths:
+      - "examples/php/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-php"]
+
   examples-node:
     depends_on:
       - "rust-server"

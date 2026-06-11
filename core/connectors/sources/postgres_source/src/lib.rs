@@ -1,23 +1,22 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
@@ -26,7 +25,8 @@ use iggy_connector_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Column, Pool, Postgres, Row, TypeInfo};
+use sqlx::postgres::types::{Oid, PgInterval, PgTimeTz};
+use sqlx::{Column, Pool, Postgres, Row, TypeInfo, ValueRef};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
@@ -325,16 +325,23 @@ impl PostgresSource {
             .publication_name
             .as_deref()
             .unwrap_or("iggy_publication");
+        let quoted_publication = quote_identifier(publication_name)?;
         let tables_clause = if self.config.tables.is_empty() {
             "FOR ALL TABLES".to_string()
         } else {
-            format!("FOR TABLE {}", self.config.tables.join(", "))
+            let quoted_tables = self
+                .config
+                .tables
+                .iter()
+                .map(|t| quote_qualified_identifier(t))
+                .collect::<Result<Vec<_>, _>>()?;
+            format!("FOR TABLE {}", quoted_tables.join(", "))
         };
 
         let create_publication_sql =
-            format!("CREATE PUBLICATION IF NOT EXISTS {publication_name} {tables_clause}");
+            format!("CREATE PUBLICATION IF NOT EXISTS {quoted_publication} {tables_clause}");
 
-        sqlx::query(&create_publication_sql)
+        sqlx::query(sqlx::AssertSqlSafe(create_publication_sql))
             .execute(pool)
             .await
             .map_err(|e| Error::InitError(format!("Failed to create publication: {e}")))?;
@@ -344,14 +351,15 @@ impl PostgresSource {
             .replication_slot
             .as_deref()
             .unwrap_or("iggy_slot");
-        let create_slot_sql = format!(
-            "SELECT pg_create_logical_replication_slot('{slot_name}', 'pgoutput') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{slot_name}')"
-        );
 
-        sqlx::query(&create_slot_sql)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
+        sqlx::query(
+            "SELECT pg_create_logical_replication_slot($1, 'pgoutput') \
+             WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        )
+        .bind(slot_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
 
         info!("PostgreSQL CDC setup completed. Publication: {publication_name}, Slot: {slot_name}");
         Ok(())
@@ -406,7 +414,7 @@ impl PostgresSource {
         );
 
         // Database I/O without holding the lock
-        let rows = sqlx::query(&logical_repl_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(logical_repl_sql))
             .fetch_all(pool)
             .await
             .map_err(|e| {
@@ -498,7 +506,7 @@ impl PostgresSource {
 
             // Database I/O without holding the lock
             let rows = with_retry(
-                || sqlx::query(&query).fetch_all(pool),
+                || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
                 self.get_max_retries(),
                 self.retry_delay.as_millis() as u64,
             )
@@ -563,7 +571,7 @@ impl PostgresSource {
             return Ok(());
         }
 
-        let quoted_table = quote_identifier(table)?;
+        let quoted_table = quote_qualified_identifier(table)?;
         let quoted_pk = quote_identifier(pk_column)?;
 
         let ids_list = ids
@@ -588,7 +596,7 @@ impl PostgresSource {
                 debug!("Deleting {} processed rows from '{table}'", ids.len());
             }
 
-            sqlx::query(&delete_query)
+            sqlx::query(sqlx::AssertSqlSafe(delete_query))
                 .execute(pool)
                 .await
                 .map_err(|e| {
@@ -607,7 +615,7 @@ impl PostgresSource {
                 debug!("Marking {} rows as processed in '{table}'", ids.len());
             }
 
-            sqlx::query(&update_query)
+            sqlx::query(sqlx::AssertSqlSafe(update_query))
                 .execute(pool)
                 .await
                 .map_err(|e| {
@@ -645,7 +653,7 @@ impl PostgresSource {
         last_offset: &Option<String>,
         batch_size: u32,
     ) -> Result<String, Error> {
-        let quoted_table = quote_identifier(table)?;
+        let quoted_table = quote_qualified_identifier(table)?;
         let quoted_tracking = quote_identifier(tracking_column)?;
 
         let base_query = format!("SELECT * FROM {quoted_table}");
@@ -967,6 +975,14 @@ fn extract_column_value(
                 .map(|v| serde_json::Value::from(v as i64))
                 .unwrap_or(serde_json::Value::Null))
         }
+        "OID" => {
+            let value: Option<Oid> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v.0 as u64))
+                .unwrap_or(serde_json::Value::Null))
+        }
         "INT8" => {
             let value: Option<i64> = row
                 .try_get(column_index)
@@ -1000,7 +1016,7 @@ fn extract_column_value(
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null))
         }
-        "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => {
+        "VARCHAR" | "TEXT" | "CHAR" | "NAME" | "BPCHAR" => {
             let value: Option<String> = row
                 .try_get(column_index)
                 .map_err(|_| Error::InvalidRecord)?;
@@ -1008,12 +1024,52 @@ fn extract_column_value(
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null))
         }
-        "TIMESTAMP" | "TIMESTAMPTZ" => {
+        "DATE" => {
+            let value: Option<NaiveDate> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|d| serde_json::Value::String(d.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIME" => {
+            let value: Option<NaiveTime> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|t| serde_json::Value::String(t.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMETZ" => {
+            let value: Option<PgTimeTz> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|tz| serde_json::Value::String(format!("{}{}", tz.time, tz.offset)))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMP" => {
+            let value: Option<NaiveDateTime> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|dt| serde_json::Value::String(dt.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMPTZ" => {
             let value: Option<DateTime<Utc>> = row
                 .try_get(column_index)
                 .map_err(|_| Error::InvalidRecord)?;
             Ok(value
                 .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INTERVAL" => {
+            let value: Option<PgInterval> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|iv| serde_json::Value::String(format_pg_interval(&iv)))
                 .unwrap_or(serde_json::Value::Null))
         }
         "UUID" => {
@@ -1043,26 +1099,370 @@ fn extract_column_value(
                 })
                 .unwrap_or(serde_json::Value::Null))
         }
-        _ => {
-            let value: Option<String> = row
+        "BOOL[]" => {
+            let value: Option<Vec<Option<bool>>> = row
                 .try_get(column_index)
                 .map_err(|_| Error::InvalidRecord)?;
             Ok(value
-                .map(serde_json::Value::String)
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(serde_json::Value::Bool)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
                 .unwrap_or(serde_json::Value::Null))
+        }
+        "INT2[]" => {
+            let value: Option<Vec<Option<i16>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|n| serde_json::Value::from(n as i64))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT4[]" => {
+            let value: Option<Vec<Option<i32>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|n| serde_json::Value::from(n as i64))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "OID[]" => {
+            let value: Option<Vec<Option<Oid>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|n| serde_json::Value::from(n.0 as u64))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT8[]" => {
+            let value: Option<Vec<Option<i64>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(serde_json::Value::from)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT4[]" => {
+            let value: Option<Vec<Option<f32>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|n| serde_json::Value::from(n as f64))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT8[]" => {
+            let value: Option<Vec<Option<f64>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(serde_json::Value::from)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TEXT[]" | "VARCHAR[]" | "CHAR[]" => {
+            let value: Option<Vec<Option<String>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(serde_json::Value::String)
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "UUID[]" => {
+            let value: Option<Vec<Option<Uuid>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|u| serde_json::Value::String(u.to_string()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "JSON[]" | "JSONB[]" => {
+            let value: Option<Vec<Option<serde_json::Value>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| v.unwrap_or(serde_json::Value::Null))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "DATE[]" => {
+            let value: Option<Vec<Option<NaiveDate>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|d| serde_json::Value::String(d.to_string()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIME[]" => {
+            let value: Option<Vec<Option<NaiveTime>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|t| serde_json::Value::String(t.to_string()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMP[]" => {
+            let value: Option<Vec<Option<NaiveDateTime>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|dt| serde_json::Value::String(dt.to_string()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMPTZ[]" => {
+            let value: Option<Vec<Option<DateTime<Utc>>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|dt| serde_json::Value::String(dt.to_rfc3339()))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INTERVAL[]" => {
+            let value: Option<Vec<Option<PgInterval>>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|arr| {
+                    serde_json::Value::Array(
+                        arr.into_iter()
+                            .map(|v| {
+                                v.map(|iv| serde_json::Value::String(format_pg_interval(&iv)))
+                                    .unwrap_or(serde_json::Value::Null)
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        _ => {
+            let column_name = column.name();
+            warn!(
+                "Column '{column_name}' has unrecognized Postgres type '{type_name}', \
+                 attempting raw text extraction"
+            );
+            let raw = row.try_get_raw(column_index).map_err(|e| {
+                error!("Failed to read column '{column_name}' (type '{type_name}'): {e}");
+                Error::InvalidRecordValue(format!(
+                    "column '{column_name}' has unsupported Postgres type '{type_name}'"
+                ))
+            })?;
+            if raw.is_null() {
+                return Ok(serde_json::Value::Null);
+            }
+            match raw.as_str() {
+                Ok(text) => Ok(serde_json::Value::String(text.to_owned())),
+                Err(_) => {
+                    use base64::Engine;
+                    let bytes = raw.as_bytes().map_err(|e| {
+                        error!(
+                            "Failed to read column '{column_name}' \
+                             (type '{type_name}') as bytes: {e}"
+                        );
+                        Error::InvalidRecordValue(format!(
+                            "column '{column_name}' has unsupported Postgres type '{type_name}'"
+                        ))
+                    })?;
+                    Ok(serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    ))
+                }
+            }
         }
     }
 }
 
+fn format_pg_interval(interval: &PgInterval) -> String {
+    let mut parts = Vec::new();
+
+    let years = interval.months / 12;
+    let months = interval.months % 12;
+
+    if years != 0 {
+        parts.push(format!(
+            "{years} year{}",
+            if years.unsigned_abs() != 1 { "s" } else { "" }
+        ));
+    }
+    if months != 0 {
+        parts.push(format!(
+            "{months} mon{}",
+            if months.unsigned_abs() != 1 { "s" } else { "" }
+        ));
+    }
+    if interval.days != 0 {
+        parts.push(format!(
+            "{} day{}",
+            interval.days,
+            if interval.days.unsigned_abs() != 1 {
+                "s"
+            } else {
+                ""
+            }
+        ));
+    }
+    if interval.microseconds != 0 || parts.is_empty() {
+        let negative = interval.microseconds < 0;
+        let abs_us = interval.microseconds.unsigned_abs();
+        let total_secs = abs_us / 1_000_000;
+        let remaining_us = abs_us % 1_000_000;
+        let hours = total_secs / 3600;
+        let mins = (total_secs % 3600) / 60;
+        let secs = total_secs % 60;
+        let sign = if negative { "-" } else { "" };
+        if remaining_us != 0 {
+            parts.push(format!(
+                "{sign}{:02}:{:02}:{:02}.{:06}",
+                hours, mins, secs, remaining_us
+            ));
+        } else {
+            parts.push(format!("{sign}{hours:02}:{mins:02}:{secs:02}"));
+        }
+    }
+
+    parts.join(" ")
+}
+
 fn quote_identifier(name: &str) -> Result<String, Error> {
     if name.is_empty() {
-        return Err(Error::InvalidConfig);
+        return Err(Error::InvalidConfigValue(
+            "identifier must not be empty".to_string(),
+        ));
     }
     if name.contains('\0') {
-        return Err(Error::InvalidConfig);
+        return Err(Error::InvalidConfigValue(format!(
+            "identifier '{name}' contains NUL byte"
+        )));
     }
     let escaped = name.replace('"', "\"\"");
     Ok(format!("\"{escaped}\""))
+}
+
+/// Quote a possibly schema-qualified identifier like `public.users` as
+/// `"public"."users"`. Each dot-separated segment is validated and quoted
+/// independently so that schema-qualified table names survive intact.
+fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
+    if !name.contains('.') {
+        return quote_identifier(name);
+    }
+    let parts: Result<Vec<_>, _> = name.split('.').map(quote_identifier).collect();
+    Ok(parts?.join("."))
 }
 
 fn format_offset_value(value: &str) -> String {
@@ -1280,6 +1680,30 @@ mod tests {
     }
 
     #[test]
+    fn given_unqualified_name_should_quote_as_single_identifier() {
+        let result = quote_qualified_identifier("users").expect("Failed to quote");
+        assert_eq!(result, "\"users\"");
+    }
+
+    #[test]
+    fn given_schema_qualified_name_should_quote_each_segment() {
+        let result = quote_qualified_identifier("public.users").expect("Failed to quote");
+        assert_eq!(result, "\"public\".\"users\"");
+    }
+
+    #[test]
+    fn given_qualified_name_with_quote_chars_should_escape_each_segment() {
+        let result = quote_qualified_identifier("my\"schema.my\"table").expect("Failed to quote");
+        assert_eq!(result, "\"my\"\"schema\".\"my\"\"table\"");
+    }
+
+    #[test]
+    fn given_qualified_name_with_empty_segment_should_fail() {
+        assert!(quote_qualified_identifier("public.").is_err());
+        assert!(quote_qualified_identifier(".users").is_err());
+    }
+
+    #[test]
     fn given_insert_message_should_parse_correctly() {
         let mut config = test_config();
         config.mode = "cdc".to_string();
@@ -1454,5 +1878,75 @@ mod tests {
         assert_eq!(original.last_poll_time, deserialized.last_poll_time);
         assert_eq!(original.tracking_offsets, deserialized.tracking_offsets);
         assert_eq!(original.processed_rows, deserialized.processed_rows);
+    }
+
+    #[test]
+    fn given_zero_interval_should_format_as_zero_time() {
+        let interval = PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: 0,
+        };
+        assert_eq!(format_pg_interval(&interval), "00:00:00");
+    }
+
+    #[test]
+    fn given_interval_with_months_and_days_should_format_correctly() {
+        let interval = PgInterval {
+            months: 14,
+            days: 3,
+            microseconds: 0,
+        };
+        assert_eq!(format_pg_interval(&interval), "1 year 2 mons 3 days");
+    }
+
+    #[test]
+    fn given_interval_with_time_should_format_correctly() {
+        let interval = PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: 3_661_000_000,
+        };
+        assert_eq!(format_pg_interval(&interval), "01:01:01");
+    }
+
+    #[test]
+    fn given_interval_with_microseconds_should_format_fractional_seconds() {
+        let interval = PgInterval {
+            months: 0,
+            days: 1,
+            microseconds: 500_000,
+        };
+        assert_eq!(format_pg_interval(&interval), "1 day 00:00:00.500000");
+    }
+
+    #[test]
+    fn given_singular_units_should_omit_plural_suffix() {
+        let interval = PgInterval {
+            months: 13,
+            days: 1,
+            microseconds: 0,
+        };
+        assert_eq!(format_pg_interval(&interval), "1 year 1 mon 1 day");
+    }
+
+    #[test]
+    fn given_negative_microseconds_should_format_with_sign() {
+        let interval = PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: -1_500_000,
+        };
+        assert_eq!(format_pg_interval(&interval), "-00:00:01.500000");
+    }
+
+    #[test]
+    fn given_negative_hours_should_format_with_sign() {
+        let interval = PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: -3_600_000_000,
+        };
+        assert_eq!(format_pg_interval(&interval), "-01:00:00");
     }
 }

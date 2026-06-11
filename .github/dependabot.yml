@@ -18,14 +18,26 @@
 version: 2
 updates:
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/foreign/cpp"
+      - "/foreign/python"
+      # TODO(hubcio): uncomment once #3235 is merged
+      # - "/foreign/php"
     schedule:
       interval: "weekly"
+      day: "monday"
     rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps): "
     reviewers:
       - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "rust"
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         patterns:
@@ -38,11 +50,223 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "tuesday"
     rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps): "
     reviewers:
       - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "github_actions"
+      - "CI/CD"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "uv"
+    directories:
+      - "/foreign/python"
+      - "/bdd/python"
+      - "/examples/python"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "python"
+      - "python:uv"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/foreign/node"
+      - "/web"
+      - "/examples/node"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "javascript"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "gomod"
+    directories:
+      - "/foreign/go"
+      - "/bdd/go"
+      - "/examples/go"
+    schedule:
+      interval: "weekly"
+      day: "friday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "go"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "nuget"
+    directories:
+      - "/foreign/csharp"
+      - "/examples/csharp"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "csharp"
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "System.IO.Hashing"
+      - dependency-name: "Microsoft.SourceLink.GitHub"
+      - dependency-name: "Microsoft.Extensions.Logging.Abstractions"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "gradle"
+    directories:
+      - "/foreign/java"
+      - "/bdd/java"
+      - "/examples/java"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "java"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/core/server"
+      - "/core/server-ng"
+      - "/core/connectors/runtime"
+      - "/core/ai/mcp"
+      - "/core/bench/dashboard/server"
+      - "/web"
+      - "/bdd"
+      - "/bdd/csharp"
+      - "/bdd/go"
+      - "/bdd/java"
+      - "/bdd/node"
+      - "/bdd/python"
+      - "/bdd/rust"
+      - "/foreign/python"
+      - "/foreign/python/.devcontainer"
+      - "/foreign/java/external-processors/iggy-connector-flink/docker"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "docker"
+    cooldown:
+      default-days: 7
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "bazel"
+    directory: "/foreign/cpp"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "C++"
+    cooldown:
+      default-days: 7
     groups:
       minor-and-patch:
         patterns:

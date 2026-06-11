@@ -1,22 +1,21 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+use crate::connectors::fixtures;
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
@@ -30,11 +29,11 @@ use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, Image
 use tracing::info;
 use uuid::Uuid;
 
-const MINIO_IMAGE: &str = "minio/minio";
+const MINIO_IMAGE: &str = "docker.io/minio/minio";
 const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 const MINIO_PORT: u16 = 9000;
 const MINIO_CONSOLE_PORT: u16 = 9001;
-const ICEBERG_REST_IMAGE: &str = "apache/iceberg-rest-fixture";
+const ICEBERG_REST_IMAGE: &str = "docker.io/apache/iceberg-rest-fixture";
 const ICEBERG_REST_TAG: &str = "latest";
 const ICEBERG_REST_PORT: u16 = 8181;
 
@@ -150,6 +149,7 @@ impl IcebergRestContainer {
             .with_env_var("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
             .with_env_var("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
             .with_mapped_port(0, ICEBERG_REST_PORT.tcp())
+            .with_container_name(fixtures::unique_container_name("iceberg-rest"))
             .start()
             .await
             .map_err(|error| TestBinaryError::FixtureSetup {
@@ -448,7 +448,7 @@ impl TestFixture for IcebergFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let id = Uuid::new_v4();
         let network = format!("iggy-iceberg-{id}");
-        let minio_name = format!("minio-{id}");
+        let minio_name = fixtures::unique_container_name("minio-iceberg");
 
         let minio = MinioContainer::start(&network, &minio_name).await?;
 

@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
@@ -216,7 +215,7 @@ impl PostgresSink {
         sql.push_str(&format!(", payload {payload_type}"));
         sql.push_str(", created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())");
 
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(pool)
             .await
             .map_err(|e| Error::InitError(format!("Failed to create table '{table_name}': {e}")))?;
@@ -368,7 +367,7 @@ impl PostgresSink {
         include_origin_timestamp: bool,
         payload_format: PayloadFormat,
     ) -> Result<(), (sqlx::Error, bool)> {
-        let mut query_builder = sqlx::query(query);
+        let mut query_builder = sqlx::query(sqlx::AssertSqlSafe(query));
 
         for message in messages {
             let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {

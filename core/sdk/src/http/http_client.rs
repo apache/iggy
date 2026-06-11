@@ -1,31 +1,31 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
+use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
-    IdentityInfo, TransportProtocol, validate_api_url,
+    HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
 };
-use reqwest::{Response, StatusCode, Url};
+use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
@@ -200,6 +200,31 @@ impl HttpTransport for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidHttpRequest)?;
         Self::handle_response(response).await
+    }
+
+    async fn send_http_request(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<Bytes, IggyError> {
+        let method = Method::from_bytes(<&str>::from(method).as_bytes())
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let url = self.get_url(path)?;
+        let token = self.access_token.read().await;
+        let mut request = self.client.request(method, url).bearer_auth(token.deref());
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)?;
+        let response = Self::handle_response(response).await?;
+        response
+            .bytes()
+            .await
+            .map_err(|_| IggyError::InvalidHttpRequest)
     }
 
     /// Returns true if the client is authenticated.

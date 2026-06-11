@@ -1,28 +1,28 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use integration::harness::TestBinaryError;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
+
+use crate::connectors::fixtures;
 use testcontainers_modules::{
     postgres,
-    testcontainers::{ContainerAsync, runners::AsyncRunner},
+    testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
 };
 
 pub(super) const POSTGRES_PORT: u16 = 5432;
@@ -110,7 +110,7 @@ pub trait PostgresSourceOps: PostgresOps {
     ) -> impl std::future::Future<Output = i64> + Send + 'a {
         async move {
             let query = format!("SELECT COUNT(*) FROM {}", self.table_name());
-            let count: (i64,) = sqlx::query_as(&query)
+            let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
                 .fetch_one(pool)
                 .await
                 .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
@@ -128,12 +128,14 @@ pub struct PostgresContainer {
 
 impl PostgresContainer {
     pub(super) async fn start() -> Result<Self, TestBinaryError> {
-        let container = postgres::Postgres::default().start().await.map_err(|e| {
-            TestBinaryError::FixtureSetup {
+        let container = postgres::Postgres::default()
+            .with_container_name(fixtures::unique_container_name("postgres"))
+            .start()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "PostgresContainer".to_string(),
                 message: format!("Failed to start container: {e}"),
-            }
-        })?;
+            })?;
 
         let host_port = container
             .get_host_port_ipv4(POSTGRES_PORT)

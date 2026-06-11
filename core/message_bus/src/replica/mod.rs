@@ -23,5 +23,6 @@
 //! shard-0 bootstrap (which also binds the SDK client listeners) live
 //! in [`io`].
 
+pub mod auth;
 pub mod io;
 pub mod listener;

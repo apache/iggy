@@ -1,27 +1,30 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::config_writer::write_current_config;
-use crate::login_register::LoginRegisterError;
+use crate::dispatch::{
+    make_client_request_handler, make_deferred_client_request_handler,
+    make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
+};
+use crate::partition_helpers::{
+    configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
+};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
-use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
@@ -31,56 +34,23 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
-use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE,
-};
-use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
-};
-use iggy_binary_protocol::requests::messages::{PollMessagesRequest, SendMessagesHeader};
-use iggy_binary_protocol::requests::personal_access_tokens::{
-    CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
-    DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
-};
-use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
-use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
-use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
-use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
-use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_binary_protocol::responses::streams::get_stream::{
-    GetStreamResponse, TopicHeader as StreamTopicHeader,
-};
-use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
-use iggy_binary_protocol::responses::system::get_cluster_metadata::{
-    ClusterMetadataResponse, ClusterNodeResponse,
-};
-use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
-use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
-use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
-use iggy_binary_protocol::{
-    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, WireName, WirePartitioning,
-};
-use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
-    PersonalAccessToken, TopicStats, UserStatus, variadic,
-};
+use iggy_binary_protocol::Operation;
+use iggy_common::{IggyByteSize, PartitionStats, TopicStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
+use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener, MessageHandler};
+use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     TlsServerCredentials, install_default_crypto_provider, load_pem, self_signed_for_loopback,
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, IggyMessageBus, MessageBus, ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, IggyMessageBus, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -91,34 +61,26 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
-use metadata::stm::user::{
-    CreatePersonalAccessTokenRequest as ReplicatedCreatePersonalAccessTokenRequest,
-    DeletePersonalAccessTokenRequest as ReplicatedDeletePersonalAccessTokenRequest,
-};
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
-use server_common::Message;
-use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
+use server_common::bootstrap::create_directories;
+use server_common::executor::create_shard_executor;
+use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
-use secrecy::ExposeSecret;
-use server::bootstrap::{create_directories, create_shard_executor};
 use server::log::logger::Logging;
 use server::shard_allocator::{ShardAllocator, ShardInfo};
-use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
-use server::streaming::segments::storage::create_segment_storage;
 use server::streaming::users::user::User as LegacyUser;
-use server::streaming::utils::crypto;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
-use shard::metrics::ShardMetrics;
-use shard::shards_table::{PapayaShardsTable, calculate_shard_assignment};
+use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
+    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig,
+    Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
+    shard_mesh_channels,
 };
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -129,7 +91,6 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-const CLUSTER_ID: u128 = 1;
 const SHARD_REPLICA_ID: u8 = 0;
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
@@ -140,7 +101,7 @@ type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, Consume
 /// [`ServerNgMuxStateMachine`] on its own runtime, skipping the WAL.
 type ServerNgMetadataBundle = <variadic!(Users, Streams, ConsumerGroups) as WithFactory>::Bundle;
 
-type ServerNgMetadata = IggyMetadata<
+pub(crate) type ServerNgMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,
     PrepareJournal,
     IggySnapshot,
@@ -154,7 +115,7 @@ pub type ServerNgShard = IggyShard<
     PapayaShardsTable,
 >;
 
-type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
+pub(crate) type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -379,6 +340,9 @@ enum MetadataHandoff {
 }
 
 struct TcpTopology {
+    /// Domain-separation cluster id derived from `cluster.name`; threaded to
+    /// every consensus instance and the replica handshake so frames agree.
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     client_listen_addr: SocketAddr,
@@ -668,7 +632,12 @@ fn run_shard_thread(
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
     let result = runtime.block_on(async move {
-        shard_main(
+        // `shard_main`'s future grows past clippy's `large_futures` cap
+        // (it ferries the metadata handoff, bus, builders, and inflight
+        // I/O in one state machine). Heap-pin it so the top-level
+        // `block_on` future stays small; one allocation per startup buys
+        // the stack budget back.
+        Box::pin(shard_main(
             shard_id,
             total_shards,
             replica_id,
@@ -678,7 +647,7 @@ fn run_shard_thread(
             shutdown_flag,
             metadata_handoff,
             owner_table,
-        )
+        ))
         .await
     });
 
@@ -788,6 +757,7 @@ async fn shard_main(
             let consensus = restore_metadata_consensus(
                 &journal,
                 restored_op,
+                topology.cluster_id,
                 topology.self_replica_id,
                 topology.replica_count,
                 Rc::clone(&bus),
@@ -805,7 +775,10 @@ async fn shard_main(
     );
 
     let shard_metrics = ShardMetrics::for_shard();
-    let shard = build_shard_for_thread(
+    // Notifier install deferred until after tick handler wires below.
+    let senders_for_notifier = senders.clone();
+    let metrics_for_notifier = shard_metrics.clone();
+    let (shard, sessions) = build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -842,12 +815,54 @@ async fn shard_main(
         return Ok(());
     }
 
+    // Tick handler must install before the notifier so early commits
+    // do not broadcast ticks whose handler slot is still `None`.
+    let (reconcile_wake_tx, reconcile_wake_rx) = channel::<()>(1);
+    let (reconcile_stop_tx, reconcile_stop_rx) = channel::<()>(1);
+    crate::partition_reconciler::install_tick_handler(&shard, reconcile_wake_tx);
+
+    // Only shard 0 commits metadata.
+    if shard_id == 0 {
+        let notifier = make_metadata_commit_notifier(senders_for_notifier, metrics_for_notifier);
+        shard.plane.metadata().set_commit_notifier(Some(notifier));
+    } else {
+        drop(senders_for_notifier);
+        drop(metrics_for_notifier);
+    }
+
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
     let pump_handle = compio::runtime::spawn(async move {
         pump_shard.run_message_pump(stop_rx).await;
     });
     bus.track_background(pump_handle);
+
+    let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
+        Rc::clone(&shard),
+        total_shards,
+        Rc::new(config.clone()),
+        topology.cluster_id,
+        topology.self_replica_id,
+        topology.replica_count,
+    ));
+    let reconcile_periodic = config
+        .system
+        .sharding
+        .reconcile_periodic_interval
+        .get_duration();
+    let reconciler_handle = compio::runtime::spawn({
+        let ctx = Rc::clone(&reconciler_ctx);
+        async move {
+            crate::partition_reconciler::run_reconciler(
+                ctx,
+                reconcile_wake_rx,
+                reconcile_stop_rx,
+                reconcile_periodic,
+            )
+            .await;
+        }
+    });
+    bus.track_background(reconciler_handle);
 
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
@@ -864,7 +879,7 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        let on_client_request = make_client_request_handler(&shard);
+        let on_client_request = make_client_request_handler(&shard, &sessions);
         let accepted_replica = make_delegating_replica_accept_fn(Rc::clone(&coord));
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
 
@@ -872,12 +887,14 @@ async fn shard_main(
             start_tcp_runtime(&shard, config, &topology, accepted_replica, accepted_client).await
         {
             let _ = stop_tx.try_send(());
+            let _ = reconcile_stop_tx.try_send(());
             return Err(error);
         }
     }
 
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
+    let _ = reconcile_stop_tx.try_send(());
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
@@ -1019,7 +1036,7 @@ async fn build_shard_for_thread(
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
-) -> Result<Rc<ServerNgShard>, ServerNgError> {
+) -> Result<(Rc<ServerNgShard>, Rc<RefCell<SessionManager>>), ServerNgError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
@@ -1044,7 +1061,7 @@ async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
-    let mut partitions = IggyPartitions::with_capacity(
+    let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: config.system.partition.messages_required_to_save,
@@ -1075,12 +1092,12 @@ async fn build_shard_for_thread(
                     if owning_shard == shard_id {
                         owned.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
                     } else {
-                        // Non-owning entry: only `shard_id` is consulted
-                        // by the router; `local_idx` is meaningful only on
-                        // the owning shard, so a sentinel `0` is safe.
                         shards_table.insert(
                             namespace,
-                            PartitionLocation::new(ShardId::new(owning_shard), LocalIdx::new(0)),
+                            PartitionLocation::new(
+                                ShardId::new(owning_shard),
+                                partition.created_revision,
+                            ),
                         );
                     }
                 }
@@ -1094,40 +1111,53 @@ async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, topic_stats, partition_metadata) in owned {
-        validate_recovered_namespace(config, stream_id, topic_id, partition_metadata.id)?;
+        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = load_partition(
             config,
             namespace,
             topic_stats,
             &partition_metadata,
+            topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
             Rc::clone(&bus),
         )
         .await?;
-        let local_idx = partitions.insert(namespace, partition);
+        partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
-            PartitionLocation::new(ShardId::new(shard_id), LocalIdx::new(*local_idx)),
+            PartitionLocation::new(ShardId::new(shard_id), partition_metadata.created_revision),
         );
     }
 
     let shard_handle = Rc::new(RefCell::new(None));
+    // One per-shard SessionManager, shared by the client-request handler
+    // (binds sessions) and the get_clients handler (reads them). Created
+    // here so both wirings reference the same instance.
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle);
+    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
+    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
+    let on_list_clients = make_list_clients_handler(&sessions);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
         on_replica_message,
         on_client_request,
+        on_metadata_submit,
+        on_list_clients,
         metadata,
         partitions,
         senders,
         inbox,
         shards_table,
-        PartitionConsensusConfig::new(CLUSTER_ID, topology.replica_count, Rc::clone(&bus)),
+        PartitionConsensusConfig::new(
+            topology.cluster_id,
+            shard::ReplicaTopology::new(topology.self_replica_id, topology.replica_count),
+            Rc::clone(&bus),
+        ),
         CoordinatorConfig::default(),
         metrics,
     )
@@ -1136,18 +1166,19 @@ async fn build_shard_for_thread(
 
     let shard = Rc::new(built.shard);
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-    Ok(shard)
+    Ok((shard, sessions))
 }
 
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
-        CLUSTER_ID,
+        cluster_id,
         self_replica_id,
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
@@ -1198,35 +1229,13 @@ fn restore_metadata_consensus(
     consensus
 }
 
-const fn validate_recovered_namespace(
-    config: &ServerNgConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerNgError> {
-    let namespace = &config.extra.namespace;
-    if stream_id < namespace.max_streams
-        && topic_id < namespace.max_topics
-        && partition_id < namespace.max_partitions
-    {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredNamespaceOutOfBounds {
-        stream_id,
-        topic_id,
-        partition_id,
-        max_streams: namespace.max_streams,
-        max_topics: namespace.max_topics,
-        max_partitions: namespace.max_partitions,
-    })
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn load_partition(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
     topic_stats: Arc<TopicStats>,
     partition_metadata: &Partition,
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
@@ -1236,7 +1245,7 @@ async fn load_partition(
     let partition_id = namespace.partition_id();
     let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
-        CLUSTER_ID,
+        cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
@@ -1484,222 +1493,6 @@ async fn load_segment_max_timestamp(
     Ok(indexes_max_timestamp(&indexes))
 }
 
-fn configure_consumer_offsets(
-    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerNgConfig,
-    namespace: IggyNamespace,
-    current_offset: u64,
-) -> Result<(), ServerNgError> {
-    let stream_id = namespace.stream_id();
-    let topic_id = namespace.topic_id();
-    let partition_id = namespace.partition_id();
-    let consumer_offsets_path =
-        config
-            .system
-            .get_consumer_offsets_path(stream_id, topic_id, partition_id);
-    let consumer_group_offsets_path =
-        config
-            .system
-            .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-
-    let loaded_consumer_offsets = load_partition_consumer_offsets(
-        &consumer_offsets_path,
-        "consumer",
-        stream_id,
-        topic_id,
-        partition_id,
-    )?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
-    {
-        let guard = consumer_offsets.pin();
-        for offset in loaded_consumer_offsets {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer",
-                    consumer_id: offset.consumer_id as usize,
-                    offset: recovered_offset,
-                    current_offset,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                });
-            }
-            guard.insert(offset.consumer_id as usize, offset);
-        }
-    }
-
-    let loaded_group_offsets = load_partition_consumer_group_offsets(
-        &consumer_group_offsets_path,
-        stream_id,
-        topic_id,
-        partition_id,
-    )?;
-    let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
-    {
-        let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in loaded_group_offsets {
-            let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer group",
-                    consumer_id: group_id.0,
-                    offset: recovered_offset,
-                    current_offset,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                });
-            }
-            guard.insert(group_id, offset);
-        }
-    }
-
-    partition.configure_consumer_offset_storage(
-        consumer_offsets_path,
-        consumer_group_offsets_path,
-        consumer_offsets,
-        consumer_group_offsets,
-        config.system.partition.enforce_fsync,
-    );
-    Ok(())
-}
-
-fn load_partition_consumer_offsets(
-    path: &str,
-    consumer_kind: &'static str,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<Vec<iggy_common::ConsumerOffset>, ServerNgError> {
-    if !Path::new(path).exists() {
-        return Ok(Vec::new());
-    }
-
-    load_consumer_offsets(path).or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
-        {
-            return Ok(Vec::new());
-        }
-
-        Err(ServerNgError::ConsumerOffsetsLoad {
-            consumer_kind,
-            stream_id,
-            topic_id,
-            partition_id,
-            path: path.to_string(),
-            source: Box::new(source),
-        })
-    })
-}
-
-fn load_partition_consumer_group_offsets(
-    path: &str,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerNgError> {
-    if !Path::new(path).exists() {
-        return Ok(Vec::new());
-    }
-
-    load_consumer_group_offsets(path).or_else(|source| {
-        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
-        {
-            return Ok(Vec::new());
-        }
-
-        Err(ServerNgError::ConsumerOffsetsLoad {
-            consumer_kind: "consumer group",
-            stream_id,
-            topic_id,
-            partition_id,
-            path: path.to_string(),
-            source: Box::new(source),
-        })
-    })
-}
-
-async fn ensure_initial_segment(
-    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerNgConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerNgError> {
-    if partition.log.has_segments() {
-        return Ok(());
-    }
-
-    // TODO: decouple segment storage creation from the `server` crate.
-    let storage =
-        create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to create initial segment storage"
-                );
-                source
-            })?;
-    let messages_path = config
-        .system
-        .get_messages_file_path(stream_id, topic_id, partition_id, 0);
-    let index_path = config
-        .system
-        .get_index_path(stream_id, topic_id, partition_id, 0);
-    partition.log.add_persisted_segment(
-        Segment::new(0, config.system.segment.size),
-        storage,
-        Some(Rc::new(
-            MessagesWriter::new(
-                &messages_path,
-                Rc::new(AtomicU64::new(0)),
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %messages_path,
-                    error = %source,
-                    "failed to initialize initial messages writer"
-                );
-                source
-            })?,
-        )),
-        Some(Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(AtomicU64::new(0)),
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %index_path,
-                    error = %source,
-                    "failed to initialize initial sparse index writer"
-                );
-                source
-            })?,
-        )),
-    );
-    partition.stats.increment_segments_count(1);
-
-    Ok(())
-}
-
 fn resolve_tcp_topology(
     config: &ServerNgConfig,
     current_replica_id: Option<u8>,
@@ -1722,6 +1515,7 @@ fn resolve_tcp_topology(
             });
         }
         return Ok(TcpTopology {
+            cluster_id: auth::cluster_domain_id(&config.cluster.name),
             // Keep parity with the current server binary and the integration
             // harness: `--replica-id 0` may be passed unconditionally in
             // single-node mode; any other id is rejected above so the WAL
@@ -1774,6 +1568,7 @@ fn resolve_tcp_topology(
     let peers = resolve_cluster_replica_peers(&config.cluster.nodes, self_replica_id)?;
 
     Ok(TcpTopology {
+        cluster_id: auth::cluster_domain_id(&config.cluster.name),
         self_replica_id,
         replica_count,
         client_listen_addr,
@@ -1902,6 +1697,7 @@ async fn start_via_replica_io(
         tcp_tls,
     } = accepted_clients;
 
+    let replica_auth = load_replica_auth(config);
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
@@ -1913,9 +1709,10 @@ async fn start_via_replica_io(
         tcp_tls_credentials,
         None,
         None,
-        CLUSTER_ID,
+        topology.cluster_id,
         topology.self_replica_id,
         topology.replica_count,
+        replica_auth,
         topology.peers.clone(),
         accepted_replica,
         tcp,
@@ -1998,16 +1795,20 @@ async fn start_manual_runtime(
         let token = shard.bus.token();
         let max_message_size = shard.bus.config().max_message_size;
         let handshake_grace = shard.bus.config().handshake_grace;
+        let cluster_id = topology.cluster_id;
         let self_replica_id = topology.self_replica_id;
         let replica_count = topology.replica_count;
+        let replica_auth = load_replica_auth(config);
+        let auth_for_listener = replica_auth.clone();
         let accepted_replica_for_listener = accepted_replica.clone();
         let replica_handle = compio::runtime::spawn(async move {
             replica_listener::run(
                 replica_listener,
                 token,
-                CLUSTER_ID,
+                cluster_id,
                 self_replica_id,
                 replica_count,
+                auth_for_listener,
                 accepted_replica_for_listener,
                 max_message_size,
                 handshake_grace,
@@ -2017,9 +1818,11 @@ async fn start_manual_runtime(
         shard.bus.track_background(replica_handle);
         connector::start(
             &shard.bus,
-            CLUSTER_ID,
+            cluster_id,
             topology.self_replica_id,
             topology.peers.clone(),
+            replica_auth,
+            handshake_grace,
             accepted_replica,
             shard.bus.config().reconnect_period,
         )
@@ -2065,1184 +1868,6 @@ async fn start_manual_runtime(
     Ok(())
 }
 
-type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
-type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
-
-fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
-    let shard = Rc::clone(shard);
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
-    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
-    let sessions_for_disconnect = Rc::clone(&sessions);
-    let shard_for_disconnect = Rc::clone(&shard);
-    shard
-        .bus
-        .set_client_connection_lost_fn(Rc::new(move |client_id| {
-            if let Some(vsr_client_id) = sessions_for_disconnect
-                .borrow_mut()
-                .remove_connection(client_id)
-            {
-                // Local-table reclaim happens here; then spawn a detached
-                // task to submit a cluster-replicated `Logout` so peer
-                // replicas drop the slot too. Without this, an
-                // already-committed `Register` lingers on every backup
-                // until they evict the client themselves -- a
-                // local-vs-cluster divergence observable across view
-                // changes. `submit_logout_in_process` requires shard 0
-                // consensus, which this handler always runs on.
-                shard_for_disconnect
-                    .plane
-                    .metadata()
-                    .remove_client_session(vsr_client_id);
-                let shard = Rc::clone(&shard_for_disconnect);
-                compio::runtime::spawn(async move {
-                    // request_id 0 + session 0: synthetic disconnect
-                    // logout; `submit_logout_in_process` short-circuits to
-                    // current commit when no session entry exists, so a
-                    // race with the explicit logout path is a no-op.
-                    if let Err(error) = shard
-                        .plane
-                        .metadata()
-                        .submit_logout_in_process(vsr_client_id, 0, 0)
-                        .await
-                    {
-                        warn!(
-                            vsr_client_id,
-                            ?error,
-                            "disconnect logout submit failed; peer slots may linger until eviction"
-                        );
-                    }
-                })
-                .detach();
-            }
-        }));
-    Rc::new(move |client_id, message| {
-        enqueue_client_request(
-            Rc::clone(&shard),
-            Rc::clone(&sessions),
-            Rc::clone(&queues),
-            Rc::clone(&active),
-            client_id,
-            message,
-        );
-    })
-}
-
-fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> MessageHandler {
-    let shard_handle = Rc::clone(shard_handle);
-    Rc::new(move |_replica_id, message| {
-        if let Some(shard) = upgrade_shard_handle(&shard_handle) {
-            shard.dispatch(message);
-        }
-    })
-}
-
-fn make_deferred_client_request_handler(
-    bus: &Rc<IggyMessageBus>,
-    shard_handle: &ServerNgShardHandle,
-) -> RequestHandler {
-    let shard_handle = Rc::clone(shard_handle);
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
-    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
-    let sessions_for_disconnect = Rc::clone(&sessions);
-    let shard_handle_for_disconnect = Rc::clone(&shard_handle);
-    bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
-        if let Some(vsr_client_id) = sessions_for_disconnect
-            .borrow_mut()
-            .remove_connection(client_id)
-            && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
-        {
-            // TODO(vsr): this handler runs on shards > 0 which have no
-            // consensus; `submit_logout_in_process` would panic. Local
-            // table reclaim only -- bounded local-vs-cluster divergence
-            // window until `evict_oldest` reclaims the peer slot. Fix by
-            // routing a synthetic Logout request through the inter-shard
-            // router to shard 0.
-            shard.plane.metadata().remove_client_session(vsr_client_id);
-        }
-    }));
-    Rc::new(move |client_id, message| {
-        let shard_handle = Rc::clone(&shard_handle);
-        let sessions = Rc::clone(&sessions);
-        let queues = Rc::clone(&queues);
-        let active = Rc::clone(&active);
-        queues
-            .borrow_mut()
-            .entry(client_id)
-            .or_default()
-            .push_back(message);
-        if !active.borrow_mut().insert(client_id) {
-            return;
-        }
-        compio::runtime::spawn(async move {
-            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-                active.borrow_mut().remove(&client_id);
-                return;
-            };
-            drain_client_requests(shard, sessions, queues, active, client_id).await;
-        })
-        .detach();
-    })
-}
-
-fn enqueue_client_request(
-    shard: Rc<ServerNgShard>,
-    sessions: Rc<RefCell<SessionManager>>,
-    queues: ClientRequestQueues,
-    active: ActiveClientRequests,
-    client_id: u128,
-    message: Message<GenericHeader>,
-) {
-    queues
-        .borrow_mut()
-        .entry(client_id)
-        .or_default()
-        .push_back(message);
-    if !active.borrow_mut().insert(client_id) {
-        return;
-    }
-
-    compio::runtime::spawn(async move {
-        drain_client_requests(shard, sessions, queues, active, client_id).await;
-    })
-    .detach();
-}
-
-#[allow(clippy::future_not_send)]
-async fn drain_client_requests(
-    shard: Rc<ServerNgShard>,
-    sessions: Rc<RefCell<SessionManager>>,
-    queues: ClientRequestQueues,
-    active: ActiveClientRequests,
-    client_id: u128,
-) {
-    loop {
-        let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
-            return;
-        };
-        handle_client_request(&shard, &sessions, client_id, message).await;
-    }
-}
-
-fn pop_next_client_request(
-    queues: &ClientRequestQueues,
-    active: &ActiveClientRequests,
-    client_id: u128,
-) -> Option<Message<GenericHeader>> {
-    let mut queues = queues.borrow_mut();
-    let Some(queue) = queues.get_mut(&client_id) else {
-        active.borrow_mut().remove(&client_id);
-        return None;
-    };
-    let message = queue.pop_front();
-    if queue.is_empty() {
-        queues.remove(&client_id);
-    }
-    if message.is_none() {
-        active.borrow_mut().remove(&client_id);
-    }
-    message
-}
-
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn handle_client_request(
-    shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    message: Message<iggy_binary_protocol::GenericHeader>,
-) {
-    let request = match message.try_into_typed::<RequestHeader>() {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "dropping client request with invalid header"
-            );
-            return;
-        }
-    };
-
-    ensure_transport_connection(shard, sessions, transport_client_id);
-
-    let header = *request.header();
-    if header.operation == Operation::NonReplicated {
-        // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
-        // legitimately pre-auth (liveness probe + connection bootstrap
-        // metadata). Every other non-replicated code (`GET_STREAM*`,
-        // `GET_TOPIC*`, `GET_STATS`, `POLL_MESSAGES`) reads live state and
-        // MUST go through Register first, since server-ng has no
-        // per-resource authz layer.
-        let nr_code = u32::from_le_bytes(
-            request.header().reserved[..4]
-                .try_into()
-                .unwrap_or_default(),
-        );
-        let allowed_pre_auth = matches!(nr_code, PING_CODE | GET_CLUSTER_METADATA_CODE);
-        if !allowed_pre_auth && sessions.borrow().get_session(transport_client_id).is_none() {
-            warn!(
-                transport_client_id,
-                code = nr_code,
-                "dropping pre-auth non-replicated read"
-            );
-            return;
-        }
-        handle_non_replicated_request(shard, transport_client_id, request).await;
-        return;
-    }
-
-    if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
-        handle_login_register_request(shard, sessions, transport_client_id, request).await;
-        return;
-    }
-
-    if header.operation == Operation::Logout {
-        handle_logout_request(shard, sessions, transport_client_id, request).await;
-        return;
-    }
-
-    let bound = sessions.borrow().get_session(transport_client_id);
-    if bound.is_none() {
-        // Replicated request on an unbound transport. Without this short-
-        // circuit, the rewrite below overwrites `header.client` with
-        // `transport_client_id` and dispatches; the request_preflight then
-        // rejects with `NoSession`/`SessionMismatch` and the failure either
-        // disappears silently or emits an Eviction the SDK previously
-        // could not decode. Either way the SDK blocked until socket
-        // timeout. Emit an empty Reply so the SDK fails fast: the typed
-        // decoder downstream rejects the empty body with `InvalidCommand`
-        // instead of hanging.
-        let commit = current_metadata_commit(shard);
-        let reply = build_empty_reply(&header, transport_client_id, 0, commit);
-        if let Err(error) = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await
-        {
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "failed to surface unbound-session reply"
-            );
-        } else {
-            warn!(
-                transport_client_id,
-                operation = ?header.operation,
-                "dropping replicated request from unbound transport; replied empty"
-            );
-        }
-        return;
-    }
-
-    let resolved_namespace = if header.operation.is_partition() {
-        match resolve_partition_request_namespace(shard, header.operation, request_body(&request)) {
-            Ok(namespace) => Some(namespace),
-            Err(error) => {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "dropping partition request with unresolved namespace"
-                );
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
-        *new_header = header;
-        new_header.client = transport_client_id;
-        if let Some(namespace) = resolved_namespace {
-            new_header.namespace = namespace;
-        }
-        if let Some((bound_client_id, bound_session)) = bound {
-            new_header.client = bound_client_id;
-            new_header.session = bound_session;
-        }
-    });
-    let request = match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                operation = ?header.operation,
-                "dropping request with invalid PAT replication context"
-            );
-            return;
-        }
-    };
-    shard.dispatch(request.into_generic());
-}
-
-#[allow(clippy::future_not_send)]
-async fn handle_non_replicated_request(
-    shard: &Rc<ServerNgShard>,
-    transport_client_id: u128,
-    request: Message<RequestHeader>,
-) {
-    const CODE_RANGE: std::ops::Range<usize> = 0..4;
-    let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    match code {
-        PING_CODE => {
-            let commit = current_metadata_commit(shard);
-            let reply = build_empty_reply(
-                request.header(),
-                request.header().client,
-                request.header().session,
-                commit,
-            );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "failed to send non-replicated ping reply"
-                );
-            }
-        }
-        _ => match build_non_replicated_response(shard, code, request_body(&request)) {
-            Ok(response) => {
-                let commit = current_metadata_commit(shard);
-                let reply = response.into_reply(
-                    request.header(),
-                    request.header().client,
-                    request.header().session,
-                    commit,
-                );
-                if let Err(error) = shard
-                    .bus
-                    .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                    .await
-                {
-                    warn!(
-                        transport_client_id,
-                        code,
-                        error = %error,
-                        "failed to send non-replicated VSR reply"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(
-                    transport_client_id,
-                    code,
-                    error = %error,
-                    "dropping unsupported non-replicated VSR request"
-                );
-            }
-        },
-    }
-}
-
-#[allow(clippy::future_not_send)]
-async fn handle_logout_request(
-    shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    request: Message<RequestHeader>,
-) {
-    let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
-        warn!(
-            transport_client_id,
-            "dropping logout for unbound VSR session"
-        );
-        return;
-    };
-
-    let request_id = request.header().request;
-    let commit = match shard
-        .plane
-        .metadata()
-        .submit_logout_in_process(vsr_client_id, session, request_id)
-        .await
-    {
-        Ok(commit) => commit,
-        Err(error) => {
-            warn!(transport_client_id, error = %error, "logout/unregister failed");
-            return;
-        }
-    };
-
-    sessions.borrow_mut().remove_connection(transport_client_id);
-
-    let reply = build_empty_reply(request.header(), vsr_client_id, session, commit);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send logout reply"
-        );
-    }
-}
-
-fn ensure_transport_connection(
-    shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-) {
-    let Some(meta) = shard.bus.client_meta(transport_client_id) else {
-        return;
-    };
-    sessions
-        .borrow_mut()
-        .ensure_connection(transport_client_id, meta.peer_addr);
-}
-
-fn maybe_rewrite_pat_request(
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    request: Message<RequestHeader>,
-) -> Result<Message<RequestHeader>, IggyError> {
-    let operation = request.header().operation;
-    let user_id = match operation {
-        Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
-            .borrow()
-            .get_user_id(transport_client_id)
-            .ok_or(IggyError::Unauthenticated)?,
-        _ => return Ok(request),
-    };
-
-    let body = request_body(&request);
-    let rewritten = match operation {
-        Operation::CreatePersonalAccessToken => {
-            let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            // Primary mints the raw token + hash here and ships the hash
-            // through consensus. Replicas decode the hash directly. Doing
-            // this inside `CreatePersonalAccessTokenRequest::apply` would
-            // call `ring::rand` per-replica and diverge state.
-            let token_hash = mint_pat_token_hash();
-            ReplicatedCreatePersonalAccessTokenRequest {
-                user_id,
-                name: wire.name,
-                expiry: wire.expiry,
-                token_hash,
-            }
-            .to_bytes()
-        }
-        Operation::DeletePersonalAccessToken => {
-            let wire = WireDeletePersonalAccessTokenRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            ReplicatedDeletePersonalAccessTokenRequest {
-                user_id,
-                name: wire.name,
-            }
-            .to_bytes()
-        }
-        _ => unreachable!(),
-    };
-
-    rewrite_request_body(&request, &rewritten)
-}
-
-/// Mints a fresh PAT raw token and returns its hex-encoded SHA-256 hash
-/// (64 bytes ASCII) for replication. The raw token is currently dropped --
-/// see the TODO on `CreatePersonalAccessTokenRequest::apply` for the missing
-/// return-to-client path.
-fn mint_pat_token_hash() -> [u8; 64] {
-    let (_raw, hash) = iggy_common::PersonalAccessToken::mint_raw_and_hash();
-    let bytes = hash.as_bytes();
-    let mut out = [0u8; 64];
-    let len = bytes.len().min(64);
-    out[..len].copy_from_slice(&bytes[..len]);
-    out
-}
-
-fn rewrite_request_body(
-    request: &Message<RequestHeader>,
-    body: &Bytes,
-) -> Result<Message<RequestHeader>, IggyError> {
-    let total_size = std::mem::size_of::<RequestHeader>()
-        .checked_add(body.len())
-        .ok_or(IggyError::InvalidConfiguration)?;
-    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut rewritten = Message::<RequestHeader>::new(total_size);
-    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
-        &mut rewritten.as_mut_slice()[..std::mem::size_of::<RequestHeader>()],
-    )
-    .expect("zeroed bytes are a valid request header");
-    *header = *request.header();
-    header.size = size;
-    rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
-    // TODO(vsr): the body changed but `request_checksum` / `checksum` /
-    // `checksum_body` were copied verbatim from the original header. Safe
-    // today because the SDK initializes `request_checksum` to 0 and the
-    // server does not validate it; the moment integrity checking lands,
-    // recompute these here (or zero them and re-sign in a follow-up step).
-    Ok(rewritten)
-}
-
-#[allow(clippy::future_not_send)]
-async fn handle_login_register_request(
-    shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    request: Message<RequestHeader>,
-) {
-    let body = request_body(&request);
-    let vsr_client_id = request.header().client;
-
-    if let Ok(wire_request) = LoginRegisterRequest::decode_from(body) {
-        match verify_login_credentials(
-            shard,
-            wire_request.username.as_str(),
-            wire_request.password.expose_secret(),
-        ) {
-            Ok(user_id) => {
-                if let Err(error) = complete_login_register(
-                    shard,
-                    sessions,
-                    transport_client_id,
-                    vsr_client_id,
-                    request.header(),
-                    user_id,
-                )
-                .await
-                {
-                    warn!(transport_client_id, error = %error, "login/register failed");
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
-                }
-                return;
-            }
-            Err(LoginRegisterError::InvalidCredentials) => {
-                // Fall through to PAT attempt so a credential payload that
-                // collides with a valid PAT payload shape still gets a
-                // chance; if PAT also rejects, the final fall-through emits
-                // the empty-reply failure path below.
-            }
-            Err(error) => {
-                warn!(transport_client_id, error = %error, "login/register failed");
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
-                return;
-            }
-        }
-    }
-
-    if let Ok(wire_request) = LoginRegisterWithPatRequest::decode_from(body) {
-        match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
-            Ok(user_id) => {
-                if let Err(error) = complete_login_register(
-                    shard,
-                    sessions,
-                    transport_client_id,
-                    vsr_client_id,
-                    request.header(),
-                    user_id,
-                )
-                .await
-                {
-                    warn!(
-                        transport_client_id,
-                        error = %error,
-                        "login/register with PAT failed"
-                    );
-                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
-                }
-                return;
-            }
-            Err(error) => {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "login/register with PAT failed"
-                );
-                send_login_failure_reply(shard, transport_client_id, request.header()).await;
-                return;
-            }
-        }
-    }
-
-    warn!(
-        transport_client_id,
-        "dropping register request with unsupported payload shape"
-    );
-    send_login_failure_reply(shard, transport_client_id, request.header()).await;
-}
-
-/// Empty Reply on a failed Register. Without it the SDK -- which only
-/// decodes `Command2::Reply` -- blocks until the socket read timeout fires
-/// for what is really a typed failure. An empty body fails downstream
-/// `LoginRegisterResponse` decoding with `InvalidCommand`, surfacing the
-/// failure to the caller immediately. A future change can switch this to
-/// an Eviction frame with a typed `EvictionReason` once the SDK eviction
-/// decoder lands at every transport.
-#[allow(clippy::future_not_send)]
-async fn send_login_failure_reply(
-    shard: &Rc<ServerNgShard>,
-    transport_client_id: u128,
-    request_header: &RequestHeader,
-) {
-    let commit = current_metadata_commit(shard);
-    let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send login-failure reply"
-        );
-    }
-}
-
-fn request_body(request: &Message<RequestHeader>) -> &[u8] {
-    &request.as_slice()[std::mem::size_of::<RequestHeader>()..request.header().size as usize]
-}
-
-fn resolve_partition_request_namespace(
-    shard: &Rc<ServerNgShard>,
-    operation: Operation,
-    body: &[u8],
-) -> Result<u64, IggyError> {
-    let namespace = match operation {
-        Operation::SendMessages => {
-            if body.len() < 4 {
-                return Err(IggyError::InvalidCommand);
-            }
-            let metadata_length = u32::from_le_bytes(
-                body[..4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ) as usize;
-            if body.len() < 4 + metadata_length {
-                return Err(IggyError::InvalidCommand);
-            }
-            let header = SendMessagesHeader::decode_from(&body[4..4 + metadata_length])
-                .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_send_messages_namespace(shard, &header)?
-        }
-        Operation::StoreConsumerOffset => {
-            let request = StoreConsumerOffsetRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
-                shard,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-            )?
-        }
-        Operation::DeleteConsumerOffset => {
-            let request = DeleteConsumerOffsetRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
-                shard,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-            )?
-        }
-        Operation::StoreConsumerOffset2 => {
-            let request = StoreConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
-                shard,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-            )?
-        }
-        Operation::DeleteConsumerOffset2 => {
-            let request = DeleteConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
-                shard,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-            )?
-        }
-        Operation::DeleteSegments => {
-            let request =
-                DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
-                shard,
-                &request.stream_id,
-                &request.topic_id,
-                Some(request.partition_id),
-            )?
-        }
-        _ => return Err(IggyError::FeatureUnavailable),
-    };
-    Ok(namespace.inner())
-}
-
-fn resolve_send_messages_namespace(
-    shard: &Rc<ServerNgShard>,
-    header: &SendMessagesHeader,
-) -> Result<IggyNamespace, IggyError> {
-    let WirePartitioning::PartitionId(partition_id) = header.partitioning else {
-        return Err(IggyError::FeatureUnavailable);
-    };
-    resolve_partition_namespace(
-        shard,
-        &header.stream_id,
-        &header.topic_id,
-        Some(partition_id),
-    )
-}
-
-fn resolve_partition_namespace(
-    shard: &Rc<ServerNgShard>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-    partition_id: Option<u32>,
-) -> Result<IggyNamespace, IggyError> {
-    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .namespace_from_partition(stream_id, topic_id, partition_id)
-        .ok_or(IggyError::InvalidIdentifier)
-}
-
-fn build_non_replicated_response(
-    shard: &Rc<ServerNgShard>,
-    code: u32,
-    body: &[u8],
-) -> Result<NonReplicatedResponse, IggyError> {
-    match code {
-        GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_cluster_metadata_response().to_bytes(),
-        )),
-        GET_STATS_CODE => Ok(NonReplicatedResponse::Bytes(
-            build_stats_response(shard)?.to_bytes(),
-        )),
-        GET_STREAM_CODE => {
-            let request =
-                GetStreamRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_stream_response(shard, &request.stream_id).map(|response| {
-                response.map_or(NonReplicatedResponse::Empty, |response| {
-                    NonReplicatedResponse::Bytes(response.to_bytes())
-                })
-            })
-        }
-        GET_STREAMS_CODE => {
-            let _ = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::Bytes(
-                build_get_streams_response(shard)?.to_bytes(),
-            ))
-        }
-        GET_TOPIC_CODE => {
-            let request =
-                GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_topic_response(shard, &request.stream_id, &request.topic_id).map(|response| {
-                response.map_or(NonReplicatedResponse::Empty, |response| {
-                    NonReplicatedResponse::Bytes(response.to_bytes())
-                })
-            })
-        }
-        GET_TOPICS_CODE => {
-            let request =
-                GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::Bytes(
-                build_get_topics_response(shard, &request.stream_id)?.to_bytes(),
-            ))
-        }
-        POLL_MESSAGES_CODE => {
-            let request =
-                PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::EmptyPolledMessages {
-                partition_id: request.partition_id.unwrap_or(0),
-            })
-        }
-        _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
-            Some(meta) if !meta.is_replicated() => Ok(NonReplicatedResponse::Empty),
-            Some(_) => Err(IggyError::FeatureUnavailable),
-            None => Err(IggyError::InvalidCommand),
-        },
-    }
-}
-
-fn build_cluster_metadata_response() -> ClusterMetadataResponse {
-    ClusterMetadataResponse {
-        name: "server-ng".to_owned(),
-        nodes: vec![ClusterNodeResponse {
-            name: "node-0".to_owned(),
-            ip: "127.0.0.1".to_owned(),
-            tcp_port: 0,
-            quic_port: 0,
-            http_port: 0,
-            websocket_port: 0,
-            role: 0,
-            status: 0,
-        }],
-    }
-}
-
-fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
-    let (streams_count, topics_count, partitions_count, messages_size_bytes, messages_count) =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                let mut topics_count = 0u32;
-                let mut partitions_count = 0u32;
-                let mut messages_size_bytes = 0u64;
-                let mut messages_count = 0u64;
-                for (_, stream) in &streams.items {
-                    topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-                    messages_size_bytes =
-                        messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-                    messages_count =
-                        messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                    for (_, topic) in &stream.topics {
-                        partitions_count =
-                            partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-                    }
-                }
-                Ok((
-                    usize_to_u32(streams.items.len())?,
-                    topics_count,
-                    partitions_count,
-                    messages_size_bytes,
-                    messages_count,
-                ))
-            })?;
-    let consumer_groups_count = shard
-        .plane
-        .metadata()
-        .mux_stm
-        .consumer_groups()
-        .read(|groups| usize_to_u32(groups.items.len()))?;
-
-    Ok(StatsResponse {
-        process_id: std::process::id(),
-        cpu_usage: 0.0,
-        total_cpu_usage: 0.0,
-        memory_usage: 0,
-        total_memory: 0,
-        available_memory: 0,
-        run_time: 0,
-        start_time: 0,
-        read_bytes: 0,
-        written_bytes: 0,
-        messages_size_bytes,
-        streams_count,
-        topics_count,
-        partitions_count,
-        segments_count: 0,
-        messages_count,
-        clients_count: 0,
-        consumer_groups_count,
-        hostname: "unknown_hostname".to_owned(),
-        os_name: "unknown_os_name".to_owned(),
-        os_version: "unknown_os_version".to_owned(),
-        kernel_version: "unknown_kernel_version".to_owned(),
-        iggy_server_version: server::VERSION.to_owned(),
-        iggy_server_semver: server::SEMANTIC_VERSION.get_numeric_version().ok(),
-        cache_metrics: Vec::new(),
-        threads_count: 0,
-        free_disk_space: 0,
-        total_disk_space: 0,
-    })
-}
-
-fn build_get_stream_response(
-    shard: &Rc<ServerNgShard>,
-    stream_id: &WireIdentifier,
-) -> Result<Option<GetStreamResponse>, IggyError> {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetStreamResponse {
-            stream: stream_response(stream)?,
-            topics: stream
-                .topics
-                .iter()
-                .map(|(_, topic)| topic_header(topic))
-                .collect::<Result<Vec<_>, _>>()?,
-        }))
-    })
-}
-
-fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsResponse, IggyError> {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        streams
-            .items
-            .iter()
-            .map(|(_, stream)| stream_response(stream))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|streams| GetStreamsResponse { streams })
-    })
-}
-
-fn build_get_topic_response(
-    shard: &Rc<ServerNgShard>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-) -> Result<Option<GetTopicResponse>, IggyError> {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
-            return Ok(None);
-        };
-        let Some(topic_id) = resolve_topic_id(streams, stream_id, topic_id) else {
-            return Ok(None);
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        let topic = stream
-            .topics
-            .get(topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        Ok(Some(GetTopicResponse {
-            topic: topic_header(topic)?,
-            partitions: topic
-                .partitions
-                .iter()
-                .map(partition_response)
-                .collect::<Result<Vec<_>, _>>()?,
-        }))
-    })
-}
-
-fn build_get_topics_response(
-    shard: &Rc<ServerNgShard>,
-    stream_id: &WireIdentifier,
-) -> Result<GetTopicsResponse, IggyError> {
-    shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
-            return Ok(GetTopicsResponse { topics: Vec::new() });
-        };
-        let stream = streams
-            .items
-            .get(stream_id)
-            .ok_or(IggyError::InvalidIdentifier)?;
-        stream
-            .topics
-            .iter()
-            .map(|(_, topic)| topic_header(topic))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|topics| GetTopicsResponse { topics })
-    })
-}
-
-fn resolve_stream_id(
-    streams: &metadata::stm::stream::StreamsInner,
-    identifier: &WireIdentifier,
-) -> Option<usize> {
-    match identifier {
-        WireIdentifier::Numeric(id) => {
-            let id = *id as usize;
-            streams.items.contains(id).then_some(id)
-        }
-        WireIdentifier::String(name) => streams.index.get(name.as_str()).copied(),
-    }
-}
-
-fn resolve_topic_id(
-    streams: &metadata::stm::stream::StreamsInner,
-    stream_id: usize,
-    identifier: &WireIdentifier,
-) -> Option<usize> {
-    let stream = streams.items.get(stream_id)?;
-    match identifier {
-        WireIdentifier::Numeric(id) => {
-            let id = *id as usize;
-            stream.topics.contains(id).then_some(id)
-        }
-        WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
-    }
-}
-
-fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamResponse, IggyError> {
-    Ok(StreamResponse {
-        id: usize_to_u32(stream.id)?,
-        created_at: stream.created_at.as_micros(),
-        topics_count: usize_to_u32(stream.topics.len())?,
-        size_bytes: stream.stats.size_bytes_inconsistent(),
-        messages_count: stream.stats.messages_count_inconsistent(),
-        name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-    })
-}
-
-fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
-    Ok(StreamTopicHeader {
-        id: usize_to_u32(topic.id)?,
-        created_at: topic.created_at.as_micros(),
-        partitions_count: usize_to_u32(topic.partitions.len())?,
-        message_expiry: u64::from(topic.message_expiry),
-        compression_algorithm: topic.compression_algorithm.as_code(),
-        max_topic_size: topic.max_topic_size.as_bytes_u64(),
-        replication_factor: topic.replication_factor,
-        size_bytes: topic.stats.size_bytes_inconsistent(),
-        messages_count: topic.stats.messages_count_inconsistent(),
-        name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
-    })
-}
-
-fn partition_response(
-    partition: &metadata::stm::stream::Partition,
-) -> Result<PartitionResponse, IggyError> {
-    Ok(PartitionResponse {
-        id: usize_to_u32(partition.id)?,
-        created_at: partition.created_at.as_micros(),
-        segments_count: 0,
-        current_offset: 0,
-        size_bytes: 0,
-        messages_count: 0,
-    })
-}
-
-fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
-    u32::try_from(value).map_err(|_| IggyError::InvalidIdentifier)
-}
-
-fn verify_login_credentials(
-    shard: &Rc<ServerNgShard>,
-    username: &str,
-    password: &str,
-) -> Result<u32, LoginRegisterError> {
-    shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some(user_id) = users.index.get(username).copied() else {
-            return Err(LoginRegisterError::InvalidCredentials);
-        };
-        let Some(user) = users.items.get(user_id as usize) else {
-            return Err(LoginRegisterError::InvalidCredentials);
-        };
-        if user.status != UserStatus::Active {
-            return Err(LoginRegisterError::UserInactive);
-        }
-        if !crypto::verify_password(password, user.password_hash.as_ref()) {
-            return Err(LoginRegisterError::InvalidCredentials);
-        }
-        Ok(user.id)
-    })
-}
-
-fn verify_pat_credentials(
-    shard: &Rc<ServerNgShard>,
-    token: &str,
-) -> Result<u32, LoginRegisterError> {
-    let token_hash = PersonalAccessToken::hash_token(token);
-    let now = IggyTimestamp::now();
-    shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some((user_id, token_name)) =
-            users.personal_access_token_index.get(token_hash.as_str())
-        else {
-            return Err(LoginRegisterError::InvalidToken);
-        };
-        let Some(pat) = users
-            .personal_access_tokens
-            .get(user_id)
-            .and_then(|tokens| tokens.get(token_name))
-        else {
-            return Err(LoginRegisterError::InvalidToken);
-        };
-        if pat.is_expired(now) {
-            return Err(LoginRegisterError::InvalidToken);
-        }
-        let Some(user) = users.items.get(*user_id as usize) else {
-            return Err(LoginRegisterError::InvalidToken);
-        };
-        if user.status != UserStatus::Active {
-            return Err(LoginRegisterError::UserInactive);
-        }
-        Ok(user.id)
-    })
-}
-
-#[allow(clippy::future_not_send)]
-async fn complete_login_register(
-    shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    vsr_client_id: u128,
-    request_header: &RequestHeader,
-    user_id: u32,
-) -> Result<(), LoginRegisterError> {
-    let existing_session = {
-        let sessions = sessions.borrow();
-        sessions
-            .get_session(transport_client_id)
-            .map(|(_, session)| session)
-    };
-    if let Some(session) = existing_session {
-        let commit = current_metadata_commit(shard);
-        let reply =
-            build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-        let _ = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await;
-        return Ok(());
-    }
-
-    {
-        let mut sessions = sessions.borrow_mut();
-        sessions
-            .login(transport_client_id, user_id)
-            .map_err(LoginRegisterError::Session)?;
-    }
-
-    let session = match shard
-        .plane
-        .metadata()
-        .submit_register_in_process(vsr_client_id)
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = sessions
-                .borrow_mut()
-                .reset_to_connected(transport_client_id);
-            return Err(LoginRegisterError::Transient(error));
-        }
-    };
-
-    {
-        let mut sessions = sessions.borrow_mut();
-        if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
-            // No local rollback: `submit_register_in_process` above has
-            // already committed cluster-wide. A local-only
-            // `remove_client_session` here would diverge peers (they retain
-            // the slot until they evict the client themselves). The
-            // transport-disconnect callback owns local cleanup once the
-            // socket closes.
-            return Err(LoginRegisterError::Session(error));
-        }
-    }
-
-    let commit = current_metadata_commit(shard);
-    let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send login/register reply"
-        );
-    }
-
-    Ok(())
-}
-
 fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
     if !mux_stm.users().read(|users| users.items.is_empty()) {
         return;
@@ -3270,128 +1895,6 @@ fn validate_cluster_root_bootstrap(
         username_env: IGGY_ROOT_USERNAME_ENV,
         password_env: IGGY_ROOT_PASSWORD_ENV,
     })
-}
-
-enum NonReplicatedResponse {
-    Empty,
-    EmptyPolledMessages { partition_id: u32 },
-    Bytes(Bytes),
-}
-
-impl NonReplicatedResponse {
-    fn into_reply(
-        self,
-        request_header: &RequestHeader,
-        client_id: u128,
-        session: u64,
-        commit: u64,
-    ) -> Message<ReplyHeader> {
-        match self {
-            Self::Empty => build_empty_reply(request_header, client_id, session, commit),
-            Self::EmptyPolledMessages { partition_id } => {
-                build_reply_with_body(request_header, client_id, session, commit, 16, |body| {
-                    body[..4].copy_from_slice(&partition_id.to_le_bytes());
-                    body[4..12].copy_from_slice(&0u64.to_le_bytes());
-                    body[12..16].copy_from_slice(&0u32.to_le_bytes());
-                })
-            }
-            Self::Bytes(body) => {
-                build_reply_from_bytes(request_header, client_id, session, commit, &body)
-            }
-        }
-    }
-}
-
-fn build_empty_reply(
-    request_header: &RequestHeader,
-    client_id: u128,
-    session: u64,
-    commit: u64,
-) -> Message<ReplyHeader> {
-    build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
-}
-
-fn build_login_register_reply(
-    request_header: &RequestHeader,
-    client_id: u128,
-    session: u64,
-    commit: u64,
-    user_id: u32,
-) -> Message<ReplyHeader> {
-    build_reply_with_body(request_header, client_id, session, commit, 12, |body| {
-        body[..4].copy_from_slice(&user_id.to_le_bytes());
-        body[4..12].copy_from_slice(&session.to_le_bytes());
-    })
-}
-
-fn build_reply_from_bytes(
-    request_header: &RequestHeader,
-    client_id: u128,
-    session: u64,
-    commit: u64,
-    body: &Bytes,
-) -> Message<ReplyHeader> {
-    build_reply_with_body(
-        request_header,
-        client_id,
-        session,
-        commit,
-        body.len(),
-        |out| out.copy_from_slice(body),
-    )
-}
-
-fn build_reply_with_body(
-    request_header: &RequestHeader,
-    client_id: u128,
-    session: u64,
-    commit: u64,
-    body_len: usize,
-    write_body: impl FnOnce(&mut [u8]),
-) -> Message<ReplyHeader> {
-    let header_len = std::mem::size_of::<ReplyHeader>();
-    let total_size = header_len + body_len;
-    let mut reply = Message::<ReplyHeader>::new(total_size);
-    let header_size = u32::try_from(total_size).expect("reply size must fit into u32");
-    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
-        &mut reply.as_mut_slice()[..header_len],
-    )
-    .expect("zeroed bytes are valid");
-    *header = ReplyHeader {
-        cluster: request_header.cluster,
-        size: header_size,
-        view: request_header.view,
-        release: request_header.release,
-        command: Command2::Reply,
-        replica: request_header.replica,
-        request_checksum: request_header.request_checksum,
-        client: client_id,
-        op: session,
-        commit,
-        timestamp: request_header.timestamp,
-        request: request_header.request,
-        operation: request_header.operation,
-        namespace: request_header.namespace,
-        ..Default::default()
-    };
-    write_body(&mut reply.as_mut_slice()[header_len..total_size]);
-    reply
-}
-
-fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
-    shard
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .map_or(0, VsrConsensus::commit_max)
-}
-
-fn upgrade_shard_handle(shard_handle: &ServerNgShardHandle) -> Option<Rc<ServerNgShard>> {
-    shard_handle
-        .borrow()
-        .as_ref()
-        .and_then(std::rc::Weak::upgrade)
 }
 
 /// Replica accept callback that ships every inbound connection through
@@ -3600,6 +2103,22 @@ async fn start_client_listeners(
     Ok(bound)
 }
 
+/// Build the replica auth context from cluster config. Returns `None` when the
+/// cluster or replica auth is disabled, keeping the handshake in legacy mode.
+/// Only the derived MAC key is carried onward in [`ReplicaAuth`]; the raw secret
+/// (masked in config logs via `config_env(secret)`) is read here only to derive
+/// that key. `ClusterConfig::validate` guarantees a non-empty secret whenever
+/// both `cluster.enabled` and `cluster.auth.enabled` are set (validate
+/// early-returns `Ok` while `cluster.enabled` is false).
+fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
+    if !config.cluster.enabled || !config.cluster.auth.enabled {
+        return None;
+    }
+    Some(ReplicaAuth::new(
+        config.cluster.auth.shared_secret.as_bytes(),
+    ))
+}
+
 fn load_tcp_tls_server_credentials(
     config: &ServerNgConfig,
 ) -> Result<TlsServerCredentials, ServerNgError> {
@@ -3669,6 +2188,66 @@ fn socket_addr_from_parts(
             source,
         })?;
     Ok(SocketAddr::new(ip, port))
+}
+
+/// Build the closure that broadcasts a
+/// [`LifecycleFrame::MetadataCommitTick`] to every shard's inbox after a
+/// partition-shaped metadata operation commits on shard 0.
+///
+/// The receiver-side partition reconciliation loop listens for these
+/// wake-ups; coalescing is intentional, so `Full` is recorded as a metric
+/// and dropped (the periodic tick recovers). Installed via
+/// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
+/// sole writer of the metadata state machine.
+fn make_metadata_commit_notifier(
+    senders: Vec<TaggedSender>,
+    metrics: ShardMetrics,
+) -> metadata::CommitNotifier {
+    Rc::new(move |operation: Operation| {
+        if !operation_triggers_partition_reconcile(operation) {
+            return;
+        }
+        for sender in &senders {
+            let frame = ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick);
+            match sender.try_send(frame) {
+                Ok(()) => {}
+                Err(crossfire::TrySendError::Full(_)) => {
+                    metrics.record_frame_drop(
+                        frame_drop_variant::METADATA_COMMIT_TICK,
+                        frame_drop_reason::FULL,
+                    );
+                }
+                Err(crossfire::TrySendError::Disconnected(_)) => {
+                    metrics.record_frame_drop(
+                        frame_drop_variant::METADATA_COMMIT_TICK,
+                        frame_drop_reason::DISCONNECTED,
+                    );
+                }
+            }
+        }
+    })
+}
+
+/// Filter at the broadcast site, keeping unrelated ops off the SDK reply
+/// path. Any new partition-shape op must be added here.
+///
+/// The bare `CreateTopic` / `CreatePartitions` arms are unreachable: the
+/// leader's prepare-builder in `IggyMetadata` rewrites both into their
+/// `*WithAssignments` form, stamping each partition's `consensus_group_id`
+/// before journaling, so a committed prepare only ever carries the
+/// assignment-bearing variant. Kept as defense-in-depth against a future
+/// commit path that emits a bare op.
+const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
+    matches!(
+        op,
+        Operation::CreateTopic
+            | Operation::CreateTopicWithAssignments
+            | Operation::CreatePartitions
+            | Operation::CreatePartitionsWithAssignments
+            | Operation::DeleteTopic
+            | Operation::DeleteStream
+            | Operation::DeletePartitions
+    )
 }
 
 #[cfg(test)]
@@ -3789,6 +2368,11 @@ mod tests {
 
     #[compio::test]
     async fn await_metadata_bundle_aborts_on_shutdown_flag() {
+        // compio 0.19 `JoinHandle` yields `Result<T, JoinError>`; the
+        // `ResumeUnwind` impl re-raises a task panic and maps cancellation
+        // to `None`.
+        use compio::runtime::ResumeUnwind;
+
         let (_bundle_tx, bundle_rx) = crossfire::mpmc::bounded_async::<ServerNgMetadataBundle>(1);
         let flag = Arc::new(AtomicBool::new(false));
 
@@ -3804,7 +2388,8 @@ mod tests {
 
         let err = waiter
             .await
-            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            .resume_unwind()
+            .expect("waiter task was cancelled")
             .expect_err("shutdown flag must abort the bundle wait");
         assert!(
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 1 }),

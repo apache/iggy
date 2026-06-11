@@ -31,14 +31,29 @@ inputs:
     description: "Whether to save cache (true/false)"
     required: false
     default: "false"
-  print-cache-status:
-    description: "Whether to print cache status to job summary"
+  free-disk-space:
+    description: >-
+      Whether to reclaim runner disk before the build. Default "true".
+      Set "false" for light legs (fmt/sort/clippy/check/machete/doctest) that
+      fit in the ~89 GiB default headroom and should not pay the ~20-45s cost.
+    required: false
+    default: "true"
+  free-disk-space-aggressive:
+    description: >-
+      Forwarded to free-disk-space. When "true", run jlumbroso for a deep
+      cleanup. Enable for disk-heavy jobs (e.g. llvm-cov instrumented builds).
     required: false
     default: "false"
 
 runs:
   using: "composite"
   steps:
+    - name: Free runner disk space
+      if: inputs.free-disk-space == 'true'
+      uses: ./.github/actions/utils/free-disk-space
+      with:
+        aggressive: ${{ inputs.free-disk-space-aggressive }}
+
     - name: Install system dependencies (Linux)
       if: runner.os == 'Linux'
       run: |
@@ -79,16 +94,26 @@ runs:
         save-if: ${{ inputs.save-cache == 'true' }}
 
     - name: Cache status
-      if: inputs.read-cache == 'true' && inputs.print-cache-status == 'true'
+      if: inputs.read-cache == 'true'
       run: |
-        echo "### Rust Cache" >> $GITHUB_STEP_SUMMARY
+        CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
         if [ "${{ steps.rust-cache.outputs.cache-hit }}" == "true" ]; then
-          echo "✅ Cache hit" >> $GITHUB_STEP_SUMMARY
+          status="full hit"
         elif [ -d "target" ]; then
-          echo "🔶 Partial cache hit" >> $GITHUB_STEP_SUMMARY
+          status="partial hit"
         else
-          echo "❌ Cache miss" >> $GITHUB_STEP_SUMMARY
+          status="miss"
         fi
+        # Unpacked on-disk footprint of the restore. The cache action only logs
+        # the compressed size; this prints to the job log (stdout), so size is
+        # visible without opening the summary and without annotations.
+        echo "Rust cache: ${status}"
+        printf '%-10s %s\n' "SIZE" "PATH"
+        for dir in "${GITHUB_WORKSPACE}/target" "${CARGO_HOME_DIR}/registry" "${CARGO_HOME_DIR}/git"; do
+          if [ -d "${dir}" ]; then
+            printf '%-10s %s\n' "$(du -sh "${dir}" 2>/dev/null | cut -f1)" "${dir/#${GITHUB_WORKSPACE}\//}"
+          fi
+        done
       shell: bash
 
     - name: Install cargo-nextest

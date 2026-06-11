@@ -88,7 +88,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
         (),
         shard::PartitionConsensusConfig::new(
             CLUSTER_ID,
-            replica_count,
+            shard::ReplicaTopology::new(id, replica_count),
             SharedSimOutbox(Arc::clone(bus)),
         ),
     )

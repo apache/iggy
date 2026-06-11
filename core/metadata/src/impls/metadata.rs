@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use crate::MuxStateMachine;
 use crate::stm::consumer_group::ConsumerGroups;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
@@ -21,9 +22,10 @@ use crate::stm::stream::Streams;
 use crate::stm::user::Users;
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
-    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, Pipeline, PipelineEntry,
-    Plane, PlaneIdentity, PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer,
-    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_reply_message,
+    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, EvictionContext, Pipeline,
+    PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
+    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
     drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
     replicate_preflight, replicate_to_next_in_chain, request_preflight,
@@ -46,6 +48,7 @@ use server_common::Message;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::Path;
+use std::rc::Rc;
 use tracing::{debug, error, warn};
 
 fn freeze_client_reply(
@@ -279,9 +282,6 @@ impl<M> SnapshotCoordinator<M> {
 /// Failures for [`IggyMetadata::submit_register_in_process`]. All transient;
 /// the login/register handler wraps every variant in
 /// `LoginRegisterError::Transient` so SDK read-timeout replays.
-//
-// TODO(pipeline-backpressure, canceled-retry): absorb-silently loop will
-// make transients internal-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterSubmitError {
@@ -336,6 +336,16 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
+/// Late-bound callback invoked after every successful
+/// `mux_stm.update(prepare)` on shard 0's metadata commit path.
+///
+/// Wired by server-ng bootstrap once the metadata bundle has broadcast;
+/// receives the committed [`Operation`] so the recipient can filter (the
+/// partition reconciliation loop only cares about partition-shaped
+/// events). Wrapped in [`RefCell`] for late binding; the per-shard
+/// single-thread invariant keeps access safe without [`Sync`].
+pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
+
 pub struct IggyMetadata<C, J, S, M> {
     /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
@@ -360,6 +370,12 @@ pub struct IggyMetadata<C, J, S, M> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
+    /// Late-bound post-commit notifier. Fires once per committed
+    /// operation after [`crate::stm::StateMachine::update`] succeeds in
+    /// both [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
+    /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
+    /// 0 sets it; peer shards and tests leave it `None`).
+    commit_notifier: RefCell<Option<CommitNotifier>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -389,6 +405,26 @@ where
             allocator,
             coordinator,
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
+            commit_notifier: RefCell::new(None),
+        }
+    }
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Install (or replace) the post-commit notifier. Passing `None`
+    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// only; peer shards never commit metadata locally.
+    pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
+        *self.commit_notifier.borrow_mut() = notifier;
+    }
+
+    /// Fire post-commit notifier. Clones the `Rc` out under a short
+    /// borrow so a re-entrant `set_commit_notifier` from inside the
+    /// closure cannot panic on `borrow_mut`.
+    fn fire_commit_notifier(&self, operation: Operation) {
+        let notifier = self.commit_notifier.borrow().as_ref().map(Rc::clone);
+        if let Some(notifier) = notifier {
+            notifier(operation);
         }
     }
 }
@@ -418,13 +454,17 @@ where
         let operation = message.header().operation;
 
         // Preflight first: dedup, eviction sends, cached-reply replay all
-        // must run regardless of pipeline pressure.
-        let preflight = if operation == Operation::Register {
+        // must run regardless of pipeline pressure. Wire-path ingress has no
+        // home-shard transport context, so resends fall back to the
+        // consensus-plane (best-effort by VSR id).
+        let dispatch = if operation == Operation::Register {
             register_preflight(consensus, &self.client_table, client_id).await
         } else {
-            request_preflight(consensus, &self.client_table, client_id, session, request).await
+            let outcome =
+                request_preflight(consensus, &self.client_table, client_id, session, request);
+            apply_preflight_consensus_plane(consensus, outcome, client_id).await
         };
-        if !preflight {
+        if !dispatch {
             return;
         }
 
@@ -654,7 +694,8 @@ where
             }
         }
 
-        if ack_quorum_reached(consensus, PlaneKind::Metadata, header) {
+        let quorum = ack_quorum_reached(consensus, PlaneKind::Metadata, header);
+        if quorum {
             let journal = self.journal.as_ref().unwrap();
 
             debug!(
@@ -738,6 +779,10 @@ where
                             prepare_header.op
                         );
                     });
+                    // Post-commit notifier (e.g. partition reconciler
+                    // wake-up). Filtering by operation is the
+                    // recipient's responsibility.
+                    self.fire_commit_notifier(prepare_header.operation);
                     let reply = build_reply_message(&prepare_header, &response);
                     // Cache only if session exists. Client evicted between
                     // prepare and commit: skip cache (`commit_reply` no-ops),
@@ -1006,7 +1051,12 @@ where
             .as_ref()
             .expect("submit_logout_in_process: consensus only exists on shard 0");
 
-        if self.client_table.borrow().get_session(client_id).is_none() {
+        // Session guard: only propose a Logout when the slot still holds the
+        // exact session this logout targets. A late disconnect-logout for a
+        // reused client id (slot since rebound to a newer session) carries the
+        // stale session and is dropped here, so it can never wipe the fresh
+        // registration. A missing slot also fails the match and short-circuits.
+        if self.client_table.borrow().get_session(client_id) != Some(session) {
             return Ok(consensus.commit_min());
         }
 
@@ -1087,8 +1137,122 @@ where
         }
     }
 
-    pub fn remove_client_session(&self, client_id: u128) -> bool {
-        self.client_table.borrow_mut().remove_client(client_id)
+    /// Submit a replicated client request from in-process and await the
+    /// committed reply.
+    ///
+    /// A peer (home) shard relays a client's replicated request here (shard
+    /// 0 owns the metadata consensus group) and awaits the full committed
+    /// reply over the pipeline subscriber. The home shard then writes the
+    /// reply to the originating socket -- it holds the connection and the
+    /// `vsr -> transport` mapping that this side cannot reconstruct.
+    ///
+    /// Mirrors [`Self::submit_register_in_process`] but: (1) uses
+    /// `request_preflight` (dedup / session check) instead of the register
+    /// gate, (2) returns the committed reply as a `Message<GenericHeader>`
+    /// (body = state machine output) rather than just the commit op. A
+    /// `Duplicate`/eviction preflight outcome is returned here as the reply
+    /// frame so the home shard resends it by transport id.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the
+    /// prepare, `InProgress` / `PipelineFull` on pipeline pressure,
+    /// `Canceled` when preflight absorbed the request (dedup / eviction /
+    /// gap) or the pending prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata
+    /// consensus group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_request_in_process(
+        &self,
+        message: Message<RequestHeader>,
+    ) -> Result<Message<GenericHeader>, RegisterSubmitError> {
+        let request_header = *message.header();
+        let client_id = request_header.client;
+        let session = request_header.session;
+        let request = request_header.request;
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_request_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    RegisterSubmitError::NotCaughtUp
+                } else {
+                    RegisterSubmitError::NotPrimary
+                },
+            );
+        }
+
+        // Dedup / session / eviction. shard 0 cannot route by the VSR
+        // consensus `client_id` (its top bits are random, not home-shard
+        // routing), so a Replay/Evict is returned to the home shard as the
+        // reply -- `handle_client_request` writes it to the originating socket
+        // by transport id, exactly like a fresh commit. Drop surfaces as
+        // Canceled so the home shard stays silent and the SDK replays.
+        match request_preflight(consensus, &self.client_table, client_id, session, request) {
+            PreflightOutcome::Dispatch => {}
+            PreflightOutcome::Replay(reply) => {
+                return server_common::Message::<GenericHeader>::try_from(
+                    server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::copy_from_slice(
+                        reply.as_slice(),
+                    ),
+                )
+                .map_err(|_| RegisterSubmitError::Canceled);
+            }
+            PreflightOutcome::Evict(reason) => {
+                let ctx = EvictionContext::from_consensus(consensus);
+                return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+            }
+            PreflightOutcome::Drop => return Err(RegisterSubmitError::Canceled),
+        }
+
+        if consensus.pipeline().borrow().is_full() {
+            return Err(RegisterSubmitError::PipelineFull);
+        }
+
+        let prepare = self
+            .prepare_request(message)
+            .map_err(|_| RegisterSubmitError::Canceled)?;
+
+        consensus.verify_pipeline();
+        let view_snapshot = consensus.view();
+        let commit_min_snapshot = consensus.commit_min();
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        debug_assert!(
+            is_caught_up_primary(consensus),
+            "submit_request_in_process: gate flipped between check and dispatch"
+        );
+        self.on_replicate(prepare).await;
+        debug_assert!(
+            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
+            "submit_request_in_process: view/commit_min advanced across on_replicate await"
+        );
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => warn!(
+                        error = %error,
+                        "dropping malformed PrepareOk from metadata loopback queue"
+                    ),
+                },
+                command => warn!(
+                    ?command,
+                    "dropping unexpected message from metadata loopback queue"
+                ),
+            }
+        }
+
+        receiver
+            .await
+            .map(server_common::Message::into_generic)
+            .map_err(|Canceled| RegisterSubmitError::Canceled)
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after
@@ -1109,12 +1273,14 @@ where
             let session = req.message.header().session;
             let request = req.message.header().request;
             let operation = req.message.header().operation;
-            let preflight = if operation == Operation::Register {
+            let dispatch = if operation == Operation::Register {
                 register_preflight(consensus, &self.client_table, client_id).await
             } else {
-                request_preflight(consensus, &self.client_table, client_id, session, request).await
+                let outcome =
+                    request_preflight(consensus, &self.client_table, client_id, session, request);
+                apply_preflight_consensus_plane(consensus, outcome, client_id).await
             };
-            if !preflight {
+            if !dispatch {
                 continue;
             }
 
@@ -1359,6 +1525,11 @@ where
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
+                // Post-commit notifier (e.g. partition reconciler
+                // wake-up). Same hook fires on backups so reconcilers
+                // converge after replicated commits, not only quorum-acked
+                // ones reached via `on_ack` on the primary.
+                self.fire_commit_notifier(header.operation);
                 let reply = build_reply_message(&header, &response);
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
@@ -1455,6 +1626,11 @@ where
         client: client_id,
         session: 0,
         request: 0,
+        // Route through the metadata consensus group. The chain-forwarded
+        // prepare is re-routed on each peer by namespace; a `0` here would
+        // hash to a non-zero shard with no metadata consensus and be
+        // silently dropped (see `shard::router::route_typed`).
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         ..RequestHeader::default()
     };
     msg
@@ -1486,6 +1662,8 @@ where
         client: client_id,
         session,
         request,
+        // Metadata consensus group (see `build_register_request_message`).
+        namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         ..RequestHeader::default()
     };
     msg
@@ -1538,4 +1716,93 @@ where
     };
 
     prepare
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stm::consumer_group::ConsumerGroups;
+    use crate::stm::stream::Streams;
+    use crate::stm::user::Users;
+    use iggy_common::variadic;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type TestMux = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+
+    /// Build a peer-shard-style `IggyMetadata` with `consensus`,
+    /// `journal`, and `snapshot` all `None`. Enough to test the
+    /// commit-notifier slot without standing up VSR / WAL infrastructure:
+    /// the test picks `()` for `C` / `J` / `S` since no notifier code path
+    /// touches their methods.
+    fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
+        IggyMetadata::new(None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn commit_notifier_fires_with_received_operation() {
+        let md = peer_metadata();
+        let captured: Rc<RefCell<Vec<Operation>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let observer = Rc::clone(&captured);
+        md.set_commit_notifier(Some(Rc::new(move |op| {
+            observer.borrow_mut().push(op);
+        })));
+
+        md.fire_commit_notifier(Operation::CreateTopicWithAssignments);
+        md.fire_commit_notifier(Operation::DeletePartitions);
+        md.fire_commit_notifier(Operation::DeleteStream);
+
+        let seen = captured.borrow();
+        assert_eq!(
+            seen.as_slice(),
+            &[
+                Operation::CreateTopicWithAssignments,
+                Operation::DeletePartitions,
+                Operation::DeleteStream,
+            ],
+            "notifier must observe every fired operation in order"
+        );
+    }
+
+    #[test]
+    fn commit_notifier_is_no_op_when_unset() {
+        // No notifier installed: firing must not panic, must not allocate.
+        // Mirrors the production-side guarantee that peer shards (no
+        // notifier) take the same commit path as shard 0 (with notifier).
+        let md = peer_metadata();
+        md.fire_commit_notifier(Operation::CreateStream);
+    }
+
+    #[test]
+    fn commit_notifier_can_be_replaced_and_cleared() {
+        let md = peer_metadata();
+        let first_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let second_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        let first_observer = Rc::clone(&first_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *first_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::CreateStream);
+        assert_eq!(*first_count.borrow(), 1);
+
+        // Replace: the first closure must no longer run.
+        let second_observer = Rc::clone(&second_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *second_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::DeleteStream);
+        assert_eq!(*first_count.borrow(), 1, "old notifier must be detached");
+        assert_eq!(*second_count.borrow(), 1, "new notifier must take over");
+
+        // Clear: subsequent fires must be no-ops.
+        md.set_commit_notifier(None);
+        md.fire_commit_notifier(Operation::DeleteTopic);
+        assert_eq!(
+            *second_count.borrow(),
+            1,
+            "cleared notifier must stay quiet"
+        );
+    }
 }

@@ -1,0 +1,70 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: free-disk-space
+description: >-
+  Reclaim disk space on GitHub-hosted Linux runners by removing
+  pre-installed toolchains the Iggy build does not use.
+  Logs reclaimed GiB and elapsed seconds.
+
+inputs:
+  aggressive:
+    description: >-
+      When "true", run jlumbroso/free-disk-space for a deep cleanup
+      (~30+ GiB) instead of the light built-in removal (~12 GiB).
+      Enable only for disk-heavy jobs (e.g. llvm-cov instrumented builds).
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cleanup disk space (light)
+      if: runner.os == 'Linux' && inputs.aggressive != 'true'
+      shell: bash
+      run: |
+        echo "Disk space before cleanup:"
+        df -h
+        before=$(df --output=avail -B1 / | tail -n1)
+        start=$(date +%s)
+        paths=(/usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL)
+        # Skip /usr/share/dotnet when actions/setup-dotnet has provisioned it
+        # (DOTNET_ROOT set or `dotnet` already on PATH); removing it breaks
+        # subsequent dotnet invocations.
+        if [ -z "${DOTNET_ROOT:-}" ] && ! command -v dotnet >/dev/null 2>&1; then
+          paths+=(/usr/share/dotnet)
+        else
+          echo "Keeping /usr/share/dotnet (DOTNET_ROOT=${DOTNET_ROOT:-unset}, dotnet on PATH=$(command -v dotnet || echo no))"
+        fi
+        sudo rm -rf "${paths[@]}"
+        # Uncomment these if more space is needed
+        # sudo docker image prune --all --force
+        # sudo docker builder prune -a
+        end=$(date +%s)
+        after=$(df --output=avail -B1 / | tail -n1)
+        reclaimed_gib=$(awk -v b="$((after - before))" 'BEGIN { printf "%.2f", b/1024/1024/1024 }')
+        echo "::notice::Reclaimed ${reclaimed_gib} GiB in $((end - start))s"
+        echo "Disk space after cleanup:"
+        df -h
+
+    - name: Cleanup disk space (aggressive)
+      if: runner.os == 'Linux' && inputs.aggressive == 'true'
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      with:
+        # Preserve the .NET SDK when actions/setup-dotnet provisioned it
+        # (DOTNET_ROOT set); removing it breaks subsequent dotnet invocations.
+        dotnet: ${{ env.DOTNET_ROOT == '' }}
