@@ -40,6 +40,7 @@ use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
+use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::io as replica_io;
 use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
@@ -90,7 +91,6 @@ use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-const CLUSTER_ID: u128 = 1;
 const SHARD_REPLICA_ID: u8 = 0;
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
@@ -340,6 +340,9 @@ enum MetadataHandoff {
 }
 
 struct TcpTopology {
+    /// Domain-separation cluster id derived from `cluster.name`; threaded to
+    /// every consensus instance and the replica handshake so frames agree.
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     client_listen_addr: SocketAddr,
@@ -749,6 +752,7 @@ async fn shard_main(
             let consensus = restore_metadata_consensus(
                 &journal,
                 restored_op,
+                topology.cluster_id,
                 topology.self_replica_id,
                 topology.replica_count,
                 Rc::clone(&bus),
@@ -1062,6 +1066,7 @@ async fn build_shard_for_thread(
             namespace,
             topic_stats,
             &partition_metadata,
+            topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
             Rc::clone(&bus),
@@ -1096,7 +1101,7 @@ async fn build_shard_for_thread(
         senders,
         inbox,
         shards_table,
-        PartitionConsensusConfig::new(CLUSTER_ID, topology.replica_count, Rc::clone(&bus)),
+        PartitionConsensusConfig::new(topology.cluster_id, topology.replica_count, Rc::clone(&bus)),
         CoordinatorConfig::default(),
         metrics,
     )
@@ -1111,12 +1116,13 @@ async fn build_shard_for_thread(
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
-        CLUSTER_ID,
+        cluster_id,
         self_replica_id,
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
@@ -1191,11 +1197,13 @@ const fn validate_recovered_namespace(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_partition(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
     topic_stats: Arc<TopicStats>,
     partition_metadata: &Partition,
+    cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
@@ -1205,7 +1213,7 @@ async fn load_partition(
     let partition_id = namespace.partition_id();
     let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
-        CLUSTER_ID,
+        cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
@@ -1691,6 +1699,7 @@ fn resolve_tcp_topology(
             });
         }
         return Ok(TcpTopology {
+            cluster_id: auth::cluster_domain_id(&config.cluster.name),
             // Keep parity with the current server binary and the integration
             // harness: `--replica-id 0` may be passed unconditionally in
             // single-node mode; any other id is rejected above so the WAL
@@ -1743,6 +1752,7 @@ fn resolve_tcp_topology(
     let peers = resolve_cluster_replica_peers(&config.cluster.nodes, self_replica_id)?;
 
     Ok(TcpTopology {
+        cluster_id: auth::cluster_domain_id(&config.cluster.name),
         self_replica_id,
         replica_count,
         client_listen_addr,
@@ -1871,6 +1881,7 @@ async fn start_via_replica_io(
         tcp_tls,
     } = accepted_clients;
 
+    let replica_auth = load_replica_auth(config);
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
@@ -1882,9 +1893,10 @@ async fn start_via_replica_io(
         tcp_tls_credentials,
         None,
         None,
-        CLUSTER_ID,
+        topology.cluster_id,
         topology.self_replica_id,
         topology.replica_count,
+        replica_auth,
         topology.peers.clone(),
         accepted_replica,
         tcp,
@@ -1967,16 +1979,20 @@ async fn start_manual_runtime(
         let token = shard.bus.token();
         let max_message_size = shard.bus.config().max_message_size;
         let handshake_grace = shard.bus.config().handshake_grace;
+        let cluster_id = topology.cluster_id;
         let self_replica_id = topology.self_replica_id;
         let replica_count = topology.replica_count;
+        let replica_auth = load_replica_auth(config);
+        let auth_for_listener = replica_auth.clone();
         let accepted_replica_for_listener = accepted_replica.clone();
         let replica_handle = compio::runtime::spawn(async move {
             replica_listener::run(
                 replica_listener,
                 token,
-                CLUSTER_ID,
+                cluster_id,
                 self_replica_id,
                 replica_count,
+                auth_for_listener,
                 accepted_replica_for_listener,
                 max_message_size,
                 handshake_grace,
@@ -1986,9 +2002,11 @@ async fn start_manual_runtime(
         shard.bus.track_background(replica_handle);
         connector::start(
             &shard.bus,
-            CLUSTER_ID,
+            cluster_id,
             topology.self_replica_id,
             topology.peers.clone(),
+            replica_auth,
+            handshake_grace,
             accepted_replica,
             shard.bus.config().reconnect_period,
         )
@@ -2267,6 +2285,22 @@ async fn start_client_listeners(
     }
 
     Ok(bound)
+}
+
+/// Build the replica auth context from cluster config. Returns `None` when the
+/// cluster or replica auth is disabled, keeping the handshake in legacy mode.
+/// Only the derived MAC key is carried onward in [`ReplicaAuth`]; the raw secret
+/// (masked in config logs via `config_env(secret)`) is read here only to derive
+/// that key. `ClusterConfig::validate` guarantees a non-empty secret whenever
+/// both `cluster.enabled` and `cluster.auth.enabled` are set (validate
+/// early-returns `Ok` while `cluster.enabled` is false).
+fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
+    if !config.cluster.enabled || !config.cluster.auth.enabled {
+        return None;
+    }
+    Some(ReplicaAuth::new(
+        config.cluster.auth.shared_secret.as_bytes(),
+    ))
 }
 
 fn load_tcp_tls_server_credentials(

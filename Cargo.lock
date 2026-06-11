@@ -8180,6 +8180,7 @@ version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
  "async-channel",
+ "blake3",
  "bytes",
  "compio",
  "compio-quic",
@@ -8191,6 +8192,7 @@ dependencies = [
  "libc",
  "rand 0.10.1",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "scopeguard",
@@ -8199,6 +8201,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
