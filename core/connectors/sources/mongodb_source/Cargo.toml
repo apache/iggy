@@ -26,6 +26,9 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
+[package.metadata.cargo-machete]
+ignored = ["dashmap", "once_cell", "simd-json"]
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
