@@ -75,8 +75,13 @@ pub struct HttpJwtConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub not_before: IggyDuration,
+    // skip_serializing keeps the secrets out of the runtime current_config.toml
+    // (and the diagnostic snapshot that cats it). The live secrets are read from
+    // env / on-disk config at boot, never from the snapshot.
+    #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub encoding_secret: String,
+    #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub decoding_secret: String,
     pub use_base64_secret: bool,
@@ -156,5 +161,38 @@ impl HttpJwtConfig {
         } else {
             JwtSecret::Default(secret.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jwt_secrets_are_never_serialized() {
+        // current_config.toml (and the diagnostic snapshot that cats it) is
+        // produced by serializing this struct, so the JWT secrets must not
+        // survive a serialize. Built via deserialize to skip enumerating the
+        // duration fields; skip_serializing is format-agnostic, so a JSON dump
+        // proves the toml path too.
+        let json = r#"{
+            "algorithm": "HS256",
+            "issuer": "iggy.apache.org",
+            "audience": "iggy.apache.org",
+            "valid_issuers": ["iggy.apache.org"],
+            "valid_audiences": ["iggy.apache.org"],
+            "access_token_expiry": "1 h",
+            "clock_skew": "5 s",
+            "not_before": "0 s",
+            "encoding_secret": "encoding-MUST-NOT-be-persisted",
+            "decoding_secret": "decoding-MUST-NOT-be-persisted",
+            "use_base64_secret": false
+        }"#;
+        let config: HttpJwtConfig = serde_json::from_str(json).expect("deserialize jwt config");
+        let serialized = serde_json::to_string(&config).expect("serialize jwt config");
+        assert!(
+            !serialized.contains("MUST-NOT-be-persisted"),
+            "JWT secret leaked into serialized config: {serialized}"
+        );
     }
 }

@@ -57,6 +57,7 @@ async fn periodic_reconnect_skips_already_connected_peer() {
             CLUSTER,
             1,
             2,
+            None,
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -70,7 +71,17 @@ async fn periodic_reconnect_skips_already_connected_peer() {
     // missing, bus1's listener will see N extra accepts.
     let period = Duration::from_millis(50);
     let dial_delegate = install_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(&bus0, CLUSTER, 0, vec![(1u8, addr1)], dial_delegate, period).await;
+    start_connector(
+        &bus0,
+        CLUSTER,
+        0,
+        vec![(1u8, addr1)],
+        None,
+        Duration::from_secs(5),
+        dial_delegate,
+        period,
+    )
+    .await;
 
     // Wait for the initial connection to settle on both sides.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -42,6 +42,7 @@ use iggy_common::IggyError;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::connector::start as start_connector;
+use crate::replica::auth::ReplicaAuth;
 use crate::replica::listener::{bind as bind_replica_listener, run as run_replica_listener};
 use crate::transports::quic::server_config_with_cert;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
@@ -180,6 +181,7 @@ pub async fn start_on_shard_zero(
     cluster_id: u128,
     self_id: u8,
     replica_count: u8,
+    auth: Option<ReplicaAuth>,
     peers: Vec<(u8, SocketAddr)>,
     on_accepted_replica: AcceptedReplicaFn,
     on_accepted_client: AcceptedClientFn,
@@ -213,6 +215,7 @@ pub async fn start_on_shard_zero(
     let on_accepted_replica_for_listener = on_accepted_replica.clone();
     let listener_max_message_size = bus.config().max_message_size;
     let listener_handshake_grace = bus.config().handshake_grace;
+    let auth_for_listener = auth.clone();
     let replica_handle = compio::runtime::spawn(async move {
         run_replica_listener(
             replica_listener,
@@ -220,6 +223,7 @@ pub async fn start_on_shard_zero(
             cluster_id,
             self_id,
             replica_count,
+            auth_for_listener,
             on_accepted_replica_for_listener,
             listener_max_message_size,
             listener_handshake_grace,
@@ -326,6 +330,8 @@ pub async fn start_on_shard_zero(
         cluster_id,
         self_id,
         peers,
+        auth,
+        bus.config().handshake_grace,
         on_accepted_replica,
         reconnect_period,
     )
@@ -380,6 +386,7 @@ pub async fn start_on_shard_zero_default(
         cluster_id,
         self_id,
         replica_count,
+        None,
         peers,
         on_accepted_replica,
         on_accepted_client,

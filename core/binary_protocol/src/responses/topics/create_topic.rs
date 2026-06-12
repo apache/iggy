@@ -15,5 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `CreateTopic` response is empty.
-pub type CreateTopicResponse = super::EmptyResponse;
+/// `CreateTopic` reply ships the freshly-created topic.
+///
+/// Same `[TopicHeader][PartitionResponse]*` layout as `GetTopicResponse`,
+/// so the SDK reuses one decoder for both calls. Legacy server's
+/// `create_topic_handler` builds this shape directly; server-ng's metadata
+/// STM emits the same bytes from `apply`.
+pub type CreateTopicResponse = super::GetTopicResponse;

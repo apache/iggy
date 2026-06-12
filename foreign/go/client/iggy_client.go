@@ -20,7 +20,7 @@ package client
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +32,7 @@ import (
 type Options struct {
 	protocol   iggcon.Protocol
 	tcpOptions []tcp.Option
+	logger     *slog.Logger
 
 	heartbeatInterval time.Duration
 }
@@ -40,6 +41,7 @@ func GetDefaultOptions() Options {
 	return Options{
 		protocol:          iggcon.Tcp,
 		tcpOptions:        nil,
+		logger:            slog.New(slog.DiscardHandler),
 		heartbeatInterval: 5 * time.Second,
 	}
 }
@@ -54,8 +56,21 @@ func WithTcp(tcpOpts ...tcp.Option) Option {
 	}
 }
 
+// WithLogger sets the logger for the Iggy client and its underlying transport.
+// This logger is used by the heartbeat and forwarded to the transport.
+// When no logger is provided, all internal log output is silently discarded.
+func WithLogger(logger *slog.Logger) Option {
+	return func(opts *Options) {
+		if logger == nil {
+			return
+		}
+		opts.logger = logger
+	}
+}
+
 type IggyClient struct {
 	iggcon.Client
+	logger             *slog.Logger
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
 	heartbeatInterval  time.Duration
@@ -75,12 +90,13 @@ func NewIggyClient(options ...Option) (iggcon.Client, error) {
 	var cli iggcon.Client
 	switch opts.protocol {
 	case iggcon.Tcp:
-		cli = tcp.NewIggyTcpClient(opts.tcpOptions...)
+		cli = tcp.NewIggyTcpClient(opts.logger, opts.tcpOptions...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)
 	}
 	ic := &IggyClient{
 		Client:            cli,
+		logger:            opts.logger,
 		cancel:            func() {},
 		heartbeatInterval: opts.heartbeatInterval,
 	}
@@ -110,7 +126,7 @@ func (ic *IggyClient) Connect(ctx context.Context) error {
 				case <-ticker.C:
 					pingCtx, pingCancel := context.WithTimeout(lifetimeCtx, ic.heartbeatInterval/2)
 					if err := ic.Ping(pingCtx); err != nil {
-						log.Printf("[WARN] heartbeat failed: %v", err)
+						ic.logger.Warn("heartbeat failed", "error", err)
 					}
 					pingCancel()
 				}
