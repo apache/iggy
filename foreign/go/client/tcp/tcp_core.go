@@ -320,19 +320,24 @@ func (c *IggyTcpClient) sendAndFetchResponse(ctx context.Context, message []byte
 
 func (c *IggyTcpClient) sendLocked(message []byte, command command.Code) ([]byte, error) {
 	payload := createPayload(message, command)
+	c.logger.Debug("Sending a TCP request", "payload_length", len(payload), "code", command)
 	if _, err := c.write(payload); err != nil {
 		c.invalidateConnLocked()
 		return nil, err
 	}
 
+	c.logger.Debug("Sent a TCP request, waiting for a response...", "code", command)
+
 	readBytes, buffer, err := c.read(ResponseInitialBytesLength)
 	if err != nil {
 		c.invalidateConnLocked()
+		c.logger.Error("Failed to read response for TCP request", "code", command, "error", err)
 		return nil, err
 	}
 
 	if readBytes != ResponseInitialBytesLength {
 		c.invalidateConnLocked()
+		c.logger.Error("Received an invalid or empty response.")
 		return nil, fmt.Errorf("received an invalid or empty response: %w", ierror.EmptyResponse{})
 	}
 
@@ -341,6 +346,8 @@ func (c *IggyTcpClient) sendLocked(message []byte, command command.Code) ([]byte
 	}
 
 	length := int(binary.LittleEndian.Uint32(buffer[4:]))
+	c.logger.Debug("Status: OK.", "response_length", length)
+
 	if length <= 1 {
 		return []byte{}, nil
 	}
@@ -386,12 +393,18 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	switch c.state {
 	case iggcon.StateShutdown:
 		c.mtx.Unlock()
+		c.logger.Debug("Cannot connect. Client is shutdown.")
 		return ierror.ErrClientShutdown
 	case iggcon.StateConnected,
 		iggcon.StateAuthenticating,
-		iggcon.StateAuthenticated,
-		iggcon.StateConnecting:
+		iggcon.StateAuthenticated:
+		clientAddress := c.clientAddress
 		c.mtx.Unlock()
+		c.logger.Debug("Client is already connected.", "client_address", clientAddress)
+		return nil
+	case iggcon.StateConnecting:
+		c.mtx.Unlock()
+		c.logger.Debug("Client is already connecting.")
 		return nil
 	default:
 		c.state = iggcon.StateConnecting
@@ -405,8 +418,10 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		elapsed := now.Sub(connectedAt)
 		interval := c.config.reconnection.reestablishAfter
 
+		c.logger.Debug("Elapsed time since last connection", "elapsed", elapsed)
 		if elapsed < interval {
 			remaining := interval - elapsed
+			c.logger.Info("Trying to connect to the server", "remaining", remaining)
 			time.Sleep(remaining)
 		}
 	}
@@ -423,15 +438,22 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		retry.Attempts(attempts),
 		retry.Delay(interval),
 		retry.DelayType(retry.FixedDelay),
+		retry.OnRetry(func(n uint, err error) {
+			c.logger.Info("Retrying to connect to server...", "retry_count", n+1, "max_retries", attempts, "error", err)
+		}),
 	).Do(
 		func() error {
+			c.logger.Info("Iggy client is connecting to server...", "server_address", c.currentServerAddress)
 			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.currentServerAddress)
 			if err != nil {
+				c.logger.Error("Failed to establish TCP connection to the server", "error", err)
 				return ierror.ErrCannotEstablishConnection
 			}
 
 			tc := connection.(*net.TCPConn)
-			_ = tc.SetNoDelay(c.config.noDelay)
+			if err := tc.SetNoDelay(c.config.noDelay); err != nil {
+				c.logger.Error("Failed to set the nodelay option on the client, continuing...", "error", err)
+			}
 
 			c.mtx.Lock()
 			c.clientAddress = tc.LocalAddr().String()
@@ -451,6 +473,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 
 			tlsConn := tls.Client(connection, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
+				c.logger.Error("Failed to establish a TLS connection to the server", "error", err)
 				_ = connection.Close()
 				return fmt.Errorf("TLS handshake failed: %w", err)
 			}
@@ -461,6 +484,9 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		c.mtx.Lock()
 		c.state = iggcon.StateDisconnected
 		c.mtx.Unlock()
+		if !c.config.reconnection.enabled {
+			c.logger.Warn("Automatic reconnection is disabled.")
+		}
 		// TODO publish event disconnected
 		return err
 	}
@@ -469,6 +495,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	c.conn = conn
 	c.state = iggcon.StateConnected
 	c.connectedAt = time.Now()
+	c.logger.Info("Iggy client has connected to the Iggy server", "client_address", c.clientAddress, "server_address", c.currentServerAddress)
 	c.mtx.Unlock()
 	return nil
 }
@@ -490,6 +517,7 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	}
 
 	if serverName == "" {
+		c.logger.Error("Failed to create a server name from the domain.", "error", ierror.ErrInvalidTlsDomain)
 		return nil, ierror.ErrInvalidTlsDomain
 	}
 	tlsConfig.ServerName = serverName
@@ -498,11 +526,16 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	if c.config.tls.tlsCAFile != "" {
 		caCert, err := os.ReadFile(c.config.tls.tlsCAFile)
 		if err != nil {
+			c.logger.Error("Failed to read the CA file", "certificate_path", c.config.tls.tlsCAFile, "error", err)
 			return nil, ierror.ErrInvalidTlsCertificatePath
 		}
 
 		caCertPool := x509.NewCertPool()
 		if !caCertPool.AppendCertsFromPEM(caCert) {
+			c.logger.Error(
+				"Failed to parse the CA certificate.",
+				"certificate_path", c.config.tls.tlsCAFile,
+			)
 			return nil, ierror.ErrInvalidTlsCertificate
 		}
 
@@ -519,10 +552,15 @@ func (c *IggyTcpClient) disconnect() error {
 	if c.state == iggcon.StateDisconnected {
 		return nil
 	}
+
+	c.logger.Info("Iggy client is disconnecting from server...", "client_address", c.clientAddress)
 	c.state = iggcon.StateDisconnected
+
 	if err := c.conn.Close(); err != nil {
 		return err
 	}
+
+	c.logger.Info("Iggy client has disconnected from server.", "client_address", c.clientAddress)
 	// TODO event pushing logic
 	return nil
 }
@@ -530,13 +568,19 @@ func (c *IggyTcpClient) disconnect() error {
 func (c *IggyTcpClient) shutdown() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
+
 	if c.state == iggcon.StateShutdown {
 		return nil
 	}
+
+	c.logger.Info("Shutting down the Iggy TCP client...", "client_address", c.clientAddress)
+
 	if err := c.conn.Close(); err != nil {
 		return err
 	}
+
 	c.state = iggcon.StateShutdown
+	c.logger.Info("Iggy TCP client has been shutdown.", "client_address", c.clientAddress)
 	// TODO push shutdown event
 	return nil
 }

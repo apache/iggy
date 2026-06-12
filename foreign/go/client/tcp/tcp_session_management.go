@@ -29,6 +29,7 @@ import (
 )
 
 func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
+	c.logger.Info("Iggy client is signing in...", "client_address", c.clientAddress)
 	buffer, err := c.do(ctx, &command.LoginUser{
 		Username: username,
 		Password: password,
@@ -37,6 +38,7 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 		return nil, err
 	}
 
+	c.logger.Info("Iggy client has signed in successfully.", "client_address", c.clientAddress)
 	identity := binaryserialization.DeserializeLogInResponse(buffer)
 	shouldRedirect, err := c.HandleLeaderRedirection(ctx)
 	if err != nil {
@@ -52,6 +54,7 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
+	c.logger.Info("Iggy client is signing in...", "client_address", c.clientAddress)
 	buffer, err := c.do(ctx, &command.LoginWithPersonalAccessToken{
 		Token: token,
 	})
@@ -59,6 +62,7 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 		return nil, err
 	}
 
+	c.logger.Info("Iggy client has signed in successfully.", "client_address", c.clientAddress)
 	identity := binaryserialization.DeserializeLogInResponse(buffer)
 	shouldRedirect, err := c.HandleLeaderRedirection(ctx)
 	if err != nil {
@@ -107,6 +111,7 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	c.mtx.Lock()
 	if !c.leaderRedirectionState.CanRedirect() {
 		c.mtx.Unlock()
+		c.logger.Warn("Maximum leader redirections reached, continuing with current connection")
 		return false, nil
 	}
 	c.mtx.Unlock()
