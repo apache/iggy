@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{LocalIdx, ShardId};
+use super::ShardId;
 
-/// Location of a partition: which shard owns it and its local index within that shard.
+/// Which shard owns a partition, plus the committed-metadata epoch the row
+/// was written at.
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionLocation {
     pub shard_id: ShardId,
-    pub local_idx: LocalIdx,
+    /// `Partition::created_revision` from the committed metadata at the
+    /// time this row was written. The reconciler compares it against the
+    /// STM's current value to detect a stale local partition after a
+    /// delete+recreate reused the same slab-key namespace tuple.
+    pub epoch: u64,
 }
 
 impl PartitionLocation {
-    pub fn new(shard_id: ShardId, local_idx: LocalIdx) -> Self {
-        Self {
-            shard_id,
-            local_idx,
-        }
+    pub fn new(shard_id: ShardId, epoch: u64) -> Self {
+        Self { shard_id, epoch }
     }
 }

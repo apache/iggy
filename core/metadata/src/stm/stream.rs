@@ -19,7 +19,7 @@ use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::partitions::{
@@ -29,11 +29,12 @@ use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest,
+    UpdateTopicRequest,
 };
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
-use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
+use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
 };
@@ -49,6 +50,10 @@ pub struct PartitionSnapshot {
     pub id: usize,
     pub consensus_group_id: u64,
     pub created_at: IggyTimestamp,
+    /// `#[serde(default)]` so snapshots predating this field restore
+    /// with revision 0 instead of failing to decode.
+    #[serde(default)]
+    pub created_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -56,15 +61,26 @@ pub struct Partition {
     pub id: usize,
     pub consensus_group_id: u64,
     pub created_at: IggyTimestamp,
+    /// `StreamsInner::revision` at creation. Reconciler compares it to the
+    /// epoch it stored at materialisation; a mismatch means a delete+recreate
+    /// reused the slab key, so the local partition is stale and must be torn
+    /// down before rebuild.
+    pub created_revision: u64,
 }
 
 impl Partition {
     #[must_use]
-    pub const fn new(id: usize, consensus_group_id: u64, created_at: IggyTimestamp) -> Self {
+    pub const fn new(
+        id: usize,
+        consensus_group_id: u64,
+        created_at: IggyTimestamp,
+        created_revision: u64,
+    ) -> Self {
         Self {
             id,
             consensus_group_id,
             created_at,
+            created_revision,
         }
     }
 }
@@ -226,6 +242,12 @@ define_state! {
     Streams {
         index: AHashMap<Arc<str>, usize>,
         items: Slab<Stream>,
+        // Monotonic counter bumped on every partition-shaping commit
+        // (create/delete topic, create/delete partitions, delete stream).
+        // Reconciler uses it for a fast-skip when nothing changed and stamps
+        // it onto each new Partition::created_revision. Deterministic across
+        // replicas: same ops, same order.
+        revision: u64,
     }
 }
 
@@ -426,12 +448,13 @@ impl StateHandler for DeleteStreamRequest {
             return Bytes::new();
         };
 
-        if let Some(stream) = state.items.get(stream_id) {
-            let name = stream.name.clone();
-
-            state.items.remove(stream_id);
-            state.index.remove(&name);
-        }
+        let Some(stream) = state.items.get(stream_id) else {
+            return Bytes::new();
+        };
+        let name = stream.name.clone();
+        state.items.remove(stream_id);
+        state.index.remove(&name);
+        state.revision = state.revision.wrapping_add(1);
         Bytes::new()
     }
 }
@@ -451,14 +474,27 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
         };
+
+        let name_arc: Arc<str> = Arc::from(self.request.name.as_str());
+        // Validate under a short immutable borrow that ends before the
+        // revision bump below takes `&mut state`.
+        {
+            let Some(stream) = state.items.get(stream_id) else {
+                return Bytes::new();
+            };
+            if stream.topic_index.contains_key(&name_arc) {
+                return Bytes::new();
+            }
+        }
+
+        // Past validation: this commit adds partitions, so bump the
+        // monotonic revision and stamp every new partition with it.
+        let new_revision = state.revision.wrapping_add(1);
+        state.revision = new_revision;
+
         let Some(stream) = state.items.get_mut(stream_id) else {
             return Bytes::new();
         };
-
-        let name_arc: Arc<str> = Arc::from(self.request.name.as_str());
-        if stream.topic_index.contains_key(&name_arc) {
-            return Bytes::new();
-        }
 
         let replication_factor = if self.request.replication_factor == 0 {
             1
@@ -491,6 +527,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     id: partition.partition_id as usize,
                     consensus_group_id: partition.consensus_group_id,
                     created_at: timestamp,
+                    created_revision: new_revision,
                 };
                 topic.partitions.push(partition);
             }
@@ -498,38 +535,71 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
 
         stream.topic_index.insert(name_arc, topic_id);
 
-        // Reply body: the SDK `create_topic` decodes a `GetTopicResponse`. A
-        // freshly created topic has empty/zeroed segment stats; each assigned
-        // partition is reported at offset 0.
-        let partitions = self
-            .partitions
-            .iter()
-            .map(|partition| PartitionResponse {
-                id: partition.partition_id,
-                created_at: timestamp.as_micros(),
+        let Some(topic) = stream.topics.get(topic_id) else {
+            return Bytes::new();
+        };
+        encode_create_topic_reply(&self.request, topic_id, topic)
+    }
+}
+
+/// Encode the `CreateTopic` reply as `[TopicHeader][PartitionResponse]*`,
+/// the `GetTopicResponse` shape the SDK already decodes, so the create
+/// reply deserializes without a schema break. Returns empty bytes on a
+/// `u32` overflow (same contract as a validation rejection) rather than
+/// saturating to `u32::MAX`.
+fn encode_create_topic_reply(
+    request: &CreateTopicRequest,
+    topic_id: usize,
+    topic: &Topic,
+) -> Bytes {
+    let Ok(topic_id_u32) = u32::try_from(topic_id) else {
+        return Bytes::new();
+    };
+    let Ok(partitions_count_u32) = u32::try_from(topic.partitions.len()) else {
+        return Bytes::new();
+    };
+    let header = TopicHeader {
+        id: topic_id_u32,
+        created_at: topic.created_at.into(),
+        partitions_count: partitions_count_u32,
+        message_expiry: request.message_expiry,
+        compression_algorithm: request.compression_algorithm,
+        max_topic_size: request.max_topic_size,
+        replication_factor: topic.replication_factor,
+        size_bytes: 0,
+        messages_count: 0,
+        name: request.name.clone(),
+    };
+    let Ok(partitions_resp) = topic
+        .partitions
+        .iter()
+        .map(|p| {
+            u32::try_from(p.id).map(|id| PartitionResponse {
+                id,
+                created_at: p.created_at.into(),
                 segments_count: 0,
                 current_offset: 0,
                 size_bytes: 0,
                 messages_count: 0,
             })
-            .collect();
-        GetTopicResponse {
-            topic: TopicHeader {
-                id: topic_id as u32,
-                created_at: timestamp.as_micros(),
-                partitions_count: self.partitions.len() as u32,
-                message_expiry: self.request.message_expiry,
-                compression_algorithm: self.request.compression_algorithm,
-                max_topic_size: self.request.max_topic_size,
-                replication_factor,
-                size_bytes: 0,
-                messages_count: 0,
-                name: self.request.name.clone(),
-            },
-            partitions,
-        }
-        .to_bytes()
+        })
+        .collect::<Result<Vec<PartitionResponse>, _>>()
+    else {
+        return Bytes::new();
+    };
+
+    let mut buf = BytesMut::with_capacity(
+        header.encoded_size()
+            + partitions_resp
+                .iter()
+                .map(WireEncode::encoded_size)
+                .sum::<usize>(),
+    );
+    header.encode(&mut buf);
+    for partition in &partitions_resp {
+        partition.encode(&mut buf);
     }
+    buf.freeze()
 }
 
 impl StateHandler for UpdateTopicRequest {
@@ -583,11 +653,13 @@ impl StateHandler for DeleteTopicRequest {
             return Bytes::new();
         };
 
-        if let Some(topic) = stream.topics.get(topic_id) {
-            let name = topic.name.clone();
-            stream.topics.remove(topic_id);
-            stream.topic_index.remove(&name);
-        }
+        let Some(topic) = stream.topics.get(topic_id) else {
+            return Bytes::new();
+        };
+        let name = topic.name.clone();
+        stream.topics.remove(topic_id);
+        stream.topic_index.remove(&name);
+        state.revision = state.revision.wrapping_add(1);
         Bytes::new()
     }
 }
@@ -600,7 +672,6 @@ impl StateHandler for PurgeTopicRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. assigned partition IDs) instead of empty Bytes.
 impl StateHandler for CreatePartitionsWithAssignmentsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
@@ -611,39 +682,64 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             return Bytes::new();
         };
 
+        // Resolve absolute partition ids under a borrow that ends before
+        // the revision bump. Validate every id transition before mutating
+        // topic.partitions; mid-batch overflow + retry would otherwise
+        // re-base over a partial set and mint duplicate ids.
+        let resolved: Vec<usize> = {
+            let Some(stream) = state.items.get_mut(stream_id) else {
+                return Bytes::new();
+            };
+            let Some(topic) = stream.topics.get_mut(topic_id) else {
+                return Bytes::new();
+            };
+
+            let base_partition_id = topic
+                .partitions
+                .iter()
+                .map(|partition| partition.id)
+                .max()
+                .and_then(|partition_id| partition_id.checked_add(1))
+                .unwrap_or(0);
+            let Ok(base_partition_id) = u32::try_from(base_partition_id) else {
+                return Bytes::new();
+            };
+
+            let mut resolved: Vec<usize> = Vec::with_capacity(self.partitions.len());
+            for partition in &self.partitions {
+                let Some(resolved_id_u32) = partition.partition_id.checked_add(base_partition_id)
+                else {
+                    return Bytes::new();
+                };
+                let Ok(resolved_id_usize) = usize::try_from(resolved_id_u32) else {
+                    return Bytes::new();
+                };
+                resolved.push(resolved_id_usize);
+            }
+            resolved
+        };
+
+        let new_revision = state.revision.wrapping_add(1);
+        state.revision = new_revision;
+
         let Some(stream) = state.items.get_mut(stream_id) else {
             return Bytes::new();
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
             return Bytes::new();
         };
-
-        let base_partition_id = topic
-            .partitions
-            .iter()
-            .map(|partition| partition.id)
-            .max()
-            .and_then(|partition_id| partition_id.checked_add(1))
-            .unwrap_or(0);
-        let Ok(base_partition_id) = u32::try_from(base_partition_id) else {
-            return Bytes::new();
-        };
-
-        for partition in &self.partitions {
-            let partition_id = partition
-                .partition_id
-                .checked_add(base_partition_id)
-                .and_then(|partition_id| usize::try_from(partition_id).ok());
-            let Some(partition_id) = partition_id else {
-                return Bytes::new();
-            };
-            let partition = Partition {
-                id: partition_id,
+        for (resolved_id_usize, partition) in resolved.into_iter().zip(self.partitions.iter()) {
+            topic.partitions.push(Partition {
+                id: resolved_id_usize,
                 consensus_group_id: partition.consensus_group_id,
                 created_at: timestamp,
-            };
-            topic.partitions.push(partition);
+                created_revision: new_revision,
+            });
         }
+
+        // Matches legacy CreatePartitions wire contract: empty-ok body on
+        // success. SDK discards the reply payload (resolved ids are derivable
+        // from the request's base + count).
         Bytes::new()
     }
 }
@@ -666,10 +762,14 @@ impl StateHandler for DeletePartitionsRequest {
         };
 
         let count_to_delete = self.partitions_count as usize;
-        if count_to_delete > 0 && count_to_delete <= topic.partitions.len() {
+        let did_delete = count_to_delete > 0 && count_to_delete <= topic.partitions.len();
+        if did_delete {
             topic
                 .partitions
                 .truncate(topic.partitions.len() - count_to_delete);
+        }
+        if did_delete {
+            state.revision = state.revision.wrapping_add(1);
         }
         Bytes::new()
     }
@@ -679,6 +779,9 @@ impl StateHandler for DeletePartitionsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamsSnapshot {
     pub items: Vec<(usize, StreamSnapshot)>,
+    /// `#[serde(default)]` so older snapshots restore at revision 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Snapshotable for Streams {
@@ -719,6 +822,7 @@ impl Snapshotable for Streams {
                                             id: p.id,
                                             consensus_group_id: p.consensus_group_id,
                                             created_at: p.created_at,
+                                            created_revision: p.created_revision,
                                         })
                                         .collect(),
                                     round_robin_counter: topic
@@ -744,7 +848,10 @@ impl Snapshotable for Streams {
                     )
                 })
                 .collect();
-            StreamsSnapshot { items }
+            StreamsSnapshot {
+                items,
+                revision: inner.revision,
+            }
         })
     }
 
@@ -789,6 +896,7 @@ impl Snapshotable for Streams {
                             id: p.id,
                             consensus_group_id: p.consensus_group_id,
                             created_at: p.created_at,
+                            created_revision: p.created_revision,
                         })
                         .collect(),
                     round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
@@ -817,6 +925,7 @@ impl Snapshotable for Streams {
         let inner = StreamsInner {
             index,
             items,
+            revision: snapshot.revision,
             last_result: None,
         };
         Ok(inner.into())
@@ -829,6 +938,7 @@ impl_fill_restore!(Streams, streams);
 mod tests {
     use super::*;
     use iggy_binary_protocol::WireName;
+    use iggy_binary_protocol::codec::WireDecode;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest as WireCreatePartitionsRequest,
@@ -837,6 +947,7 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 
     fn create_stream(inner: &mut StreamsInner, name: &str) {
         let request = CreateStreamRequest {
@@ -937,5 +1048,126 @@ mod tests {
             inner.items[0].topics[0].partitions[3].consensus_group_id,
             13
         );
+    }
+
+    #[test]
+    fn create_topic_apply_returns_get_topic_response_compatible_bytes() {
+        // STM apply must emit `[TopicHeader][PartitionResponse]*` so existing
+        // SDK decoders (`decode_response::<GetTopicResponse>`) parse the reply
+        // without a wire-schema break.
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "topic"),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 100,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 101,
+                },
+            ],
+        };
+
+        let bytes = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let (reply, consumed) = GetTopicResponse::decode(&bytes).expect("reply decodes");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(reply.topic.id, 0);
+        assert_eq!(reply.topic.partitions_count, 2);
+        assert_eq!(reply.topic.name.as_str(), "topic");
+        assert_eq!(reply.partitions.len(), 2);
+        assert_eq!(reply.partitions[0].id, 0);
+        assert_eq!(reply.partitions[1].id, 1);
+    }
+
+    #[test]
+    fn create_topic_apply_returns_empty_on_validation_failure() {
+        // Unknown stream id rejects the command; legacy contract returns
+        // empty body so SDK decodes failure.
+        let mut inner = StreamsInner::new();
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(42, 1, "topic"),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let bytes = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn create_partitions_apply_resolves_ids_and_returns_empty_reply() {
+        // STM resolves request-relative ids against the topic's current
+        // partition count; the wire reply is empty (matches legacy
+        // empty-ok response; SDK ignores the body).
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "topic"),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 50,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 51,
+                },
+            ],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+
+        let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            // request-relative offsets 0..=1; base is 2 (next after the
+            // two topic-creation partitions), so resolved ids are 2 and 3.
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 60,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 61,
+                },
+            ],
+        };
+
+        let bytes = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
+        assert!(bytes.is_empty());
+
+        let partitions = &inner.items[0].topics[0].partitions;
+        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions[2].id, 2);
+        assert_eq!(partitions[2].consensus_group_id, 60);
+        assert_eq!(partitions[3].id, 3);
+        assert_eq!(partitions[3].consensus_group_id, 61);
+    }
+
+    #[test]
+    fn create_partitions_apply_returns_empty_on_validation_failure() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        // Topic missing => validation failure path
+        let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(99),
+                partitions_count: 1,
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let bytes = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
+        assert!(bytes.is_empty());
     }
 }

@@ -224,6 +224,11 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     }
 
     @Override
+    public boolean supportsOffsetLag() {
+        return false;
+    }
+
+    @Override
     public void close() {
         if (asyncClient != null) {
             try {

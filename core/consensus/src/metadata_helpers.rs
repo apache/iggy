@@ -387,6 +387,8 @@ mod tests {
 
     #[allow(clippy::future_not_send)]
     impl MessageBus for ClientSpyBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             client_id: u128,

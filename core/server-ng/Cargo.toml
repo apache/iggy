@@ -115,6 +115,7 @@ err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
 fs2 = { workspace = true }
+futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_binary_protocol = { workspace = true }
@@ -170,6 +171,12 @@ hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 vergen-git2 = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+bytemuck = { workspace = true }
+iggy = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints.clippy]
 enum_glob_use = "deny"
