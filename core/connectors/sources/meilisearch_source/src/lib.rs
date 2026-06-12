@@ -31,13 +31,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{str::FromStr, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
-use tracing::info;
+use tracing::{info, warn};
 
 source_connector!(MeilisearchSource);
 
 const CONNECTOR_NAME: &str = "Meilisearch source";
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_POLLING_INTERVAL: &str = "5s";
+const DEFAULT_INCLUDE_METADATA: bool = false;
+const PRIMARY_KEY_SORT_DIRECTION: &str = "asc";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeilisearchSourceConfig {
@@ -47,56 +49,81 @@ pub struct MeilisearchSourceConfig {
     pub api_key: Option<SecretString>,
     pub query: Option<String>,
     pub filter: Option<Value>,
-    pub sort: Option<Vec<String>>,
     pub batch_size: Option<usize>,
     pub polling_interval: Option<String>,
-    pub timeout: Option<String>,
     pub include_metadata: Option<bool>,
 }
 
 #[derive(Debug)]
 pub struct MeilisearchSource {
     id: u32,
-    config: MeilisearchSourceConfig,
+    config: ResolvedMeilisearchSourceConfig,
     client: Option<Client>,
+    primary_key: Option<String>,
+    state: Mutex<State>,
+}
+
+#[derive(Debug)]
+struct ResolvedMeilisearchSourceConfig {
+    url: String,
+    index: String,
+    api_key: Option<SecretString>,
+    query: String,
+    filter: Option<Value>,
     batch_size: usize,
     polling_interval: Duration,
     include_metadata: bool,
-    state: Mutex<State>,
+}
+
+impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
+    fn from(config: MeilisearchSourceConfig) -> Self {
+        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+        let polling_interval = parse_duration_or_default(
+            "polling_interval",
+            config.polling_interval.as_deref(),
+            DEFAULT_POLLING_INTERVAL,
+        );
+        let include_metadata = config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA);
+
+        Self {
+            url: config.url,
+            index: config.index,
+            api_key: config.api_key,
+            query: config.query.unwrap_or_default(),
+            filter: config.filter,
+            batch_size,
+            polling_interval,
+            include_metadata,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct State {
-    next_offset: usize,
+    last_primary_key: Option<Value>,
     documents_produced: usize,
     poll_count: usize,
 }
 
 impl MeilisearchSource {
     pub fn new(id: u32, config: MeilisearchSourceConfig, state: Option<ConnectorState>) -> Self {
-        let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-        let polling_interval =
-            parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
-        let include_metadata = config.include_metadata.unwrap_or(false);
         let restored_state = state
             .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, id))
             .inspect(|state| {
                 info!(
                     "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
-                     Next offset: {}, documents produced: {}, poll count: {}",
-                    state.next_offset, state.documents_produced, state.poll_count
+                     Last primary key: {:?}, documents produced: {}, poll count: {}",
+                    state.last_primary_key, state.documents_produced, state.poll_count
                 );
             });
 
         Self {
             id,
-            config,
+            config: config.into(),
             client: None,
-            batch_size,
-            polling_interval,
-            include_metadata,
+            primary_key: None,
             state: Mutex::new(restored_state.unwrap_or(State {
-                next_offset: 0,
+                last_primary_key: None,
                 documents_produced: 0,
                 poll_count: 0,
             })),
@@ -132,41 +159,62 @@ impl MeilisearchSource {
         )))
     }
 
+    async fn get_primary_key(&self, client: &Client) -> Result<String, Error> {
+        let mut index = client
+            .get_index(&self.config.index)
+            .await
+            .map_err(map_sdk_error)?;
+        index
+            .get_primary_key()
+            .await
+            .map_err(map_sdk_error)?
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::InvalidConfigValue(format!(
+                    "Meilisearch index '{}' must define a primary key for stable source polling",
+                    self.config.index
+                ))
+            })
+    }
+
     async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
-        let offset = {
+        let last_primary_key = {
             let state = self.state.lock().await;
-            state.next_offset
+            state.last_primary_key.clone()
         };
+        let primary_key = self.primary_key.as_deref().ok_or_else(|| {
+            Error::Connection("Meilisearch primary key is not initialized".to_string())
+        })?;
         let filter_expression = self.filter_expression()?;
-        let sort_refs = self.sort_refs();
+        let cursor_filter = cursor_filter_expression(primary_key, last_primary_key.as_ref())?;
+        let combined_filter = combine_filter_expressions(filter_expression, cursor_filter);
+        let sort = format!("{primary_key}:{PRIMARY_KEY_SORT_DIRECTION}");
+        let sort_refs = [sort.as_str()];
         let index = client.index(&self.config.index);
         let mut query = index.search();
         query
-            .with_query(self.config.query.as_deref().unwrap_or_default())
-            .with_offset(offset)
-            .with_limit(self.batch_size);
+            .with_query(&self.config.query)
+            .with_limit(self.config.batch_size)
+            .with_sort(&sort_refs);
 
-        if let Some(filter) = &filter_expression {
+        if let Some(filter) = &combined_filter {
             query.with_filter(filter);
         }
 
-        if !sort_refs.is_empty() {
-            query.with_sort(&sort_refs);
-        }
-
-        let documents = match query.execute::<Value>().await {
+        let documents: Vec<Value> = match query.execute::<Value>().await {
             Ok(results) => results.hits.into_iter().map(|hit| hit.result).collect(),
-            Err(MeilisearchSdkError::Meilisearch(error))
-                if error.error_code == MeilisearchErrorCode::IndexNotFound =>
-            {
-                Vec::new()
-            }
             Err(error) => return Err(map_sdk_error(error)),
         };
-        let messages = self.documents_to_messages(offset, documents)?;
+        let last_document_primary_key = documents
+            .last()
+            .map(|document| document_primary_key(document, primary_key))
+            .transpose()?;
+        let messages = self.documents_to_messages(documents)?;
 
         let mut state = self.state.lock().await;
-        state.next_offset += messages.len();
+        if let Some(primary_key) = last_document_primary_key {
+            state.last_primary_key = Some(primary_key);
+        }
         state.documents_produced += messages.len();
         state.poll_count += 1;
 
@@ -180,54 +228,23 @@ impl MeilisearchSource {
 
         match filter {
             Value::String(filter) if !filter.is_empty() => Ok(Some(filter.clone())),
-            Value::Array(filters) => filters
-                .iter()
-                .map(|value| {
-                    value.as_str().map(str::to_string).ok_or_else(|| {
-                        Error::InvalidConfigValue(
-                            "Meilisearch filter arrays must contain only strings".to_string(),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map(|filters| {
-                    if filters.is_empty() {
-                        None
-                    } else {
-                        Some(filters.join(" AND "))
-                    }
-                }),
+            Value::Array(filters) => filter_array_expression(filters, false),
             _ => Err(Error::InvalidConfigValue(
-                "Meilisearch filter must be a string or an array of strings".to_string(),
+                "Meilisearch filter must be a string or an array of strings/arrays".to_string(),
             )),
         }
     }
 
-    fn sort_refs(&self) -> Vec<&str> {
-        self.config
-            .sort
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(String::as_str)
-            .collect()
-    }
-
-    fn documents_to_messages(
-        &self,
-        offset: usize,
-        documents: Vec<Value>,
-    ) -> Result<Vec<ProducedMessage>, Error> {
+    fn documents_to_messages(&self, documents: Vec<Value>) -> Result<Vec<ProducedMessage>, Error> {
         documents
             .into_iter()
-            .enumerate()
-            .map(|(index, document)| {
-                let payload = if self.include_metadata {
+            .map(|document| {
+                let payload = if self.config.include_metadata {
                     json!({
                         "document": document,
                         "meilisearch": {
                             "index": self.config.index,
-                            "offset": offset + index,
+                            "primary_key": self.primary_key.as_deref(),
                         }
                     })
                 } else {
@@ -256,13 +273,16 @@ impl MeilisearchSource {
 #[async_trait]
 impl Source for MeilisearchSource {
     async fn open(&mut self) -> Result<(), Error> {
+        let sanitized_url = sanitize_url_for_logging(&self.config.url);
         info!(
             "Opening Meilisearch source connector with ID: {} for URL: {}, index: {}",
-            self.id, self.config.url, self.config.index
+            self.id, sanitized_url, self.config.index
         );
 
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
+        let primary_key = self.get_primary_key(&client).await?;
+        self.primary_key = Some(primary_key);
         self.client = Some(client);
 
         info!(
@@ -273,7 +293,7 @@ impl Source for MeilisearchSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        sleep(self.polling_interval).await;
+        sleep(self.config.polling_interval).await;
         let client = self
             .client
             .as_ref()
@@ -308,10 +328,18 @@ impl Source for MeilisearchSource {
     }
 }
 
-fn parse_duration(value: Option<&str>, default: &str) -> Duration {
-    value
-        .and_then(|value| humantime::Duration::from_str(value).ok())
-        .unwrap_or_else(|| humantime::Duration::from_str(default).expect("valid default duration"))
+fn parse_duration_or_default(field: &str, value: Option<&str>, default: &str) -> Duration {
+    if let Some(value) = value {
+        match humantime::Duration::from_str(value) {
+            Ok(duration) => return duration.into(),
+            Err(error) => warn!(
+                "Invalid Meilisearch source {field} value '{value}': {error}. Using default '{default}'"
+            ),
+        }
+    }
+
+    humantime::Duration::from_str(default)
+        .expect("valid default duration")
         .into()
 }
 
@@ -323,7 +351,7 @@ fn normalize_host(host: &str) -> Result<String, Error> {
         ));
     }
 
-    let with_scheme = if host.starts_with("http://") || host.starts_with("https://") {
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
@@ -333,6 +361,98 @@ fn normalize_host(host: &str) -> Result<String, Error> {
         host.pop();
     }
     Ok(host)
+}
+
+fn sanitize_url_for_logging(host: &str) -> String {
+    let Ok(normalized) = normalize_host(host) else {
+        return "<invalid-url>".to_string();
+    };
+    let Some((scheme, rest)) = normalized.split_once("://") else {
+        return normalized;
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    if let Some((_, host)) = authority.rsplit_once('@') {
+        format!("{scheme}://<redacted>@{host}{path}")
+    } else {
+        normalized
+    }
+}
+
+fn filter_array_expression(filters: &[Value], nested: bool) -> Result<Option<String>, Error> {
+    let separator = if nested { " OR " } else { " AND " };
+    let mut expressions = Vec::with_capacity(filters.len());
+
+    for filter in filters {
+        match filter {
+            Value::String(filter) if !filter.is_empty() => expressions.push(filter.clone()),
+            Value::Array(filters) => {
+                if let Some(filter) = filter_array_expression(filters, true)? {
+                    expressions.push(format!("({filter})"));
+                }
+            }
+            _ => {
+                return Err(Error::InvalidConfigValue(
+                    "Meilisearch filter arrays must contain only strings or nested arrays"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    if expressions.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(expressions.join(separator)))
+    }
+}
+
+fn combine_filter_expressions(
+    user_filter: Option<String>,
+    cursor_filter: Option<String>,
+) -> Option<String> {
+    match (user_filter, cursor_filter) {
+        (Some(user_filter), Some(cursor_filter)) => {
+            Some(format!("({user_filter}) AND ({cursor_filter})"))
+        }
+        (Some(user_filter), None) => Some(user_filter),
+        (None, Some(cursor_filter)) => Some(cursor_filter),
+        (None, None) => None,
+    }
+}
+
+fn cursor_filter_expression(
+    primary_key: &str,
+    last_primary_key: Option<&Value>,
+) -> Result<Option<String>, Error> {
+    last_primary_key
+        .map(|value| {
+            primary_key_filter_literal(value).map(|literal| format!("{primary_key} > {literal}"))
+        })
+        .transpose()
+}
+
+fn primary_key_filter_literal(value: &Value) -> Result<String, Error> {
+    match value {
+        Value::String(_) | Value::Number(_) => serde_json::to_string(value).map_err(|error| {
+            Error::Serialization(format!(
+                "Failed to serialize Meilisearch primary key: {error}"
+            ))
+        }),
+        _ => Err(Error::InvalidConfigValue(
+            "Meilisearch source primary key values must be strings or numbers".to_string(),
+        )),
+    }
+}
+
+fn document_primary_key(document: &Value, primary_key: &str) -> Result<Value, Error> {
+    let value = document.get(primary_key).ok_or_else(|| {
+        Error::InvalidConfigValue(format!(
+            "Meilisearch document is missing primary key '{primary_key}'"
+        ))
+    })?;
+    primary_key_filter_literal(value)?;
+    Ok(value.clone())
 }
 
 fn map_sdk_error(error: MeilisearchSdkError) -> Error {
@@ -375,10 +495,8 @@ mod tests {
             api_key: None,
             query: None,
             filter: None,
-            sort: None,
             batch_size: Some(10),
             polling_interval: Some("1ms".to_string()),
-            timeout: Some("1s".to_string()),
             include_metadata: None,
         }
     }
@@ -390,9 +508,9 @@ mod tests {
     }
 
     #[test]
-    fn given_persisted_state_should_restore_next_offset() {
+    fn given_persisted_state_should_restore_last_primary_key() {
         let state = State {
-            next_offset: 42,
+            last_primary_key: Some(json!(42)),
             documents_produced: 42,
             poll_count: 7,
         };
@@ -402,7 +520,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let restored = source.state.lock().await;
-            assert_eq!(restored.next_offset, 42);
+            assert_eq!(restored.last_primary_key, Some(json!(42)));
             assert_eq!(restored.documents_produced, 42);
             assert_eq!(restored.poll_count, 7);
         });
@@ -421,12 +539,54 @@ mod tests {
     }
 
     #[test]
+    fn filter_expression_should_accept_nested_filter_arrays() {
+        let mut config = config();
+        config.filter = Some(json!([
+            ["genres = horror", "genres = thriller"],
+            "director = 'Jordan Peele'"
+        ]));
+        let source = MeilisearchSource::new(1, config, None);
+
+        assert_eq!(
+            source.filter_expression().unwrap(),
+            Some(
+                "(genres = horror OR genres = thriller) AND director = 'Jordan Peele'".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn cursor_filter_should_compare_against_last_primary_key() {
+        assert_eq!(
+            cursor_filter_expression("id", Some(&json!("movie-1"))).unwrap(),
+            Some("id > \"movie-1\"".to_string())
+        );
+        assert_eq!(
+            cursor_filter_expression("id", Some(&json!(42))).unwrap(),
+            Some("id > 42".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_host_should_trim_before_checking_scheme() {
+        let url = normalize_host(" https://localhost:7700/ ").unwrap();
+        assert_eq!(url, "https://localhost:7700");
+    }
+
+    #[test]
+    fn sanitize_url_should_redact_credentials() {
+        let url = sanitize_url_for_logging("https://user:pass@localhost:7700/indexes");
+        assert_eq!(url, "https://<redacted>@localhost:7700/indexes");
+    }
+
+    #[test]
     fn documents_should_be_wrapped_when_metadata_is_enabled() {
         let mut config = config();
         config.include_metadata = Some(true);
-        let source = MeilisearchSource::new(1, config, None);
+        let mut source = MeilisearchSource::new(1, config, None);
+        source.primary_key = Some("id".to_string());
         let messages = source
-            .documents_to_messages(3, vec![json!({"id": 1, "title": "hello"})])
+            .documents_to_messages(vec![json!({"id": 1, "title": "hello"})])
             .unwrap();
 
         let payload: Value = serde_json::from_slice(&messages[0].payload).unwrap();
@@ -436,7 +596,7 @@ mod tests {
                 "document": {"id": 1, "title": "hello"},
                 "meilisearch": {
                     "index": "iggy_messages",
-                    "offset": 3,
+                    "primary_key": "id",
                 }
             })
         );

@@ -52,11 +52,13 @@ impl TestFixture for MeilisearchSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = MeilisearchContainer::start().await?;
         let http_client = create_http_client();
-
-        Ok(Self {
+        let fixture = Self {
             container,
             http_client,
-        })
+        };
+        fixture.create_source_index().await?;
+
+        Ok(fixture)
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
