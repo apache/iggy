@@ -241,6 +241,13 @@ namespace Iggy {
         public function consumeMessages(callable $callback, int $limit): int {}
 
         /**
+         * Returns an iterator over messages for use with foreach.
+         *
+         * @return \Iggy\MessageIterator
+         */
+        public function iterMessages(): \Iggy\MessageIterator {}
+
+        /**
          * Deletes the stored offset for the provided partition id.
          *
          * If partition_id is null, at least one message must have been polled first.
@@ -304,6 +311,35 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    class MessageIterator implements \Iterator {
+        public function __construct() {}
+
+        /**
+         * @return \Iggy\ReceiveMessage|null
+         */
+        public function current(): ?\Iggy\ReceiveMessage {}
+
+        /**
+         * @return int
+         */
+        public function key(): int {}
+
+        /**
+         * @return void
+         */
+        public function next(): void {}
+
+        /**
+         * @return void
+         */
+        public function rewind(): void {}
+
+        /**
+         * @return bool
+         */
+        public function valid(): bool {}
     }
 
     class PollingStrategy {
