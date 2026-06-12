@@ -78,13 +78,31 @@ pub struct FlatBufferConvert {
 }
 
 impl FlatBufferConvert {
-    pub fn new(config: FlatBufferConvertConfig) -> Self {
-        Self { config }
+    pub fn new(config: FlatBufferConvertConfig) -> Result<Self, Error> {
+        Self::validate_conversion(config.source_format, config.target_format)?;
+        Ok(Self { config })
     }
 
-    fn payload_matches_source_format(&self, payload: &Payload) -> bool {
+    fn validate_conversion(source: Schema, target: Schema) -> Result<(), Error> {
+        if matches!(
+            (source, target),
+            (Schema::Json, Schema::FlatBuffer)
+                | (Schema::FlatBuffer, Schema::Json)
+                | (Schema::FlatBuffer, Schema::Text)
+                | (Schema::FlatBuffer, Schema::Raw)
+        ) || source == target
+        {
+            return Ok(());
+        }
+
+        Err(Error::InvalidConfigValue(format!(
+            "unsupported FlatBuffer conversion: {source} -> {target}"
+        )))
+    }
+
+    fn payload_matches_source_format(source_format: Schema, payload: &Payload) -> bool {
         matches!(
-            (&self.config.source_format, payload),
+            (source_format, payload),
             (Schema::Json, Payload::Json(_))
                 | (Schema::Raw, Payload::Raw(_))
                 | (Schema::Text, Payload::Text(_))
@@ -105,8 +123,11 @@ impl Transform for FlatBufferConvert {
         _metadata: &TopicMetadata,
         mut message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
-        if !self.payload_matches_source_format(&message.payload) {
-            return Err(Error::InvalidPayloadType);
+        if !Self::payload_matches_source_format(self.config.source_format, &message.payload) {
+            return Err(Error::InvalidConfigValue(format!(
+                "expected {} payload",
+                self.config.source_format
+            )));
         }
 
         message.payload = match (&self.config.source_format, &self.config.target_format) {
@@ -134,11 +155,10 @@ impl Transform for FlatBufferConvert {
                     include_paths: self.config.include_paths.clone(),
                 };
                 let decoder = FlatBufferStreamDecoder::new(decoder_config);
-                if let Payload::FlatBuffer(bytes) = message.payload {
-                    decoder.decode(bytes)?
-                } else {
+                let Payload::FlatBuffer(bytes) = message.payload else {
                     return Err(Error::InvalidPayloadType);
-                }
+                };
+                decoder.decode(bytes)?
             }
             (Schema::FlatBuffer, Schema::Text) => {
                 let encoder = FlatBufferStreamEncoder::default();
@@ -149,11 +169,7 @@ impl Transform for FlatBufferConvert {
                 encoder.convert_format(message.payload, Schema::Raw)?
             }
             (source, target) if source == target => message.payload,
-            (source, target) => {
-                return Err(Error::InvalidConfigValue(format!(
-                    "unsupported FlatBuffer conversion: {source} -> {target}"
-                )));
-            }
+            _ => unreachable!("conversion pair was validated during construction"),
         };
 
         Ok(Some(message))
@@ -163,12 +179,14 @@ impl Transform for FlatBufferConvert {
 impl Default for FlatBufferConvert {
     fn default() -> Self {
         Self::new(FlatBufferConvertConfig::default())
+            .expect("default FlatBuffer conversion configuration must be valid")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn message(payload: Payload) -> DecodedMessage {
         DecodedMessage {
@@ -190,33 +208,42 @@ mod tests {
     }
 
     #[test]
-    fn given_unsupported_conversion_should_return_error() {
-        let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
+    fn given_unsupported_conversion_should_fail_during_construction() {
+        let result = FlatBufferConvert::new(FlatBufferConvertConfig {
             source_format: Schema::Text,
             target_format: Schema::FlatBuffer,
             ..FlatBufferConvertConfig::default()
         });
 
-        let result = converter.transform(&metadata(), message(Payload::Text("value".to_string())));
-
-        assert!(matches!(
-            result,
-            Err(Error::InvalidConfigValue(message))
-                if message == "unsupported FlatBuffer conversion: text -> flatbuffer"
-        ));
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
 
     #[test]
-    fn given_payload_not_matching_source_format_should_return_error() {
-        let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
-            source_format: Schema::Json,
-            target_format: Schema::FlatBuffer,
-            ..FlatBufferConvertConfig::default()
-        });
+    fn given_payload_not_matching_each_source_format_should_return_error() {
+        let cases = [
+            (Schema::Json, Payload::Text(String::new())),
+            (Schema::Raw, Payload::Json(simd_json::json!({}))),
+            (Schema::Text, Payload::Raw(vec![])),
+            (Schema::Proto, Payload::Text(String::new())),
+            (Schema::FlatBuffer, Payload::Avro(vec![])),
+            (Schema::Avro, Payload::FlatBuffer(vec![])),
+        ];
 
-        let result = converter.transform(&metadata(), message(Payload::Text("value".to_string())));
+        for (source_format, payload) in cases {
+            let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
+                source_format,
+                target_format: source_format,
+                ..FlatBufferConvertConfig::default()
+            })
+            .unwrap();
 
-        assert!(matches!(result, Err(Error::InvalidPayloadType)));
+            let result = converter.transform(&metadata(), message(payload));
+
+            assert!(
+                matches!(result, Err(Error::InvalidConfigValue(_))),
+                "{source_format} should reject a mismatched payload"
+            );
+        }
     }
 
     #[test]
@@ -225,7 +252,8 @@ mod tests {
             source_format: Schema::FlatBuffer,
             target_format: Schema::FlatBuffer,
             ..FlatBufferConvertConfig::default()
-        });
+        })
+        .unwrap();
         let bytes = vec![1, 2, 3, 4];
 
         let result = converter
@@ -256,10 +284,77 @@ mod tests {
         let expected = encoder.encode(payload.clone()).unwrap();
 
         let result = FlatBufferConvert::new(config)
+            .unwrap()
             .transform(&metadata(), message(payload))
             .unwrap()
             .unwrap();
 
         assert!(matches!(result.payload, Payload::FlatBuffer(data) if data == expected));
+    }
+
+    #[test]
+    fn given_flatbuffer_when_converting_to_text_should_base64_encode_payload() {
+        let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
+            source_format: Schema::FlatBuffer,
+            target_format: Schema::Text,
+            ..FlatBufferConvertConfig::default()
+        })
+        .unwrap();
+        let bytes = vec![1, 2, 3, 4];
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let result = converter
+            .transform(&metadata(), message(Payload::FlatBuffer(bytes)))
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(result.payload, Payload::Text(text) if text == expected));
+    }
+
+    #[test]
+    fn given_flatbuffer_when_converting_to_raw_should_preserve_bytes() {
+        let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
+            source_format: Schema::FlatBuffer,
+            target_format: Schema::Raw,
+            ..FlatBufferConvertConfig::default()
+        })
+        .unwrap();
+        let bytes = vec![1, 2, 3, 4];
+
+        let result = converter
+            .transform(&metadata(), message(Payload::FlatBuffer(bytes.clone())))
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(result.payload, Payload::Raw(data) if data == bytes));
+    }
+
+    #[test]
+    fn given_flatbuffer_when_converting_to_json_should_include_buffer_metadata() {
+        let converter = FlatBufferConvert::new(FlatBufferConvertConfig {
+            source_format: Schema::FlatBuffer,
+            target_format: Schema::Json,
+            ..FlatBufferConvertConfig::default()
+        })
+        .unwrap();
+        let bytes = vec![1, 2, 3, 4];
+        let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let result = converter
+            .transform(&metadata(), message(Payload::FlatBuffer(bytes.clone())))
+            .unwrap()
+            .unwrap();
+
+        let Payload::Json(simd_json::OwnedValue::Object(map)) = result.payload else {
+            panic!("expected JSON object payload");
+        };
+        assert_eq!(
+            map.get("buffer_size"),
+            Some(&simd_json::OwnedValue::from(bytes.len()))
+        );
+        assert_eq!(
+            map.get("raw_data_base64"),
+            Some(&simd_json::OwnedValue::from(expected_base64))
+        );
     }
 }
