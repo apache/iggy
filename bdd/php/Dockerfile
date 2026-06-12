@@ -47,7 +47,7 @@ ENV PHP=/usr/bin/php8.3
 ENV PHP_CONFIG=/usr/bin/php-config8.3
 ENV IGGY_HOST=iggy-server
 ENV IGGY_PORT=8090
-ENV BDD_FEATURE_FILE=/app/features/basic_messaging.feature
+ENV BDD_FEATURE_FILE=/workspace/bdd/scenarios/basic_messaging.feature
 
 RUN rustup component add llvm-tools-preview \
     && cargo install cargo-php --locked --version 0.1.21 \

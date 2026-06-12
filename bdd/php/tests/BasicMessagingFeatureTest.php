@@ -77,6 +77,7 @@ final class BasicMessagingFeatureTest extends TestCase
         $currentSteps = [];
         $section = null;
         $stepPattern = '/^(Given|When|Then|And|But|\*) (.+)$/';
+        $unsupportedStructurePattern = '/^(Scenario Outline|Rule|Examples):|^\|/';
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || str_starts_with($line, '#') || str_starts_with($line, '@')) {
@@ -97,6 +98,10 @@ final class BasicMessagingFeatureTest extends TestCase
                 $currentSteps = [];
                 $section = 'scenario';
                 continue;
+            }
+
+            if (preg_match($unsupportedStructurePattern, $line) === 1) {
+                throw new RuntimeException("Unsupported BDD structure: {$line}");
             }
 
             if (preg_match($stepPattern, $line, $matches) !== 1) {
