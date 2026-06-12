@@ -19,6 +19,7 @@
 
 package org.apache.iggy.connector.pinot.consumer;
 
+import org.apache.pinot.spi.stream.StreamMessage;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -33,6 +34,7 @@ class IggyMessageBatchTest {
     void testEmptyBatch() {
         IggyMessageBatch batch = new IggyMessageBatch(new ArrayList<>());
         assertThat(batch.getMessageCount()).isEqualTo(0);
+        assertThat(batch.getSizeInBytes()).isEqualTo(0);
     }
 
     @Test
@@ -45,18 +47,22 @@ class IggyMessageBatchTest {
         IggyMessageBatch batch = new IggyMessageBatch(messages);
 
         assertThat(batch.getMessageCount()).isEqualTo(1);
-        assertThat(batch.getMessageAtIndex(0)).isEqualTo(payload);
-        assertThat(batch.getMessageLengthAtIndex(0)).isEqualTo(payload.length);
-        assertThat(batch.getNextStreamMessageOffsetAtIndex(0)).isEqualTo(100L);
-        assertThat(batch.getNextStreamPartitionMsgOffsetAtIndex(0)).isEqualTo(offset);
+        assertThat(batch.getSizeInBytes()).isEqualTo(payload.length);
+
+        StreamMessage<byte[]> message = batch.getStreamMessage(0);
+        assertThat(message.getValue()).isEqualTo(payload);
+        assertThat(message.getLength()).isEqualTo(payload.length);
+        assertThat(message.getMetadata().getOffset()).isEqualTo(offset);
     }
 
     @Test
     void testMultipleMessages() {
         List<IggyMessageBatch.IggyMessageAndOffset> messages = new ArrayList<>();
+        long totalBytes = 0;
 
         for (int i = 0; i < 10; i++) {
             byte[] payload = ("message-" + i).getBytes(StandardCharsets.UTF_8);
+            totalBytes += payload.length;
             IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(i * 100L);
             messages.add(new IggyMessageBatch.IggyMessageAndOffset(payload, offset));
         }
@@ -64,13 +70,15 @@ class IggyMessageBatchTest {
         IggyMessageBatch batch = new IggyMessageBatch(messages);
 
         assertThat(batch.getMessageCount()).isEqualTo(10);
+        assertThat(batch.getSizeInBytes()).isEqualTo(totalBytes);
 
         for (int i = 0; i < 10; i++) {
             byte[] expectedPayload = ("message-" + i).getBytes(StandardCharsets.UTF_8);
-            assertThat(batch.getMessageAtIndex(i)).isEqualTo(expectedPayload);
-            assertThat(batch.getMessageLengthAtIndex(i)).isEqualTo(expectedPayload.length);
-            assertThat(batch.getNextStreamMessageOffsetAtIndex(i)).isEqualTo(i * 100L);
-            assertThat(batch.getMessageOffsetAtIndex(i)).isEqualTo(i);
+            StreamMessage<byte[]> message = batch.getStreamMessage(i);
+            assertThat(message.getValue()).isEqualTo(expectedPayload);
+            assertThat(message.getLength()).isEqualTo(expectedPayload.length);
+            assertThat(message.getMetadata().getOffset())
+                    .isEqualTo(messages.get(i).getOffset());
         }
     }
 
@@ -87,21 +95,6 @@ class IggyMessageBatchTest {
     }
 
     @Test
-    void testNullOffsetAtInvalidIndex() {
-        List<IggyMessageBatch.IggyMessageAndOffset> messages = new ArrayList<>();
-        byte[] payload = "test".getBytes(StandardCharsets.UTF_8);
-        IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(100L);
-        messages.add(new IggyMessageBatch.IggyMessageAndOffset(payload, offset));
-
-        IggyMessageBatch batch = new IggyMessageBatch(messages);
-
-        assertThat(batch.getNextStreamPartitionMsgOffsetAtIndex(-1)).isNull();
-        assertThat(batch.getNextStreamPartitionMsgOffsetAtIndex(10)).isNull();
-        assertThat(batch.getNextStreamMessageOffsetAtIndex(-1)).isEqualTo(0);
-        assertThat(batch.getNextStreamMessageOffsetAtIndex(10)).isEqualTo(0);
-    }
-
-    @Test
     void testLargeMessageBatch() {
         List<IggyMessageBatch.IggyMessageAndOffset> messages = new ArrayList<>();
 
@@ -115,7 +108,8 @@ class IggyMessageBatchTest {
         IggyMessageBatch batch = new IggyMessageBatch(messages);
 
         assertThat(batch.getMessageCount()).isEqualTo(1000);
-        assertThat(batch.getMessageLengthAtIndex(0)).isEqualTo(1024);
-        assertThat(batch.getMessageLengthAtIndex(999)).isEqualTo(1024);
+        assertThat(batch.getSizeInBytes()).isEqualTo(1000L * 1024);
+        assertThat(batch.getStreamMessage(0).getLength()).isEqualTo(1024);
+        assertThat(batch.getStreamMessage(999).getLength()).isEqualTo(1024);
     }
 }

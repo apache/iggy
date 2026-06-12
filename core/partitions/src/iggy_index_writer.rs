@@ -120,12 +120,16 @@ impl IggyIndexWriter {
 
     /// Flushes buffered index file contents to disk.
     ///
+    /// Uses `fdatasync` (data only): index files are append-only and the
+    /// size change is tracked in datasync metadata on Linux, so the inode
+    /// metadata fsync of `sync_all` adds latency without correctness gain.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
-            .sync_all()
+            .sync_data()
             .await
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())

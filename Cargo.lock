@@ -9859,6 +9859,7 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "bytemuck",
  "bytes",
  "compio",
@@ -12463,6 +12464,7 @@ version = "0.8.0"
 dependencies = [
  "ahash 0.8.12",
  "argon2",
+ "assert_cmd",
  "async-channel",
  "async_zip",
  "axum",
@@ -12484,9 +12486,11 @@ dependencies = [
  "error_set",
  "figlet-rs",
  "fs2",
+ "futures",
  "hash32 1.0.0",
  "human-repr",
  "hwlocality",
+ "iggy",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
@@ -12524,6 +12528,7 @@ dependencies = [
  "sysinfo 0.39.2",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tower-http",
  "tracing",
