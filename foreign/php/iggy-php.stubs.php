@@ -241,13 +241,6 @@ namespace Iggy {
         public function consumeMessages(callable $callback, int $limit): int {}
 
         /**
-         * Returns an iterator over messages for use with foreach.
-         *
-         * @return \Iggy\MessageIterator
-         */
-        public function iterMessages(): \Iggy\MessageIterator {}
-
-        /**
          * Deletes the stored offset for the provided partition id.
          *
          * If partition_id is null, at least one message must have been polled first.
@@ -272,6 +265,13 @@ namespace Iggy {
          * @return int|null
          */
         public function getLastStoredOffset(int $partition_id): ?int {}
+
+        /**
+         * Returns an iterator over messages for use with foreach.
+         *
+         * @return \Iggy\MessageIterator
+         */
+        public function iterMessages(): \Iggy\MessageIterator {}
 
         /**
          * Gets the name of the consumer group.
