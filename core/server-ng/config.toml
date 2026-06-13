@@ -556,6 +556,18 @@ enabled = false
 # This prevents accidental cross-cluster communication.
 name = "iggy-cluster"
 
+# Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
+[cluster.auth]
+# When true, every replica peer must complete the authenticated handshake or be
+# rejected, and shared_secret becomes mandatory. Off by default = legacy
+# unauthenticated replica traffic. Enabling it is a coordinated-restart change.
+enabled = false
+
+# Cluster-wide pre-shared key, >= 32 bytes of CSPRNG output, byte-identical on
+# every node. Prefer the IGGY_CLUSTER_AUTH_SHARED_SECRET env var (masked in
+# logs, never persisted) over storing it on disk. Ignored when enabled = false.
+shared_secret = ""
+
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current

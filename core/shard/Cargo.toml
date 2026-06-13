@@ -22,6 +22,14 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[features]
+# Simulator-only test hook (`IggyShard::init_partition`): bypasses the
+# reconciler's `ReconcileOp::InsertOwned` funnel, mutating `IggyPartitions`
+# off the pump task. A `-p iggy-server-ng` build excludes it; `cargo build
+# --workspace` unifies features and compiles it into the shared `shard`
+# unit (simulator requests it). Benign: no production caller.
+simulator = []
+
 [dependencies]
 bytes = { workspace = true }
 compio = { workspace = true }

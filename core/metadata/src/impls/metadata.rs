@@ -48,6 +48,7 @@ use server_common::Message;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::Path;
+use std::rc::Rc;
 use tracing::{debug, error, warn};
 
 fn freeze_client_reply(
@@ -335,6 +336,16 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
+/// Late-bound callback invoked after every successful
+/// `mux_stm.update(prepare)` on shard 0's metadata commit path.
+///
+/// Wired by server-ng bootstrap once the metadata bundle has broadcast;
+/// receives the committed [`Operation`] so the recipient can filter (the
+/// partition reconciliation loop only cares about partition-shaped
+/// events). Wrapped in [`RefCell`] for late binding; the per-shard
+/// single-thread invariant keeps access safe without [`Sync`].
+pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
+
 pub struct IggyMetadata<C, J, S, M> {
     /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
@@ -359,6 +370,12 @@ pub struct IggyMetadata<C, J, S, M> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
+    /// Late-bound post-commit notifier. Fires once per committed
+    /// operation after [`crate::stm::StateMachine::update`] succeeds in
+    /// both [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
+    /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
+    /// 0 sets it; peer shards and tests leave it `None`).
+    commit_notifier: RefCell<Option<CommitNotifier>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -388,6 +405,26 @@ where
             allocator,
             coordinator,
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
+            commit_notifier: RefCell::new(None),
+        }
+    }
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Install (or replace) the post-commit notifier. Passing `None`
+    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// only; peer shards never commit metadata locally.
+    pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
+        *self.commit_notifier.borrow_mut() = notifier;
+    }
+
+    /// Fire post-commit notifier. Clones the `Rc` out under a short
+    /// borrow so a re-entrant `set_commit_notifier` from inside the
+    /// closure cannot panic on `borrow_mut`.
+    fn fire_commit_notifier(&self, operation: Operation) {
+        let notifier = self.commit_notifier.borrow().as_ref().map(Rc::clone);
+        if let Some(notifier) = notifier {
+            notifier(operation);
         }
     }
 }
@@ -742,6 +779,10 @@ where
                             prepare_header.op
                         );
                     });
+                    // Post-commit notifier (e.g. partition reconciler
+                    // wake-up). Filtering by operation is the
+                    // recipient's responsibility.
+                    self.fire_commit_notifier(prepare_header.operation);
                     let reply = build_reply_message(&prepare_header, &response);
                     // Cache only if session exists. Client evicted between
                     // prepare and commit: skip cache (`commit_reply` no-ops),
@@ -1484,6 +1525,11 @@ where
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
+                // Post-commit notifier (e.g. partition reconciler
+                // wake-up). Same hook fires on backups so reconcilers
+                // converge after replicated commits, not only quorum-acked
+                // ones reached via `on_ack` on the primary.
+                self.fire_commit_notifier(header.operation);
                 let reply = build_reply_message(&header, &response);
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
@@ -1670,4 +1716,93 @@ where
     };
 
     prepare
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stm::consumer_group::ConsumerGroups;
+    use crate::stm::stream::Streams;
+    use crate::stm::user::Users;
+    use iggy_common::variadic;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type TestMux = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+
+    /// Build a peer-shard-style `IggyMetadata` with `consensus`,
+    /// `journal`, and `snapshot` all `None`. Enough to test the
+    /// commit-notifier slot without standing up VSR / WAL infrastructure:
+    /// the test picks `()` for `C` / `J` / `S` since no notifier code path
+    /// touches their methods.
+    fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
+        IggyMetadata::new(None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn commit_notifier_fires_with_received_operation() {
+        let md = peer_metadata();
+        let captured: Rc<RefCell<Vec<Operation>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let observer = Rc::clone(&captured);
+        md.set_commit_notifier(Some(Rc::new(move |op| {
+            observer.borrow_mut().push(op);
+        })));
+
+        md.fire_commit_notifier(Operation::CreateTopicWithAssignments);
+        md.fire_commit_notifier(Operation::DeletePartitions);
+        md.fire_commit_notifier(Operation::DeleteStream);
+
+        let seen = captured.borrow();
+        assert_eq!(
+            seen.as_slice(),
+            &[
+                Operation::CreateTopicWithAssignments,
+                Operation::DeletePartitions,
+                Operation::DeleteStream,
+            ],
+            "notifier must observe every fired operation in order"
+        );
+    }
+
+    #[test]
+    fn commit_notifier_is_no_op_when_unset() {
+        // No notifier installed: firing must not panic, must not allocate.
+        // Mirrors the production-side guarantee that peer shards (no
+        // notifier) take the same commit path as shard 0 (with notifier).
+        let md = peer_metadata();
+        md.fire_commit_notifier(Operation::CreateStream);
+    }
+
+    #[test]
+    fn commit_notifier_can_be_replaced_and_cleared() {
+        let md = peer_metadata();
+        let first_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let second_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        let first_observer = Rc::clone(&first_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *first_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::CreateStream);
+        assert_eq!(*first_count.borrow(), 1);
+
+        // Replace: the first closure must no longer run.
+        let second_observer = Rc::clone(&second_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *second_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::DeleteStream);
+        assert_eq!(*first_count.borrow(), 1, "old notifier must be detached");
+        assert_eq!(*second_count.borrow(), 1, "new notifier must take over");
+
+        // Clear: subsequent fires must be no-ops.
+        md.set_commit_notifier(None);
+        md.fire_commit_notifier(Operation::DeleteTopic);
+        assert_eq!(
+            *second_count.borrow(),
+            1,
+            "cleared notifier must stay quiet"
+        );
+    }
 }

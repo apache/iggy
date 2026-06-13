@@ -40,6 +40,11 @@ pub enum Command2 {
     DoViewChange = 11,
     StartView = 12,
     Eviction = 13,
+
+    // Replica-to-replica auth handshake (server-ng consensus plane).
+    ReplicaHello = 14,
+    ReplicaChallenge = 15,
+    ReplicaFinish = 16,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -50,7 +55,7 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= 13
+        *bits <= Self::ReplicaFinish as u8
     }
 }
 
@@ -67,5 +72,20 @@ mod tests {
         buf[60] = 99;
         let result = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn replica_auth_commands_are_valid_bit_patterns() {
+        // Locks the is_valid_bit_pattern bump: 14/15/16 parse, 17 still rejects.
+        for command in 14u8..=16 {
+            let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
+            buf.resize(256, 0);
+            buf[60] = command;
+            assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_ok());
+        }
+        let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
+        buf.resize(256, 0);
+        buf[60] = 17;
+        assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

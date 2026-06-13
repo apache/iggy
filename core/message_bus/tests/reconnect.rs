@@ -43,7 +43,17 @@ async fn periodic_retry_picks_up_late_listener() {
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let period = Duration::from_millis(100);
     let dial_delegate = install_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(&bus0, CLUSTER, 0, vec![(1, addr)], dial_delegate, period).await;
+    start_connector(
+        &bus0,
+        CLUSTER,
+        0,
+        vec![(1, addr)],
+        None,
+        Duration::from_secs(5),
+        dial_delegate,
+        period,
+    )
+    .await;
     assert!(!bus0.replicas().contains(1), "first connect should fail");
 
     // Bring bus 1 online on the same address.
@@ -58,6 +68,7 @@ async fn periodic_retry_picks_up_late_listener() {
             CLUSTER,
             1,
             2,
+            None,
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),

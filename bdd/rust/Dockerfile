@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.96
 FROM rust:${RUST_VERSION}
 
 WORKDIR /app

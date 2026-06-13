@@ -38,7 +38,7 @@ partitions = { path = "../partitions" }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 server_common = { path = "../server_common" }
-shard = { path = "../shard" }
+shard = { path = "../shard", features = ["simulator"] }
 strum = { workspace = true }
 tracing = { workspace = true }
 

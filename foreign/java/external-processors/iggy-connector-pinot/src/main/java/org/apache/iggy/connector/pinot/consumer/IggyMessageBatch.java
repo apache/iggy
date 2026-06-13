@@ -49,37 +49,6 @@ public class IggyMessageBatch implements MessageBatch<byte[]> {
     }
 
     @Override
-    public byte[] getMessageAtIndex(int index) {
-        return messages.get(index).message;
-    }
-
-    @Override
-    public int getMessageOffsetAtIndex(int index) {
-        return index;
-    }
-
-    @Override
-    public int getMessageLengthAtIndex(int index) {
-        return messages.get(index).message.length;
-    }
-
-    @Override
-    public long getNextStreamMessageOffsetAtIndex(int index) {
-        if (index >= 0 && index < messages.size()) {
-            return messages.get(index).offset.getOffset();
-        }
-        return 0;
-    }
-
-    @Override
-    public StreamPartitionMsgOffset getNextStreamPartitionMsgOffsetAtIndex(int index) {
-        if (index >= 0 && index < messages.size()) {
-            return messages.get(index).offset;
-        }
-        return null;
-    }
-
-    @Override
     public StreamMessage<byte[]> getStreamMessage(int index) {
         IggyMessageAndOffset messageAndOffset = messages.get(index);
 
@@ -105,6 +74,15 @@ public class IggyMessageBatch implements MessageBatch<byte[]> {
         // Return the offset after the last message
         long lastOffset = messages.get(messages.size() - 1).offset.getOffset();
         return new IggyStreamPartitionMsgOffset(lastOffset + 1);
+    }
+
+    @Override
+    public long getSizeInBytes() {
+        long size = 0;
+        for (IggyMessageAndOffset messageAndOffset : messages) {
+            size += messageAndOffset.message.length;
+        }
+        return size;
     }
 
     /**
