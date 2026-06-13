@@ -138,6 +138,13 @@ mod ffi {
         members: Vec<ConsumerGroupMember>,
     }
 
+    struct ConsumerGroup {
+        id: u32,
+        name: String,
+        partitions_count: u32,
+        members_count: u32,
+    }
+
     struct ConsumerGroupInfo {
         stream_id: u32,
         topic_id: u32,
@@ -231,6 +238,25 @@ mod ffi {
             message_expiry_value: u64,
             max_topic_size: String,
         ) -> Result<TopicDetails>;
+        fn get_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<TopicDetails>;
+        fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
+        #[allow(clippy::too_many_arguments)]
+        fn update_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            topic_name: String,
+            compression_algorithm: String,
+            replication_factor: u8,
+            message_expiry_kind: String,
+            message_expiry_value: u64,
+            max_topic_size: String,
+        ) -> Result<()>;
+        fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
@@ -256,6 +282,11 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<ConsumerGroupDetails>;
+        fn get_consumer_groups(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<Vec<ConsumerGroup>>;
         fn delete_consumer_group(
             self: &Client,
             stream_id: Identifier,
