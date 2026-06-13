@@ -30,7 +30,7 @@ use bytes::Bytes;
 /// Well-formed Produce response with a single placeholder topic/partition.
 pub fn encode_produce_error_response(version: i16, error_code: i16) -> Bytes {
     let topics = vec![ProduceTopicData {
-        topic: String::new(),
+        topic: String::new(), // TODO topic name will be populated in the end to end functional completion
         partitions: vec![ProducePartitionData {
             partition: 0,
             records: None,

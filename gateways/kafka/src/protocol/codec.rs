@@ -17,7 +17,9 @@
 
 //! Low-level Kafka primitive encoders/decoders (ported wire codec).
 
-#![allow(clippy::pedantic, clippy::missing_const_for_fn)]
+#![allow(clippy::missing_const_for_fn, clippy::bool_to_int_with_if)]
+#![allow(clippy::missing_errors_doc, clippy::cast_sign_loss, clippy::must_use_candidate,clippy::missing_panics_doc, clippy::cast_possible_truncation,clippy::cast_lossless)]
+
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -97,10 +99,9 @@ impl Decoder {
         if n < 0 {
             return Err(KafkaProtocolError::InvalidArrayLength(n));
         }
-        let count = usize::try_from(n).map_err(|_| KafkaProtocolError::CollectionTooLarge {
-            count: n as usize,
-            max: MAX_COLLECTION_LEN,
-        })?;
+        // Safe: n is in [0, i32::MAX]; i32::MAX (2_147_483_647) fits in usize
+        // on all 32-bit and 64-bit platforms this crate targets.
+        let count = n as usize;
         if count > MAX_COLLECTION_LEN {
             return Err(KafkaProtocolError::CollectionTooLarge {
                 count,
@@ -209,6 +210,7 @@ impl Decoder {
             });
         }
         let count = count as usize;
+
         for _ in 0..count {
             self.read_varint()?; // tag number
             let size = usize::try_from(self.read_varint()?).map_err(|_| {
@@ -343,7 +345,7 @@ impl Encoder {
     pub fn write_empty_tagged_fields(&mut self) {
         self.write_varint(0);
     }
-
+    #[must_use]
     pub fn freeze(self) -> Bytes {
         self.bytes.freeze()
     }
