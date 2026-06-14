@@ -90,8 +90,8 @@ func TestIdentifier_ValueMutationDoesNotCorruptEncoded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range id.Value {
-		id.Value[i] ^= 0xFF
+	for i := range id.value {
+		id.value[i] ^= 0xFF
 	}
 	after, err := id.AppendBinary(nil)
 	if err != nil {

@@ -18,17 +18,18 @@
 package iggcon
 
 import (
+	"bytes"
 	"encoding/binary"
 
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 type Identifier struct {
-	Kind   IdKind
-	Length int
-	Value  []byte
-	// encoded caches the wire bytes; populated by NewIdentifier, empty for
-	// zero-value Identifiers (marshalers fall back to Kind/Length/Value).
+	kind   IdKind
+	length int
+	value  []byte
+	// encoded holds the wire bytes [kind][length][value...]. NewIdentifier is
+	// the only constructor, so this is the single source of truth for marshaling.
 	encoded []byte
 }
 
@@ -56,9 +57,9 @@ func newNumericIdentifier(value uint32) (Identifier, error) {
 	binary.LittleEndian.PutUint32(val, value)
 	encoded := []byte{byte(NumericId), 4, val[0], val[1], val[2], val[3]}
 	return Identifier{
-		Kind:    NumericId,
-		Length:  4,
-		Value:   val,
+		kind:    NumericId,
+		length:  4,
+		value:   val,
 		encoded: encoded,
 	}, nil
 }
@@ -75,29 +76,38 @@ func newStringIdentifier(value string) (Identifier, error) {
 	encoded[1] = byte(length)
 	copy(encoded[2:], val)
 	return Identifier{
-		Kind:    StringId,
-		Length:  length,
-		Value:   val,
+		kind:    StringId,
+		length:  length,
+		value:   val,
 		encoded: encoded,
 	}, nil
 }
 
+// Kind returns the identifier kind (NumericId or StringId).
+func (id Identifier) Kind() IdKind { return id.kind }
+
+// Length returns the byte length of the identifier value.
+func (id Identifier) Length() int { return id.length }
+
+// Value returns a copy of the raw identifier bytes.
+func (id Identifier) Value() []byte { return bytes.Clone(id.value) }
+
 // Uint32 returns the numeric value of the identifier.
 func (id Identifier) Uint32() (uint32, error) {
-	if id.Kind != NumericId || id.Length != 4 {
+	if id.kind != NumericId || id.length != 4 {
 		return 0, ierror.ErrResourceNotFound
 	}
 
-	return binary.LittleEndian.Uint32(id.Value), nil
+	return binary.LittleEndian.Uint32(id.value), nil
 }
 
 // String returns the string value of the identifier.
 func (id Identifier) String() (string, error) {
-	if id.Kind != StringId {
+	if id.kind != StringId {
 		return "", ierror.ErrInvalidIdentifier
 	}
 
-	return string(id.Value), nil
+	return string(id.value), nil
 }
 
 func (id Identifier) MarshalBinary() ([]byte, error) {
@@ -105,22 +115,17 @@ func (id Identifier) MarshalBinary() ([]byte, error) {
 }
 
 func (id Identifier) AppendBinary(b []byte) ([]byte, error) {
-	if len(id.encoded) > 0 {
-		return append(b, id.encoded...), nil
-	}
-	b = append(b, byte(id.Kind), byte(id.Length))
-	b = append(b, id.Value...)
-	return b, nil
+	return append(b, id.encoded...), nil
 }
 
 func MarshalIdentifiers(identifiers ...Identifier) ([]byte, error) {
 	size := 0
-	for i := 0; i < len(identifiers); i++ {
-		size += 2 + identifiers[i].Length
+	for i := range identifiers {
+		size += len(identifiers[i].encoded)
 	}
 	bytes := make([]byte, 0, size)
 
-	for i := 0; i < len(identifiers); i++ {
+	for i := range identifiers {
 		var err error
 		bytes, err = identifiers[i].AppendBinary(bytes)
 		if err != nil {
