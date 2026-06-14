@@ -414,17 +414,6 @@ func (c *IggyTcpClient) invalidateConnLocked() {
 	c.state = iggcon.StateDisconnected
 }
 
-// createPayload builds wire-format request bytes; the hot path uses
-// encodeWireRequest with a pooled buffer instead.
-func createPayload(message []byte, command command.Code) []byte {
-	messageLength := len(message) + 4
-	messageBytes := make([]byte, RequestInitialBytesLength+messageLength)
-	binary.LittleEndian.PutUint32(messageBytes[:4], uint32(messageLength))
-	binary.LittleEndian.PutUint32(messageBytes[4:8], uint32(command))
-	copy(messageBytes[8:], message)
-	return messageBytes
-}
-
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()

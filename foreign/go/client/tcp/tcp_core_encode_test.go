@@ -62,51 +62,49 @@ func newTestPollCmd() *command.PollMessages {
 	}
 }
 
-func TestEncodeWireRequest_AppenderPathMatchesCreatePayload(t *testing.T) {
+func TestEncodeWireRequest_AppenderPathMatchesFallback(t *testing.T) {
 	cmd := newTestPollCmd()
 
-	// reference: the legacy MarshalBinary + createPayload pipeline.
 	body, err := cmd.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := createPayload(body, cmd.Code())
+	// Force the same logical request down the MarshalBinary fallback;
+	// the AppendBinary fast path must produce identical wire bytes.
+	fallback := &fakeMarshalOnlyCmd{body: body, code: cmd.Code()}
+	want, err := encodeWireRequest(make([]byte, 0, 256), fallback)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// new path through encodeWireRequest, simulating a pool buffer.
-	buf := make([]byte, 0, 256)
-	got, err := encodeWireRequest(buf, cmd)
+	got, err := encodeWireRequest(make([]byte, 0, 256), cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if !bytes.Equal(got, want) {
-		t.Fatalf("wire bytes diverge\nwant: %v\n got: %v", want, got)
-	}
-	// length header = body + 4-byte command code
-	gotLen := binary.LittleEndian.Uint32(got[:4])
-	if int(gotLen) != len(body)+4 {
-		t.Errorf("length header = %d, want %d", gotLen, len(body)+4)
-	}
-	gotCode := binary.LittleEndian.Uint32(got[4:8])
-	if command.Code(gotCode) != cmd.Code() {
-		t.Errorf("code header = %d, want %d", gotCode, cmd.Code())
+		t.Fatalf("fast path diverges from MarshalBinary fallback\nwant: %v\n got: %v", want, got)
 	}
 }
 
-func TestEncodeWireRequest_FallbackPathMatchesCreatePayload(t *testing.T) {
+func TestEncodeWireRequest_FallbackPathMatchesWireSpec(t *testing.T) {
 	cmd := &fakeMarshalOnlyCmd{
 		body: []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03},
 		code: command.Code(42),
 	}
-	want := createPayload(cmd.body, cmd.code)
+	// Wire spec: [length-le32][code-le32][body].
+	want := []byte{
+		0x0B, 0x00, 0x00, 0x00, // length = 11 (7-byte body + 4-byte code)
+		0x2A, 0x00, 0x00, 0x00, // code = 42
+		0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, // body
+	}
 
-	buf := make([]byte, 0, 256)
-	got, err := encodeWireRequest(buf, cmd)
+	got, err := encodeWireRequest(make([]byte, 0, 256), cmd)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, want) {
-		t.Fatalf("fallback bytes diverge\nwant: %v\n got: %v", want, got)
+		t.Fatalf("fallback bytes diverge from wire spec\nwant: %v\n got: %v", want, got)
 	}
 }
 
