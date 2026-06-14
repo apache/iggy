@@ -6943,6 +6943,7 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "opensearch",
+ "rmp-serde",
  "secrecy",
  "serde",
  "serde_json",

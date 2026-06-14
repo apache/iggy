@@ -571,3 +571,118 @@ impl Source for OpenSearchSource {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> OpenSearchSourceConfig {
+        OpenSearchSourceConfig {
+            url: "http://localhost:9200".to_string(),
+            index: "test_documents".to_string(),
+            username: None,
+            password: None,
+            query: None,
+            polling_interval: Some("100ms".to_string()),
+            batch_size: Some(10),
+            timestamp_field: Some("timestamp".to_string()),
+            scroll_timeout: None,
+            state: None,
+        }
+    }
+
+    fn test_state() -> State {
+        State {
+            last_poll_timestamp: None,
+            total_documents_fetched: 500,
+            poll_count: 5,
+            last_document_id: Some("doc_42".to_string()),
+            last_scroll_id: None,
+            last_offset: Some(500),
+            error_count: 1,
+            last_error: Some("connection reset".to_string()),
+            processing_stats: ProcessingStats {
+                total_bytes_processed: 1024,
+                avg_batch_processing_time_ms: 12.5,
+                last_successful_poll: None,
+                empty_polls_count: 2,
+                successful_polls_count: 5,
+            },
+        }
+    }
+
+    #[test]
+    fn given_persisted_state_should_restore_total_documents_fetched() {
+        let state = test_state();
+        let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
+        let connector_state = ConnectorState(serialized);
+
+        let source = OpenSearchSource::new(1, test_config(), Some(connector_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let restored = source.state.lock().await;
+            assert_eq!(restored.total_documents_fetched, 500);
+            assert_eq!(restored.poll_count, 5);
+            assert_eq!(restored.last_document_id, Some("doc_42".to_string()));
+        });
+    }
+
+    #[test]
+    fn given_no_state_should_start_fresh() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert_eq!(state.total_documents_fetched, 0);
+            assert_eq!(state.poll_count, 0);
+            assert_eq!(state.last_document_id, None);
+        });
+    }
+
+    #[test]
+    fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let source = OpenSearchSource::new(1, test_config(), Some(invalid_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert_eq!(state.total_documents_fetched, 0);
+            assert_eq!(state.poll_count, 0);
+        });
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = test_state();
+
+        let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
+        let deserialized: State =
+            rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(
+            original.total_documents_fetched,
+            deserialized.total_documents_fetched
+        );
+        assert_eq!(original.poll_count, deserialized.poll_count);
+        assert_eq!(original.last_document_id, deserialized.last_document_id);
+        assert_eq!(original.error_count, deserialized.error_count);
+    }
+
+    #[test]
+    fn serialize_state_helper_should_produce_valid_connector_state() {
+        let source = OpenSearchSource::new(1, test_config(), None);
+        let state = test_state();
+
+        let connector_state = source.serialize_state(&state);
+        assert!(connector_state.is_some());
+
+        let restored: State = connector_state
+            .unwrap()
+            .deserialize(CONNECTOR_NAME, 1)
+            .expect("Failed to deserialize state");
+        assert_eq!(restored.total_documents_fetched, 500);
+    }
+}
