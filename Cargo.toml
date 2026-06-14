@@ -45,6 +45,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/opensearch_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -206,6 +207,7 @@ nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.51.0"
 once_cell = "1.21.4"
+opensearch = { version = "2.4.0", features = ["rustls-tls"], default-features = false }
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [
