@@ -29,6 +29,10 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
+// emptyWireReq is an 8-byte wire payload for a zero-code request with empty body:
+// [length-le32=4][code-le32=0]. Reused across tests that don't care about the body.
+var emptyWireReq = []byte{4, 0, 0, 0, 0, 0, 0, 0}
+
 // newTestClient creates an IggyTcpClient backed by an in-memory net.Pipe connection.
 // Returns the client and the server-side end of the pipe; caller must close the server conn.
 func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
@@ -55,7 +59,7 @@ func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 
 func TestSendAndFetchResponse_NilContext(t *testing.T) {
 	c, _ := newTestClient(t)
-	_, err := c.sendWireAndFetchResponse(nil, []byte{4, 0, 0, 0, 0, 0, 0, 0}) //nolint:staticcheck
+	_, err := c.sendWireAndFetchResponse(nil, emptyWireReq) //nolint:staticcheck
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -94,7 +98,7 @@ func TestSendAndFetchResponse_ContextErrors(t *testing.T) {
 
 			// server does not respond, but it doesn't matter.
 			// ctx.Err() should fire before any I/O is attempted.
-			_, err := c.sendWireAndFetchResponse(tt.ctx, []byte{4, 0, 0, 0, 0, 0, 0, 0})
+			_, err := c.sendWireAndFetchResponse(tt.ctx, emptyWireReq)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -113,7 +117,7 @@ func TestSendAndFetchResponse_DeadlineTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	_, err := c.sendWireAndFetchResponse(ctx, []byte{4, 0, 0, 0, 0, 0, 0, 0})
+	_, err := c.sendWireAndFetchResponse(ctx, emptyWireReq)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
@@ -141,7 +145,7 @@ func TestSendAndFetchResponse_CancelDuringIO(t *testing.T) {
 	}()
 
 	// Server does not respond, so the client blocks until the context is cancelled.
-	_, err := c.sendWireAndFetchResponse(ctx, []byte{4, 0, 0, 0, 0, 0, 0, 0})
+	_, err := c.sendWireAndFetchResponse(ctx, emptyWireReq)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -196,7 +200,7 @@ func TestSendAndFetchResponse_ErrorStatus(t *testing.T) {
 
 	go serverRespond(t, serverConn, uint32(ierror.UnauthenticatedCode), nil)
 
-	_, err := c.sendWireAndFetchResponse(context.Background(), []byte{4, 0, 0, 0, 0, 0, 0, 0})
+	_, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -216,7 +220,7 @@ func TestSendAndFetchResponse_SuccessEmptyBody(t *testing.T) {
 
 	go serverRespond(t, serverConn, 0, nil)
 
-	result, err := c.sendWireAndFetchResponse(context.Background(), []byte{4, 0, 0, 0, 0, 0, 0, 0})
+	result, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -234,7 +238,7 @@ func TestSendAndFetchResponse_SuccessWithBody(t *testing.T) {
 	body := []byte("hello iggy")
 	go serverRespond(t, serverConn, 0, body)
 
-	result, err := c.sendWireAndFetchResponse(context.Background(), []byte{4, 0, 0, 0, 0, 0, 0, 0})
+	result, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
