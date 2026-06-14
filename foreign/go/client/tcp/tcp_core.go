@@ -24,6 +24,7 @@ import (
 	"encoding"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -52,6 +53,7 @@ type IggyTcpClient struct {
 	conn                   net.Conn
 	mtx                    sync.Mutex
 	config                 config
+	logger                 *slog.Logger
 	MessageCompression     iggcon.IggyMessageCompression
 	leaderRedirectionState iggcon.LeaderRedirectionState
 	clientAddress          string
@@ -198,7 +200,10 @@ func WithTLSValidateCertificate(validate bool) TLSOption {
 
 // NewIggyTcpClient creates a new Iggy TCP client with the given options.
 // warning: don't use this function directly, use iggycli.NewIggyClient with iggycli.WithTcp instead.
-func NewIggyTcpClient(options ...Option) *IggyTcpClient {
+func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	opts := GetDefaultOptions()
 	for _, opt := range options {
 		if opt != nil {
@@ -208,6 +213,7 @@ func NewIggyTcpClient(options ...Option) *IggyTcpClient {
 
 	return &IggyTcpClient{
 		config:                 opts.config,
+		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
 		state:                  iggcon.StateDisconnected,

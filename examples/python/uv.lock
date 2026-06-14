@@ -27,8 +27,8 @@ requires-dist = [
     { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.0,<3.0" },
     { name = "pytest-xdist", marker = "extra == 'all'", specifier = ">=3.0,<4.0" },
     { name = "pytest-xdist", marker = "extra == 'testing'", specifier = ">=3.0,<4.0" },
-    { name = "ruff", marker = "extra == 'all'", specifier = ">=0.15.15,<1.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.15,<1.0" },
+    { name = "ruff", marker = "extra == 'all'", specifier = ">=0.1.0,<1.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0,<1.0" },
     { name = "testcontainers", marker = "extra == 'all'", specifier = ">=3.7.0,<5.0" },
     { name = "testcontainers", marker = "extra == 'testing-docker'", specifier = ">=3.7.0,<5.0" },
 ]

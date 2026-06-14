@@ -57,7 +57,7 @@
 #       Darwin, MinGW, and NonStop.
 #
 #   (3) This script is generated from the Groovy template
-#       https://github.com/gradle/gradle/blob/HEAD/platforms/jvm/plugins-application/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
+#       https://github.com/gradle/gradle/blob/3d91ce3b8caaf77ad09f381f43615b715b53f72c/platforms/jvm/plugins-application/src/main/resources/org/gradle/api/internal/plugins/unixStartScript.txt
 #       within the Gradle project.
 #
 #       You can find Gradle at https://github.com/gradle/gradle/.
@@ -112,10 +112,10 @@ die () {
 #
 ##############################################################################
 
-GRADLE_WRAPPER_VERSION=9.3.1
-REQUIRED_WRAPPER_JAR_CHECKSUM="b3a875ddc1f044746e1b1a55f645584505f4a10438c1afea9f15e92a7c42ec13"
+GRADLE_WRAPPER_VERSION=9.5.1
+REQUIRED_WRAPPER_JAR_CHECKSUM="497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7"
 
-for attempt in 1 2 3; do
+for _ in 1 2 3; do
     if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
         if ! curl -s -S --retry 3 -L -o "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" "https://raw.githubusercontent.com/gradle/gradle/v$GRADLE_WRAPPER_VERSION/gradle/wrapper/gradle-wrapper.jar"; then
             rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"

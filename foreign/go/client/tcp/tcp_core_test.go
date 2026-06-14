@@ -18,10 +18,13 @@
 package tcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,8 +42,9 @@ func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 	t.Helper()
 	serverConn, clientConn := net.Pipe()
 	c := &IggyTcpClient{
-		conn:  clientConn,
-		state: iggcon.StateConnected,
+		conn:   clientConn,
+		state:  iggcon.StateConnected,
+		logger: slog.New(slog.DiscardHandler),
 	}
 	t.Cleanup(func() {
 		err := clientConn.Close()
@@ -247,5 +251,24 @@ func TestSendAndFetchResponse_SuccessWithBody(t *testing.T) {
 	}
 	if c.state != iggcon.StateConnected {
 		t.Errorf("expected state %v, got %v", iggcon.StateConnected, c.state)
+	}
+}
+
+func TestNewIggyTcpClient_StoresProvidedLogger(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	c := NewIggyTcpClient(logger)
+
+	c.logger.Info("transport probe", "source", "tcp")
+
+	output := buf.String()
+	if !strings.Contains(output, "transport probe") {
+		t.Errorf("expected logger output to contain 'transport probe', got: %q", output)
+	}
+	if !strings.Contains(output, "source=tcp") {
+		t.Errorf("expected logger output to contain 'source=tcp', got: %q", output)
 	}
 }

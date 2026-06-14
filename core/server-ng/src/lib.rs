@@ -22,6 +22,8 @@ pub mod bootstrap;
 pub mod config_writer;
 pub mod dispatch;
 pub mod login_register;
+pub mod partition_helpers;
+pub mod partition_reconciler;
 pub mod pat;
 pub mod responses;
 pub mod server_error;

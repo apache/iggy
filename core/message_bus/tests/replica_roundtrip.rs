@@ -53,6 +53,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
             CLUSTER,
             1,
             2,
+            None,
             accept_delegate_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -75,6 +76,8 @@ async fn two_replicas_exchange_prepare_and_ack() {
         CLUSTER,
         0,
         vec![(1, addr1)],
+        None,
+        Duration::from_secs(5),
         dial_delegate_0,
         DEFAULT_RECONNECT_PERIOD,
     )
