@@ -74,7 +74,7 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
 /// pump), preventing concurrent access from independent async tasks.
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
-    B: MessageBus + ConnectionInstaller,
+    B: MessageBus + ConnectionInstaller + 'static,
     T: ShardsTable,
 {
     /// Network-receive entry point. Classifies the raw
@@ -233,7 +233,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
@@ -259,6 +259,8 @@ where
                             if self.accept_frame_for_self(&frame) {
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                                // Tail drain catches reconcile ops whose marker was dropped.
+                                self.apply_reconcile_ops();
                             }
                         }
                         Err(_) => break,
@@ -273,6 +275,7 @@ where
                 self.process_frame(frame).await;
                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
                     .await;
+                self.apply_reconcile_ops();
             }
         }
     }
@@ -313,7 +316,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn process_frame(&self, frame: ShardFrame)
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
@@ -337,7 +340,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
     {
         match payload {
             LifecycleFrame::ReplicaConnectionSetup { fd, replica_id } => {
@@ -398,6 +401,45 @@ where
                         "forward-client-send delivery failed"
                     );
                 }
+            }
+            LifecycleFrame::MetadataSubmit(submit) => {
+                // Only shard 0 owns the metadata consensus group, and
+                // `forward_metadata_submit` always addresses shard 0, so a
+                // non-zero shard here is a routing bug. The handler (wired
+                // by server-ng) replies `None` on the carried sender if it
+                // cannot submit, so the awaiting peer never blocks forever.
+                debug_assert_eq!(
+                    self.id, 0,
+                    "MetadataSubmit must only be processed on shard 0"
+                );
+                (self.on_metadata_submit)(submit);
+            }
+            LifecycleFrame::ListClients { reply } => {
+                // Every shard handles this (not shard-0-only): each replies
+                // with the clients whose connections it homes. The handler
+                // (wired by server-ng) reads this shard's `SessionManager`
+                // and pushes the list over `reply`.
+                (self.on_list_clients)(reply);
+            }
+            LifecycleFrame::MetadataCommitTick => {
+                // Reconciler may not yet be wired (e.g. mid-bootstrap, or
+                // single-shard tests that never enable the reconciler loop).
+                // Count the drop so operators can detect a stuck handler
+                // slot; the reconciler also runs a periodic tick that
+                // recovers any missed wake-up.
+                if !self.dispatch_metadata_commit_tick() {
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::METADATA_COMMIT_TICK,
+                        frame_drop_reason::UNROUTABLE,
+                    );
+                    tracing::trace!(
+                        shard = self.id,
+                        "metadata commit tick received before reconciler handler installed; dropping"
+                    );
+                }
+            }
+            LifecycleFrame::ReconcileApply => {
+                self.apply_reconcile_ops();
             }
         }
     }

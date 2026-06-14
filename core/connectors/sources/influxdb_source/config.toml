@@ -30,6 +30,7 @@ schema = "json"
 batch_length = 100
 
 [plugin_config]
+version = "v2"
 url = "http://localhost:8086"
 org = "iggy"
 token = "replace-with-token"

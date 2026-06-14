@@ -51,6 +51,7 @@ async fn lower_id_dials_higher_id_accepts() {
             CLUSTER,
             0,
             2,
+            None,
             accept_0,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -68,6 +69,7 @@ async fn lower_id_dials_higher_id_accepts() {
             CLUSTER,
             1,
             2,
+            None,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -85,12 +87,24 @@ async fn lower_id_dials_higher_id_accepts() {
         CLUSTER,
         0,
         peers.clone(),
+        None,
+        Duration::from_secs(5),
         dial_0,
         DEFAULT_RECONNECT_PERIOD,
     )
     .await;
     let dial_1 = install_replicas_locally(bus1.clone(), on_message.clone());
-    start_connector(&bus1, CLUSTER, 1, peers, dial_1, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus1,
+        CLUSTER,
+        1,
+        peers,
+        None,
+        Duration::from_secs(5),
+        dial_1,
+        DEFAULT_RECONNECT_PERIOD,
+    )
+    .await;
 
     // Wait for the directional connection to settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

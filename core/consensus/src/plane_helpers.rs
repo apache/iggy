@@ -454,6 +454,8 @@ mod tests {
     struct NoopBus;
 
     impl MessageBus for NoopBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             _client_id: u128,
@@ -661,6 +663,8 @@ mod tests {
 
     #[allow(clippy::future_not_send)]
     impl MessageBus for SpyBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             _client_id: u128,

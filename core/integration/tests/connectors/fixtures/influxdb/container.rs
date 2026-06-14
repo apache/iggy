@@ -1,22 +1,21 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
@@ -27,7 +26,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tracing::info;
 
-const INFLUXDB_IMAGE: &str = "influxdb";
+const INFLUXDB_IMAGE: &str = "docker.io/library/influxdb";
 const INFLUXDB_TAG: &str = "2.7-alpine";
 const INFLUXDB_PORT: u16 = 8086;
 
@@ -46,6 +45,9 @@ pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
 
 // ── env-var keys injected into the connectors runtime ────────────────────────
+
+pub const ENV_SOURCE_VERSION: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_VERSION";
+pub const ENV_SINK_VERSION: &str = "IGGY_CONNECTORS_SINK_INFLUXDB_PLUGIN_CONFIG_VERSION";
 
 pub const ENV_SOURCE_URL: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_URL";
 pub const ENV_SOURCE_ORG: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_ORG";
@@ -114,6 +116,7 @@ impl InfluxDbContainer {
                 .with_env_var("DOCKER_INFLUXDB_INIT_ORG", INFLUXDB_ORG)
                 .with_env_var("DOCKER_INFLUXDB_INIT_BUCKET", INFLUXDB_BUCKET)
                 .with_env_var("DOCKER_INFLUXDB_INIT_ADMIN_TOKEN", INFLUXDB_TOKEN)
+                .with_container_name(fixtures::unique_container_name("influxdb"))
                 .start()
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {
@@ -121,14 +124,16 @@ impl InfluxDbContainer {
                     message: format!("Failed to start container: {e}"),
                 })?;
 
-        let mapped_port = container
+        let ports = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDbContainer".to_string(),
                 message: format!("Failed to get ports: {e}"),
-            })?
+            })?;
+        let mapped_port = ports
             .map_to_host_port_ipv4(INFLUXDB_PORT)
+            .or_else(|| ports.map_to_host_port_ipv6(INFLUXDB_PORT))
             .ok_or_else(|| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDbContainer".to_string(),
                 message: "No mapping for InfluxDB port".to_string(),

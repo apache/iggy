@@ -68,6 +68,7 @@ run_suite(){
 case "$SDK" in
   rust)     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
   python)   run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
+  php)      run_suite php-bdd    "🐘"   "Running PHP BDD tests"    ;;
   go)       run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
   go-race)
     export GO_TEST_EXTRA_FLAGS="-race"
@@ -79,6 +80,7 @@ case "$SDK" in
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
+    run_suite php-bdd    "🐘"   "Running PHP BDD tests"                        || exit $?
     run_suite go-bdd     "🐹"   "Running Go BDD tests"                         || exit $?
     GO_TEST_EXTRA_FLAGS="-race" \
     run_suite go-bdd     "🐹⚡" "Running Go BDD tests with data race detector"  || exit $?
@@ -90,7 +92,7 @@ case "$SDK" in
     cleanup; exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [--coverage] [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
+    log "📖 Usage: $0 [--coverage] [rust|python|php|go|go-race|node|csharp|java|all|clean] [feature_file]"
     exit 2 ;;
 esac
 

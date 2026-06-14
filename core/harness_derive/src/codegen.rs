@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::attrs::{ConfigOverride, IggyTestAttrs, TlsMode, Transport};
 use crate::params::{
@@ -125,6 +124,18 @@ fn generate_variants(attrs: &IggyTestAttrs) -> Vec<TestVariant> {
     variants
 }
 
+/// HTTP is not served by the next-gen (VSR) server, so HTTP transport variants
+/// must not compile into the test binary under `--features vsr`. The proc macro
+/// cannot read the consuming crate's feature flags at expansion time, so it
+/// emits this `cfg` gate on HTTP variants; the `integration` crate resolves it.
+fn vsr_transport_cfg(transport: Transport) -> TokenStream {
+    if matches!(transport, Transport::Http) {
+        quote!(#[cfg(not(feature = "vsr"))])
+    } else {
+        quote!()
+    }
+}
+
 /// Generate test code from attributes and input function.
 pub fn generate_tests(attrs: &IggyTestAttrs, input: &ItemFn) -> syn::Result<TokenStream> {
     let fn_name = &input.sig.ident;
@@ -189,8 +200,10 @@ fn generate_single_test(
     let fixture_seed = generate_fixture_seed(params);
     let start_and_seed = generate_start_and_seed(attrs, fixture_seed);
     let harness_param_bindings = generate_harness_param_bindings(params);
+    let vsr_cfg = vsr_transport_cfg(variant.transport);
 
     Ok(quote! {
+        #vsr_cfg
         #(#other_attrs)*
         #[::tokio::test]
         #[::serial_test::parallel]
@@ -231,8 +244,10 @@ fn generate_test_module(
         let test_name = format_ident!("{}", variant.suffix());
         let harness_setup = generate_harness_setup(variant, has_fixtures, attrs);
         let start_and_seed = generate_start_and_seed(attrs, fixture_seed.clone());
+        let vsr_cfg = vsr_transport_cfg(variant.transport);
 
         test_fns.push(quote! {
+            #vsr_cfg
             #(#other_attrs)*
             #[::tokio::test]
             #[::serial_test::parallel]
@@ -302,8 +317,10 @@ fn generate_impl_functions_for_test_matrix(
     if variants.len() == 1 {
         let variant = &variants[0];
         let harness_setup = generate_harness_setup(variant, has_fixtures, attrs);
+        let vsr_cfg = vsr_transport_cfg(variant.transport);
 
         return Ok(quote! {
+            #vsr_cfg
             #(#other_attrs)*
             #[::tokio::test]
             #[::serial_test::parallel]
@@ -328,8 +345,10 @@ fn generate_impl_functions_for_test_matrix(
     for variant in variants {
         let impl_name = format_ident!("__impl_{}", variant.suffix());
         let harness_setup = generate_harness_setup(variant, has_fixtures, attrs);
+        let vsr_cfg = vsr_transport_cfg(variant.transport);
 
         impl_fns.push(quote! {
+            #vsr_cfg
             async fn #impl_name(#(#param_names: #param_types),*) {
                 #fixture_setup
                 #fixture_envs
@@ -346,6 +365,7 @@ fn generate_impl_functions_for_test_matrix(
 
         let test_name = format_ident!("{}", variant.suffix());
         test_fn_calls.push(quote! {
+            #vsr_cfg
             #(#other_attrs)*
             #[::tokio::test]
             #[::serial_test::parallel]

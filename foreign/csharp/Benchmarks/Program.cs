@@ -51,8 +51,8 @@ for (var i = 0; i < producerCount; i++)
         ReceiveBufferSize = int.MaxValue,
         SendBufferSize = int.MaxValue,
 #elif OS_MAC
-		ReceiveBufferSize = 7280*1024,
-		SendBufferSize = 7280*1024,
+        ReceiveBufferSize = 7280 * 1024,
+        SendBufferSize = 7280 * 1024,
 #endif
     });
 

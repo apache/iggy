@@ -45,7 +45,7 @@ pub use command::Command2;
 pub use error::ConsensusError;
 pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
-    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
-    SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader, read_size_field,
+    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN, ReplyHeader,
+    RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader, read_size_field,
 };
 pub use operation::Operation;

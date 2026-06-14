@@ -48,6 +48,10 @@ impl IndexWriter {
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
         opts.create(true).write(true);
+        // Mirror MessagesWriter: truncate on fresh-build retry.
+        if !file_exists {
+            opts.truncate(true);
+        }
         let file = opts
             .open(file_path)
             .await

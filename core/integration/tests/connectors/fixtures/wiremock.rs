@@ -1,22 +1,21 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+use crate::connectors::fixtures;
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
@@ -26,7 +25,7 @@ use testcontainers_modules::testcontainers::core::{IntoContainerPort, Mount};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-const WIREMOCK_IMAGE: &str = "wiremock/wiremock";
+const WIREMOCK_IMAGE: &str = "docker.io/wiremock/wiremock";
 const WIREMOCK_TAG: &str = "3.13.2";
 const WIREMOCK_PORT: u16 = 8080;
 
@@ -62,6 +61,7 @@ impl WireMockContainer {
                     .to_string(),
                 "/home/wiremock/__files",
             ))
+            .with_container_name(fixtures::unique_container_name("wiremock"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {

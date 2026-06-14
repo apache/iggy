@@ -14,14 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-//! End-to-end bootstrap: `replica::io::start_on_shard_zero` binds the
-//! TCP-TLS plane (alongside replica + client TCP listeners) and the
-//! caller dials the listener address surfaced via
-//! [`message_bus::replica::io::BoundPlanes::tcp_tls`]. Mirrors the
-//! `tcp_tls_client_listener.rs` listener-level test one level up the
-//! stack: the validator, paired-presence trio, and `BoundPlanes`
-//! growth all participate.
 
 mod common;
 
@@ -91,6 +83,7 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
         CLUSTER,
         0,
         1,
+        None,
         vec![],
         accepted_replica,
         accepted_client,

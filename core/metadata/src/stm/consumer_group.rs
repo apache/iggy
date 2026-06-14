@@ -22,9 +22,12 @@ use bytes::Bytes;
 
 use ahash::AHashMap;
 use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
+use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -164,9 +167,9 @@ impl ConsumerGroups {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. assigned group ID) instead of empty Bytes.
 impl StateHandler for CreateConsumerGroupRequest {
     type State = ConsumerGroupsInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(
         &self,
         state: &mut ConsumerGroupsInner,
@@ -199,7 +202,20 @@ impl StateHandler for CreateConsumerGroupRequest {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             state.topic_name_index.entry(key).or_default().push(id);
         }
-        Bytes::new()
+
+        // Reply body: the SDK `create_consumer_group` decodes a
+        // `ConsumerGroupDetailsResponse`. A freshly created group has no
+        // assigned partitions and no joined members yet.
+        ConsumerGroupDetailsResponse {
+            group: ConsumerGroupResponse {
+                id: id as u32,
+                partitions_count: 0,
+                members_count: 0,
+                name: self.name.clone(),
+            },
+            members: Vec::new(),
+        }
+        .to_bytes()
     }
 }
 

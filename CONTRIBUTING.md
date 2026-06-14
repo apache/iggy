@@ -10,10 +10,6 @@ PRs without one may be closed at maintainer's discretion.
     - Maintainer may request for more details or a different approach
 3. Then code
 
-## Size Limits
-
-For new contributors we require to keep PRs under 500 lines of code, unless explicitly approved by a maintainer under linked issue.
-
 ## High-Risk Areas
 
 These require design discussion in the issue before coding:
@@ -69,6 +65,16 @@ typos --write-changes
 
 If it's indeed not a typo, you can set an exception in `.typos.toml`.
 
+### License Header Checks
+
+We use [HawkEye](https://github.com/korandoru/hawkeye):
+
+```bash
+cargo install hawkeye --version "$(cat .github/config/hawkeye.version)" --locked
+./scripts/ci/license-headers.sh --check
+./scripts/ci/license-headers.sh --fix
+```
+
 ### Pre-commit Hooks
 
 We use [prek](https://github.com/j178/prek):
@@ -113,11 +119,11 @@ Keep subject under 72 chars. Use body for details if needed.
 Move a PR around the review queue by posting a slash command on its own
 line in a regular PR comment (not an inline review reply):
 
-| Command | Who | Effect |
-| --- | --- | --- |
-| `/ready` | author or maintainer | mark `S-waiting-on-review` |
-| `/author` | maintainer or returning contributor | mark `S-waiting-on-author` |
-| `/request-review @user-or-team ...` | author or maintainer | request review from the listed `@user` / `@org/team` handles |
+| Command                             | Who                                 | Effect                                                       |
+| ----------------------------------- | ----------------------------------- | ------------------------------------------------------------ |
+| `/ready`                            | author or maintainer                | mark `S-waiting-on-review`                                   |
+| `/author`                           | maintainer or returning contributor | mark `S-waiting-on-author`                                   |
+| `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
 
 Some labels move on their own: opening or marking a non-draft PR ready sets
 `S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;

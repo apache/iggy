@@ -175,7 +175,7 @@ setup. Set `IGGY_TLS_CONNECTION_STRING` to enable TLS connection tests. Set
 TLS connection strings use the Rust SDK connection-string format, for example:
 
 ```text
-iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&domain=localhost&ca_file=/path/to/ca.pem
+iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/path/to/ca.pem
 ```
 
 ## API Notes
