@@ -101,11 +101,7 @@ func (id Identifier) String() (string, error) {
 }
 
 func (id Identifier) MarshalBinary() ([]byte, error) {
-	bytes := make([]byte, id.Length+2)
-	bytes[0] = byte(id.Kind)
-	bytes[1] = byte(id.Length)
-	copy(bytes[2:], id.Value)
-	return bytes, nil
+	return id.AppendBinary(nil)
 }
 
 func (id Identifier) AppendBinary(b []byte) ([]byte, error) {
