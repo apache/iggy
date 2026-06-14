@@ -53,6 +53,7 @@ const ENV_SINK_PLUGIN_FILE_ROTATION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONF
 const ENV_SINK_PLUGIN_MAX_MESSAGES: &str =
     "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_MAX_MESSAGES_PER_FILE";
 
+const DEFAULT_MAX_MESSAGES_PER_FILE: usize = 5;
 const POLL_ATTEMPTS: usize = 30;
 const POLL_INTERVAL_MS: u64 = 500;
 
@@ -263,6 +264,14 @@ impl TestFixture for S3SinkFixture {
         envs.insert(
             ENV_SINK_PLUGIN_SECRET_KEY.to_string(),
             MINIO_SECRET_KEY.to_string(),
+        );
+        envs.insert(
+            ENV_SINK_PLUGIN_FILE_ROTATION.to_string(),
+            "messages".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_PLUGIN_MAX_MESSAGES.to_string(),
+            DEFAULT_MAX_MESSAGES_PER_FILE.to_string(),
         );
         envs
     }
