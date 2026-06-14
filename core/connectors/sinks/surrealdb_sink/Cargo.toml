@@ -46,4 +46,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 simd-json = { workspace = true }
-toml = { workspace = true }
