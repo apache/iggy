@@ -1,13 +1,46 @@
 {
     "name": "apache/iggy-php",
     "description": "PHP extension bindings for Apache Iggy.",
+    "type": "php-ext",
     "license": "Apache-2.0",
-    "type": "library",
+    "homepage": "https://iggy.apache.org",
+    "keywords": [
+        "apache",
+        "iggy",
+        "messaging",
+        "streaming",
+        "message-streaming",
+        "event-streaming",
+        "php-extension",
+        "rust-extension"
+    ],
+    "authors": [
+        {
+            "name": "Apache Iggy (Incubating) Contributors",
+            "homepage": "https://iggy.apache.org"
+        }
+    ],
+    "support": {
+        "chat": "https://discord.gg/apache-iggy",
+        "docs": "https://iggy.apache.org/docs/",
+        "issues": "https://github.com/apache/iggy/issues",
+        "source": "https://github.com/apache/iggy/tree/master/foreign/php"
+    },
     "require": {
         "php": ">=8.3"
     },
     "require-dev": {
         "phpunit/phpunit": "^10.5"
+    },
+    "php-ext": {
+        "extension-name": "iggy_php",
+        "support-zts": false,
+        "support-nts": true,
+        "configure-options": [],
+        "download-url-method": [
+            "pre-packaged-binary",
+            "composer-default"
+        ]
     },
     "scripts": {
         "test": "phpunit"

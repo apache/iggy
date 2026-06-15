@@ -51,6 +51,11 @@ impl MessagesWriter {
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
         opts.create(true).write(true);
+        // `file_exists = false` asserts a fresh start; truncate so a
+        // stale file from a partial prior attempt doesn't survive.
+        if !file_exists {
+            opts.truncate(true);
+        }
         let file = opts
             .open(file_path)
             .await

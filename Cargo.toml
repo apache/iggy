@@ -336,6 +336,7 @@ wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }
+zeroize = "1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]

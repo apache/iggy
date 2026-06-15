@@ -30,6 +30,17 @@ pub trait ShardsTable {
     /// namespace is not yet registered (partition not created or update
     /// hasn't propagated).
     fn shard_for(&self, namespace: IggyNamespace) -> Option<u16>;
+
+    /// Epoch (`Partition::created_revision`) stored on the row, if any.
+    /// The reconciler compares it to the committed value to detect a
+    /// stale local partition after slab-key reuse.
+    fn epoch_for(&self, namespace: IggyNamespace) -> Option<u64>;
+
+    fn insert(&self, namespace: IggyNamespace, location: PartitionLocation);
+
+    fn remove(&self, namespace: &IggyNamespace) -> Option<PartitionLocation>;
+
+    fn namespaces(&self) -> Vec<IggyNamespace>;
 }
 
 /// Always-`None` impl. Satisfies the trait for test / simulator paths
@@ -40,6 +51,20 @@ pub trait ShardsTable {
 impl ShardsTable for () {
     fn shard_for(&self, _namespace: IggyNamespace) -> Option<u16> {
         None
+    }
+
+    fn epoch_for(&self, _namespace: IggyNamespace) -> Option<u64> {
+        None
+    }
+
+    fn insert(&self, _namespace: IggyNamespace, _location: PartitionLocation) {}
+
+    fn remove(&self, _namespace: &IggyNamespace) -> Option<PartitionLocation> {
+        None
+    }
+
+    fn namespaces(&self) -> Vec<IggyNamespace> {
+        Vec::new()
     }
 }
 
@@ -68,21 +93,32 @@ impl PapayaShardsTable {
             inner: papaya::HashMap::with_capacity(capacity),
         }
     }
-
-    pub fn insert(&self, namespace: IggyNamespace, location: PartitionLocation) {
-        self.inner.pin().insert(namespace, location);
-    }
-
-    pub fn remove(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
-        let guard = self.inner.guard();
-        self.inner.remove(namespace, &guard).copied()
-    }
 }
 
 impl ShardsTable for PapayaShardsTable {
     fn shard_for(&self, namespace: IggyNamespace) -> Option<u16> {
         let guard = self.inner.guard();
         self.inner.get(&namespace, &guard).map(|loc| *loc.shard_id)
+    }
+
+    fn epoch_for(&self, namespace: IggyNamespace) -> Option<u64> {
+        let guard = self.inner.guard();
+        self.inner.get(&namespace, &guard).map(|loc| loc.epoch)
+    }
+
+    fn insert(&self, namespace: IggyNamespace, location: PartitionLocation) {
+        self.inner.pin().insert(namespace, location);
+    }
+
+    fn remove(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
+        let guard = self.inner.guard();
+        self.inner.remove(namespace, &guard).copied()
+    }
+
+    /// Snapshot: papaya guards cannot escape the call site.
+    fn namespaces(&self) -> Vec<IggyNamespace> {
+        let guard = self.inner.guard();
+        self.inner.iter(&guard).map(|(ns, _)| *ns).collect()
     }
 }
 

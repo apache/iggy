@@ -60,6 +60,7 @@ async fn try_send_returns_backpressure_when_queue_full() {
             CLUSTER,
             1,
             2,
+            None,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             Duration::from_secs(10),
@@ -76,6 +77,8 @@ async fn try_send_returns_backpressure_when_queue_full() {
         CLUSTER,
         0,
         vec![(1, addr1)],
+        None,
+        Duration::from_secs(5),
         dial_0,
         DEFAULT_RECONNECT_PERIOD,
     )
