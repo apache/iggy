@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0.300
+FROM mcr.microsoft.com/dotnet/sdk:10.0.301
 
 COPY ./foreign/csharp ./foreign/csharp
 COPY ./bdd/scenarios ./bdd/scenarios
