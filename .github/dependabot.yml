@@ -260,17 +260,22 @@ updates:
     cooldown:
       default-days: 7
     ignore:
+      # Docker dependency-name matching strips the registry prefix, so
+      # MCR images are named by repository path only. A
+      # `mcr.microsoft.com/...` form silently never matches and the bump
+      # leaks through (see closed PRs #3474, #3485).
+      #
       # The Python interpreter version is pinned and synced across SDK
       # files, CI, and Dockerfiles by
       # scripts/ci/sync-python-interpreter-version.sh; a Dependabot bump
       # of the base image alone would fail that check.
       - dependency-name: "python"
-      - dependency-name: "mcr.microsoft.com/devcontainers/python"
+      - dependency-name: "devcontainers/python"
       # Go and .NET toolchain base images are pinned deliberately to
       # match the versions used across CI and the SDK builds. Bumping
       # them is a manual decision, not Dependabot churn.
       - dependency-name: "golang"
-      - dependency-name: "mcr.microsoft.com/dotnet/sdk"
+      - dependency-name: "dotnet/sdk"
     groups:
       docker:
         patterns:
