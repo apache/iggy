@@ -50,8 +50,14 @@ HELM_SMOKE_UI_HOST="${HELM_SMOKE_UI_HOST:-ui.iggy.local}"
 HELM_SMOKE_TIMEOUT="${HELM_SMOKE_TIMEOUT:-5m}"
 HELM_SMOKE_GATEWAY_NAMESPACE="${HELM_SMOKE_GATEWAY_NAMESPACE:-envoy-gateway-system}"
 HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
+HELM_SMOKE_GATEWAY_PF_PORT="${HELM_SMOKE_GATEWAY_PF_PORT:-8080}"
 HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_SERVER_CPU_ALLOCATION="${HELM_SMOKE_SERVER_CPU_ALLOCATION:-1}"
+
+# HELM_SMOKE_GATEWAY_NAMESPACE and HELM_SMOKE_GATEWAY_NAME must match the
+# defaults in scripts/ci/setup-helm-smoke-cluster.sh - the HTTPRoute
+# parentRef below targets the Gateway by ns + name and overriding one
+# without the other silently breaks route attach.
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -265,56 +271,83 @@ validate() {
   validate_helm_docs
 }
 
-# PID of the kubectl port-forward process started by get_gateway_base_url.
-# Stored at script scope so smoke() can kill it regardless of exit path.
+# PID of the kubectl port-forward process started by smoke().
+# Stored at script scope so the EXIT trap can kill it on any code path.
 HELM_SMOKE_GW_PF_PID=""
+# Temp values file that may need cleanup if smoke() aborts mid-flight.
+HELM_SMOKE_VALUES_FILE=""
 
-get_gateway_base_url() {
+cleanup_smoke_state() {
+  if [ -n "${HELM_SMOKE_GW_PF_PID:-}" ]; then
+    kill "$HELM_SMOKE_GW_PF_PID" 2>/dev/null || true
+    HELM_SMOKE_GW_PF_PID=""
+  fi
+  if [ -n "${HELM_SMOKE_VALUES_FILE:-}" ]; then
+    rm -f "$HELM_SMOKE_VALUES_FILE"
+    HELM_SMOKE_VALUES_FILE=""
+  fi
+}
+
+# Look up the Service that fronts the Envoy Gateway. Retries briefly to
+# tolerate the gap between Gateway "Programmed" and the owning Service
+# appearing - kubectl jsonpath on an empty `items` array exits non-zero,
+# so we also swallow stderr to avoid leaking "array index out of bounds".
+find_gateway_service() {
   local svc_selector
   local svc_name
-  local pf_port=8080
+  local _
 
   svc_selector="gateway.envoyproxy.io/owning-gateway-name=${HELM_SMOKE_GATEWAY_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${HELM_SMOKE_GATEWAY_NAMESPACE}"
 
-  svc_name="$(kubectl get svc \
-    --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
-    --selector "$svc_selector" \
-    -o jsonpath='{.items[0].metadata.name}')"
+  for _ in $(seq 1 15); do
+    svc_name="$(kubectl get svc \
+      --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
+      --selector "$svc_selector" \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -n "$svc_name" ]; then
+      printf '%s\n' "$svc_name"
+      return 0
+    fi
+    sleep 1
+  done
 
-  if [ -z "$svc_name" ]; then
-    echo "Error: could not find Envoy Gateway proxy service" >&2
-    return 1
-  fi
+  echo "Error: could not find Envoy Gateway proxy service after 15 attempts" >&2
+  return 1
+}
 
-  kubectl port-forward "svc/${svc_name}" "${pf_port}:80" \
+# Start kubectl port-forward in the caller's shell (not a subshell) so the
+# PID is visible to the EXIT trap. Waits up to ~45 s for the tunnel to
+# accept connections (15 iterations * (curl --max-time 2 + sleep 1)).
+# curl returns 0 on any HTTP response (even 4xx/5xx); non-zero means
+# the tunnel isn't ready yet.
+start_gateway_port_forward() {
+  local svc_name="$1"
+  local ready=false
+  local _
+
+  kubectl port-forward "svc/${svc_name}" "${HELM_SMOKE_GATEWAY_PF_PORT}:80" \
     --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
     >/dev/null 2>&1 &
   HELM_SMOKE_GW_PF_PID=$!
 
-  # Wait up to 15 s for the tunnel to accept connections.
-  # curl returns 0 on any HTTP response (even 4xx/5xx); non-zero means ECONNREFUSED.
-  local ready=false
   for _ in $(seq 1 15); do
     if curl -s --connect-timeout 1 --max-time 2 \
-        -o /dev/null "http://127.0.0.1:${pf_port}" 2>/dev/null; then
+        -o /dev/null "http://127.0.0.1:${HELM_SMOKE_GATEWAY_PF_PORT}" 2>/dev/null; then
       ready=true
       break
     fi
     if ! kill -0 "$HELM_SMOKE_GW_PF_PID" 2>/dev/null; then
       echo "Error: gateway port-forward process exited unexpectedly" >&2
+      HELM_SMOKE_GW_PF_PID=""
       return 1
     fi
     sleep 1
   done
 
   if [ "$ready" = false ]; then
-    echo "Error: gateway port-forward did not become ready within 15 s" >&2
-    kill "$HELM_SMOKE_GW_PF_PID" 2>/dev/null || true
-    HELM_SMOKE_GW_PF_PID=""
+    echo "Error: gateway port-forward did not become ready within 45 s" >&2
     return 1
   fi
-
-  echo "http://127.0.0.1:${pf_port}"
 }
 
 smoke() {
@@ -328,8 +361,10 @@ smoke() {
   local ui_healthz_status
   local leftover_resources
   local helm_status
-  local smoke_values_file
+  local gateway_svc
   local gateway_url
+
+  trap cleanup_smoke_state EXIT
 
   mkdir -p "$HELM_SMOKE_REPORT_DIR"
 
@@ -353,9 +388,9 @@ EOF
 
   echo "$ui_image_tag" > "$HELM_SMOKE_REPORT_DIR/ui-image-tag.txt"
 
-  smoke_values_file="$(mktemp "${TMPDIR:-/tmp}/iggy-helm-smoke-values.XXXXXX.yaml")"
+  HELM_SMOKE_VALUES_FILE="$(mktemp "${TMPDIR:-/tmp}/iggy-helm-smoke-values.XXXXXX.yaml")"
 
-  cat > "$smoke_values_file" <<EOF
+  cat > "$HELM_SMOKE_VALUES_FILE" <<EOF
 server:
   env:
     - name: RUST_LOG
@@ -382,13 +417,14 @@ EOF
     --create-namespace \
     --wait \
     --timeout "$HELM_SMOKE_TIMEOUT" \
-    -f "$smoke_values_file"; then
+    -f "$HELM_SMOKE_VALUES_FILE"; then
     helm_status=0
   else
     helm_status=$?
   fi
 
-  rm -f "$smoke_values_file"
+  rm -f "$HELM_SMOKE_VALUES_FILE"
+  HELM_SMOKE_VALUES_FILE=""
 
   if [ "$helm_status" -ne 0 ]; then
     return "$helm_status"
@@ -436,11 +472,11 @@ spec:
           port: 3050
 EOF
 
-  gateway_url="$(get_gateway_base_url)"
+  gateway_svc="$(find_gateway_service)"
+  start_gateway_port_forward "$gateway_svc"
+  gateway_url="http://127.0.0.1:${HELM_SMOKE_GATEWAY_PF_PORT}"
 
   kubectl version --client=true > "$HELM_SMOKE_REPORT_DIR/kubectl-version.txt"
-  kubectl -n "$HELM_SMOKE_NAMESPACE" rollout status "deployment/$HELM_SMOKE_RELEASE" --timeout="$HELM_SMOKE_TIMEOUT"
-  kubectl -n "$HELM_SMOKE_NAMESPACE" rollout status "deployment/${HELM_SMOKE_RELEASE}-ui" --timeout="$HELM_SMOKE_TIMEOUT"
   kubectl -n "$HELM_SMOKE_NAMESPACE" get pods,svc,httproutes > "$HELM_SMOKE_REPORT_DIR/resources.txt"
 
   for _ in $(seq 1 30); do
@@ -471,9 +507,6 @@ EOF
   done
 
   test "$ui_healthz_status" = "200"
-
-  kill "${HELM_SMOKE_GW_PF_PID:-}" 2>/dev/null || true
-  HELM_SMOKE_GW_PF_PID=""
 
   if [ "$cleanup_after_success" = true ]; then
     cleanup_smoke

@@ -30,11 +30,16 @@ Environment:
   HELM_SMOKE_KIND_IMAGE             kind node image (default: kindest/node:v1.35.0)
   HELM_SMOKE_KIND_PLATFORM          docker platform for the kind node image
   HELM_SMOKE_KIND_WAIT              kind create wait timeout (default: 120s)
-  HELM_SMOKE_GATEWAY_API_VERSION    Gateway API CRD release tag (default: v1.5.0)
-  HELM_SMOKE_ENVOY_GATEWAY_VERSION  Envoy Gateway Helm chart version (default: v1.4.1)
+  HELM_SMOKE_GATEWAY_API_VERSION    Gateway API CRD release tag (default: v1.5.1)
+  HELM_SMOKE_ENVOY_GATEWAY_VERSION  Envoy Gateway Helm chart version (default: v1.8.1)
   HELM_SMOKE_GATEWAY_TIMEOUT        gateway readiness timeout (default: 5m)
   HELM_SMOKE_GATEWAY_NAMESPACE      namespace for Envoy Gateway and the Gateway resource (default: envoy-gateway-system)
   HELM_SMOKE_GATEWAY_NAME           name of the Gateway resource (default: iggy-smoke-gateway)
+
+HELM_SMOKE_GATEWAY_NAMESPACE and HELM_SMOKE_GATEWAY_NAME must match the
+values used by scripts/ci/test-helm.sh, since the HTTPRoute parentRef there
+targets this Gateway by namespace + name. Overriding one without the other
+silently breaks route attach.
 EOF
 }
 
@@ -52,8 +57,8 @@ HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_KIND_IMAGE="${HELM_SMOKE_KIND_IMAGE:-kindest/node:v1.35.0}"
 HELM_SMOKE_KIND_PLATFORM="${HELM_SMOKE_KIND_PLATFORM:-}"
 HELM_SMOKE_KIND_WAIT="${HELM_SMOKE_KIND_WAIT:-120s}"
-HELM_SMOKE_GATEWAY_API_VERSION="${HELM_SMOKE_GATEWAY_API_VERSION:-v1.5.0}"
-HELM_SMOKE_ENVOY_GATEWAY_VERSION="${HELM_SMOKE_ENVOY_GATEWAY_VERSION:-v1.4.1}"
+HELM_SMOKE_GATEWAY_API_VERSION="${HELM_SMOKE_GATEWAY_API_VERSION:-v1.5.1}"
+HELM_SMOKE_ENVOY_GATEWAY_VERSION="${HELM_SMOKE_ENVOY_GATEWAY_VERSION:-v1.8.1}"
 HELM_SMOKE_GATEWAY_TIMEOUT="${HELM_SMOKE_GATEWAY_TIMEOUT:-5m}"
 HELM_SMOKE_GATEWAY_NAMESPACE="${HELM_SMOKE_GATEWAY_NAMESPACE:-envoy-gateway-system}"
 HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
@@ -136,31 +141,17 @@ echo "Upgrading Gateway API CRDs to ${HELM_SMOKE_GATEWAY_API_VERSION}..."
 kubectl apply --server-side --force-conflicts \
   -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${HELM_SMOKE_GATEWAY_API_VERSION}/standard-install.yaml"
 
-echo "Creating EnvoyProxy, GatewayClass, and Gateway..."
+echo "Creating GatewayClass and Gateway..."
+# Default EnvoyProxy provider (ClusterIP) is enough - the smoke test reaches
+# Envoy via `kubectl port-forward svc/...:80`, which tunnels through the
+# apiserver to the ClusterIP regardless of service type.
 kubectl apply -f - <<EOF
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: EnvoyProxy
-metadata:
-  name: iggy-smoke-proxy
-  namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
-spec:
-  provider:
-    type: Kubernetes
-    kubernetes:
-      envoyService:
-        type: NodePort
----
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
   name: iggy-smoke
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
-  parametersRef:
-    group: gateway.envoyproxy.io
-    kind: EnvoyProxy
-    name: iggy-smoke-proxy
-    namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
