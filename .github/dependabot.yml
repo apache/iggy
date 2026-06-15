@@ -194,6 +194,12 @@ updates:
       - "java"
     cooldown:
       default-days: 7
+    ignore:
+      # examples/java wires iggy's own artifact to the local build via
+      # dependency substitution (settings.gradle.kts) behind a
+      # `local-dev` placeholder version. A Dependabot bump to a real
+      # release breaks example CI, which builds against the local tree.
+      - dependency-name: "org.apache.iggy:*"
     groups:
       java:
         patterns:
