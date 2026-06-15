@@ -18,12 +18,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
     AutoCommitWhen as RustAutoCommitWhen, *,
 };
 use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
+use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
 use pyo3::prelude::*;
@@ -36,7 +38,6 @@ use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
 use crate::identifier::PyIdentifier;
-use crate::iterator::ReceiveMessageIterator;
 use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
@@ -78,13 +79,15 @@ impl IggyConsumer {
     }
 
     /// Gets the name of the stream this consumer group is configured for.
-    fn stream(&self) -> PyIdentifier {
-        self.inner.blocking_lock().stream().into()
+    fn stream(&self) -> PyResult<PyIdentifier> {
+        let guard = self.inner.blocking_lock();
+        PyIdentifier::try_from(guard.stream())
     }
 
     /// Gets the name of the topic this consumer group is configured for.
-    fn topic(&self) -> PyIdentifier {
-        self.inner.blocking_lock().topic().into()
+    fn topic(&self) -> PyResult<PyIdentifier> {
+        let guard = self.inner.blocking_lock();
+        PyIdentifier::try_from(guard.topic())
     }
 
     /// Stores the provided offset for the provided partition id or if none is specified
@@ -105,7 +108,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 
@@ -126,7 +129,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 
@@ -162,16 +165,17 @@ impl IggyConsumer {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume = get_runtime().spawn(scope(task_locals, async move {
-                let task_locals =
-                    Python::attach(pyo3_async_runtimes::tokio::get_current_locals).unwrap();
-                let consumer = PyCallbackConsumer {
-                    callback: Arc::new(callback),
-                    task_locals: Arc::new(Mutex::new(task_locals)),
-                };
-                let mut inner = inner.lock().await;
-                inner.consume_messages(&consumer, shutdown_rx).await
-            }));
+            let handle_consume: JoinHandle<PyResult<Result<(), IggyError>>> =
+                get_runtime().spawn(scope(task_locals, async move {
+                    let task_locals =
+                        Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
+                    let consumer = PyCallbackConsumer {
+                        callback: Arc::new(callback),
+                        task_locals: Arc::new(Mutex::new(task_locals)),
+                    };
+                    let mut inner = inner.lock().await;
+                    Ok(inner.consume_messages(&consumer, shutdown_rx).await)
+                }));
             let consume_result;
 
             if let Some(shutdown_event) = shutdown_event {
@@ -181,17 +185,13 @@ impl IggyConsumer {
                     shutdown_tx: Sender<()>,
                 ) -> PyResult<()> {
                     Python::attach(|py| {
-                        into_future(
-                            shutdown_event
-                                .bind(py)
-                                .as_any()
-                                .call_method0("wait")
-                                .unwrap(),
-                        )
+                        into_future(shutdown_event.bind(py).as_any().call_method0("wait")?)
                     })?
                     .await?;
-                    shutdown_tx.send(()).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
+                    shutdown_tx.send(()).map_err(|_| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            "Failed to signal shutdown",
+                        )
                     })?;
                     Ok(())
                 }
@@ -201,16 +201,49 @@ impl IggyConsumer {
                 ));
                 let shutdown_result;
                 (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
-                shutdown_result.unwrap()?;
+                shutdown_result.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })??;
             } else {
                 consume_result = handle_consume.await;
             }
 
             consume_result
-                .unwrap()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
+    }
+}
+
+#[pyclass]
+pub struct ReceiveMessageIterator {
+    pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+}
+
+#[pymethods]
+impl ReceiveMessageIterator {
+    pub fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut inner = inner.lock().await;
+            if let Some(message) = inner.next().await {
+                Ok(message
+                    .map(|m| ReceiveMessage {
+                        inner: m.message,
+                        partition_id: m.partition_id,
+                    })
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?)
+            } else {
+                Err(PyStopAsyncIteration::new_err("No more messages"))
+            }
+        })
+    }
+
+    pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
     }
 }
 
