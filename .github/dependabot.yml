@@ -102,8 +102,29 @@ updates:
 
   - package-ecosystem: "npm"
     directories:
-      - "/foreign/node"
       - "/web"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "javascript"
+    cooldown:
+      default-days: 7
+    groups:
+      web:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/foreign/node"
       - "/examples/node"
     schedule:
       interval: "weekly"
@@ -120,7 +141,7 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      javascript:
+      node:
         patterns:
           - "*"
 
