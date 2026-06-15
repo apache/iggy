@@ -79,6 +79,30 @@ pub fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// Reap a dead child by PID and describe how it exited: normal exit code,
+/// or terminating signal plus whether a core was dumped. `waitpid` only
+/// succeeds from the spawning process; returns None when the child is
+/// still running or was already reaped by another waiter.
+#[cfg(unix)]
+pub fn reap_exit_status(pid: u32) -> Option<String> {
+    let mut status: libc::c_int = 0;
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if reaped != pid as libc::pid_t {
+        return None;
+    }
+    if libc::WIFEXITED(status) {
+        return Some(format!("exited with code {}", libc::WEXITSTATUS(status)));
+    }
+    if libc::WIFSIGNALED(status) {
+        return Some(format!(
+            "killed by signal {} (core dumped: {})",
+            libc::WTERMSIG(status),
+            libc::WCOREDUMP(status)
+        ));
+    }
+    Some(format!("unrecognized wait status {status}"))
+}
+
 /// Gracefully stop a child process: SIGTERM, wait up to 5s, then SIGKILL.
 /// Returns the child for final cleanup (wait_with_output).
 pub fn graceful_kill(mut child: Child) -> Child {

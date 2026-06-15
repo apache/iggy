@@ -464,6 +464,11 @@ pub async fn build_partition_fresh(
     consensus.init();
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition.set_partition_dir(config.system.get_partition_path(
+        stream_id,
+        topic_id,
+        partition_id,
+    ));
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);

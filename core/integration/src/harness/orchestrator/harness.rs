@@ -189,6 +189,33 @@ impl TestHarness {
             const LOGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
 
             let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
+
+            // Wait for the full replica mesh BEFORE the login probe below.
+            // The probe is the cluster's first metadata op; if it commits
+            // while a replica is still joining the mesh, that replica misses
+            // the op and -- with no log-repair path yet -- wedges, dropping
+            // every later op as a gap. Gating on all nodes meshed means the
+            // test runs against a fully constructed cluster with no late
+            // joiners.
+            while Instant::now() < deadline
+                && !self
+                    .servers
+                    .iter()
+                    .all(ServerHandle::replica_mesh_complete)
+            {
+                sleep(CLUSTER_READY_RETRY_INTERVAL).await;
+            }
+            if !self
+                .servers
+                .iter()
+                .all(ServerHandle::replica_mesh_complete)
+            {
+                return Err(TestBinaryError::InvalidState {
+                    message: "Timed out waiting for VSR replica mesh to form on all nodes"
+                        .to_string(),
+                });
+            }
+
             let mut last_error = None;
 
             while Instant::now() < deadline {

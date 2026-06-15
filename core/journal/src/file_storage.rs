@@ -89,19 +89,33 @@ impl FileStorage {
         Ok(buf)
     }
 
-    /// Append write, returns bytes written.
+    /// Append write at the next free offset; returns the offset written to.
+    ///
+    /// Reserves the region by advancing `write_offset` **synchronously,
+    /// before** the write `.await`. On the single-threaded compio runtime
+    /// two `write_append` calls can interleave at the await; reserving first
+    /// hands each a distinct, non-overlapping offset. The previous code read
+    /// the offset and advanced the cursor *after* the await, so two in-flight
+    /// appends both saw the same offset and wrote over each other (and the
+    /// journal recorded the same index position for both) -- the corruption
+    /// seen under interleaved `on_replicate` calls (a queued op drained while
+    /// the next op is freshly submitted).
+    ///
+    /// The reservation is not rolled back on write error: the space stays
+    /// reserved, so the failing op leaves an uncommitted gap that recovery
+    /// truncates rather than a slot a later append could reuse mid-flight.
     ///
     /// # Errors
     /// Returns an I/O error if the write fails.
-    #[allow(clippy::cast_possible_truncation)]
-    pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<usize> {
-        let len = buf.buf_len();
+    pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<u64> {
+        let len = buf.buf_len() as u64;
+        let offset = self.write_offset.get();
+        self.write_offset.set(offset + len);
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &mut *self.file.get() };
-        let (result, _buf) = file.write_all_at(buf, self.write_offset.get()).await.into();
+        let (result, _buf) = file.write_all_at(buf, offset).await.into();
         result?;
-        self.write_offset.set(self.write_offset.get() + len as u64);
-        Ok(len)
+        Ok(offset)
     }
 
     /// The file path this storage was opened with.

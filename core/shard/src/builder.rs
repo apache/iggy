@@ -31,7 +31,8 @@ use crate::coordinator::{ShardZeroCoordinator, classify_try_send_err};
 use crate::metrics::{ShardMetrics, frame_drop_variant};
 use crate::{
     CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, Receiver, ShardCtorError, ShardFrame, ShardIdentity, TaggedSender,
+    PartitionConsensusConfig, PartitionReadHandler, Receiver, ShardCtorError, ShardFrame,
+    ShardIdentity, TaggedSender,
 };
 use consensus::VsrConsensus;
 use journal::JournalHandle;
@@ -66,6 +67,7 @@ where
     on_client_request: RequestHandler,
     on_metadata_submit: MetadataSubmitHandler,
     on_list_clients: ListClientsHandler,
+    on_partition_read: PartitionReadHandler,
     metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
     partitions: IggyPartitions<B>,
     senders: Vec<TaggedSender>,
@@ -94,6 +96,7 @@ where
         on_client_request: RequestHandler,
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
+        on_partition_read: PartitionReadHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
         senders: Vec<TaggedSender>,
@@ -110,6 +113,7 @@ where
             on_client_request,
             on_metadata_submit,
             on_list_clients,
+            on_partition_read,
             metadata,
             partitions,
             senders,
@@ -216,6 +220,7 @@ where
             self.on_client_request,
             self.on_metadata_submit,
             self.on_list_clients,
+            self.on_partition_read,
             self.metadata,
             self.partitions,
             self.senders,

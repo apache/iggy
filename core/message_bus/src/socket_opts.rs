@@ -92,8 +92,9 @@ mod tests {
             not(any(target_os = "illumos", target_os = "solaris", target_os = "cygwin"))
         ))]
         socket.set_reuse_port(true).expect("reserve reuseport");
+        // Bound, not listening: mirrors the harness's PortReserver, which
+        // holds ports without joining the SO_REUSEPORT accept group.
         socket.bind(&reserve_addr.into()).expect("reserve bind");
-        socket.listen(1).expect("reserve listen");
         let addr = socket
             .local_addr()
             .expect("reserve local addr")

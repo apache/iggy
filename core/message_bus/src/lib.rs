@@ -211,6 +211,16 @@ impl ReplicaOwnerTable {
             owner => Some(owner),
         }
     }
+
+    /// Number of slots currently claimed by any shard, i.e. live peer
+    /// replica connections on this node.
+    #[must_use]
+    pub fn owned_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.load(Ordering::Acquire) != OWNER_NONE)
+            .count()
+    }
 }
 
 impl Default for ReplicaOwnerTable {
@@ -765,7 +775,7 @@ impl IggyMessageBus {
     /// closure so the closure body is free to call
     /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
     /// without tripping the runtime borrow check.
-    pub(crate) fn notify_connection_lost(&self, replica_id: u8) {
+    pub(crate) fn notify_connection_lost(&self, replica_id: u8, reason: &'static str) {
         // Stand down if a live registry entry exists for this replica. A
         // reconnect that round-robined back to this same shard installs a
         // fresh entry before this stale post-loop runs; the owner-table
@@ -789,8 +799,17 @@ impl IggyMessageBus {
         tracing::warn!(
             shard_id = self.shard_id,
             replica_id,
+            reason,
             "replica connection lost"
         );
+        let expected = self.config.mesh_expected_peers;
+        if expected > 0 {
+            tracing::warn!(
+                connected = self.owner_table.owned_count(),
+                expected,
+                "replica mesh degraded"
+            );
+        }
         let cb = self
             .connection_lost_fn
             .borrow()
@@ -1358,10 +1377,10 @@ mod tests {
         });
         bus.set_connection_lost_fn(cb);
 
-        bus.notify_connection_lost(1); // first closure runs (+1) and swaps
+        bus.notify_connection_lost(1, "test"); // first closure runs (+1) and swaps
         assert_eq!(counter.get(), 1);
 
-        bus.notify_connection_lost(1); // second closure runs (+10)
+        bus.notify_connection_lost(1, "test"); // second closure runs (+10)
         assert_eq!(counter.get(), 11);
     }
 
@@ -1385,7 +1404,7 @@ mod tests {
         assert!(bus.mark_replica_owned(7), "owner-table claim must succeed");
 
         // Stale predecessor post-loop fires while the reinstall is live.
-        bus.notify_connection_lost(7);
+        bus.notify_connection_lost(7, "test");
         assert_eq!(
             bus.owning_shard(7),
             Some(3),
@@ -1394,7 +1413,7 @@ mod tests {
 
         // Genuine disconnect: no live entry, the slot is released.
         bus.replicas().remove(7);
-        bus.notify_connection_lost(7);
+        bus.notify_connection_lost(7, "test");
         assert_eq!(
             bus.owning_shard(7),
             None,

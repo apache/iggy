@@ -28,4 +28,5 @@ pub mod pat;
 pub mod responses;
 pub mod server_error;
 pub mod session_manager;
+pub mod users;
 pub mod wire;

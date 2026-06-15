@@ -73,12 +73,14 @@ impl ReservedPort {
                 message: format!("Failed to bind TCP socket: {e}"),
             })?;
 
-        socket
-            .listen(1)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to listen on TCP socket: {e}"),
-            })?;
-
+        // Bind WITHOUT listen: a listening reservation joins the port's
+        // SO_REUSEPORT group and accepts early dials into a backlog nobody
+        // drains. During cluster startup a peer's replica connector dials
+        // ports whose reservations are still held (release happens per-node
+        // right before spawn), so each such dial used to wedge until the
+        // 2s handshake-ack timeout. A bound-only socket still holds the
+        // port against ephemeral allocation but answers RST, so dialers
+        // fail fast and the reconnect sweep retries cleanly.
         let addr = socket
             .local_addr()
             .map_err(|e| TestBinaryError::InvalidState {

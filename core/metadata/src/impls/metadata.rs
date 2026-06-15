@@ -586,7 +586,8 @@ where
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
         // sibling on_request races during journal.append await).
         // TODO: hard assert for backups once message repair lands.
-        if consensus.is_follower() {
+        let is_backup = consensus.is_follower();
+        if is_backup {
             if header.op != current_op + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
@@ -643,11 +644,14 @@ where
         self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
-        // Backup: advance sequencer + checksum post-append. Primary also
-        // reaches here; push_prepare_entry already advanced sync with the
-        // pipeline push, so calls are idempotent on primary.
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
+        // Backup only: advance sequencer + checksum post-append. Primary
+        // already advanced in push_prepare_entry; re-setting here would
+        // rewind a sibling prepare pipelined during the append await to a
+        // stale op + parent, projecting a duplicate next.
+        if is_backup {
+            consensus.sequencer().set_sequence(header.op);
+            consensus.set_last_prepare_checksum(header.checksum);
+        }
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(&header).await;
@@ -968,12 +972,15 @@ where
         // Subscribe before await so receiver registers before any self-loopback
         // ack fires. compio is single-threaded; explicit anyway.
         consensus.verify_pipeline();
-        // Snapshot (view, commit_min) pre-subscribe. Validate it after
-        // `on_replicate` returns and again on receiver completion: another
-        // task could mutate either during the awaits and silently invalidate
-        // the gate, with release builds proceeding on a stale view-state.
+        // Snapshot the view pre-subscribe to detect a view change across the
+        // `on_replicate` await. commit_min is deliberately NOT snapshotted:
+        // earlier pipelined ops legally commit while this prepare replicates
+        // (the single-threaded executor interleaves `on_ack` at await
+        // points), and nothing past the await consumes a frozen commit_min.
+        // The caught-up gate only matters at dispatch, before the prepare is
+        // sequenced; once it holds an op slot, commit progress cannot
+        // double-register this client.
         let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
         // can drop the borrow. No commit-max advance flips the gate today;
@@ -983,10 +990,20 @@ where
             "submit_register_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "submit_register_in_process: view/commit_min advanced across on_replicate await"
-        );
+        if consensus.view() != view_snapshot {
+            // View changed while the prepare replicated. The drained
+            // loopback below stays safe: `on_ack` drops stale acks via its
+            // status preflight and the pipeline (op, checksum) match. The
+            // subscriber resolves the outcome either way: a reply if the
+            // prepare survived into the new view, or `Canceled` (recovered
+            // below via the inherited-session re-check).
+            warn!(
+                client_id,
+                view_before = view_snapshot,
+                view_after = consensus.view(),
+                "view changed while register prepare replicated; deferring to subscriber outcome"
+            );
+        }
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
@@ -1095,18 +1112,23 @@ where
             .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
 
         consensus.verify_pipeline();
+        // View-only snapshot; commit_min legally advances across the await.
+        // Same reasoning as `submit_register_in_process`.
         let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         debug_assert!(
             is_caught_up_primary(consensus),
             "submit_logout_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "submit_logout_in_process: view/commit_min advanced across on_replicate await"
-        );
+        if consensus.view() != view_snapshot {
+            warn!(
+                client_id,
+                view_before = view_snapshot,
+                view_after = consensus.view(),
+                "view changed while logout prepare replicated; deferring to subscriber outcome"
+            );
+        }
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {

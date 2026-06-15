@@ -154,8 +154,10 @@ impl Users {
         // Bootstrap path is intentionally unreplicated (every replica calls
         // this locally on shard 0). A fresh `IggyTimestamp::now()` per replica
         // would make `root.created_at` differ across the cluster and break
-        // any future snapshot/state-hash equality check. Stamp the UNIX
-        // epoch sentinel instead: every replica reads the same value.
+        // any future snapshot/state-hash equality check. Stamp a fixed
+        // non-zero sentinel instead: deterministic across replicas (every
+        // replica reads the same value) while remaining a valid `> 0`
+        // creation timestamp for clients that assert one.
         self.inner
             .try_apply(UsersCommand::CreateUser(
                 CreateUserRequest {
@@ -178,7 +180,7 @@ impl Users {
                         streams: Vec::new(),
                     }),
                 },
-                IggyTimestamp::zero(),
+                IggyTimestamp::from(1),
             ))
             .expect("root user bootstrap must run on the metadata writer");
     }
