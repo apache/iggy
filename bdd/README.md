@@ -7,7 +7,8 @@ This directory contains cross-SDK Behavior-Driven Development (BDD) tests for Ap
 ```bash
 bdd/
 ├── scenarios/                  # Shared Gherkin feature files
-│   └── basic_messaging.feature
+│   ├── basic_messaging.feature
+│   └── leader_redirection.feature
 ├── rust/                       # Rust SDK BDD implementation
 │   ├── Dockerfile              # Rust BDD test container
 │   ├── tests/
@@ -17,11 +18,13 @@ bdd/
 │   ├── tests/
 │   ├── pyproject.toml
 │   └── uv.lock
-├── node/                       # Node SDK BDD implementation
-│   └── Dockerfile              # Node BDD test container
 ├── go/                         # Go SDK BDD implementation
 │   ├── Dockerfile              # Go BDD test container
-│   └── tests/
+│   ├── tests/
+│   ├── go.mod
+│   └── go.sum
+├── node/                       # Node SDK BDD implementation
+│   └── Dockerfile              # Node BDD test container
 ├── csharp/                     # csharp SDK BDD implementation
 │   └── Dockerfile              # csharp BDD test container
 ├── java/                       # Java SDK BDD implementation
@@ -32,7 +35,10 @@ bdd/
 │   ├── Dockerfile              # PHP BDD test container
 │   ├── phpunit.xml.dist
 │   └── tests/
-├── docker-compose.yml          # Orchestrates server + SDK containers
+├── docker-compose.yml          # Base: SDK test clients (always included)
+├── docker-compose.server.yml   # Single iggy-server test setup
+├── docker-compose.cluster.yml  # Leader + follower test setup
+├── docker-compose.coverage.yml # Coverage collection overlay
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
 ```
@@ -42,10 +48,14 @@ bdd/
 ### Quick Start
 
 ```bash
-# Run all SDK tests
+# Usage: ../scripts/run-bdd-tests.sh [--coverage] <sdk> [feature]
+#   sdk:     rust | python | php | go | go-race | node | csharp | java | all | clean  (default: all)
+#   feature: basic_messaging | leader_redirection | all  (default: all)
+
+# Run all features for all SDKs
 ../scripts/run-bdd-tests.sh all
 
-# Run specific SDK tests
+# Run specific SDK tests (all features)
 ../scripts/run-bdd-tests.sh rust
 ../scripts/run-bdd-tests.sh python
 ../scripts/run-bdd-tests.sh go
@@ -53,6 +63,12 @@ bdd/
 ../scripts/run-bdd-tests.sh csharp
 ../scripts/run-bdd-tests.sh java
 ../scripts/run-bdd-tests.sh php
+
+# Run only basic_messaging feature for Rust SDK
+../scripts/run-bdd-tests.sh rust basic_messaging
+
+# Run only leader_redirection
+../scripts/run-bdd-tests.sh all leader_redirection
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
@@ -65,7 +81,7 @@ bdd/
 
 ### How it Works
 
-1. **Server Container**: Builds and runs the latest Iggy server in debug mode
+1. **Server Containers**: `docker-compose.server.yml` runs a single Iggy server; `docker-compose.cluster.yml` adds a leader + follower pair for cluster scenarios
 2. **SDK Containers**: Each SDK has its own container with the appropriate runtime and dependencies
 3. **Shared Features**: All SDKs test against the same `.feature` files for consistency
 4. **Health Checks**: Containers wait for the server to be healthy before running tests
@@ -79,7 +95,7 @@ To add a new SDK (e.g., Node.js):
 3. Create `node/tests/` directory with BDD implementation
 4. Add `node-bdd` service to `docker-compose.yml`
 5. Update `../scripts/run-bdd-tests.sh` script
-6. Update [changed-files-config.json](https://github.com/apache/iggy/blob/master/.github/changed-files-config.json) file to include the new SDK files
+6. Update [components.yml](https://github.com/apache/iggy/blob/master/.github/config/components.yml) file to include the new SDK files
 
 ### CI/CD Integration
 
@@ -89,11 +105,15 @@ GitHub Actions workflow: [ci-test-bdd.yml](https://github.com/apache/iggy/blob/m
 
 ### For Rust SDK
 
-The Rust implementation is located in `core/bdd/` and linked via Docker volumes.
+The Rust implementation is located in `bdd/rust/` and linked via Docker volumes.
 
 ### For Python SDK
 
 The Python implementation is in `bdd/python/tests/` and needs to be updated as the Python SDK API evolves.
+
+### For Go SDK
+
+The Go implementation is located in `bdd/go/tests/`.
 
 ### For Node SDK
 
