@@ -101,4 +101,3 @@ fn mint_pat_raw_and_hash() -> (String, [u8; 64]) {
     out.copy_from_slice(bytes);
     (raw, out)
 }
-

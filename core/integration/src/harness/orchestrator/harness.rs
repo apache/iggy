@@ -198,18 +198,11 @@ impl TestHarness {
             // test runs against a fully constructed cluster with no late
             // joiners.
             while Instant::now() < deadline
-                && !self
-                    .servers
-                    .iter()
-                    .all(ServerHandle::replica_mesh_complete)
+                && !self.servers.iter().all(ServerHandle::replica_mesh_complete)
             {
                 sleep(CLUSTER_READY_RETRY_INTERVAL).await;
             }
-            if !self
-                .servers
-                .iter()
-                .all(ServerHandle::replica_mesh_complete)
-            {
+            if !self.servers.iter().all(ServerHandle::replica_mesh_complete) {
                 return Err(TestBinaryError::InvalidState {
                     message: "Timed out waiting for VSR replica mesh to form on all nodes"
                         .to_string(),

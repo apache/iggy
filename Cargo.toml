@@ -109,7 +109,7 @@ clap_complete = "4.6.5"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = { version = "7.2.2", default-features = false }
-compio = { version = "=0.19.0", features = [
+compio = { version = "=0.19.1", features = [
     "runtime",
     "macros",
     "io-uring",

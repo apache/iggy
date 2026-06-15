@@ -29,7 +29,6 @@ use crate::auth::{
 use crate::bootstrap::{ServerNgShard, ServerNgShardHandle};
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
-use crate::users::maybe_rewrite_user_password_request;
 use crate::responses::{
     NonReplicatedResponse, build_consumer_offset_body, build_empty_reply, build_get_me_response,
     build_non_replicated_response, build_polled_messages_body, build_raw_pat_reply,
@@ -37,6 +36,7 @@ use crate::responses::{
     resolve_partition_request_namespace,
 };
 use crate::session_manager::SessionManager;
+use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 use bytes::Bytes;
 use consensus::{MetadataHandle, PartitionsHandle};

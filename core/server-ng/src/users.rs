@@ -27,8 +27,8 @@
 //! replicates the hash, mirroring the PAT mint in [`crate::pat`].
 
 use crate::wire::{request_body, rewrite_request_body};
-use iggy_binary_protocol::requests::users::{CreateUserRequest, ChangePasswordRequest};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
 use iggy_binary_protocol::{Operation, RequestHeader};
 use iggy_common::IggyError;
 use server::streaming::utils::crypto;
