@@ -27,9 +27,9 @@ repositories {
 }
 
 dependencies {
-    implementation("org.apache.iggy:iggy:local-dev")
+    implementation("org.apache.iggy:iggy:0.8.0")
     implementation("org.slf4j:slf4j-simple:2.0.18")
-    implementation("tools.jackson.core:jackson-databind:3.1.3")
+    implementation("tools.jackson.core:jackson-databind:3.1.4")
 }
 
 spotless {
