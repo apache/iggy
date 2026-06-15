@@ -1,0 +1,89 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Single Iggy server test setup.
+# Activated by: ./scripts/run-bdd-tests.sh <sdk> basic_messaging
+#               ./scripts/run-bdd-tests.sh <sdk> leader_redirection
+#               ./scripts/run-bdd-tests.sh <sdk> all
+
+x-server-bdd-deps: &server-bdd-deps
+  depends_on:
+    iggy-server:
+      condition: service_healthy
+  environment:
+    - IGGY_TCP_ADDRESS=iggy-server:8090
+
+services:
+  iggy-server:
+    image: iggy-bdd-server
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: core/server/Dockerfile
+      target: runtime-prebuilt
+      args:
+        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
+        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+        LIBC: glibc
+        PROFILE: debug
+    command: [ "--fresh", "--with-default-root-credentials" ]
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
+    environment:
+      - RUST_LOG=info
+      - IGGY_SYSTEM_PATH=local_data
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8070
+    volumes:
+      - iggy_data:/app/local_data
+    networks:
+      - iggy-bdd-network
+
+  rust-bdd:
+    <<: *server-bdd-deps
+
+  python-bdd:
+    <<: *server-bdd-deps
+
+  go-bdd:
+    <<: *server-bdd-deps
+
+  node-bdd:
+    <<: *server-bdd-deps
+
+  csharp-bdd:
+    <<: *server-bdd-deps
+
+  java-bdd:
+    <<: *server-bdd-deps
+
+volumes:
+  iggy_data:
