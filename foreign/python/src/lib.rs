@@ -18,15 +18,13 @@
 pub mod client;
 mod consumer;
 mod identifier;
-mod iterator;
 mod receive_message;
 mod send_message;
 mod stream;
 mod topic;
 
 use client::IggyClient;
-use consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer};
-use iterator::ReceiveMessageIterator;
+use consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceiveMessageIterator};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;

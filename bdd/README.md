@@ -19,12 +19,19 @@ bdd/
 │   └── uv.lock
 ├── node/                       # Node SDK BDD implementation
 │   └── Dockerfile              # Node BDD test container
+├── go/                         # Go SDK BDD implementation
+│   ├── Dockerfile              # Go BDD test container
+│   └── tests/
 ├── csharp/                     # csharp SDK BDD implementation
 │   └── Dockerfile              # csharp BDD test container
 ├── java/                       # Java SDK BDD implementation
 │   ├── Dockerfile              # Java BDD test container
 │   ├── src/test/
 │   └── build.gradle.kts
+├── php/                        # PHP SDK BDD implementation
+│   ├── Dockerfile              # PHP BDD test container
+│   ├── phpunit.xml.dist
+│   └── tests/
 ├── docker-compose.yml          # Orchestrates server + SDK containers
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
@@ -45,6 +52,7 @@ bdd/
 ../scripts/run-bdd-tests.sh node
 ../scripts/run-bdd-tests.sh csharp
 ../scripts/run-bdd-tests.sh java
+../scripts/run-bdd-tests.sh php
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
@@ -98,6 +106,10 @@ The csharp implementation is located at [foreign/csharp/Iggy_SDK.Tests.BDD](../f
 ### For Java SDK
 
 The Java implementation is located in `java/src/test/`
+
+### For PHP SDK
+
+The PHP implementation is located in `bdd/php/tests/` and runs through PHPUnit.
 
 ### Adding New Scenarios
 

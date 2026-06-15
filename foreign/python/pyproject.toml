@@ -132,6 +132,7 @@ all = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
+timeout = 30
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
