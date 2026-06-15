@@ -1059,7 +1059,7 @@ mod tests {
         );
         assert_eq!(
             tcp_client_config.request_timeout,
-            IggyDuration::from_str("300s").unwrap()
+            IggyDuration::from_str("30s").unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);

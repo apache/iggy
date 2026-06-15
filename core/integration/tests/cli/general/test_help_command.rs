@@ -193,7 +193,7 @@ Options:
       --request-timeout <REQUEST_TIMEOUT>
           The optional per-request timeout for send/receive operations
 {CLAP_INDENT}
-          [default: "300s"]
+          [default: "30s"]
 
   -q, --quiet
           Quiet mode (disabled stdout printing)

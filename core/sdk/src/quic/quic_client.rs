@@ -991,7 +991,7 @@ mod tests {
         );
         assert_eq!(
             quic_client_config.request_timeout,
-            IggyDuration::from_str("300s").unwrap()
+            IggyDuration::from_str("30s").unwrap()
         );
 
         assert!(quic_client_config.reconnection.enabled);

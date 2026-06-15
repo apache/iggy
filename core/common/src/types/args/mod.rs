@@ -221,7 +221,7 @@ pub struct ArgsOptional {
 
     /// The optional per-request timeout for send/receive operations
     ///
-    /// [default: "300s"]
+    /// [default: "30s"]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout: Option<String>,
@@ -426,7 +426,7 @@ impl Default for Args {
             websocket_tls_domain: "localhost".to_string(),
             websocket_tls_ca_file: None,
             websocket_tls_validate_certificate: false,
-            request_timeout: "300s".to_string(),
+            request_timeout: "30s".to_string(),
         }
     }
 }

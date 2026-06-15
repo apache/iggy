@@ -847,7 +847,7 @@ mod tests {
         );
         assert_eq!(
             client.config.request_timeout,
-            IggyDuration::from_str("300s").unwrap()
+            IggyDuration::from_str("30s").unwrap()
         );
         assert!(matches!(client.config.auto_login, AutoLogin::Disabled));
         assert!(client.config.reconnection.enabled);
