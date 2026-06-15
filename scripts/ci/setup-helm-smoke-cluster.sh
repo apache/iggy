@@ -141,17 +141,35 @@ echo "Upgrading Gateway API CRDs to ${HELM_SMOKE_GATEWAY_API_VERSION}..."
 kubectl apply --server-side --force-conflicts \
   -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${HELM_SMOKE_GATEWAY_API_VERSION}/standard-install.yaml"
 
-echo "Creating GatewayClass and Gateway..."
-# Default EnvoyProxy provider (ClusterIP) is enough - the smoke test reaches
-# Envoy via `kubectl port-forward svc/...:80`, which tunnels through the
-# apiserver to the ClusterIP regardless of service type.
+echo "Creating EnvoyProxy, GatewayClass, and Gateway..."
+# Envoy Gateway's default envoyService type is LoadBalancer, which never
+# gets an address on kind (no LB controller). Pin to ClusterIP - the smoke
+# test reaches Envoy via `kubectl port-forward svc/...:80`, which tunnels
+# through the apiserver to the ClusterIP, so no node port is needed.
 kubectl apply -f - <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: iggy-smoke-proxy
+  namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: ClusterIP
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
   name: iggy-smoke
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: iggy-smoke-proxy
+    namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
