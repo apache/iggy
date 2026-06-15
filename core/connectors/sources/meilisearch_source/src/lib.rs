@@ -17,7 +17,9 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    retry::{exponential_backoff, jitter, parse_duration},
+    source_connector,
 };
 use meilisearch_sdk::{
     client::Client,
@@ -29,7 +31,7 @@ use meilisearch_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{str::FromStr, time::Duration};
+use std::{future::Future, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
 
@@ -39,6 +41,11 @@ const CONNECTOR_NAME: &str = "Meilisearch source";
 const DEFAULT_BATCH_SIZE: usize = 100;
 const DEFAULT_POLLING_INTERVAL: &str = "5s";
 const DEFAULT_INCLUDE_METADATA: bool = false;
+const DEFAULT_TIMEOUT: &str = "30s";
+const DEFAULT_RETRY_DELAY: &str = "500ms";
+const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_MAX_OPEN_RETRIES: u32 = 5;
 const PRIMARY_KEY_SORT_DIRECTION: &str = "asc";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +59,11 @@ pub struct MeilisearchSourceConfig {
     pub batch_size: Option<usize>,
     pub polling_interval: Option<String>,
     pub include_metadata: Option<bool>,
+    pub timeout: Option<String>,
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+    pub max_retry_delay: Option<String>,
+    pub max_open_retries: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -73,17 +85,28 @@ struct ResolvedMeilisearchSourceConfig {
     batch_size: usize,
     polling_interval: Duration,
     include_metadata: bool,
+    timeout: Duration,
+    max_retries: u32,
+    retry_delay: Duration,
+    max_retry_delay: Duration,
+    max_open_retries: u32,
 }
 
 impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
     fn from(config: MeilisearchSourceConfig) -> Self {
         let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-        let polling_interval = parse_duration_or_default(
-            "polling_interval",
-            config.polling_interval.as_deref(),
-            DEFAULT_POLLING_INTERVAL,
-        );
+        let polling_interval =
+            parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
         let include_metadata = config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA);
+        let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
+        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let max_retry_delay =
+            parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        let max_open_retries = config
+            .max_open_retries
+            .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
+            .max(1);
 
         Self {
             url: config.url,
@@ -94,6 +117,11 @@ impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
             batch_size,
             polling_interval,
             include_metadata,
+            timeout,
+            max_retries,
+            retry_delay,
+            max_retry_delay,
+            max_open_retries,
         }
     }
 }
@@ -148,7 +176,9 @@ impl MeilisearchSource {
     }
 
     async fn check_connectivity(&self, client: &Client) -> Result<(), Error> {
-        let health = client.health().await.map_err(map_sdk_error)?;
+        let health = self
+            .retry_sdk_open_operation("health check", || client.health())
+            .await?;
         if health.status == "available" {
             return Ok(());
         }
@@ -160,21 +190,22 @@ impl MeilisearchSource {
     }
 
     async fn get_primary_key(&self, client: &Client) -> Result<String, Error> {
-        let mut index = client
-            .get_index(&self.config.index)
-            .await
-            .map_err(map_sdk_error)?;
-        index
-            .get_primary_key()
-            .await
-            .map_err(map_sdk_error)?
-            .map(str::to_string)
-            .ok_or_else(|| {
-                Error::InvalidConfigValue(format!(
-                    "Meilisearch index '{}' must define a primary key for stable source polling",
-                    self.config.index
-                ))
+        let primary_key = self
+            .retry_sdk_open_operation("get primary key", || async {
+                let mut index = client.get_index(&self.config.index).await?;
+                index
+                    .get_primary_key()
+                    .await
+                    .map(|primary_key| primary_key.map(str::to_string))
             })
+            .await?;
+
+        primary_key.ok_or_else(|| {
+            Error::InvalidConfigValue(format!(
+                "Meilisearch index '{}' must define a primary key for stable source polling",
+                self.config.index
+            ))
+        })
     }
 
     async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
@@ -201,10 +232,13 @@ impl MeilisearchSource {
             query.with_filter(filter);
         }
 
-        let documents: Vec<Value> = match query.execute::<Value>().await {
-            Ok(results) => results.hits.into_iter().map(|hit| hit.result).collect(),
-            Err(error) => return Err(map_sdk_error(error)),
-        };
+        let results = self
+            .retry_sdk_operation("search documents", || {
+                let query = query.clone();
+                async move { query.execute::<Value>().await }
+            })
+            .await?;
+        let documents: Vec<Value> = results.hits.into_iter().map(|hit| hit.result).collect();
         let last_document_primary_key = documents
             .last()
             .map(|document| document_primary_key(document, primary_key))
@@ -268,6 +302,92 @@ impl MeilisearchSource {
             })
             .collect()
     }
+
+    async fn retry_sdk_operation<T, Fut, Op>(
+        &self,
+        operation: &str,
+        operation_fn: Op,
+    ) -> Result<T, Error>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MeilisearchSdkError>>,
+    {
+        self.retry_sdk_operation_with_attempts(operation, self.config.max_retries, operation_fn)
+            .await
+    }
+
+    async fn retry_sdk_open_operation<T, Fut, Op>(
+        &self,
+        operation: &str,
+        operation_fn: Op,
+    ) -> Result<T, Error>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MeilisearchSdkError>>,
+    {
+        self.retry_sdk_operation_with_attempts(
+            operation,
+            self.config.max_open_retries,
+            operation_fn,
+        )
+        .await
+    }
+
+    async fn retry_sdk_operation_with_attempts<T, Fut, Op>(
+        &self,
+        operation: &str,
+        max_attempts: u32,
+        mut operation_fn: Op,
+    ) -> Result<T, Error>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MeilisearchSdkError>>,
+    {
+        let max_attempts = max_attempts.max(1);
+        let mut attempt = 0u32;
+
+        loop {
+            let result = tokio::time::timeout(self.config.timeout, operation_fn()).await;
+            match result {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) => {
+                    attempt += 1;
+                    let should_retry = attempt < max_attempts && is_transient_sdk_error(&error);
+                    if !should_retry {
+                        return Err(map_sdk_error(error));
+                    }
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        attempt,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch {operation} failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:?}..."
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(_) => {
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(Error::HttpRequestFailed(format!(
+                            "Meilisearch {operation} timed out after {:?}",
+                            self.config.timeout
+                        )));
+                    }
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        attempt,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch {operation} timed out after {:?} (attempt {attempt}/{max_attempts}). Retrying in {delay:?}...",
+                        self.config.timeout
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -326,21 +446,6 @@ impl Source for MeilisearchSource {
         );
         Ok(())
     }
-}
-
-fn parse_duration_or_default(field: &str, value: Option<&str>, default: &str) -> Duration {
-    if let Some(value) = value {
-        match humantime::Duration::from_str(value) {
-            Ok(duration) => return duration.into(),
-            Err(error) => warn!(
-                "Invalid Meilisearch source {field} value '{value}': {error}. Using default '{default}'"
-            ),
-        }
-    }
-
-    humantime::Duration::from_str(default)
-        .expect("valid default duration")
-        .into()
 }
 
 fn normalize_host(host: &str) -> Result<String, Error> {
@@ -434,13 +539,14 @@ fn cursor_filter_expression(
 
 fn primary_key_filter_literal(value: &Value) -> Result<String, Error> {
     match value {
-        Value::String(_) | Value::Number(_) => serde_json::to_string(value).map_err(|error| {
+        Value::Number(_) => serde_json::to_string(value).map_err(|error| {
             Error::Serialization(format!(
                 "Failed to serialize Meilisearch primary key: {error}"
             ))
         }),
         _ => Err(Error::InvalidConfigValue(
-            "Meilisearch source primary key values must be strings or numbers".to_string(),
+            "Meilisearch source primary key values must be numbers with getmeili/meilisearch:v1.13"
+                .to_string(),
         )),
     }
 }
@@ -484,6 +590,19 @@ fn map_sdk_error(error: MeilisearchSdkError) -> Error {
     }
 }
 
+fn is_transient_sdk_error(error: &MeilisearchSdkError) -> bool {
+    match error {
+        MeilisearchSdkError::Meilisearch(meilisearch_error) => {
+            meilisearch_error.error_type == MeilisearchErrorType::Internal
+        }
+        MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
+            communication_error.status_code == 429 || communication_error.status_code >= 500
+        }
+        MeilisearchSdkError::HttpError(_) | MeilisearchSdkError::Timeout => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +617,11 @@ mod tests {
             batch_size: Some(10),
             polling_interval: Some("1ms".to_string()),
             include_metadata: None,
+            timeout: None,
+            max_retries: None,
+            retry_delay: None,
+            max_retry_delay: None,
+            max_open_retries: None,
         }
     }
 
@@ -556,15 +680,19 @@ mod tests {
     }
 
     #[test]
-    fn cursor_filter_should_compare_against_last_primary_key() {
-        assert_eq!(
-            cursor_filter_expression("id", Some(&json!("movie-1"))).unwrap(),
-            Some("id > \"movie-1\"".to_string())
-        );
+    fn cursor_filter_should_compare_against_numeric_last_primary_key() {
         assert_eq!(
             cursor_filter_expression("id", Some(&json!(42))).unwrap(),
             Some("id > 42".to_string())
         );
+    }
+
+    #[test]
+    fn cursor_filter_should_reject_string_last_primary_key() {
+        let error = cursor_filter_expression("id", Some(&json!("movie-1")))
+            .expect_err("string primary key should be rejected");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
     }
 
     #[test]
@@ -577,6 +705,12 @@ mod tests {
     fn sanitize_url_should_redact_credentials() {
         let url = sanitize_url_for_logging("https://user:pass@localhost:7700/indexes");
         assert_eq!(url, "https://<redacted>@localhost:7700/indexes");
+    }
+
+    #[test]
+    fn sanitize_url_should_redact_credentials_without_scheme() {
+        let url = sanitize_url_for_logging("user:pass@localhost:7700/indexes");
+        assert_eq!(url, "http://<redacted>@localhost:7700/indexes");
     }
 
     #[test]

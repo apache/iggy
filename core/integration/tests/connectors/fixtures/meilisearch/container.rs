@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
@@ -73,6 +74,7 @@ impl MeilisearchContainer {
                     .with_expected_status_code(200u16),
             ))
             .with_network(unique_network)
+            .with_container_name(fixtures::unique_container_name("meilisearch"))
             .with_env_var("MEILI_ENV", "development")
             .with_mapped_port(0, MEILISEARCH_PORT.tcp())
             .start()

@@ -13,6 +13,11 @@ them as JSON messages into Iggy.
 - `batch_size`: Maximum documents fetched per poll. Defaults to `100`.
 - `polling_interval`: Delay between polls as a humantime string. Defaults to `5s`.
 - `include_metadata`: Wrap each hit with Meilisearch metadata. Defaults to `false`.
+- `timeout`: Request timeout as a humantime string. Defaults to `30s`.
+- `max_retries`: Maximum transient retry attempts during polling. Defaults to `3`.
+- `retry_delay`: Initial retry delay. Defaults to `500ms`.
+- `max_retry_delay`: Maximum retry delay. Defaults to `5s`.
+- `max_open_retries`: Maximum transient retry attempts during `open()`. Defaults to `5`.
 
 ## Behavior
 
@@ -21,9 +26,12 @@ a `/search` request sorted by that primary key and stores the last emitted
 primary-key value in connector state. This avoids offset pagination skips when
 documents are inserted or deleted between polls.
 
-The primary-key field must be configured as filterable and sortable in
-Meilisearch, because the connector adds a cursor filter and primary-key sort to
-each search request. Returned hits are serialized as JSON message payloads.
+The primary-key field must be numeric, filterable, and sortable in Meilisearch,
+because the connector adds a cursor filter and primary-key sort to each search
+request. The numeric primary-key requirement matches the pinned integration test
+version, `getmeili/meilisearch:v1.13`, where greater-than filters on string
+attributes are not supported. Returned hits are serialized as JSON message
+payloads.
 
 When `include_metadata` is enabled, each payload has this shape:
 

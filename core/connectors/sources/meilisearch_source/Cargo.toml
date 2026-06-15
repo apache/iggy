@@ -38,7 +38,6 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
-humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 meilisearch-sdk = { workspace = true }

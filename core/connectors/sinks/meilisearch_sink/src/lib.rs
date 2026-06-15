@@ -32,6 +32,7 @@ use meilisearch_sdk::{
     },
     indexes::Index,
     task_info::TaskInfo,
+    tasks::Task,
 };
 use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
@@ -196,7 +197,7 @@ impl MeilisearchSink {
 
     async fn check_connectivity(&self, client: &Client) -> Result<(), Error> {
         let health = self
-            .retry_sdk_operation("health check", || client.health())
+            .retry_sdk_open_operation("health check", || client.health())
             .await?;
         if health.status == "available" {
             return Ok(());
@@ -258,7 +259,7 @@ impl MeilisearchSink {
         );
 
         let task = self
-            .retry_sdk_operation("create index", || {
+            .retry_sdk_open_operation("create index", || {
                 client.create_index(&self.config.index, Some(&self.config.primary_key))
             })
             .await?;
@@ -378,10 +379,18 @@ impl MeilisearchSink {
         &self,
         client: &Client,
         documents: Vec<Value>,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, PartialIndexError> {
         let mut accepted = 0usize;
         for chunk in documents.chunks(self.config.batch_size) {
-            accepted += self.index_document_chunk(client, chunk).await?;
+            match self.index_document_chunk(client, chunk).await {
+                Ok(indexed) => accepted += indexed,
+                Err(partial_error) => {
+                    return Err(PartialIndexError {
+                        accepted: accepted + partial_error.accepted,
+                        error: partial_error.error,
+                    });
+                }
+            }
         }
         Ok(accepted)
     }
@@ -390,7 +399,7 @@ impl MeilisearchSink {
         &self,
         client: &Client,
         documents: &[Value],
-    ) -> Result<usize, Error> {
+    ) -> Result<usize, PartialIndexError> {
         if documents.is_empty() {
             return Ok(0);
         }
@@ -401,16 +410,22 @@ impl MeilisearchSink {
                 self.retry_sdk_operation("add or replace documents", || {
                     index.add_or_replace(documents, Some(&self.config.primary_key))
                 })
-                .await?
+                .await
             }
             MeilisearchDocumentAction::Update => {
                 self.retry_sdk_operation("add or update documents", || {
                     index.add_or_update(documents, Some(&self.config.primary_key))
                 })
-                .await?
+                .await
             }
-        };
-        self.wait_for_task(client, task).await?;
+        }
+        .map_err(|error| PartialIndexError { accepted: 0, error })?;
+        self.wait_for_task(client, task)
+            .await
+            .map_err(|error| PartialIndexError {
+                accepted: documents.len(),
+                error,
+            })?;
         Ok(documents.len())
     }
 
@@ -427,14 +442,9 @@ impl MeilisearchSink {
         client: &Client,
         task: TaskInfo,
     ) -> Result<(), Error> {
-        let task = task
-            .wait_for_completion(
-                client,
-                Some(self.config.task_poll_interval),
-                Some(self.config.task_timeout),
-            )
-            .await
-            .map_err(map_sdk_error)?;
+        let task = self
+            .wait_for_task_status(client, task, self.config.max_open_retries)
+            .await?;
 
         if task.is_success() {
             return Ok(());
@@ -457,14 +467,9 @@ impl MeilisearchSink {
     }
 
     async fn wait_for_task_completion(&self, client: &Client, task: TaskInfo) -> Result<(), Error> {
-        let task = task
-            .wait_for_completion(
-                client,
-                Some(self.config.task_poll_interval),
-                Some(self.config.task_timeout),
-            )
-            .await
-            .map_err(map_sdk_error)?;
+        let task = self
+            .wait_for_task_status(client, task, self.config.max_retries)
+            .await?;
 
         if task.is_success() {
             return Ok(());
@@ -483,16 +488,77 @@ impl MeilisearchSink {
         ))
     }
 
+    async fn wait_for_task_status(
+        &self,
+        client: &Client,
+        task: TaskInfo,
+        max_attempts: u32,
+    ) -> Result<Task, Error> {
+        let task_uid = task.get_task_uid();
+        let mut elapsed_time = Duration::ZERO;
+
+        while self.config.task_timeout > elapsed_time {
+            let status = self
+                .retry_sdk_operation_with_attempts("get task status", max_attempts, || {
+                    client.get_task(task.clone())
+                })
+                .await?;
+
+            if status.is_success() || status.is_failure() {
+                return Ok(status);
+            }
+
+            tokio::time::sleep(self.config.task_poll_interval).await;
+            elapsed_time += self.config.task_poll_interval;
+        }
+
+        Err(Error::HttpRequestFailed(format!(
+            "Meilisearch task {task_uid} timed out after {:?}",
+            self.config.task_timeout
+        )))
+    }
+
     async fn retry_sdk_operation<T, Fut, Op>(
         &self,
         operation: &str,
+        operation_fn: Op,
+    ) -> Result<T, Error>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MeilisearchSdkError>>,
+    {
+        self.retry_sdk_operation_with_attempts(operation, self.config.max_retries, operation_fn)
+            .await
+    }
+
+    async fn retry_sdk_open_operation<T, Fut, Op>(
+        &self,
+        operation: &str,
+        operation_fn: Op,
+    ) -> Result<T, Error>
+    where
+        Op: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, MeilisearchSdkError>>,
+    {
+        self.retry_sdk_operation_with_attempts(
+            operation,
+            self.config.max_open_retries,
+            operation_fn,
+        )
+        .await
+    }
+
+    async fn retry_sdk_operation_with_attempts<T, Fut, Op>(
+        &self,
+        operation: &str,
+        max_attempts: u32,
         mut operation_fn: Op,
     ) -> Result<T, Error>
     where
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        let max_attempts = self.config.max_retries.max(1);
+        let max_attempts = max_attempts.max(1);
         let mut attempt = 0u32;
 
         loop {
@@ -538,9 +604,9 @@ impl MeilisearchSink {
         }
     }
 
-    async fn record_error(&self) {
+    async fn record_errors(&self, errors: usize) {
         let mut state = self.state.lock().await;
-        state.errors_count += 1;
+        state.errors_count += errors;
     }
 }
 
@@ -596,12 +662,23 @@ impl Sink for MeilisearchSink {
 
         let messages_count = messages.len();
         let mut documents = Vec::with_capacity(messages.len());
+        let mut invalid_records = 0usize;
         for message in messages {
-            if let Some(document) =
-                self.prepare_document(topic_metadata, &messages_metadata, message)?
-            {
-                documents.push(document);
+            match self.prepare_document(topic_metadata, &messages_metadata, message) {
+                Ok(Some(document)) => documents.push(document),
+                Ok(None) => {}
+                Err(Error::InvalidRecordValue(reason)) => {
+                    invalid_records += 1;
+                    warn!(
+                        "Dropping invalid Meilisearch sink record for connector ID: {}, reason: {}",
+                        self.id, reason
+                    );
+                }
+                Err(error) => return Err(error),
             }
+        }
+        if invalid_records > 0 {
+            self.record_errors(invalid_records).await;
         }
 
         if documents.is_empty() {
@@ -621,9 +698,15 @@ impl Sink for MeilisearchSink {
                 );
                 Ok(())
             }
-            Err(error) => {
-                self.record_error().await;
-                Err(error)
+            Err(partial_error) => {
+                let mut state = self.state.lock().await;
+                state.documents_enqueued += partial_error.accepted;
+                if self.config.wait_for_tasks {
+                    state.documents_indexed += partial_error.accepted;
+                }
+                state.errors_count += 1;
+                drop(state);
+                Err(partial_error.error)
             }
         }
     }
@@ -675,15 +758,16 @@ fn insert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Va
 }
 
 fn sanitize_url_for_log(raw: &str) -> String {
-    let Ok(mut url) = Url::parse(raw) else {
-        return raw.to_string();
+    let normalized = normalize_host(raw).unwrap_or_else(|_| raw.trim().to_string());
+    let Ok(mut url) = Url::parse(&normalized) else {
+        return "<invalid-url>".to_string();
     };
 
     if !url.username().is_empty() {
-        let _ = url.set_username("<redacted>");
+        let _ = url.set_username("");
     }
     if url.password().is_some() {
-        let _ = url.set_password(Some("<redacted>"));
+        let _ = url.set_password(None);
     }
     url.to_string()
 }
@@ -708,6 +792,12 @@ fn normalize_host(raw: &str) -> Result<String, Error> {
         host.pop();
     }
     Ok(host)
+}
+
+#[derive(Debug)]
+struct PartialIndexError {
+    accepted: usize,
+    error: Error,
 }
 
 fn is_index_not_found(error: &MeilisearchSdkError) -> bool {
@@ -960,6 +1050,12 @@ mod tests {
 
         assert_eq!(document["data"], "AAECAw==");
         assert_eq!(document["data_encoding"], ENCODING_BASE64);
+    }
+
+    #[test]
+    fn sanitize_url_should_redact_credentials_without_scheme() {
+        let url = sanitize_url_for_log("user:pass@localhost:7700/indexes");
+        assert_eq!(url, "http://localhost:7700/indexes");
     }
 
     #[test]
