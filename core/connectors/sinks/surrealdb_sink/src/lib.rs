@@ -26,12 +26,15 @@ use iggy_connector_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use surrealdb::Surreal;
 use surrealdb::engine::remote::ws::{Client as WsClient, Ws, Wss};
 use surrealdb::opt::Config;
 use surrealdb::opt::auth::{Database, Namespace, Root};
+use surrealdb::types::QueryError;
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 sink_connector!(SurrealDbSink);
@@ -50,7 +53,7 @@ type SurrealDbClient = Surreal<WsClient>;
 #[derive(Debug)]
 pub struct SurrealDbSink {
     id: u32,
-    client: Option<SurrealDbClient>,
+    client: Mutex<Option<SurrealDbClient>>,
     config: SurrealDbSinkConfig,
     table: String,
     auth_scope: AuthScope,
@@ -174,7 +177,7 @@ impl SurrealDbSink {
 
         SurrealDbSink {
             id,
-            client: None,
+            client: Mutex::new(None),
             config,
             table,
             auth_scope,
@@ -237,23 +240,8 @@ impl Sink for SurrealDbSink {
             self.table
         );
 
-        let client = self.connect().await?;
-        self.signin_if_configured(&client).await?;
-        client
-            .use_ns(&self.config.namespace)
-            .use_db(&self.config.database)
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to select namespace/database: {e}")))?;
-        client
-            .health()
-            .await
-            .map_err(|e| Error::InitError(format!("SurrealDB health check failed: {e}")))?;
-
-        if self.auto_define_table {
-            self.ensure_table(&client).await?;
-        }
-
-        self.client = Some(client);
+        let client = self.connect_and_select().await?;
+        *self.client.lock().await = Some(client);
         info!(
             "Opened SurrealDB sink connector ID: {} for table: {}",
             self.id, self.table
@@ -273,7 +261,7 @@ impl Sink for SurrealDbSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         info!("Closing SurrealDB sink connector with ID: {}", self.id);
-        self.client.take();
+        self.client.get_mut().take();
 
         let messages_processed = self.messages_processed.load(Ordering::Relaxed);
         let insertion_errors = self.insertion_errors.load(Ordering::Relaxed);
@@ -286,6 +274,26 @@ impl Sink for SurrealDbSink {
 }
 
 impl SurrealDbSink {
+    async fn connect_and_select(&self) -> Result<SurrealDbClient, Error> {
+        let client = self.connect().await?;
+        self.signin_if_configured(&client).await?;
+        client
+            .use_ns(&self.config.namespace)
+            .use_db(&self.config.database)
+            .await
+            .map_err(|e| Error::InitError(format!("Failed to select namespace/database: {e}")))?;
+        client
+            .health()
+            .await
+            .map_err(|e| Error::InitError(format!("SurrealDB health check failed: {e}")))?;
+
+        if self.auto_define_table {
+            self.ensure_table(&client).await?;
+        }
+
+        Ok(client)
+    }
+
     async fn connect(&self) -> Result<SurrealDbClient, Error> {
         let config = Config::new().query_timeout(self.query_timeout);
         let endpoint = self.config.endpoint.as_str();
@@ -299,6 +307,21 @@ impl SurrealDbSink {
                 .await
                 .map_err(|e| Error::InitError(format!("Failed to connect to SurrealDB: {e}")))
         }
+    }
+
+    async fn get_client(&self) -> Result<SurrealDbClient, Error> {
+        self.client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::InitError("SurrealDB sink is not connected".to_string()))
+    }
+
+    async fn reconnect(&self) -> Result<(), Error> {
+        warn!("Reconnecting SurrealDB sink connector ID: {}", self.id);
+        let client = self.connect_and_select().await?;
+        *self.client.lock().await = Some(client);
+        Ok(())
     }
 
     async fn signin_if_configured(&self, client: &SurrealDbClient) -> Result<(), Error> {
@@ -380,17 +403,12 @@ impl SurrealDbSink {
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
     ) -> Result<(), Error> {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| Error::InitError("SurrealDB sink is not connected".to_string()))?;
-
         let mut successful_inserts = 0u64;
-        let mut last_error = None;
+        let record_id_prefix = RecordIdPrefix::new(topic_metadata);
 
         for batch in messages.chunks(self.batch_size) {
             let outcome = self
-                .insert_batch(client, batch, topic_metadata, messages_metadata)
+                .insert_batch(batch, &record_id_prefix, topic_metadata, messages_metadata)
                 .await;
             successful_inserts += outcome.inserted_count;
 
@@ -401,7 +419,6 @@ impl SurrealDbSink {
                     "Failed to insert SurrealDB batch for connector ID: {}, table: {}, error: {error}",
                     self.id, self.table
                 );
-                last_error = Some(error);
             }
         }
 
@@ -420,17 +437,13 @@ impl SurrealDbSink {
             );
         }
 
-        if let Some(error) = last_error {
-            Err(error)
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     async fn insert_batch(
         &self,
-        client: &SurrealDbClient,
         messages: &[ConsumedMessage],
+        record_id_prefix: &RecordIdPrefix,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
     ) -> BatchInsertOutcome {
@@ -443,7 +456,7 @@ impl SurrealDbSink {
 
         let mut records = Vec::with_capacity(messages.len());
         for message in messages {
-            match self.build_record(topic_metadata, messages_metadata, message) {
+            match self.build_record(record_id_prefix, topic_metadata, messages_metadata, message) {
                 Ok(record) => records.push(record),
                 Err(error) => {
                     return BatchInsertOutcome {
@@ -454,23 +467,39 @@ impl SurrealDbSink {
             }
         }
 
-        self.insert_records_with_retry(client, records).await
+        self.insert_records_with_retry(records).await
     }
 
-    async fn insert_records_with_retry(
-        &self,
-        client: &SurrealDbClient,
-        records: Vec<Value>,
-    ) -> BatchInsertOutcome {
+    async fn insert_records_with_retry(&self, records: Vec<Value>) -> BatchInsertOutcome {
         let mut attempts = 0u32;
         let query = build_insert_query(&self.table);
         let record_count = records.len() as u64;
-        let variables = json!({ "records": records });
+        let mut variables = Some(json!({ "records": records }));
 
         loop {
+            let final_attempt = attempts + 1 >= self.max_retries;
+            let Some(bound_variables) = bind_variables_for_attempt(&mut variables, final_attempt)
+            else {
+                return BatchInsertOutcome {
+                    inserted_count: 0,
+                    error: Some(Error::CannotStoreData(
+                        "SurrealDB batch insert variables were consumed before final attempt"
+                            .to_string(),
+                    )),
+                };
+            };
+            let client = match self.get_client().await {
+                Ok(client) => client,
+                Err(error) => {
+                    return BatchInsertOutcome {
+                        inserted_count: 0,
+                        error: Some(error),
+                    };
+                }
+            };
             let result = client
                 .query(&query)
-                .bind(variables.clone())
+                .bind(bound_variables)
                 .await
                 .and_then(|response| response.check());
 
@@ -483,11 +512,22 @@ impl SurrealDbSink {
                 }
                 Err(error) => {
                     attempts += 1;
-                    if !is_transient_error(&error) || attempts >= self.max_retries {
+                    let transient = is_transient_error(&error);
+                    if !transient || attempts >= self.max_retries {
                         return BatchInsertOutcome {
                             inserted_count: 0,
                             error: Some(Error::CannotStoreData(format!(
                                 "SurrealDB batch insert failed after {attempts} attempts: {error}"
+                            ))),
+                        };
+                    }
+                    if is_connection_error(&error)
+                        && let Err(reconnect_error) = self.reconnect().await
+                    {
+                        return BatchInsertOutcome {
+                            inserted_count: 0,
+                            error: Some(Error::Connection(format!(
+                                "Failed to reconnect to SurrealDB after transient write error: {reconnect_error}"
                             ))),
                         };
                     }
@@ -509,6 +549,7 @@ impl SurrealDbSink {
 
     fn build_record(
         &self,
+        record_id_prefix: &RecordIdPrefix,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         message: &ConsumedMessage,
@@ -517,7 +558,7 @@ impl SurrealDbSink {
         record.insert(
             "id".to_string(),
             Value::String(build_record_id(
-                topic_metadata,
+                record_id_prefix,
                 messages_metadata,
                 message.id,
             )),
@@ -597,6 +638,14 @@ impl SurrealDbSink {
 
 fn build_insert_query(table: &str) -> String {
     format!("INSERT IGNORE INTO {table} $records RETURN NONE;")
+}
+
+fn bind_variables_for_attempt(variables: &mut Option<Value>, final_attempt: bool) -> Option<Value> {
+    if final_attempt {
+        variables.take()
+    } else {
+        variables.clone()
+    }
 }
 
 fn build_auto_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
@@ -679,22 +728,38 @@ fn encode_headers(
     Ok(Value::Object(encoded))
 }
 
+#[derive(Debug)]
+struct RecordIdPrefix {
+    stream: String,
+    topic: String,
+}
+
+impl RecordIdPrefix {
+    fn new(topic_metadata: &TopicMetadata) -> Self {
+        let mut stream = String::with_capacity(topic_metadata.stream.len() * 2);
+        push_hex_component(&mut stream, topic_metadata.stream.as_bytes());
+        let mut topic = String::with_capacity(topic_metadata.topic.len() * 2);
+        push_hex_component(&mut topic, topic_metadata.topic.as_bytes());
+
+        Self { stream, topic }
+    }
+}
+
 fn build_record_id(
-    topic_metadata: &TopicMetadata,
+    record_id_prefix: &RecordIdPrefix,
     messages_metadata: &MessagesMetadata,
     message_id: u128,
 ) -> String {
-    let mut id = String::with_capacity(
-        topic_metadata.stream.len() * 2 + topic_metadata.topic.len() * 2 + 48,
-    );
+    let mut id =
+        String::with_capacity(record_id_prefix.stream.len() + record_id_prefix.topic.len() + 48);
     id.push('s');
-    push_hex_component(&mut id, topic_metadata.stream.as_bytes());
+    id.push_str(&record_id_prefix.stream);
     id.push_str("_t");
-    push_hex_component(&mut id, topic_metadata.topic.as_bytes());
+    id.push_str(&record_id_prefix.topic);
     id.push_str("_p");
     id.push_str(&messages_metadata.partition_id.to_string());
     id.push_str("_m");
-    id.push_str(&format!("{message_id:032x}"));
+    let _ = write!(&mut id, "{message_id:032x}");
     id
 }
 
@@ -731,24 +796,47 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), Error> {
 }
 
 fn is_transient_error(error: &surrealdb::Error) -> bool {
+    is_transaction_conflict(error)
+        || is_connection_error(error)
+        || is_timeout_or_service_error(error)
+}
+
+fn is_transaction_conflict(error: &surrealdb::Error) -> bool {
+    if matches!(error.query_details(), Some(QueryError::TransactionConflict)) {
+        return true;
+    }
+
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("timeout")
-        || message.contains("timed out")
-        || message.contains("connection")
+    message.contains("transaction conflict") || message.contains("transaction can be retried")
+}
+
+fn is_connection_error(error: &surrealdb::Error) -> bool {
+    if error.is_connection() {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("connection")
         || message.contains("network")
         || message.contains("websocket")
         || message.contains("channel")
         || message.contains("broken pipe")
         || message.contains("reset by peer")
+}
+
+fn is_timeout_or_service_error(error: &surrealdb::Error) -> bool {
+    if matches!(error.query_details(), Some(QueryError::TimedOut { .. })) {
+        return true;
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("timeout")
+        || message.contains("timed out")
         || message.contains("temporarily unavailable")
         || message.contains("service unavailable")
 }
 
 fn redact_endpoint(endpoint: &str) -> String {
-    if let Some((_, host)) = endpoint.rsplit_once('@') {
-        return format!("***@{}", host);
-    }
-
     endpoint.to_string()
 }
 
@@ -930,7 +1018,9 @@ mod tests {
 
     #[test]
     fn given_topic_metadata_should_build_deterministic_record_id() {
-        let id = build_record_id(&test_topic_metadata(), &test_messages_metadata(), 42);
+        let topic_metadata = test_topic_metadata();
+        let record_id_prefix = RecordIdPrefix::new(&topic_metadata);
+        let id = build_record_id(&record_id_prefix, &test_messages_metadata(), 42);
 
         assert_eq!(
             id,
@@ -1035,8 +1125,15 @@ mod tests {
         message.headers = Some(headers);
 
         let sink = SurrealDbSink::new(1, test_config());
+        let topic_metadata = test_topic_metadata();
+        let record_id_prefix = RecordIdPrefix::new(&topic_metadata);
         let record = sink
-            .build_record(&test_topic_metadata(), &test_messages_metadata(), &message)
+            .build_record(
+                &record_id_prefix,
+                &topic_metadata,
+                &test_messages_metadata(),
+                &message,
+            )
             .expect("Failed to build record");
         let object = record.as_object().expect("record should be object");
 
@@ -1059,6 +1156,29 @@ mod tests {
     }
 
     #[test]
+    fn given_invalid_batch_when_processing_messages_should_record_error_and_continue() {
+        let mut config = test_config();
+        config.payload_format = Some("json".to_string());
+        let sink = SurrealDbSink::new(1, config);
+        let message = test_message(Payload::Raw(b"not-json".to_vec()));
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                sink.process_messages(
+                    &test_topic_metadata(),
+                    &test_messages_metadata(),
+                    &[message],
+                )
+                .await
+                .expect("batch failures should not stop the sink task");
+            });
+
+        assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn given_metadata_disabled_should_build_minimal_record() {
         let mut config = test_config();
         config.include_metadata = Some(false);
@@ -1067,9 +1187,16 @@ mod tests {
         config.include_origin_timestamp = Some(false);
         let sink = SurrealDbSink::new(1, config);
         let message = test_message(Payload::Text("minimal".to_string()));
+        let topic_metadata = test_topic_metadata();
+        let record_id_prefix = RecordIdPrefix::new(&topic_metadata);
 
         let record = sink
-            .build_record(&test_topic_metadata(), &test_messages_metadata(), &message)
+            .build_record(
+                &record_id_prefix,
+                &topic_metadata,
+                &test_messages_metadata(),
+                &message,
+            )
             .expect("Failed to build record");
         let object = record.as_object().expect("record should be object");
 
@@ -1083,11 +1210,55 @@ mod tests {
     }
 
     #[test]
-    fn given_endpoint_with_credentials_should_redact_prefix() {
-        assert_eq!(
-            redact_endpoint("user:pass@127.0.0.1:8000"),
-            "***@127.0.0.1:8000"
-        );
+    fn given_endpoint_should_log_unchanged_host_port() {
         assert_eq!(redact_endpoint("127.0.0.1:8000"), "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn given_retry_variables_when_more_attempts_remain_should_clone_payload() {
+        let original = json!({ "records": [{"id": "one"}] });
+        let mut variables = Some(original.clone());
+
+        let bound =
+            bind_variables_for_attempt(&mut variables, false).expect("variables should bind");
+
+        assert_eq!(bound, original);
+        assert_eq!(variables, Some(original));
+    }
+
+    #[test]
+    fn given_retry_variables_when_final_attempt_should_take_payload() {
+        let original = json!({ "records": [{"id": "one"}] });
+        let mut variables = Some(original.clone());
+
+        let bound =
+            bind_variables_for_attempt(&mut variables, true).expect("variables should bind");
+
+        assert_eq!(bound, original);
+        assert_eq!(variables, None);
+    }
+
+    #[test]
+    fn given_transaction_conflict_error_should_be_transient() {
+        let error = surrealdb::Error::query(
+            "Transaction conflict".to_string(),
+            QueryError::TransactionConflict,
+        );
+
+        assert!(is_transient_error(&error));
+        assert!(is_transaction_conflict(&error));
+    }
+
+    #[test]
+    fn given_query_timeout_error_should_be_transient() {
+        let error = surrealdb::Error::query(
+            "Query timed out".to_string(),
+            QueryError::TimedOut {
+                duration: Duration::from_secs(30),
+            },
+        );
+
+        assert!(is_transient_error(&error));
+        assert!(is_timeout_or_service_error(&error));
     }
 }
