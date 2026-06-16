@@ -29,8 +29,12 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
+# dashmap and once_cell are not imported directly in this crate's source, but
+# the source_connector! macro (in iggy_connector_sdk::source) expands bare
+# `use dashmap::DashMap` and `use once_cell::sync::Lazy` into this crate's
+# namespace, so they must be listed here.
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell", "futures", "simd-json"]
+ignored = ["dashmap", "once_cell"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -47,6 +51,5 @@ rmp-serde = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

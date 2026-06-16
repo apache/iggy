@@ -1,21 +1,18 @@
-# OpenSearch Source Connector with State Management
+# OpenSearch Source Connector
 
-This OpenSearch source connector provides comprehensive state management capabilities to track processing progress and enable fault-tolerant data ingestion.
+Polls documents from an OpenSearch index and publishes them to Iggy streams as JSON
+messages. Incremental progress is tracked with OpenSearch `search_after` pagination
+on `(timestamp_field, _id)`.
 
 ## Features
 
-- **Incremental Data Processing**: Track last processed timestamp to avoid reprocessing data
-- **Cursor-based Pagination**: Support for document ID-based cursors
-- **Scroll-based Pagination**: Support for OpenSearch scroll API
-- **Error Tracking**: Monitor error counts and last error messages
-- **Processing Statistics**: Track performance metrics and processing times
-- **Persistent State Storage**: Multiple storage backends (file, OpenSearch, Redis)
-- **Auto-save**: Configurable automatic state persistence
-- **State Recovery**: Resume processing from last known position after restart
+- Incremental polling via `search_after` on a configured timestamp field plus `_id`
+- Optional custom OpenSearch query (`match_all` by default)
+- Basic authentication (username + password)
+- Runtime state persistence via the connectors runtime (`ConnectorState` / MessagePack)
+- Optional supplementary file-backed state when `plugin_config.state.enabled = true`
 
 ## Configuration
-
-### Basic Configuration
 
 ```toml
 type = "source"
@@ -24,6 +21,7 @@ enabled = true
 version = 0
 name = "OpenSearch source"
 path = "target/release/libiggy_connector_opensearch_source"
+plugin_config_format = "json"
 
 [[streams]]
 stream = "opensearch_stream"
@@ -38,174 +36,65 @@ index = "logs-*"
 polling_interval = "30s"
 batch_size = 100
 timestamp_field = "@timestamp"
-query = {
-  "match_all": {}
-}
+query = { "match_all": {} }
 ```
 
-### State Management Configuration
+### Required fields
+
+| Field | Description |
+| --- | --- |
+| `url` | OpenSearch HTTP endpoint |
+| `index` | Index name or pattern |
+| `timestamp_field` | Document field used for sort order and incremental cursors (required) |
+
+### Optional fields
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `polling_interval` | `10s` | Delay before each poll (humantime format) |
+| `batch_size` | `100` | Maximum documents per search request (minimum `1`) |
+| `query` | `match_all` | OpenSearch query DSL object |
+| `username` / `password` | none | HTTP basic authentication |
+| `verbose_logging` | `false` | Emit per-poll batch counts at `info!` instead of `debug!` |
+
+### File-backed state (optional)
+
+Runtime state is always returned from `poll()` and persisted by the connectors
+runtime. To additionally mirror state to JSON files on disk:
 
 ```toml
-[plugin_config]
-# ... basic config ...
-state = {
-  enabled = true
-  storage_type = "file"  # "file", "opensearch", "redis"
-  storage_config = {
-    base_path = "./connector_states"  # for file storage
-    # index = "connector_states"      # for opensearch storage
-    # url = "redis://localhost:6379"  # for redis storage
-  }
-  state_id = "opensearch_logs_connector"
-  auto_save_interval = "5m"
-  tracked_fields = [
-    "last_poll_timestamp",
-    "last_document_id",
-    "total_documents_fetched"
-  ]
-}
+[plugin_config.state]
+enabled = true
+storage_type = "file"
+storage_config = { base_path = "./connector_states" }
+state_id = "opensearch_logs_connector"
 ```
 
-## State Information
+Only `storage_type = "file"` is implemented. State is saved on `close()` when
+`state.enabled = true`.
 
-The connector tracks the following state information:
+## State fields
 
-### Processing State
+The connector tracks:
 
-- `last_poll_timestamp`: Last successful poll timestamp
-- `total_documents_fetched`: Total number of documents processed
-- `poll_count`: Number of polling cycles executed
-- `last_document_id`: Last processed document ID (for cursor pagination)
-- `last_scroll_id`: Last scroll ID (for scroll pagination)
-- `last_offset`: Last processed offset
+- `search_after`: OpenSearch sort tuple from the last document in the previous batch
+- `last_poll_timestamp`: timestamp of the last processed document
+- `last_document_id`: `_id` of the last processed document
+- `total_documents_fetched`, `poll_count`, error counters, and processing statistics
 
-### Error Tracking
+Corrupt runtime state causes `open()` to fail with `InitError` rather than silently
+resetting the cursor.
 
-- `error_count`: Total number of errors encountered
-- `last_error`: Last error message
+## Timestamp formats
 
-### Performance Statistics
-
-- `total_bytes_processed`: Total bytes processed
-- `avg_batch_processing_time_ms`: Average processing time per batch
-- `last_successful_poll`: Timestamp of last successful poll
-- `empty_polls_count`: Number of polls that returned no documents
-- `successful_polls_count`: Number of successful polls
-
-## Storage Backends
-
-### File Storage (Default)
-
-```toml
-state = {
-  enabled = true
-  storage_type = "file"
-  storage_config = {
-    base_path = "./connector_states"
-  }
-}
-```
-
-### OpenSearch Storage
-
-```toml
-state = {
-  enabled = true
-  storage_type = "opensearch"
-  storage_config = {
-    index = "connector_states"
-    url = "http://localhost:9200"
-  }
-}
-```
-
-### Redis Storage
-
-```toml
-state = {
-  enabled = true
-  storage_type = "redis"
-  storage_config = {
-    url = "redis://localhost:6379"
-    key_prefix = "connector_states:"
-  }
-}
-```
-
-## State File Format
-
-State files are stored as JSON with the following structure:
-
-```json
-{
-  "id": "opensearch_logs_connector",
-  "last_updated": "2024-01-15T10:30:00Z",
-  "version": 1,
-  "data": {
-    "last_poll_timestamp": "2024-01-15T10:30:00Z",
-    "total_documents_fetched": 15000,
-    "poll_count": 150,
-    "last_document_id": "doc_12345",
-    "last_scroll_id": "scroll_abc123",
-    "last_offset": 15000,
-    "error_count": 2,
-    "last_error": "Connection timeout",
-    "processing_stats": {
-      "total_bytes_processed": 1048576,
-      "avg_batch_processing_time_ms": 125.5,
-      "last_successful_poll": "2024-01-15T10:30:00Z",
-      "empty_polls_count": 5,
-      "successful_polls_count": 145
-    }
-  },
-  "metadata": {
-    "connector_type": "opensearch_source",
-    "connector_id": 1,
-    "index": "logs-*",
-    "url": "http://localhost:9200"
-  }
-}
-```
-
-## Best Practices
-
-1. **State ID Uniqueness**: Use unique state IDs for different connector instances
-2. **Auto-save Interval**: Set appropriate auto-save intervals based on your data volume
-3. **Storage Location**: Use persistent storage locations for production deployments
-4. **State Cleanup**: Regularly clean up old state files to prevent disk space issues
-5. **Error Handling**: Monitor error counts and implement appropriate alerting
-6. **Backup**: Regularly backup state files for disaster recovery
+The configured `timestamp_field` may be an RFC 3339 string or epoch milliseconds /
+seconds in the document `_source`.
 
 ## Troubleshooting
 
-### Common Issues
-
-1. **State Not Loading**: Check file permissions and storage path
-2. **State Corruption**: Delete corrupted state files to start fresh
-3. **Performance Issues**: Adjust auto-save interval and batch sizes
-4. **Storage Full**: Implement state cleanup policies
-
-### Monitoring
-
-Monitor the following metrics:
-
-- State save/load success rates
-- Processing statistics
-- Error counts and types
-- Storage usage for state files
-
-## Migration
-
-To migrate from a connector without state management:
-
-1. Add state configuration to your connector config
-2. Set `enabled = true` in state config
-3. Restart the connector
-4. The connector will start tracking state from the next poll cycle
-
-To migrate between storage backends:
-
-1. Export state from current storage
-2. Update storage configuration
-3. Import state to new storage
-4. Restart connector
+| Symptom | Check |
+| --- | --- |
+| `open()` fails with missing index | Index name, URL, and credentials |
+| `open()` fails with `state restore failed` | Delete or repair the connector runtime state file |
+| No new documents after restart | `timestamp_field` mapping must match indexed documents |
+| Duplicate messages | Lower `batch_size` only after confirming sort stability on `(timestamp_field, _id)` |

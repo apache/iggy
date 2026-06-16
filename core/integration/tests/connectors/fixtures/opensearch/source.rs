@@ -67,7 +67,10 @@ impl OpenSearchSourceFixture {
         name: &str,
         value: i32,
     ) -> Result<(), TestBinaryError> {
-        let timestamp = IggyTimestamp::now().to_rfc3339_string();
+        let timestamp = IggyTimestamp::from(
+            IggyTimestamp::now().as_micros() + u64::from(doc_id as u32) * 1_000,
+        )
+        .to_rfc3339_string();
         let document = serde_json::json!({
             "id": doc_id,
             "name": name,

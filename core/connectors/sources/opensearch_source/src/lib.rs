@@ -18,6 +18,7 @@
  */
 use async_trait::async_trait;
 use iggy_common::{DateTime, Utc};
+use iggy_connector_sdk::retry::parse_duration;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -29,65 +30,49 @@ use opensearch::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 mod state_manager;
-use crate::state_manager::{FileStateStorage, SourceState, StateStorage};
-pub use state_manager::{StateInfo, StateManager, StateStats};
+use crate::state_manager::{SourceState, create_state_storage};
 
 source_connector!(OpenSearchSource);
 
 const CONNECTOR_NAME: &str = "OpenSearch source";
+const DEFAULT_POLLING_INTERVAL: &str = "10s";
+const DEFAULT_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     last_poll_timestamp: Option<DateTime<Utc>>,
     total_documents_fetched: usize,
     poll_count: usize,
-    /// Last document ID processed (for cursor-based pagination)
     last_document_id: Option<String>,
-    /// Last scroll ID (for scroll-based pagination)
-    last_scroll_id: Option<String>,
-    /// Last processed offset
-    last_offset: Option<u64>,
-    /// Error count and last error
+    /// OpenSearch `search_after` tuple from the last hit in the previous batch.
+    search_after: Option<Vec<Value>>,
     error_count: usize,
     last_error: Option<String>,
-    /// Processing statistics
     processing_stats: ProcessingStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProcessingStats {
-    /// Total bytes processed
     total_bytes_processed: u64,
-    /// Average processing time per batch
     avg_batch_processing_time_ms: f64,
-    /// Last successful processing timestamp
     last_successful_poll: Option<DateTime<Utc>>,
-    /// Number of empty polls
     empty_polls_count: usize,
-    /// Number of successful polls
     successful_polls_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
-    /// Enable state persistence
+    #[serde(default)]
     pub enabled: bool,
-    /// State storage type: "file", "opensearch", "redis", etc.
     pub storage_type: Option<String>,
-    /// State storage configuration (depends on storage_type)
     pub storage_config: Option<Value>,
-    /// State ID for this connector instance
     pub state_id: Option<String>,
-    /// Auto-save state interval (e.g., "30s", "5m")
     pub auto_save_interval: Option<String>,
-    /// Fields to track in state (e.g., ["last_timestamp", "last_document_id"])
     pub tracked_fields: Option<Vec<String>>,
 }
 
@@ -102,7 +87,7 @@ pub struct OpenSearchSourceConfig {
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
-    pub scroll_timeout: Option<String>,
+    pub verbose_logging: Option<bool>,
     pub state: Option<StateConfig>,
 }
 
@@ -112,51 +97,54 @@ pub struct OpenSearchSource {
     config: OpenSearchSourceConfig,
     client: Option<OpenSearch>,
     polling_interval: Duration,
+    search_query: Value,
+    verbose: bool,
     state: Mutex<State>,
+    /// `Some(cause)` when runtime state restore was rejected; `None` means restore succeeded.
+    state_restore_error: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            last_poll_timestamp: None,
+            total_documents_fetched: 0,
+            poll_count: 0,
+            last_document_id: None,
+            search_after: None,
+            error_count: 0,
+            last_error: None,
+            processing_stats: ProcessingStats {
+                total_bytes_processed: 0,
+                avg_batch_processing_time_ms: 0.0,
+                last_successful_poll: None,
+                empty_polls_count: 0,
+                successful_polls_count: 0,
+            },
+        }
+    }
 }
 
 impl OpenSearchSource {
     pub fn new(id: u32, config: OpenSearchSourceConfig, state: Option<ConnectorState>) -> Self {
-        let polling_interval = config
-            .polling_interval
-            .as_deref()
-            .unwrap_or("10s")
-            .parse::<humantime::Duration>()
-            .unwrap_or_else(|_| humantime::Duration::from_str("10s").unwrap())
-            .into();
-
-        let restored_state = state
-            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
-            .inspect(|s| {
-                info!(
-                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
-                     Documents fetched: {}, poll count: {}",
-                    s.total_documents_fetched, s.poll_count
-                );
-            });
+        let polling_interval =
+            parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
+        let search_query = config
+            .query
+            .clone()
+            .unwrap_or_else(|| json!({ "match_all": {} }));
+        let verbose = config.verbose_logging.unwrap_or(false);
+        let (restored_state, state_restore_error) = restore_state(id, state);
 
         OpenSearchSource {
             id,
             config,
             client: None,
             polling_interval,
-            state: Mutex::new(restored_state.unwrap_or(State {
-                last_poll_timestamp: None,
-                total_documents_fetched: 0,
-                poll_count: 0,
-                last_document_id: None,
-                last_scroll_id: None,
-                last_offset: None,
-                error_count: 0,
-                last_error: None,
-                processing_stats: ProcessingStats {
-                    total_bytes_processed: 0,
-                    avg_batch_processing_time_ms: 0.0,
-                    last_successful_poll: None,
-                    empty_polls_count: 0,
-                    successful_polls_count: 0,
-                },
-            })),
+            search_query,
+            verbose,
+            state: Mutex::new(restored_state),
+            state_restore_error,
         }
     }
 
@@ -164,40 +152,17 @@ impl OpenSearchSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    /// Create state storage based on configuration
-    fn create_state_storage(&self) -> Option<Arc<dyn StateStorage>> {
-        let state_config = self.config.state.as_ref()?;
-        if !state_config.enabled {
-            return None;
-        }
-
-        match state_config.storage_type.as_deref() {
-            Some("file") | None => {
-                let base_path = state_config
-                    .storage_config
-                    .as_ref()
-                    .and_then(|c| c.get("base_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("./connector_states");
-
-                Some(Arc::new(FileStateStorage::new(base_path)))
-            }
-            Some("opensearch") => {
-                // TODO: Implement OpenSearch-based state storage
-                warn!("OpenSearch state storage not yet implemented, falling back to file storage");
-                Some(Arc::new(FileStateStorage::new("./connector_states")))
-            }
-            Some(storage_type) => {
-                warn!(
-                    "Unknown state storage type: {}, falling back to file storage",
-                    storage_type
-                );
-                Some(Arc::new(FileStateStorage::new("./connector_states")))
-            }
-        }
+    fn batch_size(&self) -> usize {
+        self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
     }
 
-    /// Get state ID for this connector
+    fn timestamp_field(&self) -> &str {
+        self.config
+            .timestamp_field
+            .as_deref()
+            .expect("timestamp_field validated at open()")
+    }
+
     fn get_state_id(&self) -> String {
         self.config
             .state
@@ -206,7 +171,6 @@ impl OpenSearchSource {
             .unwrap_or_else(|| format!("opensearch_source_{}", self.id))
     }
 
-    /// Convert internal state to SourceState
     async fn internal_state_to_source_state(&self) -> Result<SourceState, Error> {
         let state = self.state.lock().await;
 
@@ -215,8 +179,7 @@ impl OpenSearchSource {
             "total_documents_fetched": state.total_documents_fetched,
             "poll_count": state.poll_count,
             "last_document_id": state.last_document_id,
-            "last_scroll_id": state.last_scroll_id,
-            "last_offset": state.last_offset,
+            "search_after": state.search_after,
             "error_count": state.error_count,
             "last_error": state.last_error,
             "processing_stats": state.processing_stats,
@@ -236,7 +199,6 @@ impl OpenSearchSource {
         })
     }
 
-    /// Convert SourceState to internal state
     async fn source_state_to_internal_state(
         &mut self,
         source_state: SourceState,
@@ -264,15 +226,13 @@ impl OpenSearchSource {
             }
 
             if let Some(doc_id) = data.get("last_document_id") {
-                state.last_document_id = doc_id.as_str().map(|s| s.to_string());
+                state.last_document_id = doc_id.as_str().map(str::to_owned);
             }
 
-            if let Some(scroll_id) = data.get("last_scroll_id") {
-                state.last_scroll_id = scroll_id.as_str().map(|s| s.to_string());
-            }
-
-            if let Some(offset) = data.get("last_offset") {
-                state.last_offset = offset.as_u64();
+            if let Some(search_after) = data.get("search_after")
+                && let Ok(cursor) = serde_json::from_value(search_after.clone())
+            {
+                state.search_after = cursor;
             }
 
             if let Some(error_count) = data.get("error_count")
@@ -282,7 +242,7 @@ impl OpenSearchSource {
             }
 
             if let Some(last_error) = data.get("last_error") {
-                state.last_error = last_error.as_str().map(|s| s.to_string());
+                state.last_error = last_error.as_str().map(str::to_owned);
             }
 
             if let Some(stats) = data.get("processing_stats")
@@ -310,134 +270,187 @@ impl OpenSearchSource {
 
         let transport = transport_builder
             .build()
-            .map_err(|e| Error::Storage(format!("Failed to build transport: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to build transport: {e}")))?;
 
         Ok(OpenSearch::new(transport))
     }
 
     async fn search_documents(&self, client: &OpenSearch) -> Result<Vec<ProducedMessage>, Error> {
         let state = self.state.lock().await;
-        let batch_size = self.config.batch_size.unwrap_or(100);
+        let batch_size = self.batch_size();
+        let timestamp_field = self.timestamp_field();
+        let search_after = state.search_after.clone();
+        drop(state);
 
-        // Build query based on timestamp field if configured
-        let mut query = self.config.query.clone().unwrap_or_else(|| {
-            json!({
-                "match_all": {}
-            })
-        });
-
-        // Add timestamp filter for incremental polling
-        if let Some(timestamp_field) = &self.config.timestamp_field
-            && let Some(last_timestamp) = state.last_poll_timestamp
-        {
-            query = json!({
-                "bool": {
-                    "must": [
-                        query,
-                        {
-                            "range": {
-                                timestamp_field: {
-                                    "gt": last_timestamp.to_rfc3339()
-                                }
-                            }
-                        }
-                    ]
-                }
-            });
-        }
-
-        let search_body = json!({
-            "query": query,
+        let mut search_body = json!({
+            "query": self.search_query,
             "size": batch_size,
             "sort": [
-                {
-                    self.config.timestamp_field.as_deref().unwrap_or("@timestamp"): {
-                        "order": "asc"
-                    }
-                }
+                { timestamp_field: { "order": "asc" } },
+                { "_id": { "order": "asc" } }
             ]
         });
 
-        drop(state);
+        if let Some(cursor) = search_after {
+            search_body["search_after"] = json!(cursor);
+        }
 
         let response = client
             .search(SearchParts::Index(&[&self.config.index]))
             .body(search_body)
             .send()
             .await
-            .map_err(|e| Error::Storage(format!("Failed to execute search: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to execute search: {e}")))?;
 
         if !response.status_code().is_success() {
             let error_text = response
                 .text()
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
+                .map_err(|e| Error::Storage(format!("Failed to read search error body: {e}")))?;
             return Err(Error::Storage(format!(
-                "Search request failed: {}",
-                error_text
+                "Search request failed: {error_text}"
             )));
         }
 
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| Error::Storage(format!("Failed to parse search response: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to parse search response: {e}")))?;
 
-        let mut messages = Vec::new();
-        let mut latest_timestamp = None;
-
-        if let Some(hits) = response_body
+        let hits = response_body
             .get("hits")
             .and_then(|h| h.get("hits"))
             .and_then(|h| h.as_array())
-        {
-            for hit in hits {
-                if let Some(source) = hit.get("_source") {
-                    // Extract timestamp for incremental polling
-                    if let Some(timestamp_field) = &self.config.timestamp_field
-                        && let Some(timestamp_str) =
-                            source.get(timestamp_field).and_then(|v| v.as_str())
-                        && let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp_str)
-                    {
-                        let timestamp_utc = timestamp.with_timezone(&Utc);
-                        if latest_timestamp.is_none() || timestamp_utc > latest_timestamp.unwrap() {
-                            latest_timestamp = Some(timestamp_utc);
-                        }
-                    }
+            .cloned()
+            .unwrap_or_default();
 
-                    // Create message from document
-                    let payload = serde_json::to_vec(source).map_err(|e| {
-                        Error::Serialization(format!("Failed to serialize document: {}", e))
-                    })?;
+        let mut messages = Vec::with_capacity(hits.len());
+        let mut batch_bytes = 0u64;
+        let mut last_search_after = None;
+        let mut last_document_id = None;
+        let mut last_poll_timestamp = None;
 
-                    let message = ProducedMessage {
-                        id: None,
-                        headers: None,
-                        checksum: None,
-                        timestamp: None,
-                        origin_timestamp: None,
-                        payload,
-                    };
-                    messages.push(message);
-                }
+        for hit in &hits {
+            if let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) {
+                last_search_after = Some(sort.clone());
             }
+
+            if let Some(document_id) = hit.get("_id").and_then(|v| v.as_str()) {
+                last_document_id = Some(document_id.to_string());
+            }
+
+            let Some(source) = hit.get("_source") else {
+                continue;
+            };
+
+            if let Some(timestamp_value) = source.get(timestamp_field)
+                && let Some(timestamp_utc) = parse_document_timestamp(timestamp_value)
+            {
+                last_poll_timestamp = Some(timestamp_utc);
+            }
+
+            let payload = serde_json::to_vec(source)
+                .map_err(|e| Error::Serialization(format!("Failed to serialize document: {e}")))?;
+            batch_bytes += payload.len() as u64;
+
+            messages.push(ProducedMessage {
+                id: None,
+                headers: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                payload,
+            });
         }
 
-        // Update state
         let mut state = self.state.lock().await;
         state.total_documents_fetched += messages.len();
         state.poll_count += 1;
-        if let Some(timestamp) = latest_timestamp {
+        state.search_after = last_search_after;
+        state.last_document_id = last_document_id;
+        if let Some(timestamp) = last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
+        state.processing_stats.total_bytes_processed += batch_bytes;
 
         Ok(messages)
+    }
+}
+
+fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>) {
+    let Some(connector_state) = state else {
+        return (State::default(), None);
+    };
+
+    let bytes = connector_state.0;
+    match ConnectorState(bytes.clone()).deserialize::<State>(CONNECTOR_NAME, id) {
+        Some(restored) => {
+            info!(
+                "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                 Documents fetched: {}, poll count: {}",
+                restored.total_documents_fetched, restored.poll_count
+            );
+            (restored, None)
+        }
+        None => {
+            let cause = "persisted state exists but could not be deserialized. \
+                         Refusing to start to prevent silent cursor reset."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (State::default(), Some(cause))
+        }
+    }
+}
+
+fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
+    if config.timestamp_field.as_deref().is_none_or(str::is_empty) {
+        return Err(Error::InvalidConfigValue(
+            "timestamp_field is required for incremental OpenSearch polling".to_string(),
+        ));
+    }
+
+    if matches!(config.batch_size, Some(0)) {
+        return Err(Error::InvalidConfigValue(
+            "batch_size must be at least 1".to_string(),
+        ));
+    }
+
+    if let Some(state) = &config.state
+        && state.enabled
+    {
+        create_state_storage(state)?;
+    }
+
+    Ok(())
+}
+
+fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Utc)),
+        Value::Number(number) => {
+            let raw = number.as_i64()?;
+            let millis = if raw.abs() > 1_000_000_000_000 {
+                raw
+            } else {
+                raw.saturating_mul(1_000)
+            };
+            DateTime::from_timestamp_millis(millis).map(|timestamp| timestamp.with_timezone(&Utc))
+        }
+        _ => None,
     }
 }
 
 #[async_trait]
 impl Source for OpenSearchSource {
     async fn open(&mut self) -> Result<(), Error> {
+        if let Some(ref cause) = self.state_restore_error {
+            return Err(Error::InitError(format!("state restore failed: {cause}")));
+        }
+
+        validate_open_config(&self.config)?;
+
         info!(
             "Opening OpenSearch source connector with ID: {} for URL: {}, index: {}",
             self.id, self.config.url, self.config.index
@@ -445,7 +458,6 @@ impl Source for OpenSearchSource {
 
         let client = self.create_client().await?;
 
-        // Test connection by checking if index exists
         let response = client
             .indices()
             .exists(opensearch::indices::IndicesExistsParts::Index(&[&self
@@ -453,7 +465,7 @@ impl Source for OpenSearchSource {
                 .index]))
             .send()
             .await
-            .map_err(|e| Error::Storage(format!("Failed to check index existence: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to check index existence: {e}")))?;
 
         if !response.status_code().is_success() {
             return Err(Error::Storage(format!(
@@ -464,7 +476,6 @@ impl Source for OpenSearchSource {
 
         self.client = Some(client);
 
-        // Load state if state management is enabled
         if self
             .config
             .state
@@ -498,7 +509,6 @@ impl Source for OpenSearchSource {
 
         let messages = match self.search_documents(client).await {
             Ok(msgs) => {
-                // Update success statistics
                 let mut state = self.state.lock().await;
                 state.processing_stats.successful_polls_count += 1;
                 state.processing_stats.last_successful_poll = Some(Utc::now());
@@ -516,11 +526,27 @@ impl Source for OpenSearchSource {
                     state.processing_stats.empty_polls_count += 1;
                 }
 
+                let produced_count = msgs.len();
+                let total_documents_fetched = state.total_documents_fetched;
                 drop(state);
+
+                if self.verbose {
+                    info!(
+                        "OpenSearch source connector ID: {} produced {produced_count} messages. \
+                         Total fetched: {total_documents_fetched}",
+                        self.id
+                    );
+                } else {
+                    debug!(
+                        "OpenSearch source connector ID: {} produced {produced_count} messages. \
+                         Total fetched: {total_documents_fetched}",
+                        self.id
+                    );
+                }
+
                 msgs
             }
             Err(e) => {
-                // Update error statistics
                 let mut state = self.state.lock().await;
                 state.error_count += 1;
                 state.last_error = Some(e.to_string());
@@ -548,7 +574,6 @@ impl Source for OpenSearchSource {
         );
         drop(state);
 
-        // Save final state if state management is enabled
         if self
             .config
             .state
@@ -586,7 +611,7 @@ mod tests {
             polling_interval: Some("100ms".to_string()),
             batch_size: Some(10),
             timestamp_field: Some("timestamp".to_string()),
-            scroll_timeout: None,
+            verbose_logging: None,
             state: None,
         }
     }
@@ -597,8 +622,7 @@ mod tests {
             total_documents_fetched: 500,
             poll_count: 5,
             last_document_id: Some("doc_42".to_string()),
-            last_scroll_id: None,
-            last_offset: Some(500),
+            search_after: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
             error_count: 1,
             last_error: Some("connection reset".to_string()),
             processing_stats: ProcessingStats {
@@ -625,6 +649,7 @@ mod tests {
             assert_eq!(restored.total_documents_fetched, 500);
             assert_eq!(restored.poll_count, 5);
             assert_eq!(restored.last_document_id, Some("doc_42".to_string()));
+            assert!(source.state_restore_error.is_none());
         });
     }
 
@@ -638,14 +663,16 @@ mod tests {
             assert_eq!(state.total_documents_fetched, 0);
             assert_eq!(state.poll_count, 0);
             assert_eq!(state.last_document_id, None);
+            assert!(source.state_restore_error.is_none());
         });
     }
 
     #[test]
-    fn given_invalid_state_should_start_fresh() {
+    fn given_invalid_state_should_set_state_restore_error() {
         let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
         let source = OpenSearchSource::new(1, test_config(), Some(invalid_state));
 
+        assert!(source.state_restore_error.is_some());
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = source.state.lock().await;
@@ -655,7 +682,47 @@ mod tests {
     }
 
     #[test]
-    fn state_should_be_serializable_and_deserializable() {
+    fn given_invalid_state_when_open_should_fail() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let mut source = OpenSearchSource::new(1, test_config(), Some(invalid_state));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        assert!(
+            matches!(result, Err(Error::InitError(_))),
+            "open() must fail with InitError on restore failure"
+        );
+    }
+
+    #[test]
+    fn given_missing_timestamp_field_when_validate_should_fail() {
+        let mut config = test_config();
+        config.timestamp_field = None;
+        let error = validate_open_config(&config).expect_err("missing timestamp_field");
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_zero_batch_size_when_validate_should_fail() {
+        let mut config = test_config();
+        config.batch_size = Some(0);
+        let error = validate_open_config(&config).expect_err("zero batch_size");
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_rfc3339_timestamp_value_should_parse() {
+        let value = json!("2024-01-15T10:30:00Z");
+        assert!(parse_document_timestamp(&value).is_some());
+    }
+
+    #[test]
+    fn given_epoch_millis_timestamp_value_should_parse() {
+        let value = json!(1_705_312_200_000_i64);
+        assert!(parse_document_timestamp(&value).is_some());
+    }
+
+    #[test]
+    fn given_state_should_round_trip_serialization() {
         let original = test_state();
 
         let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
@@ -668,11 +735,12 @@ mod tests {
         );
         assert_eq!(original.poll_count, deserialized.poll_count);
         assert_eq!(original.last_document_id, deserialized.last_document_id);
+        assert_eq!(original.search_after, deserialized.search_after);
         assert_eq!(original.error_count, deserialized.error_count);
     }
 
     #[test]
-    fn serialize_state_helper_should_produce_valid_connector_state() {
+    fn given_state_when_serialize_helper_should_produce_connector_state() {
         let source = OpenSearchSource::new(1, test_config(), None);
         let state = test_state();
 

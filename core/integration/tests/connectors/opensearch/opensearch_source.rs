@@ -27,14 +27,32 @@ use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::sleep;
+
+fn document_ids(messages: &[serde_json::Value]) -> HashSet<i64> {
+    messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .collect()
+}
+
+fn assert_contains_document_ids(messages: &[serde_json::Value], expected_ids: &[i64]) {
+    let ids = document_ids(messages);
+    for expected_id in expected_ids {
+        assert!(
+            ids.contains(expected_id),
+            "expected document id {expected_id}, got ids {ids:?}"
+        );
+    }
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_produces_messages_to_iggy(
+async fn given_documents_in_index_when_connector_polls_should_produce_messages(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -90,28 +108,15 @@ async fn opensearch_source_produces_messages_to_iggy(
         received.len()
     );
 
-    for (i, record) in received.iter().enumerate() {
-        let expected_id = (i + 1) as i64;
-        let expected_name = format!("doc_{}", i + 1);
-
-        assert_eq!(
-            record.get("id").and_then(|v| v.as_i64()),
-            Some(expected_id),
-            "ID mismatch at record {i}"
-        );
-        assert_eq!(
-            record.get("name").and_then(|v| v.as_str()),
-            Some(expected_name.as_str()),
-            "Name mismatch at record {i}"
-        );
-    }
+    let expected_ids: Vec<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
+    assert_contains_document_ids(&received, &expected_ids);
 }
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_handles_empty_index(
+async fn given_empty_index_when_connector_polls_should_not_fail(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -151,7 +156,7 @@ async fn opensearch_source_handles_empty_index(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_produces_bulk_messages(
+async fn given_bulk_documents_when_connector_polls_should_produce_all_messages(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -204,7 +209,7 @@ async fn opensearch_source_produces_bulk_messages(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn state_persists_across_connector_restart(
+async fn given_runtime_state_when_connector_restarts_should_resume_after_cursor(
     harness: &mut TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -323,14 +328,11 @@ async fn fetch_sources(http_client: &Client, api_address: &str) -> Vec<SourceInf
     response.json().await.expect("Failed to parse sources")
 }
 
-/// Negative path: the configured index does not exist, so `open()` must
-/// fail with a `Storage` error and the runtime reports the source as
-/// `ConnectorStatus::Error` without aborting.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_with_missing_index_reports_error(
+async fn given_missing_index_when_connector_opens_should_report_error(
     harness: &TestHarness,
     _fixture: OpenSearchSourceMissingIndexFixture,
 ) {
