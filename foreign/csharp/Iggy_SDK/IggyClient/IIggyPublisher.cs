@@ -46,6 +46,20 @@ public interface IIggyPublisher
         CancellationToken token = default);
 
     /// <summary>
+    ///     Sends a single message to the specified stream and topic. See
+    ///     <see cref="SendMessagesAsync(Identifier, Identifier, Partitioning, IList{Message}, CancellationToken)" />
+    ///     for partitioning semantics.
+    /// </summary>
+    /// <remarks>
+    ///     The payload is copied into the wire buffer before the returned task completes, so caller-owned
+    ///     payload memory (e.g. a pooled <see cref="Messages.RentedMessageBatch" /> buffer) may be released
+    ///     once it completes.
+    /// </remarks>
+    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message message,
+        CancellationToken token = default)
+        => SendMessagesAsync(streamId, topicId, partitioning, new[] { message }, token);
+
+    /// <summary>
     ///     Forces a flush of the unsaved buffer to disk for a specific partition.
     /// </summary>
     /// <remarks>

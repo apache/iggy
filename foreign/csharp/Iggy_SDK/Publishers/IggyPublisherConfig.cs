@@ -30,13 +30,9 @@ namespace Apache.Iggy.Publishers;
 public class IggyPublisherConfig<T> : IggyPublisherConfig
 {
     /// <summary>
-    ///     Gets or sets the serializer used to convert objects of type T to message payloads.
-    ///     This property is required and cannot be null. The builder will validate that a serializer
-    ///     is provided before creating the publisher instance.
+    ///     Gets or sets the serializer used to write objects of type T into message payloads. Required; the
+    ///     builder validates it is set. <see cref="SystemTextJsonSerializer{T}" /> is available as a default.
     /// </summary>
-    /// <exception cref="InvalidOperationException">
-    ///     Thrown during publisher build if this property is null.
-    /// </exception>
     public required ISerializer<T> Serializer { get; set; }
 }
 
@@ -187,10 +183,11 @@ public class IggyPublisherConfig
     public bool EnableBackgroundSending { get; set; } = false;
 
     /// <summary>
-    ///     Gets or sets the capacity of the background message queue.
-    ///     When the queue is full, new messages will block until space becomes available.
+    ///     Gets or sets the capacity of the background message queue, measured in queued send calls: each send
+    ///     occupies one slot regardless of how many messages its batch contains, so total queued messages (and
+    ///     memory) scale with batch sizes. When the queue is full, new sends block until space becomes available.
     ///     Only used when <see cref="EnableBackgroundSending" /> is true.
-    ///     Default is 10,000 messages.
+    ///     Default is 10,000.
     /// </summary>
     public int BackgroundQueueCapacity { get; set; } = 10000;
 
@@ -201,6 +198,16 @@ public class IggyPublisherConfig
     ///     Default is 100 messages.
     /// </summary>
     public int BackgroundBatchSize { get; set; } = 100;
+
+    /// <summary>
+    ///     Gets or sets the maximum total payload size, in bytes, accumulated into a single background batch. A
+    ///     flush is triggered once either this limit or <see cref="BackgroundBatchSize" /> is reached, whichever
+    ///     comes first. A unit is never split, so the last unit may push the batch past this limit, and a single
+    ///     unit larger than the limit ships whole. Set to 0 to disable the byte limit and gate only on
+    ///     <see cref="BackgroundBatchSize" />. Only used when <see cref="EnableBackgroundSending" /> is true.
+    ///     Default is 256 KB.
+    /// </summary>
+    public int BackgroundMaxBatchBytes { get; set; } = 256 * 1024;
 
     /// <summary>
     ///     Gets or sets the interval at which to flush pending messages.

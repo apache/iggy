@@ -33,10 +33,19 @@
 //! install it; the wrapper here is idempotent and safe under races
 //! between concurrent first-use sites.
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::DigitallySignedStruct;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::sync::Arc;
+
+/// ALPN protocol id for the replica plane.
+///
+/// Both replica TLS roles pin it, so a client-plane TLS endpoint
+/// mistakenly pointed at the replica port fails ALPN negotiation
+/// instead of reaching the replica handshake.
+pub const REPLICA_ALPN: &[u8] = b"iggy-replica";
 
 /// Local-end role on a TLS connection. Selects which rustls state
 /// machine the per-transport handshake helper drives and is shared by
@@ -140,6 +149,93 @@ pub fn self_signed_for_loopback() -> TlsServerCredentials {
     TlsServerCredentials {
         cert_chain,
         key_der,
+    }
+}
+
+/// Load one or more PEM trust anchors from `ca_path` into a
+/// [`rustls::RootCertStore`] for the replica dialer's certificate
+/// verification.
+///
+/// # Errors
+///
+/// Returns [`io::Error`] when the file cannot be read, contains no
+/// certificate, or none of the certificates parse as a trust anchor.
+pub fn load_ca_pem(ca_path: &Path) -> io::Result<rustls::RootCertStore> {
+    let ca_file = std::fs::File::open(ca_path)?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut ca_reader).collect::<Result<_, _>>()?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _skipped) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no usable CA certificates found in {}", ca_path.display()),
+        ));
+    }
+    Ok(roots)
+}
+
+/// A [`ServerCertVerifier`] that accepts ANY server certificate.
+///
+/// Exists solely for the replica plane's `cluster.tls.self_signed`
+/// mode, where every node mints its own throwaway certificate and peer
+/// authentication comes from the PSK handshake bound to the TLS channel
+/// (not from PKI). Config validation rejects this mode without
+/// `cluster.auth.enabled`; never wire it anywhere a certificate is the
+/// only authentication.
+///
+/// Verifies against the workspace's ring provider: handshake signatures
+/// are still validated (so the peer must hold the private key for
+/// whatever certificate it presents), only chain / name verification is
+/// skipped.
+#[derive(Debug)]
+pub struct AcceptAnyServerCert;
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
