@@ -341,6 +341,18 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
+	switch c.state {
+	case iggcon.StateShutdown:
+		c.logger.Debug("Cannot send data. Client is shutdown.")
+		return nil, ierror.ErrClientShutdown
+	case iggcon.StateDisconnected:
+		c.logger.Debug("Cannot send data. Client is not connected.")
+		return nil, ierror.ErrNotConnected
+	case iggcon.StateConnecting:
+		c.logger.Debug("Cannot send data. Client is still connecting.")
+		return nil, ierror.ErrNotConnected
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -605,8 +617,10 @@ func (c *IggyTcpClient) disconnect() error {
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
 	c.state = iggcon.StateDisconnected
 
-	if err := c.conn.Close(); err != nil {
-		return err
+	if c.conn != nil {
+		if err := c.conn.Close(); err != nil {
+			return err
+		}
 	}
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
@@ -624,8 +638,10 @@ func (c *IggyTcpClient) shutdown() error {
 
 	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
 
-	if err := c.conn.Close(); err != nil {
-		return err
+	if c.conn != nil {
+		if err := c.conn.Close(); err != nil {
+			return err
+		}
 	}
 
 	c.state = iggcon.StateShutdown
