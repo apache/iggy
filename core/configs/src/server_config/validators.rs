@@ -627,6 +627,36 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // Replica TLS. Both cert modes run one-directional TLS (no client
+        // certificate anywhere), so TLS only authenticates the acceptor to
+        // the dialer; peer authentication comes solely from the PSK
+        // handshake. Without it any TLS-capable host could register as a
+        // replica - require auth in both modes. CA mode (the default)
+        // additionally needs all three PEM paths: cert/key for this node's
+        // acceptor side, ca_file as the dialer's trust anchor.
+        if self.tls.enabled {
+            if !self.auth.enabled {
+                eprintln!(
+                    "Invalid cluster configuration: cluster.tls.enabled = true requires cluster.auth.enabled = true (TLS authenticates the acceptor only; the PSK handshake authenticates the peer)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if !self.tls.self_signed {
+                for (field, value) in [
+                    ("cert_file", &self.tls.cert_file),
+                    ("key_file", &self.tls.key_file),
+                    ("ca_file", &self.tls.ca_file),
+                ] {
+                    if value.trim().is_empty() {
+                        eprintln!(
+                            "Invalid cluster configuration: cluster.tls.{field} must be set when cluster.tls.enabled = true and self_signed = false"
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -635,7 +665,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 mod cluster_validate_tests {
     use super::*;
     use crate::server_config::cluster::{
-        ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, TransportPorts,
+        ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
     };
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
@@ -653,6 +683,7 @@ mod cluster_validate_tests {
             name: "iggy-cluster".to_string(),
             nodes,
             auth: ClusterAuthConfig::default(),
+            tls: ClusterTlsConfig::default(),
         }
     }
 
@@ -802,6 +833,76 @@ mod cluster_validate_tests {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.auth.enabled = true;
         c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        assert!(c.validate().is_ok());
+    }
+
+    fn tls_files() -> ClusterTlsConfig {
+        ClusterTlsConfig {
+            enabled: true,
+            self_signed: false,
+            cert_file: "cert.pem".to_string(),
+            key_file: "key.pem".to_string(),
+            ca_file: "ca.pem".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tls_ca_mode_with_missing_files() {
+        // Auth on so the failure exercises the file check, not the auth gate.
+        for missing in ["cert_file", "key_file", "ca_file"] {
+            let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+            c.auth.enabled = true;
+            c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+            c.tls = tls_files();
+            match missing {
+                "cert_file" => c.tls.cert_file.clear(),
+                "key_file" => c.tls.key_file.clear(),
+                _ => c.tls.ca_file.clear(),
+            }
+            assert!(c.validate().is_err(), "missing {missing} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tls_self_signed_without_auth() {
+        // Accept-any certificate without the PSK handshake = MITM-able.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.tls = ClusterTlsConfig {
+            enabled: true,
+            self_signed: true,
+            ..ClusterTlsConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_self_signed_with_auth() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.tls = ClusterTlsConfig {
+            enabled: true,
+            self_signed: true,
+            ..ClusterTlsConfig::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_tls_ca_mode_without_auth() {
+        // TLS never authenticates the dialer (no client certificates);
+        // only the PSK handshake does, so it is mandatory with TLS on.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.tls = tls_files();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_ca_mode_with_auth() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.tls = tls_files();
         assert!(c.validate().is_ok());
     }
 }

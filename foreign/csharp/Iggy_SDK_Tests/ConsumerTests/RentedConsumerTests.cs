@@ -403,12 +403,12 @@ public class RentedConsumerTests
 
     private sealed class ThrowingEncryptor : IMessageEncryptor
     {
-        public byte[] Encrypt(byte[] plainData)
+        public byte[] Encrypt(ReadOnlySpan<byte> plainData)
         {
             throw new NotSupportedException();
         }
 
-        public byte[] Decrypt(byte[] encryptedData)
+        public byte[] Decrypt(ReadOnlySpan<byte> encryptedData)
         {
             throw new InvalidOperationException("decrypt fail");
         }

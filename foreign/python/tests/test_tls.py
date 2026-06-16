@@ -30,7 +30,6 @@ Requirements:
 
 import asyncio
 import os
-import uuid
 
 import pytest
 from testcontainers.core.container import DockerContainer
@@ -105,18 +104,20 @@ class TestTlsConnectivity:
         assert tls_client is not None
 
     @pytest.mark.asyncio
-    async def test_create_stream_over_tls(self, tls_client: IggyClient):
+    async def test_create_stream_over_tls(self, tls_client: IggyClient, unique_name):
         """Test creating and getting a stream over TLS."""
-        stream_name = f"tls-test-stream-{uuid.uuid4().hex[:8]}"
+        stream_name = unique_name()
         await tls_client.create_stream(stream_name)
         stream = await tls_client.get_stream(stream_name)
         assert stream is not None
 
     @pytest.mark.asyncio
-    async def test_produce_and_consume_over_tls(self, tls_client: IggyClient):
+    async def test_produce_and_consume_over_tls(
+        self, tls_client: IggyClient, unique_name
+    ):
         """Test producing and consuming messages over TLS."""
-        stream_name = f"tls-msg-stream-{uuid.uuid4().hex[:8]}"
-        topic_name = "tls-test-topic"
+        stream_name = unique_name()
+        topic_name = unique_name()
         partition_id = 0
 
         # Create stream and topic
