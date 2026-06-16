@@ -726,7 +726,8 @@ impl WebSocketClient {
                 let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
                 let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
                 let header_read =
-                    tokio::time::timeout_at(response_deadline, stream.read(&mut response_header)).await;
+                    tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
+                        .await;
                 let Ok(header_read) = header_read else {
                     error!(
                         "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
@@ -753,10 +754,10 @@ impl WebSocketClient {
                         return Err(IggyError::Disconnected);
                     };
                     body_read?;
-                   Bytes::from(body)
-               } else {
-                   Bytes::new()
-               };
+                    Bytes::from(body)
+                } else {
+                    Bytes::new()
+                };
 
                 crate::vsr::decode_response_split(&response_header, body)
             }

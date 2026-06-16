@@ -250,3 +250,33 @@ pub async fn get_raw_client(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::Args;
+
+    #[test]
+    fn from_args_should_fail_on_invalid_request_timeout() {
+        let args = Args {
+            request_timeout: "not-a-duration".to_string(),
+            ..Default::default()
+        };
+        let result = ClientProviderConfig::from_args(args);
+        assert!(matches!(result, Err(ClientError::InvalidDuration(_))));
+    }
+
+    #[test]
+    fn from_args_should_succeed_with_valid_request_timeout() {
+        let args = Args {
+            request_timeout: "10s".to_string(),
+            ..Default::default()
+        };
+        let config = ClientProviderConfig::from_args(args).unwrap();
+        let tcp_config = config.tcp.unwrap();
+        assert_eq!(
+            tcp_config.request_timeout,
+            IggyDuration::from_str("10s").unwrap()
+        );
+    }
+}
