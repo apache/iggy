@@ -15,24 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! End-to-end replica auth handshake over real loopback TCP. The dialer
-//! holds the lower id and dials the higher-id acceptor. The MAC algebra
+//! End-to-end replica auth handshake over real loopback TCP, through the
+//! owning-shard install paths (blind delegation: the listener reads
+//! nothing, the handshake runs in the install task). The dialer holds
+//! the lower id and dials the higher-id acceptor. The MAC algebra
 //! (reflection, replay, swapped pair) is unit-tested in
-//! `message_bus::replica::auth`; here we assert the full 3-message exchange
-//! gates the registry insert: only a peer that proves possession of the
-//! cluster PSK is installed (membership, not per-replica identity).
+//! `message_bus::replica::auth`; here we assert the full 3-message
+//! exchange gates the registry insert: only a peer that proves
+//! possession of the cluster PSK is installed (membership, not
+//! per-replica identity).
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{
+    install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
+};
 use compio::net::TcpStream;
 use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
 use iggy_common::IggyError;
-use message_bus::IggyMessageBus;
 use message_bus::connector::start as start_connector;
 use message_bus::framing::{self, MAX_MESSAGE_SIZE};
 use message_bus::replica::auth::{self, HandshakeStatus, ReplicaAuth};
 use message_bus::replica::listener::{MessageHandler, bind, run};
+use message_bus::{IggyMessageBus, MessageBusConfig};
 use server_common::Message;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -41,38 +46,48 @@ const CLUSTER: u128 = 0xCAFE;
 const SECRET_A: &[u8] = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const SECRET_B: &[u8] = b"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 const LONG_PERIOD: Duration = Duration::from_secs(30);
-const GRACE: Duration = Duration::from_secs(10);
 
 fn noop_handler() -> MessageHandler {
     Rc::new(|_peer, _msg| {})
 }
 
-/// Spawn replica 1's inbound listener with the given optional auth, returning
-/// its bound address. Replica 1 is the acceptor (higher id) of the pair.
+/// Spawn replica 1's inbound listener with the given optional auth wired
+/// into its bus ctx, returning its bound address. Replica 1 is the
+/// acceptor (higher id) of the pair; the acceptor handshake runs in the
+/// local install path, mirroring the production owning shard.
 #[allow(clippy::future_not_send)]
 async fn spawn_acceptor(
     bus: &Rc<IggyMessageBus>,
     auth: Option<ReplicaAuth>,
 ) -> std::net::SocketAddr {
+    set_replica_ctx(bus, CLUSTER, 1, 2, auth);
     let (listener, addr) = bind(loopback()).await.expect("bind acceptor");
     let token = bus.token();
     let delegate = install_replicas_locally(bus.clone(), noop_handler());
     let handle = compio::runtime::spawn(async move {
-        run(
-            listener,
-            token,
-            CLUSTER,
-            1,
-            2,
-            auth,
-            delegate,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            GRACE,
-        )
-        .await;
+        run(listener, token, delegate).await;
     });
     bus.track_background(handle);
     addr
+}
+
+/// Build a dialer bus (replica 0) with the given auth and start its
+/// connector toward `addr`.
+#[allow(clippy::future_not_send)]
+async fn spawn_dialer(
+    bus: &Rc<IggyMessageBus>,
+    auth: Option<ReplicaAuth>,
+    addr: std::net::SocketAddr,
+) {
+    set_replica_ctx(bus, CLUSTER, 0, 2, auth);
+    start_connector(
+        bus,
+        0,
+        vec![(1, addr)],
+        install_dialed_replicas_locally(bus.clone(), noop_handler()),
+        LONG_PERIOD,
+    )
+    .await;
 }
 
 #[compio::test]
@@ -81,17 +96,7 @@ async fn authenticated_handshake_registers_verified_peer() {
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
 
     let dialer = Rc::new(IggyMessageBus::new(0));
-    start_connector(
-        &dialer,
-        CLUSTER,
-        0,
-        vec![(1, addr)],
-        Some(ReplicaAuth::new(SECRET_A)),
-        GRACE,
-        install_replicas_locally(dialer.clone(), noop_handler()),
-        LONG_PERIOD,
-    )
-    .await;
+    spawn_dialer(&dialer, Some(ReplicaAuth::new(SECRET_A)), addr).await;
 
     // Both ends register only after the mutual MAC verifies.
     wait_until(|| dialer.replicas().contains(1), Duration::from_secs(2)).await;
@@ -107,17 +112,7 @@ async fn wrong_key_rejects_peer() {
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_B))).await;
 
     let dialer = Rc::new(IggyMessageBus::new(0));
-    start_connector(
-        &dialer,
-        CLUSTER,
-        0,
-        vec![(1, addr)],
-        Some(ReplicaAuth::new(SECRET_A)),
-        GRACE,
-        install_replicas_locally(dialer.clone(), noop_handler()),
-        LONG_PERIOD,
-    )
-    .await;
+    spawn_dialer(&dialer, Some(ReplicaAuth::new(SECRET_A)), addr).await;
 
     // Dialer rejects the acceptor's MAC; neither side completes the exchange.
     settle().await;
@@ -141,17 +136,7 @@ async fn enforcement_rejects_legacy_peer() {
     let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
 
     let dialer = Rc::new(IggyMessageBus::new(0));
-    start_connector(
-        &dialer,
-        CLUSTER,
-        0,
-        vec![(1, addr)],
-        None,
-        GRACE,
-        install_replicas_locally(dialer.clone(), noop_handler()),
-        LONG_PERIOD,
-    )
-    .await;
+    spawn_dialer(&dialer, None, addr).await;
 
     settle().await;
     assert!(
@@ -167,23 +152,17 @@ async fn enforcement_rejects_legacy_peer() {
 async fn dialer_times_out_when_acceptor_sends_no_challenge() {
     // Authenticated dialer vs a legacy acceptor that never answers with a
     // ReplicaChallenge: the dialer's handshake_grace fires and it drops without
-    // registering. Exercises the mid-handshake timeout path.
+    // registering. Exercises the mid-handshake timeout path on the
+    // (locally simulated) owning shard.
     let acceptor = Rc::new(IggyMessageBus::new(0));
     let addr = spawn_acceptor(&acceptor, None).await;
 
-    let dialer = Rc::new(IggyMessageBus::new(0));
-    let short_grace = Duration::from_millis(200);
-    start_connector(
-        &dialer,
-        CLUSTER,
-        0,
-        vec![(1, addr)],
-        Some(ReplicaAuth::new(SECRET_A)),
-        short_grace,
-        install_replicas_locally(dialer.clone(), noop_handler()),
-        LONG_PERIOD,
-    )
-    .await;
+    let short_grace = MessageBusConfig {
+        handshake_grace: Duration::from_millis(200),
+        ..MessageBusConfig::default()
+    };
+    let dialer = Rc::new(IggyMessageBus::with_tunables(0, short_grace));
+    spawn_dialer(&dialer, Some(ReplicaAuth::new(SECRET_A)), addr).await;
 
     compio::time::sleep(Duration::from_millis(700)).await;
     assert!(

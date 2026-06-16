@@ -194,7 +194,7 @@ public class BasicMessagingOperationsSteps
         _context.LastSendMessage.ShouldNotBeNull();
 
         lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Header.Id);
-        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Payload);
+        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Payload.ToArray());
     }
 }
 
