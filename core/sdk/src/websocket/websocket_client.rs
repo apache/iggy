@@ -821,19 +821,23 @@ impl WebSocketClient {
             }
         };
 
-        match tokio::time::timeout(self.config.request_timeout.get_duration(), io).await {
-            Ok(result) => result,
-            Err(_) => {
-                // Reset to prevent response desync on the shared stream.
-                *self.stream.lock().await = None;
-                #[cfg(feature = "vsr")]
-                {
-                    *self
-                        .consensus_session
-                        .lock()
-                        .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        if self.config.request_timeout.is_zero() {
+            io.await
+        } else {
+            match tokio::time::timeout(self.config.request_timeout.get_duration(), io).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Reset to prevent response desync on the shared stream.
+                    *self.stream.lock().await = None;
+                    #[cfg(feature = "vsr")]
+                    {
+                        *self
+                            .consensus_session
+                            .lock()
+                            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+                    }
+                    Err(IggyError::RequestTimeout(self.config.request_timeout))
                 }
-                Err(IggyError::RequestTimeout(self.config.request_timeout))
             }
         }
     }

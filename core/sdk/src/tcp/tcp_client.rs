@@ -834,19 +834,23 @@ impl TcpClient {
                 Err(IggyError::NotConnected)
             };
 
-            match tokio::time::timeout(request_timeout.get_duration(), io).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // Reset to prevent response desync on the shared stream.
-                    *stream.lock().await = None;
-                    #[cfg(feature = "vsr")]
-                    {
-                        *consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned") =
-                            ConsensusSession::new();
+            if request_timeout.is_zero() {
+                io.await
+            } else {
+                match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Reset to prevent response desync on the shared stream.
+                        *stream.lock().await = None;
+                        #[cfg(feature = "vsr")]
+                        {
+                            *consensus_session
+                                .lock()
+                                .expect("consensus session mutex poisoned") =
+                                ConsensusSession::new();
+                        }
+                        Err(IggyError::RequestTimeout(request_timeout))
                     }
-                    Err(IggyError::RequestTimeout(request_timeout))
                 }
             }
         })

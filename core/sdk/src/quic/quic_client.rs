@@ -731,16 +731,21 @@ impl QuicClient {
                 Err(IggyError::NotConnected)
             };
 
-            match tokio::time::timeout(request_timeout.get_duration(), io).await {
-                Ok(result) => result,
-                Err(_) => {
-                    #[cfg(feature = "vsr")]
-                    {
-                        *consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+            if request_timeout.is_zero() {
+                io.await
+            } else {
+                match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        #[cfg(feature = "vsr")]
+                        {
+                            *consensus_session
+                                .lock()
+                                .expect("consensus session mutex poisoned") =
+                                ConsensusSession::new();
+                        }
+                        Err(IggyError::RequestTimeout(request_timeout))
                     }
-                    Err(IggyError::RequestTimeout(request_timeout))
                 }
             }
         })
