@@ -67,7 +67,7 @@ jobs:
               'Python SDK': 'python',
               'C# SDK': 'csharp',
               'Node.js SDK': 'javascript',
-              'C++ SDK': 'C++',
+              'C++ SDK': 'cpp',
               'PHP SDK': 'php',
               'CLI': 'tui',
               'Web UI': 'web',

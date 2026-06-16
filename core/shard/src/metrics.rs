@@ -79,6 +79,10 @@ pub mod frame_drop_variant {
     pub const FORWARD_CLIENT_SEND: &str = "forward_client_send";
     pub const FORWARD_REPLICA_SEND: &str = "forward_replica_send";
     pub const METADATA_COMMIT_TICK: &str = "metadata_commit_tick";
+    /// A delegated replica handshake's outcome ack to shard 0 was
+    /// dropped; the shard-0 deadline expiry recovers the slot / pending
+    /// entry, so this stays informational.
+    pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -98,7 +102,7 @@ pub mod frame_drop_reason {
     pub const MISROUTED: &str = "misrouted";
 }
 
-const VARIANT_COUNT: usize = 6;
+const VARIANT_COUNT: usize = 7;
 const REASON_COUNT: usize = 5;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -108,6 +112,7 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::FORWARD_CLIENT_SEND,
     frame_drop_variant::FORWARD_REPLICA_SEND,
     frame_drop_variant::METADATA_COMMIT_TICK,
+    frame_drop_variant::REPLICA_HANDSHAKE_ACK,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
