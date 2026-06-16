@@ -541,6 +541,66 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('A consumer group iterator yields messages in order')]
+    public function testIterMessages(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-iterator');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+        $partitionId = 0;
+        $messages = array_map(
+            static fn (int $i): string => "Consumer iterator test {$i} - {$streamName}",
+            range(0, 4),
+        );
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::interval(micros(5)),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+            $iterator = $consumer->iterMessages();
+            $received = [];
+            $keys = [];
+
+            assert_instance_of(Iterator::class, $iterator);
+
+            foreach ($iterator as $key => $message) {
+                $keys[] = $key;
+                $received[] = $message->payload();
+
+                if (count($received) === count($messages)) {
+                    break;
+                }
+            }
+
+            assert_same(range(0, count($messages) - 1), $keys);
+            assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('Consumer group consumeMessages requires a finite limit')]
     public function testConsumeMessagesRequiresLimit(): void
     {
