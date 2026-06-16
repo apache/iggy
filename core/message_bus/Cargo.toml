@@ -38,6 +38,7 @@ compio-quic = { workspace = true }
 compio-ws = { workspace = true }
 configs = { workspace = true }
 futures = { workspace = true }
+futures-rustls = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 libc = { workspace = true }

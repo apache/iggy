@@ -40,9 +40,13 @@
 //! That property is library-version-sensitive: a future minor bump of
 //! `futures-rustls` could change `Stream::poll_read`'s buffering
 //! contract and silently break the pump. Two guards keep the invariant
-//! load-bearing: (a) `compio = "=0.18.0"` is exact-pinned in the
-//! workspace `Cargo.toml`, freezing the transitive `futures-rustls`
-//! version; (b) the `tcp_tls_cancel_safe` integration test
+//! load-bearing: (a) the workspace pins `compio = "=0.19.0"` AND
+//! depends on `futures-rustls = "0.26.0"` directly (the replica plane
+//! handshakes with it for exporter access), so cargo must unify both on
+//! one 0.26.x build - a compio-tls drift to a different futures-rustls
+//! minor fails resolution loudly (note the exact compio pin alone does
+//! NOT freeze transitives; only `Cargo.lock` does); (b) the
+//! `tcp_tls_cancel_safe` integration test
 //! (`core/message_bus/tests/tcp_tls_cancel_safe.rs`) empirically
 //! reasserts the property in CI as a counterpart to the plaintext-TCP
 //! `cancel_unsafe` test. If either tripwire fires after a dependency
@@ -104,17 +108,32 @@ const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 
 /// In-process TCP-TLS transport: a [`TcpStream`] paired with a
-/// role-specific rustls configuration.
+/// role-specific rustls configuration, or an already-handshaken
+/// [`TlsStream`].
 ///
-/// Construct with [`Self::new_server`] or [`Self::new_client`]; drive
-/// with [`TransportConn::run`]. Override the close grace via
+/// Construct with [`Self::new_server`] / [`Self::new_client`] (the
+/// rustls handshake then runs inside [`TransportConn::run`]) or with
+/// [`Self::from_established`] when the caller has already completed the
+/// handshake itself (the replica plane does: it runs the PSK handshake
+/// over the TLS stream before installing). Override the close grace via
 /// [`Self::with_close_grace`] and the handshake grace via
 /// [`Self::with_handshake_grace`].
 pub struct TcpTlsTransportConn {
-    stream: TcpStream,
-    role: TlsRole,
+    state: ConnState,
     close_grace: Duration,
     handshake_grace: Duration,
+}
+
+/// Handshake progress at construction time.
+enum ConnState {
+    /// Raw TCP; `run` performs the role-specific rustls handshake under
+    /// `handshake_grace` before entering the pump.
+    Pending { stream: TcpStream, role: TlsRole },
+    /// Handshake already completed by the caller; `run` enters the pump
+    /// directly and `handshake_grace` is unused. Boxed: a `TlsStream`
+    /// carries the full rustls connection state inline and would
+    /// otherwise dwarf the `Pending` variant.
+    Established(Box<TlsStream<TcpStream>>),
 }
 
 impl TcpTlsTransportConn {
@@ -123,8 +142,10 @@ impl TcpTlsTransportConn {
     #[must_use]
     pub const fn new_server(stream: TcpStream, config: Arc<rustls::ServerConfig>) -> Self {
         Self {
-            stream,
-            role: TlsRole::Server(config),
+            state: ConnState::Pending {
+                stream,
+                role: TlsRole::Server(config),
+            },
             close_grace: DEFAULT_CLOSE_GRACE,
             handshake_grace: DEFAULT_HANDSHAKE_GRACE,
         }
@@ -140,11 +161,24 @@ impl TcpTlsTransportConn {
         server_name: ServerName<'static>,
     ) -> Self {
         Self {
-            stream,
-            role: TlsRole::Client {
-                config,
-                server_name,
+            state: ConnState::Pending {
+                stream,
+                role: TlsRole::Client {
+                    config,
+                    server_name,
+                },
             },
+            close_grace: DEFAULT_CLOSE_GRACE,
+            handshake_grace: DEFAULT_HANDSHAKE_GRACE,
+        }
+    }
+
+    /// Wrap an already-handshaken TLS stream; [`TransportConn::run`]
+    /// enters the steady-state pump directly.
+    #[must_use]
+    pub fn from_established(tls: TlsStream<TcpStream>) -> Self {
+        Self {
+            state: ConnState::Established(Box::new(tls)),
             close_grace: DEFAULT_CLOSE_GRACE,
             handshake_grace: DEFAULT_HANDSHAKE_GRACE,
         }
@@ -165,7 +199,8 @@ impl TcpTlsTransportConn {
     /// Override the wall-clock bound on the rustls handshake. The
     /// installer plumbs `MessageBusConfig::handshake_grace` in
     /// production; tests may shrink the budget to drive the timeout
-    /// path deterministically.
+    /// path deterministically. No effect on connections built via
+    /// [`Self::from_established`]: the handshake has already run.
     #[must_use]
     pub const fn with_handshake_grace(mut self, handshake_grace: Duration) -> Self {
         self.handshake_grace = handshake_grace;
@@ -180,28 +215,32 @@ impl TransportConn for TcpTlsTransportConn {
         let peer = ctx.peer.clone();
         let handshake_grace = self.handshake_grace;
 
-        let mut tls =
-            match compio::time::timeout(handshake_grace, handshake(self.role, self.stream)).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!(
-                        %label,
-                        %peer,
-                        error = ?e,
-                        "TLS handshake failed; closing connection"
-                    );
-                    return;
+        let mut tls = match self.state {
+            ConnState::Established(tls) => *tls,
+            ConnState::Pending { stream, role } => {
+                match compio::time::timeout(handshake_grace, handshake(role, stream)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!(
+                            %label,
+                            %peer,
+                            error = ?e,
+                            "TLS handshake failed; closing connection"
+                        );
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            %label,
+                            %peer,
+                            grace = ?handshake_grace,
+                            "TLS handshake exceeded handshake_grace; closing connection"
+                        );
+                        return;
+                    }
                 }
-                Err(_elapsed) => {
-                    warn!(
-                        %label,
-                        %peer,
-                        grace = ?handshake_grace,
-                        "TLS handshake exceeded handshake_grace; closing connection"
-                    );
-                    return;
-                }
-            };
+            }
+        };
 
         run_pump(&mut tls, ctx).await;
         drive_close(&mut tls, self.close_grace, label, &peer).await;
@@ -829,6 +868,75 @@ mod tests {
         client_shutdown.trigger();
         let _ = compio::time::timeout(Duration::from_secs(10), server_handle).await;
         let _ = compio::time::timeout(Duration::from_secs(10), client_handle).await;
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn from_established_via_futures_rustls_exporter_route() {
+        // Tripwire for the replica plane's channel-binding path: it
+        // handshakes with futures-rustls directly (the only way to reach
+        // `export_keying_material`), then converts into the compio
+        // `TlsStream` the pump runs on through compio-tls's public
+        // `From` impls over `Pin<Box<AsyncStream<S>>>`. A compio-tls
+        // bump that closes the From route or changes the compat shape
+        // breaks this test at compile time; a bump that breaks exporter
+        // symmetry fails the assertions.
+        use crate::replica::auth::{EXPORTER_LABEL, EXPORTER_LEN};
+        use compio::io::compat::AsyncStream;
+
+        let (server_config, cert_chain) = server_cfg();
+        let client_config = client_cfg_trusting(&cert_chain);
+        let server_name: ServerName<'static> = "localhost".try_into().expect("server name");
+
+        let (client_stream, server_stream) = connected_pair().await;
+        let accept_fut = futures_rustls::TlsAcceptor::from(server_config)
+            .accept(Box::pin(AsyncStream::new(server_stream)));
+        let connect_fut = futures_rustls::TlsConnector::from(client_config)
+            .connect(server_name, Box::pin(AsyncStream::new(client_stream)));
+        let (server_res, client_res) = futures::join!(accept_fut, connect_fut);
+        let server_tls = server_res.expect("futures-rustls accept");
+        let client_tls = client_res.expect("futures-rustls connect");
+
+        let server_exporter = server_tls
+            .get_ref()
+            .1
+            .export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)
+            .expect("server exporter");
+        let client_exporter = client_tls
+            .get_ref()
+            .1
+            .export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)
+            .expect("client exporter");
+        assert_eq!(
+            server_exporter, client_exporter,
+            "exporter must be symmetric across the two ends of one session"
+        );
+        assert_ne!(
+            server_exporter, [0u8; EXPORTER_LEN],
+            "exporter must not be all-zero (zero aliases the plaintext binding)"
+        );
+
+        // The From route, then a frame through the steady-state pump.
+        let server_conn = TcpTlsTransportConn::from_established(TlsStream::from(server_tls));
+        let client_conn = TcpTlsTransportConn::from_established(TlsStream::from(client_tls));
+
+        let (_server_out, server_in, server_shutdown, server_handle) = drive(server_conn);
+        let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
+
+        client_out
+            .send(header_only(Command2::Request))
+            .await
+            .expect("client send");
+        let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
+            .await
+            .expect("server recv within 5 s")
+            .expect("server frame");
+        assert_eq!(received.header().command, Command2::Request);
+
+        server_shutdown.trigger();
+        client_shutdown.trigger();
+        let _ = compio::time::timeout(Duration::from_secs(5), server_handle).await;
+        let _ = compio::time::timeout(Duration::from_secs(5), client_handle).await;
     }
 
     #[test]

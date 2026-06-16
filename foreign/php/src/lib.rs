@@ -19,6 +19,7 @@ pub mod client;
 pub mod consumer;
 pub mod error;
 pub mod identifier;
+pub mod message_iterator;
 pub mod receive_message;
 pub mod runtime;
 pub mod send_message;
@@ -33,6 +34,7 @@ use crate::error::{
     AuthenticationException, ConnectionException, IggyException, NotFoundException,
     TransientException,
 };
+use crate::message_iterator::MessageIterator;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
@@ -50,6 +52,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<TransientException>()
         .class::<IggyClient>()
         .class::<IggyConsumer>()
+        .class::<MessageIterator>()
         .class::<AutoCommit>()
         .class::<AutoCommitWhen>()
         .class::<PollingStrategy>()

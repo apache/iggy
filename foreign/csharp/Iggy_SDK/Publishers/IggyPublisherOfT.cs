@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
@@ -23,14 +25,14 @@ using Microsoft.Extensions.Logging;
 namespace Apache.Iggy.Publishers;
 
 /// <summary>
-///     Typed publisher that automatically serializes objects of type T to message payloads.
-///     Extends <see cref="IggyPublisher" /> with serialization capabilities.
+///     Typed publisher that serializes objects of type <typeparamref name="T" /> to message payloads through the
+///     configured <see cref="ISerializer{T}" />. With background sending enabled, values are queued and serialized
+///     at flush time by the <see cref="BackgroundMessageProcessor" />.
 /// </summary>
 /// <typeparam name="T">The type to serialize to message payloads</typeparam>
 public class IggyPublisher<T> : IggyPublisher
 {
-    private readonly IggyPublisherConfig<T> _typedConfig;
-    private readonly ILogger<IggyPublisher<T>> _typedLogger;
+    private readonly ISerializer<T> _serializer;
 
     /// <summary>
     ///     Initializes a new instance of the typed <see cref="IggyPublisher{T}" /> class
@@ -38,25 +40,56 @@ public class IggyPublisher<T> : IggyPublisher
     /// <param name="client">The Iggy client for server communication</param>
     /// <param name="config">Typed publisher configuration including serializer</param>
     /// <param name="logger">Logger instance for diagnostic output</param>
-    public IggyPublisher(IIggyClient client, IggyPublisherConfig<T> config, ILogger<IggyPublisher<T>> logger) : base(
-        client, config, logger)
+    public IggyPublisher(IIggyClient client, IggyPublisherConfig<T> config, ILogger<IggyPublisher<T>> logger)
+        : base(client, config, logger)
     {
-        _typedConfig = config;
-        _typedLogger = logger;
+        _serializer = config.Serializer;
     }
 
     /// <summary>
-    ///     Serializes and sends a single object as a message
+    ///     Serializes and sends a single object as a message. With background sending enabled the value is queued
+    ///     and serialized at flush time; otherwise it is serialized into a pooled buffer and sent immediately.
     /// </summary>
+    /// <remarks>
+    ///     With background sending enabled, <paramref name="data" /> is serialized later, at flush time - not when
+    ///     this method returns. If <typeparamref name="T" /> is a mutable reference type, mutating the instance after
+    ///     the call (or returning it to a pool) before the flush changes what is sent. Pass an immutable value or a
+    ///     snapshot, or call <see cref="IggyPublisher.WaitUntilAllSendsAsync" /> before reusing it.
+    /// </remarks>
     /// <param name="data">The object to serialize and send</param>
-    /// <param name="messageId">Optional message ID. If null, a new GUID will be generated</param>
+    /// <param name="messageId">Optional message ID. If null, the message is sent with ID 0 and the server assigns one</param>
     /// <param name="userHeaders">Optional user headers to attach to the message</param>
     /// <param name="ct">Cancellation token</param>
     public async Task SendAsync(T data, Guid? messageId = null,
         Dictionary<HeaderKey, HeaderValue>? userHeaders = null, CancellationToken ct = default)
     {
-        var message = CreateMessage(data, messageId, userHeaders);
-        await SendMessagesAsync([message], ct);
+        EnsureInitialized();
+
+        var id = messageId?.ToUInt128() ?? UInt128.Zero;
+
+        if (BackgroundProcessor != null)
+        {
+            await BackgroundProcessor.EnqueueAsync(
+                TypedUnit<T>.Single(data, id, userHeaders, _serializer, Config.MessageEncryptor), ct);
+            return;
+        }
+
+        var writer = new PooledBufferWriter();
+        try
+        {
+            _serializer.Serialize(data, writer);
+            var message = new Message(id, writer.Written, userHeaders);
+            if (Config.MessageEncryptor != null)
+            {
+                PublisherEncryption.Encrypt(message, Config.MessageEncryptor);
+            }
+
+            await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, message, ct);
+        }
+        finally
+        {
+            writer.Dispose();
+        }
     }
 
     /// <summary>
@@ -66,8 +99,27 @@ public class IggyPublisher<T> : IggyPublisher
     /// <param name="ct">Cancellation token</param>
     public async Task SendAsync(IEnumerable<T> data, CancellationToken ct = default)
     {
-        var messages = data.Select(item => CreateMessage(item, null, null)).ToList();
-        await SendMessagesAsync(messages, ct);
+        EnsureInitialized();
+
+        if (BackgroundProcessor != null)
+        {
+            TypedUnit<T> unit = TypedUnit<T>.Batch(data, _serializer, Config.MessageEncryptor);
+            if (unit.Count > 0)
+            {
+                await BackgroundProcessor.EnqueueAsync(unit, ct);
+            }
+
+            return;
+        }
+
+        using var builder = new RentedMessageBatchBuilder();
+        foreach (var item in data)
+        {
+            builder.Add((Data: item, Serializer: _serializer),
+                static (state, writer) => state.Serializer.Serialize(state.Data, writer));
+        }
+
+        await SendDirectBatchAsync(builder, ct);
     }
 
     /// <summary>
@@ -75,42 +127,65 @@ public class IggyPublisher<T> : IggyPublisher
     /// </summary>
     /// <param name="items">The collection of items to send, each with optional message ID and headers</param>
     /// <param name="ct">Cancellation token</param>
-    public async Task SendAsync(IEnumerable<(T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders)> items,
+    public async Task SendAsync(
+        IEnumerable<(T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders)> items,
         CancellationToken ct = default)
     {
-        var messages = items.Select(item => CreateMessage(item.data, item.messageId, item.userHeaders)).ToList();
-        await SendMessagesAsync(messages, ct);
+        EnsureInitialized();
+
+        if (BackgroundProcessor != null)
+        {
+            TypedUnit<T> unit = TypedUnit<T>.Batch(items, _serializer, Config.MessageEncryptor);
+            if (unit.Count > 0)
+            {
+                await BackgroundProcessor.EnqueueAsync(unit, ct);
+            }
+
+            return;
+        }
+
+        using var builder = new RentedMessageBatchBuilder();
+        foreach ((T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders) item in items)
+        {
+            builder.Add((Data: item.data, Serializer: _serializer),
+                static (state, writer) => state.Serializer.Serialize(state.Data, writer), item.messageId,
+                item.userHeaders);
+        }
+
+        await SendDirectBatchAsync(builder, ct);
     }
 
-    /// <summary>
-    ///     Serializes an object using the configured serializer
-    /// </summary>
-    /// <param name="data">The object to serialize</param>
-    /// <returns>The serialized byte array</returns>
-    public byte[] Serialize(T data)
+    private async Task SendDirectBatchAsync(RentedMessageBatchBuilder builder, CancellationToken ct)
     {
-        return _typedConfig.Serializer.Serialize(data);
-    }
-
-    /// <summary>
-    ///     Creates a message from an object by serializing it
-    /// </summary>
-    /// <param name="data">The object to serialize</param>
-    /// <param name="messageId">Optional message ID</param>
-    /// <param name="userHeaders">Optional user headers</param>
-    /// <returns>A new message with the serialized payload</returns>
-    private Message CreateMessage(T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders)
-    {
+        var batch = builder.Build();
         try
         {
-            var payload = Serialize(data);
-            var id = messageId ?? Guid.NewGuid();
-            return new Message(id, payload, userHeaders);
+            IList<Message> messages = batch.Messages;
+            if (messages.Count == 0)
+            {
+                return;
+            }
+
+            if (Config.MessageEncryptor != null)
+            {
+                // Payloads are fresh arrays after encryption, so return the rented buffer now instead of holding plaintext through the send.
+                PublisherEncryption.EncryptAll(messages, Config.MessageEncryptor);
+                batch.Dispose();
+            }
+
+            await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);
         }
-        catch (Exception ex)
+        finally
         {
-            _typedLogger.LogError(ex, "Failed to serialize message of type {Type}", typeof(T).Name);
-            throw;
+            batch.Dispose();
+        }
+    }
+
+    private void EnsureInitialized()
+    {
+        if (!IsInitialized)
+        {
+            throw new PublisherNotInitializedException();
         }
     }
 }

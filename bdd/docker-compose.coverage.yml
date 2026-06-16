@@ -28,11 +28,14 @@ services:
     command:
       - sh
       - -c
-      - >-
-        rustup component add llvm-tools-preview
-        && cargo install cargo-llvm-cov
-        && cargo llvm-cov test -p bdd --features bdd
-        --lcov --output-path /reports/rust-bdd-coverage.lcov
+      - |
+        rustup component add llvm-tools-preview \
+        && cargo install cargo-llvm-cov \
+        && case "$$BDD_FEATURE" in
+          basic_messaging)    cargo llvm-cov test -p bdd --features bdd --test basic_messaging --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+          leader_redirection) cargo llvm-cov test -p bdd --features bdd --test leader_redirection --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+          *)                  cargo llvm-cov test -p bdd --features bdd --lcov --output-path /reports/rust-bdd-coverage.lcov ;;
+        esac
 
   python-bdd:
     volumes:
@@ -69,7 +72,7 @@ services:
       - sh
       - -c
       - >-
-        go test -v ${GO_TEST_EXTRA_FLAGS}
+        go test -v
         -coverpkg=github.com/apache/iggy/foreign/go/...
         -coverprofile=/reports/go-bdd-coverage.out
         ./...
@@ -87,15 +90,15 @@ services:
     volumes:
       - ../reports:/reports
     command:
-      - dotnet
-      - test
-      - --coverage
-      - --coverage-output-format
-      - cobertura
-      - --coverage-output
-      - csharp-bdd-coverage.cobertura.xml
-      - --results-directory
-      - /reports
+      - sh
+      - -c
+      - |
+        FILTER=""
+        case "$$BDD_FEATURE" in
+          basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
+          leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
+        esac
+        dotnet test $$FILTER --coverage --coverage-output-format cobertura --coverage-output csharp-bdd-coverage.cobertura.xml --results-directory /reports
 
   java-bdd:
     volumes:

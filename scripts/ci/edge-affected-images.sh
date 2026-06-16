@@ -79,23 +79,38 @@ if ! PLAN="$(cargo rail plan --since "$BASE" -f json 2>"$RAIL_ERR")"; then
 fi
 
 # Parse defensively: malformed output must fall OPEN, never abort under set -e
-# (that fails closed and skips the publish). jq prints nothing on a parse error,
-# leaving MODE empty. A valid {mode:crates, crates:[]} is the normal
-# docs/SDK/config-only push and must publish nothing, so only an unparsable
-# MODE or a non-"crates" mode escalates to emit_all.
-MODE="$(jq -r '.scope.mode // "full"' <<<"$PLAN" 2>/dev/null || true)"
-if [[ -z "$MODE" ]]; then
-  echo "::warning::edge-gate: unparsable cargo-rail output, refreshing all images" >&2
-  emit_all
-  exit 0
-fi
-if [[ "$MODE" != "crates" ]]; then
-  echo "::notice::edge-gate: cargo-rail reports full workspace, refreshing all images" >&2
-  emit_all
-  exit 0
-fi
+# (that fails closed and skips the publish). cargo-rail's ExecutionScopeMode is
+# one of three snake_case values:
+#   crates    -> a specific affected subset; gate each image on it below.
+#   empty     -> no build/test/bench surface was touched (docs / infra / non-Rust
+#                files only), so zero crates ship new code. Non-crate build inputs
+#                (the embedded web UI, Dockerfiles) are still gated per image via
+#                gate.paths, so fall through with an EMPTY crate set rather than
+#                refreshing everything. A node/docs/SDK-only push lands here.
+#   workspace -> a package-scoped surface pins to all crates (or none resolvable);
+#                rebuild every image.
+# An absent or unparsable mode falls open to emit_all.
+MODE="$(jq -r '.scope.mode // ""' <<<"$PLAN" 2>/dev/null || true)"
+AFFECTED=()
+case "$MODE" in
+  crates)
+    mapfile -t AFFECTED < <(jq -r '.scope.crates // [] | .[]' <<<"$PLAN")
+    ;;
+  empty)
+    echo "::notice::edge-gate: no crate impact, gating images on paths only" >&2
+    ;;
+  workspace)
+    echo "::notice::edge-gate: cargo-rail reports full workspace, refreshing all images" >&2
+    emit_all
+    exit 0
+    ;;
+  *)
+    echo "::warning::edge-gate: unparsable or unexpected cargo-rail mode '${MODE:-<empty>}', refreshing all images" >&2
+    emit_all
+    exit 0
+    ;;
+esac
 
-mapfile -t AFFECTED < <(jq -r '.scope.crates // [] | .[]' <<<"$PLAN")
 declare -A AFFECTED_SET=()
 for crate in ${AFFECTED[@]+"${AFFECTED[@]}"}; do
   AFFECTED_SET["$crate"]=1

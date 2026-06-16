@@ -17,7 +17,7 @@
 
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Messages;
 
@@ -43,27 +43,19 @@ internal static class TcpMessageStreamHelpers
         return (status, length);
     }
 
-    internal static int CalculateMessageBytesCount(IList<Message> messages)
+    internal static int CalculateMessageBytesCount(ReadOnlySpan<Message> messages)
     {
         var bytesCount = 0;
         foreach (var message in messages)
         {
             bytesCount += 16 + 64 + message.Payload.Length;
-            if (message.RawUserHeaders is not null)
+            if (!message.RawUserHeaders.IsEmpty)
             {
                 bytesCount += message.RawUserHeaders.Length;
                 continue;
             }
 
-            if (message.UserHeaders is null)
-            {
-                continue;
-            }
-
-            foreach (var header in message.UserHeaders)
-            {
-                bytesCount += 1 + 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length;
-            }
+            bytesCount += TcpContracts.HeadersByteLength(message.UserHeaders);
         }
 
         return bytesCount;
