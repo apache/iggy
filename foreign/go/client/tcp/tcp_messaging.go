@@ -77,8 +77,7 @@ func (c *IggyTcpClient) PollMessagesInto(
 	partitionId *uint32,
 	buf []byte,
 ) (*iggcon.PolledMessage, []byte, error) {
-	bp := acquireRequestBuf()
-	wire, err := encodeWireRequest(*bp, &command.PollMessages{
+	buf, err := c.doInto(ctx, &command.PollMessages{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -86,15 +85,7 @@ func (c *IggyTcpClient) PollMessagesInto(
 		Strategy:    strategy,
 		Count:       count,
 		PartitionId: partitionId,
-	})
-	if err != nil {
-		releaseRequestBuf(bp)
-		return nil, buf, err
-	}
-	*bp = wire
-
-	buf, err = c.sendWireAndFetchResponseInto(ctx, wire, buf)
-	releaseRequestBuf(bp)
+	}, buf)
 	if err != nil {
 		return nil, buf, err
 	}

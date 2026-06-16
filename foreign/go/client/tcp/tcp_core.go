@@ -290,17 +290,21 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	return c.doInto(ctx, cmd, nil)
+}
+
+func (c *IggyTcpClient) doInto(ctx context.Context, cmd command.Command, buf []byte) ([]byte, error) {
 	bp := acquireRequestBuf()
-	buf, err := encodeWireRequest(*bp, cmd)
+	wire, err := encodeWireRequest(*bp, cmd)
 	if err != nil {
 		releaseRequestBuf(bp)
-		return nil, err
+		return buf, err
 	}
-	*bp = buf
+	*bp = wire
 
-	resp, err := c.sendWireAndFetchResponse(ctx, buf)
+	buf, err = c.sendWireAndFetchResponseInto(ctx, wire, buf)
 	releaseRequestBuf(bp)
-	return resp, err
+	return buf, err
 }
 
 // encodeWireRequest writes the wire-format request (4-byte length, 4-byte
