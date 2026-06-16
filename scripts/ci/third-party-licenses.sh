@@ -44,6 +44,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# cargo-about shells out to `cargo metadata`, which refreshes the crates.io
+# index and downloads dep manifests. Both can fail transiently on a network
+# blip ("Connection reset by peer") even past cargo's own net retries. Retry
+# the whole invocation a few times so a flake never reddens a release gate.
+CARGO_ABOUT_ATTEMPTS=3
+CARGO_ABOUT_RETRY_DELAY_SECONDS=5
+
 ACTION=""
 MANIFESTS=()
 OUTPUT=""
@@ -172,13 +179,23 @@ run_cargo_about() {
   local out="$2"
   require_cmd cargo-about
 
-  ( cd "$REPO_ROOT" && \
-    cargo about generate \
-      --config about.toml \
-      --manifest-path "$target_manifest" \
-      --fail \
-      -o "$out" \
-      about.hbs )
+  local attempt
+  for ((attempt = 1; attempt <= CARGO_ABOUT_ATTEMPTS; attempt++)); do
+    if ( cd "$REPO_ROOT" && \
+      cargo about generate \
+        --config about.toml \
+        --manifest-path "$target_manifest" \
+        --fail \
+        -o "$out" \
+        about.hbs ); then
+      return 0
+    fi
+    if ((attempt < CARGO_ABOUT_ATTEMPTS)); then
+      echo "warning: cargo-about failed (attempt ${attempt}/${CARGO_ABOUT_ATTEMPTS}), retrying in ${CARGO_ABOUT_RETRY_DELAY_SECONDS}s" >&2
+      sleep "$CARGO_ABOUT_RETRY_DELAY_SECONDS"
+    fi
+  done
+  return 1
 }
 
 # Run license-checker-rseidelsohn against an npm package directory and

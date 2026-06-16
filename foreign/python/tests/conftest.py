@@ -22,8 +22,14 @@ This module provides pytest fixtures for setting up test environments
 and connecting to Iggy servers in various configurations.
 """
 
+# TODO(slbotbm): Create text fixture for clean up after
+# delete_stream() has been implemented.
+
 import asyncio
 import os
+import secrets
+import string
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +71,43 @@ async def iggy_client() -> IggyClient:
     return client
 
 
+@pytest.fixture
+def unique_name():
+    """Return a factory for generating unique test names."""
+
+    def make_name(
+        prefix: str = "",
+        *,
+        min_bytes: int = 8,
+        max_bytes: int = 255,
+    ) -> str:
+        if min_bytes < 0:
+            raise ValueError("min_bytes must be non-negative")
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if max_bytes < min_bytes:
+            raise ValueError("max_bytes must be greater than or equal to min_bytes")
+
+        prefix_bytes = len(prefix.encode())
+        if prefix_bytes > max_bytes:
+            raise ValueError("prefix exceeds max_bytes")
+
+        min_suffix_bytes = max(0, min_bytes - prefix_bytes)
+        max_suffix_bytes = max_bytes - prefix_bytes
+        if min_suffix_bytes > max_suffix_bytes:
+            raise ValueError("prefix leaves insufficient room within byte bounds")
+
+        alphabet = string.ascii_lowercase + string.digits
+        suffix_bytes = (
+            secrets.randbelow(max_suffix_bytes - min_suffix_bytes + 1)
+            + min_suffix_bytes
+        )
+        suffix = "".join(secrets.choice(alphabet) for _ in range(suffix_bytes))
+        return f"{prefix}{suffix}"
+
+    return make_name
+
+
 @pytest.fixture(scope="session", autouse=True)
 def configure_asyncio():
     """Configure asyncio settings for tests."""
@@ -84,7 +127,9 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(items):
     """Modify test collection to add markers automatically."""
+    integration_modules = {
+        path.name for path in Path(__file__).parent.glob("test_*.py")
+    }
     for item in items:
-        # Mark all tests in test_iggy_sdk.py as integration tests
-        if "test_iggy_sdk" in item.nodeid or "test_tls" in item.nodeid:
+        if any(module in item.nodeid for module in integration_modules):
             item.add_marker(pytest.mark.integration)
