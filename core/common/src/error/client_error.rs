@@ -29,6 +29,9 @@ pub enum ClientError {
     /// Transport is invalid and cannot be used.
     #[error("Invalid transport {0}")]
     InvalidTransport(String),
+    /// Duration value is invalid.
+    #[error("Invalid duration: {0}")]
+    InvalidDuration(String),
     /// IO error.
     #[error("IO error")]
     IoError(#[from] io::Error),
