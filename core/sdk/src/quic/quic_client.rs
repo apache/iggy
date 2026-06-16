@@ -658,7 +658,6 @@ impl QuicClient {
         let request_timeout = self.config.request_timeout;
         #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
-        // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let io = async {
                 let connection = connection.lock().await;
@@ -732,9 +731,18 @@ impl QuicClient {
                 Err(IggyError::NotConnected)
             };
 
-            tokio::time::timeout(request_timeout.get_duration(), io)
-                .await
-                .map_err(|_| IggyError::RequestTimeout(request_timeout))?
+            match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                Ok(result) => result,
+                Err(_) => {
+                    #[cfg(feature = "vsr")]
+                    {
+                        *consensus_session
+                            .lock()
+                            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+                    }
+                    Err(IggyError::RequestTimeout(request_timeout))
+                }
+            }
         })
         .await
         .map_err(|e| {
