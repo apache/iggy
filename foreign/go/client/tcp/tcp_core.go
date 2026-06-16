@@ -251,15 +251,6 @@ func releaseRequestBuf(bp *[]byte) {
 	requestBufPool.Put(bp)
 }
 
-func (c *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
-	buffer := make([]byte, expectedSize)
-	n, err := c.readInto(buffer)
-	if err != nil {
-		return n, buffer[:n], err
-	}
-	return n, buffer, nil
-}
-
 // readInto reads exactly len(buf) bytes from the connection into buf.
 func (c *IggyTcpClient) readInto(buf []byte) (int, error) {
 	var totalRead int
@@ -387,10 +378,6 @@ func (c *IggyTcpClient) sendWireAndFetchResponseInto(ctx context.Context, wirePa
 		return result, err
 	}
 	return result, nil
-}
-
-func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
-	return c.sendLockedInto(wirePayload, nil)
 }
 
 func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) {
