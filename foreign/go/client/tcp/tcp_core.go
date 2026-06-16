@@ -60,6 +60,7 @@ type IggyTcpClient struct {
 	currentServerAddress   string
 	connectedAt            time.Time
 	state                  iggcon.State
+	events                 *eventBroadcaster
 	// respHeader is the reused response-status read buffer; guarded by c.mtx.
 	respHeader [ResponseInitialBytesLength]byte
 }
@@ -220,6 +221,7 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		connectedAt:            time.Time{},
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
+		events:                 newEventBroadcaster(),
 	}
 }
 
@@ -431,12 +433,16 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	return buffer, nil
 }
 
-// invalidateConnLocked closes the connection and marks it as disconnected
+// invalidateConnLocked closes the connection and marks it as disconnected,
+// publishing a Disconnected event on the transition.
 func (c *IggyTcpClient) invalidateConnLocked() {
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
-	c.state = iggcon.StateDisconnected
+	if c.state != iggcon.StateDisconnected {
+		c.state = iggcon.StateDisconnected
+		c.events.publish(iggcon.DiagnosticEventDisconnected)
+	}
 }
 
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
@@ -548,7 +554,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		if !c.config.reconnection.enabled {
 			c.logger.Warn("Automatic reconnection is disabled.")
 		}
-		// TODO publish event disconnected
+		c.events.publish(iggcon.DiagnosticEventDisconnected)
 		return err
 	}
 
@@ -558,6 +564,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	c.connectedAt = time.Now()
 	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
 	c.mtx.Unlock()
+	c.events.publish(iggcon.DiagnosticEventConnected)
 	return nil
 }
 
@@ -624,7 +631,7 @@ func (c *IggyTcpClient) disconnect() error {
 	}
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
-	// TODO event pushing logic
+	c.events.publish(iggcon.DiagnosticEventDisconnected)
 	return nil
 }
 
@@ -646,10 +653,18 @@ func (c *IggyTcpClient) shutdown() error {
 
 	c.state = iggcon.StateShutdown
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
-	// TODO push shutdown event
+	c.events.publish(iggcon.DiagnosticEventShutdown)
+	c.events.close()
 	return nil
 }
 
 func (c *IggyTcpClient) Close() error {
 	return c.shutdown()
+}
+
+// SubscribeEvents returns an independent channel of client lifecycle events
+// and an unsubscribe function. The channel is closed on shutdown, after the
+// final DiagnosticEventShutdown.
+func (c *IggyTcpClient) SubscribeEvents() (<-chan iggcon.DiagnosticEvent, func()) {
+	return c.events.subscribe()
 }
