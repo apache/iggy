@@ -64,13 +64,8 @@ func (c *IggyTcpClient) PollMessages(
 	return polled, err
 }
 
-// PollMessagesInto polls messages like PollMessages but reads the response
-// body into the caller-supplied buf, growing it as needed. The returned buf
-// (possibly reallocated) should be passed back on the next call to avoid
-// per-RPC allocations once the buffer is large enough.
-//
-// The Payload and UserHeaders fields of every returned message alias buf;
-// copy out any bytes you need before the next PollMessagesInto call.
+// Payload and UserHeaders in the returned messages alias buf; copy out bytes
+// you need before the next call.
 func (c *IggyTcpClient) PollMessagesInto(
 	ctx context.Context,
 	streamId iggcon.Identifier,

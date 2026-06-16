@@ -114,11 +114,8 @@ type Client interface {
 		partitionId *uint32,
 	) (*PolledMessage, error)
 
-	// PollMessagesInto is like PollMessages but reads the response body into
-	// the caller-supplied buf, growing it as needed. The returned buf (possibly
-	// reallocated) should be passed back on the next call to amortize
-	// allocations. Payload and UserHeaders in the returned messages alias buf;
-	// copy out bytes you need before calling PollMessagesInto again.
+	// Payload and UserHeaders in the returned messages alias buf; copy out bytes
+	// you need before calling PollMessagesInto again.
 	PollMessagesInto(
 		ctx context.Context,
 		streamId Identifier,

@@ -334,14 +334,61 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 	return c.sendWireAndFetchResponseInto(ctx, wirePayload, nil)
 }
 
+func (c *IggyTcpClient) sendWireAndFetchResponseInto(ctx context.Context, wirePayload, buf []byte) ([]byte, error) {
+	if ctx == nil {
+		return buf, ierror.ErrNilContext
+	}
+	if err := ctx.Err(); err != nil {
+		return buf, err
+	}
+
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return buf, err
+	}
+
+	if ctx.Done() == nil {
+		return c.sendLockedInto(wirePayload, buf)
+	}
+
+	conn := c.conn
+	var deadlineMu sync.Mutex
+	cleared := false
+
+	stop := context.AfterFunc(ctx, func() {
+		deadlineMu.Lock()
+		defer deadlineMu.Unlock()
+		if !cleared {
+			// Set a deadline in the past to unblock any ongoing read/write operations on the connection.
+			// This must use the snapshotted conn, not c.conn, to avoid setting a deadline on a
+			// new connection if Connect() reestablishes the connection after the context is cancelled.
+			_ = conn.SetDeadline(time.Now())
+		}
+	})
+	defer stop()
+
+	result, err := c.sendLockedInto(wirePayload, buf)
+
+	deadlineMu.Lock()
+	cleared = true
+	_ = conn.SetDeadline(time.Time{})
+	deadlineMu.Unlock()
+
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return result, ctxErr
+		}
+		return result, err
+	}
+	return result, nil
+}
+
 func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	return c.sendLockedInto(wirePayload, nil)
 }
 
-// sendLockedInto is like sendLocked but reads the response body into buf,
-// growing it when its capacity is insufficient. The returned slice is buf
-// resliced to the response length; Payload/UserHeaders in the parsed message
-// will alias this slice, so the caller must not recycle it until done.
 func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) {
 	if _, err := c.write(wirePayload); err != nil {
 		c.invalidateConnLocked()
@@ -374,57 +421,6 @@ func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) 
 	}
 
 	return buf, nil
-}
-
-// sendWireAndFetchResponseInto is like sendWireAndFetchResponse but reads the
-// response body into buf, growing it when capacity is insufficient. The
-// returned slice aliases buf; see sendLockedInto for aliasing semantics.
-func (c *IggyTcpClient) sendWireAndFetchResponseInto(ctx context.Context, wirePayload, buf []byte) ([]byte, error) {
-	if ctx == nil {
-		return buf, ierror.ErrNilContext
-	}
-	if err := ctx.Err(); err != nil {
-		return buf, err
-	}
-
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return buf, err
-	}
-
-	if ctx.Done() == nil {
-		return c.sendLockedInto(wirePayload, buf)
-	}
-
-	conn := c.conn
-	var deadlineMu sync.Mutex
-	cleared := false
-
-	stop := context.AfterFunc(ctx, func() {
-		deadlineMu.Lock()
-		defer deadlineMu.Unlock()
-		if !cleared {
-			_ = conn.SetDeadline(time.Now())
-		}
-	})
-	defer stop()
-
-	result, err := c.sendLockedInto(wirePayload, buf)
-
-	deadlineMu.Lock()
-	cleared = true
-	_ = conn.SetDeadline(time.Time{})
-	deadlineMu.Unlock()
-
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return result, ctxErr
-		}
-		return result, err
-	}
-	return result, nil
 }
 
 // invalidateConnLocked closes the connection and marks it as disconnected
