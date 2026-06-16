@@ -99,7 +99,7 @@ impl From<ConnectionString<QuicConnectionStringOptions>> for QuicClientConfig {
             max_idle_timeout: connection_string.options().max_idle_timeout(),
             validate_certificate: connection_string.options().validate_certificate(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
-            request_timeout: IggyDuration::from_str("30s").unwrap(),
+            request_timeout: connection_string.options().request_timeout(),
         }
     }
 }

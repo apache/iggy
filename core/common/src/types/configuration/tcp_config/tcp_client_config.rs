@@ -76,7 +76,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
             tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
-            request_timeout: IggyDuration::from_str("30s").unwrap(),
+            request_timeout: connection_string.options().request_timeout(),
             nodelay: connection_string.options().nodelay(),
         }
     }

@@ -21,6 +21,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct WebSocketConnectionStringOptions {
     heartbeat_interval: IggyDuration,
+    request_timeout: IggyDuration,
     reconnection: WebSocketClientReconnectionConfig,
 
     read_buffer_size: Option<usize>,
@@ -40,6 +41,10 @@ pub struct WebSocketConnectionStringOptions {
 impl WebSocketConnectionStringOptions {
     pub fn heartbeat_interval(&self) -> IggyDuration {
         self.heartbeat_interval
+    }
+
+    pub fn request_timeout(&self) -> IggyDuration {
+        self.request_timeout
     }
 
     pub fn reconnection(&self) -> &WebSocketClientReconnectionConfig {
@@ -112,6 +117,10 @@ impl ConnectionStringOptions for WebSocketConnectionStringOptions {
             match parts[0] {
                 "heartbeat_interval" => {
                     parsed_options.heartbeat_interval = IggyDuration::from_str(parts[1])
+                        .map_err(|_| IggyError::InvalidConnectionString)?;
+                }
+                "request_timeout" => {
+                    parsed_options.request_timeout = IggyDuration::from_str(parts[1])
                         .map_err(|_| IggyError::InvalidConnectionString)?;
                 }
                 "reconnection_retries" => {
@@ -193,6 +202,7 @@ impl Default for WebSocketConnectionStringOptions {
     fn default() -> Self {
         WebSocketConnectionStringOptions {
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
             reconnection: WebSocketClientReconnectionConfig::default(),
             read_buffer_size: None,
             write_buffer_size: None,

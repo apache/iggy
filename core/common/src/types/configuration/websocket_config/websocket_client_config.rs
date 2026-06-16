@@ -159,7 +159,7 @@ impl From<ConnectionString<WebSocketConnectionStringOptions>> for WebSocketClien
             auto_login: connection_string.auto_login().to_owned(),
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
-            request_timeout: IggyDuration::from_str("30s").unwrap(),
+            request_timeout: connection_string.options().request_timeout(),
             ws_config,
             tls_enabled: options.tls_enabled(),
             tls_domain: options.tls_domain().into(),
