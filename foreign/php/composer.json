@@ -1,6 +1,7 @@
 {
     "name": "apache/iggy-php",
     "description": "PHP extension bindings for Apache Iggy.",
+    "version": "0.1.0",
     "type": "php-ext",
     "license": "Apache-2.0",
     "homepage": "https://iggy.apache.org",

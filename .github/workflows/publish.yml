@@ -49,7 +49,7 @@ on:
         required: false
         default: ""
       publish_other:
-        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go)"
+        description: "Other SDKs to publish (comma-separated: python, php, node, java, csharp, go)"
         type: string
         required: false
         default: ""
@@ -109,6 +109,8 @@ on:
         required: false
       NUGET_API_KEY:
         required: false
+      PACKAGIST_TOKEN:
+        required: false
 
 env:
   IGGY_CI_BUILD: true
@@ -119,7 +121,7 @@ permissions:
   id-token: write
 
 # Static group so two concurrent release dispatches cannot race the
-# crates.io / Maven Central / npm / NuGet / DockerHub / PyPI uploads.
+# crates.io / Maven Central / npm / NuGet / DockerHub / PyPI / Packagist uploads.
 # `run_id` in the group was effectively a no-op because it is unique
 # per dispatch. `cancel-in-progress: false` keeps any in-flight upload
 # running to completion rather than leaving partial state in registries.
@@ -264,6 +266,7 @@ jobs:
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
       has_python: ${{ steps.mk.outputs.has_python }}
+      has_php: ${{ steps.mk.outputs.has_php }}
       has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
       has_docker: ${{ steps.mk.outputs.has_docker }}
     steps:
@@ -327,7 +330,7 @@ jobs:
 
             // Parse other SDKs
             ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
-              if (['python','node','java','csharp','go'].includes(sdk)) {
+              if (['python','php','node','java','csharp','go'].includes(sdk)) {
                 wants.push(`sdk-${sdk}`);
               } else {
                 core.warning(`Unknown SDK: ${sdk}`);
@@ -338,6 +341,7 @@ jobs:
               dockerhub: 'docker',
               crates: 'rust',
               pypi: 'python',
+              packagist: 'php',
               npm: 'node',
               maven: 'java',
               nuget: 'csharp',
@@ -426,6 +430,13 @@ jobs:
               // Python version will be extracted in the publish job
             } else {
               core.setOutput('has_python', 'false');
+            }
+
+            const phpTarget = targets.find(t => t.key === 'sdk-php');
+            if (phpTarget) {
+              core.setOutput('has_php', 'true');
+            } else {
+              core.setOutput('has_php', 'false');
             }
 
   check-tags:
@@ -580,8 +591,8 @@ jobs:
                 echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> $GITHUB_STEP_SUMMARY
               # Fail-fast on wrong-target for MANUAL publish. A wrong-target tag
               # means create-git-tag would hard-fail 20-40 minutes later after
-              # publishing artifacts to crates.io / PyPI / npm / Maven /
-              # NuGet / DockerHub. Catching it at check-tags converts that
+              # publishing artifacts to crates.io / PyPI / Packagist / npm /
+              # Maven / NuGet / DockerHub. Catching it at check-tags converts that
               # into a fast, cheap failure at the top of the run.
               # Same-target is still benign (rerun convergence).
               #
@@ -711,6 +722,18 @@ jobs:
       use_latest_ci: ${{ inputs.use_latest_ci }}
       commit: ${{ needs.validate.outputs.commit }}
 
+  build-php-extensions:
+    name: Build PHP extensions
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_php == 'true'
+    uses: ./.github/workflows/_build_php_extensions.yml
+    with:
+      upload_artifacts: true
+      use_latest_ci: ${{ inputs.use_latest_ci }}
+      commit: ${{ needs.validate.outputs.commit }}
+
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:
     name: Publish Rust crates
@@ -731,13 +754,14 @@ jobs:
   # Docker publishing on native runners (no QEMU emulation)
   publish-docker:
     name: Docker ${{ matrix.name }} (${{ matrix.arch }})
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, build-php-extensions, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -1034,16 +1058,17 @@ jobs:
             Commit: ${{ needs.validate.outputs.commit }}
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
-  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
+  # Non-Docker, non-Rust publishing (Python, PHP, Node, Java, C#, Go SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, build-php-extensions, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
@@ -1058,6 +1083,7 @@ jobs:
       JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
       JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
       status: ${{ steps.status.outputs.status }}
@@ -1164,6 +1190,39 @@ jobs:
           wheels_path: dist
 
       # ─────────────────────────────────────────
+      # PHP SDK Publishing
+      # ─────────────────────────────────────────
+      - name: Tag PHP SDK release (${{ matrix.key }})
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          inputs.skip_tag_creation == false &&
+          matrix.type == 'php' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          message: |
+            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
+
+            Component: ${{ matrix.key }}
+            Tag: ${{ steps.ver.outputs.tag }}
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
+
+      - name: Publish PHP SDK
+        if: matrix.type == 'php'
+        uses: ./.github/actions/php/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          dry_run: ${{ inputs.dry_run }}
+          packages_artifact: php-extensions-all
+          packages_path: dist
+
+      # ─────────────────────────────────────────
       # Node SDK Publishing
       # ─────────────────────────────────────────
       - name: Publish Node SDK
@@ -1237,6 +1296,52 @@ jobs:
           description: apache-iggy ${{ steps.ver.outputs.version }} on npm
           max_attempts: "15"
           initial_sleep_seconds: "3"
+
+      - name: Wait for Packagist availability
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'php' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/wait-for-url
+        with:
+          url: https://repo.packagist.org/p2/apache/iggy-php.json
+          description: apache/iggy-php metadata on Packagist
+          max_attempts: "20"
+          initial_sleep_seconds: "3"
+
+      - name: Verify Packagist version
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'php' &&
+          steps.ver.outputs.should_tag == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+
+          sleep_s=3
+          for attempt in $(seq 1 20); do
+            if curl -sSL https://repo.packagist.org/p2/apache/iggy-php.json \
+              | jq -e --arg version "$version" '.packages["apache/iggy-php"][] | select(.version == $version or .version == ("v" + $version))' >/dev/null; then
+              echo "apache/iggy-php ${version} is present in Packagist metadata"
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 20 ]; then
+              break
+            fi
+            echo "Packagist metadata is available but ${version} is not listed yet (attempt ${attempt}/20, sleep ${sleep_s}s)"
+            sleep "$sleep_s"
+            sleep_s=$(( sleep_s * 2 ))
+            if [ "$sleep_s" -gt 30 ]; then
+              sleep_s=30
+            fi
+          done
+
+          echo "Timed out waiting for apache/iggy-php ${version} in Packagist metadata"
+          exit 1
 
       # Java publishes to ASF Nexus staging via `./gradlew publish`
       # (repository.apache.org/service/local/staging/deploy/maven2). The
@@ -1317,6 +1422,7 @@ jobs:
         if: |
           success() &&
           inputs.dry_run == false &&
+          matrix.type != 'php' &&
           inputs.skip_tag_creation == false &&
           steps.ver.outputs.should_tag == 'true'
         uses: ./.github/actions/utils/create-git-tag
@@ -1345,6 +1451,7 @@ jobs:
         plan,
         check-tags,
         build-python-wheels,
+        build-php-extensions,
         publish-rust-crates,
         publish-docker,
         docker-manifests,
@@ -1432,6 +1539,7 @@ jobs:
                 crates)     REGISTRY_DISPLAY="crates.io" ;;
                 dockerhub)  REGISTRY_DISPLAY="Docker Hub" ;;
                 pypi)       REGISTRY_DISPLAY="PyPI" ;;
+                packagist)  REGISTRY_DISPLAY="Packagist" ;;
                 npm)        REGISTRY_DISPLAY="npm" ;;
                 maven)      REGISTRY_DISPLAY="Maven" ;;
                 nuget)      REGISTRY_DISPLAY="NuGet" ;;
@@ -1473,6 +1581,17 @@ jobs:
                 success)   echo "✅ **Python wheels built successfully for all platforms**" ;;
                 failure)   echo "❌ **Python wheel building failed**" ;;
                 skipped)   echo "⏭️ **Python wheel building was skipped**" ;;
+              esac
+              echo
+            fi
+
+            # PHP extension building status
+            if [ "${{ needs.plan.outputs.has_php }}" = "true" ]; then
+              echo "### PHP Extension Building"
+              case "${{ needs.build-php-extensions.result }}" in
+                success)   echo "✅ **PHP extension packages built successfully for all platforms**" ;;
+                failure)   echo "❌ **PHP extension package building failed**" ;;
+                skipped)   echo "⏭️ **PHP extension package building was skipped**" ;;
               esac
               echo
             fi
@@ -1536,6 +1655,7 @@ jobs:
         validate,
         plan,
         build-python-wheels,
+        build-php-extensions,
         publish-rust-crates,
         publish-docker,
         docker-manifests,

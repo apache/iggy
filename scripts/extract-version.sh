@@ -260,6 +260,22 @@ handle_check() {
 
     echo ""
 
+    # --- Check 3: PHP dual-file sync ---
+    echo "=== PHP dual-file sync ==="
+    local php_script="$SCRIPT_DIR/ci/php-sdk-version-sync.sh"
+    if [[ -x "$php_script" ]]; then
+        if "$php_script" --check; then
+            passes=$((passes + 1))
+        else
+            errors=$((errors + 1))
+        fi
+    else
+        echo -e "  ${RED}FAIL${NC} php-sdk-version-sync.sh not found or not executable"
+        errors=$((errors + 1))
+    fi
+
+    echo ""
+
     # --- Summary ---
     local total=$((passes + errors))
     echo "=== Summary ==="
@@ -406,12 +422,11 @@ fi
 # version would be auto-published to PyPI but never git-tagged).
 #
 # Matches (any of):
-#   -edge[.N]   (rust crates, docker, node SDK)
-#   -rc[.N]     (all SDKs)
+#   -<semver pre-release> (rust crates, docker, node/PHP SDKs)
 #   .devN       (Python SDK PEP 440 development markers)
 #   rcN$        (legacy bare rcN, retained for compatibility)
 if [[ "$RETURN_IS_PRE_RELEASE" == "true" ]]; then
-    if [[ "$VERSION" =~ -(edge|rc) ]] \
+    if [[ "$VERSION" =~ -[0-9A-Za-z] ]] \
        || [[ "$VERSION" =~ \.dev[0-9]+$ ]] \
        || [[ "$VERSION" =~ rc[0-9]+$ ]]; then
         echo "true"

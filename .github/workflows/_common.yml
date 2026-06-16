@@ -42,6 +42,15 @@ jobs:
       - name: Check Python SDK versions are synchronized
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
+  php-versions:
+    name: Check PHP SDK versions sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Check PHP SDK versions are synchronized
+        run: ./scripts/ci/php-sdk-version-sync.sh --check
+
   python-interpreter-versions:
     name: Check Python interpreter versions sync
     runs-on: ubuntu-latest

@@ -123,6 +123,12 @@ components:
     version_file: "foreign/python/pyproject.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
 
+  sdk-php:
+    tag_pattern: "^php-sdk-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
+    registry: packagist
+    version_file: "foreign/php/composer.json"
+    version_regex: '"version"\s*:\s*"([^"]+)"'
+
   sdk-node:
     tag_pattern: "^node-sdk-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
     registry: npm

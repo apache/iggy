@@ -1,0 +1,227 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: php-post-merge
+description: PHP post-merge Packagist publishing with pre-built PIE extension archives
+
+inputs:
+  version:
+    description: "Version for publishing"
+    required: true
+  tag:
+    description: "Git tag that identifies this PHP SDK release"
+    required: true
+  commit:
+    description: "Commit SHA being published"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+  packages_artifact:
+    description: "Name of the artifact containing PHP extension archives"
+    required: false
+    default: "php-extensions-all"
+  packages_path:
+    description: "Path where PHP packages should be downloaded"
+    required: false
+    default: "dist"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate version format
+      run: |
+        VERSION="${{ inputs.version }}"
+
+        if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+          echo "Invalid PHP SDK version format: $VERSION"
+          echo "Expected Composer/Cargo-compatible SemVer: X.Y.Z[-prerelease][+build]"
+          exit 1
+        fi
+
+        echo "Version format valid: $VERSION"
+      shell: bash
+
+    - name: Download pre-built PHP packages
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ inputs.packages_artifact }}
+        path: ${{ inputs.packages_path }}
+
+    - name: Validate downloaded PHP packages
+      run: |
+        set -euo pipefail
+
+        PACKAGES_PATH="${{ inputs.packages_path }}"
+        VERSION="${{ inputs.version }}"
+
+        if [ ! -d "$PACKAGES_PATH" ]; then
+          echo "PHP packages directory not found: $PACKAGES_PATH"
+          exit 1
+        fi
+
+        expected=(
+          "php_iggy_php-${VERSION}_php8.3-x86_64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-x86_64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-aarch64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-aarch64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-x86_64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-x86_64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-aarch64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-aarch64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-x86_64-macos-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-x86_64-macos-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-aarch64-macos-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-aarch64-macos-bsdlibc-nts.zip"
+          "apache-iggy-php-${VERSION}-source.tar.gz"
+        )
+
+        missing=0
+        for filename in "${expected[@]}"; do
+          if [ ! -f "$PACKAGES_PATH/$filename" ]; then
+            echo "Missing expected package: $filename"
+            missing=1
+          fi
+        done
+        if [ "$missing" -ne 0 ]; then
+          exit 1
+        fi
+
+        echo "Validating PHP extension archive contents:"
+        for archive in "$PACKAGES_PATH"/*.zip; do
+          filename="$(basename "$archive")"
+          echo "  - $filename"
+          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'iggy_php.so'
+          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'LICENSE'
+          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'NOTICE'
+          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'LICENSE-binary'
+        done
+
+        echo ""
+        echo "Packages ready for publishing:"
+        find "$PACKAGES_PATH" -maxdepth 1 -type f -print | sort | while IFS= read -r file; do
+          size="$(du -h "$file" | cut -f1)"
+          echo "  - $(basename "$file") ($size)"
+        done
+      shell: bash
+
+    - name: Display publishing information (dry run)
+      if: inputs.dry_run == 'true'
+      run: |
+        PACKAGES_PATH="${{ inputs.packages_path }}"
+        VERSION="${{ inputs.version }}"
+        TAG="${{ inputs.tag }}"
+
+        echo "DRY RUN - Would publish PHP SDK:"
+        echo ""
+        echo "Package: apache/iggy-php"
+        echo "Version: $VERSION"
+        echo "Tag: $TAG"
+        echo "Registry: https://packagist.org/packages/apache/iggy-php"
+        echo ""
+        echo "Release assets that would be uploaded:"
+        find "$PACKAGES_PATH" -maxdepth 1 -type f -print | sort | sed 's|.*/|  - |'
+        echo ""
+        echo "Packagist would be asked to refresh https://github.com/apache/iggy"
+      shell: bash
+
+    - name: Publish GitHub release assets
+      if: inputs.dry_run == 'false'
+      run: |
+        set -euo pipefail
+
+        PACKAGES_PATH="${{ inputs.packages_path }}"
+        VERSION="${{ inputs.version }}"
+        TAG="${{ inputs.tag }}"
+        COMMIT="${{ inputs.commit }}"
+
+        if [ -z "$TAG" ]; then
+          echo "PHP release tag input is empty"
+          exit 1
+        fi
+        if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+          echo "PHP release tag $TAG does not exist on origin"
+          echo "Create the annotated PHP SDK tag before publishing GitHub release assets or refreshing Packagist."
+          exit 1
+        fi
+
+        release_notes="$(mktemp)"
+        {
+          echo "Apache Iggy PHP SDK ${VERSION}"
+          echo ""
+          echo "This GitHub release contains downstream convenience binaries for the PHP extension."
+          echo "The canonical Apache source release remains the ASF release artifact."
+        } > "$release_notes"
+
+        prerelease_flag=()
+        if [[ "$VERSION" == *-* ]]; then
+          prerelease_flag=(--prerelease)
+        fi
+
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "GitHub release $TAG exists, uploading assets with clobber"
+          gh release upload "$TAG" "$PACKAGES_PATH"/* --clobber
+        else
+          echo "Creating GitHub release $TAG"
+          gh release create "$TAG" "$PACKAGES_PATH"/* \
+            --target "$COMMIT" \
+            --title "$TAG" \
+            --notes-file "$release_notes" \
+            "${prerelease_flag[@]}"
+        fi
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Trigger Packagist update
+      if: inputs.dry_run == 'false'
+      run: |
+        set -euo pipefail
+
+        if [ -z "${PACKAGIST_TOKEN:-}" ]; then
+          echo "PACKAGIST_TOKEN is not set"
+          exit 1
+        fi
+
+        if [[ "$PACKAGIST_TOKEN" != *:* ]]; then
+          echo "PACKAGIST_TOKEN must use Packagist bearer credentials in USERNAME:apiToken format"
+          exit 1
+        fi
+
+        response="$(mktemp)"
+        http_code="$(curl -sSL \
+          -o "$response" \
+          -w '%{http_code}' \
+          -X POST \
+          -H 'Content-Type: application/json' \
+          -H "Authorization: Bearer ${PACKAGIST_TOKEN}" \
+          'https://packagist.org/api/update-package' \
+          -d '{"repository":"https://github.com/apache/iggy"}')"
+
+        if [ "$http_code" != "200" ]; then
+          echo "Packagist update failed with HTTP $http_code"
+          cat "$response"
+          exit 1
+        fi
+
+        cat "$response"
+        echo ""
+        echo "Packagist update requested for apache/iggy-php"
+      shell: bash
+      env:
+        PACKAGIST_TOKEN: ${{ env.PACKAGIST_TOKEN }}
