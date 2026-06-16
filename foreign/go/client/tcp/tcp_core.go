@@ -331,23 +331,71 @@ func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
 // sendWireAndFetchResponse sends a pre-built wire payload (length header,
 // command code, body) and returns the response body.
 func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayload []byte) ([]byte, error) {
+	return c.sendWireAndFetchResponseInto(ctx, wirePayload, nil)
+}
+
+func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
+	return c.sendLockedInto(wirePayload, nil)
+}
+
+// sendLockedInto is like sendLocked but reads the response body into buf,
+// growing it when its capacity is insufficient. The returned slice is buf
+// resliced to the response length; Payload/UserHeaders in the parsed message
+// will alias this slice, so the caller must not recycle it until done.
+func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) {
+	if _, err := c.write(wirePayload); err != nil {
+		c.invalidateConnLocked()
+		return buf, err
+	}
+
+	if _, err := c.readInto(c.respHeader[:]); err != nil {
+		c.invalidateConnLocked()
+		return buf, err
+	}
+
+	if status := ierror.Code(binary.LittleEndian.Uint32(c.respHeader[0:4])); status != 0 {
+		return buf, ierror.FromCode(status)
+	}
+
+	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
+	if length <= 1 {
+		return buf[:0], nil
+	}
+
+	if cap(buf) < length {
+		buf = make([]byte, length)
+	} else {
+		buf = buf[:length]
+	}
+
+	if _, err := c.readInto(buf); err != nil {
+		c.invalidateConnLocked()
+		return buf, err
+	}
+
+	return buf, nil
+}
+
+// sendWireAndFetchResponseInto is like sendWireAndFetchResponse but reads the
+// response body into buf, growing it when capacity is insufficient. The
+// returned slice aliases buf; see sendLockedInto for aliasing semantics.
+func (c *IggyTcpClient) sendWireAndFetchResponseInto(ctx context.Context, wirePayload, buf []byte) ([]byte, error) {
 	if ctx == nil {
-		return nil, ierror.ErrNilContext
+		return buf, ierror.ErrNilContext
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return buf, err
 	}
 
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return buf, err
 	}
 
-	// fast path for non-cancellable ctx.
 	if ctx.Done() == nil {
-		return c.sendLocked(wirePayload)
+		return c.sendLockedInto(wirePayload, buf)
 	}
 
 	conn := c.conn
@@ -358,17 +406,13 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 		deadlineMu.Lock()
 		defer deadlineMu.Unlock()
 		if !cleared {
-			// Set a deadline in the past to unblock any ongoing read/write operations on the connection.
-			// This must use the snapshotted conn, not c.conn, to avoid setting a deadline on a
-			// new connection if Connect() reestablishes the connection after the context is cancelled.
 			_ = conn.SetDeadline(time.Now())
 		}
 	})
 	defer stop()
 
-	result, err := c.sendLocked(wirePayload)
+	result, err := c.sendLockedInto(wirePayload, buf)
 
-	// clear the deadline of connection.
 	deadlineMu.Lock()
 	cleared = true
 	_ = conn.SetDeadline(time.Time{})
@@ -376,40 +420,11 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return result, ctxErr
 		}
-		return nil, err
+		return result, err
 	}
 	return result, nil
-}
-
-func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
-	if _, err := c.write(wirePayload); err != nil {
-		c.invalidateConnLocked()
-		return nil, err
-	}
-
-	if _, err := c.readInto(c.respHeader[:]); err != nil {
-		c.invalidateConnLocked()
-		return nil, err
-	}
-
-	if status := ierror.Code(binary.LittleEndian.Uint32(c.respHeader[0:4])); status != 0 {
-		return nil, ierror.FromCode(status)
-	}
-
-	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
-	if length <= 1 {
-		return []byte{}, nil
-	}
-
-	_, buffer, err := c.read(length)
-	if err != nil {
-		c.invalidateConnLocked()
-		return nil, err
-	}
-
-	return buffer, nil
 }
 
 // invalidateConnLocked closes the connection and marks it as disconnected
