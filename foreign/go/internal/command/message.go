@@ -165,51 +165,35 @@ func (m *PollMessages) Code() Code {
 	return PollMessagesCode
 }
 
-func (m *PollMessages) MarshalBinary() ([]byte, error) {
-	consumerIdBytes, err := m.Consumer.Id.MarshalBinary()
-	if err != nil {
+func (m *PollMessages) AppendBinary(b []byte) ([]byte, error) {
+	b = append(b, byte(m.Consumer.Kind))
+	var err error
+	if b, err = m.Consumer.Id.AppendBinary(b); err != nil {
 		return nil, err
 	}
-	streamIdBytes, err := m.StreamId.MarshalBinary()
-	if err != nil {
+	if b, err = m.StreamId.AppendBinary(b); err != nil {
 		return nil, err
 	}
-	topicIdBytes, err := m.TopicId.MarshalBinary()
-	if err != nil {
+	if b, err = m.TopicId.AppendBinary(b); err != nil {
 		return nil, err
 	}
-	messageSize := 1 + len(consumerIdBytes) + len(streamIdBytes) + len(topicIdBytes) + partitionStrategySize + offsetSize + commitFlagSize
-	bytes := make([]byte, messageSize)
-
-	bytes[0] = byte(m.Consumer.Kind)
-	position := 1
-	copy(bytes[position:position+len(consumerIdBytes)], consumerIdBytes)
-	position += len(consumerIdBytes)
-
-	copy(bytes[position:position+len(streamIdBytes)], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
-	position += len(topicIdBytes)
 	if m.PartitionId != nil {
-		bytes[position] = 1
-		binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], *m.PartitionId)
+		b = append(b, 1)
+		b = binary.LittleEndian.AppendUint32(b, *m.PartitionId)
 	} else {
-		bytes[position] = 0
-		binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], 0)
+		b = append(b, 0, 0, 0, 0, 0)
 	}
-	bytes[position+1+4] = byte(m.Strategy.Kind)
-
-	position += partitionStrategySize
-	binary.LittleEndian.PutUint64(bytes[position:position+8], m.Strategy.Value)
-	binary.LittleEndian.PutUint32(bytes[position+8:position+12], m.Count)
-
-	position += offsetSize
-
+	b = append(b, byte(m.Strategy.Kind))
+	b = binary.LittleEndian.AppendUint64(b, m.Strategy.Value)
+	b = binary.LittleEndian.AppendUint32(b, m.Count)
 	if m.AutoCommit {
-		bytes[position] = 1
+		b = append(b, 1)
 	} else {
-		bytes[position] = 0
+		b = append(b, 0)
 	}
+	return b, nil
+}
 
-	return bytes, nil
+func (m *PollMessages) MarshalBinary() ([]byte, error) {
+	return m.AppendBinary(nil)
 }
