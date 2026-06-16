@@ -410,14 +410,13 @@ func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) 
 
 	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
 	if length <= 1 {
-		return buf[:0], nil
+		return buf, nil
 	}
 
 	if cap(buf) < length {
 		buf = make([]byte, length)
-	} else {
-		buf = buf[:length]
 	}
+	buf = buf[:length]
 
 	if _, err := c.readInto(buf); err != nil {
 		c.invalidateConnLocked()
