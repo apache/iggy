@@ -99,14 +99,11 @@ impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
             parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
         let include_metadata = config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA);
         let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
-        let max_open_retries = config
-            .max_open_retries
-            .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
-            .max(1);
+        let max_open_retries = config.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES);
 
         Self {
             url: config.url,
@@ -336,54 +333,52 @@ impl MeilisearchSource {
     async fn retry_sdk_operation_with_attempts<T, Fut, Op>(
         &self,
         operation: &str,
-        max_attempts: u32,
+        max_retries: u32,
         mut operation_fn: Op,
     ) -> Result<T, Error>
     where
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        let max_attempts = max_attempts.max(1);
-        let mut attempt = 0u32;
+        let mut retries = 0u32;
 
         loop {
             let result = tokio::time::timeout(self.config.timeout, operation_fn()).await;
             match result {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => {
-                    attempt += 1;
-                    let should_retry = attempt < max_attempts && is_transient_sdk_error(&error);
-                    if !should_retry {
+                    if retries >= max_retries || !is_transient_sdk_error(&error) {
                         return Err(map_sdk_error(error));
                     }
+                    retries += 1;
                     let delay = jitter(exponential_backoff(
                         self.config.retry_delay,
-                        attempt,
+                        retries,
                         self.config.max_retry_delay,
                     ));
                     warn!(
-                        "Meilisearch {operation} failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:?}..."
+                        "Meilisearch {operation} failed (retry {retries}/{max_retries}): {error}. Retrying in {delay:?}..."
                     );
-                    tokio::time::sleep(delay).await;
+                    sleep(delay).await;
                 }
                 Err(_) => {
-                    attempt += 1;
-                    if attempt >= max_attempts {
+                    if retries >= max_retries {
                         return Err(Error::HttpRequestFailed(format!(
                             "Meilisearch {operation} timed out after {:?}",
                             self.config.timeout
                         )));
                     }
+                    retries += 1;
                     let delay = jitter(exponential_backoff(
                         self.config.retry_delay,
-                        attempt,
+                        retries,
                         self.config.max_retry_delay,
                     ));
                     warn!(
-                        "Meilisearch {operation} timed out after {:?} (attempt {attempt}/{max_attempts}). Retrying in {delay:?}...",
+                        "Meilisearch {operation} timed out after {:?} (retry {retries}/{max_retries}). Retrying in {delay:?}...",
                         self.config.timeout
                     );
-                    tokio::time::sleep(delay).await;
+                    sleep(delay).await;
                 }
             }
         }
@@ -402,6 +397,10 @@ impl Source for MeilisearchSource {
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
         let primary_key = self.get_primary_key(&client).await?;
+        warn!(
+            "Meilisearch source connector with ID: {} requires numeric primary key values for cursor pagination. Index: {}, primary key: {}",
+            self.id, self.config.index, primary_key
+        );
         self.primary_key = Some(primary_key);
         self.client = Some(client);
 
@@ -432,12 +431,13 @@ impl Source for MeilisearchSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        let state = self.state.lock().await;
-        info!(
-            "Meilisearch source connector with ID: {} is closing. Stats: {} documents produced, {} polls executed",
-            self.id, state.documents_produced, state.poll_count
-        );
-        drop(state);
+        {
+            let state = self.state.lock().await;
+            info!(
+                "Meilisearch source connector with ID: {} is closing. Stats: {} documents produced, {} polls executed",
+                self.id, state.documents_produced, state.poll_count
+            );
+        }
 
         self.client = None;
         info!(
@@ -545,7 +545,7 @@ fn primary_key_filter_literal(value: &Value) -> Result<String, Error> {
             ))
         }),
         _ => Err(Error::InvalidConfigValue(
-            "Meilisearch source primary key values must be numbers with getmeili/meilisearch:v1.13"
+            "Meilisearch source primary key values must be numbers for cursor pagination"
                 .to_string(),
         )),
     }

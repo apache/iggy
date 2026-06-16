@@ -305,17 +305,8 @@ pub trait MeilisearchOps: Sync {
                     message: format!("Failed to index Meilisearch documents: {e}"),
                 })?;
 
-            if response.status().is_success() {
-                return Ok(());
-            }
-
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Err(TestBinaryError::InvalidState {
-                message: format!(
-                    "Failed to index Meilisearch documents: status={status}, body={body}"
-                ),
-            })
+            let task = parse_task_response(response, "index Meilisearch documents").await?;
+            self.wait_for_task(task.task_uid).await
         }
     }
 }

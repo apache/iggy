@@ -28,10 +28,10 @@ documents are inserted or deleted between polls.
 
 The primary-key field must be numeric, filterable, and sortable in Meilisearch,
 because the connector adds a cursor filter and primary-key sort to each search
-request. The numeric primary-key requirement matches the pinned integration test
-version, `getmeili/meilisearch:v1.13`, where greater-than filters on string
-attributes are not supported. Returned hits are serialized as JSON message
-payloads.
+request. The connector logs this numeric primary-key requirement during
+`open()`. String primary keys are not supported until the Meilisearch version
+used for validation supports greater-than filters on string attributes. Returned
+hits are serialized as JSON message payloads.
 
 When `include_metadata` is enabled, each payload has this shape:
 
