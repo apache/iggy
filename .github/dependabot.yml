@@ -15,6 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Version updates: every entry uses a single group covering ALL update
+# types, so each ecosystem entry opens at most one version-update PR
+# per cycle. Security updates bypass these groups and may still open
+# individual PRs.
 version: 2
 updates:
   - package-ecosystem: "cargo"
@@ -39,12 +43,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      rust:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -59,17 +60,14 @@ updates:
       - "apache/iggy-committers"
     labels:
       - "dependencies"
-      - "github_actions"
+      - "github-actions"
       - "CI/CD"
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      github-actions:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "uv"
     directories:
@@ -92,17 +90,41 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      # Load-bearing for Python, not just tidiness: the three projects
+      # share apache-iggy via a path dependency, so each uv.lock embeds
+      # the SDK's requirement metadata. Majors escaped the previous
+      # minor-and-patch group as per-directory PRs that rewrote that
+      # embedded metadata without the manifest change it was derived
+      # from, and could never pass the lockfile check (see #3451).
+      python:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
+
+  - package-ecosystem: "npm"
+    directories:
+      - "/web"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+    rebase-strategy: "disabled"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps): "
+    reviewers:
+      - "apache/iggy-committers"
+    labels:
+      - "dependencies"
+      - "javascript"
+    cooldown:
+      default-days: 7
+    groups:
+      web:
+        patterns:
+          - "*"
 
   - package-ecosystem: "npm"
     directories:
       - "/foreign/node"
-      - "/web"
       - "/examples/node"
     schedule:
       interval: "weekly"
@@ -119,12 +141,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      node:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "gomod"
     directories:
@@ -146,12 +165,9 @@ updates:
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      go:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "nuget"
     directories:
@@ -176,12 +192,9 @@ updates:
       - dependency-name: "Microsoft.SourceLink.GitHub"
       - dependency-name: "Microsoft.Extensions.Logging.Abstractions"
     groups:
-      minor-and-patch:
+      csharp:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "gradle"
     directories:
@@ -202,13 +215,16 @@ updates:
       - "java"
     cooldown:
       default-days: 7
+    ignore:
+      # examples/java wires iggy's own artifact to the local build via
+      # dependency substitution (settings.gradle.kts) behind a
+      # `local-dev` placeholder version. A Dependabot bump to a real
+      # release breaks example CI, which builds against the local tree.
+      - dependency-name: "org.apache.iggy:*"
     groups:
-      minor-and-patch:
+      java:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "docker"
     directories:
@@ -243,13 +259,27 @@ updates:
       - "docker"
     cooldown:
       default-days: 7
+    ignore:
+      # Docker dependency-name matching strips the registry prefix, so
+      # MCR images are named by repository path only. A
+      # `mcr.microsoft.com/...` form silently never matches and the bump
+      # leaks through (see closed PRs #3474, #3485).
+      #
+      # The Python interpreter version is pinned and synced across SDK
+      # files, CI, and Dockerfiles by
+      # scripts/ci/sync-python-interpreter-version.sh; a Dependabot bump
+      # of the base image alone would fail that check.
+      - dependency-name: "python"
+      - dependency-name: "devcontainers/python"
+      # Go and .NET toolchain base images are pinned deliberately to
+      # match the versions used across CI and the SDK builds. Bumping
+      # them is a manual decision, not Dependabot churn.
+      - dependency-name: "golang"
+      - dependency-name: "dotnet/sdk"
     groups:
-      minor-and-patch:
+      docker:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"
 
   - package-ecosystem: "bazel"
     directory: "/foreign/cpp"
@@ -264,13 +294,10 @@ updates:
       - "apache/iggy-committers"
     labels:
       - "dependencies"
-      - "C++"
+      - "cpp"
     cooldown:
       default-days: 7
     groups:
-      minor-and-patch:
+      cpp:
         patterns:
           - "*"
-        update-types:
-          - "minor"
-          - "patch"

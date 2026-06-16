@@ -29,16 +29,23 @@
 use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
+use message_bus::replica::auth::ReplicaAuth;
+use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::listener::MessageHandler;
+use message_bus::transports::tls::{
+    AcceptAnyServerCert, REPLICA_ALPN, install_default_crypto_provider, self_signed_for_loopback,
+};
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedQuicConn, AcceptedReplicaFn,
     AcceptedTlsClientFn, AcceptedWsClientFn, AcceptedWssClientFn, ClientConnMeta,
-    ClientTransportKind, IggyMessageBus, fd_transfer, installer,
+    ClientTransportKind, DialedReplicaFn, IggyMessageBus, fd_transfer, installer,
 };
+use rustls::pki_types::ServerName;
 use server_common::Message;
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Build a stub [`ClientConnMeta`] for tests that don't care about
 /// peer addr / transport details. Uses `127.0.0.1:0` and the given
@@ -69,16 +76,119 @@ pub fn header_only(command: Command2, cluster: u128, replica: u8) -> Message<Gen
     })
 }
 
-/// Build an [`AcceptedReplicaFn`] that installs accepted replica streams
-/// directly on the given bus. Mimics the pre-delegation behaviour for
-/// single-shard tests that don't spin up a coordinator.
+/// Install the replica handshake identity on a test bus. Production
+/// bootstrap does this once per shard; tests call it before wiring the
+/// listener / connector callbacks below.
+pub fn set_replica_ctx(
+    bus: &IggyMessageBus,
+    cluster_id: u128,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+) {
+    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        cluster_id,
+        self_id,
+        replica_count,
+        auth: auth.map(Rc::new),
+        tls: None,
+    });
+}
+
+/// [`set_replica_ctx`] variant with a replica TLS context attached.
+pub fn set_replica_ctx_with_tls(
+    bus: &IggyMessageBus,
+    cluster_id: u128,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+    tls: Rc<ReplicaTlsCtx>,
+) {
+    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        cluster_id,
+        self_id,
+        replica_count,
+        auth: auth.map(Rc::new),
+        tls: Some(tls),
+    });
+}
+
+/// Build a self-signed-mode replica TLS context mirroring the production
+/// `cluster.tls.self_signed` shape: TLS 1.3 only, `iggy-replica` ALPN,
+/// throwaway per-node certificate, accept-any dialer verifier.
+#[must_use]
+pub fn self_signed_replica_tls_ctx(replica_count: u8) -> Rc<ReplicaTlsCtx> {
+    install_default_crypto_provider();
+    let creds = self_signed_for_loopback();
+    let mut server =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(creds.cert_chain, creds.key_der)
+            .expect("server config from self-signed credentials");
+    server.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
+    let mut client =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth();
+    client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
+    let peer_names = (0..replica_count)
+        .map(|_| ServerName::try_from("localhost").expect("static server name"))
+        .collect();
+    Rc::new(ReplicaTlsCtx {
+        server: Arc::new(server),
+        client: Arc::new(client),
+        peer_names,
+    })
+}
+
+/// Build an [`AcceptedReplicaFn`] that runs the owning-shard inbound
+/// path (acceptor handshake + install) locally on the given bus,
+/// bypassing the coordinator but exercising the same admission (cap
+/// slot) and handshake code the production owning shard runs. Requires
+/// [`set_replica_ctx`] on the bus.
 #[must_use]
 pub fn install_replicas_locally(
     bus: Rc<IggyMessageBus>,
     on_message: MessageHandler,
 ) -> AcceptedReplicaFn {
+    Rc::new(move |stream| {
+        let Some(slot) = bus.try_acquire_replica_handshake_slot() else {
+            return;
+        };
+        let release_bus = Rc::clone(&bus);
+        installer::install_replica_inbound(
+            &bus,
+            stream,
+            on_message.clone(),
+            Box::new(move || {
+                release_bus.release_replica_handshake_slot(slot);
+            }),
+        );
+    })
+}
+
+/// Build a [`DialedReplicaFn`] that runs the owning-shard outbound path
+/// (dialer handshake + install) locally on the given bus, including the
+/// pending-dial mark / clear the production shard-0 callback and router
+/// perform. Requires [`set_replica_ctx`] on the bus.
+#[must_use]
+pub fn install_dialed_replicas_locally(
+    bus: Rc<IggyMessageBus>,
+    on_message: MessageHandler,
+) -> DialedReplicaFn {
     Rc::new(move |stream, peer_id| {
-        installer::install_replica_tcp(&bus, peer_id, stream, on_message.clone());
+        bus.mark_dial_pending(peer_id);
+        let clear_bus = Rc::clone(&bus);
+        installer::install_replica_outbound(
+            &bus,
+            peer_id,
+            stream,
+            on_message.clone(),
+            Box::new(move || {
+                clear_bus.clear_dial_pending(peer_id);
+            }),
+        );
     })
 }
 
