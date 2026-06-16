@@ -6931,11 +6931,9 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
- "dashmap",
  "iggy_common",
  "iggy_connector_sdk",
  "meilisearch-sdk",
- "once_cell",
  "reqwest 0.13.4",
  "secrecy",
  "serde",

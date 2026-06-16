@@ -28,7 +28,8 @@ JSON object payloads are indexed as documents. JSON arrays or scalar values are
 wrapped in a `value` field because Meilisearch documents must be objects. Raw
 payloads are parsed as JSON when possible; otherwise, they are indexed as base64
 data. Text payloads are indexed in a `text` field. Unsupported payload schemas
-fail the batch instead of being silently dropped.
+are skipped with a warning and counted as sink errors, matching the connector
+runtime's per-record drop behavior for malformed records.
 
 When the configured primary key is absent, the connector injects a stable value
 derived from the exact Iggy stream, topic, partition, offset, and message ID.
