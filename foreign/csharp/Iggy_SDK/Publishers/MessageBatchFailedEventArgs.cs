@@ -30,7 +30,9 @@ public class MessageBatchFailedEventArgs : EventArgs
     public Exception Exception { get; }
 
     /// <summary>
-    ///     Gets the array of messages that failed to send.
+    ///     Gets the array of messages that failed to send. Payloads are owned copies, safe to inspect or re-send.
+    ///     With an encryptor configured they are already ciphertext (<see cref="Message.Encrypted" /> is set), and
+    ///     re-sending through the publisher will not encrypt them again.
     /// </summary>
     public Message[] FailedMessages { get; }
 

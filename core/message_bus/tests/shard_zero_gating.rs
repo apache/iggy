@@ -22,8 +22,9 @@
 mod common;
 
 use common::{
-    install_clients_locally, install_quic_clients_locally, install_replicas_locally,
-    install_tls_clients_locally, install_ws_clients_locally, install_wss_clients_locally, loopback,
+    install_clients_locally, install_dialed_replicas_locally, install_quic_clients_locally,
+    install_replicas_locally, install_tls_clients_locally, install_ws_clients_locally,
+    install_wss_clients_locally, loopback, set_replica_ctx,
 };
 use iggy_common::IggyError;
 use message_bus::client_listener::RequestHandler;
@@ -44,23 +45,13 @@ async fn shard_zero_binds_listener_and_starts_connector() {
     // Peer (replica 1) stands up its own bus + inbound listener so the
     // directional dial from replica 0 succeeds.
     let peer_bus = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&peer_bus, CLUSTER, 1, 2, None);
     let peer_handler: MessageHandler = Rc::new(|_, _| {});
     let (peer_listener, peer_addr) = bind(loopback()).await.expect("bind peer listener");
     let peer_token = peer_bus.token();
     let peer_accept = install_replicas_locally(peer_bus.clone(), peer_handler.clone());
     let peer_listen_handle = compio::runtime::spawn(async move {
-        run(
-            peer_listener,
-            peer_token,
-            CLUSTER,
-            1,
-            2,
-            None,
-            peer_accept,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(peer_listener, peer_token, peer_accept).await;
     });
     peer_bus.track_background(peer_listen_handle);
 
@@ -68,9 +59,11 @@ async fn shard_zero_binds_listener_and_starts_connector() {
     // install-locally delegates so shard 0 registers inbound / outbound
     // peers on its own registry (mimicking a single-shard deployment).
     let bus_zero = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus_zero, CLUSTER, 0, 2, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let on_request: RequestHandler = Rc::new(|_, _| {});
     let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(bus_zero.clone(), on_message.clone());
     let accepted_client = install_clients_locally(bus_zero.clone(), on_request);
 
     let bound = start_on_shard_zero(
@@ -84,12 +77,10 @@ async fn shard_zero_binds_listener_and_starts_connector() {
         None,
         None,
         None,
-        CLUSTER,
         0,
-        2,
-        None,
         vec![(1u8, peer_addr)],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         None,
         None,
@@ -129,9 +120,11 @@ async fn shard_zero_binds_listener_and_starts_connector() {
 #[compio::test]
 async fn non_zero_shard_skips_io() {
     let bus_one = Rc::new(IggyMessageBus::new(1));
+    set_replica_ctx(&bus_one, CLUSTER, 1, 2, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let accepted_replica = install_replicas_locally(bus_one.clone(), on_message);
+    let accepted_replica = install_replicas_locally(bus_one.clone(), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(bus_one.clone(), on_message);
     let accepted_client = install_clients_locally(bus_one.clone(), on_request);
 
     let dead_peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -147,12 +140,10 @@ async fn non_zero_shard_skips_io() {
         None,
         None,
         None,
-        CLUSTER,
         1,
-        2,
-        None,
         vec![(0u8, dead_peer)],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         None,
         None,
@@ -197,9 +188,11 @@ async fn shard_zero_binds_all_six_planes_when_configured() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let bus_zero = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus_zero, CLUSTER, 0, 1, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let on_request: RequestHandler = Rc::new(|_, _| {});
     let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(bus_zero.clone(), on_message.clone());
     let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
     let accepted_ws = install_ws_clients_locally(bus_zero.clone(), on_request.clone());
     let accepted_quic = install_quic_clients_locally(bus_zero.clone(), on_request.clone());
@@ -225,12 +218,10 @@ async fn shard_zero_binds_all_six_planes_when_configured() {
         Some(tls_creds),
         Some(loopback()),
         Some(wss_creds),
-        CLUSTER,
         0,
-        1,
-        None,
         vec![],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         Some(accepted_ws),
         Some(accepted_quic),
@@ -278,9 +269,11 @@ async fn tcp_tls_listen_addr_without_credentials_rejected() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let bus_zero = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus_zero, CLUSTER, 0, 1, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message);
+    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(bus_zero.clone(), on_message);
     let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
     let accepted_tls = install_tls_clients_locally(bus_zero.clone(), on_request);
 
@@ -295,12 +288,10 @@ async fn tcp_tls_listen_addr_without_credentials_rejected() {
         None,
         None,
         None,
-        CLUSTER,
         0,
-        1,
-        None,
         vec![],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         None,
         None,
@@ -320,9 +311,11 @@ async fn wss_listen_addr_without_credentials_rejected() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let bus_zero = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus_zero, CLUSTER, 0, 1, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message);
+    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(bus_zero.clone(), on_message);
     let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
     let accepted_wss = install_wss_clients_locally(bus_zero.clone(), on_request);
 
@@ -337,12 +330,10 @@ async fn wss_listen_addr_without_credentials_rejected() {
         None,
         Some(loopback()),
         None,
-        CLUSTER,
         0,
-        1,
-        None,
         vec![],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         None,
         None,

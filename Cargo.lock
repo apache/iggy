@@ -8726,6 +8726,7 @@ dependencies = [
  "compio-ws",
  "configs",
  "futures",
+ "futures-rustls",
  "iggy_binary_protocol",
  "iggy_common",
  "libc",
