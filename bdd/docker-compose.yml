@@ -16,204 +16,40 @@
 # under the License.
 
 services:
-  # Original single server for backward compatibility
-  iggy-server:
-    platform: linux/amd64
-    build:
-      context: ..
-      dockerfile: core/server/Dockerfile
-      target: runtime-prebuilt
-      args:
-        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
-        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
-        LIBC: glibc
-        PROFILE: debug
-    command: [ "--fresh", "--with-default-root-credentials" ]
-    cap_add:
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    healthcheck:
-      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping" ]
-      interval: 20s
-      timeout: 3s
-      retries: 30
-      start_period: 2s
-    environment:
-      - RUST_LOG=info
-      - IGGY_SYSTEM_PATH=local_data
-      - IGGY_TCP_ADDRESS=0.0.0.0:8090
-      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
-      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
-      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8070
-    volumes:
-      - iggy_data:/app/local_data
-    networks:
-      - iggy-bdd-network
-
-  # Leader server for cluster testing
-  iggy-leader:
-    platform: linux/amd64
-    build:
-      context: ..
-      dockerfile: core/server/Dockerfile
-      target: runtime-prebuilt
-      args:
-        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
-        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
-        LIBC: glibc
-        PROFILE: debug
-    # Leader runs without --follower flag; --replica-id selects this node's
-    # entry (replica_id=0) from the shared cluster.nodes roster below.
-    command: [ "--fresh", "--with-default-root-credentials", "--replica-id", "0" ]
-    cap_add:
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    healthcheck:
-      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8091", "ping" ]
-      interval: 20s
-      timeout: 3s
-      retries: 30
-      start_period: 2s
-    environment:
-      - RUST_LOG=info
-      - IGGY_SYSTEM_PATH=local_data_leader
-      # Server bind addresses for this container.
-      - IGGY_TCP_ADDRESS=0.0.0.0:8091
-      - IGGY_HTTP_ADDRESS=0.0.0.0:3001
-      - IGGY_QUIC_ADDRESS=0.0.0.0:8081
-      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8071
-      # Cluster configuration. The block below is byte-identical on the
-      # follower container; the only runtime difference is --replica-id,
-      # passed via the command above.
-      - IGGY_CLUSTER_ENABLED=true
-      - IGGY_CLUSTER_NAME=test-cluster
-      - IGGY_CLUSTER_NODES_0_NAME=leader-node
-      - IGGY_CLUSTER_NODES_0_IP=iggy-leader
-      - IGGY_CLUSTER_NODES_0_REPLICA_ID=0
-      - IGGY_CLUSTER_NODES_0_PORTS_TCP=8091
-      - IGGY_CLUSTER_NODES_0_PORTS_QUIC=8081
-      - IGGY_CLUSTER_NODES_0_PORTS_HTTP=3001
-      - IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET=8071
-      - IGGY_CLUSTER_NODES_1_NAME=follower-node
-      - IGGY_CLUSTER_NODES_1_IP=iggy-follower
-      - IGGY_CLUSTER_NODES_1_REPLICA_ID=1
-      - IGGY_CLUSTER_NODES_1_PORTS_TCP=8092
-      - IGGY_CLUSTER_NODES_1_PORTS_QUIC=8082
-      - IGGY_CLUSTER_NODES_1_PORTS_HTTP=3002
-      - IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET=8072
-    volumes:
-      - iggy_leader_data:/app/local_data_leader
-    networks:
-      - iggy-bdd-network
-
-  # Follower server for cluster testing
-  iggy-follower:
-    platform: linux/amd64
-    build:
-      context: ..
-      dockerfile: core/server/Dockerfile
-      target: runtime-prebuilt
-      args:
-        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
-        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
-        LIBC: glibc
-        PROFILE: debug
-    # Follower runs with --follower flag; --replica-id selects this node's
-    # entry (replica_id=1) from the shared cluster.nodes roster below.
-    command: [ "--fresh", "--with-default-root-credentials", "--follower", "--replica-id", "1" ]
-    cap_add:
-      - SYS_NICE
-    security_opt:
-      - seccomp:unconfined
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    healthcheck:
-      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8092", "ping" ]
-      interval: 20s
-      timeout: 3s
-      retries: 30
-      start_period: 2s
-    environment:
-      - RUST_LOG=info
-      - IGGY_SYSTEM_PATH=local_data_follower
-      # Server bind addresses for this container.
-      - IGGY_TCP_ADDRESS=0.0.0.0:8092
-      - IGGY_HTTP_ADDRESS=0.0.0.0:3002
-      - IGGY_QUIC_ADDRESS=0.0.0.0:8082
-      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8072
-      # Cluster configuration. The block below is byte-identical on the
-      # leader container; the only runtime difference is --replica-id,
-      # passed via the command above.
-      - IGGY_CLUSTER_ENABLED=true
-      - IGGY_CLUSTER_NAME=test-cluster
-      - IGGY_CLUSTER_NODES_0_NAME=leader-node
-      - IGGY_CLUSTER_NODES_0_IP=iggy-leader
-      - IGGY_CLUSTER_NODES_0_REPLICA_ID=0
-      - IGGY_CLUSTER_NODES_0_PORTS_TCP=8091
-      - IGGY_CLUSTER_NODES_0_PORTS_QUIC=8081
-      - IGGY_CLUSTER_NODES_0_PORTS_HTTP=3001
-      - IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET=8071
-      - IGGY_CLUSTER_NODES_1_NAME=follower-node
-      - IGGY_CLUSTER_NODES_1_IP=iggy-follower
-      - IGGY_CLUSTER_NODES_1_REPLICA_ID=1
-      - IGGY_CLUSTER_NODES_1_PORTS_TCP=8092
-      - IGGY_CLUSTER_NODES_1_PORTS_QUIC=8082
-      - IGGY_CLUSTER_NODES_1_PORTS_HTTP=3002
-      - IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET=8072
-    volumes:
-      - iggy_follower_data:/app/local_data_follower
-    networks:
-      - iggy-bdd-network
-
   rust-bdd:
+    image: iggy-bdd-rust
     build:
       context: ..
       dockerfile: bdd/rust/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
-      iggy-leader:
-        condition: service_healthy
-      iggy-follower:
-        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
-      # Additional addresses for leader redirection tests
-      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
-      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
+      - BDD_FEATURE=${BDD_FEATURE:-all}
       - RUST_LOG=debug
       - RUSTFLAGS=-C linker=gcc
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
-    command: [ "cargo", "test", "-p", "bdd", "--features", "bdd" ]
+    command:
+      - sh
+      - -c
+      - |
+        case "$$BDD_FEATURE" in
+          basic_messaging)    cargo test -p bdd --features bdd --test basic_messaging ;;
+          leader_redirection) cargo test -p bdd --features bdd --test leader_redirection ;;
+          *)                  cargo test -p bdd --features bdd ;;
+        esac
     networks:
       - iggy-bdd-network
 
   python-bdd:
+    image: iggy-bdd-python
     build:
       context: ..
       dockerfile: bdd/python/Dockerfile
-    depends_on:
-      - iggy-server
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
     working_dir: /app
@@ -221,75 +57,81 @@ services:
     networks:
       - iggy-bdd-network
 
-  go-bdd:
+  php-bdd:
     build:
       context: ..
-      dockerfile: bdd/go/Dockerfile
+      dockerfile: bdd/php/Dockerfile
     depends_on:
       iggy-server:
         condition: service_healthy
-      iggy-leader:
-        condition: service_healthy
-      iggy-follower:
-        condition: service_healthy
+    environment:
+      - IGGY_HOST=iggy-server
+      - IGGY_PORT=8090
+      - IGGY_USERNAME=iggy
+      - IGGY_PASSWORD=iggy
+      - BDD_FEATURE_FILE=/app/features/basic_messaging.feature
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+    command: [ "./scripts/test.sh", "--configuration", "/workspace/bdd/php/phpunit.xml.dist" ]
+    networks:
+      - iggy-bdd-network
+
+  go-bdd:
+    image: iggy-bdd-go
+    build:
+      context: ..
+      dockerfile: bdd/go/Dockerfile
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
+      - BDD_FEATURE=${BDD_FEATURE:-all}
       - GO_TEST_EXTRA_FLAGS=${GO_TEST_EXTRA_FLAGS:-}
-    volumes:
-      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: [ "sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS} ./..." ]
+    command: [ "sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS:-} ./..." ]
     networks:
       - iggy-bdd-network
 
   node-bdd:
+    image: iggy-bdd-node
     build:
       context: ..
       dockerfile: bdd/node/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
     command: [ "npm", "run", "test:bdd" ]
     networks:
       - iggy-bdd-network
 
   csharp-bdd:
+    image: iggy-bdd-csharp
     build:
       context: ..
       dockerfile: bdd/csharp/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
-      iggy-leader:
-        condition: service_healthy
-      iggy-follower:
-        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
-      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
-      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
-    command: [ "dotnet", "test" ]
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+    command:
+      - sh
+      - -c
+      - |
+        FILTER=""
+        case "$$BDD_FEATURE" in
+          basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
+          leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
+        esac
+        dotnet test $$FILTER
     networks:
       - iggy-bdd-network
 
   java-bdd:
+    image: iggy-bdd-java
     build:
       context: ..
       dockerfile: bdd/java/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-      - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
     command: [ "gradle", "--no-daemon", "test" ]
@@ -299,8 +141,3 @@ services:
 networks:
   iggy-bdd-network:
     driver: bridge
-
-volumes:
-  iggy_data:
-  iggy_leader_data:
-  iggy_follower_data:

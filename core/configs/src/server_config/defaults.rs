@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
+use super::cluster::{
+    ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
+};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server::{
@@ -605,6 +607,8 @@ impl Default for ClusterConfig {
                     },
                 })
                 .collect(),
+            auth: ClusterAuthConfig::default(),
+            tls: ClusterTlsConfig::default(),
         }
     }
 }

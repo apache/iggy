@@ -28,23 +28,59 @@ for arg in "$@"; do
 done
 
 SDK="${ARGS[0]:-all}"
-FEATURE="${ARGS[1]:-scenarios/basic_messaging.feature}"
-
-export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS="${GO_TEST_EXTRA_FLAGS:-}"
-
-cd "$(dirname "$0")/../bdd"
-
-COMPOSE_CMD=(docker compose -f docker-compose.yml)
-if [ "$COVERAGE" = "1" ]; then
-  COMPOSE_CMD+=(-f docker-compose.coverage.yml)
-  mkdir -p ../reports
-fi
+FEATURE="${ARGS[1]:-all}"
 
 log(){ printf "%b\n" "$*"; }
 
+usage(){
+  log "Usage: $0 [--coverage] <sdk> [feature]"
+  log ""
+  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | all | clean (default: all)"
+  log "  feature: basic_messaging | leader_redirection | all  (default: all)"
+  log ""
+  log "Examples:"
+  log "  $0 rust                         # run all features for Rust"
+  log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
+  log "  $0 all leader_redirection       # run leader_redirection for all supporting SDKs"
+  log "  $0 --coverage go basic_messaging"
+}
+
+case "$FEATURE" in
+  basic_messaging|leader_redirection|all) ;;
+  *)
+    log "Unknown feature: ${FEATURE}"
+    usage
+    exit 2 ;;
+esac
+
+export DOCKER_BUILDKIT=1 BDD_FEATURE="$FEATURE" GO_TEST_EXTRA_FLAGS="${GO_TEST_EXTRA_FLAGS:-}"
+
+cd "$(dirname "$0")/../bdd"
+
+ALL_COMPOSE_FILES=(
+  -f docker-compose.yml
+  -f docker-compose.server.yml
+  -f docker-compose.cluster.yml
+  -f docker-compose.coverage.yml
+)
+
+COMPOSE_FILES=(-f docker-compose.yml)
+case "$FEATURE" in
+  basic_messaging|leader_redirection|all)
+    COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
+esac
+case "$FEATURE" in
+  leader_redirection|all)
+    COMPOSE_FILES+=(-f docker-compose.cluster.yml) ;;
+esac
+if [ "$COVERAGE" = "1" ]; then
+  COMPOSE_FILES+=(-f docker-compose.coverage.yml)
+  mkdir -p ../reports
+fi
+
 cleanup(){
   log "🧹  cleaning up containers & volumes…"
-  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose "${ALL_COMPOSE_FILES[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -56,20 +92,40 @@ fi
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
-  log "${emoji}  ${label}…"
-  set +e
-  "${COMPOSE_CMD[@]}" up --build --abort-on-container-exit --exit-code-from "$svc" "$svc"
-  local code=$?
-  set -e
-  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  if [ "$FEATURE" = "leader_redirection" ]; then
+    case "$svc" in
+      rust-bdd|go-bdd|csharp-bdd) ;;
+      *)
+        if [ "$SDK" = "all" ]; then
+          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
+          return 0
+        else
+          log "❌ ${SDK} does not support feature '${FEATURE}'"
+          return 1
+        fi
+        ;;
+    esac
+  fi
+
+  log "${emoji} ${label}..."
+  local code=0
+  docker compose "${COMPOSE_FILES[@]}" \
+    up --build --exit-code-from "$svc" "$svc" \
+    || code=$?
+  docker compose "${COMPOSE_FILES[@]}" \
+    down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }
 
 case "$SDK" in
   rust)     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
   python)   run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
+  php)      run_suite php-bdd    "🐘"   "Running PHP BDD tests"    ;;
   go)       run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
   go-race)
+    if [ "$COVERAGE" = "1" ]; then
+      log "⚠️ coverage collection automatically drops -race flag as coverage does not need -race"
+    fi
     export GO_TEST_EXTRA_FLAGS="-race"
     run_suite go-bdd "🐹⚡" "Running Go BDD tests with data race detector"
     ;;
@@ -79,6 +135,7 @@ case "$SDK" in
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
+    run_suite php-bdd    "🐘"   "Running PHP BDD tests"                        || exit $?
     run_suite go-bdd     "🐹"   "Running Go BDD tests"                         || exit $?
     GO_TEST_EXTRA_FLAGS="-race" \
     run_suite go-bdd     "🐹⚡" "Running Go BDD tests with data race detector"  || exit $?
@@ -87,11 +144,12 @@ case "$SDK" in
     run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
     ;;
   clean)
-    cleanup; exit 0 ;;
+    cleanup
+    exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [--coverage] [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
+    usage
     exit 2 ;;
 esac
 
-log "✅ BDD tests completed for: ${SDK}"
+log "✅ BDD tests completed for: sdk=${SDK}  feature=${FEATURE}"

@@ -161,7 +161,7 @@ public class IggyPublisherBuilder
     /// <param name="topicPartitionsCount">The number of partitions for the topic. Default is 1.</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages in the topic. Default is None.</param>
     /// <param name="replicationFactor">The replication factor for the topic. Null means server default.</param>
-    /// <param name="messageExpiry">The message expiry time in seconds (0 for no expiry). Default is 0.</param>
+    /// <param name="messageExpiry">The message expiry time. TimeSpan.Zero uses the server default, TimeSpan.MaxValue never expires. Default is TimeSpan.Zero.</param>
     /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 for unlimited). Default is 0.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
@@ -242,7 +242,7 @@ public class IggyPublisherBuilder
     ///     When enabled, messages are queued and sent in batches for improved throughput.
     /// </summary>
     /// <param name="enabled">Whether background sending is enabled. Default is true.</param>
-    /// <param name="queueCapacity">The maximum number of messages that can be queued. Default is 10,000.</param>
+    /// <param name="queueCapacity">The maximum number of queued send calls; each send occupies one slot regardless of how many messages its batch contains. Default is 10,000.</param>
     /// <param name="batchSize">The number of messages to send in each batch. Default is 100.</param>
     /// <param name="flushInterval">The interval at which to flush pending messages. Default is 100ms.</param>
     /// <param name="disposalTimeout">

@@ -24,10 +24,14 @@
 //! dials higher-id peers for the replica plane. Each accepted or
 //! dialed connection is handed to the delegate callback supplied by
 //! the caller (typically wrapping `shard::coordinator::ShardZeroCoordinator`).
-//! TCP and pre-upgrade WS callbacks duplicate the fd and ship it to
-//! the owning shard via the inter-shard `ShardFrame` channel; TCP-TLS,
-//! WSS, and QUIC callbacks install locally on shard 0 (the connection
-//! state is not serialisable so cross-shard handover is not possible).
+//! Replica, client-TCP, and pre-upgrade WS callbacks duplicate the raw
+//! fd and ship it to the owning shard via the inter-shard `ShardFrame`
+//! channel; replica delegation is blind (no byte is read on shard 0 -
+//! the owning shard runs the handshake, see
+//! [`crate::replica::handshake`]). TCP-TLS, WSS, and QUIC CLIENT
+//! callbacks install locally on shard 0: their handshake state
+//! materialises before delegation could happen, and post-handshake
+//! rustls / QUIC state is not serialisable.
 //!
 //! Non-zero shards early-return `Ok(None)`; the launcher calls this helper
 //! unconditionally per shard, so non-zero shards just have no listener
@@ -47,7 +51,7 @@ use crate::transports::quic::server_config_with_cert;
 use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
 use crate::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, AcceptedWssClientFn, IggyMessageBus, client_listener,
+    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus, client_listener,
 };
 
 /// QUIC server credentials passed by the bootstrap layer.
@@ -132,14 +136,16 @@ pub fn assert_listen_addrs_distinct(
 /// alongside. Non-zero shards early-return `Ok(None)`.
 ///
 /// Each accepted / dialed connection is handed to the supplied
-/// delegate callback. The TCP callbacks (`on_accepted_replica`,
-/// `on_accepted_client`) and the WS callback (`on_accepted_ws_client`)
-/// are responsible for the dup-fd + inter-shard send. The QUIC,
-/// TCP-TLS, and WSS callbacks
+/// delegate callback. The replica callbacks (`on_accepted_replica` for
+/// blind inbound delegation, `on_dialed_replica` for outbound), the
+/// client-TCP callback (`on_accepted_client`), and the WS callback
+/// (`on_accepted_ws_client`) are responsible for the dup-fd +
+/// inter-shard send. The QUIC, TCP-TLS, and WSS callbacks
 /// (`on_accepted_quic_client` / `on_accepted_tcp_tls_client` /
-/// `on_accepted_wss_client`) install locally on shard 0; those planes
-/// have no cross-shard handover (QUIC by transport design, TLS-family
-/// because the rustls connection state is not serialisable).
+/// `on_accepted_wss_client`) install locally on shard 0; those CLIENT
+/// planes have no cross-shard handover (QUIC by transport design,
+/// TLS-family because the handshake completes before delegation could
+/// happen and the resulting rustls state is not serialisable).
 ///
 /// `ws_listen_addr` / `on_accepted_ws_client` are paired: if either is
 /// `Some`, both must be. Same for the QUIC trio
@@ -177,11 +183,10 @@ pub async fn start_on_shard_zero(
     tcp_tls_credentials: Option<TlsServerCredentials>,
     wss_listen_addr: Option<SocketAddr>,
     wss_credentials: Option<TlsServerCredentials>,
-    cluster_id: u128,
     self_id: u8,
-    replica_count: u8,
     peers: Vec<(u8, SocketAddr)>,
     on_accepted_replica: AcceptedReplicaFn,
+    on_dialed_replica: DialedReplicaFn,
     on_accepted_client: AcceptedClientFn,
     on_accepted_ws_client: Option<AcceptedWsClientFn>,
     on_accepted_quic_client: Option<AcceptedQuicClientFn>,
@@ -210,21 +215,8 @@ pub async fn start_on_shard_zero(
     let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr).await?;
 
     let token_for_replica = bus.token();
-    let on_accepted_replica_for_listener = on_accepted_replica.clone();
-    let listener_max_message_size = bus.config().max_message_size;
-    let listener_handshake_grace = bus.config().handshake_grace;
     let replica_handle = compio::runtime::spawn(async move {
-        run_replica_listener(
-            replica_listener,
-            token_for_replica,
-            cluster_id,
-            self_id,
-            replica_count,
-            on_accepted_replica_for_listener,
-            listener_max_message_size,
-            listener_handshake_grace,
-        )
-        .await;
+        run_replica_listener(replica_listener, token_for_replica, on_accepted_replica).await;
     });
     bus.track_background(replica_handle);
 
@@ -321,15 +313,7 @@ pub async fn start_on_shard_zero(
         }
     };
 
-    start_connector(
-        bus,
-        cluster_id,
-        self_id,
-        peers,
-        on_accepted_replica,
-        reconnect_period,
-    )
-    .await;
+    start_connector(bus, self_id, peers, on_dialed_replica, reconnect_period).await;
 
     Ok(Some(BoundPlanes {
         replica: replica_bound,
@@ -358,11 +342,10 @@ pub async fn start_on_shard_zero_default(
     bus: &Rc<IggyMessageBus>,
     replica_listen_addr: SocketAddr,
     client_listen_addr: SocketAddr,
-    cluster_id: u128,
     self_id: u8,
-    replica_count: u8,
     peers: Vec<(u8, SocketAddr)>,
     on_accepted_replica: AcceptedReplicaFn,
+    on_dialed_replica: DialedReplicaFn,
     on_accepted_client: AcceptedClientFn,
 ) -> Result<Option<BoundPlanes>, IggyError> {
     let reconnect_period = bus.config().reconnect_period;
@@ -377,11 +360,10 @@ pub async fn start_on_shard_zero_default(
         None,
         None,
         None,
-        cluster_id,
         self_id,
-        replica_count,
         peers,
         on_accepted_replica,
+        on_dialed_replica,
         on_accepted_client,
         None,
         None,

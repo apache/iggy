@@ -16,7 +16,6 @@
 // under the License.
 
 using System.Runtime.CompilerServices;
-using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -160,13 +159,13 @@ public partial class IggyConsumer
                 {
                     try
                     {
-                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload.ToArray());
+                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload.Span);
 
                         Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
                         if (!message.RawUserHeaders.IsEmpty)
                         {
                             var decryptedHeaderBytes =
-                                _config.MessageEncryptor.Decrypt(message.RawUserHeaders.ToArray());
+                                _config.MessageEncryptor.Decrypt(message.RawUserHeaders.Span);
                             decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
                         }
 
@@ -207,19 +206,18 @@ public partial class IggyConsumer
                 {
                     if (_logger.IsEnabled(LogLevel.Debug))
                     {
-                        _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
+                        _logger.LogDebug(
+                            "No new messages found, committing offset {Offset} for partition {PartitionId}",
                             lastPolledPartitionOffset, rental.PartitionId);
                     }
+
                     await StoreOffsetAsync(lastPolledPartitionOffset, partitionId, false, ct);
                 }
 
                 return;
             }
 
-            if (anyNewMessages)
-            {
-                _lastPolledOffset.AddOrUpdate(rental.PartitionId, currentOffset, (_, _) => currentOffset);
-            }
+            _lastPolledOffset.AddOrUpdate(rental.PartitionId, currentOffset, (_, _) => currentOffset);
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {

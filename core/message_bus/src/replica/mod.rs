@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Replica plane: shard-0 bootstrap orchestrator (`io`) and inbound
-//! TCP listener (`listener`).
+//! Replica plane: shard-0 bootstrap orchestrator (`io`), inbound TCP
+//! listener (`listener`), and the handshake halves run on the owning
+//! shard (`handshake`).
 //!
 //! The replica plane is TCP-only by design — see [`listener`] for the
 //! load-bearing invariants. Outbound dialing and the per-process
 //! shard-0 bootstrap (which also binds the SDK client listeners) live
 //! in [`io`].
 
+pub mod auth;
+pub mod handshake;
 pub mod io;
 pub mod listener;

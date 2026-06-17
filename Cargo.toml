@@ -162,6 +162,12 @@ flume = "0.12.0"
 fs2 = "0.4.3"
 futures = "0.3.32"
 futures-core = { version = "0.3.32", default-features = false }
+# Pinned to the minor compio-tls 0.10.0 resolves to: the replica plane
+# handshakes with futures-rustls directly (TLS exporter access) and hands
+# the stream to compio-tls via its From impls, so both crates must agree
+# on the futures-rustls types. Cargo unifies within 0.26.x; drift to 0.27
+# fails compilation loudly (see the tripwire test in message_bus).
+futures-rustls = "0.26.0"
 futures-util = "0.3.32"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
@@ -336,6 +342,7 @@ wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }
+zeroize = "1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]

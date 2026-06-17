@@ -84,7 +84,6 @@ public sealed class HeaderValueTests
     [Fact]
     public void Int128_ReturnsCorrectValue()
     {
-        // You should provide a valid Int128 value here for testing.
         var value = new Int128(123, 456);
         var header = HeaderValue.FromInt128(value);
 
