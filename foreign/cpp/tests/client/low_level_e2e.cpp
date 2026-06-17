@@ -330,8 +330,8 @@ TEST_F(LowLevelE2E_Client, GetTopicReturnsTopicForExistingTopic) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
-                                         "duration", 1000, "1GiB"));
+    ASSERT_NO_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1, "duration", 1000, "1GiB"));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -359,13 +359,13 @@ TEST_F(LowLevelE2E_Client, GetTopicBeforeLoginThrows) {
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
-    ASSERT_THROW(unauthenticated_client->get_topic(make_string_identifier(stream_name),
-                                                   make_string_identifier(topic_name)),
-                 std::exception);
+    ASSERT_THROW(
+        unauthenticated_client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
-    ASSERT_THROW(unauthenticated_client->get_topic(make_string_identifier(stream_name),
-                                                   make_string_identifier(topic_name)),
-                 std::exception);
+    ASSERT_THROW(
+        unauthenticated_client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, GetTopicWithWrongStreamIdThrows) {
@@ -483,8 +483,8 @@ TEST_F(LowLevelE2E_Client, GetTopicIsStableAcrossBackToBackCalls) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
-                                         "duration", 1000, "1GiB"));
+    ASSERT_NO_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1, "duration", 1000, "1GiB"));
 
     iggy::ffi::TopicDetails first_topic{};
     iggy::ffi::TopicDetails second_topic{};
@@ -511,8 +511,8 @@ TEST_F(LowLevelE2E_Client, GetTopicAgreesWithGetStreamTopicSummary) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
-                                         "duration", 1000, "1GiB"));
+    ASSERT_NO_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1, "duration", 1000, "1GiB"));
 
     ASSERT_NO_THROW({
         const auto stream_details = client->get_stream(make_string_identifier(stream_name));
