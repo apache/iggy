@@ -28,13 +28,13 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::time::sleep;
 use tracing::info;
-use uuid::Uuid;
 
 const MEILISEARCH_IMAGE: &str = "getmeili/meilisearch";
 const MEILISEARCH_TAG: &str = "v1.13";
 const MEILISEARCH_PORT: u16 = 7700;
 const MEILISEARCH_HEALTH_ENDPOINT: &str = "/health";
 pub const TEST_INDEX: &str = "iggy_messages";
+const DOCUMENT_LIST_LIMIT: usize = 10000;
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
 
@@ -64,8 +64,6 @@ pub struct MeilisearchContainer {
 
 impl MeilisearchContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
-        let unique_network = format!("iggy-meilisearch-{}", Uuid::new_v4());
-
         let container = GenericImage::new(MEILISEARCH_IMAGE, MEILISEARCH_TAG)
             .with_exposed_port(MEILISEARCH_PORT.tcp())
             .with_wait_for(WaitFor::http(
@@ -73,7 +71,6 @@ impl MeilisearchContainer {
                     .with_port(MEILISEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_network(unique_network)
             .with_container_name(fixtures::unique_container_name("meilisearch"))
             .with_env_var("MEILI_ENV", "development")
             .with_mapped_port(0, MEILISEARCH_PORT.tcp())
@@ -231,7 +228,7 @@ pub trait MeilisearchOps: Sync {
             let response = self
                 .http_client()
                 .get(&url)
-                .query(&[("limit", "100")])
+                .query(&[("limit", DOCUMENT_LIST_LIMIT)])
                 .send()
                 .await
                 .map_err(|e| TestBinaryError::InvalidState {

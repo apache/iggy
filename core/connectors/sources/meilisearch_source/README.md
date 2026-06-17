@@ -26,12 +26,30 @@ a `/search` request sorted by that primary key and stores the last emitted
 primary-key value in connector state. This avoids offset pagination skips when
 documents are inserted or deleted between polls.
 
-The primary-key field must be numeric, filterable, and sortable in Meilisearch,
+The primary-key field must be an integer, filterable, and sortable in Meilisearch,
 because the connector adds a cursor filter and primary-key sort to each search
-request. The connector logs this numeric primary-key requirement during
+request. The connector logs this integer primary-key requirement during
 `open()`. String primary keys are not supported until the Meilisearch version
 used for validation supports greater-than filters on string attributes. Returned
 hits are serialized as JSON message payloads.
+
+Configure the primary-key field as both filterable and sortable before starting
+the connector. For example, when the primary key is `id`:
+
+```bash
+curl -X PATCH "$MEILISEARCH_URL/indexes/iggy_messages/settings" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "filterableAttributes": ["id"],
+    "sortableAttributes": ["id"]
+  }'
+```
+
+Meilisearch state is advanced in memory when a batch is returned from `poll()`.
+If the runtime fails to send that batch to Iggy, the source trait does not
+provide an acknowledgment callback that would let this connector roll the cursor
+back before the next poll. This is a known limitation of the current connector
+source API.
 
 When `include_metadata` is enabled, each payload has this shape:
 

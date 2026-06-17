@@ -72,6 +72,8 @@ pub struct MeilisearchSource {
     config: ResolvedMeilisearchSourceConfig,
     client: Option<Client>,
     primary_key: Option<String>,
+    primary_key_sort: Option<String>,
+    filter_expression: Option<String>,
     state: Mutex<State>,
 }
 
@@ -123,7 +125,7 @@ impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct State {
     last_primary_key: Option<Value>,
     documents_produced: usize,
@@ -147,6 +149,8 @@ impl MeilisearchSource {
             config: config.into(),
             client: None,
             primary_key: None,
+            primary_key_sort: None,
+            filter_expression: None,
             state: Mutex::new(restored_state.unwrap_or(State {
                 last_primary_key: None,
                 documents_produced: 0,
@@ -205,7 +209,10 @@ impl MeilisearchSource {
         })
     }
 
-    async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
+    async fn search_documents(
+        &self,
+        client: &Client,
+    ) -> Result<(Vec<ProducedMessage>, bool), Error> {
         let last_primary_key = {
             let state = self.state.lock().await;
             state.last_primary_key.clone()
@@ -213,11 +220,13 @@ impl MeilisearchSource {
         let primary_key = self.primary_key.as_deref().ok_or_else(|| {
             Error::Connection("Meilisearch primary key is not initialized".to_string())
         })?;
-        let filter_expression = self.filter_expression()?;
+        let sort = self.primary_key_sort.as_deref().ok_or_else(|| {
+            Error::Connection("Meilisearch primary key sort is not initialized".to_string())
+        })?;
         let cursor_filter = cursor_filter_expression(primary_key, last_primary_key.as_ref())?;
-        let combined_filter = combine_filter_expressions(filter_expression, cursor_filter);
-        let sort = format!("{primary_key}:{PRIMARY_KEY_SORT_DIRECTION}");
-        let sort_refs = [sort.as_str()];
+        let combined_filter =
+            combine_filter_expressions(self.filter_expression.as_deref(), cursor_filter);
+        let sort_refs = [sort];
         let index = client.index(&self.config.index);
         let mut query = index.search();
         query
@@ -241,6 +250,7 @@ impl MeilisearchSource {
             .map(|document| document_primary_key(document, primary_key))
             .transpose()?;
         let messages = self.documents_to_messages(documents)?;
+        let state_changed = last_document_primary_key.is_some();
 
         let mut state = self.state.lock().await;
         if let Some(primary_key) = last_document_primary_key {
@@ -249,21 +259,7 @@ impl MeilisearchSource {
         state.documents_produced += messages.len();
         state.poll_count += 1;
 
-        Ok(messages)
-    }
-
-    fn filter_expression(&self) -> Result<Option<String>, Error> {
-        let Some(filter) = self.config.filter.as_ref().filter(|value| !value.is_null()) else {
-            return Ok(None);
-        };
-
-        match filter {
-            Value::String(filter) if !filter.is_empty() => Ok(Some(filter.clone())),
-            Value::Array(filters) => filter_array_expression(filters, false),
-            _ => Err(Error::InvalidConfigValue(
-                "Meilisearch filter must be a string or an array of strings/arrays".to_string(),
-            )),
-        }
+        Ok((messages, state_changed))
     }
 
     fn documents_to_messages(&self, documents: Vec<Value>) -> Result<Vec<ProducedMessage>, Error> {
@@ -394,13 +390,16 @@ impl Source for MeilisearchSource {
             self.id, sanitized_url, self.config.index
         );
 
+        let filter_expression = filter_expression(self.config.filter.as_ref())?;
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
         let primary_key = self.get_primary_key(&client).await?;
-        warn!(
-            "Meilisearch source connector with ID: {} requires numeric primary key values for cursor pagination. Index: {}, primary key: {}",
+        info!(
+            "Meilisearch source connector with ID: {} requires integer primary key values for cursor pagination. Index: {}, primary key: {}",
             self.id, self.config.index, primary_key
         );
+        self.primary_key_sort = Some(format!("{primary_key}:{PRIMARY_KEY_SORT_DIRECTION}"));
+        self.filter_expression = filter_expression;
         self.primary_key = Some(primary_key);
         self.client = Some(client);
 
@@ -417,10 +416,12 @@ impl Source for MeilisearchSource {
             .client
             .as_ref()
             .ok_or_else(|| Error::Connection("Meilisearch client not initialized".to_string()))?;
-        let messages = self.search_documents(client).await?;
-        let persisted_state = {
+        let (messages, state_changed) = self.search_documents(client).await?;
+        let persisted_state = if state_changed {
             let state = self.state.lock().await;
             self.serialize_state(&state)
+        } else {
+            None
         };
 
         Ok(ProducedMessages {
@@ -512,15 +513,29 @@ fn filter_array_expression(filters: &[Value], nested: bool) -> Result<Option<Str
     }
 }
 
+fn filter_expression(filter: Option<&Value>) -> Result<Option<String>, Error> {
+    let Some(filter) = filter.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+
+    match filter {
+        Value::String(filter) if !filter.is_empty() => Ok(Some(filter.clone())),
+        Value::Array(filters) => filter_array_expression(filters, false),
+        _ => Err(Error::InvalidConfigValue(
+            "Meilisearch filter must be a string or an array of strings/arrays".to_string(),
+        )),
+    }
+}
+
 fn combine_filter_expressions(
-    user_filter: Option<String>,
+    user_filter: Option<&str>,
     cursor_filter: Option<String>,
 ) -> Option<String> {
     match (user_filter, cursor_filter) {
         (Some(user_filter), Some(cursor_filter)) => {
             Some(format!("({user_filter}) AND ({cursor_filter})"))
         }
-        (Some(user_filter), None) => Some(user_filter),
+        (Some(user_filter), None) => Some(user_filter.to_string()),
         (None, Some(cursor_filter)) => Some(cursor_filter),
         (None, None) => None,
     }
@@ -539,11 +554,16 @@ fn cursor_filter_expression(
 
 fn primary_key_filter_literal(value: &Value) -> Result<String, Error> {
     match value {
-        Value::Number(_) => serde_json::to_string(value).map_err(|error| {
-            Error::Serialization(format!(
-                "Failed to serialize Meilisearch primary key: {error}"
-            ))
-        }),
+        Value::Number(number) if number.is_i64() || number.is_u64() => serde_json::to_string(value)
+            .map_err(|error| {
+                Error::Serialization(format!(
+                    "Failed to serialize Meilisearch primary key: {error}"
+                ))
+            }),
+        Value::Number(_) => Err(Error::InvalidConfigValue(
+            "Meilisearch source primary key values must be integers for cursor pagination"
+                .to_string(),
+        )),
         _ => Err(Error::InvalidConfigValue(
             "Meilisearch source primary key values must be numbers for cursor pagination"
                 .to_string(),
@@ -651,13 +671,56 @@ mod tests {
     }
 
     #[test]
+    fn given_no_state_should_start_fresh() {
+        let source = MeilisearchSource::new(1, config(), None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert_eq!(state.last_primary_key, None);
+            assert_eq!(state.documents_produced, 0);
+            assert_eq!(state.poll_count, 0);
+        });
+    }
+
+    #[test]
+    fn given_invalid_state_should_start_fresh() {
+        let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
+        let source = MeilisearchSource::new(1, config(), Some(invalid_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = source.state.lock().await;
+            assert_eq!(state.last_primary_key, None);
+            assert_eq!(state.documents_produced, 0);
+            assert_eq!(state.poll_count, 0);
+        });
+    }
+
+    #[test]
+    fn state_should_be_serializable_and_deserializable() {
+        let original = State {
+            last_primary_key: Some(json!(9007199254740993_u64)),
+            documents_produced: 123,
+            poll_count: 11,
+        };
+
+        let connector_state = ConnectorState::serialize(&original, CONNECTOR_NAME, 1)
+            .expect("Failed to serialize state");
+        let restored = connector_state
+            .deserialize::<State>(CONNECTOR_NAME, 1)
+            .expect("Failed to deserialize state");
+
+        assert_eq!(original, restored);
+    }
+
+    #[test]
     fn filter_expression_should_accept_string_filter() {
         let mut config = config();
         config.filter = Some(json!("status = active"));
-        let source = MeilisearchSource::new(1, config, None);
 
         assert_eq!(
-            source.filter_expression().unwrap(),
+            filter_expression(config.filter.as_ref()).unwrap(),
             Some("status = active".to_string())
         );
     }
@@ -669,14 +732,21 @@ mod tests {
             ["genres = horror", "genres = thriller"],
             "director = 'Jordan Peele'"
         ]));
-        let source = MeilisearchSource::new(1, config, None);
 
         assert_eq!(
-            source.filter_expression().unwrap(),
+            filter_expression(config.filter.as_ref()).unwrap(),
             Some(
                 "(genres = horror OR genres = thriller) AND director = 'Jordan Peele'".to_string()
             )
         );
+    }
+
+    #[test]
+    fn filter_expression_should_reject_object_filter() {
+        let error = filter_expression(Some(&json!({"status": "active"})))
+            .expect_err("object filters should be rejected");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
     }
 
     #[test]
@@ -685,6 +755,22 @@ mod tests {
             cursor_filter_expression("id", Some(&json!(42))).unwrap(),
             Some("id > 42".to_string())
         );
+    }
+
+    #[test]
+    fn cursor_filter_should_preserve_large_integer_last_primary_key() {
+        assert_eq!(
+            cursor_filter_expression("id", Some(&json!(9007199254740993_u64))).unwrap(),
+            Some("id > 9007199254740993".to_string())
+        );
+    }
+
+    #[test]
+    fn cursor_filter_should_reject_float_last_primary_key() {
+        let error = cursor_filter_expression("id", Some(&json!(1.5)))
+            .expect_err("float primary key should be rejected");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
     }
 
     #[test]
