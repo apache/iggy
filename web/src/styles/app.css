@@ -20,7 +20,7 @@
 @import url('./tooltip.css') layer(base);
 @import url('./variables.css') layer(base);
 
-@import 'tailwindcss';
+@import 'tailwindcss/index.css';
 
 @custom-variant dark (&:is(.dark *));
 
