@@ -126,7 +126,7 @@ pub fn from_config(
         TransformType::FlatBufferConvert => {
             let cfg: FlatBufferConvertConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
-            Ok(Arc::new(FlatBufferConvert::new(cfg)))
+            Ok(Arc::new(FlatBufferConvert::new(cfg)?))
         }
         TransformType::AvroConvert => {
             let cfg: AvroConvertConfig =
