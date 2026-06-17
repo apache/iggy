@@ -68,12 +68,26 @@ fn render_template(template: &str, ctx: &PathContext<'_>) -> Result<String, Erro
     let ts_millis = (ctx.first_timestamp_micros / 1_000).to_string();
 
     Ok(template
-        .replace("{stream}", ctx.stream)
-        .replace("{topic}", ctx.topic)
+        .replace("{stream}", &sanitize_key_segment(ctx.stream))
+        .replace("{topic}", &sanitize_key_segment(ctx.topic))
         .replace("{partition}", &ctx.partition_id.to_string())
         .replace("{date}", &date)
         .replace("{hour}", &hour)
         .replace("{timestamp}", &ts_millis))
+}
+
+/// Replace characters that produce ambiguous or hard-to-list S3 key segments.
+/// Keeps `[a-zA-Z0-9._-]`, replaces everything else with `_`.
+fn sanitize_key_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
@@ -191,6 +205,25 @@ mod tests {
     fn timestamp_to_datetime_known() {
         let dt = timestamp_to_datetime(1_710_597_600_000_000).unwrap();
         assert_eq!(dt.format("%Y-%m-%dT%H").to_string(), "2024-03-16T14");
+    }
+
+    #[test]
+    fn sanitize_stream_topic_names() {
+        let ctx = PathContext {
+            stream: "my//stream",
+            topic: "topic with spaces",
+            partition_id: 0,
+            first_timestamp_micros: 1_710_597_600_000_000,
+        };
+        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
+        assert!(
+            !key.contains("//"),
+            "Sanitized key must not contain '//' from stream name: {key}"
+        );
+        assert!(
+            !key.contains(' '),
+            "Sanitized key must not contain spaces: {key}"
+        );
     }
 
     #[test]

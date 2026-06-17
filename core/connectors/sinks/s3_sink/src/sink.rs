@@ -202,13 +202,14 @@ impl S3Sink {
         processed: &mut u64,
     ) -> Result<(), Error> {
         for message in messages {
+            let resolved = self.resolved();
             let formatted = formatter::format_message(
                 message,
                 topic_metadata,
                 messages_metadata,
                 self.config.include_metadata,
                 self.config.include_headers,
-                self.output_format,
+                resolved.output_format,
             )?;
 
             let flush_payload = {
@@ -217,8 +218,8 @@ impl S3Sink {
 
                 if buffer.should_rotate(
                     self.config.file_rotation,
-                    self.max_file_size_bytes,
-                    self.max_messages,
+                    resolved.max_file_size_bytes,
+                    resolved.max_messages,
                 ) {
                     Some(self.extract_flush_payload(key, &mut buffer)?)
                 } else {
@@ -240,7 +241,8 @@ impl S3Sink {
         key: &BufferKey,
         buffer: &mut FileBuffer,
     ) -> Result<FlushPayload, Error> {
-        let data = formatter::finalize_buffer(buffer.entries(), self.output_format);
+        let resolved = self.resolved();
+        let data = formatter::finalize_buffer(buffer.entries(), resolved.output_format);
 
         let ctx = PathContext {
             stream: &key.stream,
@@ -255,7 +257,7 @@ impl S3Sink {
             &ctx,
             buffer.first_offset(),
             buffer.last_offset(),
-            self.output_format,
+            resolved.output_format,
         )?;
 
         let msg_count = buffer.message_count();
@@ -347,8 +349,9 @@ impl S3Sink {
         s3_key: &str,
         data: &[u8],
     ) -> Result<(), Error> {
-        let max_attempts = self.max_attempts();
-        let base_delay = self.retry_delay;
+        let resolved = self.resolved();
+        let max_attempts = resolved.max_attempts;
+        let base_delay = resolved.retry_delay;
         let mut attempt = 0u32;
 
         loop {
@@ -389,7 +392,9 @@ impl S3Sink {
                     );
                 }
             }
-            let delay = jitter(exponential_backoff(base_delay, attempt - 1, MAX_BACKOFF));
+            // exponential_backoff expects a 0-based retry index
+            let retry_index = attempt - 1;
+            let delay = jitter(exponential_backoff(base_delay, retry_index, MAX_BACKOFF));
             tokio::time::sleep(delay).await;
         }
     }
@@ -520,7 +525,7 @@ mod tests {
         };
         let mut sink = S3Sink::new(1, config);
         sink.validate_and_parse_config().unwrap();
-        assert_eq!(sink.max_messages, 500);
+        assert_eq!(sink.resolved().max_messages, 500);
     }
 
     #[test]
@@ -600,7 +605,7 @@ mod tests {
         let config = test_config();
         let mut sink = S3Sink::new(1, config);
         sink.validate_and_parse_config().unwrap();
-        assert_eq!(sink.max_messages, u64::MAX);
+        assert_eq!(sink.resolved().max_messages, u64::MAX);
     }
 
     #[test]

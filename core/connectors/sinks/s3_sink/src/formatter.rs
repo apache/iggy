@@ -192,17 +192,23 @@ fn timestamp_to_rfc3339(micros: u64) -> String {
 }
 
 /// Finalize buffer entries into the output byte format.
-/// For JsonArray: byte-concatenation (no re-parse). For JsonLines/Raw: newline-separated.
 pub(crate) fn finalize_buffer<'a>(
     entries: impl Iterator<Item = &'a [u8]>,
     format: OutputFormat,
 ) -> Vec<u8> {
     match format {
-        OutputFormat::JsonLines | OutputFormat::Raw => {
+        OutputFormat::JsonLines => {
             let mut result = Vec::new();
             for entry in entries {
                 result.extend_from_slice(entry);
                 result.push(b'\n');
+            }
+            result
+        }
+        OutputFormat::Raw => {
+            let mut result = Vec::new();
+            for entry in entries {
+                result.extend_from_slice(entry);
             }
             result
         }
@@ -337,6 +343,18 @@ mod tests {
         let entries = entries_from_boundaries(data, &boundaries);
         let result = finalize_buffer(entries, OutputFormat::JsonLines);
         assert_eq!(result, b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn finalize_raw_no_delimiter() {
+        let data = b"\x00\x01\x02\x0a\xff\xfe";
+        let boundaries = [4usize, 6];
+        let entries = entries_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(entries, OutputFormat::Raw);
+        assert_eq!(
+            result, data,
+            "Raw must concatenate without inserting delimiters"
+        );
     }
 
     #[test]

@@ -70,6 +70,10 @@ pub struct S3SinkConfig {
     pub include_metadata: bool,
     #[serde(default)]
     pub include_headers: bool,
+    /// Total number of attempts (including the initial one) before giving up.
+    /// `max_attempts = 3` means 1 initial try + 2 retries. The `max_retries`
+    /// alias is accepted for convenience but follows the same "total attempts"
+    /// semantics.
     #[serde(default, alias = "max_retries")]
     pub max_attempts: Option<u32>,
     #[serde(default)]
@@ -169,16 +173,25 @@ impl OutputFormat {
     }
 }
 
+/// Parsed and validated config fields, constructed only inside `open()`.
+/// Avoids accessing unresolved zero/default placeholder values before
+/// the sink is fully initialized.
+#[derive(Debug)]
+pub(crate) struct ResolvedConfig {
+    pub max_file_size_bytes: u64,
+    pub max_messages: u64,
+    pub output_format: OutputFormat,
+    pub retry_delay: std::time::Duration,
+    pub max_attempts: u32,
+}
+
 pub struct S3Sink {
     id: u32,
     config: S3SinkConfig,
     bucket: Option<Box<s3::Bucket>>,
     buffers: DashMap<BufferKey, Arc<tokio::sync::Mutex<buffer::FileBuffer>>>,
-    max_file_size_bytes: u64,
-    max_messages: u64,
-    output_format: OutputFormat,
+    resolved: Option<ResolvedConfig>,
     state: tokio::sync::Mutex<SinkState>,
-    retry_delay: std::time::Duration,
 }
 
 impl fmt::Debug for S3Sink {
@@ -188,10 +201,7 @@ impl fmt::Debug for S3Sink {
             .field("config", &self.config)
             .field("bucket", &self.bucket.as_ref().map(|b| &b.name))
             .field("buffers_count", &self.buffers.len())
-            .field("max_file_size_bytes", &self.max_file_size_bytes)
-            .field("max_messages", &self.max_messages)
-            .field("output_format", &self.output_format)
-            .field("retry_delay", &self.retry_delay)
+            .field("resolved", &self.resolved)
             .finish()
     }
 }
@@ -217,15 +227,12 @@ impl S3Sink {
             config,
             bucket: None,
             buffers: DashMap::new(),
-            max_file_size_bytes: 0,
-            max_messages: u64::MAX,
-            output_format: OutputFormat::JsonLines,
+            resolved: None,
             state: tokio::sync::Mutex::new(SinkState {
                 messages_received: 0,
                 messages_uploaded: 0,
                 messages_lost: 0,
             }),
-            retry_delay: std::time::Duration::from_secs(1),
         }
     }
 
@@ -246,15 +253,15 @@ impl S3Sink {
             ));
         }
 
-        self.output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
-        self.max_file_size_bytes = parse_file_size(&self.config.max_file_size)?;
+        let output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
+        let max_file_size_bytes = parse_file_size(&self.config.max_file_size)?;
 
-        if self.max_file_size_bytes == 0 {
+        if max_file_size_bytes == 0 {
             return Err(Error::InvalidConfigValue(
                 "max_file_size must be greater than 0".to_owned(),
             ));
         }
-        if self.max_file_size_bytes > MAX_S3_SINGLE_PUT_SIZE {
+        if max_file_size_bytes > MAX_S3_SINGLE_PUT_SIZE {
             return Err(Error::InvalidConfigValue(format!(
                 "max_file_size ({}) exceeds S3 single PutObject limit of 5 GiB",
                 self.config.max_file_size
@@ -266,12 +273,13 @@ impl S3Sink {
             .retry_delay
             .as_deref()
             .unwrap_or(DEFAULT_RETRY_DELAY);
-        self.retry_delay = humantime::Duration::from_str(delay_str)
+        let retry_delay = humantime::Duration::from_str(delay_str)
             .map(|d| d.into())
             .map_err(|e| {
                 Error::InvalidConfigValue(format!("Invalid retry_delay '{delay_str}': {e}"))
             })?;
 
+        let mut max_messages = u64::MAX;
         if self.config.file_rotation == FileRotation::Messages {
             match self.config.max_messages_per_file {
                 None => {
@@ -286,7 +294,7 @@ impl S3Sink {
                     ));
                 }
                 Some(n) => {
-                    self.max_messages = n;
+                    max_messages = n;
                 }
             }
         } else if let Some(n) = self.config.max_messages_per_file {
@@ -295,14 +303,26 @@ impl S3Sink {
                     "max_messages_per_file must be greater than 0".to_owned(),
                 ));
             }
-            self.max_messages = n;
+            max_messages = n;
         }
+
+        let max_attempts = self.config.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+
+        self.resolved = Some(ResolvedConfig {
+            max_file_size_bytes,
+            max_messages,
+            output_format,
+            retry_delay,
+            max_attempts,
+        });
 
         Ok(())
     }
 
-    fn max_attempts(&self) -> u32 {
-        self.config.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)
+    pub(crate) fn resolved(&self) -> &ResolvedConfig {
+        self.resolved
+            .as_ref()
+            .expect("BUG: resolved config accessed before open()")
     }
 }
 
