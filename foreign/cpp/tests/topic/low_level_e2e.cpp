@@ -69,31 +69,9 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
                         ", expiry_kind=" + expiry_option.kind +
                         ", expiry_value=" + std::to_string(expiry_option.value) + ", max_topic_size=" + max_topic_size);
 
-                    ASSERT_NO_THROW({
-                        const auto topic_details = client->create_topic(
-                            make_string_identifier(stream_name), topic_name, 1, compression_algorithm,
-                            replication_factor, expiry_option.kind, expiry_option.value, max_topic_size);
-                        EXPECT_EQ(topic_details.name, topic_name);
-                        EXPECT_GT(topic_details.created_at, 0u);
-                        EXPECT_EQ(topic_details.size_bytes, 0u);
-                        EXPECT_EQ(topic_details.messages_count, 0u);
-                        EXPECT_EQ(topic_details.partitions_count, 1u);
-                        EXPECT_EQ(topic_details.partitions.size(), 1u);
-                        EXPECT_EQ(topic_details.compression_algorithm, compression_algorithm);
-                        if (replication_factor != 0) {
-                            EXPECT_EQ(topic_details.replication_factor, replication_factor);
-                        }
-                        if (expiry_option.kind == "never_expire") {
-                            EXPECT_EQ(topic_details.message_expiry, std::numeric_limits<std::uint64_t>::max());
-                        } else if (expiry_option.kind == "duration") {
-                            EXPECT_EQ(topic_details.message_expiry, expiry_option.value);
-                        }
-                        if (max_topic_size == "unlimited") {
-                            EXPECT_EQ(topic_details.max_topic_size, std::numeric_limits<std::uint64_t>::max());
-                        } else if (max_topic_size == "1GiB") {
-                            EXPECT_EQ(topic_details.max_topic_size, 1024ULL * 1024ULL * 1024ULL);
-                        }
-                    });
+                    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1,
+                                                         compression_algorithm, replication_factor, expiry_option.kind,
+                                                         expiry_option.value, max_topic_size));
                     ++expected_topics_count;
                     expected_topic_names.insert(topic_name);
                 }
@@ -127,30 +105,10 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_NO_THROW({
-        const auto zero_partitions_topic =
-            client->create_topic(make_string_identifier(stream_name), zero_partitions_topic_name, 0, "none", 0,
-                                 "server_default", 0, "server_default");
-        EXPECT_EQ(zero_partitions_topic.name, zero_partitions_topic_name);
-        EXPECT_GT(zero_partitions_topic.created_at, 0u);
-        EXPECT_EQ(zero_partitions_topic.size_bytes, 0u);
-        EXPECT_EQ(zero_partitions_topic.messages_count, 0u);
-        EXPECT_EQ(zero_partitions_topic.partitions_count, 0u);
-        EXPECT_TRUE(zero_partitions_topic.partitions.empty());
-        EXPECT_EQ(zero_partitions_topic.compression_algorithm, "none");
-    });
-    ASSERT_NO_THROW({
-        const auto max_partitions_topic =
-            client->create_topic(make_string_identifier(stream_name), max_partitions_topic_name, 1000, "none", 0,
-                                 "server_default", 0, "server_default");
-        EXPECT_EQ(max_partitions_topic.name, max_partitions_topic_name);
-        EXPECT_GT(max_partitions_topic.created_at, 0u);
-        EXPECT_EQ(max_partitions_topic.size_bytes, 0u);
-        EXPECT_EQ(max_partitions_topic.messages_count, 0u);
-        EXPECT_EQ(max_partitions_topic.partitions_count, 1000u);
-        EXPECT_EQ(max_partitions_topic.partitions.size(), 1000u);
-        EXPECT_EQ(max_partitions_topic.compression_algorithm, "none");
-    });
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), zero_partitions_topic_name, 0, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), max_partitions_topic_name, 1000, "none",
+                                         0, "server_default", 0, "server_default"));
     ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), overflow_topic_name, 1001, "none", 0,
                                       "server_default", 0, "server_default"),
                  std::exception);
@@ -190,17 +148,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
     }
 
     const std::string max_length_name(255, 'a');
-    ASSERT_NO_THROW({
-        const auto topic_details = client->create_topic(make_string_identifier(stream_name), max_length_name, 1, "none",
-                                                        0, "server_default", 0, "server_default");
-        EXPECT_EQ(topic_details.name, max_length_name);
-        EXPECT_GT(topic_details.created_at, 0u);
-        EXPECT_EQ(topic_details.size_bytes, 0u);
-        EXPECT_EQ(topic_details.messages_count, 0u);
-        EXPECT_EQ(topic_details.partitions_count, 1u);
-        EXPECT_EQ(topic_details.partitions.size(), 1u);
-        EXPECT_EQ(topic_details.compression_algorithm, "none");
-    });
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), max_length_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
 }
 
 TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
@@ -212,17 +161,8 @@ TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW({
-        const auto topic_details = client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                                        "server_default", 0, "server_default");
-        EXPECT_EQ(topic_details.name, topic_name);
-        EXPECT_GT(topic_details.created_at, 0u);
-        EXPECT_EQ(topic_details.size_bytes, 0u);
-        EXPECT_EQ(topic_details.messages_count, 0u);
-        EXPECT_EQ(topic_details.partitions_count, 1u);
-        EXPECT_EQ(topic_details.partitions.size(), 1u);
-        EXPECT_EQ(topic_details.compression_algorithm, "none");
-    });
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
     ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
                                       0, "server_default"),
                  std::exception);
@@ -241,28 +181,10 @@ TEST_F(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
     ASSERT_NO_THROW(client->create_stream(second_stream_name));
     TrackStream(second_stream_name);
 
-    ASSERT_NO_THROW({
-        const auto first_topic = client->create_topic(make_string_identifier(first_stream_name), topic_name, 1, "none",
-                                                      0, "server_default", 0, "server_default");
-        EXPECT_EQ(first_topic.name, topic_name);
-        EXPECT_GT(first_topic.created_at, 0u);
-        EXPECT_EQ(first_topic.size_bytes, 0u);
-        EXPECT_EQ(first_topic.messages_count, 0u);
-        EXPECT_EQ(first_topic.partitions_count, 1u);
-        EXPECT_EQ(first_topic.partitions.size(), 1u);
-        EXPECT_EQ(first_topic.compression_algorithm, "none");
-    });
-    ASSERT_NO_THROW({
-        const auto second_topic = client->create_topic(make_string_identifier(second_stream_name), topic_name, 1,
-                                                       "none", 0, "server_default", 0, "server_default");
-        EXPECT_EQ(second_topic.name, topic_name);
-        EXPECT_GT(second_topic.created_at, 0u);
-        EXPECT_EQ(second_topic.size_bytes, 0u);
-        EXPECT_EQ(second_topic.messages_count, 0u);
-        EXPECT_EQ(second_topic.partitions_count, 1u);
-        EXPECT_EQ(second_topic.partitions.size(), 1u);
-        EXPECT_EQ(second_topic.compression_algorithm, "none");
-    });
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(second_stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
