@@ -20,6 +20,7 @@ use iggy_common::{StreamClient, UserClient};
 use integration::iggy_harness;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
+use server::http::jwt::install_default_crypto_provider;
 use server::http::jwt::json_web_token::Audience;
 
 const TEST_ISSUER: &str = "https://test-issuer.com";
@@ -87,6 +88,8 @@ fn now_timestamp() -> u64 {
 
 /// Creates a valid JWT token with specified expiration time
 fn create_valid_jwt(exp_seconds: u64) -> String {
+    install_default_crypto_provider();
+
     let now = now_timestamp();
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
@@ -107,6 +110,8 @@ fn create_valid_jwt(exp_seconds: u64) -> String {
 
 /// Creates a valid JWT token with audience as array
 fn create_valid_jwt_with_array_aud(exp_seconds: u64) -> String {
+    install_default_crypto_provider();
+
     let now = now_timestamp();
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
@@ -131,6 +136,8 @@ fn create_valid_jwt_with_array_aud(exp_seconds: u64) -> String {
 
 /// Creates an expired JWT token (expired 1 hour ago)
 fn create_expired_jwt() -> String {
+    install_default_crypto_provider();
+
     let now = now_timestamp();
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),
@@ -151,6 +158,8 @@ fn create_expired_jwt() -> String {
 
 /// Creates a JWT token with unknown issuer
 fn create_unknown_issuer_jwt() -> String {
+    install_default_crypto_provider();
+
     let now = now_timestamp();
     let claims = TestClaims {
         jti: uuid::Uuid::now_v7().to_string(),

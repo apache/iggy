@@ -23,7 +23,7 @@ pub mod storage;
 
 pub const COMPONENT: &str = "HTTP_JWT";
 
-pub(crate) fn install_default_crypto_provider() {
+pub fn install_default_crypto_provider() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
 
     INSTALL.call_once(|| {
