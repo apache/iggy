@@ -19,6 +19,8 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Apache.Iggy.Configuration;
@@ -66,9 +68,8 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     Fired whenever the connection state changes.
+    ///     Closes the underlying stream and releases the connection's semaphores.
     /// </summary>
-    //public event EventHandler<ConnectionStateChangedEventArgs>? OnConnectionStateChanged;
     public void Dispose()
     {
         _stream?.Close();
@@ -271,8 +272,20 @@ public sealed class TcpMessageStream : IIggyClient
 
 
     /// <inheritdoc />
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+    public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
         IList<Message> messages, CancellationToken token = default)
+        => SendMessagesCoreAsync(streamId, topicId, partitioning, AsSpan(messages), token);
+
+    /// <inheritdoc />
+    public Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        Message message, CancellationToken token = default)
+    {
+        ReadOnlySpan<Message> span = [message];
+        return SendMessagesCoreAsync(streamId, topicId, partitioning, span, token);
+    }
+
+    private Task SendMessagesCoreAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        ReadOnlySpan<Message> messages, CancellationToken token)
     {
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length
                              + 2 + partitioning.Length + 4 + 4;
@@ -280,24 +293,40 @@ public sealed class TcpMessageStream : IIggyClient
                                 + metadataLength;
         var payloadBufferSize = messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
 
-        IMemoryOwner<byte> messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
         IMemoryOwner<byte> payloadBuffer = MemoryPool<byte>.Shared.Rent(payloadBufferSize);
         try
         {
-            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], streamId,
-                topicId, partitioning, messages);
+            FillSendMessagesPayload(payloadBuffer.Memory.Span, messageBufferSize, streamId, topicId,
+                partitioning, messages);
+        }
+        catch
+        {
+            payloadBuffer.Dispose();
+            throw;
+        }
 
-            TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize],
-                messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);
+        return SendAckAndDisposeAsync(payloadBuffer, payloadBufferSize, token);
+    }
 
+    private async Task SendAckAndDisposeAsync(IMemoryOwner<byte> payloadBuffer, int payloadBufferSize,
+        CancellationToken token)
+    {
+        try
+        {
             await SendAckAsync(payloadBuffer.Memory[..payloadBufferSize], token);
         }
         finally
         {
-            messageBuffer.Dispose();
             payloadBuffer.Dispose();
         }
     }
+
+    private static ReadOnlySpan<Message> AsSpan(IList<Message> messages) => messages switch
+    {
+        Message[] array => array,
+        List<Message> list => CollectionsMarshal.AsSpan(list),
+        _ => messages.ToArray()
+    };
 
     /// <inheritdoc />
     public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
@@ -863,6 +892,15 @@ public sealed class TcpMessageStream : IIggyClient
         return new AuthResponse(userId, null);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void FillSendMessagesPayload(Span<byte> buffer, int messageBufferSize,
+        Identifier streamId, Identifier topicId, Partitioning partitioning, ReadOnlySpan<Message> messages)
+    {
+        TcpContracts.CreateMessage(buffer.Slice(8, messageBufferSize), streamId, topicId, partitioning, messages);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer[..4], messageBufferSize + 4);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer[4..8], CommandCodes.SEND_MESSAGES_CODE);
+    }
+
     private async Task TryEstablishConnectionAsync(CancellationToken token)
     {
         var retryCount = 0;
@@ -1096,7 +1134,8 @@ public sealed class TcpMessageStream : IIggyClient
                 while (totalRead < response.Length)
                 {
                     var readBytes
-                        = await _stream.ReadAsync(errorBuffer.Memory.Slice(totalRead, response.Length - totalRead), token);
+                        = await _stream.ReadAsync(errorBuffer.Memory.Slice(totalRead, response.Length - totalRead),
+                            token);
                     if (readBytes == 0)
                     {
                         throw new IggyZeroBytesException();
@@ -1167,7 +1206,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     Sets the connection state and fires the OnConnectionStateChanged event.
+    ///     Sets the connection state and publishes a ConnectionStateChangedEventArgs to subscribers via the connection event aggregator.
     /// </summary>
     /// <param name="newState">The new connection state</param>
     private void SetConnectionStateAsync(ConnectionState newState)

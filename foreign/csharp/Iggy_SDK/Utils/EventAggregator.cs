@@ -31,6 +31,18 @@ internal class EventAggregator<T>
         _logger = loggerFactory.CreateLogger<EventAggregator<T>>();
     }
 
+    // Lets publishers skip building event args (e.g. payload snapshots) when nobody is listening.
+    public bool HasSubscribers
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _subscribers.Count > 0;
+            }
+        }
+    }
+
     public void Subscribe(Func<T, Task> handler)
     {
         lock (_lock)
@@ -72,6 +84,11 @@ internal class EventAggregator<T>
             List<Func<T, Task>> handlers;
             lock (_lock)
             {
+                if (_subscribers.Count == 0)
+                {
+                    return;
+                }
+
                 handlers = _subscribers.ToList();
             }
 
@@ -83,7 +100,7 @@ internal class EventAggregator<T>
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process event of type {Type}", handler.GetType().Name);
+                    _logger.LogError(ex, "Failed to process event of type {Type}", typeof(T).Name);
                 }
             });
             await Task.WhenAll(tasks);

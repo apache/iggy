@@ -37,8 +37,10 @@ use std::rc::Rc;
 use tracing::{debug, info, warn};
 
 /// TCP entry point for client installs. Applies socket options and
-/// delegates to [`install_client_conn`]. See
-/// [`super::replica::install_replica_tcp`] for the plane-symmetric docs.
+/// delegates to [`install_client_conn`].
+///
+/// The replica plane applies the same socket options inside its install
+/// scaffold (`super::replica::install_replica_inbound` / `_outbound`).
 #[allow(clippy::future_not_send)]
 pub fn install_client_tcp(
     bus: &Rc<IggyMessageBus>,

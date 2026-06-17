@@ -37,6 +37,9 @@ pub struct ClusterConfig {
     /// Replica-to-replica authentication settings (PSK + BLAKE3 handshake).
     #[serde(default)]
     pub auth: ClusterAuthConfig,
+    /// Replica-to-replica TLS settings for the consensus (`tcp_replica`) port.
+    #[serde(default)]
+    pub tls: ClusterTlsConfig,
 }
 
 /// Replica-to-replica authentication for the consensus (`tcp_replica`) port.
@@ -68,6 +71,42 @@ pub struct ClusterAuthConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub shared_secret: String,
+}
+
+/// Replica-to-replica TLS for the consensus (`tcp_replica`) port.
+///
+/// Mirrors the legacy [`super::tcp::TcpTlsConfig`] shape plus `ca_file`:
+/// the replica plane DIALS its peers (a TLS client role the
+/// client-facing server plane never has), so the dialer needs a trust
+/// anchor to verify the acceptor's certificate against.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterTlsConfig {
+    /// When true every replica connection is wrapped in TLS (1.3 only)
+    /// before the replica handshake runs. Requires `cluster.auth.enabled`:
+    /// TLS carries no client certificates, so it authenticates the
+    /// acceptor only; the PSK handshake authenticates the peer while TLS
+    /// supplies confidentiality. Enabling is a coordinated-restart
+    /// change: a TLS dialer cannot talk to a plaintext acceptor or vice
+    /// versa. Flip every node in one restart.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true the node auto-generates a self-signed certificate at
+    /// boot and the dialer accepts ANY peer certificate. With the
+    /// default `false`, `cert_file` / `key_file` / `ca_file` are all
+    /// required.
+    #[serde(default)]
+    pub self_signed: bool,
+    /// PEM certificate chain presented by this node's acceptor side.
+    #[serde(default)]
+    pub cert_file: String,
+    /// PEM private key matching `cert_file`.
+    #[serde(default)]
+    pub key_file: String,
+    /// PEM trust anchor(s) the dialer verifies peer certificates
+    /// against. Unused when `self_signed` is true.
+    #[serde(default)]
+    pub ca_file: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
@@ -111,6 +150,7 @@ mod tests {
                 enabled: true,
                 shared_secret: "current-psk-MUST-NOT-be-persisted".to_owned(),
             },
+            tls: ClusterTlsConfig::default(),
         };
         let serialized = serde_json::to_string(&config).expect("serialize cluster config");
         assert!(

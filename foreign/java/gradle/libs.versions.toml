@@ -45,7 +45,7 @@ testcontainers = "2.0.5"
 netty = "4.2.15.Final"
 
 # Spotbugs
-spotbugs = "4.9.8"
+spotbugs = "4.10.1"
 
 # Config
 typesafe-config = "1.4.9"
