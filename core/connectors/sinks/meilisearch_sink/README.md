@@ -17,10 +17,10 @@ Meilisearch index through the official Rust SDK.
 - `wait_for_tasks`: Poll Meilisearch tasks until terminal state before returning from `consume()`. Defaults to `true`.
 - `task_timeout`: Maximum time to wait for each Meilisearch task. Defaults to `30s`.
 - `task_poll_interval`: Delay between task polls. Defaults to `100ms`.
-- `max_retries`: Maximum transient retry attempts. Defaults to `3`.
+- `max_retries`: Maximum transient retries after the initial request. Defaults to `3`.
 - `retry_delay`: Initial transient retry delay. Defaults to `500ms`.
 - `max_retry_delay`: Maximum transient retry delay. Defaults to `5s`.
-- `max_open_retries`: Maximum transient retry attempts while opening the index. Defaults to `5`.
+- `max_open_retries`: Maximum transient retries after the initial request while opening the index. Defaults to `5`.
 
 ## Behavior
 
@@ -38,7 +38,8 @@ delivery idempotent for the same message.
 
 When `include_metadata` is enabled, metadata fields are only inserted when the
 document does not already contain those names. Existing user fields are
-preserved.
+preserved. If `primary_key` is set to a field other than `iggy_id`, the
+connector also inserts `iggy_id` as stable Iggy metadata when absent.
 
 `wait_for_tasks=false` only skips waiting for document indexing tasks during
 `consume()`. If `create_index_if_not_exists=true` and the connector creates the

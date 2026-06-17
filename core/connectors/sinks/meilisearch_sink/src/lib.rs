@@ -145,14 +145,11 @@ impl From<MeilisearchSinkConfig> for ResolvedMeilisearchSinkConfig {
             config.task_poll_interval.as_deref(),
             DEFAULT_TASK_POLL_INTERVAL,
         );
-        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
-        let max_open_retries = config
-            .max_open_retries
-            .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
-            .max(1);
+        let max_open_retries = config.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES);
 
         Self {
             url: config.url,
@@ -259,7 +256,7 @@ impl MeilisearchSink {
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         message: ConsumedMessage,
-    ) -> Result<Option<Value>, Error> {
+    ) -> Result<Value, Error> {
         let generated_id = generated_document_id(topic_metadata, messages_metadata, &message);
         let ConsumedMessage {
             id,
@@ -309,9 +306,11 @@ impl MeilisearchSink {
             .or_insert_with(|| Value::String(generated_id.clone()));
 
         if self.config.include_metadata {
-            document
-                .entry(DEFAULT_PRIMARY_KEY.to_string())
-                .or_insert_with(|| Value::String(generated_id));
+            if self.config.primary_key != DEFAULT_PRIMARY_KEY {
+                document
+                    .entry(DEFAULT_PRIMARY_KEY.to_string())
+                    .or_insert_with(|| Value::String(generated_id));
+            }
             insert_metadata_field(
                 &mut document,
                 "iggy_message_id",
@@ -352,7 +351,7 @@ impl MeilisearchSink {
             }
         }
 
-        Ok(Some(Value::Object(document)))
+        Ok(Value::Object(document))
     }
 
     fn document_from_json_value(value: Value) -> Map<String, Value> {
@@ -483,20 +482,28 @@ impl MeilisearchSink {
         &self,
         client: &Client,
         task: TaskInfo,
-        max_attempts: u32,
+        max_retries: u32,
     ) -> Result<Task, Error> {
         let task_uid = task.get_task_uid();
         let started = Instant::now();
 
         loop {
-            if started.elapsed() >= self.config.task_timeout {
+            let remaining = self.config.task_timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
                 break;
             }
-            let status = self
-                .retry_sdk_operation_with_attempts("get task status", max_attempts, || {
+
+            let status = match tokio::time::timeout(
+                remaining,
+                self.retry_sdk_operation_with_retries("get task status", max_retries, || {
                     client.get_task(task.clone())
-                })
-                .await?;
+                }),
+            )
+            .await
+            {
+                Ok(status) => status?,
+                Err(_) => break,
+            };
 
             if status.is_success() || status.is_failure() {
                 return Ok(status);
@@ -524,7 +531,7 @@ impl MeilisearchSink {
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        self.retry_sdk_operation_with_attempts(operation, self.config.max_retries, operation_fn)
+        self.retry_sdk_operation_with_retries(operation, self.config.max_retries, operation_fn)
             .await
     }
 
@@ -537,61 +544,57 @@ impl MeilisearchSink {
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        self.retry_sdk_operation_with_attempts(
-            operation,
-            self.config.max_open_retries,
-            operation_fn,
-        )
-        .await
+        self.retry_sdk_operation_with_retries(operation, self.config.max_open_retries, operation_fn)
+            .await
     }
 
-    async fn retry_sdk_operation_with_attempts<T, Fut, Op>(
+    async fn retry_sdk_operation_with_retries<T, Fut, Op>(
         &self,
         operation: &str,
-        max_attempts: u32,
+        max_retries: u32,
         mut operation_fn: Op,
     ) -> Result<T, Error>
     where
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        let mut attempt = 0u32;
+        let mut retries = 0u32;
 
         loop {
             let result = tokio::time::timeout(self.config.timeout, operation_fn()).await;
             match result {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => {
-                    attempt += 1;
-                    let should_retry = attempt < max_attempts && is_transient_sdk_error(&error);
+                    let should_retry = retries < max_retries && is_transient_sdk_error(&error);
                     if !should_retry {
                         return Err(map_sdk_error(error));
                     }
+                    retries += 1;
                     let delay = jitter(exponential_backoff(
                         self.config.retry_delay,
-                        attempt,
+                        retries,
                         self.config.max_retry_delay,
                     ));
                     warn!(
-                        "Meilisearch {operation} failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:?}..."
+                        "Meilisearch {operation} failed (retry {retries}/{max_retries}): {error}. Retrying in {delay:?}..."
                     );
                     sleep(delay).await;
                 }
                 Err(_) => {
-                    attempt += 1;
-                    if attempt >= max_attempts {
+                    if retries >= max_retries {
                         return Err(Error::HttpRequestFailed(format!(
                             "Meilisearch {operation} timed out after {:?}",
                             self.config.timeout
                         )));
                     }
+                    retries += 1;
                     let delay = jitter(exponential_backoff(
                         self.config.retry_delay,
-                        attempt,
+                        retries,
                         self.config.max_retry_delay,
                     ));
                     warn!(
-                        "Meilisearch {operation} timed out after {:?} (attempt {attempt}/{max_attempts}). Retrying in {delay:?}...",
+                        "Meilisearch {operation} timed out after {:?} (retry {retries}/{max_retries}). Retrying in {delay:?}...",
                         self.config.timeout
                     );
                     sleep(delay).await;
@@ -661,8 +664,7 @@ impl Sink for MeilisearchSink {
         let mut invalid_records = 0usize;
         for message in messages {
             match self.prepare_document(topic_metadata, &messages_metadata, message) {
-                Ok(Some(document)) => documents.push(document),
-                Ok(None) => {}
+                Ok(document) => documents.push(document),
                 Err(Error::InvalidRecordValue(reason)) => {
                     invalid_records += 1;
                     warn!(
@@ -697,9 +699,6 @@ impl Sink for MeilisearchSink {
             Err(partial_error) => {
                 let mut state = self.state.lock().await;
                 state.documents_enqueued += partial_error.accepted;
-                if self.config.wait_for_tasks {
-                    state.documents_indexed += partial_error.accepted;
-                }
                 state.errors_count += 1;
                 drop(state);
                 Err(partial_error.error)
@@ -735,7 +734,7 @@ fn generated_document_id(
         topic_metadata.topic.as_str(),
         messages_metadata.partition_id,
         message.offset,
-        message.id
+        message.id.to_string()
     ]);
     let encoded = serde_json::to_vec(&components)
         .map(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes))
@@ -942,6 +941,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_ids_support_u128_message_ids() {
+        let mut message = message(Payload::Text("x".to_string()));
+        message.id = u128::MAX;
+
+        let id = generated_document_id(&topic_metadata(), &messages_metadata(), &message);
+
+        assert!(id.starts_with("iggy_"));
+    }
+
+    #[test]
     fn injects_default_primary_key_and_metadata() {
         let sink = sink_with_config(base_config());
         let payload = Payload::Json(simd_json::json!({
@@ -952,8 +961,7 @@ mod tests {
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message)
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["name"], "Alice");
         assert_eq!(document["iggy_id"], expected_id);
@@ -976,8 +984,7 @@ mod tests {
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message)
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["id"], "existing");
         assert_eq!(document["iggy_id"], expected_id);
@@ -994,8 +1001,7 @@ mod tests {
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["iggy_offset"], 999);
         assert_eq!(document["iggy_stream"], "user-stream");
@@ -1012,8 +1018,7 @@ mod tests {
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["name"], "Alice");
         assert!(document["iggy_id"].as_str().is_some());
@@ -1029,8 +1034,7 @@ mod tests {
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message)
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["value"], json!(["a", "b"]));
         assert_eq!(document["iggy_id"], expected_id);
@@ -1046,8 +1050,7 @@ mod tests {
                 &messages_metadata(),
                 message(Payload::Raw(vec![0, 1, 2, 3])),
             )
-            .expect("prepare document")
-            .expect("document");
+            .expect("prepare document");
 
         assert_eq!(document["data"], "AAECAw==");
         assert_eq!(document["data_encoding"], ENCODING_BASE64);
