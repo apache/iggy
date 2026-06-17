@@ -30,13 +30,13 @@ use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::requests::messages::{PollMessagesRequest, SendMessagesHeader};
+use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
@@ -289,13 +289,6 @@ pub(crate) fn build_non_replicated_response(
                 response.map_or(NonReplicatedResponse::Empty, |response| {
                     NonReplicatedResponse::Bytes(response.to_bytes())
                 })
-            })
-        }
-        POLL_MESSAGES_CODE => {
-            let request =
-                PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::EmptyPolledMessages {
-                partition_id: request.partition_id.unwrap_or(0),
             })
         }
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
@@ -594,7 +587,6 @@ fn partition_response(
 
 pub(crate) enum NonReplicatedResponse {
     Empty,
-    EmptyPolledMessages { partition_id: u32 },
     Bytes(Bytes),
 }
 
@@ -608,13 +600,6 @@ impl NonReplicatedResponse {
     ) -> Message<ReplyHeader> {
         match self {
             Self::Empty => build_empty_reply(request_header, client_id, session, commit),
-            Self::EmptyPolledMessages { partition_id } => {
-                build_reply_with_body(request_header, client_id, session, commit, 16, |body| {
-                    body[..4].copy_from_slice(&partition_id.to_le_bytes());
-                    body[4..12].copy_from_slice(&0u64.to_le_bytes());
-                    body[12..16].copy_from_slice(&0u32.to_le_bytes());
-                })
-            }
             Self::Bytes(body) => {
                 build_reply_from_bytes(request_header, client_id, session, commit, &body)
             }
@@ -814,7 +799,11 @@ pub(crate) fn build_polled_messages_body(
             }
 
             let offset = batch.base_offset + u64::from(offset_delta);
-            let timestamp = batch.base_timestamp + u64::from(timestamp_delta);
+            // `base_timestamp` is the flat broker append time stamped once per
+            // batch; `timestamp_delta` is a per-message delta against the
+            // producer origin, so it only applies to `origin_timestamp`. Adding
+            // it to the broker base would mix two clocks.
+            let timestamp = batch.base_timestamp;
             let origin_timestamp = batch.origin_timestamp + u64::from(timestamp_delta);
 
             messages.extend_from_slice(checksum);

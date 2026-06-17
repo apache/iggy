@@ -101,9 +101,15 @@ impl FileStorage {
     /// seen under interleaved `on_replicate` calls (a queued op drained while
     /// the next op is freshly submitted).
     ///
-    /// The reservation is not rolled back on write error: the space stays
-    /// reserved, so the failing op leaves an uncommitted gap that recovery
-    /// truncates rather than a slot a later append could reuse mid-flight.
+    /// On write error the reservation is rolled back **only when no later
+    /// append has reserved space after us** (`write_offset == offset + len`).
+    /// Leaving the gap is unsafe: a subsequent append (e.g. a VSR retransmit
+    /// of this op) would write past the zero hole, fsync and ack, and on
+    /// reopen the recovery scan would hit the hole and truncate from there --
+    /// silently dropping the committed op that now sits above the gap. Rolling
+    /// back lets the next append reuse the slot instead. In the rare
+    /// interleave where another append already reserved after us, rolling back
+    /// would clobber its slot, so the gap is left for recovery in that case.
     ///
     /// # Errors
     /// Returns an I/O error if the write fails.
@@ -114,7 +120,12 @@ impl FileStorage {
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &mut *self.file.get() };
         let (result, _buf) = file.write_all_at(buf, offset).await.into();
-        result?;
+        if let Err(error) = result {
+            if self.write_offset.get() == offset + len {
+                self.write_offset.set(offset);
+            }
+            return Err(error);
+        }
         Ok(offset)
     }
 

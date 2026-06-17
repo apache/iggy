@@ -1257,14 +1257,28 @@ where
             //   idempotent-safe; log loudly for diagnosis.
             // - above the sequencer: journaling an op the sequencer has not
             //   assigned yet means the next local assignment would collide
-            //   with it. Not recoverable in place; crash in release too
-            //   rather than corrupt op assignment silently.
-            assert!(
-                header.op <= current_op,
-                "primary: prepare op {} ahead of sequencer {}; next op assignment would collide",
-                header.op,
-                current_op
-            );
+            //   with it. Unreachable today (view fences run first, one
+            //   primary per view, the chain stops before the primary), so
+            //   trip the invariant in debug; in release log loudly and drop
+            //   rather than crash a library or corrupt op assignment.
+            if header.op > current_op {
+                debug_assert!(
+                    header.op <= current_op,
+                    "primary: prepare op {} ahead of sequencer {}; next op assignment would collide",
+                    header.op,
+                    current_op
+                );
+                emit_partition_diag(
+                    tracing::Level::ERROR,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "primary prepare ahead of sequencer; dropping to avoid op-assignment collision",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+                );
+                return;
+            }
             if header.op < current_op {
                 emit_partition_diag(
                     tracing::Level::WARN,

@@ -461,26 +461,6 @@ pub struct SendMessages2MessageView<'a> {
 }
 
 #[allow(dead_code)]
-impl SendMessages2MessageView<'_> {
-    pub fn owned_message(&self, batch: &SendMessages2Header) -> IggyMessage2 {
-        IggyMessage2 {
-            header: IggyMessage2Header {
-                checksum: self.header.checksum,
-                id: self.header.id,
-                offset: batch.base_offset + u64::from(self.header.offset_delta),
-                timestamp: batch.base_timestamp,
-                origin_timestamp: batch.origin_timestamp + u64::from(self.header.timestamp_delta),
-                user_headers_length: self.header.user_headers_length,
-                payload_length: self.header.payload_length,
-            },
-            payload: Bytes::copy_from_slice(self.payload),
-            user_headers: (!self.user_headers.is_empty())
-                .then(|| Bytes::copy_from_slice(self.user_headers)),
-        }
-    }
-}
-
-#[allow(dead_code)]
 pub struct SendMessages2Iterator<'a> {
     blob: &'a [u8],
     position: usize,
@@ -558,19 +538,16 @@ pub fn convert_request_message(
     let request_header = *message.header();
     let total_size = request_header.size as usize;
     let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
-    if decode_request_slice(body).is_ok() {
+    if decode_batch_slice(body).is_ok() {
         return Ok(message);
     }
     SendMessages2Owned::from_legacy_request(namespace, body)?.encode_request(request_header)
 }
 
-/// Decode one stored batch slice (`[256B command header][blob]`) -- the
-/// persisted segment-file record format. Validates the batch checksum.
+/// Decode one batch slice (`[256B command header][blob]`), validating the
+/// batch checksum. The persisted segment-file record and the request slice
+/// share this layout, so both decode through here.
 pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
-    decode_request_slice(body)
-}
-
-fn decode_request_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
     }

@@ -1069,6 +1069,11 @@ where
                     // on data that is already gone.
                     let removed = partitions.remove(&namespace);
                     partitions.untombstone(&namespace);
+                    // A topic created then deleted before its `InsertOwned`
+                    // pass never drains parked frames the normal way; reclaim
+                    // them here so they cannot leak across many create-delete
+                    // races (the partition is gone, so the frames are moot).
+                    self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
                     if removed.is_none() {
@@ -1081,6 +1086,7 @@ where
                 }
                 ReconcileOp::RemoveRouted { namespace } => {
                     self.shards_table.remove(&namespace);
+                    self.discard_parked_partition_frames(namespace);
                 }
             }
         }
@@ -1153,6 +1159,25 @@ where
             Err(e) => {
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
             }
+        }
+    }
+
+    /// Drop parked frames for a namespace that will never materialise (it was
+    /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
+    /// reclaimed instead of leaking until process exit.
+    fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
+        if let Some(frames) = self
+            .pending_partition_frames
+            .borrow_mut()
+            .remove(&namespace)
+            && !frames.is_empty()
+        {
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                count = frames.len(),
+                "discarding parked partition frames for removed namespace"
+            );
         }
     }
 

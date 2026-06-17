@@ -730,11 +730,15 @@ impl TcpClient {
                     // hold the stream lock forever and wedge every later
                     // request on this client. On expiry drop the stream --
                     // a late reply would desync framing for the next request.
-                    let header_read = tokio::time::timeout(
-                        RESPONSE_READ_TIMEOUT,
-                        stream.read(&mut response_header),
-                    )
-                    .await;
+                    //
+                    // One deadline spans BOTH the header and body reads: a
+                    // reply that delivers a header then stalls must not get a
+                    // fresh full timeout for the body (which would allow up to
+                    // 2x `RESPONSE_READ_TIMEOUT` total).
+                    let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                    let header_read =
+                        tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
+                            .await;
                     let Ok(header_read) = header_read else {
                         error!(
                             "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
@@ -755,8 +759,8 @@ impl TcpClient {
                     let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
                     let body = if body_size > 0 {
                         let mut body = BytesMut::with_capacity(body_size);
-                        let body_read = tokio::time::timeout(
-                            RESPONSE_READ_TIMEOUT,
+                        let body_read = tokio::time::timeout_at(
+                            response_deadline,
                             stream.read_buf(&mut body, body_size),
                         )
                         .await;
