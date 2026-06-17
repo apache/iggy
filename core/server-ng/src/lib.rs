@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod config_writer;
+pub mod consumer_group;
 pub mod dispatch;
 pub mod login_register;
 pub mod partition_helpers;

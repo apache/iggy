@@ -18,9 +18,12 @@
 // a2a_jwt is HTTP-only (JWT against the HTTP transport); vsr has no HTTP.
 #[cfg(not(feature = "vsr"))]
 mod a2a_jwt;
-// Consumer groups are not implemented under vsr yet.
+// Polling-based consumer-group scenarios are not implemented under vsr yet.
 #[cfg(not(feature = "vsr"))]
 mod cg;
+// The ported round-robin membership join scenario runs against server-ng.
+#[cfg(feature = "vsr")]
+mod cg_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter); revisit under vsr once basics are green.
 #[cfg(not(feature = "vsr"))]

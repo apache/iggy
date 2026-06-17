@@ -70,6 +70,8 @@ pub enum Operation {
     UpdatePermissions = 145,
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
+    JoinConsumerGroup = 148,
+    LeaveConsumerGroup = 149,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
@@ -121,6 +123,8 @@ impl Operation {
                 | Self::UpdatePermissions
                 | Self::CreatePersonalAccessToken
                 | Self::DeletePersonalAccessToken
+                | Self::JoinConsumerGroup
+                | Self::LeaveConsumerGroup
         )
     }
 
@@ -181,6 +185,8 @@ impl Operation {
             | Self::UpdatePermissions
             | Self::CreatePersonalAccessToken
             | Self::DeletePersonalAccessToken
+            | Self::JoinConsumerGroup
+            | Self::LeaveConsumerGroup
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset

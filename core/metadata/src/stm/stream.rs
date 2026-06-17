@@ -339,6 +339,54 @@ impl Streams {
             .map(|(_, next_partition_id)| next_partition_id)
     }
 
+    /// Pick the next partition for a `Balanced` send, advancing the topic's
+    /// round-robin counter. `None` if the topic has no partitions.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn next_balanced_partition(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<u32> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let count = topic.partitions.len();
+            if count == 0 {
+                return None;
+            }
+            let current = topic
+                .round_robin_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some((c + 1) % count))
+                .unwrap_or(0);
+            Some(topic.partitions[current % count].id as u32)
+        })
+    }
+
+    /// Pick the partition for a `MessagesKey` send by hashing the key modulo
+    /// the partition count. `None` if the topic has no partitions.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn partition_by_messages_key(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        key: &[u8],
+    ) -> Option<u32> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let count = topic.partitions.len();
+            if count == 0 {
+                return None;
+            }
+            let index = iggy_common::calculate_32(key) as usize % count;
+            Some(topic.partitions[index % count].id as u32)
+        })
+    }
+
     #[must_use]
     pub fn namespace_from_partition(
         &self,

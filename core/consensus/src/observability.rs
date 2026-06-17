@@ -633,6 +633,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::DeleteSegments => "delete_segments",
         Operation::CreateConsumerGroup => "create_consumer_group",
         Operation::DeleteConsumerGroup => "delete_consumer_group",
+        Operation::JoinConsumerGroup => "join_consumer_group",
+        Operation::LeaveConsumerGroup => "leave_consumer_group",
         Operation::CreateUser => "create_user",
         Operation::UpdateUser => "update_user",
         Operation::DeleteUser => "delete_user",

@@ -29,9 +29,11 @@ use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    POLL_MESSAGES_CODE,
 };
+use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
@@ -42,6 +44,7 @@ use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsReques
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
+use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
@@ -72,15 +75,16 @@ use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Build the `get_me` reply for the requesting connection, sourced
-/// entirely from the per-shard [`SessionManager`] (`user_id`, transport
-/// kind, peer address) -- no message-bus lookup. `consumer_groups` is
-/// empty (see [`client_record_to_response`]).
+/// Build the `get_me` reply for the requesting connection. Identity
+/// (`user_id`, transport kind, peer address) comes from the per-shard
+/// [`SessionManager`]; the `consumer_groups` list is read from the
+/// (replicated) consumer-group STM by the connection's bound VSR client id.
 pub(crate) fn build_get_me_response(
+    shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) -> ClientDetailsResponse {
-    let client = sessions
+    let mut client = sessions
         .borrow()
         .client_record(transport_client_id)
         .map_or_else(
@@ -100,9 +104,39 @@ pub(crate) fn build_get_me_response(
             },
             |record| connected_client_to_response(&record),
         );
+
+    // The wire `consumer_groups` list keys off the connection's bound VSR
+    // client id (the same id recorded as a group member by the replicated
+    // Join op), not the transport id.
+    let consumer_groups = sessions
+        .borrow()
+        .get_session(transport_client_id)
+        .map(|(vsr_client_id, _)| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .consumer_groups()
+                .memberships(vsr_client_id)
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(
+            |(stream_id, topic_id, group_id)| ConsumerGroupInfoResponse {
+                stream_id,
+                topic_id,
+                group_id,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        client.consumer_groups_count = consumer_groups.len() as u32;
+    }
     ClientDetailsResponse {
         client,
-        consumer_groups: Vec::new(),
+        consumer_groups,
     }
 }
 
@@ -110,11 +144,10 @@ pub(crate) fn build_get_me_response(
 /// `SessionManager` or a `get_clients` gather) into the wire
 /// [`ClientResponse`]. Shared by `get_me`, `get_clients`, and `get_client`.
 ///
-/// TODO(consumer-group-membership): `consumer_groups_count` is always 0
-/// -- server-ng does not yet track which consumer groups a connection
-/// joined. Populate once the partition-reconciliation / consumer-group
-/// rebalancing work lands; until then `get_me` / `get_clients` report no
-/// memberships.
+/// `consumer_groups_count` is left 0 here; `get_me` overrides it from the
+/// consumer-group STM (see [`build_get_me_response`]). The `get_clients` /
+/// `get_client` gather paths report 0 until per-client membership is
+/// resolved across the shard mesh.
 pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
     // The transport client id is a u128 `(shard << 112) | seq`; the wire
     // `client_id` is the u32 seq tail.
@@ -209,8 +242,22 @@ fn resolve_send_messages_namespace(
     shard: &Rc<ServerNgShard>,
     header: &SendMessagesHeader,
 ) -> Result<IggyNamespace, IggyError> {
-    let WirePartitioning::PartitionId(partition_id) = header.partitioning else {
-        return Err(IggyError::FeatureUnavailable);
+    let partition_id = match &header.partitioning {
+        WirePartitioning::PartitionId(partition_id) => *partition_id,
+        WirePartitioning::Balanced => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .next_balanced_partition(&header.stream_id, &header.topic_id)
+            .ok_or(IggyError::InvalidIdentifier)?,
+        WirePartitioning::MessagesKey(key) => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+            .ok_or(IggyError::InvalidIdentifier)?,
     };
     resolve_partition_namespace(
         shard,
@@ -290,6 +337,18 @@ pub(crate) fn build_non_replicated_response(
                     NonReplicatedResponse::Bytes(response.to_bytes())
                 })
             })
+        }
+        GET_CONSUMER_GROUP_CODE => {
+            let request = GetConsumerGroupRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let response = shard.plane.metadata().mux_stm.consumer_groups().details(
+                &request.stream_id,
+                &request.topic_id,
+                &request.group_id,
+            );
+            Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
+                NonReplicatedResponse::Bytes(response.to_bytes())
+            }))
         }
         POLL_MESSAGES_CODE => {
             let request =

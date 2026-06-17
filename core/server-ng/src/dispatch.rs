@@ -27,6 +27,7 @@ use crate::auth::{
     verify_login_credentials, verify_pat_credentials,
 };
 use crate::bootstrap::{ServerNgShard, ServerNgShardHandle};
+use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
@@ -57,7 +58,7 @@ use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::RegisterSubmitError;
+use metadata::impls::metadata::{RegisterSubmitError, StreamsFrontend};
 use partitions::{Partition, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -557,6 +558,20 @@ async fn handle_client_request(
             return;
         }
     };
+    // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
+    // partition count for Join) before replication; see `crate::consumer_group`.
+    let request = match maybe_rewrite_consumer_group_request(shard, request) {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "dropping consumer-group request with invalid payload"
+            );
+            return;
+        }
+    };
     let request_header = *request.header();
     // Replicated request: run consensus on the metadata owner (shard 0) and
     // bring the committed reply back here. This shard owns the connection,
@@ -639,7 +654,7 @@ async fn handle_non_replicated_request(
             // sourced from this shard's `SessionManager` (not `IggyMetadata`),
             // so it is built here rather than in
             // `build_non_replicated_response`.
-            let response = build_get_me_response(sessions, transport_client_id);
+            let response = build_get_me_response(shard, sessions, transport_client_id);
             send_non_replicated_bytes(
                 shard,
                 &request,
@@ -983,17 +998,36 @@ fn decode_poll_request(
 ) -> Result<DecodedPollRequest, IggyError> {
     let wire = PollMessagesRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
+    let strategy = polling_strategy_from_wire(&wire.strategy)?;
+    let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
+
+    // A consumer-group poll carries the group identifier (not a partition):
+    // the server picks the partition by advancing the polling member's
+    // round-robin cursor, mirroring the legacy server.
+    if wire.consumer.kind == 2 {
+        let (group_id, partition_id, member_id) = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .consumer_groups()
+            .resolve_member_next_partition(
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.consumer.id,
+                request.header().client,
+            )
+            .ok_or(IggyError::InvalidIdentifier)?;
+        let namespace =
+            resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
+        let consumer = PollingConsumer::ConsumerGroup(group_id as usize, member_id);
+        return Ok((namespace, partition_id, consumer, args));
+    }
+
     let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
-    let strategy = polling_strategy_from_wire(&wire.strategy)?;
-    Ok((
-        namespace,
-        partition_id,
-        consumer,
-        PollingArgs::new(strategy, wire.count, wire.auto_commit),
-    ))
+    Ok((namespace, partition_id, consumer, args))
 }
 
 fn decode_consumer_offset_request(

@@ -180,8 +180,16 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
         "consumer_group.delete",
         Operation::DeleteConsumerGroup,
     ),
-    CommandMeta::non_replicated(JOIN_CONSUMER_GROUP_CODE, "consumer_group.join"),
-    CommandMeta::non_replicated(LEAVE_CONSUMER_GROUP_CODE, "consumer_group.leave"),
+    CommandMeta::replicated(
+        JOIN_CONSUMER_GROUP_CODE,
+        "consumer_group.join",
+        Operation::JoinConsumerGroup,
+    ),
+    CommandMeta::replicated(
+        LEAVE_CONSUMER_GROUP_CODE,
+        "consumer_group.leave",
+        Operation::LeaveConsumerGroup,
+    ),
     // Login + Register (PAT - Personal Access Token variant)
     CommandMeta::non_replicated(LOGIN_REGISTER_WITH_PAT_CODE, "user.login_register_with_pat"),
 ];
@@ -272,6 +280,8 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         Operation::DeleteSegments => 43,
         Operation::CreateConsumerGroup => 46,
         Operation::DeleteConsumerGroup => 47,
+        Operation::JoinConsumerGroup => 48,
+        Operation::LeaveConsumerGroup => 49,
         Operation::CreateUser => 9,
         Operation::UpdateUser => 11,
         Operation::DeleteUser => 10,
