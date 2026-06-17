@@ -321,6 +321,218 @@ TEST_F(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
     EXPECT_GE(second_stats.clients_count, 1u);
 }
 
+TEST_F(LowLevelE2E_Client, GetTopicReturnsTopicForExistingTopic) {
+    RecordProperty("description", "Returns topic details for an existing topic.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
+                                         "duration", 1000, "1GiB"));
+
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        EXPECT_EQ(topic_details.name, topic_name);
+        EXPECT_EQ(topic_details.partitions_count, 3u);
+        EXPECT_EQ(topic_details.partitions.size(), 3u);
+        EXPECT_EQ(topic_details.compression_algorithm, "gzip");
+        EXPECT_EQ(topic_details.replication_factor, 1u);
+        EXPECT_EQ(topic_details.message_expiry, 1000u);
+        EXPECT_EQ(topic_details.max_topic_size, 1024ULL * 1024ULL * 1024ULL);
+    });
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicBeforeLoginThrows) {
+    RecordProperty("description", "Rejects get_topic before connect, and after connect but before login.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(unauthenticated_client->get_topic(make_string_identifier(stream_name),
+                                                   make_string_identifier(topic_name)),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->get_topic(make_string_identifier(stream_name),
+                                                   make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicWithWrongStreamIdThrows) {
+    RecordProperty("description", "Rejects get_topic when the topic belongs to a different stream.");
+    const std::string first_stream_name  = GetRandomName();
+    const std::string second_stream_name = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    iggy::ffi::Client *client            = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(first_stream_name));
+    TrackStream(first_stream_name);
+    ASSERT_NO_THROW(client->create_stream(second_stream_name));
+    TrackStream(second_stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_THROW(client->get_topic(make_string_identifier(second_stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicWithWrongTopicThrows) {
+    RecordProperty("description", "Rejects get_topic when the topic does not exist in the stream.");
+    const std::string stream_name      = GetRandomName();
+    const std::string topic_name       = GetRandomName();
+    const std::string wrong_topic_name = GetRandomName();
+    iggy::ffi::Client *client          = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(wrong_topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicAfterStreamDeletionThrows) {
+    RecordProperty("description", "Rejects get_topic after the stream has been deleted.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
+
+    ASSERT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicAfterTopicDeletionThrows) {
+    RecordProperty("description", "Rejects get_topic after the topic has been deleted.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+
+    ASSERT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicReturnsEmptyPartitionsForZeroPartitionTopic) {
+    RecordProperty("description", "Returns an empty partitions vector for a topic created with zero partitions.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 0, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        EXPECT_EQ(topic_details.name, topic_name);
+        EXPECT_EQ(topic_details.partitions_count, 0u);
+        EXPECT_TRUE(topic_details.partitions.empty());
+    });
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicReturnsMaxBoundaryPartitionCount) {
+    RecordProperty("description", "Returns the maximum boundary partition count for a topic created with it.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1000, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        EXPECT_EQ(topic_details.name, topic_name);
+        EXPECT_EQ(topic_details.partitions_count, 1000u);
+        EXPECT_EQ(topic_details.partitions.size(), 1000u);
+    });
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicIsStableAcrossBackToBackCalls) {
+    RecordProperty("description", "Returns stable topic details across back-to-back get_topic calls.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
+                                         "duration", 1000, "1GiB"));
+
+    iggy::ffi::TopicDetails first_topic{};
+    iggy::ffi::TopicDetails second_topic{};
+    ASSERT_NO_THROW({
+        first_topic  = client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        second_topic = client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+    });
+
+    EXPECT_EQ(static_cast<std::string>(second_topic.name), static_cast<std::string>(first_topic.name));
+    EXPECT_EQ(second_topic.message_expiry, first_topic.message_expiry);
+    EXPECT_EQ(static_cast<std::string>(second_topic.compression_algorithm),
+              static_cast<std::string>(first_topic.compression_algorithm));
+    EXPECT_EQ(second_topic.max_topic_size, first_topic.max_topic_size);
+    EXPECT_EQ(second_topic.replication_factor, first_topic.replication_factor);
+    EXPECT_EQ(second_topic.partitions_count, first_topic.partitions_count);
+    EXPECT_EQ(second_topic.partitions.size(), first_topic.partitions.size());
+}
+
+TEST_F(LowLevelE2E_Client, GetTopicAgreesWithGetStreamTopicSummary) {
+    RecordProperty("description", "Returns topic details that agree with get_stream topic summary fields.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "gzip", 1,
+                                         "duration", 1000, "1GiB"));
+
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        ASSERT_EQ(stream_details.topics.size(), 1u);
+
+        const auto topic_summary = stream_details.topics.front();
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+
+        EXPECT_EQ(static_cast<std::string>(topic_details.name), static_cast<std::string>(topic_summary.name));
+        EXPECT_EQ(topic_details.message_expiry, topic_summary.message_expiry);
+        EXPECT_EQ(static_cast<std::string>(topic_details.compression_algorithm),
+                  static_cast<std::string>(topic_summary.compression_algorithm));
+        EXPECT_EQ(topic_details.max_topic_size, topic_summary.max_topic_size);
+        EXPECT_EQ(topic_details.replication_factor, topic_summary.replication_factor);
+        EXPECT_EQ(topic_details.partitions_count, topic_summary.partitions_count);
+        EXPECT_EQ(topic_details.partitions.size(), topic_summary.partitions_count);
+    });
+}
+
 TEST_F(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_me before connect, and after connect but before login.");
     iggy::ffi::Client *client = GetLoggedOutClient();
