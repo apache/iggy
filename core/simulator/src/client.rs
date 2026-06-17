@@ -393,6 +393,7 @@ impl SimClient {
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
+            only_if_expired: false,
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
     }

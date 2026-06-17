@@ -49,7 +49,7 @@ use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader, WireDecode, 
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::RegisterSubmitError;
+use metadata::impls::metadata::MetadataSubmitError;
 use secrecy::ExposeSecret;
 use server_common::Message;
 use shard::{ConnectedClientInfo, ListClientsHandler};
@@ -619,7 +619,7 @@ async fn send_non_replicated_bytes(
 pub(crate) async fn submit_register_on_owner(
     shard: &Rc<ServerNgShard>,
     vsr_client_id: u128,
-) -> Result<u64, RegisterSubmitError> {
+) -> Result<u64, MetadataSubmitError> {
     if shard.id == 0 {
         return shard
             .plane
@@ -634,7 +634,7 @@ pub(crate) async fn submit_register_on_owner(
     });
     match rx.recv().await {
         Ok(Some(session)) => Ok(session),
-        _ => Err(RegisterSubmitError::Canceled),
+        _ => Err(MetadataSubmitError::Canceled),
     }
 }
 
@@ -645,7 +645,7 @@ async fn submit_logout_on_owner(
     vsr_client_id: u128,
     session: u64,
     request: u64,
-) -> Result<u64, RegisterSubmitError> {
+) -> Result<u64, MetadataSubmitError> {
     if shard.id == 0 {
         return shard
             .plane
@@ -662,7 +662,7 @@ async fn submit_logout_on_owner(
     });
     match rx.recv().await {
         Ok(Some(commit)) => Ok(commit),
-        _ => Err(RegisterSubmitError::Canceled),
+        _ => Err(MetadataSubmitError::Canceled),
     }
 }
 

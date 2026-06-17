@@ -37,6 +37,7 @@ use iggy_common::{
 };
 use serde::{Deserialize, Serialize};
 use slab::Slab;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 // ============================================================================
@@ -96,6 +97,12 @@ define_state! {
         // touched via single-key `.get` / `.insert` / `.remove`. Never
         // iterate. Reach for `BTreeMap` the first time iteration is needed.
         personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
+        // Expiry-ordered index of expiring PATs: `(expiry_micros, user_id,
+        // name)`. Never-expiring tokens are absent. Unlike the sibling
+        // `AHashMap` index above, a `BTreeSet` is safe to iterate (its order
+        // is deterministic across replicas), which lets the PAT cleaner find
+        // expired tokens in O(log n) per tick instead of scanning every token.
+        personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)>,
         permissioner: Permissioner,
     }
 }
@@ -125,6 +132,24 @@ impl UsersInner {
             }
             WireIdentifier::String(name) => self.index.get(name.as_str()).map(|&id| id as usize),
         }
+    }
+
+    /// Collect `(user_id, name)` for every expired personal access token.
+    ///
+    /// Walks the expiry-ordered `personal_access_token_expiry_index`,
+    /// stopping at the first not-yet-expired entry, so a tick with nothing
+    /// due costs O(log n), not a full O(users x tokens) scan. The `BTreeSet`
+    /// is sorted, so iteration is deterministic across replicas (the sibling
+    /// `personal_access_token_index` `AHashMap` is not); the leader-only
+    /// caller replicates each delete regardless.
+    #[must_use]
+    pub fn expired_personal_access_tokens(&self, now: IggyTimestamp) -> Vec<(UserId, Arc<str>)> {
+        let now_micros = now.as_micros();
+        self.personal_access_token_expiry_index
+            .iter()
+            .take_while(|(expiry_micros, _, _)| *expiry_micros <= now_micros)
+            .map(|(_, user_id, name)| (*user_id, Arc::clone(name)))
+            .collect()
     }
 }
 
@@ -252,16 +277,23 @@ impl WireDecode for CreatePersonalAccessTokenRequest {
 pub struct DeletePersonalAccessTokenRequest {
     pub user_id: UserId,
     pub name: WireName,
+    /// `true` for a cleaner-originated delete: apply removes the token only if
+    /// the stored token is still expired as of the prepare timestamp, so a
+    /// token deleted and recreated under the same name with a fresh expiry
+    /// between the cleaner's snapshot read and this commit survives. `false`
+    /// for an unconditional client delete by name.
+    pub only_if_expired: bool,
 }
 
 impl WireEncode for DeletePersonalAccessTokenRequest {
     fn encoded_size(&self) -> usize {
-        4 + self.name.encoded_size()
+        4 + self.name.encoded_size() + 1
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.user_id);
         self.name.encode(buf);
+        buf.put_u8(u8::from(self.only_if_expired));
     }
 }
 
@@ -269,7 +301,22 @@ impl WireDecode for DeletePersonalAccessTokenRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
         let user_id = read_u32_le(buf, 0)?;
         let (name, consumed) = WireName::decode(&buf[4..])?;
-        Ok((Self { user_id, name }, 4 + consumed))
+        let pos = 4 + consumed;
+        let Some(&flag) = buf.get(pos) else {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: 1,
+                have: 0,
+            });
+        };
+        Ok((
+            Self {
+                user_id,
+                name,
+                only_if_expired: flag != 0,
+            },
+            pos + 1,
+        ))
     }
 }
 
@@ -371,6 +418,13 @@ impl StateHandler for DeleteUserRequest {
             if let Some(tokens) = state.personal_access_tokens.remove(&(user_id as UserId)) {
                 for pat in tokens.values() {
                     state.personal_access_token_index.remove(&pat.token);
+                    if let Some(expiry_at) = pat.expiry_at {
+                        state.personal_access_token_expiry_index.remove(&(
+                            expiry_at.as_micros(),
+                            user_id as UserId,
+                            Arc::clone(&pat.name),
+                        ));
+                    }
                 }
             }
         }
@@ -422,8 +476,7 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             .personal_access_tokens
             .entry(self.user_id)
             .or_default();
-        let name_arc: Arc<str> = Arc::from(self.name.as_str());
-        if user_tokens.contains_key(&name_arc) {
+        if user_tokens.contains_key(self.name.as_str()) {
             return Bytes::new();
         }
 
@@ -442,22 +495,56 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             .expect("token_hash is hex-ASCII generated by the primary");
         let pat =
             PersonalAccessToken::raw(self.user_id, self.name.as_ref(), token_hash_str, expiry_at);
+        // `raw` already minted one `Arc<str>` for the name; share that single
+        // allocation across the map key and both indices rather than
+        // re-allocating the name per consumer.
+        let name: Arc<str> = Arc::clone(&pat.name);
         let token_hash = Arc::clone(&pat.token);
-        user_tokens.insert(name_arc, pat);
+        user_tokens.insert(Arc::clone(&name), pat);
+        if let Some(expiry_at) = expiry_at {
+            state.personal_access_token_expiry_index.insert((
+                expiry_at.as_micros(),
+                self.user_id,
+                Arc::clone(&name),
+            ));
+        }
         state
             .personal_access_token_index
-            .insert(token_hash, (self.user_id, Arc::from(self.name.as_str())));
+            .insert(token_hash, (self.user_id, name));
         Bytes::new()
     }
 }
 
 impl StateHandler for DeletePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
         if let Some(user_tokens) = state.personal_access_tokens.get_mut(&self.user_id) {
             let name_arc: Arc<str> = Arc::from(self.name.as_str());
+            if self.only_if_expired {
+                // Cleaner-originated. Re-check the *currently stored* token
+                // against this prepare's replicated timestamp and skip unless
+                // it is still expired. A token deleted and recreated under the
+                // same name with a fresh expiry between the cleaner's snapshot
+                // and this commit is ordered before this delete, so apply sees
+                // the new expiry and preserves it. A never-expiring recreate
+                // (`expiry_at == None`) is likewise preserved.
+                let still_expired = user_tokens
+                    .get(&name_arc)
+                    .and_then(|pat| pat.expiry_at)
+                    .is_some_and(|expiry_at| expiry_at.as_micros() <= timestamp.as_micros());
+                if !still_expired {
+                    return Bytes::new();
+                }
+            }
             if let Some(pat) = user_tokens.remove(&name_arc) {
                 state.personal_access_token_index.remove(&pat.token);
+                if let Some(expiry_at) = pat.expiry_at {
+                    state.personal_access_token_expiry_index.remove(&(
+                        expiry_at.as_micros(),
+                        self.user_id,
+                        name_arc,
+                    ));
+                }
             }
         }
         Bytes::new()
@@ -624,6 +711,8 @@ impl Snapshotable for Users {
             AHashMap::new();
         let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)> =
             AHashMap::new();
+        let mut personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)> =
+            BTreeSet::new();
         for (user_id, tokens) in snapshot.personal_access_tokens {
             let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
             for (name, pat_snap) in tokens {
@@ -634,6 +723,13 @@ impl Snapshotable for Users {
                     &pat_snap.token,
                     pat_snap.expiry_at,
                 );
+                if let Some(expiry_at) = pat.expiry_at {
+                    personal_access_token_expiry_index.insert((
+                        expiry_at.as_micros(),
+                        user_id,
+                        Arc::clone(&name),
+                    ));
+                }
                 personal_access_token_index
                     .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
                 token_map.insert(name, pat);
@@ -679,6 +775,7 @@ impl Snapshotable for Users {
             items,
             personal_access_tokens,
             personal_access_token_index,
+            personal_access_token_expiry_index,
             permissioner,
             last_result: None,
         };
@@ -713,6 +810,7 @@ mod tests {
         let request = DeletePersonalAccessTokenRequest {
             user_id: 11,
             name: WireName::new("staging").unwrap(),
+            only_if_expired: true,
         };
 
         let bytes = request.to_bytes();
@@ -743,10 +841,102 @@ mod tests {
         let delete = DeletePersonalAccessTokenRequest {
             user_id: 5,
             name: WireName::new("deploy").unwrap(),
+            only_if_expired: false,
         };
         delete.apply(&mut users, IggyTimestamp::now());
 
         assert!(users.personal_access_tokens[&5].is_empty());
         assert!(users.personal_access_token_index.is_empty());
+    }
+
+    #[test]
+    fn delete_keeps_expiry_index_in_sync() {
+        let mut users = UsersInner::new();
+        // Created at the epoch with a 1-unit expiry: a `Some(expiry_at)`, so
+        // it lands in the expiry index (a never-expiring token would not).
+        CreatePersonalAccessTokenRequest {
+            user_id: 7,
+            name: WireName::new("ci").unwrap(),
+            expiry: 1,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+        assert_eq!(users.personal_access_token_expiry_index.len(), 1);
+
+        DeletePersonalAccessTokenRequest {
+            user_id: 7,
+            name: WireName::new("ci").unwrap(),
+            only_if_expired: false,
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+        assert!(users.personal_access_token_expiry_index.is_empty());
+    }
+
+    #[test]
+    fn expiry_gated_delete_skips_token_until_expired() {
+        let mut users = UsersInner::new();
+        // Created at the epoch with a 1-unit expiry, so it lands in the expiry
+        // index with a `Some(expiry_at)` just after the epoch.
+        CreatePersonalAccessTokenRequest {
+            user_id: 3,
+            name: WireName::new("foo").unwrap(),
+            expiry: 1,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+
+        // Gated delete stamped at the epoch: the token's expiry is still in the
+        // future relative to this prepare, so the cleaner-style delete is a
+        // no-op. Models a fresh recreate racing the cleaner.
+        DeletePersonalAccessTokenRequest {
+            user_id: 3,
+            name: WireName::new("foo").unwrap(),
+            only_if_expired: true,
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+        assert!(users.personal_access_tokens[&3].contains_key("foo"));
+        assert_eq!(users.personal_access_token_expiry_index.len(), 1);
+
+        // Gated delete stamped now (>> the epoch+1 expiry): genuinely expired,
+        // so it is removed and the indices stay in sync.
+        DeletePersonalAccessTokenRequest {
+            user_id: 3,
+            name: WireName::new("foo").unwrap(),
+            only_if_expired: true,
+        }
+        .apply(&mut users, IggyTimestamp::now());
+        assert!(users.personal_access_tokens[&3].is_empty());
+        assert!(users.personal_access_token_expiry_index.is_empty());
+        assert!(users.personal_access_token_index.is_empty());
+    }
+
+    #[test]
+    fn expired_personal_access_tokens_collects_only_expired() {
+        let mut users = UsersInner::new();
+        // Created at the epoch with a 1-unit expiry: expired relative to now.
+        for (user_id, name, fill) in [(5u32, "expired", b'a'), (9u32, "stale", b'b')] {
+            CreatePersonalAccessTokenRequest {
+                user_id,
+                name: WireName::new(name).unwrap(),
+                expiry: 1,
+                token_hash: [fill; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, IggyTimestamp::zero());
+        }
+        // expiry 0 -> ServerDefault -> no expiry_at, so never collected as expired.
+        CreatePersonalAccessTokenRequest {
+            user_id: 5,
+            name: WireName::new("forever").unwrap(),
+            expiry: 0,
+            token_hash: [b'c'; PAT_TOKEN_HASH_BYTES],
+        }
+        .apply(&mut users, IggyTimestamp::zero());
+
+        let mut expired = users.expired_personal_access_tokens(IggyTimestamp::now());
+        expired.sort();
+        assert_eq!(
+            expired,
+            vec![(5, Arc::from("expired")), (9, Arc::from("stale"))]
+        );
     }
 }
