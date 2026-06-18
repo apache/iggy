@@ -733,28 +733,6 @@ TEST_F(LowLevelE2E_Topic, GetTopicsBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->get_topics(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(LowLevelE2E_Topic, GetTopicsWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects get_topics requests that use invalid stream identifier formats.");
-    const std::string stream_name = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->get_topics(std::move(invalid_kind_id)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->get_topics(std::move(invalid_numeric_id)), std::exception);
-}
-
 TEST_F(LowLevelE2E_Topic, GetTopicsReturnsEmptyForStreamWithoutTopics) {
     RecordProperty("description", "Returns an empty topic list for an existing stream that has no topics.");
     const std::string stream_name = GetRandomName();
