@@ -34,6 +34,13 @@ runs:
       if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
+    - name: Configure Cargo network retries
+      if: inputs.task != 'lint'
+      shell: bash
+      run: |
+        echo "CARGO_HTTP_MULTIPLEXING=false" >> "$GITHUB_ENV"
+        echo "CARGO_NET_RETRY=10" >> "$GITHUB_ENV"
+
     - name: Install clang-format
       if: inputs.task == 'lint'
       shell: bash
