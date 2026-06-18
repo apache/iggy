@@ -234,6 +234,44 @@ impl TestFixture for OpenSearchSourcePreCreatedFixture {
     }
 }
 
+/// OpenSearch source fixture with pre-created index and a small `batch_size` for
+/// pagination integration tests.
+pub struct OpenSearchSourceSmallBatchFixture {
+    inner: OpenSearchSourceFixture,
+}
+
+impl std::ops::Deref for OpenSearchSourceSmallBatchFixture {
+    type Target = OpenSearchSourceFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl OpenSearchOps for OpenSearchSourceSmallBatchFixture {
+    fn container(&self) -> &OpenSearchContainer {
+        &self.inner.container
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        &self.inner.http_client
+    }
+}
+
+#[async_trait]
+impl TestFixture for OpenSearchSourceSmallBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = OpenSearchSourceFixture::setup().await?;
+        inner.setup_index().await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_BATCH_SIZE.to_string(), "2".to_string());
+        envs
+    }
+}
+
 /// OpenSearch source fixture pointing at an index that is never created,
 /// for exercising the connector's "missing index" failure path.
 pub struct OpenSearchSourceMissingIndexFixture {

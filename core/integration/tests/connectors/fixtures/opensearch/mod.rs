@@ -22,5 +22,5 @@ pub mod source;
 
 pub use source::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
-    OpenSearchSourceTypedFieldsFixture,
+    OpenSearchSourceSmallBatchFixture, OpenSearchSourceTypedFieldsFixture,
 };

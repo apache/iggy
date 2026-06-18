@@ -35,9 +35,7 @@ use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
 
 mod state_manager;
-use crate::state_manager::{
-    SOURCE_STATE_VERSION, SourceState, validate_state_storage_config,
-};
+use crate::state_manager::{SOURCE_STATE_VERSION, SourceState, validate_state_storage_config};
 
 source_connector!(OpenSearchSource);
 
@@ -68,6 +66,8 @@ struct State {
 struct ProcessingStats {
     #[serde(default)]
     total_bytes_processed: u64,
+    /// Running cumulative average over the connector's lifetime, persisted and accumulated
+    /// across restarts. Reflects long-term throughput baseline, not session-only average.
     #[serde(default)]
     avg_batch_processing_time_ms: f64,
     #[serde(default)]
@@ -270,31 +270,38 @@ impl OpenSearchSource {
             )));
         }
 
-        let response_body: Value = response
+        let mut response_body: Value = response
             .json()
             .await
             .map_err(|e| Error::Storage(format!("Failed to parse search response: {e}")))?;
 
-        let hits = response_body
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
-            .cloned()
+        let hits: Vec<Value> = response_body
+            .get_mut("hits")
+            .and_then(|h| h.get_mut("hits"))
+            .and_then(|arr| arr.as_array_mut())
+            .map(std::mem::take)
             .unwrap_or_default();
 
         let mut messages = Vec::with_capacity(hits.len());
         let mut batch_bytes = 0u64;
-        let mut last_search_after = None;
+        let mut last_sort: Option<&Vec<Value>> = None;
         let mut last_poll_timestamp = None;
 
         for hit in &hits {
-            if let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) {
-                last_search_after = Some(sort.clone());
-            }
+            let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) else {
+                warn!(
+                    connector_id = self.id,
+                    hit_id = hit.get("_id").and_then(|value| value.as_str()),
+                    "Skipping OpenSearch hit without sort tuple; document will not be published"
+                );
+                continue;
+            };
 
             let Some(source) = hit.get("_source") else {
                 continue;
             };
+
+            last_sort = Some(sort);
 
             if let Some(timestamp_value) = source.get(timestamp_field)
                 && let Some(timestamp_utc) = parse_document_timestamp(timestamp_value)
@@ -318,21 +325,61 @@ impl OpenSearchSource {
 
         Ok(SearchOutcome {
             messages,
-            search_after: last_search_after,
+            search_after: last_sort.map(ToOwned::to_owned),
             last_poll_timestamp,
             batch_bytes,
         })
     }
 
-    async fn apply_search_outcome(&self, outcome: &SearchOutcome) {
+    async fn finalize_poll(
+        &self,
+        outcome: SearchOutcome,
+        processing_time_ms: f64,
+    ) -> (Vec<ProducedMessage>, Option<ConnectorState>) {
         let mut state = self.state.lock().await;
         state.total_documents_fetched += outcome.messages.len();
         state.poll_count += 1;
-        state.search_after = outcome.search_after.clone();
+        state.search_after = outcome.search_after;
         if let Some(timestamp) = outcome.last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
         state.processing_stats.total_bytes_processed += outcome.batch_bytes;
+
+        if outcome.messages.is_empty() {
+            state.processing_stats.empty_polls_count += 1;
+        } else {
+            state.processing_stats.successful_polls_count += 1;
+            state.processing_stats.last_successful_poll = Some(Utc::now());
+        }
+
+        let total_polls = state.processing_stats.successful_polls_count
+            + state.processing_stats.empty_polls_count;
+        state.processing_stats.avg_batch_processing_time_ms =
+            (state.processing_stats.avg_batch_processing_time_ms * (total_polls - 1) as f64
+                + processing_time_ms)
+                / total_polls as f64;
+
+        let produced_count = outcome.messages.len();
+        let total_documents_fetched = state.total_documents_fetched;
+        let messages = outcome.messages;
+        let persisted_state = self.serialize_state(&state);
+        drop(state);
+
+        if self.verbose {
+            info!(
+                "OpenSearch source connector ID: {} produced {produced_count} messages. \
+                 Total fetched: {total_documents_fetched}",
+                self.id
+            );
+        } else {
+            debug!(
+                "OpenSearch source connector ID: {} produced {produced_count} messages. \
+                 Total fetched: {total_documents_fetched}",
+                self.id
+            );
+        }
+
+        (messages, persisted_state)
     }
 
     #[cfg(test)]
@@ -352,16 +399,12 @@ impl OpenSearchSource {
     }
 }
 
-fn restore_state(
-    id: u32,
-    state: Option<ConnectorState>,
-) -> (State, Option<String>, bool) {
+fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>, bool) {
     let Some(connector_state) = state else {
         return (State::default(), None, false);
     };
 
-    let bytes = connector_state.0;
-    match ConnectorState(bytes.clone()).deserialize::<State>(CONNECTOR_NAME, id) {
+    match connector_state.deserialize::<State>(CONNECTOR_NAME, id) {
         Some(restored) => {
             info!(
                 "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
@@ -489,49 +532,10 @@ impl Source for OpenSearchSource {
             .as_ref()
             .ok_or_else(|| Error::Storage("OpenSearch client not initialized".to_string()))?;
 
-        let messages = match self.search_documents(client).await {
+        let (messages, persisted_state) = match self.search_documents(client).await {
             Ok(outcome) => {
-                self.apply_search_outcome(&outcome).await;
-
                 let processing_time = start_time.elapsed().as_millis() as f64;
-                let (produced_count, total_documents_fetched) = {
-                    let mut state = self.state.lock().await;
-                    if outcome.messages.is_empty() {
-                        state.processing_stats.empty_polls_count += 1;
-                    } else {
-                        state.processing_stats.successful_polls_count += 1;
-                        state.processing_stats.last_successful_poll = Some(Utc::now());
-                    }
-
-                    let total_polls = state.processing_stats.successful_polls_count
-                        + state.processing_stats.empty_polls_count;
-                    state.processing_stats.avg_batch_processing_time_ms =
-                        (state.processing_stats.avg_batch_processing_time_ms
-                            * (total_polls - 1) as f64
-                            + processing_time)
-                            / total_polls as f64;
-
-                    (
-                        outcome.messages.len(),
-                        state.total_documents_fetched,
-                    )
-                };
-
-                if self.verbose {
-                    info!(
-                        "OpenSearch source connector ID: {} produced {produced_count} messages. \
-                         Total fetched: {total_documents_fetched}",
-                        self.id
-                    );
-                } else {
-                    debug!(
-                        "OpenSearch source connector ID: {} produced {produced_count} messages. \
-                         Total fetched: {total_documents_fetched}",
-                        self.id
-                    );
-                }
-
-                outcome.messages
+                self.finalize_poll(outcome, processing_time).await
             }
             Err(e) => {
                 let mut state = self.state.lock().await;
@@ -540,11 +544,6 @@ impl Source for OpenSearchSource {
                 drop(state);
                 return Err(e);
             }
-        };
-
-        let persisted_state = {
-            let state = self.state.lock().await;
-            self.serialize_state(&state)
         };
 
         sleep(self.polling_interval).await;
@@ -570,12 +569,8 @@ impl Source for OpenSearchSource {
             .as_ref()
             .map(|s| s.enabled)
             .unwrap_or(false)
-            && let Err(e) = self.save_state().await
         {
-            warn!(
-                "Failed to save final state for OpenSearch source connector with ID: {}: {}",
-                self.id, e
-            );
+            self.save_state().await?;
         }
 
         self.client = None;

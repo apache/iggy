@@ -71,7 +71,7 @@ async fn poll_json_messages(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_message_payload_structure(
+async fn given_document_in_index_when_connector_polls_should_expose_payload_structure(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -102,7 +102,7 @@ async fn opensearch_source_message_payload_structure(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_typed_fields_should_round_trip_in_payload(
+async fn given_typed_fields_document_when_connector_polls_should_round_trip_payload(
     harness: &TestHarness,
     fixture: OpenSearchSourceTypedFieldsFixture,
 ) {
@@ -135,7 +135,7 @@ async fn opensearch_source_typed_fields_should_round_trip_in_payload(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_search_after_when_second_batch_inserted_should_not_duplicate(
+async fn given_first_batch_polled_when_second_batch_inserted_should_not_duplicate(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {

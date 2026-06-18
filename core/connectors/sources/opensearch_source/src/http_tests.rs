@@ -295,6 +295,29 @@ async fn given_basic_auth_when_search_should_send_authorization_header() {
 }
 
 #[tokio::test]
+async fn given_hit_without_sort_when_poll_should_skip_document() {
+    let hit = json!({
+        "_id": "doc-1",
+        "_source": { "id": 1, "timestamp": "2024-01-01T00:00:00Z" }
+    });
+    let body = search_response(vec![hit]).to_string();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let body = body.clone();
+        async move { (StatusCode::OK, body) }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("poll should succeed");
+    assert!(produced.messages.is_empty());
+
+    let (_, polls, _, empty_polls) = source.test_metrics().await;
+    assert_eq!(polls, 1);
+    assert_eq!(empty_polls, 1);
+}
+
+#[tokio::test]
 async fn given_hit_without_source_when_search_should_skip_document() {
     let hit = json!({
         "_id": "doc-1",
@@ -411,7 +434,10 @@ async fn given_runtime_state_when_open_should_not_load_stale_file_state() {
     restarted.open().await.unwrap();
 
     let (_, polls, _, _) = restarted.test_metrics().await;
-    assert_eq!(polls, 1, "runtime ConnectorState must not be overwritten by stale file");
+    assert_eq!(
+        polls, 1,
+        "runtime ConnectorState must not be overwritten by stale file"
+    );
 }
 
 #[tokio::test]

@@ -20,6 +20,7 @@
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
+    OpenSearchSourceSmallBatchFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
@@ -147,6 +148,63 @@ async fn given_documents_in_index_when_connector_polls_should_produce_messages(
     );
 
     let expected_ids: Vec<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
+    assert_contains_document_ids(&received, &expected_ids);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_all(
+    harness: &TestHarness,
+    fixture: OpenSearchSourceSmallBatchFixture,
+) {
+    const DOC_COUNT: usize = 6;
+
+    let client = harness.root_client().await.unwrap();
+
+    fixture
+        .insert_documents(DOC_COUNT)
+        .await
+        .expect("Failed to insert documents");
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "pagination_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= DOC_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert!(
+        received.len() >= DOC_COUNT,
+        "Expected at least {DOC_COUNT} messages across search_after pages, got {}",
+        received.len()
+    );
+
+    let expected_ids: Vec<i64> = (1..=DOC_COUNT as i64).collect();
     assert_contains_document_ids(&received, &expected_ids);
 }
 

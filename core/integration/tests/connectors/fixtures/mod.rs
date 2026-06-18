@@ -71,7 +71,7 @@ pub use mongodb::{
 };
 pub use opensearch::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
-    OpenSearchSourceTypedFieldsFixture,
+    OpenSearchSourceSmallBatchFixture, OpenSearchSourceTypedFieldsFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,

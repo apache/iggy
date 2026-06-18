@@ -30,25 +30,9 @@ pub(crate) const SOURCE_STATE_VERSION: u32 = 1;
 
 impl OpenSearchSource {
     pub(super) async fn save_state(&self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
+        let Some(state_config) = self.config.state.as_ref().filter(|s| s.enabled) else {
             return Ok(());
-        }
-
-        let state_config = self
-            .config
-            .state
-            .as_ref()
-            .ok_or_else(|| {
-                Error::InvalidConfigValue(
-                    "plugin_config.state.enabled is true but state config is missing".to_string(),
-                )
-            })?;
+        };
         let storage = create_state_storage(state_config)?;
 
         let source_state = self.internal_state_to_source_state().await?;
@@ -62,25 +46,9 @@ impl OpenSearchSource {
     }
 
     pub(super) async fn load_state(&mut self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
+        let Some(state_config) = self.config.state.as_ref().filter(|s| s.enabled) else {
             return Ok(());
-        }
-
-        let state_config = self
-            .config
-            .state
-            .as_ref()
-            .ok_or_else(|| {
-                Error::InvalidConfigValue(
-                    "plugin_config.state.enabled is true but state config is missing".to_string(),
-                )
-            })?;
+        };
         let storage = create_state_storage(state_config)?;
 
         let state_id = self.get_state_id();
@@ -168,7 +136,8 @@ impl FileStateStorage {
 #[async_trait]
 impl StateStorage for FileStateStorage {
     async fn save_source_state(&self, state: &SourceState) -> Result<(), Error> {
-        use tokio::fs;
+        use tokio::fs::{self, OpenOptions};
+        use tokio::io::AsyncWriteExt;
 
         fs::create_dir_all(&self.base_path)
             .await
@@ -179,9 +148,23 @@ impl StateStorage for FileStateStorage {
         let json = serde_json::to_string_pretty(state)
             .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
 
-        fs::write(&tmp_path, json)
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to open state temp file: {e}")))?;
+        tmp_file
+            .write_all(json.as_bytes())
             .await
             .map_err(|e| Error::Storage(format!("Failed to write state temp file: {e}")))?;
+        tmp_file
+            .sync_data()
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to sync state temp file: {e}")))?;
+        drop(tmp_file);
+
         fs::rename(&tmp_path, &path)
             .await
             .map_err(|e| Error::Storage(format!("Failed to rename state file: {e}")))?;
@@ -197,7 +180,9 @@ impl StateStorage for FileStateStorage {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(Error::Storage(format!("Failed to read state file: {error}")));
+                return Err(Error::Storage(format!(
+                    "Failed to read state file: {error}"
+                )));
             }
         };
 
@@ -288,10 +273,13 @@ mod tests {
 
     #[test]
     fn given_default_storage_type_should_use_file_backend() {
+        let temp_dir = TempDir::new().expect("tempdir");
         let config = StateConfig {
             enabled: true,
             storage_type: None,
-            storage_config: None,
+            storage_config: Some(
+                json!({ "base_path": temp_dir.path().to_string_lossy().as_ref() }),
+            ),
             state_id: None,
         };
         let storage = create_state_storage(&config).expect("default file storage");

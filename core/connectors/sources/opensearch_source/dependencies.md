@@ -33,7 +33,7 @@ to `cargo tree -p iggy_connector_opensearch_source` for the full graph.
 | --- | --- | --- | --- |
 | `async-trait` | `^0.1.89` | MIT / Apache-2.0 | Proc-macro that enables `async fn` in trait definitions; required by the `Source` trait impl in `lib.rs`. |
 | `dashmap` | `^6.1.0` | MIT | Concurrent hash map; injected into this crate's namespace by the `source_connector!` macro expansion in the SDK. Not used directly in source files. |
-| `humantime` | `^2.3.0` | MIT / Apache-2.0 | Parses human-readable duration strings in optional file-state `auto_save_interval` config (reserved for future use). |
+| `humantime` | `^2.3.0` | MIT / Apache-2.0 | Workspace dependency; duration parsing uses `iggy_connector_sdk::retry::parse_duration`. |
 | `iggy_common` | workspace | Apache-2.0 | Shared Iggy types: `DateTime`, `Utc`, and `serde_secret` for optional basic-auth password serialisation. |
 | `iggy_connector_sdk` | workspace | Apache-2.0 | Core connector abstractions: `Source` trait, `ProducedMessage`, `ProducedMessages`, `ConnectorState`, `Schema`, `Error`, `parse_duration`, and the `source_connector!` registration macro. |
 | `once_cell` | `^1.21.4` | MIT / Apache-2.0 | `Lazy` global; injected by the `source_connector!` macro expansion in the SDK. Not used directly in source files. |
