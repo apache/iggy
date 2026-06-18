@@ -137,7 +137,7 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// owns the session locally, but the consensus proposal (`Register` /
 /// `Logout`) must execute on shard 0. The peer hands just that step here
 /// and awaits the committed op number over `reply` (`None` = transient
-/// submit failure; all `RegisterSubmitError` variants are transient by
+/// submit failure; all `MetadataSubmitError` variants are transient by
 /// contract, so the caller retries rather than distinguishing them).
 pub enum MetadataSubmit {
     Register {
