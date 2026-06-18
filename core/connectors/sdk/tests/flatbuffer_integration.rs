@@ -37,7 +37,7 @@ async fn should_transform_with_real_schema_and_field_mapping() {
         ..FlatBufferConvertConfig::default()
     };
 
-    let converter = FlatBufferConvert::new(config);
+    let converter = FlatBufferConvert::new(config).unwrap();
     let metadata = iggy_connector_sdk::TopicMetadata {
         stream: "test_stream".to_string(),
         topic: "test_topic".to_string(),
@@ -196,7 +196,7 @@ async fn should_transform_json_to_flatbuffer_with_field_mappings() {
         ..FlatBufferConvertConfig::default()
     };
 
-    let converter = FlatBufferConvert::new(config);
+    let converter = FlatBufferConvert::new(config).unwrap();
     let metadata = iggy_connector_sdk::TopicMetadata {
         stream: "test_stream".to_string(),
         topic: "test_topic".to_string(),
