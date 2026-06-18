@@ -23,18 +23,20 @@
 # Used as a fallback when running tests without a Docker daemon that supports
 # testcontainers auto-launch (e.g. some CI environments). Start manually with:
 #   docker compose -f core/integration/tests/connectors/opensearch/docker-compose.yml up -d
-# then run:
+# then run (set IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_URL=http://localhost:9200):
 #   cargo test -p integration -- connectors::opensearch
 
 services:
   opensearch:
     image: opensearchproject/opensearch:2.19.1
-    container_name: iggy-test-opensearch
+    container_name: iggy-opensearch-manual
     ports:
       - "9200:9200"
     environment:
       discovery.type: single-node
       plugins.security.disabled: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: "iggy-test-password1!"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]

@@ -36,8 +36,7 @@ const TEST_INDEX_PREFIX: &str = "test_documents";
 pub struct OpenSearchSourceFixture {
     container: OpenSearchContainer,
     http_client: HttpClient,
-    // Unique per fixture so tests sharing one container never collide on the
-    // same index. The connector reads from here via ENV_SOURCE_INDEX.
+    // Unique per fixture so parallel tests never collide on the same index.
     index: String,
 }
 
@@ -97,6 +96,27 @@ impl OpenSearchSourceFixture {
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
         OpenSearchOps::refresh_index(self, &self.index).await
     }
+
+    pub async fn insert_typed_sample_document(&self) -> Result<(), TestBinaryError> {
+        let timestamp = IggyTimestamp::now().to_rfc3339_string();
+        let document = serde_json::json!({
+            "id": 1,
+            "title": "OpenSearch typed field coverage",
+            "status": "active",
+            "count": 9_223_372_036_854_775_807_i64,
+            "score": 98.6_f32,
+            "ratio": 0.125_f64,
+            "active": true,
+            "timestamp": timestamp,
+            "client_ip": "192.168.1.42",
+            "location": { "lat": 40.12, "lon": -71.34 },
+            "tags": ["integration", "opensearch"],
+            "optional_note": null
+        });
+        self.index_document(&self.index, "typed-1", &document)
+            .await?;
+        self.refresh_index().await
+    }
 }
 
 #[async_trait]
@@ -139,6 +159,41 @@ impl TestFixture for OpenSearchSourceFixture {
             "../../target/debug/libiggy_connector_opensearch_source".to_string(),
         );
         envs
+    }
+}
+
+/// OpenSearch source fixture with typed-field index mapping.
+pub struct OpenSearchSourceTypedFieldsFixture {
+    inner: OpenSearchSourceFixture,
+}
+
+impl std::ops::Deref for OpenSearchSourceTypedFieldsFixture {
+    type Target = OpenSearchSourceFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl OpenSearchOps for OpenSearchSourceTypedFieldsFixture {
+    fn container(&self) -> &OpenSearchContainer {
+        &self.inner.container
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        &self.inner.http_client
+    }
+}
+
+#[async_trait]
+impl TestFixture for OpenSearchSourceTypedFieldsFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = OpenSearchSourceFixture::setup().await?;
+        inner.create_typed_fields_index(&inner.index).await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
     }
 }
 

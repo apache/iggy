@@ -35,7 +35,9 @@ use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
 
 mod state_manager;
-use crate::state_manager::{SourceState, create_state_storage};
+use crate::state_manager::{
+    SOURCE_STATE_VERSION, SourceState, validate_state_storage_config,
+};
 
 source_connector!(OpenSearchSource);
 
@@ -43,25 +45,36 @@ const CONNECTOR_NAME: &str = "OpenSearch source";
 const DEFAULT_POLLING_INTERVAL: &str = "10s";
 const DEFAULT_BATCH_SIZE: usize = 100;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct State {
+    #[serde(default)]
     last_poll_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
     total_documents_fetched: usize,
+    #[serde(default)]
     poll_count: usize,
-    last_document_id: Option<String>,
     /// OpenSearch `search_after` tuple from the last hit in the previous batch.
+    #[serde(default)]
     search_after: Option<Vec<Value>>,
+    #[serde(default)]
     error_count: usize,
+    #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
     processing_stats: ProcessingStats,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ProcessingStats {
+    #[serde(default)]
     total_bytes_processed: u64,
+    #[serde(default)]
     avg_batch_processing_time_ms: f64,
+    #[serde(default)]
     last_successful_poll: Option<DateTime<Utc>>,
+    #[serde(default)]
     empty_polls_count: usize,
+    #[serde(default)]
     successful_polls_count: usize,
 }
 
@@ -72,8 +85,6 @@ pub struct StateConfig {
     pub storage_type: Option<String>,
     pub storage_config: Option<Value>,
     pub state_id: Option<String>,
-    pub auto_save_interval: Option<String>,
-    pub tracked_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,27 +113,15 @@ pub struct OpenSearchSource {
     state: Mutex<State>,
     /// `Some(cause)` when runtime state restore was rejected; `None` means restore succeeded.
     state_restore_error: Option<String>,
+    /// True when `new()` restored a valid runtime `ConnectorState`. File mirror must not override it.
+    runtime_state_restored: bool,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            last_poll_timestamp: None,
-            total_documents_fetched: 0,
-            poll_count: 0,
-            last_document_id: None,
-            search_after: None,
-            error_count: 0,
-            last_error: None,
-            processing_stats: ProcessingStats {
-                total_bytes_processed: 0,
-                avg_batch_processing_time_ms: 0.0,
-                last_successful_poll: None,
-                empty_polls_count: 0,
-                successful_polls_count: 0,
-            },
-        }
-    }
+struct SearchOutcome {
+    messages: Vec<ProducedMessage>,
+    search_after: Option<Vec<Value>>,
+    last_poll_timestamp: Option<DateTime<Utc>>,
+    batch_bytes: u64,
 }
 
 impl OpenSearchSource {
@@ -134,7 +133,8 @@ impl OpenSearchSource {
             .clone()
             .unwrap_or_else(|| json!({ "match_all": {} }));
         let verbose = config.verbose_logging.unwrap_or(false);
-        let (restored_state, state_restore_error) = restore_state(id, state);
+        let (restored_state, state_restore_error, runtime_state_restored) =
+            restore_state(id, state);
 
         OpenSearchSource {
             id,
@@ -145,6 +145,7 @@ impl OpenSearchSource {
             verbose,
             state: Mutex::new(restored_state),
             state_restore_error,
+            runtime_state_restored,
         }
     }
 
@@ -171,24 +172,16 @@ impl OpenSearchSource {
             .unwrap_or_else(|| format!("opensearch_source_{}", self.id))
     }
 
-    async fn internal_state_to_source_state(&self) -> Result<SourceState, Error> {
+    pub(crate) async fn internal_state_to_source_state(&self) -> Result<SourceState, Error> {
         let state = self.state.lock().await;
-
-        let data = json!({
-            "last_poll_timestamp": state.last_poll_timestamp,
-            "total_documents_fetched": state.total_documents_fetched,
-            "poll_count": state.poll_count,
-            "last_document_id": state.last_document_id,
-            "search_after": state.search_after,
-            "error_count": state.error_count,
-            "last_error": state.last_error,
-            "processing_stats": state.processing_stats,
-        });
+        let data = serde_json::to_value(&*state).map_err(|error| {
+            Error::Serialization(format!("Failed to serialize connector state: {error}"))
+        })?;
 
         Ok(SourceState {
             id: self.get_state_id(),
             last_updated: Utc::now(),
-            version: 1,
+            version: SOURCE_STATE_VERSION,
             data,
             metadata: Some(json!({
                 "connector_type": "opensearch_source",
@@ -199,65 +192,30 @@ impl OpenSearchSource {
         })
     }
 
-    async fn source_state_to_internal_state(
+    pub(crate) async fn source_state_to_internal_state(
         &mut self,
         source_state: SourceState,
     ) -> Result<(), Error> {
-        let mut state = self.state.lock().await;
-
-        if let Some(data) = source_state.data.as_object() {
-            if let Some(timestamp) = data.get("last_poll_timestamp")
-                && let Some(ts_str) = timestamp.as_str()
-                && let Ok(dt) = DateTime::parse_from_rfc3339(ts_str)
-            {
-                state.last_poll_timestamp = Some(dt.with_timezone(&Utc));
-            }
-
-            if let Some(count) = data.get("total_documents_fetched")
-                && let Some(count_val) = count.as_u64()
-            {
-                state.total_documents_fetched = count_val as usize;
-            }
-
-            if let Some(count) = data.get("poll_count")
-                && let Some(count_val) = count.as_u64()
-            {
-                state.poll_count = count_val as usize;
-            }
-
-            if let Some(doc_id) = data.get("last_document_id") {
-                state.last_document_id = doc_id.as_str().map(str::to_owned);
-            }
-
-            if let Some(search_after) = data.get("search_after")
-                && let Ok(cursor) = serde_json::from_value(search_after.clone())
-            {
-                state.search_after = cursor;
-            }
-
-            if let Some(error_count) = data.get("error_count")
-                && let Some(count_val) = error_count.as_u64()
-            {
-                state.error_count = count_val as usize;
-            }
-
-            if let Some(last_error) = data.get("last_error") {
-                state.last_error = last_error.as_str().map(str::to_owned);
-            }
-
-            if let Some(stats) = data.get("processing_stats")
-                && let Ok(processing_stats) = serde_json::from_value(stats.clone())
-            {
-                state.processing_stats = processing_stats;
-            }
+        if source_state.version != SOURCE_STATE_VERSION {
+            return Err(Error::Serialization(format!(
+                "unsupported file state version {}, expected {SOURCE_STATE_VERSION}",
+                source_state.version
+            )));
         }
 
+        let restored: State = serde_json::from_value(source_state.data).map_err(|error| {
+            Error::Serialization(format!("Failed to deserialize connector state: {error}"))
+        })?;
+
+        let mut state = self.state.lock().await;
+        *state = restored;
         Ok(())
     }
 
     async fn create_client(&self) -> Result<OpenSearch, Error> {
-        let url = Url::parse(&self.config.url)
-            .map_err(|error| Error::Storage(format!("Invalid OpenSearch URL: {error}")))?;
+        let url = Url::parse(&self.config.url).map_err(|error| {
+            Error::InvalidConfigValue(format!("Invalid OpenSearch URL: {error}"))
+        })?;
 
         let conn_pool = opensearch::http::transport::SingleNodeConnectionPool::new(url);
         let mut transport_builder = TransportBuilder::new(conn_pool);
@@ -270,12 +228,12 @@ impl OpenSearchSource {
 
         let transport = transport_builder
             .build()
-            .map_err(|e| Error::Storage(format!("Failed to build transport: {e}")))?;
+            .map_err(|error| Error::InitError(format!("Failed to build transport: {error}")))?;
 
         Ok(OpenSearch::new(transport))
     }
 
-    async fn search_documents(&self, client: &OpenSearch) -> Result<Vec<ProducedMessage>, Error> {
+    async fn search_documents(&self, client: &OpenSearch) -> Result<SearchOutcome, Error> {
         let state = self.state.lock().await;
         let batch_size = self.batch_size();
         let timestamp_field = self.timestamp_field();
@@ -327,16 +285,11 @@ impl OpenSearchSource {
         let mut messages = Vec::with_capacity(hits.len());
         let mut batch_bytes = 0u64;
         let mut last_search_after = None;
-        let mut last_document_id = None;
         let mut last_poll_timestamp = None;
 
         for hit in &hits {
             if let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) {
                 last_search_after = Some(sort.clone());
-            }
-
-            if let Some(document_id) = hit.get("_id").and_then(|v| v.as_str()) {
-                last_document_id = Some(document_id.to_string());
             }
 
             let Some(source) = hit.get("_source") else {
@@ -363,23 +316,48 @@ impl OpenSearchSource {
             });
         }
 
+        Ok(SearchOutcome {
+            messages,
+            search_after: last_search_after,
+            last_poll_timestamp,
+            batch_bytes,
+        })
+    }
+
+    async fn apply_search_outcome(&self, outcome: &SearchOutcome) {
         let mut state = self.state.lock().await;
-        state.total_documents_fetched += messages.len();
+        state.total_documents_fetched += outcome.messages.len();
         state.poll_count += 1;
-        state.search_after = last_search_after;
-        state.last_document_id = last_document_id;
-        if let Some(timestamp) = last_poll_timestamp {
+        state.search_after = outcome.search_after.clone();
+        if let Some(timestamp) = outcome.last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
-        state.processing_stats.total_bytes_processed += batch_bytes;
+        state.processing_stats.total_bytes_processed += outcome.batch_bytes;
+    }
 
-        Ok(messages)
+    #[cfg(test)]
+    fn client_initialized(&self) -> bool {
+        self.client.is_some()
+    }
+
+    #[cfg(test)]
+    async fn test_metrics(&self) -> (usize, usize, usize, usize) {
+        let state = self.state.lock().await;
+        (
+            state.total_documents_fetched,
+            state.poll_count,
+            state.error_count,
+            state.processing_stats.empty_polls_count,
+        )
     }
 }
 
-fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>) {
+fn restore_state(
+    id: u32,
+    state: Option<ConnectorState>,
+) -> (State, Option<String>, bool) {
     let Some(connector_state) = state else {
-        return (State::default(), None);
+        return (State::default(), None, false);
     };
 
     let bytes = connector_state.0;
@@ -390,14 +368,14 @@ fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<Strin
                  Documents fetched: {}, poll count: {}",
                 restored.total_documents_fetched, restored.poll_count
             );
-            (restored, None)
+            (restored, None, true)
         }
         None => {
             let cause = "persisted state exists but could not be deserialized. \
                          Refusing to start to prevent silent cursor reset."
                 .to_string();
             error!("{CONNECTOR_NAME} ID {id}: {cause}");
-            (State::default(), Some(cause))
+            (State::default(), Some(cause), false)
         }
     }
 }
@@ -418,7 +396,7 @@ fn validate_open_config(config: &OpenSearchSourceConfig) -> Result<(), Error> {
     if let Some(state) = &config.state
         && state.enabled
     {
-        create_state_storage(state)?;
+        validate_state_storage_config(state)?;
     }
 
     Ok(())
@@ -468,7 +446,7 @@ impl Source for OpenSearchSource {
             .map_err(|e| Error::Storage(format!("Failed to check index existence: {e}")))?;
 
         if !response.status_code().is_success() {
-            return Err(Error::Storage(format!(
+            return Err(Error::InitError(format!(
                 "Index '{}' does not exist or is not accessible",
                 self.config.index
             )));
@@ -482,12 +460,18 @@ impl Source for OpenSearchSource {
             .as_ref()
             .map(|s| s.enabled)
             .unwrap_or(false)
-            && let Err(e) = self.load_state().await
         {
-            warn!(
-                "Failed to load state for OpenSearch source connector with ID: {}: {}",
-                self.id, e
-            );
+            if self.runtime_state_restored {
+                info!(
+                    "Skipping file state load for OpenSearch source connector with ID: {} \
+                     because runtime ConnectorState is authoritative",
+                    self.id
+                );
+            } else {
+                self.load_state().await.map_err(|error| {
+                    Error::InitError(format!("file state load failed: {error}"))
+                })?;
+            }
         }
 
         info!(
@@ -500,35 +484,38 @@ impl Source for OpenSearchSource {
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         let start_time = std::time::Instant::now();
 
-        sleep(self.polling_interval).await;
-
         let client = self
             .client
             .as_ref()
             .ok_or_else(|| Error::Storage("OpenSearch client not initialized".to_string()))?;
 
         let messages = match self.search_documents(client).await {
-            Ok(msgs) => {
-                let mut state = self.state.lock().await;
-                state.processing_stats.successful_polls_count += 1;
-                state.processing_stats.last_successful_poll = Some(Utc::now());
+            Ok(outcome) => {
+                self.apply_search_outcome(&outcome).await;
 
                 let processing_time = start_time.elapsed().as_millis() as f64;
-                let total_polls = state.processing_stats.successful_polls_count
-                    + state.processing_stats.empty_polls_count;
-                state.processing_stats.avg_batch_processing_time_ms =
-                    (state.processing_stats.avg_batch_processing_time_ms
-                        * (total_polls - 1) as f64
-                        + processing_time)
-                        / total_polls as f64;
+                let (produced_count, total_documents_fetched) = {
+                    let mut state = self.state.lock().await;
+                    if outcome.messages.is_empty() {
+                        state.processing_stats.empty_polls_count += 1;
+                    } else {
+                        state.processing_stats.successful_polls_count += 1;
+                        state.processing_stats.last_successful_poll = Some(Utc::now());
+                    }
 
-                if msgs.is_empty() {
-                    state.processing_stats.empty_polls_count += 1;
-                }
+                    let total_polls = state.processing_stats.successful_polls_count
+                        + state.processing_stats.empty_polls_count;
+                    state.processing_stats.avg_batch_processing_time_ms =
+                        (state.processing_stats.avg_batch_processing_time_ms
+                            * (total_polls - 1) as f64
+                            + processing_time)
+                            / total_polls as f64;
 
-                let produced_count = msgs.len();
-                let total_documents_fetched = state.total_documents_fetched;
-                drop(state);
+                    (
+                        outcome.messages.len(),
+                        state.total_documents_fetched,
+                    )
+                };
 
                 if self.verbose {
                     info!(
@@ -544,7 +531,7 @@ impl Source for OpenSearchSource {
                     );
                 }
 
-                msgs
+                outcome.messages
             }
             Err(e) => {
                 let mut state = self.state.lock().await;
@@ -554,10 +541,13 @@ impl Source for OpenSearchSource {
                 return Err(e);
             }
         };
+
         let persisted_state = {
             let state = self.state.lock().await;
             self.serialize_state(&state)
         };
+
+        sleep(self.polling_interval).await;
 
         Ok(ProducedMessages {
             schema: Schema::Json,
@@ -598,6 +588,9 @@ impl Source for OpenSearchSource {
 }
 
 #[cfg(test)]
+mod http_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -621,7 +614,6 @@ mod tests {
             last_poll_timestamp: None,
             total_documents_fetched: 500,
             poll_count: 5,
-            last_document_id: Some("doc_42".to_string()),
             search_after: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
             error_count: 1,
             last_error: Some("connection reset".to_string()),
@@ -648,8 +640,12 @@ mod tests {
             let restored = source.state.lock().await;
             assert_eq!(restored.total_documents_fetched, 500);
             assert_eq!(restored.poll_count, 5);
-            assert_eq!(restored.last_document_id, Some("doc_42".to_string()));
+            assert_eq!(
+                restored.search_after,
+                Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")])
+            );
             assert!(source.state_restore_error.is_none());
+            assert!(source.runtime_state_restored);
         });
     }
 
@@ -662,8 +658,9 @@ mod tests {
             let state = source.state.lock().await;
             assert_eq!(state.total_documents_fetched, 0);
             assert_eq!(state.poll_count, 0);
-            assert_eq!(state.last_document_id, None);
+            assert_eq!(state.search_after, None);
             assert!(source.state_restore_error.is_none());
+            assert!(!source.runtime_state_restored);
         });
     }
 
@@ -702,6 +699,121 @@ mod tests {
     }
 
     #[test]
+    fn given_empty_timestamp_field_when_validate_should_fail() {
+        let mut config = test_config();
+        config.timestamp_field = Some(String::new());
+        let error = validate_open_config(&config).expect_err("empty timestamp_field");
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn given_unparseable_timestamp_value_should_return_none() {
+        let value = json!("not-a-timestamp");
+        assert!(parse_document_timestamp(&value).is_none());
+    }
+
+    #[test]
+    fn given_source_state_json_when_apply_should_restore_metrics() {
+        use crate::state_manager::{SOURCE_STATE_VERSION, SourceState};
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut source = OpenSearchSource::new(1, test_config(), None);
+            let source_state = SourceState {
+                id: "opensearch_source_1".to_string(),
+                last_updated: Utc::now(),
+                version: SOURCE_STATE_VERSION,
+                data: json!({
+                    "total_documents_fetched": 9,
+                    "poll_count": 4,
+                    "search_after": ["2024-02-01T00:00:00Z", "doc-9"],
+                    "error_count": 2,
+                    "last_error": "timeout",
+                    "processing_stats": {
+                        "total_bytes_processed": 100,
+                        "avg_batch_processing_time_ms": 1.5,
+                        "last_successful_poll": null,
+                        "empty_polls_count": 1,
+                        "successful_polls_count": 3
+                    }
+                }),
+                metadata: None,
+            };
+
+            source
+                .source_state_to_internal_state(source_state)
+                .await
+                .expect("apply source state");
+
+            let state = source.state.lock().await;
+            assert_eq!(state.total_documents_fetched, 9);
+            assert_eq!(state.poll_count, 4);
+            assert_eq!(
+                state.search_after,
+                Some(vec![json!("2024-02-01T00:00:00Z"), json!("doc-9")])
+            );
+            assert_eq!(state.error_count, 2);
+        });
+    }
+
+    #[test]
+    fn given_unsupported_file_state_version_should_fail() {
+        use crate::state_manager::SourceState;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut source = OpenSearchSource::new(1, test_config(), None);
+            let source_state = SourceState {
+                id: "opensearch_source_1".to_string(),
+                last_updated: Utc::now(),
+                version: 99,
+                data: json!({ "poll_count": 1 }),
+                metadata: None,
+            };
+
+            let error = source
+                .source_state_to_internal_state(source_state)
+                .await
+                .expect_err("unsupported version");
+            assert!(matches!(error, Error::Serialization(_)));
+        });
+    }
+
+    #[test]
+    fn given_invalid_url_when_open_should_return_invalid_config() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut config = test_config();
+            config.url = "not-a-url".to_string();
+            let mut source = OpenSearchSource::new(1, config, None);
+            let error = source.open().await.expect_err("invalid url");
+            assert!(matches!(error, Error::InvalidConfigValue(_)));
+        });
+    }
+
+    #[test]
+    fn given_internal_state_when_export_should_round_trip_source_state() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let source = OpenSearchSource::new(1, test_config(), None);
+            {
+                let mut runtime_state = source.state.lock().await;
+                *runtime_state = test_state();
+            }
+            let exported = source
+                .internal_state_to_source_state()
+                .await
+                .expect("export state");
+            assert_eq!(exported.id, "opensearch_source_1");
+            assert_eq!(exported.data["total_documents_fetched"], 500);
+            assert_eq!(
+                exported.metadata.as_ref().unwrap()["index"],
+                "test_documents"
+            );
+        });
+    }
+
+    #[test]
     fn given_zero_batch_size_when_validate_should_fail() {
         let mut config = test_config();
         config.batch_size = Some(0);
@@ -734,7 +846,6 @@ mod tests {
             deserialized.total_documents_fetched
         );
         assert_eq!(original.poll_count, deserialized.poll_count);
-        assert_eq!(original.last_document_id, deserialized.last_document_id);
         assert_eq!(original.search_after, deserialized.search_after);
         assert_eq!(original.error_count, deserialized.error_count);
     }

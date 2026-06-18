@@ -48,6 +48,44 @@ fn assert_contains_document_ids(messages: &[serde_json::Value], expected_ids: &[
     }
 }
 
+async fn poll_all_messages_from_offset_zero(
+    client: &impl MessageClient,
+    consumer_id: &Identifier,
+    min_messages: usize,
+) -> Vec<serde_json::Value> {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let mut received = Vec::new();
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::offset(0),
+                100,
+                false,
+            )
+            .await
+        {
+            received.clear();
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= min_messages {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    received
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
@@ -281,41 +319,33 @@ async fn given_runtime_state_when_connector_restarts_should_resume_after_cursor(
         .expect("Failed to restart connectors");
     sleep(Duration::from_millis(100)).await;
 
-    let mut received_after: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                10,
-                true,
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received_after.push(json);
-                }
-            }
-            if received_after.len() >= TEST_MESSAGE_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
+    let audit_consumer: Identifier = "state_audit_consumer".try_into().unwrap();
+    let all_messages =
+        poll_all_messages_from_offset_zero(&client, &audit_consumer, TEST_MESSAGE_COUNT * 2).await;
 
-    assert_eq!(received_after.len(), TEST_MESSAGE_COUNT);
+    let batch1_ids: HashSet<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
+    let batch1_occurrences = all_messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .filter(|id| batch1_ids.contains(id))
+        .count();
+    assert_eq!(
+        batch1_occurrences, TEST_MESSAGE_COUNT,
+        "batch 1 IDs must appear exactly once on the stream; duplicates mean cursor reset"
+    );
 
-    for record in &received_after {
-        let id = record.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        assert!(
-            id > TEST_MESSAGE_COUNT as i64,
-            "After restart, got ID {id} from first batch"
-        );
-    }
+    let batch2_ids: HashSet<i64> =
+        ((TEST_MESSAGE_COUNT + 1) as i64..=(TEST_MESSAGE_COUNT * 2) as i64).collect();
+    let batch2_seen: HashSet<i64> = all_messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .filter(|id| batch2_ids.contains(id))
+        .collect();
+    assert_eq!(
+        batch2_seen.len(),
+        TEST_MESSAGE_COUNT,
+        "batch 2 IDs must be present after restart, got {batch2_seen:?}"
+    );
 }
 
 async fn fetch_sources(http_client: &Client, api_address: &str) -> Vec<SourceInfoResponse> {
@@ -362,8 +392,8 @@ async fn given_missing_index_when_connector_opens_should_report_error(
         .as_ref()
         .expect("Source with missing index should expose a last_error");
     assert!(
-        last_error.message.contains("does not exist"),
-        "last_error should mention the missing index, got: {}",
+        last_error.message.contains("Plugin initialization failed"),
+        "missing index should fail during plugin open, got: {}",
         last_error.message
     );
 }

@@ -20,4 +20,7 @@
 pub mod container;
 pub mod source;
 
-pub use source::{OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture};
+pub use source::{
+    OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
+    OpenSearchSourceTypedFieldsFixture,
+};

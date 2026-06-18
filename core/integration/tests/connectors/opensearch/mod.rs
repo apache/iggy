@@ -18,6 +18,7 @@
  */
 
 mod opensearch_source;
+mod opensearch_source_types;
 
 const TEST_MESSAGE_COUNT: usize = 3;
 const POLL_ATTEMPTS: usize = 100;

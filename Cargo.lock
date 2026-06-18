@@ -6937,6 +6937,7 @@ name = "iggy_connector_opensearch_source"
 version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
+ "axum",
  "dashmap",
  "humantime",
  "iggy_common",
@@ -6947,6 +6948,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
