@@ -23,7 +23,7 @@
 //! failures stay silent so the SDK replays).
 
 use crate::session_manager::SessionError;
-use metadata::RegisterSubmitError;
+use metadata::MetadataSubmitError;
 
 /// Login/register failure.
 ///
@@ -37,7 +37,7 @@ pub enum LoginRegisterError {
     Session(SessionError),
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
-    Transient(RegisterSubmitError),
+    Transient(MetadataSubmitError),
 }
 
 impl LoginRegisterError {
@@ -76,6 +76,6 @@ mod tests {
         assert!(LoginRegisterError::UserInactive.is_terminal());
         assert!(LoginRegisterError::Session(SessionError::ConnectionNotFound(0)).is_terminal());
         // Transient is the only recoverable variant: never terminal.
-        assert!(!LoginRegisterError::Transient(RegisterSubmitError::PipelineFull).is_terminal());
+        assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
     }
 }

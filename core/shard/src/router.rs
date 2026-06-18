@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
-use crate::shards_table::{ShardsTable, calculate_shard_from_consensus_ns};
+use crate::shards_table::{
+    ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
+};
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
 use crossfire::TrySendError;
 use futures::FutureExt;
@@ -146,20 +148,27 @@ where
         }
         if operation.is_partition() {
             let partition_namespace = IggyNamespace::from_raw(namespace_u64);
-            let Some(target) = self.shards_table.shard_for(partition_namespace) else {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::PARTITION,
-                    frame_drop_reason::UNROUTABLE,
-                );
-                tracing::error!(
-                    shard = self.id,
-                    stream = partition_namespace.stream_id(),
-                    topic = partition_namespace.topic_id(),
-                    partition = partition_namespace.partition_id(),
-                    "namespace not found in shards_table, dropping message"
-                );
-                return;
-            };
+            // The shards table is a cache of the deterministic hash
+            // assignment (every `InsertOwned`/`InsertRouted` row stores
+            // `calculate_shard_assignment`'s result), seeded asynchronously
+            // by each shard's reconciler. A miss therefore means "not seeded
+            // yet", not "unroutable": fall back to the hash so replication
+            // frames arriving during the post-commit convergence window are
+            // not dropped (the partition plane re-checks materialisation on
+            // the owning shard).
+            let target = self
+                .shards_table
+                .shard_for(partition_namespace)
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        shard = self.id,
+                        stream = partition_namespace.stream_id(),
+                        topic = partition_namespace.topic_id(),
+                        partition = partition_namespace.partition_id(),
+                        "namespace not in shards_table; routing by hash assignment"
+                    );
+                    calculate_shard_assignment(&partition_namespace, self.shard_count)
+                });
             self.try_send_to_target(target, generic, operation);
             return;
         }
@@ -457,6 +466,19 @@ where
                 // (wired by server-ng) reads this shard's `SessionManager`
                 // and pushes the list over `reply`.
                 (self.on_list_clients)(reply);
+            }
+            LifecycleFrame::PartitionRead {
+                namespace,
+                read,
+                reply,
+            } => {
+                // Addressed to the shard owning `namespace` (the sender
+                // resolved it via the shards table). The handler (wired by
+                // server-ng) runs the read against this shard's partitions
+                // plane and pushes the result over `reply`; a dropped
+                // sender means the read is skipped and the gather side
+                // times out.
+                (self.on_partition_read)(namespace, read, reply);
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or

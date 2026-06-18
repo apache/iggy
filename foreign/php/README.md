@@ -145,6 +145,15 @@ $consumer->consumeMessages(
     },
     100,
 );
+
+foreach ($consumer->iterMessages() as $message) {
+    process($message->payload());
+    $consumer->storeOffset($message->offset(), $message->partitionId());
+
+    if (shouldStop()) {
+        break;
+    }
+}
 ```
 
 ## Tests
@@ -190,6 +199,8 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   polled. Pass an explicit partition id before the first poll.
 - `consumeMessages()` requires an explicit finite limit. It does not run forever
   by default.
+- `iterMessages()` returns a PHP `Iterator` and can be used with `foreach`.
+  Break out of the loop when the caller's processing limit or shutdown signal is reached.
 - `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
   If callback success must control commits, use `AutoCommit::disabled()` and call
   `storeOffset()` after the callback work succeeds.

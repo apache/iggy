@@ -15,12 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// a2a_jwt is HTTP-only (JWT against the HTTP transport); vsr has no HTTP.
+#[cfg(not(feature = "vsr"))]
 mod a2a_jwt;
+// Consumer groups are not implemented under vsr yet.
+#[cfg(not(feature = "vsr"))]
 mod cg;
+// 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
+// the harness transport filter); revisit under vsr once basics are green.
+#[cfg(not(feature = "vsr"))]
 mod concurrent_addition;
 mod general;
+// Asserts the periodic messages cleaner deletes expired segments from disk;
+// server-ng has no data-maintenance cleaner yet.
+#[cfg(not(feature = "vsr"))]
 mod message_cleanup;
 mod message_retrieval;
+// Mixes server restarts, consumer-group barriers, and DeleteSegments
+// maintenance; out of vsr scope for now.
+#[cfg(not(feature = "vsr"))]
 mod purge_delete;
 mod scenarios;
 mod specific;

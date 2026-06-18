@@ -18,16 +18,19 @@
 use crate::iggy_index_writer::IggyIndexWriter;
 use crate::journal::{
     MessageLookup, PartitionJournal, PartitionJournalMemStorage, QueryableJournal,
+    select_batch_slice,
 };
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{delete_persisted_offset, persist_offset};
 use crate::segment::Segment;
+use crate::types::Fragment;
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
     PollingArgs, PollingConsumer,
 };
+use compio::io::AsyncReadAtExt;
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
@@ -36,7 +39,11 @@ use consensus::{
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
-use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader};
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
+    StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader, WireDecode, WireIdentifier};
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
@@ -46,9 +53,10 @@ use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus};
 use server_common::{
     Message, SegmentStorage,
-    iobuf::Frozen,
+    iobuf::{Frozen, Owned},
     send_messages2::{
-        convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
+        COMMAND_HEADER_SIZE, convert_request_message, decode_batch_slice, decode_prepare_slice,
+        stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -85,6 +93,12 @@ where
     pub write_lock: Arc<TokioMutex<()>>,
     consumer_offsets_path: Option<String>,
     consumer_group_offsets_path: Option<String>,
+    /// Canonical on-disk partition directory, set at construction by the
+    /// server builder. Disk polls must not derive this from live writers:
+    /// sealed segments drop their writer at rotation, so a writer-derived
+    /// path transiently disappears and silently hides the disk tier.
+    /// `None` only for in-memory (simulated) partitions.
+    partition_dir: Option<String>,
     consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     observed_view: u32,
@@ -171,6 +185,7 @@ where
             write_lock: Arc::new(TokioMutex::new(())),
             consumer_offsets_path: None,
             consumer_group_offsets_path: None,
+            partition_dir: None,
             consumer_offset_enforce_fsync: false,
             pending_consumer_offset_commits: HashMap::new(),
             observed_view,
@@ -204,6 +219,10 @@ where
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
         partition
+    }
+
+    pub fn set_partition_dir(&mut self, partition_dir: String) {
+        self.partition_dir = Some(partition_dir);
     }
 
     pub fn configure_consumer_offset_storage(
@@ -572,14 +591,11 @@ where
 
         let result = match args.strategy.kind {
             PollingKind::Timestamp => {
-                self.log
-                    .journal()
-                    .inner
-                    .get(&MessageLookup::Timestamp {
-                        timestamp: args.strategy.value,
-                        count: args.count,
-                    })
-                    .await
+                self.lookup_messages(MessageLookup::Timestamp {
+                    timestamp: args.strategy.value,
+                    count: args.count,
+                })
+                .await
             }
             kind => {
                 let start_offset = match kind {
@@ -596,14 +612,11 @@ where
                     return Ok((PollFragments::new(), None));
                 }
 
-                self.log
-                    .journal()
-                    .inner
-                    .get(&MessageLookup::Offset {
-                        offset: start_offset,
-                        count: args.count,
-                    })
-                    .await
+                self.lookup_messages(MessageLookup::Offset {
+                    offset: start_offset,
+                    count: args.count,
+                })
+                .await
             }
         };
 
@@ -672,6 +685,269 @@ where
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
         IggyNamespace::from_raw(self.consensus.namespace())
+    }
+
+    /// Resolve a poll query against the in-memory journal, falling back to
+    /// the on-disk segments for ranges the journal no longer holds (the
+    /// persist threshold drains committed batches to segment files).
+    ///
+    /// A query is served from exactly one tier per call: a poll that starts
+    /// below the journal's oldest resident offset reads from disk only, and
+    /// the client's next poll (advancing past what was returned) eventually
+    /// crosses back into the resident range. Timestamp queries try disk
+    /// first whenever segments hold persisted bytes -- older matches always
+    /// live there -- and fall back to the journal when the disk has none.
+    async fn lookup_messages(&self, query: MessageLookup) -> Option<PollQueryResult<4096>> {
+        let serve_journal_first = match query {
+            MessageLookup::Offset { offset, .. } => self
+                .log
+                .journal()
+                .inner
+                .oldest_resident_offset()
+                .is_some_and(|oldest| offset >= oldest),
+            MessageLookup::Timestamp { .. } => !self.has_persisted_segment_bytes(),
+        };
+
+        if serve_journal_first {
+            return self.log.journal().inner.get(&query).await;
+        }
+        match self.poll_from_disk(query).await {
+            Some((mut fragments, last_matching_offset, matched)) => {
+                // A poll can straddle the tiers: older messages already
+                // drained to segments, the tail still journal-resident.
+                // Continue past the last disk match by offset (timestamp
+                // matches are contiguous from the first hit, so an offset
+                // continuation is equivalent).
+                let remaining = query.count().saturating_sub(matched);
+                if remaining > 0
+                    && let Some(last_offset) = last_matching_offset
+                {
+                    let continuation = MessageLookup::Offset {
+                        offset: last_offset + 1,
+                        count: remaining,
+                    };
+                    if let Some((journal_fragments, journal_last)) =
+                        self.log.journal().inner.get(&continuation).await
+                    {
+                        fragments.extend(journal_fragments);
+                        return Some((fragments, journal_last.or(last_matching_offset)));
+                    }
+                }
+                Some((fragments, last_matching_offset))
+            }
+            // Nothing matched on disk (e.g. a timestamp newer than every
+            // persisted batch): the match, if any, is journal-resident.
+            None => self.log.journal().inner.get(&query).await,
+        }
+    }
+
+    fn partition_dir(&self) -> Option<String> {
+        if self.partition_dir.is_some() {
+            return self.partition_dir.clone();
+        }
+        // Writer-derived fallback for partitions built without
+        // `set_partition_dir`. Unreliable mid-rotation: sealed segments
+        // drop their writer, so prefer the stored path above.
+        self.log
+            .messages_writers()
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .and_then(|writer| {
+                std::path::Path::new(&writer.path())
+                    .parent()
+                    .map(|dir| dir.to_string_lossy().into_owned())
+            })
+    }
+
+    fn has_persisted_segment_bytes(&self) -> bool {
+        self.log
+            .segments()
+            .iter()
+            .any(|segment| segment.size.as_bytes_u64() > 0)
+    }
+
+    /// Serve a poll from the on-disk segment files.
+    ///
+    /// Picks the starting segment + byte position via the sparse index
+    /// (one entry per persist flush; a miss falls back to the segment
+    /// start), then walks stamped `[256B SendMessages2Header][blob]`
+    /// batches in chunked reads, slicing fragments with the same selector
+    /// the journal path uses. Batches split across a chunk boundary are
+    /// re-read from their start in the next chunk.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn poll_from_disk(
+        &self,
+        query: MessageLookup,
+    ) -> Option<(PollFragments<4096>, Option<u64>, u32)> {
+        const DISK_POLL_CHUNK: u64 = 1 << 20;
+
+        let count = query.count();
+        if count == 0 || !self.log.has_segments() {
+            return None;
+        }
+
+        let (start_segment, mut position) = self.disk_poll_start(&query);
+
+        let mut fragments = PollFragments::new();
+        let mut last_matching_offset = None;
+        let mut matched: u32 = 0;
+
+        for segment_index in start_segment..self.log.segments().len() {
+            if matched >= count {
+                break;
+            }
+            let persisted = self.log.segments()[segment_index].size.as_bytes_u64();
+            if persisted == 0 || position >= persisted {
+                position = 0;
+                continue;
+            }
+            // Sealed segments drop their writer at rotation, so resolve the
+            // file from the partition directory (taken from any live writer)
+            // plus the segment's start offset, mirroring the writer naming.
+            let Some(partition_dir) = self.partition_dir() else {
+                // Simulated in-memory persistence: no files to read. A live
+                // partition hitting this means no writer was resolvable
+                // (e.g. mid-rotation), which silently hides the disk tier.
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace().inner(),
+                    segment_count = self.log.segments().len(),
+                    "disk poll: no live writer to resolve partition dir; disk tier unreadable"
+                );
+                return None;
+            };
+            let start_offset = self.log.segments()[segment_index].start_offset;
+            let path = format!("{partition_dir}/{start_offset:0>20}.log");
+            let Some(file) = self.open_segment_with_retry(&path).await else {
+                position = 0;
+                continue;
+            };
+
+            let mut chunk_len = DISK_POLL_CHUNK;
+            while matched < count && position < persisted {
+                let len = (persisted - position).min(chunk_len) as usize;
+                let Some(chunk) = self.read_chunk_with_retry(&file, position, len).await else {
+                    break;
+                };
+                let consumed = walk_disk_chunk(
+                    &chunk,
+                    query,
+                    count,
+                    &mut matched,
+                    &mut fragments,
+                    &mut last_matching_offset,
+                );
+                if consumed == 0 {
+                    if (len as u64) >= persisted - position {
+                        // The whole remainder fit and still no complete
+                        // batch decoded: corrupt tail; stop.
+                        break;
+                    }
+                    // A single batch larger than the chunk: grow and
+                    // re-read instead of spinning.
+                    chunk_len = chunk_len.saturating_mul(4);
+                    continue;
+                }
+                chunk_len = DISK_POLL_CHUNK;
+                position += consumed as u64;
+            }
+            position = 0;
+        }
+
+        if fragments.is_empty() {
+            None
+        } else {
+            Some((fragments, last_matching_offset, matched))
+        }
+    }
+
+    /// Open a segment file for a disk poll, retrying transient IO failures
+    /// (fd pressure under heavy parallel load) so one failed syscall does
+    /// not silently collapse the poll into an empty result.
+    async fn open_segment_with_retry(&self, path: &str) -> Option<compio::fs::File> {
+        for attempt in 0..3u8 {
+            match compio::fs::File::open(path).await {
+                Ok(file) => return Some(file),
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.namespace().inner(),
+                        path,
+                        attempt,
+                        %error,
+                        "disk poll: failed to open segment file"
+                    );
+                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        None
+    }
+
+    /// Read one chunk for a disk poll, retrying transient IO failures.
+    async fn read_chunk_with_retry(
+        &self,
+        file: &compio::fs::File,
+        position: u64,
+        len: usize,
+    ) -> Option<Frozen<4096>> {
+        for attempt in 0..3u8 {
+            let buffer = Owned::<4096>::zeroed(len);
+            let compio::BufResult(read, buffer) = file.read_exact_at(buffer, position).await;
+            match read {
+                Ok(()) => return Some(Frozen::from(buffer)),
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.namespace().inner(),
+                        position,
+                        attempt,
+                        %error,
+                        "disk poll: segment read failed"
+                    );
+                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        None
+    }
+
+    /// Starting `(segment index, byte position)` for a disk poll, resolved
+    /// via each segment's sparse index cache. An index miss starts at the
+    /// segment's first byte (the walk filters precisely).
+    fn disk_poll_start(&self, query: &MessageLookup) -> (usize, u64) {
+        let segments = self.log.segments();
+        match query {
+            MessageLookup::Offset { offset, .. } => {
+                let segment_index = segments
+                    .iter()
+                    .rposition(|segment| segment.start_offset <= *offset)
+                    .unwrap_or(0);
+                let position = self
+                    .log
+                    .segment_indexes(segment_index)
+                    .and_then(|cache| cache.offset_lower_bound(*offset))
+                    .map_or(0, |index| index.position);
+                (segment_index, position)
+            }
+            MessageLookup::Timestamp { timestamp, .. } => {
+                for (segment_index, _) in segments.iter().enumerate() {
+                    if let Some(index) = self
+                        .log
+                        .segment_indexes(segment_index)
+                        .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
+                    {
+                        return (segment_index, index.position);
+                    }
+                }
+                (0, 0)
+            }
+        }
     }
 
     /// Project a client request into a prepare.
@@ -875,6 +1151,10 @@ where
         }
     }
 
+    /// # Panics
+    /// Panics on a primary when a prepare's op is ahead of the local
+    /// sequencer: journaling it would make the next op assignment collide,
+    /// which is unrecoverable in place.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
@@ -951,7 +1231,8 @@ where
 
         // Backup gap check; primary sequencer pre-advanced by
         // push_prepare_entry. See metadata::on_replicate.
-        if self.consensus().is_follower() {
+        let is_backup = self.consensus().is_follower();
+        if is_backup {
             if header.op != current_op + 1 {
                 emit_partition_diag(
                     tracing::Level::WARN,
@@ -965,10 +1246,51 @@ where
                 return;
             }
         } else {
-            debug_assert_eq!(
-                header.op, current_op,
-                "primary: sequencer pre-advance broken"
-            );
+            // Primary: `push_prepare_entry` pre-advanced the sequencer, so a
+            // locally-originated prepare always satisfies
+            // `header.op == current_op`. The two violation directions carry
+            // very different risk:
+            // - below the sequencer: a duplicate delivery (parked-frame
+            //   redispatch, retransmit echo) of an op this primary already
+            //   sequenced. Apply is keyed by `header.op` and the primary
+            //   never advances its sequencer post-apply, so proceeding is
+            //   idempotent-safe; log loudly for diagnosis.
+            // - above the sequencer: journaling an op the sequencer has not
+            //   assigned yet means the next local assignment would collide
+            //   with it. Unreachable today (view fences run first, one
+            //   primary per view, the chain stops before the primary), so
+            //   trip the invariant in debug; in release log loudly and drop
+            //   rather than crash a library or corrupt op assignment.
+            if header.op > current_op {
+                debug_assert!(
+                    header.op <= current_op,
+                    "primary: prepare op {} ahead of sequencer {}; next op assignment would collide",
+                    header.op,
+                    current_op
+                );
+                emit_partition_diag(
+                    tracing::Level::ERROR,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "primary prepare ahead of sequencer; dropping to avoid op-assignment collision",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+                );
+                return;
+            }
+            if header.op < current_op {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "primary received prepare below sequencer; applying idempotently",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_reason("duplicate delivery"),
+                );
+            }
         }
         // Durability-before-ack: clone for chain-replicate, forward only
         // AFTER apply_replicated_operation persists. Forward-first would
@@ -977,13 +1299,18 @@ where
         let clone_for_forward = message.clone();
         let replicated_result = self.apply_replicated_operation(message).await;
         if replicated_result.is_ok() {
-            // Advance sequencer + checksum after journal append. Pre-advance
-            // on failing apply would leave consensus claiming op N while
-            // journal has nothing; retransmit of N would silently drop as
-            // is_old_prepare (header.op <= current_sequence).
             let consensus = self.consensus();
-            consensus.sequencer().set_sequence(header.op);
-            consensus.set_last_prepare_checksum(header.checksum);
+            // Backup only: advance sequencer + checksum after journal append.
+            // Pre-advance on failing apply would leave consensus claiming op N
+            // while journal has nothing; retransmit of N would silently drop
+            // as is_old_prepare (header.op <= current_sequence). Primary must
+            // NOT re-set here: push_prepare_entry already advanced, and a
+            // sibling request pipelined during the apply await would be
+            // rewound to a stale op + parent, projecting a duplicate next.
+            if is_backup {
+                consensus.sequencer().set_sequence(header.op);
+                consensus.set_last_prepare_checksum(header.checksum);
+            }
             if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
                 emit_partition_diag(
                     tracing::Level::WARN,
@@ -1297,21 +1624,26 @@ where
         self.persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
             .await?;
 
+        // Stamp range metadata on the segment that received the batches
+        // BEFORE rotating: rotation seals it and derives the next segment's
+        // start offset from `end_offset`, so updating after rotation would
+        // tag the fresh segment with the old range and shift every
+        // subsequent segment boundary off the file contents.
+        let segment_index = self.log.segments().len() - 1;
+        let segment = &mut self.log.segments_mut()[segment_index];
+        if segment.start_timestamp == 0 && journal_info.first_timestamp != 0 {
+            segment.start_timestamp = journal_info.first_timestamp;
+        }
+        segment.end_timestamp = journal_info.end_timestamp;
+        segment.max_timestamp = segment.max_timestamp.max(journal_info.max_timestamp);
+        segment.end_offset = journal_info.current_offset;
+
         if is_full {
             self.rotate_segment(config).await?;
         }
 
         let _ = self.log.journal_mut().inner.commit();
         self.log.journal_mut().info = JournalInfo::default();
-
-        let segment_index = self.log.segments().len() - 1;
-        let segment = &mut self.log.segments_mut()[segment_index];
-        if segment.end_offset == 0 && journal_info.first_timestamp != 0 {
-            segment.start_timestamp = journal_info.first_timestamp;
-        }
-        segment.end_timestamp = journal_info.end_timestamp;
-        segment.max_timestamp = segment.max_timestamp.max(journal_info.max_timestamp);
-        segment.end_offset = journal_info.current_offset;
 
         self.stats
             .increment_size_bytes(journal_info.size.as_bytes_u64());
@@ -1587,47 +1919,43 @@ where
         operation: Operation,
         body: &[u8],
     ) -> Result<(ConsumerKind, u32, Option<u64>, AckLevel), IggyError> {
-        let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
-        let consumer_id = body
-            .get(1..5)
-            .ok_or(IggyError::InvalidCommand)
-            .and_then(|bytes| {
-                <[u8; 4]>::try_from(bytes)
-                    .map(u32::from_le_bytes)
-                    .map_err(|_| IggyError::InvalidCommand)
-            })?;
-        let kind = ConsumerKind::from_code(consumer_kind)?;
-        // v1 implicitly Quorum. v2 trailing ack byte validated; unknown
-        // discriminants rejected so malformed wire bytes fail fast.
-        match operation {
-            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
-                let offset =
-                    body.get(5..13)
-                        .ok_or(IggyError::InvalidCommand)
-                        .and_then(|bytes| {
-                            <[u8; 8]>::try_from(bytes)
-                                .map(u64::from_le_bytes)
-                                .map_err(|_| IggyError::InvalidCommand)
-                        })?;
-                let ack = if matches!(operation, Operation::StoreConsumerOffset2) {
-                    let ack_byte = *body.get(13).ok_or(IggyError::InvalidCommand)?;
-                    AckLevel::from_code(ack_byte).map_err(|_| IggyError::InvalidCommand)?
-                } else {
-                    AckLevel::Quorum
-                };
-                Ok((kind, consumer_id, Some(offset), ack))
+        // Decode through the typed wire requests: the consumer is a
+        // `WireConsumer` (kind + variable-length identifier), not a fixed
+        // `[kind, u32]` prefix, so hand-rolled offsets would key the
+        // committed offset under a garbled consumer id and reads (which
+        // decode properly) would never find it.
+        let (consumer, offset, ack) = match operation {
+            Operation::StoreConsumerOffset => {
+                let request = StoreConsumerOffsetRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (request.consumer, Some(request.offset), AckLevel::Quorum)
             }
-            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
-                let ack = if matches!(operation, Operation::DeleteConsumerOffset2) {
-                    let ack_byte = *body.get(5).ok_or(IggyError::InvalidCommand)?;
-                    AckLevel::from_code(ack_byte).map_err(|_| IggyError::InvalidCommand)?
-                } else {
-                    AckLevel::Quorum
-                };
-                Ok((kind, consumer_id, None, ack))
+            Operation::StoreConsumerOffset2 => {
+                let request = StoreConsumerOffset2Request::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (request.consumer, Some(request.offset), request.ack)
             }
-            _ => Err(IggyError::InvalidCommand),
-        }
+            Operation::DeleteConsumerOffset => {
+                let request = DeleteConsumerOffsetRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (request.consumer, None, AckLevel::Quorum)
+            }
+            Operation::DeleteConsumerOffset2 => {
+                let request = DeleteConsumerOffset2Request::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (request.consumer, None, request.ack)
+            }
+            _ => return Err(IggyError::InvalidCommand),
+        };
+        let kind = ConsumerKind::from_code(consumer.kind)?;
+        // Named consumers hash to a stable u32 (mirrors the legacy
+        // `PollingConsumer::resolve_consumer_id`), so writes key the offset
+        // table identically to the read path's resolution.
+        let consumer_id = match &consumer.id {
+            WireIdentifier::Numeric(id) => *id,
+            WireIdentifier::String(name) => iggy_common::calculate_32(name.as_str().as_bytes()),
+        };
+        Ok((kind, consumer_id, offset, ack))
     }
 
     async fn apply_committed_consumer_offset_commits_up_to(
@@ -1792,17 +2120,33 @@ where
         let start_offset = active_segment.end_offset + 1;
 
         let segment = Segment::new(start_offset, config.segment_size);
-        let messages_path = config.get_messages_path(
-            namespace.stream_id(),
-            namespace.topic_id(),
-            namespace.partition_id(),
-            start_offset,
-        );
-        let index_path = config.get_index_path(
-            namespace.stream_id(),
-            namespace.topic_id(),
-            namespace.partition_id(),
-            start_offset,
+        // `PartitionsConfig::get_messages_path` is a stub (`/tmp/iggy_stub`);
+        // the partition's real directory is only known to the server config
+        // that created the initial segment, so derive the rotated paths from
+        // the active writer's location.
+        let (messages_path, index_path) = self.partition_dir().map_or_else(
+            || {
+                (
+                    config.get_messages_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                    config.get_index_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                )
+            },
+            |dir| {
+                (
+                    format!("{dir}/{start_offset:0>20}.log"),
+                    format!("{dir}/{start_offset:0>20}.index"),
+                )
+            },
         );
 
         let storage = SegmentStorage::new(
@@ -1869,4 +2213,60 @@ where
         // that reaches here is journal-backed and ACKs as durable.
         send_prepare_ok_common(self.consensus(), header, Some(true)).await;
     }
+}
+
+/// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
+/// chunk, pushing matching fragments. Returns bytes consumed: the start
+/// of the first batch that did not fully fit in the chunk (the caller
+/// re-reads from there), or the chunk end when everything decoded.
+fn walk_disk_chunk(
+    chunk: &Frozen<4096>,
+    query: MessageLookup,
+    count: u32,
+    matched: &mut u32,
+    fragments: &mut PollFragments<4096>,
+    last_matching_offset: &mut Option<u64>,
+) -> usize {
+    let bytes: &[u8] = chunk;
+    let mut cursor = 0usize;
+
+    while *matched < count && cursor + COMMAND_HEADER_SIZE <= bytes.len() {
+        let Ok(batch) = decode_batch_slice(&bytes[cursor..]) else {
+            // Incomplete tail batch (or corrupt data): hand the position
+            // back so the caller can re-read or bail.
+            break;
+        };
+        let total_size = batch.header.total_size();
+
+        if let Some(selection) = select_batch_slice(&batch, query, *matched) {
+            let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
+            if full_body_selected {
+                fragments.push(Fragment::slice(chunk.clone(), cursor, cursor + total_size));
+            } else {
+                let mut rewritten = batch.header;
+                rewritten.batch_length =
+                    u64::try_from(COMMAND_HEADER_SIZE + (selection.end - selection.start))
+                        .expect("sliced batch length exceeds u64::MAX");
+                rewritten.message_count = selection.matched_messages;
+                rewritten.batch_checksum = rewritten.checksum_for_blob(
+                    batch
+                        .blob()
+                        .get(selection.start..selection.end)
+                        .expect("selected batch slice must stay within blob bounds"),
+                );
+                fragments.push(Fragment::whole(rewritten.into_frozen()));
+                fragments.push(Fragment::slice(
+                    chunk.clone(),
+                    cursor + COMMAND_HEADER_SIZE + selection.start,
+                    cursor + COMMAND_HEADER_SIZE + selection.end,
+                ));
+            }
+            *last_matching_offset = Some(selection.last_matching_offset);
+            *matched += selection.matched_messages;
+        }
+
+        cursor += total_size;
+    }
+
+    cursor.min(bytes.len())
 }
