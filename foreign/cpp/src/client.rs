@@ -419,10 +419,7 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = match replication_factor {
-            0 => None,
-            value => Some(value),
-        };
+        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -535,10 +532,7 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = match replication_factor {
-            0 => None,
-            value => Some(value),
-        };
+        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,

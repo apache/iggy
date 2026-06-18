@@ -43,7 +43,7 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
     TrackStream(stream_name);
 
     const std::vector<std::string> compression_algorithms = {"none", "gzip"};
-    const std::vector<std::uint8_t> replication_factors   = {0, 1};
+    const std::vector<std::uint8_t> replication_factors   = {0, 1, 27};
     struct ExpiryOption {
         std::string kind;
         std::uint64_t value;
@@ -796,6 +796,320 @@ TEST_F(LowLevelE2E_Topic, GetTopicsAfterTopicUpdateReturnsUpdatedInputFields) {
         EXPECT_EQ(topics.front().message_expiry, 1000u);
         EXPECT_EQ(topics.front().max_topic_size, 1024ULL * 1024ULL * 1024ULL);
     });
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicWorksCorrectly) {
+    RecordProperty("description", "Returns a topic summary that matches topic details after updating a topic.");
+    const std::string stream_name        = GetRandomName();
+    const std::string original_topic     = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, 2, "none", 1,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(original_topic),
+                                         updated_topic_name, "gzip", 27, "duration", 1000, "1GiB"));
+
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(updated_topic_name));
+        const auto topics = client->get_topics(make_string_identifier(stream_name));
+        ASSERT_EQ(topics.size(), 1u);
+
+        const auto &topic_summary = topics.front();
+        EXPECT_EQ(topic_summary.id, topic_details.id);
+        EXPECT_EQ(topic_summary.created_at, topic_details.created_at);
+        EXPECT_EQ(topic_summary.name, topic_details.name);
+        EXPECT_EQ(topic_summary.size_bytes, topic_details.size_bytes);
+        EXPECT_EQ(topic_summary.message_expiry, topic_details.message_expiry);
+        EXPECT_EQ(topic_summary.compression_algorithm, topic_details.compression_algorithm);
+        EXPECT_EQ(topic_summary.max_topic_size, topic_details.max_topic_size);
+        EXPECT_EQ(topic_summary.replication_factor, topic_details.replication_factor);
+        EXPECT_EQ(topic_summary.messages_count, topic_details.messages_count);
+        EXPECT_EQ(topic_summary.partitions_count, topic_details.partitions_count);
+    });
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
+    RecordProperty("description", "Preserves the topic partition count after updating topic metadata.");
+    const std::string stream_name            = GetRandomName();
+    const std::string original_topic         = GetRandomName();
+    const std::string updated_topic_name     = GetRandomName();
+    constexpr std::uint32_t partitions_count = 3;
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, partitions_count, "none",
+                                         1, "server_default", 0, "server_default"));
+
+    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(original_topic),
+                                         updated_topic_name, "gzip", 27, "duration", 1000, "1GiB"));
+
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_string_identifier(stream_name), make_string_identifier(updated_topic_name));
+        EXPECT_EQ(topic_details.partitions_count, partitions_count);
+        EXPECT_EQ(topic_details.partitions.size(), partitions_count);
+    });
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicDoesNotChangeMessages) {
+    RecordProperty("description", "Keeps existing messages readable after updating topic metadata.");
+    const std::string stream_name        = GetRandomName();
+    const std::string original_topic     = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, 1, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_stream = client->get_stream(make_string_identifier(stream_name));
+    ASSERT_EQ(created_stream.topics.size(), 1u);
+    const auto topic_id = created_stream.topics.front().id;
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    messages.push_back(iggy::ffi::make_message(to_payload("message-before-topic-update")));
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(original_topic),
+                                         updated_topic_name, "gzip", 27, "duration", 1000, "1GiB"));
+
+    ASSERT_NO_THROW({
+        const auto polled = client->poll_messages(make_numeric_identifier(created_stream.id),
+                                                  make_string_identifier(updated_topic_name), 0, "consumer",
+                                                  make_numeric_identifier(1), "offset", 0, 10, false);
+        ASSERT_EQ(polled.count, 1u);
+        ASSERT_EQ(polled.messages.size(), 1u);
+        const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());
+        EXPECT_EQ(actual, "message-before-topic-update");
+    });
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields) {
+    RecordProperty("description",
+                   "Updates a topic across supported option combinations and verifies deterministic updated fields.");
+    const std::string stream_name = GetRandomName();
+    std::string topic_name        = GetRandomName();
+
+    const std::vector<std::string> compression_algorithms = {"none", "gzip"};
+    const std::vector<std::uint8_t> replication_factors   = {0, 1, 27};
+    struct ExpiryOption {
+        std::string kind;
+        std::uint64_t value;
+    };
+    const std::vector<ExpiryOption> expiry_options = {
+        {"server_default", 0},
+        {"never_expire", 0},
+        {"duration", 1000},
+    };
+    const std::vector<std::string> max_topic_sizes = {"server_default", "unlimited", "1GiB"};
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 2, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    for (const auto &compression_algorithm : compression_algorithms) {
+        for (const auto replication_factor : replication_factors) {
+            for (const auto &expiry_option : expiry_options) {
+                for (const auto &max_topic_size : max_topic_sizes) {
+                    const std::string updated_topic_name = GetRandomName();
+                    SCOPED_TRACE(
+                        "compression=" + compression_algorithm + ", replication=" + std::to_string(replication_factor) +
+                        ", expiry_kind=" + expiry_option.kind +
+                        ", expiry_value=" + std::to_string(expiry_option.value) + ", max_topic_size=" + max_topic_size);
+
+                    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name),
+                                                         make_string_identifier(topic_name), updated_topic_name,
+                                                         compression_algorithm, replication_factor, expiry_option.kind,
+                                                         expiry_option.value, max_topic_size));
+                    topic_name = updated_topic_name;
+                }
+            }
+        }
+    }
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicWithSameOptionsIsIdempotent) {
+    RecordProperty("description", "Calling update_topic twice with the same options returns the same topic details.");
+    const std::string stream_name        = GetRandomName();
+    const std::string original_topic     = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), original_topic, 2, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    const auto created_topic =
+        client->get_topic(make_string_identifier(stream_name), make_string_identifier(original_topic));
+
+    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_numeric_identifier(created_topic.id),
+                                         updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"));
+    const auto first_update =
+        client->get_topic(make_string_identifier(stream_name), make_numeric_identifier(created_topic.id));
+
+    ASSERT_NO_THROW(client->update_topic(make_string_identifier(stream_name), make_numeric_identifier(created_topic.id),
+                                         updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"));
+    const auto second_update =
+        client->get_topic(make_string_identifier(stream_name), make_numeric_identifier(created_topic.id));
+
+    EXPECT_EQ(second_update.id, first_update.id);
+    EXPECT_EQ(second_update.name, first_update.name);
+    EXPECT_EQ(second_update.partitions_count, first_update.partitions_count);
+    EXPECT_EQ(second_update.compression_algorithm, first_update.compression_algorithm);
+    EXPECT_EQ(second_update.replication_factor, first_update.replication_factor);
+    EXPECT_EQ(second_update.message_expiry, first_update.message_expiry);
+    EXPECT_EQ(second_update.max_topic_size, first_update.max_topic_size);
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicWithDuplicateTopicNameThrows) {
+    RecordProperty("description", "Rejects renaming a topic to another topic's existing name.");
+    const std::string stream_name       = GetRandomName();
+    const std::string first_topic_name  = GetRandomName();
+    const std::string second_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), first_topic_name, 1, "none", 1,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), second_topic_name, 1, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(first_topic_name),
+                                      second_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicWithInvalidNamesThrows) {
+    RecordProperty("description", "Rejects invalid topic names when updating a topic.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    const std::vector<std::string> invalid_topic_names = {
+        "",
+        std::string(256, 'b'),
+    };
+
+    for (const auto &invalid_topic_name : invalid_topic_names) {
+        SCOPED_TRACE("invalid_topic_name_length=" + std::to_string(invalid_topic_name.size()));
+
+        ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                          invalid_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+                     std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicFailedValidationDoesNotMutateTopic) {
+    RecordProperty("description", "Keeps the topic unchanged when update_topic fails wrapper validation.");
+    const std::string stream_name        = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(
+        client->create_topic(make_string_identifier(stream_name), topic_name, 2, "gzip", 1, "duration", 1000, "1GiB"));
+
+    const auto topic_before_update =
+        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+
+    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                      updated_topic_name, "none", 1, "duration", 2000, "not-a-size"),
+                 std::exception);
+
+    const auto topic_after_failed_update =
+        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+
+    EXPECT_EQ(topic_after_failed_update.id, topic_before_update.id);
+    EXPECT_EQ(topic_after_failed_update.name, topic_before_update.name);
+    EXPECT_EQ(topic_after_failed_update.partitions_count, topic_before_update.partitions_count);
+    EXPECT_EQ(topic_after_failed_update.compression_algorithm, topic_before_update.compression_algorithm);
+    EXPECT_EQ(topic_after_failed_update.replication_factor, topic_before_update.replication_factor);
+    EXPECT_EQ(topic_after_failed_update.message_expiry, topic_before_update.message_expiry);
+    EXPECT_EQ(topic_after_failed_update.max_topic_size, topic_before_update.max_topic_size);
+
+    EXPECT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(updated_topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicBeforeLoginThrows) {
+    RecordProperty("description", "Rejects update_topic before connect, and after connect but before login.");
+    const std::string stream_name        = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 1,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(
+        unauthenticated_client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                             updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                             updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when updating a topic on a stream that does not exist.");
+    const std::string stream_name        = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                      updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, UpdateTopicOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when updating a topic that does not exist.");
+    const std::string stream_name        = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    const std::string updated_topic_name = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                      updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, GetTopicsAfterStreamDeletionReturnsEmpty) {
