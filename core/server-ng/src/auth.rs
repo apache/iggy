@@ -123,7 +123,9 @@ pub(crate) async fn complete_login_register(
     // read-timeout replays.
     let session = match submit_register_on_owner(shard, vsr_client_id).await {
         Ok(session) => session,
-        Err(error) => return Err(LoginRegisterError::Transient(error)),
+        Err(error) => {
+            return Err(LoginRegisterError::Transient(error));
+        }
     };
 
     // Post-commit: Connected -> Authenticated -> Bound in a single borrow with
@@ -147,11 +149,11 @@ pub(crate) async fn complete_login_register(
 
     let commit = current_metadata_commit(shard);
     let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-    if let Err(error) = shard
+    let send_result = shard
         .bus
         .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
+        .await;
+    if let Err(error) = send_result {
         warn!(
             transport_client_id,
             error = %error,

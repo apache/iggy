@@ -31,8 +31,8 @@ use consensus::{
     VsrConsensus,
 };
 use iggy_binary_protocol::{
-    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    RequestHeader, StartViewChangeHeader, StartViewHeader,
+    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
@@ -46,12 +46,12 @@ use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
-use partitions::{IggyPartition, IggyPartitions};
+use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::Arc;
@@ -137,7 +137,7 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// owns the session locally, but the consensus proposal (`Register` /
 /// `Logout`) must execute on shard 0. The peer hands just that step here
 /// and awaits the committed op number over `reply` (`None` = transient
-/// submit failure; all `RegisterSubmitError` variants are transient by
+/// submit failure; all `MetadataSubmitError` variants are transient by
 /// contract, so the caller retries rather than distinguishing them).
 pub enum MetadataSubmit {
     Register {
@@ -194,6 +194,55 @@ pub type ListClientsHandler = Rc<dyn Fn(Sender<Vec<ConnectedClientInfo>>)>;
 /// doesn't answer within this window is skipped (partial result) so one
 /// wedged shard can't hang the read.
 const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A read executed on the shard that owns a partition: a message poll or a
+/// consumer-offset lookup. Carried by [`LifecycleFrame::PartitionRead`];
+/// see [`IggyShard::partition_read`].
+#[derive(Debug)]
+pub enum PartitionRead {
+    Poll {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    },
+    ConsumerOffset {
+        consumer: PollingConsumer,
+    },
+}
+
+/// Reply to a [`PartitionRead`].
+#[derive(Debug)]
+pub enum PartitionReadReply {
+    Poll {
+        fragments: PollFragments,
+        current_offset: u64,
+    },
+    ConsumerOffset {
+        stored: Option<u64>,
+        current_offset: u64,
+    },
+    /// The owning shard has no materialised partition for the namespace
+    /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
+    /// instead of an empty result.
+    NotFound,
+}
+
+/// Handler the owning shard runs for an inbound
+/// [`LifecycleFrame::PartitionRead`]. server-ng wires it to its partitions
+/// plane; the handler pushes the result back over the carried reply sender.
+pub type PartitionReadHandler =
+    Rc<dyn Fn(IggyNamespace, PartitionRead, Sender<PartitionReadReply>)>;
+
+/// Reply budget for a cross-shard [`IggyShard::partition_read`]. Bounds a
+/// wedged owning shard; the caller maps expiry to a client-visible error.
+///
+/// 10s, not lower: a disk poll over tiny segments opens one file per
+/// segment, so a 1024-message read can legitimately take several seconds
+/// on an oversubscribed host (8 parallel test clusters). Expiry is masked
+/// as an empty poll downstream while the abandoned walk keeps running, so
+/// a too-small budget turns slow reads into missing data plus duplicated
+/// walks from client retries. Must stay below the SDK's 30s request
+/// deadline.
+const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Create a bounded inter-shard channel whose sender is tagged with the
 /// owning shard.
@@ -418,6 +467,14 @@ pub enum LifecycleFrame {
     ListClients {
         reply: Sender<Vec<ConnectedClientInfo>>,
     },
+    /// Execute a partition read (message poll / consumer-offset lookup) on
+    /// the shard that owns `namespace` and push the result back over
+    /// `reply`. See [`IggyShard::partition_read`].
+    PartitionRead {
+        namespace: IggyNamespace,
+        read: PartitionRead,
+        reply: Sender<PartitionReadReply>,
+    },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
@@ -545,6 +602,11 @@ where
     /// the simulator stub ctor.
     on_list_clients: ListClientsHandler,
 
+    /// Handler for inbound [`LifecycleFrame::PartitionRead`] queries.
+    /// server-ng wires it to this shard's partitions plane. Defaults to a
+    /// no-op for the simulator stub ctor.
+    on_partition_read: PartitionReadHandler,
+
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
@@ -588,6 +650,14 @@ where
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B>>>,
+
+    /// Partition-plane frames that arrived before this shard's reconciler
+    /// materialised the namespace (post-`CreateTopic` convergence window).
+    /// Parked here instead of dropped -- there is no consensus retransmit
+    /// driver in production yet -- and re-dispatched when the matching
+    /// `ReconcileOp::InsertOwned` lands. Bounded per namespace; overflow
+    /// drops the frame (at-least-once: client/primary retries recover).
+    pending_partition_frames: RefCell<HashMap<IggyNamespace, Vec<Message<GenericHeader>>>>,
 }
 
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
@@ -629,6 +699,7 @@ where
         on_client_request: RequestHandler,
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
+        on_partition_read: PartitionReadHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
         senders: Vec<TaggedSender>,
@@ -654,6 +725,7 @@ where
             on_client_request,
             on_metadata_submit,
             on_list_clients,
+            on_partition_read,
             senders,
             shard_count,
             inbox,
@@ -663,6 +735,7 @@ where
             metrics,
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            pending_partition_frames: RefCell::new(HashMap::new()),
         })
     }
 
@@ -758,6 +831,64 @@ where
         clients
     }
 
+    /// Run a partition read (message poll / consumer-offset lookup) on the
+    /// shard owning `namespace` and await the reply.
+    ///
+    /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
+    /// (self-sends included, so a locally-owned partition takes the same
+    /// path). `None` = unroutable namespace, full owning-shard inbox,
+    /// dropped reply sender, or [`PARTITION_READ_TIMEOUT`] expiry; the
+    /// caller maps it to a client-visible error.
+    #[allow(clippy::future_not_send)]
+    pub async fn partition_read(
+        &self,
+        namespace: IggyNamespace,
+        read: PartitionRead,
+    ) -> Option<PartitionReadReply> {
+        let Some(target) = self.shards_table.shard_for(namespace) else {
+            tracing::warn!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                "partition_read: namespace not routable (not materialised yet or deleted)"
+            );
+            return None;
+        };
+        let (reply_tx, reply_rx) = channel::<PartitionReadReply>(1);
+        let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+            namespace,
+            read,
+            reply: reply_tx,
+        });
+        let sender = self.senders.get(target as usize)?;
+        if let Err(error) = sender.try_send(frame) {
+            tracing::warn!(
+                shard = self.id,
+                target,
+                "partition_read: inbox rejected PartitionRead frame: {error:?}"
+            );
+            return None;
+        }
+        match compio::time::timeout(PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
+            Ok(Ok(reply)) => Some(reply),
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    "partition_read: reply sender dropped (handler not wired / shutdown)"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    "partition_read: owning shard did not reply within budget"
+                );
+                None
+            }
+        }
+    }
+
     /// Return a clone of the shard-0 coordinator handle, if attached.
     /// Bootstrap uses this to wire the listener accept callbacks
     /// (replica + client) to coordinator-driven fd-delegation instead
@@ -796,6 +927,7 @@ where
             on_client_request: std::rc::Rc::new(|_, _| {}),
             on_metadata_submit: std::rc::Rc::new(|_| {}),
             on_list_clients: std::rc::Rc::new(|_| {}),
+            on_partition_read: std::rc::Rc::new(|_, _, _| {}),
             plane,
             coordinator: None,
             senders: Vec::new(),
@@ -812,6 +944,7 @@ where
             metrics: crate::metrics::ShardMetrics::for_shard(),
             metadata_tick_handler: RefCell::new(None),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            pending_partition_frames: RefCell::new(HashMap::new()),
         }
     }
 
@@ -907,6 +1040,34 @@ where
                         PartitionLocation::new(ShardId::new(self_shard_id), epoch),
                     );
                     self.metrics.record_partition_materialised();
+                    // Re-dispatch frames that arrived before this partition
+                    // materialised (see `park_if_unmaterialised`). `dispatch`
+                    // re-routes them onto our own inbox, so the pump
+                    // processes them after this drain completes.
+                    let parked = self
+                        .pending_partition_frames
+                        .borrow_mut()
+                        .remove(&namespace);
+                    if let Some(frames) = parked {
+                        tracing::debug!(
+                            shard = self_shard_id,
+                            namespace_raw = namespace.inner(),
+                            count = frames.len(),
+                            "re-dispatching parked partition frames after materialisation"
+                        );
+                        for frame in frames {
+                            if let Some(sender) = self.senders.get(self_shard_id as usize)
+                                && let Err(error) =
+                                    sender.try_send(ShardFrame::consensus(self_shard_id, frame))
+                            {
+                                tracing::warn!(
+                                    shard = self_shard_id,
+                                    namespace_raw = namespace.inner(),
+                                    "dropping parked partition frame: inbox rejected: {error:?}"
+                                );
+                            }
+                        }
+                    }
                 }
                 ReconcileOp::InsertRouted {
                     namespace,
@@ -927,6 +1088,11 @@ where
                     // on data that is already gone.
                     let removed = partitions.remove(&namespace);
                     partitions.untombstone(&namespace);
+                    // A topic created then deleted before its `InsertOwned`
+                    // pass never drains parked frames the normal way; reclaim
+                    // them here so they cannot leak across many create-delete
+                    // races (the partition is gone, so the frames are moot).
+                    self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
                     if removed.is_none() {
@@ -939,6 +1105,7 @@ where
                 }
                 ReconcileOp::RemoveRouted { namespace } => {
                     self.shards_table.remove(&namespace);
+                    self.discard_parked_partition_frames(namespace);
                 }
             }
         }
@@ -991,8 +1158,18 @@ where
             > + StreamsFrontend,
     {
         match MessageBag::try_from(message) {
-            Ok(MessageBag::Request(request)) => self.on_request(request).await,
-            Ok(MessageBag::Prepare(prepare)) => self.on_replicate(prepare).await,
+            Ok(MessageBag::Request(request)) => {
+                let routing = (request.header().operation, request.header().namespace);
+                if let Some(request) = self.park_if_unmaterialised(request, routing.0, routing.1) {
+                    self.on_request(request).await;
+                }
+            }
+            Ok(MessageBag::Prepare(prepare)) => {
+                let routing = (prepare.header().operation, prepare.header().namespace);
+                if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
+                    self.on_replicate(prepare).await;
+                }
+            }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
             Ok(MessageBag::StartViewChange(msg)) => self.on_start_view_change(msg).await,
             Ok(MessageBag::DoViewChange(msg)) => self.on_do_view_change(msg).await,
@@ -1002,6 +1179,73 @@ where
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
             }
         }
+    }
+
+    /// Drop parked frames for a namespace that will never materialise (it was
+    /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
+    /// reclaimed instead of leaking until process exit.
+    fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
+        if let Some(frames) = self
+            .pending_partition_frames
+            .borrow_mut()
+            .remove(&namespace)
+            && !frames.is_empty()
+        {
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                count = frames.len(),
+                "discarding parked partition frames for removed namespace"
+            );
+        }
+    }
+
+    /// Park a partition-plane frame whose namespace this shard has not yet
+    /// materialised (post-`CreateTopic` convergence window: the metadata
+    /// commit precedes the reconciler pass that builds the local replica).
+    ///
+    /// Returns `Some(message)` when the frame should be processed normally:
+    /// non-partition operation, namespace materialised, or namespace
+    /// tombstoned (the plane's own tombstone guard handles the drop).
+    /// Returns `None` when the frame was parked (or dropped on overflow);
+    /// [`Self::apply_reconcile_ops`] re-dispatches parked frames once the
+    /// matching `ReconcileOp::InsertOwned` lands.
+    fn park_if_unmaterialised<H>(
+        &self,
+        message: Message<H>,
+        operation: Operation,
+        namespace_raw: u64,
+    ) -> Option<Message<H>>
+    where
+        H: iggy_binary_protocol::ConsensusHeader,
+    {
+        const MAX_PARKED_PER_NAMESPACE: usize = 128;
+        if !operation.is_partition() {
+            return Some(message);
+        }
+        let namespace = IggyNamespace::from_raw(namespace_raw);
+        let partitions = self.plane.partitions();
+        if partitions.contains(&namespace) || partitions.is_tombstoned(&namespace) {
+            return Some(message);
+        }
+        let mut pending = self.pending_partition_frames.borrow_mut();
+        let parked = pending.entry(namespace).or_default();
+        if parked.len() >= MAX_PARKED_PER_NAMESPACE {
+            tracing::warn!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                "parked-frame buffer full; dropping partition frame"
+            );
+            return None;
+        }
+        tracing::debug!(
+            shard = self.id,
+            namespace_raw = namespace.inner(),
+            operation = ?operation,
+            "parking partition frame until namespace materialises"
+        );
+        parked.push(message.into_generic());
+        None
     }
 
     #[allow(clippy::future_not_send)]

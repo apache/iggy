@@ -16,8 +16,13 @@
 // under the License.
 
 use bytes::Bytes;
+use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
+    StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -393,6 +398,7 @@ impl SimClient {
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
+            only_if_expired: false,
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
     }
@@ -436,12 +442,19 @@ impl SimClient {
         consumer_id: u32,
         offset: u64,
     ) -> Message<RequestHeader> {
-        let mut payload = Vec::with_capacity(13);
-        payload.push(consumer_kind);
-        payload.extend_from_slice(&consumer_id.to_le_bytes());
-        payload.extend_from_slice(&offset.to_le_bytes());
-
-        self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
+        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+        let request = StoreConsumerOffsetRequest {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+            offset,
+        };
+        self.build_request_with_namespace(
+            Operation::StoreConsumerOffset,
+            &request.to_bytes(),
+            namespace,
+        )
     }
 
     pub fn delete_consumer_offset(
@@ -450,11 +463,18 @@ impl SimClient {
         consumer_kind: u8,
         consumer_id: u32,
     ) -> Message<RequestHeader> {
-        let mut payload = Vec::with_capacity(5);
-        payload.push(consumer_kind);
-        payload.extend_from_slice(&consumer_id.to_le_bytes());
-
-        self.build_request_with_namespace(Operation::DeleteConsumerOffset, &payload, namespace)
+        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+        let request = DeleteConsumerOffsetRequest {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+        };
+        self.build_request_with_namespace(
+            Operation::DeleteConsumerOffset,
+            &request.to_bytes(),
+            namespace,
+        )
     }
 
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's
@@ -471,13 +491,20 @@ impl SimClient {
         offset: u64,
         ack: AckLevel,
     ) -> Message<RequestHeader> {
-        let mut payload = Vec::with_capacity(14);
-        payload.push(consumer_kind);
-        payload.extend_from_slice(&consumer_id.to_le_bytes());
-        payload.extend_from_slice(&offset.to_le_bytes());
-        payload.push(ack.as_u8());
-
-        self.build_request_with_namespace(Operation::StoreConsumerOffset2, &payload, namespace)
+        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+        let request = StoreConsumerOffset2Request {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+            offset,
+            ack,
+        };
+        self.build_request_with_namespace(
+            Operation::StoreConsumerOffset2,
+            &request.to_bytes(),
+            namespace,
+        )
     }
 
     /// Delete offset with explicit `AckLevel`.
@@ -492,12 +519,19 @@ impl SimClient {
         consumer_id: u32,
         ack: AckLevel,
     ) -> Message<RequestHeader> {
-        let mut payload = Vec::with_capacity(6);
-        payload.push(consumer_kind);
-        payload.extend_from_slice(&consumer_id.to_le_bytes());
-        payload.push(ack.as_u8());
-
-        self.build_request_with_namespace(Operation::DeleteConsumerOffset2, &payload, namespace)
+        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+        let request = DeleteConsumerOffset2Request {
+            consumer: namespace_consumer(consumer_kind, consumer_id),
+            stream_id,
+            topic_id,
+            partition_id,
+            ack,
+        };
+        self.build_request_with_namespace(
+            Operation::DeleteConsumerOffset2,
+            &request.to_bytes(),
+            namespace,
+        )
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -581,4 +615,27 @@ impl SimClient {
             ..Default::default()
         }
     }
+}
+
+/// Build a numeric-id `WireConsumer` for the offset-store/delete requests.
+/// The partition plane resolves numeric consumer ids verbatim, so this
+/// mirrors the real SDK wire shape (`[kind][WireIdentifier]`) rather than
+/// the old fixed `[kind][u32]` prefix.
+const fn namespace_consumer(kind: u8, consumer_id: u32) -> WireConsumer {
+    WireConsumer {
+        kind,
+        id: WireIdentifier::Numeric(consumer_id),
+    }
+}
+
+/// Decompose a namespace into the `(stream_id, topic_id, partition_id)` wire
+/// identifiers the consumer-offset requests carry. Namespace ids are small
+/// test values that always fit `u32`.
+fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u32>) {
+    let to_u32 = |v: usize| u32::try_from(v).expect("namespace id fits u32");
+    (
+        WireIdentifier::Numeric(to_u32(ns.stream_id())),
+        WireIdentifier::Numeric(to_u32(ns.topic_id())),
+        Some(to_u32(ns.partition_id())),
+    )
 }

@@ -45,10 +45,9 @@ pub(crate) async fn assert_produces_messages(harness: &TestHarness) {
                     true,
                 )
                 .await
+                && !polled.messages.is_empty()
             {
-                if !polled.messages.is_empty() {
-                    return;
-                }
+                return;
             }
 
             sleep(RETRY_INTERVAL).await;

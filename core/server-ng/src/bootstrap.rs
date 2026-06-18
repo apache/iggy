@@ -19,6 +19,7 @@ use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
+    make_partition_read_handler,
 };
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
@@ -878,6 +879,49 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
+    // Consensus timer driver: heartbeats, prepare retransmit, and
+    // view-change timeouts only advance when `VsrConsensus::tick` runs
+    // ("call this periodically, e.g. every 10ms"). The simulator steps it
+    // explicitly; production drives it here. Without this, a prepare lost
+    // to a transient replica-link blip is never retransmitted and its
+    // client request hangs until the SDK read timeout.
+    let (consensus_tick_stop_tx, consensus_tick_stop_rx) = channel::<()>(1);
+    let tick_shard = Rc::clone(&shard);
+    let consensus_tick_handle = compio::runtime::spawn(async move {
+        const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        loop {
+            if consensus_tick_stop_rx.try_recv().is_ok() {
+                break;
+            }
+            tick_shard.tick_metadata().await;
+            tick_shard.tick_partitions().await;
+            compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
+        }
+    });
+    bus.track_background(consensus_tick_handle);
+
+    // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
+    // group) and only when enabled. Each pass no-ops unless this node is
+    // the caught-up metadata primary, so the delete is proposed once and
+    // replicated to every replica.
+    let pat_cleaner_stop = if shard_id == 0 && config.personal_access_token.cleaner.enabled {
+        let (cleaner_stop_tx, cleaner_stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.personal_access_token.cleaner.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::personal_access_token_cleaner::run_pat_cleaner(
+                cleaner_shard,
+                cleaner_stop_rx,
+                interval,
+            )
+            .await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(cleaner_stop_tx)
+    } else {
+        None
+    };
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
@@ -910,6 +954,10 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
+            let _ = consensus_tick_stop_tx.try_send(());
+            if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+                let _ = cleaner_stop_tx.try_send(());
+            }
             return Err(error);
         }
     }
@@ -917,6 +965,10 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
+    let _ = consensus_tick_stop_tx.try_send(());
+    if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+        let _ = cleaner_stop_tx.try_send(());
+    }
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
@@ -1162,6 +1214,7 @@ async fn build_shard_for_thread(
     let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
     let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
     let on_list_clients = make_list_clients_handler(&sessions);
+    let on_partition_read = make_partition_read_handler(&shard_handle);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -1170,6 +1223,7 @@ async fn build_shard_for_thread(
         on_client_request,
         on_metadata_submit,
         on_list_clients,
+        on_partition_read,
         metadata,
         partitions,
         senders,
@@ -1301,6 +1355,11 @@ async fn load_partition(
     })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition.set_partition_dir(config.system.get_partition_path(
+        stream_id,
+        topic_id,
+        partition_id,
+    ));
     hydrate_partition_log(
         &mut partition,
         config,
