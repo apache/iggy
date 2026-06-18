@@ -206,6 +206,29 @@ async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_
 
     let expected_ids: Vec<i64> = (1..=DOC_COUNT as i64).collect();
     assert_contains_document_ids(&received, &expected_ids);
+
+    // Wait for at least one empty poll to fire (connector catches up to end of index).
+    // A cursor-reset bug would cause the connector to re-fetch all docs on the next empty poll.
+    sleep(Duration::from_millis(POLL_INTERVAL_MS * 5)).await;
+
+    let audit_consumer: Identifier = "pagination_audit".try_into().unwrap();
+    let all_on_stream =
+        poll_all_messages_from_offset_zero(&client, &audit_consumer, DOC_COUNT).await;
+
+    let all_ids: Vec<i64> = all_on_stream
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    let unique_count = document_ids(&all_on_stream).len();
+    assert_eq!(
+        all_ids.len(),
+        unique_count,
+        "stream contains duplicate document IDs after empty poll; cursor was reset"
+    );
+    assert_eq!(
+        unique_count, DOC_COUNT,
+        "expected exactly {DOC_COUNT} unique documents on stream, got {unique_count}"
+    );
 }
 
 #[iggy_harness(

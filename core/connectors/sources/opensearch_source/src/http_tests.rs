@@ -51,7 +51,7 @@ fn base_config(url: &str) -> OpenSearchSourceConfig {
         polling_interval: Some("1ms".to_string()),
         batch_size: Some(10),
         timestamp_field: Some("timestamp".to_string()),
-        verbose_logging: None,
+        verbose_logging: false,
         state: None,
     }
 }
@@ -315,6 +315,47 @@ async fn given_hit_without_sort_when_poll_should_skip_document() {
     let (_, polls, _, empty_polls) = source.test_metrics().await;
     assert_eq!(polls, 1);
     assert_eq!(empty_polls, 1);
+    assert!(
+        source.test_search_after().await.is_none(),
+        "sort-missing skip must not corrupt cursor"
+    );
+}
+
+#[tokio::test]
+async fn given_cursor_set_when_empty_poll_should_preserve_cursor() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let count = request_count.clone();
+
+    let first_page = search_response(vec![search_hit("doc-1", "2024-01-01T00:00:00Z", json!({}))]);
+    let empty_page = search_response(vec![]);
+
+    let app = mock_router(StatusCode::OK, move |_| {
+        let first_page = first_page.clone();
+        let empty_page = empty_page.clone();
+        let count = count.clone();
+        async move {
+            let page = count.fetch_add(1, Ordering::SeqCst);
+            let response = if page == 0 { first_page } else { empty_page };
+            (StatusCode::OK, response.to_string())
+        }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    source.poll().await.expect("first poll");
+    let cursor_after_first = source.test_search_after().await;
+    assert!(
+        cursor_after_first.is_some(),
+        "cursor must be set after non-empty poll"
+    );
+
+    source.poll().await.expect("empty poll");
+    let cursor_after_empty = source.test_search_after().await;
+    assert_eq!(
+        cursor_after_empty, cursor_after_first,
+        "empty poll must not reset cursor to None"
+    );
 }
 
 #[tokio::test]
@@ -334,6 +375,10 @@ async fn given_hit_without_source_when_search_should_skip_document() {
 
     let produced = source.poll().await.expect("poll should succeed");
     assert!(produced.messages.is_empty());
+    assert!(
+        source.test_search_after().await.is_none(),
+        "_source-missing skip must not corrupt cursor"
+    );
 }
 
 #[tokio::test]
@@ -384,6 +429,10 @@ async fn given_enabled_file_state_when_open_close_should_persist_state() {
     let (fetched, polls, _, _) = reloaded.test_metrics().await;
     assert_eq!(fetched, 1);
     assert_eq!(polls, 1);
+    assert!(
+        reloaded.test_search_after().await.is_some(),
+        "search_after cursor must be restored from file state"
+    );
 }
 
 #[tokio::test]
@@ -455,8 +504,11 @@ async fn given_epoch_seconds_timestamp_should_update_last_poll_timestamp() {
     source.open().await.unwrap();
     source.poll().await.unwrap();
 
-    let (_, _, _, _) = source.test_metrics().await;
-    // Timestamp parsing exercised via poll completing without error.
+    let last_ts = source.test_last_poll_timestamp().await;
+    assert!(
+        last_ts.is_some(),
+        "epoch-seconds timestamp must be parsed and stored in state"
+    );
 }
 
 #[tokio::test]
@@ -464,7 +516,7 @@ async fn given_verbose_logging_when_poll_should_succeed() {
     let app = empty_search_router(StatusCode::OK);
     let base = start_server(app).await;
     let mut config = base_config(&base);
-    config.verbose_logging = Some(true);
+    config.verbose_logging = true;
     let mut source = OpenSearchSource::new(1, config, None);
     source.open().await.unwrap();
     source.poll().await.expect("verbose poll should succeed");

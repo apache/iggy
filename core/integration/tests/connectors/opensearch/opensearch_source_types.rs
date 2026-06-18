@@ -167,31 +167,73 @@ async fn given_first_batch_polled_when_second_batch_inserted_should_not_duplicat
     }
     fixture.refresh_index().await.expect("refresh index");
 
-    let mut second_batch = Vec::new();
+    // Wait for second batch to arrive, collecting only new IDs.
+    let mut second_batch_seen = false;
     for _ in 0..POLL_ATTEMPTS {
         let polled = poll_json_messages(&client, &consumer_id, 10).await;
-        for record in polled {
-            let id = record.get("id").and_then(Value::as_i64).unwrap_or(0);
-            if !first_ids.contains(&id) {
-                second_batch.push(record);
-            }
-        }
-        if second_batch.len() >= TEST_MESSAGE_COUNT {
+        let new_count = polled
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_i64))
+            .filter(|id| !first_ids.contains(id))
+            .count();
+        if new_count >= TEST_MESSAGE_COUNT {
+            second_batch_seen = true;
             break;
         }
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
+    assert!(second_batch_seen, "second batch never arrived");
 
-    assert_eq!(
-        second_batch.len(),
-        TEST_MESSAGE_COUNT,
-        "expected second batch only"
-    );
-    for record in &second_batch {
-        let id = record.get("id").and_then(Value::as_i64).unwrap_or(0);
-        assert!(
-            id > TEST_MESSAGE_COUNT as i64,
-            "duplicate or first-batch id in second batch: {id}"
-        );
+    // Verify the full stream from offset 0 contains exactly 2*TEST_MESSAGE_COUNT unique docs.
+    // If the cursor reset bug were present, the connector would re-emit first-batch docs and
+    // the stream would contain duplicates.
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let audit_consumer: Identifier = "no_dup_audit".try_into().unwrap();
+    let mut all_on_stream: Vec<Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(audit_consumer.clone()),
+                &PollingStrategy::offset(0),
+                100,
+                false,
+            )
+            .await
+        {
+            all_on_stream.clear();
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice::<Value>(&msg.payload) {
+                    all_on_stream.push(json);
+                }
+            }
+            if all_on_stream.len() >= TEST_MESSAGE_COUNT * 2 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
+
+    let all_ids: Vec<i64> = all_on_stream
+        .iter()
+        .filter_map(|r| r.get("id").and_then(Value::as_i64))
+        .collect();
+    let unique_ids: HashSet<i64> = all_ids.iter().copied().collect();
+    assert_eq!(
+        all_ids.len(),
+        unique_ids.len(),
+        "stream has {} total IDs but only {} unique; cursor reset caused re-delivery",
+        all_ids.len(),
+        unique_ids.len()
+    );
+    assert_eq!(
+        unique_ids.len(),
+        TEST_MESSAGE_COUNT * 2,
+        "expected {} unique docs on stream (first + second batch), got {}",
+        TEST_MESSAGE_COUNT * 2,
+        unique_ids.len()
+    );
 }

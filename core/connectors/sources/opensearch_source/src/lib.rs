@@ -47,8 +47,8 @@ const DEFAULT_BATCH_SIZE: usize = 100;
 struct State {
     #[serde(default)]
     last_poll_timestamp: Option<DateTime<Utc>>,
-    #[serde(default)]
-    total_documents_fetched: usize,
+    #[serde(default, alias = "total_documents_fetched")]
+    total_documents_published: usize,
     #[serde(default)]
     poll_count: usize,
     /// OpenSearch `search_after` tuple from the last hit in the previous batch.
@@ -98,7 +98,8 @@ pub struct OpenSearchSourceConfig {
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
     pub timestamp_field: Option<String>,
-    pub verbose_logging: Option<bool>,
+    #[serde(default)]
+    pub verbose_logging: bool,
     pub state: Option<StateConfig>,
 }
 
@@ -132,7 +133,7 @@ impl OpenSearchSource {
             .query
             .clone()
             .unwrap_or_else(|| json!({ "match_all": {} }));
-        let verbose = config.verbose_logging.unwrap_or(false);
+        let verbose = config.verbose_logging;
         let (restored_state, state_restore_error, runtime_state_restored) =
             restore_state(id, state);
 
@@ -298,6 +299,11 @@ impl OpenSearchSource {
             };
 
             let Some(source) = hit.get("_source") else {
+                warn!(
+                    connector_id = self.id,
+                    hit_id = hit.get("_id").and_then(|v| v.as_str()),
+                    "Skipping OpenSearch hit without _source; document will not be published"
+                );
                 continue;
             };
 
@@ -337,9 +343,11 @@ impl OpenSearchSource {
         processing_time_ms: f64,
     ) -> (Vec<ProducedMessage>, Option<ConnectorState>) {
         let mut state = self.state.lock().await;
-        state.total_documents_fetched += outcome.messages.len();
+        state.total_documents_published += outcome.messages.len();
         state.poll_count += 1;
-        state.search_after = outcome.search_after;
+        if let Some(cursor) = outcome.search_after {
+            state.search_after = Some(cursor);
+        }
         if let Some(timestamp) = outcome.last_poll_timestamp {
             state.last_poll_timestamp = Some(timestamp);
         }
@@ -360,7 +368,7 @@ impl OpenSearchSource {
                 / total_polls as f64;
 
         let produced_count = outcome.messages.len();
-        let total_documents_fetched = state.total_documents_fetched;
+        let total_documents_published = state.total_documents_published;
         let messages = outcome.messages;
         let persisted_state = self.serialize_state(&state);
         drop(state);
@@ -368,13 +376,13 @@ impl OpenSearchSource {
         if self.verbose {
             info!(
                 "OpenSearch source connector ID: {} produced {produced_count} messages. \
-                 Total fetched: {total_documents_fetched}",
+                 Total published: {total_documents_published}",
                 self.id
             );
         } else {
             debug!(
                 "OpenSearch source connector ID: {} produced {produced_count} messages. \
-                 Total fetched: {total_documents_fetched}",
+                 Total published: {total_documents_published}",
                 self.id
             );
         }
@@ -391,11 +399,21 @@ impl OpenSearchSource {
     async fn test_metrics(&self) -> (usize, usize, usize, usize) {
         let state = self.state.lock().await;
         (
-            state.total_documents_fetched,
+            state.total_documents_published,
             state.poll_count,
             state.error_count,
             state.processing_stats.empty_polls_count,
         )
+    }
+
+    #[cfg(test)]
+    async fn test_search_after(&self) -> Option<Vec<Value>> {
+        self.state.lock().await.search_after.clone()
+    }
+
+    #[cfg(test)]
+    async fn test_last_poll_timestamp(&self) -> Option<DateTime<Utc>> {
+        self.state.lock().await.last_poll_timestamp
     }
 }
 
@@ -408,8 +426,8 @@ fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<Strin
         Some(restored) => {
             info!(
                 "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
-                 Documents fetched: {}, poll count: {}",
-                restored.total_documents_fetched, restored.poll_count
+                 Documents published: {}, poll count: {}",
+                restored.total_documents_published, restored.poll_count
             );
             (restored, None, true)
         }
@@ -542,6 +560,7 @@ impl Source for OpenSearchSource {
                 state.error_count += 1;
                 state.last_error = Some(e.to_string());
                 drop(state);
+                sleep(self.polling_interval).await;
                 return Err(e);
             }
         };
@@ -558,17 +577,18 @@ impl Source for OpenSearchSource {
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
         info!(
-            "OpenSearch source connector with ID: {} is closing. Stats: {} total documents fetched, {} polls executed, {} errors",
-            self.id, state.total_documents_fetched, state.poll_count, state.error_count
+            "OpenSearch source connector with ID: {} is closing. Stats: {} total documents published, {} polls executed, {} errors",
+            self.id, state.total_documents_published, state.poll_count, state.error_count
         );
         drop(state);
 
-        if self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
+        if self.client.is_some()
+            && self
+                .config
+                .state
+                .as_ref()
+                .map(|s| s.enabled)
+                .unwrap_or(false)
         {
             self.save_state().await?;
         }
@@ -599,7 +619,7 @@ mod tests {
             polling_interval: Some("100ms".to_string()),
             batch_size: Some(10),
             timestamp_field: Some("timestamp".to_string()),
-            verbose_logging: None,
+            verbose_logging: false,
             state: None,
         }
     }
@@ -607,8 +627,8 @@ mod tests {
     fn test_state() -> State {
         State {
             last_poll_timestamp: None,
-            total_documents_fetched: 500,
-            poll_count: 5,
+            total_documents_published: 500,
+            poll_count: 7,
             search_after: Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")]),
             error_count: 1,
             last_error: Some("connection reset".to_string()),
@@ -623,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn given_persisted_state_should_restore_total_documents_fetched() {
+    fn given_persisted_state_should_restore_total_documents_published() {
         let state = test_state();
         let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
         let connector_state = ConnectorState(serialized);
@@ -633,8 +653,8 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let restored = source.state.lock().await;
-            assert_eq!(restored.total_documents_fetched, 500);
-            assert_eq!(restored.poll_count, 5);
+            assert_eq!(restored.total_documents_published, 500);
+            assert_eq!(restored.poll_count, 7);
             assert_eq!(
                 restored.search_after,
                 Some(vec![json!("2024-01-01T00:00:00Z"), json!("doc_42")])
@@ -651,7 +671,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = source.state.lock().await;
-            assert_eq!(state.total_documents_fetched, 0);
+            assert_eq!(state.total_documents_published, 0);
             assert_eq!(state.poll_count, 0);
             assert_eq!(state.search_after, None);
             assert!(source.state_restore_error.is_none());
@@ -668,7 +688,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = source.state.lock().await;
-            assert_eq!(state.total_documents_fetched, 0);
+            assert_eq!(state.total_documents_published, 0);
             assert_eq!(state.poll_count, 0);
         });
     }
@@ -719,7 +739,7 @@ mod tests {
                 last_updated: Utc::now(),
                 version: SOURCE_STATE_VERSION,
                 data: json!({
-                    "total_documents_fetched": 9,
+                    "total_documents_published": 9,
                     "poll_count": 4,
                     "search_after": ["2024-02-01T00:00:00Z", "doc-9"],
                     "error_count": 2,
@@ -741,7 +761,7 @@ mod tests {
                 .expect("apply source state");
 
             let state = source.state.lock().await;
-            assert_eq!(state.total_documents_fetched, 9);
+            assert_eq!(state.total_documents_published, 9);
             assert_eq!(state.poll_count, 4);
             assert_eq!(
                 state.search_after,
@@ -800,7 +820,7 @@ mod tests {
                 .await
                 .expect("export state");
             assert_eq!(exported.id, "opensearch_source_1");
-            assert_eq!(exported.data["total_documents_fetched"], 500);
+            assert_eq!(exported.data["total_documents_published"], 500);
             assert_eq!(
                 exported.metadata.as_ref().unwrap()["index"],
                 "test_documents"
@@ -837,8 +857,8 @@ mod tests {
             rmp_serde::from_slice(&serialized).expect("Failed to deserialize");
 
         assert_eq!(
-            original.total_documents_fetched,
-            deserialized.total_documents_fetched
+            original.total_documents_published,
+            deserialized.total_documents_published
         );
         assert_eq!(original.poll_count, deserialized.poll_count);
         assert_eq!(original.search_after, deserialized.search_after);
@@ -857,6 +877,6 @@ mod tests {
             .unwrap()
             .deserialize(CONNECTOR_NAME, 1)
             .expect("Failed to deserialize state");
-        assert_eq!(restored.total_documents_fetched, 500);
+        assert_eq!(restored.total_documents_published, 500);
     }
 }

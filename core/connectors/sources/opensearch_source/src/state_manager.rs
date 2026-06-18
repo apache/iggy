@@ -55,17 +55,17 @@ impl OpenSearchSource {
         if let Some(source_state) = storage.load_source_state(&state_id).await? {
             self.source_state_to_internal_state(source_state).await?;
 
-            let (last_poll_timestamp, total_documents_fetched, poll_count) = {
+            let (last_poll_timestamp, total_documents_published, poll_count) = {
                 let state = self.state.lock().await;
                 (
                     state.last_poll_timestamp,
-                    state.total_documents_fetched,
+                    state.total_documents_published,
                     state.poll_count,
                 )
             };
             info!(
                 "Loaded state for OpenSearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
-                self.id, last_poll_timestamp, total_documents_fetched, poll_count
+                self.id, last_poll_timestamp, total_documents_published, poll_count
             );
         } else {
             info!(
@@ -145,7 +145,7 @@ impl StateStorage for FileStateStorage {
 
         let path = self.get_state_path(&state.id);
         let tmp_path = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(state)
+        let json = serde_json::to_string(state)
             .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
 
         let mut tmp_file = OpenOptions::new()
@@ -155,19 +155,33 @@ impl StateStorage for FileStateStorage {
             .open(&tmp_path)
             .await
             .map_err(|e| Error::Storage(format!("Failed to open state temp file: {e}")))?;
-        tmp_file
-            .write_all(json.as_bytes())
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to write state temp file: {e}")))?;
-        tmp_file
-            .sync_data()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to sync state temp file: {e}")))?;
+        if let Err(e) = tmp_file.write_all(json.as_bytes()).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!(
+                "Failed to write state temp file: {e}"
+            )));
+        }
+        if let Err(e) = tmp_file.sync_data().await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!(
+                "Failed to sync state temp file: {e}"
+            )));
+        }
         drop(tmp_file);
 
         fs::rename(&tmp_path, &path)
             .await
             .map_err(|e| Error::Storage(format!("Failed to rename state file: {e}")))?;
+
+        // Flush the parent directory entry so the rename is durable on crash.
+        if let Some(parent) = path.parent() {
+            let dir = tokio::fs::File::open(parent)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to open state directory: {e}")))?;
+            dir.sync_all()
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to sync state directory: {e}")))?;
+        }
 
         Ok(())
     }
@@ -235,7 +249,7 @@ mod tests {
                 last_updated: Utc::now(),
                 version: SOURCE_STATE_VERSION,
                 data: json!({
-                    "total_documents_fetched": 7,
+                    "total_documents_published": 7,
                     "poll_count": 2,
                     "search_after": ["2024-01-01T00:00:00Z", "doc-7"]
                 }),
@@ -251,7 +265,7 @@ mod tests {
                 .await
                 .expect("load state")
                 .expect("state file should exist");
-            assert_eq!(loaded.data["total_documents_fetched"], 7);
+            assert_eq!(loaded.data["total_documents_published"], 7);
             assert_eq!(loaded.data["poll_count"], 2);
         });
     }
