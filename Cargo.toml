@@ -113,6 +113,7 @@ compio = { version = "=0.19.1", features = [
     "runtime",
     "macros",
     "io-uring",
+    "polling",
     "time",
     "rustls",
     "ring",

@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use compio::runtime::Runtime;
+use compio::{driver::DriverType, runtime::Runtime};
 
 const DEFAULT_SHARD_RUNTIME_CAPACITY: u32 = 4096;
 const SHARD_RUNTIME_CAPACITY_ENV: &str = "IGGY_SHARD_RUNTIME_CAPACITY";
+const FORCE_POLL_DRIVER_ENV: &str = "IGGY_FORCE_POLL_DRIVER";
 
 /// Resolves the per-shard io_uring SQ/CQ capacity from `IGGY_SHARD_RUNTIME_CAPACITY`,
 /// falling back to [`DEFAULT_SHARD_RUNTIME_CAPACITY`] when the var is missing or
@@ -28,6 +29,12 @@ fn shard_capacity_from_env() -> u32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SHARD_RUNTIME_CAPACITY)
+}
+
+fn force_poll_driver_from_env() -> bool {
+    std::env::var(FORCE_POLL_DRIVER_ENV)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 /// Creates a compio runtime for a shard thread, with shard-specific `io_uring` flags.
@@ -52,16 +59,19 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // This roughly estimates the number of tasks we will create.
     let mut proactor = compio::driver::ProactorBuilder::new();
 
-    proactor
-        .capacity(shard_capacity_from_env())
-        .coop_taskrun(true)
-        .taskrun_flag(true);
+    proactor.capacity(shard_capacity_from_env());
 
-    // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
-    // This causes a freeze on macOS with compio fs operations
-    // see https://github.com/compio-rs/compio/issues/446
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    proactor.thread_pool_limit(0);
+    if force_poll_driver_from_env() {
+        proactor.driver_type(DriverType::Poll);
+    } else {
+        proactor.coop_taskrun(true).taskrun_flag(true);
+
+        // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
+        // This causes a freeze on macOS with compio fs operations
+        // see https://github.com/compio-rs/compio/issues/446
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        proactor.thread_pool_limit(0);
+    }
 
     compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor.to_owned())
