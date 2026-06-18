@@ -298,6 +298,8 @@ impl OpenSearchSource {
                 continue;
             };
 
+            last_sort = Some(sort);
+
             let Some(source) = hit.get("_source") else {
                 warn!(
                     connector_id = self.id,
@@ -306,8 +308,6 @@ impl OpenSearchSource {
                 );
                 continue;
             };
-
-            last_sort = Some(sort);
 
             if let Some(timestamp_value) = source.get(timestamp_field)
                 && let Some(timestamp_utc) = parse_document_timestamp(timestamp_value)
@@ -327,6 +327,14 @@ impl OpenSearchSource {
                 origin_timestamp: None,
                 payload,
             });
+        }
+
+        if !hits.is_empty() && last_sort.is_none() {
+            return Err(Error::Storage(format!(
+                "OpenSearch returned {} hit(s) but none had a sort tuple; \
+                 index may be missing the sort field or using an incompatible mapping",
+                hits.len()
+            )));
         }
 
         Ok(SearchOutcome {

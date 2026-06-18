@@ -295,7 +295,7 @@ async fn given_basic_auth_when_search_should_send_authorization_header() {
 }
 
 #[tokio::test]
-async fn given_hit_without_sort_when_poll_should_skip_document() {
+async fn given_batch_where_all_hits_lack_sort_when_poll_should_return_error() {
     let hit = json!({
         "_id": "doc-1",
         "_source": { "id": 1, "timestamp": "2024-01-01T00:00:00Z" }
@@ -309,15 +309,17 @@ async fn given_hit_without_sort_when_poll_should_skip_document() {
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
     source.open().await.unwrap();
 
-    let produced = source.poll().await.expect("poll should succeed");
-    assert!(produced.messages.is_empty());
+    let error = source.poll().await.expect_err("all-no-sort batch must fail");
+    assert!(
+        matches!(error, Error::Storage(_)),
+        "expected Storage error, got {error:?}"
+    );
 
-    let (_, polls, _, empty_polls) = source.test_metrics().await;
-    assert_eq!(polls, 1);
-    assert_eq!(empty_polls, 1);
+    let (_, _, errors, _) = source.test_metrics().await;
+    assert_eq!(errors, 1, "error counter must be incremented");
     assert!(
         source.test_search_after().await.is_none(),
-        "sort-missing skip must not corrupt cursor"
+        "cursor must not advance when batch errors"
     );
 }
 
@@ -376,8 +378,59 @@ async fn given_hit_without_source_when_search_should_skip_document() {
     let produced = source.poll().await.expect("poll should succeed");
     assert!(produced.messages.is_empty());
     assert!(
-        source.test_search_after().await.is_none(),
-        "_source-missing skip must not corrupt cursor"
+        source.test_search_after().await.is_some(),
+        "_source-missing skip must still advance cursor to that hit's sort position"
+    );
+}
+
+#[tokio::test]
+async fn given_trailing_hit_without_source_when_poll_should_advance_cursor_past_it() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let count = request_count.clone();
+
+    let first_page = search_response(vec![
+        search_hit("doc-1", "2024-01-01T00:00:00Z", json!({})),
+        json!({
+            "_id": "doc-2",
+            "sort": ["2024-01-02T00:00:00Z", "doc-2"]
+        }),
+    ]);
+    let empty_page = search_response(vec![]);
+
+    let app = mock_router(StatusCode::OK, move |_| {
+        let first_page = first_page.clone();
+        let empty_page = empty_page.clone();
+        let count = count.clone();
+        async move {
+            let page = count.fetch_add(1, Ordering::SeqCst);
+            let response = if page == 0 { first_page } else { empty_page };
+            (StatusCode::OK, response.to_string())
+        }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("first poll");
+    assert_eq!(produced.messages.len(), 1, "only doc-1 published; doc-2 has no _source");
+
+    let cursor = source.test_search_after().await;
+    assert!(
+        cursor.is_some(),
+        "cursor must be set after batch with trailing no-_source hit"
+    );
+    let cursor_vals = cursor.unwrap();
+    assert_eq!(
+        cursor_vals[1].as_str(),
+        Some("doc-2"),
+        "cursor must point to doc-2 (trailing no-_source), not doc-1"
+    );
+
+    // Second poll must get empty page (cursor past doc-2), not re-fetch doc-2.
+    let produced2 = source.poll().await.expect("second poll");
+    assert!(
+        produced2.messages.is_empty(),
+        "doc-2 (no _source) must not be re-fetched after cursor advances past it"
     );
 }
 
