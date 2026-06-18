@@ -878,6 +878,28 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
+    // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
+    // group) and only when enabled. Each pass no-ops unless this node is
+    // the caught-up metadata primary, so the delete is proposed once and
+    // replicated to every replica.
+    let pat_cleaner_stop = if shard_id == 0 && config.personal_access_token.cleaner.enabled {
+        let (cleaner_stop_tx, cleaner_stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.personal_access_token.cleaner.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::personal_access_token_cleaner::run_pat_cleaner(
+                cleaner_shard,
+                cleaner_stop_rx,
+                interval,
+            )
+            .await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(cleaner_stop_tx)
+    } else {
+        None
+    };
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
@@ -910,6 +932,9 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
+            if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+                let _ = cleaner_stop_tx.try_send(());
+            }
             return Err(error);
         }
     }
@@ -917,6 +942,9 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
+    if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+        let _ = cleaner_stop_tx.try_send(());
+    }
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
