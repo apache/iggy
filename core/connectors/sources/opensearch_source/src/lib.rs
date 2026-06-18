@@ -289,7 +289,7 @@ impl OpenSearchSource {
         let mut last_poll_timestamp = None;
 
         for hit in &hits {
-            let Some(sort) = hit.get("sort").and_then(|s| s.as_array()) else {
+            let Some(sort) = hit.get("sort").and_then(|s| s.as_array()).filter(|a| !a.is_empty()) else {
                 warn!(
                     connector_id = self.id,
                     hit_id = hit.get("_id").and_then(|value| value.as_str()),

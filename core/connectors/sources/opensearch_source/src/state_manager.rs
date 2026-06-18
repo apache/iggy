@@ -169,9 +169,10 @@ impl StateStorage for FileStateStorage {
         }
         drop(tmp_file);
 
-        fs::rename(&tmp_path, &path)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to rename state file: {e}")))?;
+        if let Err(e) = fs::rename(&tmp_path, &path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!("Failed to rename state file: {e}")));
+        }
 
         // Flush the parent directory entry so the rename is durable on crash.
         if let Some(parent) = path.parent() {
