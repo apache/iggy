@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unparseable_timestamp_value_should_return_none() {
+    fn given_unparsable_timestamp_value_should_return_none() {
         let value = json!("not-a-timestamp");
         assert!(parse_document_timestamp(&value).is_none());
     }
