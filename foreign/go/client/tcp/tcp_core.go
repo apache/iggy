@@ -397,7 +397,7 @@ func (c *IggyTcpClient) sendLockedInto(wirePayload, buf []byte) ([]byte, error) 
 
 	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
 	if length <= 1 {
-		return buf, nil
+		return buf[:0], nil
 	}
 
 	if cap(buf) < length {

@@ -254,6 +254,36 @@ func TestSendAndFetchResponse_SuccessWithBody(t *testing.T) {
 	}
 }
 
+// TestSendAndFetchResponse_EmptyBodyAfterNonEmpty guards against a regression
+// where sendLockedInto returned the buffer unchanged (still holding prior data)
+// when the server replied with length <= 1, causing callers to deserialize stale
+// content as ghost messages.
+func TestSendAndFetchResponse_EmptyBodyAfterNonEmpty(t *testing.T) {
+	c, serverConn := newTestClient(t)
+
+	body := []byte("stale data that must not leak")
+
+	// First call: server returns a non-empty body.
+	go serverRespond(t, serverConn, 0, body)
+	first, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
+	if err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	if !bytes.Equal(first, body) {
+		t.Fatalf("first call: got %q, want %q", first, body)
+	}
+
+	// Second call: server returns an empty body (length == 0).
+	go serverRespond(t, serverConn, 0, nil)
+	second, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
+	if err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	if len(second) != 0 {
+		t.Errorf("second call: got %d bytes (%q), want empty — stale buffer leaked", len(second), second)
+	}
+}
+
 func TestNewIggyTcpClient_StoresProvidedLogger(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{
