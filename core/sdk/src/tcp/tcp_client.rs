@@ -84,6 +84,8 @@ pub struct TcpClient {
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
+    #[cfg(feature = "vsr")]
+    consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
 impl Default for TcpClient {
@@ -199,6 +201,11 @@ impl BinaryTransport for TcpClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+
+    #[cfg(feature = "vsr")]
+    fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
+        Arc::clone(&self.consumer_group_state)
+    }
 }
 
 #[cfg(feature = "vsr")]
@@ -294,6 +301,8 @@ impl TcpClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
+            #[cfg(feature = "vsr")]
+            consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
 

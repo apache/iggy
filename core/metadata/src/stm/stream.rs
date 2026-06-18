@@ -16,12 +16,17 @@
 // under the License.
 
 use crate::stm::StateHandler;
+use crate::stm::consumer_group::{
+    ConsumerGroup, ConsumerGroupSnapshot, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
+};
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
@@ -32,9 +37,14 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest,
     UpdateTopicRequest,
 };
+use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
+    ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse,
+};
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, TopicHeader};
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
+use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
 };
@@ -106,6 +116,10 @@ pub struct TopicSnapshot {
     pub stats: StatsSnapshot,
     pub partitions: Vec<PartitionSnapshot>,
     pub round_robin_counter: usize,
+    #[serde(default)]
+    pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
+    #[serde(default)]
+    pub next_consumer_group_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +135,15 @@ pub struct Topic {
     pub stats: Arc<TopicStats>,
     pub partitions: Vec<Partition>,
     pub round_robin_counter: Arc<AtomicUsize>,
+
+    /// Consumer groups belonging to this topic, keyed by monotonic group id.
+    /// Co-located so a stream/topic delete drops them automatically.
+    pub consumer_groups: AHashMap<u64, ConsumerGroup>,
+    /// Group name -> id, for per-topic name uniqueness + name resolution.
+    pub consumer_group_index: AHashMap<Arc<str>, u64>,
+    /// Monotonic group-id counter; never reused so the partition-plane offset
+    /// key (keyed by group id) can't be inherited by a recreated group.
+    pub next_consumer_group_id: u64,
 }
 
 impl Default for Topic {
@@ -136,6 +159,9 @@ impl Default for Topic {
             stats: Arc::new(TopicStats::default()),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            consumer_groups: AHashMap::default(),
+            consumer_group_index: AHashMap::default(),
+            next_consumer_group_id: 1,
         }
     }
 }
@@ -161,6 +187,37 @@ impl Topic {
             stats: Arc::new(TopicStats::new(stream_stats)),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            consumer_groups: AHashMap::default(),
+            consumer_group_index: AHashMap::default(),
+            next_consumer_group_id: 1,
+        }
+    }
+
+    /// Re-run round-robin assignment for every consumer group under this topic
+    /// against the current partition set. Called after a partition-count change
+    /// (`CreatePartitions`/`DeletePartitions`) so groups pick up added
+    /// partitions and drop removed ones; each `rebalance_members` bumps the
+    /// group generation so stale clients re-sync.
+    pub fn rebalance_consumer_groups(&mut self) {
+        if self.consumer_groups.is_empty() {
+            return;
+        }
+        let partition_ids: Vec<usize> = self.partitions.iter().map(|p| p.id).collect();
+        for group in self.consumer_groups.values_mut() {
+            group.rebalance_members(&partition_ids);
+        }
+    }
+
+    /// Resolve a consumer-group identifier to its monotonic id within this
+    /// topic. Numeric resolves directly; string via the name index.
+    #[must_use]
+    pub fn resolve_group_id(&self, group_id: &WireIdentifier) -> Option<u64> {
+        match group_id {
+            WireIdentifier::Numeric(id) => {
+                let id = u64::from(*id);
+                self.consumer_groups.contains_key(&id).then_some(id)
+            }
+            WireIdentifier::String(name) => self.consumer_group_index.get(name.as_str()).copied(),
         }
     }
 }
@@ -263,6 +320,14 @@ collect_handlers! {
         PurgeTopic,
         CreatePartitionsWithAssignments,
         DeletePartitions,
+        // Consumer groups are co-located under the topic, so the Streams STM
+        // applies these too. `Join`/`Leave` use the enriched request types from
+        // `crate::stm::consumer_group` (imported above) which carry the VSR
+        // client id.
+        CreateConsumerGroup,
+        DeleteConsumerGroup,
+        JoinConsumerGroup,
+        LeaveConsumerGroup,
     }
 }
 
@@ -295,6 +360,19 @@ impl StreamsInner {
             WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
         }
     }
+
+    /// Mutable topic resolved from (stream, topic) identifiers -- the
+    /// consumer-group `StateHandler`s in [`crate::stm::consumer_group`] operate
+    /// through this.
+    pub(crate) fn topic_mut(
+        &mut self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<&mut Topic> {
+        let stream_id = self.resolve_stream_id(stream_id)?;
+        let topic_id = self.resolve_topic_id(stream_id, topic_id)?;
+        self.items.get_mut(stream_id)?.topics.get_mut(topic_id)
+    }
 }
 
 impl Streams {
@@ -304,6 +382,140 @@ impl Streams {
         F: FnOnce(&StreamsInner) -> R,
     {
         self.inner.read(f)
+    }
+
+    /// Build the `ConsumerGroupDetailsResponse` for a group (members + their
+    /// round-robin partition assignment). `partitions_count` is the topic's
+    /// total partition count. `None` if the stream/topic/group is unknown.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+    pub fn consumer_group_details(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
+    ) -> Option<ConsumerGroupDetailsResponse> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic
+                .consumer_groups
+                .get(&topic.resolve_group_id(group_id)?)?;
+            let members = group
+                .members
+                .iter()
+                .map(|(_, member)| ConsumerGroupMemberResponse {
+                    id: member.id as u32,
+                    partitions_count: member.partitions.len() as u32,
+                    partitions: member.partitions.iter().map(|&p| p as u32).collect(),
+                })
+                .collect();
+            Some(ConsumerGroupDetailsResponse {
+                group: ConsumerGroupResponse {
+                    id: group.id as u32,
+                    partitions_count: topic.partitions.len() as u32,
+                    members_count: group.members.len() as u32,
+                    // The name was validated at create, so the fallback is
+                    // unreachable.
+                    name: WireName::new(group.name.as_ref())
+                        .unwrap_or_else(|_| WireName::new("unknown").expect("valid")),
+                },
+                members,
+            })
+        })
+    }
+
+    /// The requesting member's `(generation, partitions)` -- served by the
+    /// `SyncConsumerGroup` endpoint for client-side partition selection.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_member_assignment(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
+        client_id: u128,
+    ) -> Option<(u64, Vec<u32>)> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic
+                .consumer_groups
+                .get(&topic.resolve_group_id(group_id)?)?;
+            let (_, member) = group
+                .members
+                .iter()
+                .find(|(_, m)| m.client_id == client_id)?;
+            let partitions = member.partitions.iter().map(|&p| p as u32).collect();
+            Some((group.generation, partitions))
+        })
+    }
+
+    /// The group's id (the consumer-group offset key) if `client_id` currently
+    /// owns `partition_id` in it -- the poll/commit fence. `None` for a stale
+    /// client whose partition was reassigned, prompting a re-sync.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_fence(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
+        client_id: u128,
+        partition_id: u32,
+    ) -> Option<u64> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic
+                .consumer_groups
+                .get(&topic.resolve_group_id(group_id)?)?;
+            let (_, member) = group
+                .members
+                .iter()
+                .find(|(_, m)| m.client_id == client_id)?;
+            member
+                .partitions
+                .iter()
+                .any(|&p| p as u32 == partition_id)
+                .then_some(group.id)
+        })
+    }
+
+    /// `(stream_id, topic_id, group_id)` of every group the client belongs to,
+    /// for `get_me` membership reporting.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_memberships(&self, client_id: u128) -> Vec<(u32, u32, u32)> {
+        self.inner.read(|inner| {
+            let mut out = Vec::new();
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for group in topic.consumer_groups.values() {
+                        if group.members.iter().any(|(_, m)| m.client_id == client_id) {
+                            out.push((stream_id as u32, topic_id as u32, group.id as u32));
+                        }
+                    }
+                }
+            }
+            out
+        })
+    }
+
+    /// Total consumer-group count across all topics (for stats).
+    #[must_use]
+    pub fn consumer_group_count(&self) -> usize {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .map(|(_, topic)| topic.consumer_groups.len())
+                .sum()
+        })
     }
 
     #[must_use]
@@ -358,7 +570,9 @@ impl Streams {
             }
             let current = topic
                 .round_robin_counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some((c + 1) % count))
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some((c + 1) % count)
+                })
                 .unwrap_or(0);
             Some(topic.partitions[current % count].id as u32)
         })
@@ -564,6 +778,9 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             stats: Arc::new(TopicStats::new(stream.stats.clone())),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            consumer_groups: AHashMap::default(),
+            consumer_group_index: AHashMap::default(),
+            next_consumer_group_id: 1,
         };
 
         let topic_id = stream.topics.insert(topic);
@@ -784,6 +1001,8 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 created_revision: new_revision,
             });
         }
+        // Added partitions are unassigned until the groups rebalance.
+        topic.rebalance_consumer_groups();
 
         // Matches legacy CreatePartitions wire contract: empty-ok body on
         // success. SDK discards the reply payload (resolved ids are derivable
@@ -815,6 +1034,8 @@ impl StateHandler for DeletePartitionsRequest {
             topic
                 .partitions
                 .truncate(topic.partitions.len() - count_to_delete);
+            // Members assigned the removed partitions must give them up.
+            topic.rebalance_consumer_groups();
         }
         if did_delete {
             state.revision = state.revision.wrapping_add(1);
@@ -876,6 +1097,14 @@ impl Snapshotable for Streams {
                                     round_robin_counter: topic
                                         .round_robin_counter
                                         .load(Ordering::Relaxed),
+                                    consumer_groups: topic
+                                        .consumer_groups
+                                        .iter()
+                                        .map(|(&id, group)| {
+                                            (id, ConsumerGroupSnapshot::from_group(group))
+                                        })
+                                        .collect(),
+                                    next_consumer_group_id: topic.next_consumer_group_id,
                                 },
                             )
                         })
@@ -948,6 +1177,27 @@ impl Snapshotable for Streams {
                         })
                         .collect(),
                     round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
+                    consumer_group_index: topic_snap
+                        .consumer_groups
+                        .iter()
+                        .map(|(_, group_snap)| (Arc::from(group_snap.name.as_str()), group_snap.id))
+                        .collect(),
+                    next_consumer_group_id: topic_snap
+                        .next_consumer_group_id
+                        .max(
+                            topic_snap
+                                .consumer_groups
+                                .iter()
+                                .map(|(id, _)| id + 1)
+                                .max()
+                                .unwrap_or(1),
+                        )
+                        .max(1),
+                    consumer_groups: topic_snap
+                        .consumer_groups
+                        .into_iter()
+                        .map(|(id, group_snap)| (id, group_snap.into_group()))
+                        .collect(),
                 };
                 topic_index.insert(topic_name, topic_slab_key);
                 topic_entries.push((topic_slab_key, topic));

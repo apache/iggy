@@ -65,7 +65,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -237,6 +237,9 @@ struct PassCounters {
     backoff_skipped: usize,
     /// Stale incarnations (slab-key reuse) torn down for rebuild.
     stale: usize,
+    /// Consumer-group offsets reclaimed for groups deleted while their topic
+    /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
+    cg_offsets_purged: usize,
 }
 
 impl PassCounters {
@@ -247,6 +250,7 @@ impl PassCounters {
             + self.removed_routed
             + self.backoff_skipped
             + self.stale
+            + self.cg_offsets_purged
     }
 }
 
@@ -280,6 +284,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
+    reconcile_consumer_group_offsets(ctx, &mut counters).await;
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -563,6 +568,66 @@ async fn tear_down_owned_partition(
     counters.removed_local += 1;
 }
 
+/// Reclaim consumer-group offsets left behind by a `DeleteConsumerGroup` whose
+/// topic still exists (a topic/stream delete already drops the whole partition
+/// directory, offsets included). For each owned partition, any stored
+/// consumer-group offset whose group id is no longer present in the topic's
+/// committed metadata is removed (in-memory entry + persisted file). Monotonic,
+/// never-reused group ids make this purely reclamation -- a recreated group
+/// gets a fresh id and never reads a dead group's offset -- so it is safe to do
+/// lazily on the reconcile pass rather than synchronously on delete.
+async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+    let live_groups = snapshot_topic_live_groups(ctx);
+    let partitions = ctx.shard.plane.partitions();
+    let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
+    for ns in owned {
+        let Some(partition) = partitions.get_by_ns(&ns) else {
+            continue;
+        };
+        let stored = partition.consumer_group_offset_ids();
+        if stored.is_empty() {
+            continue;
+        }
+        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
+        for group_id in stored {
+            let still_live = live.is_some_and(|set| set.contains(&group_id));
+            if still_live {
+                continue;
+            }
+            if let Err(err) = partition.delete_consumer_group_offset(group_id).await {
+                warn!(
+                    shard = ctx.shard.id,
+                    ns_raw = ns.inner(),
+                    group_id,
+                    error = %err,
+                    "reconciler failed to reclaim deleted consumer-group offset"
+                );
+                continue;
+            }
+            counters.cg_offsets_purged += 1;
+        }
+    }
+}
+
+/// `(stream_id, topic_id) -> live consumer-group ids` from committed metadata.
+fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), AHashSet<u64>> {
+    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let mut map: AHashMap<(usize, usize), AHashSet<u64>> = AHashMap::new();
+        for (_, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                if topic.consumer_groups.is_empty() {
+                    continue;
+                }
+                map.insert(
+                    (stream.id, topic_id),
+                    topic.consumer_groups.keys().copied().collect(),
+                );
+            }
+        }
+        map
+    })
+}
+
 /// Committed `(namespace, created_revision)` pairs. The epoch lets the
 /// additions pass detect a stale local incarnation after slab-key reuse
 /// without an `Arc<TopicStats>` clone per partition; stats are fetched
@@ -645,7 +710,6 @@ mod tests {
     use metadata::MuxStateMachine;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
-    use metadata::stm::consumer_group::ConsumerGroups;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use partitions::{IggyPartitions, PartitionsConfig};
@@ -659,7 +723,7 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
-    type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams, ConsumerGroups)>;
+    type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
     type TestShard = IggyShard<
         Rc<IggyMessageBus>,
         journal::prepare_journal::PrepareJournal,
@@ -772,6 +836,59 @@ mod tests {
         };
         mux.update(build_prepare(op, Operation::DeleteStream, &req))
             .expect("DeleteStream apply succeeds");
+    }
+
+    fn seed_create_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        name: &str,
+    ) {
+        use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+        let req = CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            name: WireName::new(name).expect("test group name fits WireName"),
+        };
+        mux.update(build_prepare(op, Operation::CreateConsumerGroup, &req))
+            .expect("CreateConsumerGroup apply succeeds");
+    }
+
+    fn seed_delete_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u32,
+    ) {
+        use iggy_binary_protocol::requests::consumer_groups::DeleteConsumerGroupRequest;
+        let req = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id: WireIdentifier::numeric(group_id),
+        };
+        mux.update(build_prepare(op, Operation::DeleteConsumerGroup, &req))
+            .expect("DeleteConsumerGroup apply succeeds");
+    }
+
+    fn seed_join_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u32,
+        client_id: u128,
+    ) {
+        use metadata::stm::consumer_group::JoinConsumerGroupRequest;
+        let req = JoinConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id: WireIdentifier::numeric(group_id),
+            client_id,
+        };
+        mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
+            .expect("JoinConsumerGroup apply succeeds");
     }
 
     fn test_config(tmp: &TempDir) -> ServerNgConfig {
@@ -1436,6 +1553,137 @@ mod tests {
         assert!(
             std::path::Path::new(&partition_root).exists(),
             "defer must not re-drive teardown: the directory must remain"
+        );
+    }
+
+    /// A bare `DeleteConsumerGroup` (topic survives) leaves the group's offsets
+    /// on the partition. The reconciler must reclaim a deleted group's offset
+    /// while leaving a still-live group's offset untouched.
+    #[compio::test]
+    async fn reconcile_reclaims_offsets_of_deleted_consumer_group() {
+        use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-cg");
+        seed_topic(&mux, 2, 0, "topic-cg", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&ns));
+
+        // Two groups: "dead" gets id 1, "live" gets id 2 (per-topic monotonic).
+        let stm = &shard.plane.metadata().mux_stm;
+        seed_create_consumer_group(stm, 3, 0, 0, "dead");
+        seed_create_consumer_group(stm, 4, 0, 0, "live");
+
+        // Seed a stored offset for each group on the partition.
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_by_ns(&ns).expect("partition materialised");
+            partition.consumer_group_offsets.pin().insert(
+                ConsumerGroupId(1),
+                ConsumerOffset::new(ConsumerKind::ConsumerGroup, 1, 7, String::new()),
+            );
+            partition.consumer_group_offsets.pin().insert(
+                ConsumerGroupId(2),
+                ConsumerOffset::new(ConsumerKind::ConsumerGroup, 2, 9, String::new()),
+            );
+        }
+
+        // Delete the "dead" group (id 1); "live" (id 2) stays.
+        seed_delete_consumer_group(stm, 5, 0, 0, 1);
+        reconcile_pass(&ctx).await;
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&ns)
+            .expect("partition still materialised");
+        let mut ids = partition.consumer_group_offset_ids();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![2],
+            "deleted group's offset reclaimed; live group's offset retained"
+        );
+    }
+
+    /// A partition-count change must re-run consumer-group assignment: a new
+    /// partition gets assigned, a removed one is dropped. Pure metadata test --
+    /// the assignment lives in the Streams STM.
+    #[compio::test]
+    async fn create_delete_partitions_reassigns_consumer_group() {
+        use metadata::impls::metadata::StreamsFrontend;
+
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-rp");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-rp",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_create_consumer_group(&mux, 3, 0, 0, "cg");
+        // Single member owns every partition (group id 1, the first in topic).
+        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
+
+        let group = WireIdentifier::numeric(1);
+        let stream = WireIdentifier::numeric(0);
+        let topic = WireIdentifier::numeric(0);
+        let assigned = |mux: &TestMux| -> Vec<u32> {
+            let (_, mut partitions) = mux
+                .streams()
+                .consumer_group_member_assignment(&stream, &topic, &group, 100)
+                .expect("member assignment present");
+            partitions.sort_unstable();
+            partitions
+        };
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1],
+            "joined member owns both partitions"
+        );
+
+        // Add one partition (request-relative id 0 rebases to absolute id 2).
+        mux.update(build_prepare(
+            5,
+            Operation::CreatePartitionsWithAssignments,
+            &CreatePartitionsWithAssignmentsRequest {
+                request: CreatePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                },
+                partitions: vec![assignment(0, 3)],
+            },
+        ))
+        .expect("CreatePartitions apply succeeds");
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1, 2],
+            "added partition must be reassigned to the member"
+        );
+
+        // Remove one partition; the member drops the highest id.
+        mux.update(build_prepare(
+            6,
+            Operation::DeletePartitions,
+            &iggy_binary_protocol::requests::partitions::DeletePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+        ))
+        .expect("DeletePartitions apply succeeds");
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1],
+            "removed partition must be dropped from the assignment"
         );
     }
 }

@@ -57,7 +57,6 @@ use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -94,13 +93,13 @@ use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
 
-type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
 /// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
 /// state. Shard 0 mints one after `recover()` and broadcasts a clone to
 /// every peer shard; each peer rebuilds a reader-mode
 /// [`ServerNgMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerNgMetadataBundle = <variadic!(Users, Streams, ConsumerGroups) as WithFactory>::Bundle;
+type ServerNgMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 
 pub(crate) type ServerNgMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,

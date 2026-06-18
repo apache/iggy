@@ -27,7 +27,6 @@
 
 use crate::bootstrap::ServerNgShard;
 use crate::wire::{request_body, rewrite_request_body};
-use consensus::MetadataHandle;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::consumer_groups::{
     JoinConsumerGroupRequest as WireJoinConsumerGroupRequest,
@@ -35,7 +34,6 @@ use iggy_binary_protocol::requests::consumer_groups::{
 };
 use iggy_binary_protocol::{Operation, RequestHeader};
 use iggy_common::IggyError;
-use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::consumer_group::{
     JoinConsumerGroupRequest as ReplicatedJoinConsumerGroupRequest,
     LeaveConsumerGroupRequest as ReplicatedLeaveConsumerGroupRequest,
@@ -43,11 +41,12 @@ use metadata::stm::consumer_group::{
 use server_common::Message;
 use std::rc::Rc;
 
-/// Rewrite a `Join`/`Leave` request body into the replicated form carrying
-/// the client's VSR id (and, for Join, the topic partition count). Every
-/// other operation passes through unchanged.
+/// Rewrite a `Join`/`Leave` request body into the replicated form carrying the
+/// client's VSR id (which the apply can't read from the consensus header). The
+/// topic's partition set is read in-STM by the co-located handler, so no
+/// partition-count enrichment is needed. Every other operation passes through.
 pub(crate) fn maybe_rewrite_consumer_group_request(
-    shard: &Rc<ServerNgShard>,
+    _shard: &Rc<ServerNgShard>,
     request: Message<RequestHeader>,
 ) -> Result<Message<RequestHeader>, IggyError> {
     let operation = request.header().operation;
@@ -57,29 +56,11 @@ pub(crate) fn maybe_rewrite_consumer_group_request(
         Operation::JoinConsumerGroup => {
             let wire = WireJoinConsumerGroupRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            let ((resolved_stream_id, resolved_topic_id), partitions_count) = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .partition_count_context(&wire.stream_id, &wire.topic_id)
-                .map_or(((0, 0), 0), |((stream_id, topic_id), count)| {
-                    (
-                        (
-                            u32::try_from(stream_id).unwrap_or(0),
-                            u32::try_from(topic_id).unwrap_or(0),
-                        ),
-                        count,
-                    )
-                });
             ReplicatedJoinConsumerGroupRequest {
                 stream_id: wire.stream_id,
                 topic_id: wire.topic_id,
                 group_id: wire.group_id,
                 client_id,
-                partitions_count,
-                resolved_stream_id,
-                resolved_topic_id,
             }
             .to_bytes()
         }

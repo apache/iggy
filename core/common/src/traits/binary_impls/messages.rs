@@ -24,14 +24,177 @@ use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
     PollingStrategy,
 };
+#[cfg(feature = "vsr")]
+use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
 use bytes::BytesMut;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
 use iggy_binary_protocol::codes::{
     FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
 };
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+
+/// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
+/// coordinator rejects a stale assignment, then retry once.
+#[cfg(feature = "vsr")]
+const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
+
+#[cfg(feature = "vsr")]
+fn group_cache_key(stream_id: &Identifier, topic_id: &Identifier, group_id: &Identifier) -> String {
+    format!("{stream_id}|{topic_id}|{group_id}")
+}
+
+#[cfg(feature = "vsr")]
+fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
+    format!("{stream_id}|{topic_id}")
+}
+
+/// Sync the requesting member's assignment from the coordinator into the
+/// transport cache. An empty reply means the member holds no partitions.
+#[cfg(feature = "vsr")]
+async fn sync_group_assignment<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    group_id: &Identifier,
+) -> Result<(), IggyError> {
+    let request = SyncConsumerGroupRequest {
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        group_id: identifier_to_wire(group_id)?,
+    };
+    let response = client
+        .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
+        .await?;
+    let key = group_cache_key(stream_id, topic_id, group_id);
+    if response.is_empty() {
+        client
+            .consumer_group_state()
+            .set_assignment(key, 0, Vec::new());
+        return Ok(());
+    }
+    let (assignment, _) =
+        SyncConsumerGroupResponse::decode(&response).map_err(|_| IggyError::InvalidCommand)?;
+    client
+        .consumer_group_state()
+        .set_assignment(key, assignment.generation, assignment.partitions);
+    Ok(())
+}
+
+/// Resolve (and cache) the topic's partition count for client-side produce
+/// partitioning.
+#[cfg(feature = "vsr")]
+async fn topic_partition_count<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+) -> Result<u32, IggyError> {
+    let key = topic_cache_key(stream_id, topic_id);
+    if let Some(count) = client.consumer_group_state().partition_count(&key) {
+        return Ok(count);
+    }
+    let details = TopicClient::get_topic(client, stream_id, topic_id)
+        .await?
+        .ok_or_else(|| IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone()))?;
+    client
+        .consumer_group_state()
+        .set_partition_count(key, details.partitions_count);
+    Ok(details.partitions_count)
+}
+
+/// Resolve `Balanced` / `MessagesKey` to an explicit `PartitionId` client-side
+/// (the VSR broker only routes explicit partitions, matching Kafka).
+#[cfg(feature = "vsr")]
+async fn resolve_partitioning<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitioning: &Partitioning,
+) -> Result<Partitioning, IggyError> {
+    match partitioning.kind {
+        PartitioningKind::PartitionId => Ok(partitioning.clone()),
+        PartitioningKind::Balanced => {
+            let count = topic_partition_count(client, stream_id, topic_id).await?;
+            if count == 0 {
+                return Err(IggyError::TopicIdNotFound(
+                    topic_id.clone(),
+                    stream_id.clone(),
+                ));
+            }
+            let key = topic_cache_key(stream_id, topic_id);
+            let partition = client
+                .consumer_group_state()
+                .next_balanced_partition(&key, count);
+            Ok(Partitioning::partition_id(partition))
+        }
+        PartitioningKind::MessagesKey => {
+            let count = topic_partition_count(client, stream_id, topic_id).await?;
+            if count == 0 {
+                return Err(IggyError::TopicIdNotFound(
+                    topic_id.clone(),
+                    stream_id.clone(),
+                ));
+            }
+            let partition = calculate_32(&partitioning.value) % count;
+            Ok(Partitioning::partition_id(partition))
+        }
+    }
+}
+
+/// Poll a consumer group: select one of the member's assigned partitions
+/// (round-robin) and send an explicit-partition poll. A coordinator fence
+/// rejection (stale assignment after a rebalance) triggers one re-sync + retry.
+#[cfg(feature = "vsr")]
+async fn poll_group_messages<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    consumer: &Consumer,
+    strategy: &PollingStrategy,
+    count: u32,
+    auto_commit: bool,
+) -> Result<PolledMessages, IggyError> {
+    let key = group_cache_key(stream_id, topic_id, &consumer.id);
+    if !client.consumer_group_state().has_assignment(&key) {
+        sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
+    }
+    for _ in 0..GROUP_POLL_MAX_ATTEMPTS {
+        let Some(partition_id) = client.consumer_group_state().next_group_partition(&key) else {
+            // Synced but holds no partitions: not a member, or none assigned.
+            return Ok(PolledMessages::empty());
+        };
+        let request = PollMessagesRequest {
+            consumer: consumer_to_wire(consumer)?,
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            partition_id: Some(partition_id),
+            strategy: polling_strategy_to_wire(strategy),
+            count,
+            auto_commit,
+        };
+        match client
+            .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
+            .await
+        {
+            Ok(response) => return PolledMessages::from_bytes(response),
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
+                client.consumer_group_state().invalidate_assignment(&key);
+                sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(IggyError::ConsumerGroupPartitionNotOwned(0, 0))
+}
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {
@@ -46,6 +209,22 @@ impl<B: BinaryClient> MessageClient for B {
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
         fail_if_not_authenticated(self).await?;
+        // VSR: a consumer-group poll without an explicit partition is resolved
+        // client-side from the member's cached assignment (the broker routes
+        // explicit partitions only).
+        #[cfg(feature = "vsr")]
+        if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
+            return poll_group_messages(
+                self,
+                stream_id,
+                topic_id,
+                consumer,
+                strategy,
+                count,
+                auto_commit,
+            )
+            .await;
+        }
         let req = PollMessagesRequest {
             consumer: consumer_to_wire(consumer)?,
             stream_id: identifier_to_wire(stream_id)?,
@@ -69,6 +248,9 @@ impl<B: BinaryClient> MessageClient for B {
         messages: &mut [IggyMessage],
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
+        // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
+        #[cfg(feature = "vsr")]
+        let partitioning = &resolve_partitioning(self, stream_id, topic_id, partitioning).await?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
         let wire_partitioning = partitioning_to_wire(partitioning)?;

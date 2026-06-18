@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::MuxStateMachine;
-use crate::stm::consumer_group::ConsumerGroups;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::Streams;
 use crate::stm::user::Users;
@@ -62,21 +61,15 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
-    #[must_use]
-    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
-impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
     fn users(&self) -> &Users {
         &self.inner().0
     }
 
     fn streams(&self) -> &Streams {
         &self.inner().1.0
-    }
-
-    fn consumer_groups(&self) -> &ConsumerGroups {
-        &self.inner().1.1.0
     }
 }
 
@@ -1743,14 +1736,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::consumer_group::ConsumerGroups;
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
     use iggy_common::variadic;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    type TestMux = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+    type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
     /// `journal`, and `snapshot` all `None`. Enough to test the

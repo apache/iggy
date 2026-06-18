@@ -116,8 +116,8 @@ pub(crate) fn build_get_me_response(
                 .plane
                 .metadata()
                 .mux_stm
-                .consumer_groups()
-                .memberships(vsr_client_id)
+                .streams()
+                .consumer_group_memberships(vsr_client_id)
         })
         .unwrap_or_default()
         .into_iter()
@@ -341,11 +341,12 @@ pub(crate) fn build_non_replicated_response(
         GET_CONSUMER_GROUP_CODE => {
             let request = GetConsumerGroupRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            let response = shard.plane.metadata().mux_stm.consumer_groups().details(
-                &request.stream_id,
-                &request.topic_id,
-                &request.group_id,
-            );
+            let response = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
             Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
                 NonReplicatedResponse::Bytes(response.to_bytes())
             }))
@@ -412,12 +413,14 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
                     messages_count,
                 ))
             })?;
-    let consumer_groups_count = shard
-        .plane
-        .metadata()
-        .mux_stm
-        .consumer_groups()
-        .read(|groups| usize_to_u32(groups.items.len()))?;
+    let consumer_groups_count = usize_to_u32(
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_count(),
+    )?;
 
     Ok(StatsResponse {
         process_id: std::process::id(),

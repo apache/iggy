@@ -390,6 +390,35 @@ where
         }
     }
 
+    /// Group ids that currently have a stored offset on this partition. Used by
+    /// the reconciler to find offsets belonging to deleted consumer groups.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_offset_ids(&self) -> Vec<u64> {
+        self.consumer_group_offsets
+            .pin()
+            .keys()
+            .map(|key| key.0 as u64)
+            .collect()
+    }
+
+    /// Reclaim a deleted consumer group's offset on this partition (in-memory
+    /// entry + persisted file). A no-op if the group has no stored offset here.
+    ///
+    /// # Errors
+    /// Returns an I/O error if deleting the persisted offset file fails.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn delete_consumer_group_offset(&self, group_id: u64) -> Result<(), IggyError> {
+        self.consumer_group_offsets
+            .pin()
+            .remove(&ConsumerGroupId(group_id as usize));
+        if let Some(path) = self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
+        {
+            delete_persisted_offset(&path).await?;
+        }
+        Ok(())
+    }
+
     async fn store_consumer_offset_and_persist(
         &self,
         consumer: PollingConsumer,

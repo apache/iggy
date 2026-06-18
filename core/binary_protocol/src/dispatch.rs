@@ -190,6 +190,7 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
         "consumer_group.leave",
         Operation::LeaveConsumerGroup,
     ),
+    CommandMeta::non_replicated(SYNC_CONSUMER_GROUP_CODE, "consumer_group.sync"),
     // Login + Register (PAT - Personal Access Token variant)
     CommandMeta::non_replicated(LOGIN_REGISTER_WITH_PAT_CODE, "user.login_register_with_pat"),
 ];
@@ -253,7 +254,8 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         DELETE_CONSUMER_GROUP_CODE => 47,
         JOIN_CONSUMER_GROUP_CODE => 48,
         LEAVE_CONSUMER_GROUP_CODE => 49,
-        LOGIN_REGISTER_WITH_PAT_CODE => 50,
+        SYNC_CONSUMER_GROUP_CODE => 50,
+        LOGIN_REGISTER_WITH_PAT_CODE => 51,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])

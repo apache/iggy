@@ -22,6 +22,7 @@ pub mod get_consumer_group;
 pub mod get_consumer_groups;
 mod join_consumer_group;
 mod leave_consumer_group;
+pub mod sync_consumer_group;
 
 pub use super::EmptyResponse;
 pub use consumer_group_response::ConsumerGroupResponse;
@@ -31,3 +32,4 @@ pub use get_consumer_group::{ConsumerGroupDetailsResponse, ConsumerGroupMemberRe
 pub use get_consumer_groups::GetConsumerGroupsResponse;
 pub use join_consumer_group::JoinConsumerGroupResponse;
 pub use leave_consumer_group::LeaveConsumerGroupResponse;
+pub use sync_consumer_group::SyncConsumerGroupResponse;

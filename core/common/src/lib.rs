@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "vsr")]
+pub mod consumer_group_client_state;
 mod error;
 pub mod http;
 mod macros;
@@ -28,6 +30,8 @@ pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(feature = "vsr")]
+pub use consumer_group_client_state::ConsumerGroupClientState;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;

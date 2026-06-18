@@ -43,16 +43,18 @@ use bytes::Bytes;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
+use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
+use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader, WireDecode, WireEncode};
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
@@ -707,6 +709,9 @@ async fn handle_non_replicated_request(
         GET_CONSUMER_OFFSET_CODE => {
             handle_get_consumer_offset(shard, transport_client_id, &request).await;
         }
+        SYNC_CONSUMER_GROUP_CODE => {
+            handle_sync_consumer_group(shard, transport_client_id, &request).await;
+        }
         _ => handle_default_non_replicated(shard, transport_client_id, code, &request).await,
     }
 }
@@ -908,6 +913,54 @@ async fn handle_get_consumer_offset(
     .await;
 }
 
+/// Serve `SyncConsumerGroup`: return the requesting member's current partition
+/// assignment + group generation so the client can select partitions locally.
+/// The member is keyed by the connection's bound VSR client id
+/// (`header().client`). An empty body decodes as "no assignment" on the SDK.
+#[allow(clippy::future_not_send)]
+async fn handle_sync_consumer_group(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
+        Ok(wire) => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_member_assignment(
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.group_id,
+                request.header().client,
+            )
+            .map_or_else(Bytes::new, |(generation, partitions)| {
+                SyncConsumerGroupResponse {
+                    generation,
+                    partitions,
+                }
+                .to_bytes()
+            }),
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "sync_consumer_group request rejected; replying empty"
+            );
+            Bytes::new()
+        }
+    };
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        body,
+        "sync_consumer_group",
+    )
+    .await;
+}
+
 /// Wait (bounded) until `namespace` is routable: this shard's routing row
 /// exists and the owning shard answers a probe read (partition
 /// materialised). Fast path: row already present -> no probe, no wait.
@@ -992,6 +1045,7 @@ fn empty_polled_messages_body(partition_id: u32) -> Bytes {
 
 type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
 
+#[allow(clippy::cast_possible_truncation)]
 fn decode_poll_request(
     shard: &Rc<ServerNgShard>,
     request: &Message<RequestHeader>,
@@ -1001,25 +1055,37 @@ fn decode_poll_request(
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
 
-    // A consumer-group poll carries the group identifier (not a partition):
-    // the server picks the partition by advancing the polling member's
-    // round-robin cursor, mirroring the legacy server.
+    // Consumer-group poll: the client selects which of its assigned
+    // partitions to read and sends it explicitly. The coordinator only
+    // FENCES ownership (a stale client whose partition was reassigned by a
+    // rebalance is rejected with `ConsumerGroupPartitionNotOwned`, prompting
+    // a re-sync) and resolves the group's numeric id for the offset key.
     if wire.consumer.kind == 2 {
-        let (group_id, partition_id, member_id) = shard
+        let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+        let client_id = request.header().client;
+        let group_id = shard
             .plane
             .metadata()
             .mux_stm
-            .consumer_groups()
-            .resolve_member_next_partition(
+            .streams()
+            .consumer_group_fence(
                 &wire.stream_id,
                 &wire.topic_id,
                 &wire.consumer.id,
-                request.header().client,
+                client_id,
+                partition_id,
             )
-            .ok_or(IggyError::InvalidIdentifier)?;
-        let namespace =
-            resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
-        let consumer = PollingConsumer::ConsumerGroup(group_id as usize, member_id);
+            .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
+                client_id as u32,
+                partition_id,
+            ))?;
+        let namespace = resolve_partition_namespace(
+            shard,
+            &wire.stream_id,
+            &wire.topic_id,
+            Some(partition_id),
+        )?;
+        let consumer = PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize);
         return Ok((namespace, partition_id, consumer, args));
     }
 
