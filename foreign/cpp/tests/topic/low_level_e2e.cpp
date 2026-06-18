@@ -17,11 +17,9 @@
  * under the License.
  */
 
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -297,6 +295,161 @@ TEST_F(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
     ASSERT_NO_THROW(unauthenticated_client->connect());
     ASSERT_THROW(unauthenticated_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                       "server_default", 0, "server_default"),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicAfterCreate) {
+    RecordProperty("description", "Deletes an existing topic after creating it.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+
+    ASSERT_NO_THROW({
+        const auto topics = client->get_topics(make_string_identifier(stream_name));
+        EXPECT_TRUE(topics.empty());
+    });
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when deleting a topic from a stream that does not exist.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when deleting a topic that does not exist.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicTwiceThrows) {
+    RecordProperty("description", "Throws when deleting the same topic a second time.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicAfterStreamDeletionThrows) {
+    RecordProperty("description", "Throws when deleting a topic after its stream has been deleted.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
+
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicBeforeLoginThrows) {
+    RecordProperty("description", "Rejects delete_topic before connect, and after connect but before login.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(
+        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicWithInvalidStreamIdentifierThrows) {
+    RecordProperty("description", "Rejects topic deletion requests that use invalid stream identifier formats.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Identifier invalid_kind_id;
+    invalid_kind_id.kind   = "invalid";
+    invalid_kind_id.length = 4;
+    invalid_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->delete_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
+
+    iggy::ffi::Identifier invalid_numeric_id;
+    invalid_numeric_id.kind   = "numeric";
+    invalid_numeric_id.length = 1;
+    invalid_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->delete_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Topic, DeleteTopicWithInvalidTopicIdentifierThrows) {
+    RecordProperty("description", "Rejects topic deletion requests that use invalid topic identifier formats.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+
+    iggy::ffi::Identifier invalid_kind_id;
+    invalid_kind_id.kind   = "invalid";
+    invalid_kind_id.length = 4;
+    invalid_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
+
+    iggy::ffi::Identifier invalid_numeric_id;
+    invalid_numeric_id.kind   = "numeric";
+    invalid_numeric_id.length = 1;
+    invalid_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
                  std::exception);
 }
 
