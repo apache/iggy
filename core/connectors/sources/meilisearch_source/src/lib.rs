@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use std::{future::Future, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
+use url::Url;
 
 source_connector!(MeilisearchSource);
 
@@ -245,10 +246,8 @@ impl MeilisearchSource {
             })
             .await?;
         let documents: Vec<Value> = results.hits.into_iter().map(|hit| hit.result).collect();
-        let last_document_primary_key = documents
-            .last()
-            .map(|document| document_primary_key(document, primary_key))
-            .transpose()?;
+        let primary_keys = document_primary_keys(&documents, primary_key)?;
+        let last_document_primary_key = primary_keys.into_iter().last();
         let messages = self.documents_to_messages(documents)?;
         let state_changed = last_document_primary_key.is_some();
 
@@ -462,11 +461,35 @@ fn normalize_host(host: &str) -> Result<String, Error> {
     } else {
         format!("http://{trimmed}")
     };
-    let mut host = with_scheme;
-    while host.ends_with('/') {
-        host.pop();
+
+    let mut url = Url::parse(&with_scheme)
+        .map_err(|error| Error::Connection(format!("Invalid Meilisearch URL: {error}")))?;
+    if url.host_str().is_none() {
+        return Err(Error::Connection(
+            "Invalid Meilisearch URL: host cannot be empty".to_string(),
+        ));
     }
-    Ok(host)
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::Connection(format!(
+            "Invalid Meilisearch URL scheme '{}': expected http or https",
+            url.scheme()
+        )));
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::Connection(
+            "Invalid Meilisearch URL: path, query, and fragment components are not supported"
+                .to_string(),
+        ));
+    }
+
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut normalized = url.to_string();
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    Ok(normalized)
 }
 
 fn sanitize_url_for_logging(host: &str) -> String {
@@ -579,6 +602,13 @@ fn document_primary_key(document: &Value, primary_key: &str) -> Result<Value, Er
     })?;
     primary_key_filter_literal(value)?;
     Ok(value.clone())
+}
+
+fn document_primary_keys(documents: &[Value], primary_key: &str) -> Result<Vec<Value>, Error> {
+    documents
+        .iter()
+        .map(|document| document_primary_key(document, primary_key))
+        .collect()
 }
 
 fn map_sdk_error(error: MeilisearchSdkError) -> Error {
@@ -788,15 +818,59 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_should_reject_path_components() {
+        let error = normalize_host("https://localhost:7700/v1")
+            .expect_err("path components should be rejected");
+
+        assert!(matches!(error, Error::Connection(_)));
+    }
+
+    #[test]
+    fn normalize_host_should_reject_query_components() {
+        let error = normalize_host("https://localhost:7700?tenant=a")
+            .expect_err("query should be rejected");
+
+        assert!(matches!(error, Error::Connection(_)));
+    }
+
+    #[test]
     fn sanitize_url_should_redact_credentials() {
-        let url = sanitize_url_for_logging("https://user:pass@localhost:7700/indexes");
-        assert_eq!(url, "https://<redacted>@localhost:7700/indexes");
+        let url = sanitize_url_for_logging("https://user:pass@localhost:7700");
+        assert_eq!(url, "https://<redacted>@localhost:7700");
     }
 
     #[test]
     fn sanitize_url_should_redact_credentials_without_scheme() {
-        let url = sanitize_url_for_logging("user:pass@localhost:7700/indexes");
-        assert_eq!(url, "http://<redacted>@localhost:7700/indexes");
+        let url = sanitize_url_for_logging("user:pass@localhost:7700");
+        assert_eq!(url, "http://<redacted>@localhost:7700");
+    }
+
+    #[test]
+    fn document_primary_keys_should_reject_missing_middle_primary_key() {
+        let documents = vec![
+            json!({"id": 1, "name": "first"}),
+            json!({"name": "missing"}),
+            json!({"id": 3, "name": "third"}),
+        ];
+
+        let error = document_primary_keys(&documents, "id")
+            .expect_err("missing middle primary key should be rejected");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn document_primary_keys_should_reject_non_integer_middle_primary_key() {
+        let documents = vec![
+            json!({"id": 1, "name": "first"}),
+            json!({"id": 1.5, "name": "float"}),
+            json!({"id": 3, "name": "third"}),
+        ];
+
+        let error = document_primary_keys(&documents, "id")
+            .expect_err("non-integer middle primary key should be rejected");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
     }
 
     #[test]

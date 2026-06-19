@@ -32,7 +32,7 @@ const SOURCE_INDEX: &str = "iggy_messages";
     server(connectors_runtime(config_path = "tests/connectors/meilisearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn meilisearch_source_produces_index_documents(
+async fn given_index_documents_when_source_polls_should_produce_messages(
     harness: &TestHarness,
     fixture: MeilisearchSourceFixture,
 ) {
@@ -91,7 +91,7 @@ async fn meilisearch_source_produces_index_documents(
     server(connectors_runtime(config_path = "tests/connectors/meilisearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn meilisearch_source_state_persists_across_connector_restart(
+async fn given_persisted_state_when_connector_restarts_should_resume_after_last_primary_key(
     harness: &mut TestHarness,
     fixture: MeilisearchSourceFixture,
 ) {
