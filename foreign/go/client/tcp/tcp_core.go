@@ -406,8 +406,8 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	c.logger.Debug("Sent a TCP request, waiting for a response...", slog.Int("code", int(commandCode)))
 
 	if _, err := c.readInto(c.respHeader[:]); err != nil {
-		c.invalidateConnLocked()
 		c.logger.Error("Failed to read response for TCP request", slog.Int("code", int(commandCode)), slog.Any("error", err))
+		c.invalidateConnLocked()
 		return nil, err
 	}
 
