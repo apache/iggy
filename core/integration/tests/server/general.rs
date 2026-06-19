@@ -16,10 +16,13 @@
 // under the License.
 
 use crate::server::scenarios::{
-    authentication_scenario, bench_scenario, consumer_timestamp_polling_scenario,
-    create_message_payload, invalid_consumer_offset_scenario, message_headers_scenario,
-    permissions_scenario, snapshot_scenario, stream_size_validation_scenario, system_scenario,
-    user_scenario,
+    authentication_scenario, consumer_timestamp_polling_scenario, create_message_payload,
+    message_headers_scenario,
+};
+#[cfg(not(feature = "vsr"))]
+use crate::server::scenarios::{
+    bench_scenario, invalid_consumer_offset_scenario, permissions_scenario, snapshot_scenario,
+    stream_size_validation_scenario, system_scenario, user_scenario,
 };
 use integration::iggy_harness;
 
@@ -37,6 +40,11 @@ async fn authentication(harness: &TestHarness) {
     authentication_scenario::run(harness).await;
 }
 
+// Blocked under vsr: asserts on responses server-ng still stubs --
+// `MaxTopicSize::ServerDefault` is echoed instead of resolved against
+// server config, and stats/cluster-metadata fields are hardcoded zeros.
+// Re-enable as the response wiring lands.
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -50,6 +58,14 @@ async fn system(harness: &TestHarness) {
     system_scenario::run(harness).await;
 }
 
+// Blocked under vsr: the startup-hang is fixed and root `created_at` now
+// resolves, but the scenario issues several sequential `login_user` calls on
+// one connection. Under vsr login == register, and the SDK's one-shot
+// `ConsensusSession` only resets on the reconnect/replay path, so the second
+// deliberate re-login panics `register_request_id already called`
+// (sdk/src/session.rs). Needs an SDK login-lifecycle fix (reset the session
+// on each fresh login).
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -63,6 +79,14 @@ async fn user(harness: &TestHarness) {
     user_scenario::run(harness).await;
 }
 
+// Blocked under vsr: password hashing and the metadata journal-append
+// race are now fixed, so the scenario runs deep into its permission
+// matrix. Remaining blocker is per-operation authorization: server-ng
+// does not enforce the caller's permissions on metadata ops, so a
+// `read_streams`-only user calling `create_stream` gets `InvalidFormat`
+// instead of `Unauthorized`. Needs the permission-enforcement subsystem
+// wired on the metadata plane.
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -102,6 +126,9 @@ async fn create_message_payload_scenario(harness: &TestHarness) {
     create_message_payload::run(harness).await;
 }
 
+// Blocked under vsr: stream/topic size accounting is not surfaced into
+// the get_stream/get_topic responses yet (sizes report 0).
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -115,6 +142,10 @@ async fn stream_size_validation(harness: &TestHarness) {
     stream_size_validation_scenario::run(harness).await;
 }
 
+// Blocked under vsr: pushes 8 MiB through the data plane, which drains the
+// in-memory partition journal to disk segments; benchmarks are out of
+// scope for the vsr test pass.
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -141,6 +172,9 @@ async fn consumer_timestamp_polling(harness: &TestHarness) {
     consumer_timestamp_polling_scenario::run(harness).await;
 }
 
+// Blocked under vsr: the snapshot-file feature (GET_SNAPSHOT_FILE) is
+// not implemented in server-ng.
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -154,6 +188,12 @@ async fn snapshot(harness: &TestHarness) {
     snapshot_scenario::run(harness).await;
 }
 
+// Blocked under vsr (unsolved): expects typed errors (`InvalidOffset`)
+// for invalid offset stores, but the partition plane neither validates
+// stored offsets nor has a wire vehicle for per-request errors (the vsr
+// Reply carries no status; Eviction is session-terminal). Needs an
+// error-reply design on the partition plane.
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(

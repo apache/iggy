@@ -145,6 +145,12 @@ pub struct MessageBusConfig {
     /// `peer_id > self_id`.
     pub reconnect_period: Duration,
 
+    /// Number of peer replicas this node expects in its mesh
+    /// (`cluster.nodes.len() - 1`, or 0 with clustering disabled).
+    /// Used only for mesh-formation observability: an info log fires
+    /// when the owner table first holds this many peers.
+    pub mesh_expected_peers: usize,
+
     /// Timeout for per-peer close drain (flush writer, tear down
     /// reader) before force-cancellation.
     pub close_peer_timeout: Duration,
@@ -208,6 +214,11 @@ impl From<&ServerNgConfig> for MessageBusConfig {
                 .expect("message_bus.max_message_size fits usize on supported targets"),
             peer_queue_capacity: bus.peer_queue_capacity,
             reconnect_period: bus.reconnect_period.get_duration(),
+            mesh_expected_peers: if cfg.cluster.enabled {
+                cfg.cluster.nodes.len().saturating_sub(1)
+            } else {
+                0
+            },
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),

@@ -446,7 +446,7 @@ pub fn install_replica_conn<C: TransportConn>(
                 return;
             }
             if !notified_transport.replace(true) {
-                bus_for_transport.notify_connection_lost(peer_id);
+                bus_for_transport.notify_connection_lost(peer_id, "transport task exited");
             }
         });
         conn.run(ctx).await;
@@ -498,7 +498,8 @@ pub fn install_replica_conn<C: TransportConn>(
                 .remove_if_token_matches(peer_id, token)
                 && !notified_dispatch_guard.replace(true)
             {
-                bus_for_dispatch_guard.notify_connection_lost(peer_id);
+                bus_for_dispatch_guard
+                    .notify_connection_lost(peer_id, "dispatch task panicked or aborted");
             }
         });
 
@@ -527,7 +528,10 @@ pub fn install_replica_conn<C: TransportConn>(
                 .close_peer_if_token_matches(peer_id, token, close_peer_timeout)
                 .await;
             if closed && !notified_dispatch.replace(true) {
-                bus_for_dispatch.notify_connection_lost(peer_id);
+                bus_for_dispatch.notify_connection_lost(
+                    peer_id,
+                    "dispatch loop ended (inbound channel closed)",
+                );
             }
         }
         info!(replica = peer_id, "peer replica disconnected");
@@ -546,6 +550,18 @@ pub fn install_replica_conn<C: TransportConn>(
             // CAS-clear runs from `IggyMessageBus::notify_connection_lost`
             // on either of the post-loop guards firing.
             install_token.set(Some(token));
+            let expected = bus.config().mesh_expected_peers;
+            if expected > 0 {
+                let connected = bus.owner_table().owned_count();
+                if connected == expected {
+                    info!(
+                        expected,
+                        "replica mesh complete: all peer connections established"
+                    );
+                } else {
+                    info!(connected, expected, "replica mesh forming");
+                }
+            }
         }
         Err(rejected) => {
             // Defensive: on single-threaded compio there is no `.await`

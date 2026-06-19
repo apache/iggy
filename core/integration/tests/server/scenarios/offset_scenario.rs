@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::PARTITION_ID;
+use super::{PARTITION_ID, poll_until_expected_count};
 use bytes::BytesMut;
 use iggy::prelude::*;
 use iggy_binary_protocol::WireUserHeaders;
@@ -195,18 +195,14 @@ async fn verify_all_messages_from_start(
     topic_name: &str,
     total_messages: u32,
 ) {
-    let polled = client
-        .poll_messages(
-            &Identifier::named(stream_name).unwrap(),
-            &Identifier::named(topic_name).unwrap(),
-            Some(PARTITION_ID),
-            &Consumer::default(),
-            &PollingStrategy::offset(0),
-            total_messages,
-            false,
-        )
-        .await
-        .unwrap();
+    let polled = poll_until_expected_count(
+        client,
+        stream_name,
+        topic_name,
+        &PollingStrategy::offset(0),
+        total_messages,
+    )
+    .await;
 
     assert_eq!(
         polled.messages.len() as u32,
@@ -230,18 +226,14 @@ async fn verify_messages_from_middle(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_messages - prior_batches_sum;
 
-        let polled = client
-            .poll_messages(
-                &Identifier::named(stream_name).unwrap(),
-                &Identifier::named(topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &Consumer::default(),
-                &PollingStrategy::offset(middle_offset + 1),
-                remaining_messages,
-                false,
-            )
-            .await
-            .unwrap();
+        let polled = poll_until_expected_count(
+            client,
+            stream_name,
+            topic_name,
+            &PollingStrategy::offset(middle_offset + 1),
+            remaining_messages,
+        )
+        .await;
 
         assert_eq!(
             polled.messages.len() as u32,

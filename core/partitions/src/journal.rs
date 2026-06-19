@@ -42,7 +42,7 @@ pub enum MessageLookup {
 }
 
 impl MessageLookup {
-    const fn count(self) -> u32 {
+    pub const fn count(self) -> u32 {
         match self {
             Self::Offset { count, .. } | Self::Timestamp { count, .. } => count,
         }
@@ -50,11 +50,11 @@ impl MessageLookup {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SelectedBatchSlice {
-    start: usize,
-    end: usize,
-    matched_messages: u32,
-    last_matching_offset: u64,
+pub struct SelectedBatchSlice {
+    pub start: usize,
+    pub end: usize,
+    pub matched_messages: u32,
+    pub last_matching_offset: u64,
 }
 
 #[allow(dead_code)]
@@ -257,6 +257,13 @@ where
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    /// Oldest message offset still resident in the in-memory journal, if
+    /// any. Polls below this must fall back to the on-disk segments.
+    pub fn oldest_resident_offset(&self) -> Option<u64> {
+        let offset_to_op = unsafe { &*self.offset_to_op.get() };
+        offset_to_op.keys().next().copied()
     }
 
     #[allow(dead_code)]
@@ -474,7 +481,7 @@ impl QueryableJournal<PartitionJournalMemStorage> for PartitionJournal<Partition
     }
 }
 
-fn select_batch_slice(
+pub fn select_batch_slice(
     batch: &SendMessages2Ref<'_>,
     query: MessageLookup,
     already_matched: u32,

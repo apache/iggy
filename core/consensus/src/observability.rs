@@ -666,10 +666,14 @@ where
     event.emit(sim_event);
 }
 
+// INFO, not DEBUG: only view-change completion flows through here
+// (PrimaryElected / ReplicaStateChanged) - rare fault-path transitions and
+// the primary diagnostic for stalled clusters. Default test/prod filters
+// drop DEBUG, which made wedged view changes invisible in logs.
 pub fn emit_replica_event(sim_event: SimEventKind, ctx: &ReplicaLogContext) {
     tracing::event!(
         target: "iggy.sim",
-        tracing::Level::DEBUG,
+        tracing::Level::INFO,
         sim_event = sim_event.as_str(),
         plane = ctx.plane.as_str(),
         cluster_id = ctx.cluster_id,
@@ -829,9 +833,11 @@ impl StructuredSimEvent for CommitLogEvent {
 impl StructuredSimEvent for ViewChangeLogEvent {
     fn emit(&self, sim_event: SimEventKind) {
         let ctx = self.replica;
+        // INFO for the same reason as emit_replica_event: view-change starts
+        // must be visible under default log filters.
         tracing::event!(
             target: "iggy.sim",
-            tracing::Level::DEBUG,
+            tracing::Level::INFO,
             sim_event = sim_event.as_str(),
             plane = ctx.plane.as_str(),
             cluster_id = ctx.cluster_id,
