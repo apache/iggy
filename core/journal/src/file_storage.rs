@@ -89,19 +89,44 @@ impl FileStorage {
         Ok(buf)
     }
 
-    /// Append write, returns bytes written.
+    /// Append write at the next free offset; returns the offset written to.
+    ///
+    /// Reserves the region by advancing `write_offset` **synchronously,
+    /// before** the write `.await`. On the single-threaded compio runtime
+    /// two `write_append` calls can interleave at the await; reserving first
+    /// hands each a distinct, non-overlapping offset. The previous code read
+    /// the offset and advanced the cursor *after* the await, so two in-flight
+    /// appends both saw the same offset and wrote over each other (and the
+    /// journal recorded the same index position for both) -- the corruption
+    /// seen under interleaved `on_replicate` calls (a queued op drained while
+    /// the next op is freshly submitted).
+    ///
+    /// On write error the reservation is rolled back **only when no later
+    /// append has reserved space after us** (`write_offset == offset + len`).
+    /// Leaving the gap is unsafe: a subsequent append (e.g. a VSR retransmit
+    /// of this op) would write past the zero hole, fsync and ack, and on
+    /// reopen the recovery scan would hit the hole and truncate from there --
+    /// silently dropping the committed op that now sits above the gap. Rolling
+    /// back lets the next append reuse the slot instead. In the rare
+    /// interleave where another append already reserved after us, rolling back
+    /// would clobber its slot, so the gap is left for recovery in that case.
     ///
     /// # Errors
     /// Returns an I/O error if the write fails.
-    #[allow(clippy::cast_possible_truncation)]
-    pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<usize> {
-        let len = buf.buf_len();
+    pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<u64> {
+        let len = buf.buf_len() as u64;
+        let offset = self.write_offset.get();
+        self.write_offset.set(offset + len);
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &mut *self.file.get() };
-        let (result, _buf) = file.write_all_at(buf, self.write_offset.get()).await.into();
-        result?;
-        self.write_offset.set(self.write_offset.get() + len as u64);
-        Ok(len)
+        let (result, _buf) = file.write_all_at(buf, offset).await.into();
+        if let Err(error) = result {
+            if self.write_offset.get() == offset + len {
+                self.write_offset.set(offset);
+            }
+            return Err(error);
+        }
+        Ok(offset)
     }
 
     /// The file path this storage was opened with.

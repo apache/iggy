@@ -75,7 +75,6 @@ pub(crate) fn encode_request_header(
         }
         _ => {
             let operation = operation_for_code(code)?;
-            let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
             // NonReplicated ops (ping, reads) bypass server-side dedup --
             // `ClientTable` only tracks request_ids for replicated ops. If
             // they consumed the monotonic counter, the next replicated
@@ -83,12 +82,30 @@ pub(crate) fn encode_request_header(
             // would see a `RequestGap` and silently drop it. Read the
             // current id without advancing; the server ignores it for
             // NonReplicated.
-            let request_id = if operation == Operation::NonReplicated {
-                session.current_request_id()
+            //
+            // They are also sessionless on the server (routed by transport
+            // id; protected codes are auth-gated server-side), so send with
+            // session 0 when unregistered -- preserving the legacy "ping
+            // works without auth" contract. Replicated ops still require a
+            // bound session for dedup and fail fast here.
+            if operation == Operation::NonReplicated {
+                (
+                    operation,
+                    session.current_request_id(),
+                    session.session().unwrap_or(0),
+                )
+            } else if operation.is_partition() {
+                // Partition ops replicate in their own per-partition group,
+                // which is at-least-once with no `ClientTable` dedup -- the
+                // metadata table never records their request ids. Consuming
+                // the counter here would gap the NEXT metadata op's id and
+                // `request_preflight` would silently drop it (`RequestGap`).
+                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
+                (operation, session.current_request_id(), session_id)
             } else {
-                session.next_request_id()
-            };
-            (operation, request_id, session_id)
+                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
+                (operation, session.next_request_id(), session_id)
+            }
         }
     };
     let namespace = namespace_for_request(code, payload, operation)?;
@@ -149,6 +166,19 @@ pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
 pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
     if response.len() < HEADER_SIZE {
         return Err(IggyError::EmptyResponse);
+    }
+
+    // Session-terminal Eviction frames map to typed errors, mirroring
+    // `decode_response_split` (the TCP/WS path) so every transport
+    // surfaces e.g. `Unauthenticated` instead of `InvalidCommand`.
+    let header_bytes: &[u8; HEADER_SIZE] = response[..HEADER_SIZE]
+        .try_into()
+        .map_err(|_| IggyError::InvalidCommand)?;
+    if peek_command(header_bytes) == Command2::Eviction {
+        if let Ok(header) = bytemuck::checked::try_from_bytes::<EvictionHeader>(header_bytes) {
+            return Err(map_eviction_reason(header.reason));
+        }
+        return Err(IggyError::Unauthenticated);
     }
 
     let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(&response[..HEADER_SIZE])
