@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(feature = "vsr")]
-mod clients;
 mod hello_world;
+#[cfg(feature = "vsr")]
+mod messages;
 #[cfg(not(feature = "vsr"))]
 mod producer;
 mod raw;

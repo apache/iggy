@@ -30,7 +30,7 @@ use common::{
     set_replica_ctx,
 };
 use compio::net::TcpListener;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::{Command2, HEADER_SIZE};
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
@@ -70,7 +70,18 @@ async fn slow_peer_does_not_block_other_peers() {
         Rc::new(std::cell::RefCell::new(Vec::new()));
     let held_streams_clone = held_streams.clone();
     let accept_b_handle = compio::runtime::spawn(async move {
-        while let Ok((stream, _)) = lb.accept().await {
+        while let Ok((mut stream, _)) = lb.accept().await {
+            // Complete the two-way mesh handshake (consume the dialer's
+            // Ping, ack it) so the dial installs; only then go mute. The
+            // head-of-line scenario needs an installed peer that stops
+            // reading, not a peer that never joins.
+            if message_bus::framing::read_message(&mut stream, HEADER_SIZE)
+                .await
+                .is_ok()
+            {
+                let ack = header_only(Command2::Ping, CLUSTER, 2);
+                let _ = message_bus::framing::write_message(&mut stream, ack).await;
+            }
             held_streams_clone.borrow_mut().push(stream);
         }
     });

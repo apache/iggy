@@ -57,6 +57,12 @@ const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 #[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
+/// Upper bound for awaiting a reply on the lockstep VSR connection. Far
+/// beyond any healthy round-trip; only trips when the server loses the
+/// reply entirely (e.g. stalled replication quorum), which would otherwise
+/// hold the stream lock forever and wedge the client.
+#[cfg(feature = "vsr")]
+const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
@@ -147,7 +153,12 @@ impl BinaryTransport for TcpClient {
         }
 
         #[cfg(feature = "vsr")]
-        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
+            // Without auto-login a reconnect cannot re-establish the session,
+            // so non-login requests fail fast. Login/register itself is the
+            // exception: the server stays deliberately silent on transient
+            // register failures (server-ng `surface_login_failure`) and
+            // relies on the client timing out and replaying the request.
             return Err(error);
         }
 
@@ -158,6 +169,13 @@ impl BinaryTransport for TcpClient {
         #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
+            // The replayed login/register must mint a fresh Register: the
+            // failed attempt already consumed the one-shot register request
+            // id and may have half-bound the session.
+            *self
+                .consensus_session
+                .lock()
+                .expect("consensus session mutex poisoned") = ConsensusSession::new();
         }
 
         {
@@ -666,7 +684,7 @@ impl TcpClient {
         #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {
                 #[cfg(feature = "vsr")]
@@ -705,7 +723,29 @@ impl TcpClient {
                     // `stream.read` delegates to `read_exact`; on success it
                     // always returns the requested length, so no short-read
                     // guard is needed here.
-                    stream.read(&mut response_header).await.map_err(|error| {
+                    //
+                    // Deadline guards against server-side reply loss (e.g. a
+                    // stalled replication quorum that never commits the op):
+                    // the connection is lockstep, so an unanswered read would
+                    // hold the stream lock forever and wedge every later
+                    // request on this client. On expiry drop the stream --
+                    // a late reply would desync framing for the next request.
+                    //
+                    // One deadline spans BOTH the header and body reads: a
+                    // reply that delivers a header then stalls must not get a
+                    // fresh full timeout for the body (which would allow up to
+                    // 2x `RESPONSE_READ_TIMEOUT` total).
+                    let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                    let header_read =
+                        tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
+                            .await;
+                    let Ok(header_read) = header_read else {
+                        error!(
+                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
+                        );
+                        return Err(IggyError::Disconnected);
+                    };
+                    header_read.map_err(|error| {
                         error!(
                             "Failed to read VSR response header for TCP request with code: {code}: {error}",
                             code = code,
@@ -719,7 +759,18 @@ impl TcpClient {
                     let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
                     let body = if body_size > 0 {
                         let mut body = BytesMut::with_capacity(body_size);
-                        stream.read_buf(&mut body, body_size).await.map_err(|error| {
+                        let body_read = tokio::time::timeout_at(
+                            response_deadline,
+                            stream.read_buf(&mut body, body_size),
+                        )
+                        .await;
+                        let Ok(body_read) = body_read else {
+                            error!(
+                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
+                            );
+                            return Err(IggyError::Disconnected);
+                        };
+                        body_read.map_err(|error| {
                             error!(
                                 "Failed to read VSR response body for TCP request with code: {code}: {error}",
                                 code = code,
@@ -773,7 +824,16 @@ impl TcpClient {
         .map_err(|e| {
             error!("Task execution failed during TCP request: {}", e);
             IggyError::TcpError
-        })?
+        })?;
+
+        if matches!(result, Err(IggyError::Disconnected)) {
+            // Reply stream state is unknown (timed out or torn mid-frame);
+            // a late reply would desync framing for the next request, so
+            // drop the connection and let callers reconnect.
+            self.stream.lock().await.take();
+            self.set_state(ClientState::Disconnected).await;
+        }
+        result
     }
 
     async fn get_client_address_value(&self) -> String {
