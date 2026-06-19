@@ -34,7 +34,6 @@ use meilisearch_sdk::{
     task_info::TaskInfo,
     tasks::Task,
 };
-use reqwest::Url;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -43,7 +42,8 @@ use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use url::Url;
 
 sink_connector!(MeilisearchSink);
 
@@ -65,7 +65,7 @@ const ENCODING_BASE64: &str = "base64";
 struct State {
     invocations_count: usize,
     documents_enqueued: usize,
-    documents_indexed: usize,
+    documents_confirmed: usize,
     errors_count: usize,
 }
 
@@ -181,7 +181,7 @@ impl MeilisearchSink {
             state: Mutex::new(State {
                 invocations_count: 0,
                 documents_enqueued: 0,
-                documents_indexed: 0,
+                documents_confirmed: 0,
                 errors_count: 0,
             }),
         }
@@ -257,9 +257,8 @@ impl MeilisearchSink {
         messages_metadata: &MessagesMetadata,
         message: ConsumedMessage,
     ) -> Result<Value, Error> {
-        let generated_id = generated_document_id(topic_metadata, messages_metadata, &message);
         let ConsumedMessage {
-            id,
+            id: message_id,
             offset,
             checksum,
             timestamp,
@@ -301,20 +300,39 @@ impl MeilisearchSink {
             }
         };
 
-        document
-            .entry(self.config.primary_key.clone())
-            .or_insert_with(|| Value::String(generated_id.clone()));
+        let mut generated_id = None;
+        if !document.contains_key(self.config.primary_key.as_str()) {
+            let value = generated_document_id_from_parts(
+                topic_metadata,
+                messages_metadata,
+                offset,
+                message_id,
+            );
+            document.insert(
+                self.config.primary_key.clone(),
+                Value::String(value.clone()),
+            );
+            generated_id = Some(value);
+        }
 
         if self.config.include_metadata {
-            if self.config.primary_key != DEFAULT_PRIMARY_KEY {
-                document
-                    .entry(DEFAULT_PRIMARY_KEY.to_string())
-                    .or_insert_with(|| Value::String(generated_id));
+            if self.config.primary_key != DEFAULT_PRIMARY_KEY
+                && !document.contains_key(DEFAULT_PRIMARY_KEY)
+            {
+                let id = generated_id.get_or_insert_with(|| {
+                    generated_document_id_from_parts(
+                        topic_metadata,
+                        messages_metadata,
+                        offset,
+                        message_id,
+                    )
+                });
+                document.insert(DEFAULT_PRIMARY_KEY.to_string(), Value::String(id.clone()));
             }
             insert_metadata_field(
                 &mut document,
                 "iggy_message_id",
-                Value::String(id.to_string()),
+                Value::String(message_id.to_string()),
             );
             insert_metadata_field(&mut document, "iggy_offset", Value::from(offset));
             insert_metadata_field(
@@ -377,6 +395,7 @@ impl MeilisearchSink {
                 Err(partial_error) => {
                     return Err(PartialIndexError {
                         accepted: accepted + partial_error.accepted,
+                        failed: partial_error.failed,
                         error: partial_error.error,
                     });
                 }
@@ -409,11 +428,16 @@ impl MeilisearchSink {
                 .await
             }
         }
-        .map_err(|error| PartialIndexError { accepted: 0, error })?;
+        .map_err(|error| PartialIndexError {
+            accepted: 0,
+            failed: documents.len(),
+            error,
+        })?;
         self.wait_for_task(client, task)
             .await
             .map_err(|error| PartialIndexError {
                 accepted: documents.len(),
+                failed: documents.len(),
                 error,
             })?;
         Ok(documents.len())
@@ -482,7 +506,7 @@ impl MeilisearchSink {
         &self,
         client: &Client,
         task: TaskInfo,
-        max_retries: u32,
+        max_get_task_retries: u32,
     ) -> Result<Task, Error> {
         let task_uid = task.get_task_uid();
         let started = Instant::now();
@@ -495,9 +519,11 @@ impl MeilisearchSink {
 
             let status = match tokio::time::timeout(
                 remaining,
-                self.retry_sdk_operation_with_retries("get task status", max_retries, || {
-                    client.get_task(task.clone())
-                }),
+                self.retry_sdk_operation_with_retries(
+                    "get task status",
+                    max_get_task_retries,
+                    || client.get_task(TaskUid(task_uid)),
+                ),
             )
             .await
             {
@@ -558,6 +584,7 @@ impl MeilisearchSink {
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
+        // One retry budget covers both SDK errors and per-attempt timeouts.
         let mut retries = 0u32;
 
         loop {
@@ -688,7 +715,7 @@ impl Sink for MeilisearchSink {
                 let mut state = self.state.lock().await;
                 state.documents_enqueued += accepted;
                 if self.config.wait_for_tasks {
-                    state.documents_indexed += accepted;
+                    state.documents_confirmed += accepted;
                 }
                 info!(
                     "Accepted {} of {} messages into Meilisearch index '{}'",
@@ -699,8 +726,16 @@ impl Sink for MeilisearchSink {
             Err(partial_error) => {
                 let mut state = self.state.lock().await;
                 state.documents_enqueued += partial_error.accepted;
-                state.errors_count += 1;
+                state.errors_count += partial_error.failed;
                 drop(state);
+                error!(
+                    "Failed to index Meilisearch sink batch for connector ID: {}, index: {}, accepted: {}, failed: {}, error: {}",
+                    self.id,
+                    self.config.index,
+                    partial_error.accepted,
+                    partial_error.failed,
+                    partial_error.error
+                );
                 Err(partial_error.error)
             }
         }
@@ -709,11 +744,11 @@ impl Sink for MeilisearchSink {
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
         info!(
-            "Meilisearch sink connector with ID: {} is closing. Stats: {} invocations, {} documents enqueued, {} documents indexed, {} errors",
+            "Meilisearch sink connector with ID: {} is closing. Stats: {} invocations, {} documents enqueued, {} documents confirmed, {} errors",
             self.id,
             state.invocations_count,
             state.documents_enqueued,
-            state.documents_indexed,
+            state.documents_confirmed,
             state.errors_count
         );
         drop(state);
@@ -724,17 +759,32 @@ impl Sink for MeilisearchSink {
     }
 }
 
+#[cfg(test)]
 fn generated_document_id(
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     message: &ConsumedMessage,
 ) -> String {
+    generated_document_id_from_parts(
+        topic_metadata,
+        messages_metadata,
+        message.offset,
+        message.id,
+    )
+}
+
+fn generated_document_id_from_parts(
+    topic_metadata: &TopicMetadata,
+    messages_metadata: &MessagesMetadata,
+    offset: u64,
+    id: u128,
+) -> String {
     let components = json!([
         topic_metadata.stream.as_str(),
         topic_metadata.topic.as_str(),
         messages_metadata.partition_id,
-        message.offset,
-        message.id.to_string()
+        offset,
+        id.to_string()
     ]);
     let encoded = serde_json::to_vec(&components)
         .map(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes))
@@ -764,7 +814,7 @@ fn sanitize_url_for_log(raw: &str) -> String {
     if url.password().is_some() {
         let _ = url.set_password(None);
     }
-    url.to_string()
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 fn normalize_host(raw: &str) -> Result<String, Error> {
@@ -782,17 +832,30 @@ fn normalize_host(raw: &str) -> Result<String, Error> {
     };
     let url = Url::parse(&with_scheme)
         .map_err(|error| Error::Connection(format!("Invalid Meilisearch URL: {error}")))?;
-    let mut host = url.to_string();
-    while host.ends_with('/') {
-        host.pop();
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        warn!("Ignoring path, query, or fragment from Meilisearch URL");
     }
-    Ok(host)
+    let mut base_url = url;
+    base_url.set_path("");
+    base_url.set_query(None);
+    base_url.set_fragment(None);
+    Ok(base_url.as_str().trim_end_matches('/').to_string())
 }
 
 #[derive(Debug)]
 struct PartialIndexError {
     accepted: usize,
+    failed: usize,
     error: Error,
+}
+
+#[derive(Clone, Copy)]
+struct TaskUid(u32);
+
+impl AsRef<u32> for TaskUid {
+    fn as_ref(&self) -> &u32 {
+        &self.0
+    }
 }
 
 fn is_index_not_found(error: &MeilisearchSdkError) -> bool {
@@ -809,7 +872,9 @@ fn is_transient_sdk_error(error: &MeilisearchSdkError) -> bool {
             meilisearch_error.error_type == MeilisearchErrorType::Internal
         }
         MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
-            communication_error.status_code == 429 || communication_error.status_code >= 500
+            communication_error.status_code == 0
+                || communication_error.status_code == 429
+                || communication_error.status_code >= 500
         }
         MeilisearchSdkError::HttpError(_) | MeilisearchSdkError::Timeout => true,
         _ => false,
@@ -826,7 +891,10 @@ fn map_sdk_error(error: MeilisearchSdkError) -> Error {
             }
         }
         MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
-            if communication_error.status_code == 429 || communication_error.status_code >= 500 {
+            if communication_error.status_code == 0
+                || communication_error.status_code == 429
+                || communication_error.status_code >= 500
+            {
                 Error::HttpRequestFailed(communication_error.to_string())
             } else {
                 Error::PermanentHttpError(communication_error.to_string())
@@ -1059,7 +1127,15 @@ mod tests {
     #[test]
     fn sanitize_url_should_redact_credentials_without_scheme() {
         let url = sanitize_url_for_log("user:pass@localhost:7700/indexes");
-        assert_eq!(url, "http://localhost:7700/indexes");
+        assert_eq!(url, "http://localhost:7700");
+    }
+
+    #[test]
+    fn normalize_host_should_strip_path_query_and_fragment() {
+        let url =
+            normalize_host("https://localhost:7700/path?foo=bar#section").expect("normalize host");
+
+        assert_eq!(url, "https://localhost:7700");
     }
 
     #[test]

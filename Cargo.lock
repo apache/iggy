@@ -6934,13 +6934,13 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "meilisearch-sdk",
- "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",
  "simd-json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ use integration::iggy_harness;
     server(connectors_runtime(config_path = "tests/connectors/meilisearch/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn meilisearch_sink_indexes_json_messages(
+async fn given_json_messages_when_sink_consumes_should_index_documents(
     harness: &TestHarness,
     fixture: MeilisearchSinkFixture,
 ) {

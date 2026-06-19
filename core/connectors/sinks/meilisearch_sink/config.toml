@@ -38,6 +38,6 @@ primary_key = "iggy_id"
 document_action = "replace"
 create_index_if_not_exists = true
 include_metadata = true
-batch_size = 100
+batch_size = 1000
 timeout = "30s"
 wait_for_tasks = true
