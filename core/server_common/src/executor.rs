@@ -71,17 +71,26 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
     let mut proactor = compio::driver::ProactorBuilder::new();
+    let coop_taskrun = coop_taskrun_from_env();
 
     proactor.capacity(shard_capacity_from_env());
-    if coop_taskrun_from_env() {
+    if coop_taskrun {
         proactor.coop_taskrun(true).taskrun_flag(true);
     }
 
     // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
     // This causes a freeze on macOS with compio fs operations
     // see https://github.com/compio-rs/compio/issues/446
+    //
+    // Also keep a worker pool when COOP_TASKRUN is disabled: without it compio
+    // routes some ops (fs reads, JWT storage) through the asyncify thread pool,
+    // and a zero-worker pool then panics with "thread pool is needed but no
+    // worker thread is running". A non-zero pool is only safe to drop when the
+    // modern io_uring flags keep those ops on the ring.
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    proactor.thread_pool_limit(0);
+    if coop_taskrun {
+        proactor.thread_pool_limit(0);
+    }
 
     compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor.to_owned())
