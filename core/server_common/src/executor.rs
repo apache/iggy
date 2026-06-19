@@ -56,6 +56,12 @@ fn coop_taskrun_from_env() -> bool {
 /// harness sets to `256` so N nodes * M shards fit under an 8 MiB
 /// `RLIMIT_MEMLOCK` budget without `ENOMEM` at ring setup.
 ///
+/// `keep_worker_pool` must be `true` when TCP, HTTP, or WebSocket transports are
+/// active: those transports dispatch blocking ops through the asyncify thread pool
+/// even when COOP_TASKRUN is on, and a zero-worker pool panics with "thread pool
+/// is needed but no worker thread is running". Pass `false` only for pure
+/// QUIC-only deployments where every op stays on the ring.
+///
 /// # Errors
 ///
 /// Returns an `std::io::Error` if the underlying `io_uring` proactor cannot be initialised.
@@ -66,7 +72,7 @@ fn coop_taskrun_from_env() -> bool {
 /// This is opt-out (not a silent fallback): the flags stay on by default and are
 /// only dropped when `IGGY_SHARD_RUNTIME_COOP_TASKRUN=false` is set explicitly,
 /// which is the documented escape hatch for kernels older than 5.19.
-pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
+pub fn create_shard_executor(keep_worker_pool: bool) -> Result<Runtime, std::io::Error> {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
@@ -82,13 +88,14 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // This causes a freeze on macOS with compio fs operations
     // see https://github.com/compio-rs/compio/issues/446
     //
-    // Also keep a worker pool when COOP_TASKRUN is disabled: without it compio
-    // routes some ops (fs reads, JWT storage) through the asyncify thread pool,
-    // and a zero-worker pool then panics with "thread pool is needed but no
-    // worker thread is running". A non-zero pool is only safe to drop when the
-    // modern io_uring flags keep those ops on the ring.
+    // Keep a worker pool whenever the caller signals it (TCP/HTTP/WS active),
+    // or when COOP_TASKRUN is off: in both cases compio may dispatch blocking
+    // ops (fs reads, JWT storage, TLS handshakes) through the asyncify pool,
+    // and a zero-worker pool panics with "thread pool is needed". Dropping the
+    // pool is only safe when modern io_uring flags handle every op on-ring AND
+    // no transport needs asyncify-backed blocking calls.
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    if coop_taskrun {
+    if coop_taskrun && !keep_worker_pool {
         proactor.thread_pool_limit(0);
     }
 

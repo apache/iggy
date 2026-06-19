@@ -633,7 +633,8 @@ fn run_shard_thread(
     // TODO(hubcio): decouple runtime creation from the `server` crate
     // (mirrors the identical TODO in `main.rs`). Reusing legacy here so
     // server-ng and the legacy server share one io_uring tuning surface.
-    let runtime = create_shard_executor()
+    let keep_pool = config.tcp.enabled || config.http.enabled || config.websocket.enabled;
+    let runtime = create_shard_executor(keep_pool)
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
     let result = runtime.block_on(async move {

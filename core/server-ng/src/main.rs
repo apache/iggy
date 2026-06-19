@@ -26,7 +26,7 @@ use server_ng::server_error::ServerNgError;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
-    let bootstrap_runtime = match server_common::create_shard_executor() {
+    let bootstrap_runtime = match server_common::create_shard_executor(true) {
         Ok(rt) => rt,
         Err(e) => {
             match e.kind() {

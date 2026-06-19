@@ -399,7 +399,9 @@ fn main() -> Result<(), ServerError> {
                             error!("Failed to bind memory: {e:?}");
                         }
 
-                        let rt = match create_shard_executor() {
+                        let keep_pool =
+                            config.tcp.enabled || config.http.enabled || config.websocket.enabled;
+                        let rt = match create_shard_executor(keep_pool) {
                             Ok(rt) => rt,
                             Err(e) => {
                                 match e.kind() {
