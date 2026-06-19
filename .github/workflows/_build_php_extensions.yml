@@ -156,6 +156,39 @@ jobs:
           name: php-license-binary
           path: foreign/php
 
+      - name: Setup yq
+        run: |
+          if command -v yq >/dev/null 2>&1; then
+            yq --version
+            exit 0
+          fi
+
+          YQ_VERSION="v4.47.1"
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
+            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
+            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
+            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
+            *)
+              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          yq_tmp="$(mktemp -d)"
+          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
+          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
+          else
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/yq-bin"
+          chmod +x "${yq_tmp}/${YQ_BINARY}"
+          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
+          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
+
       - name: Resolve version
         id: ver
         run: |
@@ -315,6 +348,39 @@ jobs:
           name: php-license-binary
           path: foreign/php
 
+      - name: Setup yq
+        run: |
+          if command -v yq >/dev/null 2>&1; then
+            yq --version
+            exit 0
+          fi
+
+          YQ_VERSION="v4.47.1"
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
+            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
+            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
+            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
+            *)
+              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          yq_tmp="$(mktemp -d)"
+          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
+          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
+          else
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/yq-bin"
+          chmod +x "${yq_tmp}/${YQ_BINARY}"
+          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
+          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
+
       - name: Resolve version
         id: ver
         run: |
@@ -386,6 +452,39 @@ jobs:
         run: |
           /tmp/copy-latest-from-master.sh save .github scripts
           /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup yq
+        run: |
+          if command -v yq >/dev/null 2>&1; then
+            yq --version
+            exit 0
+          fi
+
+          YQ_VERSION="v4.47.1"
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
+            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
+            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
+            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
+            *)
+              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          yq_tmp="$(mktemp -d)"
+          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
+          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
+          else
+            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/yq-bin"
+          chmod +x "${yq_tmp}/${YQ_BINARY}"
+          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
+          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
 
       - name: Resolve version
         id: ver

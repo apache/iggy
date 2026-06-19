@@ -1219,6 +1219,7 @@ jobs:
           tag: ${{ steps.ver.outputs.tag }}
           commit: ${{ needs.validate.outputs.commit }}
           dry_run: ${{ inputs.dry_run }}
+          packagist_token: ${{ env.PACKAGIST_TOKEN }}
           packages_artifact: php-extensions-all
           packages_path: dist
 

@@ -32,6 +32,10 @@ inputs:
     description: "Dry run mode"
     required: false
     default: "false"
+  packagist_token:
+    description: "Packagist bearer credential in USERNAME:apiToken format"
+    required: false
+    default: ""
   packages_artifact:
     description: "Name of the artifact containing PHP extension archives"
     required: false
@@ -224,4 +228,4 @@ runs:
         echo "Packagist update requested for apache/iggy-php"
       shell: bash
       env:
-        PACKAGIST_TOKEN: ${{ env.PACKAGIST_TOKEN }}
+        PACKAGIST_TOKEN: ${{ inputs.packagist_token }}
