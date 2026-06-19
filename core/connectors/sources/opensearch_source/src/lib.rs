@@ -18,7 +18,7 @@
  */
 use async_trait::async_trait;
 use iggy_common::{DateTime, Utc};
-use iggy_connector_sdk::retry::parse_duration;
+use iggy_connector_sdk::retry::{CircuitBreaker, parse_duration};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
@@ -30,11 +30,18 @@ use opensearch::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, error, info, warn};
 
+mod retry;
 mod state_manager;
+use crate::retry::{
+    DEFAULT_CB_COOL_DOWN, DEFAULT_CB_THRESHOLD, DEFAULT_MAX_OPEN_RETRIES, DEFAULT_MAX_RETRIES,
+    DEFAULT_OPEN_RETRY_MAX_DELAY, DEFAULT_RETRY_DELAY, DEFAULT_RETRY_MAX_DELAY, RetryBackoff,
+    is_transient_status, normalized_max_attempts, sleep_before_retry,
+};
 use crate::state_manager::{SOURCE_STATE_VERSION, SourceState, validate_state_storage_config};
 
 source_connector!(OpenSearchSource);
@@ -101,6 +108,13 @@ pub struct OpenSearchSourceConfig {
     #[serde(default)]
     pub verbose_logging: bool,
     pub state: Option<StateConfig>,
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+    pub retry_max_delay: Option<String>,
+    pub max_open_retries: Option<u32>,
+    pub open_retry_max_delay: Option<String>,
+    pub circuit_breaker_threshold: Option<u32>,
+    pub circuit_breaker_cool_down: Option<String>,
 }
 
 #[derive(Debug)]
@@ -111,6 +125,12 @@ pub struct OpenSearchSource {
     polling_interval: Duration,
     search_query: Value,
     verbose: bool,
+    max_retries: u32,
+    retry_delay: Duration,
+    retry_max_delay: Duration,
+    max_open_retries: u32,
+    open_retry_max_delay: Duration,
+    circuit_breaker: Arc<CircuitBreaker>,
     state: Mutex<State>,
     /// `Some(cause)` when runtime state restore was rejected; `None` means restore succeeded.
     state_restore_error: Option<String>,
@@ -137,9 +157,35 @@ impl OpenSearchSource {
         let (restored_state, state_restore_error, runtime_state_restored) =
             restore_state(id, state);
 
+        let cb_threshold = config
+            .circuit_breaker_threshold
+            .unwrap_or(DEFAULT_CB_THRESHOLD);
+        let cb_cool_down = parse_duration(
+            config.circuit_breaker_cool_down.as_deref(),
+            DEFAULT_CB_COOL_DOWN,
+        );
+        let circuit_breaker = Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down));
+        let max_retries =
+            normalized_max_attempts(config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES));
+        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let retry_max_delay =
+            parse_duration(config.retry_max_delay.as_deref(), DEFAULT_RETRY_MAX_DELAY);
+        let max_open_retries =
+            normalized_max_attempts(config.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES));
+        let open_retry_max_delay = parse_duration(
+            config.open_retry_max_delay.as_deref(),
+            DEFAULT_OPEN_RETRY_MAX_DELAY,
+        );
+
         OpenSearchSource {
             id,
             config,
+            max_retries,
+            retry_delay,
+            retry_max_delay,
+            max_open_retries,
+            open_retry_max_delay,
+            circuit_breaker,
             client: None,
             polling_interval,
             search_query,
@@ -234,6 +280,166 @@ impl OpenSearchSource {
         Ok(OpenSearch::new(transport))
     }
 
+    async fn check_index_exists_with_retry(&self, client: &OpenSearch) -> Result<(), Error> {
+        let max_attempts = self.max_open_retries;
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let response = match client
+                .indices()
+                .exists(opensearch::indices::IndicesExistsParts::Index(&[&self
+                    .config
+                    .index]))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt < max_attempts {
+                        sleep_before_retry(
+                            "index_exists",
+                            self.id,
+                            attempt,
+                            max_attempts,
+                            &RetryBackoff {
+                                delay: self.retry_delay,
+                                max_delay: self.open_retry_max_delay,
+                            },
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Err(Error::Storage(format!(
+                        "Failed to check index existence: {error}"
+                    )));
+                }
+            };
+
+            if response.status_code().is_success() {
+                return Ok(());
+            }
+
+            let status = response.status_code().as_u16();
+            if status == 404 {
+                return Err(Error::InitError(format!(
+                    "Index '{}' does not exist or is not accessible",
+                    self.config.index
+                )));
+            }
+
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+
+            if is_transient_status(status) && attempt < max_attempts {
+                sleep_before_retry(
+                    "index_exists",
+                    self.id,
+                    attempt,
+                    max_attempts,
+                    &RetryBackoff {
+                        delay: self.retry_delay,
+                        max_delay: self.open_retry_max_delay,
+                    },
+                    retry_after.as_deref(),
+                    &format!("HTTP {status}: {error_text}"),
+                )
+                .await;
+                continue;
+            }
+
+            return Err(Error::InitError(format!(
+                "Index '{}' does not exist or is not accessible",
+                self.config.index
+            )));
+        }
+    }
+
+    async fn send_search_with_retry(
+        &self,
+        client: &OpenSearch,
+        search_body: Value,
+    ) -> Result<opensearch::http::response::Response, Error> {
+        let max_attempts = self.max_retries;
+        let mut attempt = 0u32;
+
+        loop {
+            attempt += 1;
+            let response = match client
+                .search(SearchParts::Index(&[&self.config.index]))
+                .body(search_body.clone())
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt < max_attempts {
+                        sleep_before_retry(
+                            "search",
+                            self.id,
+                            attempt,
+                            max_attempts,
+                            &RetryBackoff {
+                                delay: self.retry_delay,
+                                max_delay: self.retry_max_delay,
+                            },
+                            None,
+                            &error.to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Err(Error::Storage(format!("Failed to execute search: {error}")));
+                }
+            };
+
+            if response.status_code().is_success() {
+                return Ok(response);
+            }
+
+            let status = response.status_code().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+
+            if is_transient_status(status) && attempt < max_attempts {
+                sleep_before_retry(
+                    "search",
+                    self.id,
+                    attempt,
+                    max_attempts,
+                    &RetryBackoff {
+                        delay: self.retry_delay,
+                        max_delay: self.retry_max_delay,
+                    },
+                    retry_after.as_deref(),
+                    &format!("HTTP {status}: {error_text}"),
+                )
+                .await;
+                continue;
+            }
+
+            return Err(Error::Storage(format!(
+                "Search request failed: {error_text}"
+            )));
+        }
+    }
+
     async fn search_documents(&self, client: &OpenSearch) -> Result<SearchOutcome, Error> {
         let state = self.state.lock().await;
         let batch_size = self.batch_size();
@@ -254,22 +460,7 @@ impl OpenSearchSource {
             search_body["search_after"] = json!(cursor);
         }
 
-        let response = client
-            .search(SearchParts::Index(&[&self.config.index]))
-            .body(search_body)
-            .send()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to execute search: {e}")))?;
-
-        if !response.status_code().is_success() {
-            let error_text = response
-                .text()
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to read search error body: {e}")))?;
-            return Err(Error::Storage(format!(
-                "Search request failed: {error_text}"
-            )));
-        }
+        let response = self.send_search_with_retry(client, search_body).await?;
 
         let mut response_body: Value = response
             .json()
@@ -289,7 +480,11 @@ impl OpenSearchSource {
         let mut last_poll_timestamp = None;
 
         for hit in &hits {
-            let Some(sort) = hit.get("sort").and_then(|s| s.as_array()).filter(|a| !a.is_empty()) else {
+            let Some(sort) = hit
+                .get("sort")
+                .and_then(|s| s.as_array())
+                .filter(|a| !a.is_empty())
+            else {
                 warn!(
                     connector_id = self.id,
                     hit_id = hit.get("_id").and_then(|value| value.as_str()),
@@ -423,6 +618,20 @@ impl OpenSearchSource {
     async fn test_last_poll_timestamp(&self) -> Option<DateTime<Utc>> {
         self.state.lock().await.last_poll_timestamp
     }
+
+    async fn handle_poll_error(&self, error: Error) -> Result<ProducedMessages, Error> {
+        self.circuit_breaker.record_failure().await;
+        let mut state = self.state.lock().await;
+        state.error_count += 1;
+        state.last_error = Some(error.to_string());
+        drop(state);
+        error!(
+            "{CONNECTOR_NAME} connector ID: {} poll failed: {error}",
+            self.id
+        );
+        sleep(self.polling_interval).await;
+        Err(error)
+    }
 }
 
 fn restore_state(id: u32, state: Option<ConnectorState>) -> (State, Option<String>, bool) {
@@ -505,21 +714,7 @@ impl Source for OpenSearchSource {
 
         let client = self.create_client().await?;
 
-        let response = client
-            .indices()
-            .exists(opensearch::indices::IndicesExistsParts::Index(&[&self
-                .config
-                .index]))
-            .send()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to check index existence: {e}")))?;
-
-        if !response.status_code().is_success() {
-            return Err(Error::InitError(format!(
-                "Index '{}' does not exist or is not accessible",
-                self.config.index
-            )));
-        }
+        self.check_index_exists_with_retry(&client).await?;
 
         self.client = Some(client);
 
@@ -551,6 +746,19 @@ impl Source for OpenSearchSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
+        if self.circuit_breaker.is_open().await {
+            warn!(
+                "{CONNECTOR_NAME} connector ID: {} — circuit breaker is OPEN. Skipping poll.",
+                self.id
+            );
+            sleep(self.polling_interval).await;
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: vec![],
+                state: None,
+            });
+        }
+
         let start_time = std::time::Instant::now();
 
         let client = self
@@ -558,28 +766,21 @@ impl Source for OpenSearchSource {
             .as_ref()
             .ok_or_else(|| Error::Storage("OpenSearch client not initialized".to_string()))?;
 
-        let (messages, persisted_state) = match self.search_documents(client).await {
+        match self.search_documents(client).await {
             Ok(outcome) => {
+                self.circuit_breaker.record_success();
                 let processing_time = start_time.elapsed().as_millis() as f64;
-                self.finalize_poll(outcome, processing_time).await
-            }
-            Err(e) => {
-                let mut state = self.state.lock().await;
-                state.error_count += 1;
-                state.last_error = Some(e.to_string());
-                drop(state);
+                let (messages, persisted_state) =
+                    self.finalize_poll(outcome, processing_time).await;
                 sleep(self.polling_interval).await;
-                return Err(e);
+                Ok(ProducedMessages {
+                    schema: Schema::Json,
+                    messages,
+                    state: persisted_state,
+                })
             }
-        };
-
-        sleep(self.polling_interval).await;
-
-        Ok(ProducedMessages {
-            schema: Schema::Json,
-            messages,
-            state: persisted_state,
-        })
+            Err(error) => self.handle_poll_error(error).await,
+        }
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -629,6 +830,13 @@ mod tests {
             timestamp_field: Some("timestamp".to_string()),
             verbose_logging: false,
             state: None,
+            max_retries: None,
+            retry_delay: None,
+            retry_max_delay: None,
+            max_open_retries: None,
+            open_retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
         }
     }
 

@@ -61,6 +61,15 @@ query = { "match_all": {} }
 | `query` | JSON object | `{"match_all": {}}` | OpenSearch query DSL; applied on every poll |
 | `username` / `password` | `String` | none | HTTP basic authentication |
 | `verbose_logging` | `bool` | `false` | Log per-poll batch counts at `info!` instead of `debug!` |
+| `max_retries` | `u32` | `3` | Total HTTP attempts per search during `poll()` |
+| `retry_delay` | `String` | `"1s"` | Base backoff between HTTP retries |
+| `retry_max_delay` | `String` | `"30s"` | Maximum backoff between HTTP retries |
+| `max_open_retries` | `u32` | `5` | Total attempts for index-exists check during `open()` |
+| `open_retry_max_delay` | `String` | `"30s"` | Maximum backoff during `open()` probes |
+| `circuit_breaker_threshold` | `u32` | `5` | Consecutive poll failures before circuit opens |
+| `circuit_breaker_cool_down` | `String` | `"60s"` | Duration to skip polls when circuit is open |
+
+See [docs/RESILIENCE.md](docs/RESILIENCE.md) for retry, circuit breaker, at-least-once, and backfill semantics.
 
 ### File-backed state (optional)
 
@@ -85,7 +94,7 @@ Each call to `poll()`:
 
 1. Issues `POST /{index}/_search` with the query below.
 2. Maps each hit's `_source` to a JSON `ProducedMessage`.
-3. Updates the `search_after` cursor to the sort tuple of the last successfully published hit.
+3. Updates the `search_after` cursor to the sort tuple of the last hit with a valid sort tuple.
 4. Returns `ProducedMessages` containing the messages and a serialized `ConnectorState`.
 5. Sleeps `polling_interval` before returning.
 
@@ -111,12 +120,11 @@ Two sort keys give stable order when timestamps collide. `_id` is the tiebreaker
 
 For each hit in the response:
 
-1. **Missing sort tuple** — skip with `warn!`; cursor not advanced.
-2. **Missing `_source`** — skip with `warn!`; cursor not advanced.
-3. Both present — serialize `_source` as JSON payload; advance cursor to this hit's sort tuple.
+1. **Missing sort tuple** — skip with `warn!` for that hit; if no hit in the batch has a valid sort tuple, the poll fails with `Error::Storage`.
+2. **Missing `_source`** — skip with `warn!` (not published); cursor still advances to that hit's sort position.
+3. **Both present** — serialize `_source` as JSON payload.
 
-The cursor (`search_after`) only advances for hits where **both** sort and `_source` are present.
-An empty batch leaves the cursor unchanged.
+The cursor (`search_after`) advances for any hit with a valid sort tuple, including hits skipped for missing `_source`. An empty batch leaves the cursor unchanged.
 
 ### Timestamp parsing
 
@@ -225,8 +233,10 @@ Requirements for correct operation:
   parallel export. Offset paging (`from`/`size`) is not used.
 - **At-least-once delivery** — no deduplication by `_id`. The in-memory cursor advances
   before the runtime persists `ConnectorState`; a crash can re-emit the last batch.
-- **No HTTP retry** — transient OpenSearch errors fail the poll immediately. No circuit
-  breaker (unlike the InfluxDB source).
+  See [docs/RESILIENCE.md](docs/RESILIENCE.md).
+- **HTTP retry and circuit breaker** — transient `429`/`5xx` and network errors are retried
+  per `max_retries`; consecutive failures trip a circuit breaker that skips polls until
+  cool-down. Permanent errors (`4xx` except `429`) are not retried.
 - **Backfill gap** — documents indexed with `timestamp_field` values older than
   the current cursor are not read until connector state is reset.
 - **Full `_source` only** — entire document JSON is published; no field
@@ -239,11 +249,8 @@ Requirements for correct operation:
   advances past them. If `_source` later becomes available for a document at the same
   `(timestamp_field, _id)` sort position, it will not be re-fetched. Ensure `_source` is
   enabled in the index mapping before using this connector.
-- **Missing sort tuple causes no cursor advance** — hits returned without a sort tuple
-  (rare; typically deleted-doc artifacts or partial shard results) are skipped with a
-  `warn!`. If such hits appear at the tail of a batch, the cursor stays at the last
-  successfully published document. Subsequent polls return the same hits until OpenSearch
-  stops including them.
+- **Missing sort tuple** — individual hits without a sort tuple are skipped. A batch where
+  **no** hit has a valid sort tuple fails the poll with `Error::Storage`.
 - **Single-node transport** — `SingleNodeConnectionPool` to `url`; no cluster
   node sniffing.
 

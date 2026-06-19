@@ -18,8 +18,12 @@
  */
 
 pub mod container;
+pub mod resilience;
 pub mod source;
 
+pub use resilience::{
+    OpenSearchSourceCircuitBreakerFixture, OpenSearchSourceTransientErrorFixture,
+};
 pub use source::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
     OpenSearchSourceSmallBatchFixture, OpenSearchSourceTypedFieldsFixture,

@@ -40,6 +40,15 @@ timestamp_field = "@timestamp"
 # password = "replace_with_secret"
 # verbose_logging = false
 
+# HTTP resilience (defaults shown; see docs/RESILIENCE.md).
+# max_retries = 3
+# retry_delay = "1s"
+# retry_max_delay = "30s"
+# max_open_retries = 5
+# open_retry_max_delay = "30s"
+# circuit_breaker_threshold = 5
+# circuit_breaker_cool_down = "60s"
+
 # Optional: restrict which documents are polled (defaults to match_all).
 # [plugin_config.query]
 # match = { "log.level" = "error" }

@@ -53,6 +53,13 @@ fn base_config(url: &str) -> OpenSearchSourceConfig {
         timestamp_field: Some("timestamp".to_string()),
         verbose_logging: false,
         state: None,
+        max_retries: Some(1),
+        retry_delay: Some("1ms".to_string()),
+        retry_max_delay: Some("10ms".to_string()),
+        max_open_retries: Some(1),
+        open_retry_max_delay: Some("10ms".to_string()),
+        circuit_breaker_threshold: None,
+        circuit_breaker_cool_down: None,
     }
 }
 
@@ -309,7 +316,10 @@ async fn given_batch_where_all_hits_lack_sort_when_poll_should_return_error() {
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
     source.open().await.unwrap();
 
-    let error = source.poll().await.expect_err("all-no-sort batch must fail");
+    let error = source
+        .poll()
+        .await
+        .expect_err("all-no-sort batch must fail");
     assert!(
         matches!(error, Error::Storage(_)),
         "expected Storage error, got {error:?}"
@@ -412,7 +422,11 @@ async fn given_trailing_hit_without_source_when_poll_should_advance_cursor_past_
     source.open().await.unwrap();
 
     let produced = source.poll().await.expect("first poll");
-    assert_eq!(produced.messages.len(), 1, "only doc-1 published; doc-2 has no _source");
+    assert_eq!(
+        produced.messages.len(),
+        1,
+        "only doc-1 published; doc-2 has no _source"
+    );
 
     let cursor = source.test_search_after().await;
     assert!(
@@ -573,4 +587,59 @@ async fn given_verbose_logging_when_poll_should_succeed() {
     let mut source = OpenSearchSource::new(1, config, None);
     source.open().await.unwrap();
     source.poll().await.expect("verbose poll should succeed");
+}
+
+#[tokio::test]
+async fn given_transient_search_errors_when_poll_should_retry_and_succeed() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let count = request_count.clone();
+
+    let app = mock_router(StatusCode::OK, move |_| {
+        let count = count.clone();
+        async move {
+            let attempt = count.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                (StatusCode::SERVICE_UNAVAILABLE, "temporary".to_string())
+            } else {
+                (StatusCode::OK, search_response(vec![]).to_string())
+            }
+        }
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.max_retries = Some(3);
+    config.retry_delay = Some("1ms".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    source
+        .poll()
+        .await
+        .expect("poll should succeed after retries");
+    assert!(
+        request_count.load(Ordering::SeqCst) >= 3,
+        "search should be retried after transient 503"
+    );
+}
+
+#[tokio::test]
+async fn given_circuit_breaker_open_when_poll_should_return_empty_without_error() {
+    let app = mock_router(StatusCode::OK, |_| async move {
+        (StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())
+    });
+    let base = start_server(app).await;
+    let mut config = base_config(&base);
+    config.circuit_breaker_threshold = Some(1);
+    config.circuit_breaker_cool_down = Some("60s".to_string());
+    let mut source = OpenSearchSource::new(1, config, None);
+    source.open().await.unwrap();
+
+    let _ = source.poll().await.expect_err("first poll should fail");
+
+    let produced = source
+        .poll()
+        .await
+        .expect("open circuit should skip search");
+    assert!(produced.messages.is_empty());
+    assert!(produced.state.is_none());
 }
