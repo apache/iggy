@@ -15,7 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// The legacy verifiers run only without `vsr`: they rely on Http/WebSocket/Quic
+// transports, the bench producer, or consumer groups, none of which the VSR
+// server serves yet.
+#[cfg(not(feature = "vsr"))]
 mod verify_after_server_restart;
+#[cfg(not(feature = "vsr"))]
 mod verify_consumer_group_partition_assignment;
+#[cfg(not(feature = "vsr"))]
 mod verify_no_plaintext_credentials_on_disk;
+#[cfg(not(feature = "vsr"))]
 mod verify_user_login_after_restart;
+
+// Cross-replica on-disk data identity is VSR-only.
+#[cfg(feature = "vsr")]
+mod verify_cluster_replica_data_identical;
