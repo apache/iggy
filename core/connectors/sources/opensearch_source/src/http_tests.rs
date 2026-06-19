@@ -371,7 +371,7 @@ async fn given_cursor_set_when_empty_poll_should_preserve_cursor() {
 }
 
 #[tokio::test]
-async fn given_hit_without_source_when_search_should_skip_document() {
+async fn given_all_hits_missing_source_when_poll_should_return_error() {
     let hit = json!({
         "_id": "doc-1",
         "sort": ["2024-01-01T00:00:00Z", "doc-1"]
@@ -385,11 +385,18 @@ async fn given_hit_without_source_when_search_should_skip_document() {
     let mut source = OpenSearchSource::new(1, base_config(&base), None);
     source.open().await.unwrap();
 
-    let produced = source.poll().await.expect("poll should succeed");
-    assert!(produced.messages.is_empty());
+    // All hits have valid sort tuples but none have _source; cursor must not advance.
+    let error = source
+        .poll()
+        .await
+        .expect_err("all-_source-absent batch must error");
     assert!(
-        source.test_search_after().await.is_some(),
-        "_source-missing skip must still advance cursor to that hit's sort position"
+        matches!(error, Error::Storage(_)),
+        "expected Storage error, got {error:?}"
+    );
+    assert!(
+        source.test_search_after().await.is_none(),
+        "cursor must not advance when entire batch has no _source"
     );
 }
 
@@ -449,10 +456,10 @@ async fn given_trailing_hit_without_source_when_poll_should_advance_cursor_past_
 }
 
 #[tokio::test]
-async fn given_poll_without_open_should_return_storage_error() {
+async fn given_poll_without_open_should_return_connection_error() {
     let source = OpenSearchSource::new(1, base_config("http://127.0.0.1:9"), None);
     let error = source.poll().await.expect_err("poll without open");
-    assert!(matches!(error, Error::Storage(_)));
+    assert!(matches!(error, Error::Connection(_)));
 }
 
 #[tokio::test]
@@ -558,8 +565,11 @@ async fn given_runtime_state_when_open_should_not_load_stale_file_state() {
 
 #[tokio::test]
 async fn given_epoch_seconds_timestamp_should_update_last_poll_timestamp() {
-    let hit = search_hit("doc-1", "1705312200", json!({}));
+    let hit = search_hit("doc-1", "2024-01-15T10:00:00Z", json!({}));
     let mut hit = hit;
+    // Override _source.timestamp with epoch-seconds integer to exercise the numeric
+    // branch of parse_document_timestamp. Sort tuple stays as the RFC3339 string that
+    // search_hit() placed there — sort is used only for cursor positioning.
     hit["_source"]["timestamp"] = json!(1_705_312_200_i64);
     let body = search_response(vec![hit]).to_string();
     let app = mock_router(StatusCode::OK, move |_| {

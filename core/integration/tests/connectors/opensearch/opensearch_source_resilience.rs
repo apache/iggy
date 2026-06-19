@@ -53,7 +53,6 @@ async fn poll_json_messages(
             )
             .await
         {
-            received.clear();
             for msg in polled.messages {
                 if let Ok(json) = serde_json::from_slice(&msg.payload) {
                     received.push(json);

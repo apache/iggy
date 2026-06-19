@@ -105,6 +105,7 @@ pub(crate) fn create_state_storage(config: &StateConfig) -> Result<Arc<dyn State
 pub(crate) struct SourceState {
     pub id: String,
     pub last_updated: DateTime<Utc>,
+    #[serde(default)]
     pub version: u32,
     pub data: serde_json::Value,
     pub metadata: Option<serde_json::Value>,
@@ -144,7 +145,8 @@ impl StateStorage for FileStateStorage {
             .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
 
         let path = self.get_state_path(&state.id);
-        let tmp_path = path.with_extension("json.tmp");
+        // PID in the suffix avoids races when two processes write the same state_id.
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let json = serde_json::to_string(state)
             .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
 
@@ -161,7 +163,7 @@ impl StateStorage for FileStateStorage {
                 "Failed to write state temp file: {e}"
             )));
         }
-        if let Err(e) = tmp_file.sync_data().await {
+        if let Err(e) = tmp_file.sync_all().await {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(Error::Storage(format!(
                 "Failed to sync state temp file: {e}"

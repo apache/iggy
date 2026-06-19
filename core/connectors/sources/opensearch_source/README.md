@@ -41,7 +41,7 @@ index = "logs-*"
 polling_interval = "10s"
 batch_size = 100
 timestamp_field = "@timestamp"
-query = { "match_all": {} }
+query = { match_all = {} }
 ```
 
 ### Required fields

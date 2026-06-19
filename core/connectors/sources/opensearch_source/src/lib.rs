@@ -108,9 +108,11 @@ pub struct OpenSearchSourceConfig {
     #[serde(default)]
     pub verbose_logging: bool,
     pub state: Option<StateConfig>,
+    /// Total poll-phase attempt count (not retry count); 1 = no retries, 3 = 2 retries.
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     pub retry_max_delay: Option<String>,
+    /// Total open-phase attempt count (not retry count); 1 = no retries, 5 = 4 retries.
     pub max_open_retries: Option<u32>,
     pub open_retry_max_delay: Option<String>,
     pub circuit_breaker_threshold: Option<u32>,
@@ -123,7 +125,9 @@ pub struct OpenSearchSource {
     config: OpenSearchSourceConfig,
     client: Option<OpenSearch>,
     polling_interval: Duration,
-    search_query: Value,
+    /// Pre-built query body (query + size + sort). Set once in `open()` after config validation.
+    /// `None` before `open()` and after a failed `open()`.
+    search_body_base: Option<Value>,
     verbose: bool,
     max_retries: u32,
     retry_delay: Duration,
@@ -149,10 +153,6 @@ impl OpenSearchSource {
     pub fn new(id: u32, config: OpenSearchSourceConfig, state: Option<ConnectorState>) -> Self {
         let polling_interval =
             parse_duration(config.polling_interval.as_deref(), DEFAULT_POLLING_INTERVAL);
-        let search_query = config
-            .query
-            .clone()
-            .unwrap_or_else(|| json!({ "match_all": {} }));
         let verbose = config.verbose_logging;
         let (restored_state, state_restore_error, runtime_state_restored) =
             restore_state(id, state);
@@ -188,7 +188,7 @@ impl OpenSearchSource {
             circuit_breaker,
             client: None,
             polling_interval,
-            search_query,
+            search_body_base: None,
             verbose,
             state: Mutex::new(restored_state),
             state_restore_error,
@@ -302,6 +302,9 @@ impl OpenSearchSource {
                             self.id,
                             attempt,
                             max_attempts,
+                            // retry_delay is shared with the poll phase (no separate open-phase
+                            // base delay); open_retry_max_delay caps the growth independently.
+                            // Same pattern as the InfluxDB source connector.
                             &RetryBackoff {
                                 delay: self.retry_delay,
                                 max_delay: self.open_retry_max_delay,
@@ -312,7 +315,7 @@ impl OpenSearchSource {
                         .await;
                         continue;
                     }
-                    return Err(Error::Storage(format!(
+                    return Err(Error::InitError(format!(
                         "Failed to check index existence: {error}"
                     )));
                 }
@@ -358,7 +361,7 @@ impl OpenSearchSource {
             }
 
             return Err(Error::InitError(format!(
-                "Index '{}' does not exist or is not accessible",
+                "Index '{}' check failed: HTTP {status}: {error_text}",
                 self.config.index
             )));
         }
@@ -367,16 +370,21 @@ impl OpenSearchSource {
     async fn send_search_with_retry(
         &self,
         client: &OpenSearch,
-        search_body: Value,
+        mut search_body: Value,
     ) -> Result<opensearch::http::response::Response, Error> {
         let max_attempts = self.max_retries;
         let mut attempt = 0u32;
 
         loop {
             attempt += 1;
+            let body = if attempt < max_attempts {
+                search_body.clone()
+            } else {
+                std::mem::take(&mut search_body)
+            };
             let response = match client
                 .search(SearchParts::Index(&[&self.config.index]))
-                .body(search_body.clone())
+                .body(body)
                 .send()
                 .await
             {
@@ -442,19 +450,16 @@ impl OpenSearchSource {
 
     async fn search_documents(&self, client: &OpenSearch) -> Result<SearchOutcome, Error> {
         let state = self.state.lock().await;
-        let batch_size = self.batch_size();
-        let timestamp_field = self.timestamp_field();
         let search_after = state.search_after.clone();
         drop(state);
 
-        let mut search_body = json!({
-            "query": self.search_query,
-            "size": batch_size,
-            "sort": [
-                { timestamp_field: { "order": "asc" } },
-                { "_id": { "order": "asc" } }
-            ]
-        });
+        let timestamp_field = self.timestamp_field();
+
+        let mut search_body = self
+            .search_body_base
+            .as_ref()
+            .ok_or_else(|| Error::Connection("connector not initialized; call open() first".to_string()))?
+            .clone();
 
         if let Some(cursor) = search_after {
             search_body["search_after"] = json!(cursor);
@@ -476,7 +481,7 @@ impl OpenSearchSource {
 
         let mut messages = Vec::with_capacity(hits.len());
         let mut batch_bytes = 0u64;
-        let mut last_sort: Option<&Vec<Value>> = None;
+        let mut last_sort = None;
         let mut last_poll_timestamp = None;
 
         for hit in &hits {
@@ -532,6 +537,17 @@ impl OpenSearchSource {
             )));
         }
 
+        // Guard: cursor would advance past the entire batch but nothing would be published.
+        // This happens when _source is disabled on the index (all sort-bearing hits lack _source).
+        if !hits.is_empty() && messages.is_empty() && last_sort.is_some() {
+            return Err(Error::Storage(format!(
+                "OpenSearch returned {} hit(s) with valid sort tuples but all were missing \
+                 _source; index may have _source disabled. Refusing to advance cursor \
+                 without publishing any messages.",
+                hits.len()
+            )));
+        }
+
         Ok(SearchOutcome {
             messages,
             search_after: last_sort.map(ToOwned::to_owned),
@@ -565,16 +581,20 @@ impl OpenSearchSource {
 
         let total_polls = state.processing_stats.successful_polls_count
             + state.processing_stats.empty_polls_count;
+        // total_polls >= 1 because one of the two counters was just incremented above,
+        // but use saturating_sub to make the invariant machine-checked.
         state.processing_stats.avg_batch_processing_time_ms =
-            (state.processing_stats.avg_batch_processing_time_ms * (total_polls - 1) as f64
+            (state.processing_stats.avg_batch_processing_time_ms
+                * total_polls.saturating_sub(1) as f64
                 + processing_time_ms)
                 / total_polls as f64;
 
         let produced_count = outcome.messages.len();
         let total_documents_published = state.total_documents_published;
+        let state_snapshot = state.clone();
         let messages = outcome.messages;
-        let persisted_state = self.serialize_state(&state);
         drop(state);
+        let persisted_state = self.serialize_state(&state_snapshot);
 
         if self.verbose {
             info!(
@@ -622,6 +642,9 @@ impl OpenSearchSource {
     async fn handle_poll_error(&self, error: Error) -> Result<ProducedMessages, Error> {
         self.circuit_breaker.record_failure().await;
         let mut state = self.state.lock().await;
+        // error_count and last_error accumulate in State and are captured by the next
+        // finalize_poll call (success path). Both runtime ConnectorState and file state
+        // preserve these values across restarts.
         state.error_count += 1;
         state.last_error = Some(error.to_string());
         drop(state);
@@ -687,7 +710,10 @@ fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
             .map(|timestamp| timestamp.with_timezone(&Utc)),
         Value::Number(number) => {
             let raw = number.as_i64()?;
-            let millis = if raw.abs() > 1_000_000_000_000 {
+            // Values above 1e12 are already milliseconds (Unix epoch seconds won't reach
+            // 1e12 until year 33658). Values at or below are treated as seconds and
+            // multiplied by 1000.
+            let millis = if raw > 1_000_000_000_000 || raw < -1_000_000_000_000 {
                 raw
             } else {
                 raw.saturating_mul(1_000)
@@ -706,6 +732,17 @@ impl Source for OpenSearchSource {
         }
 
         validate_open_config(&self.config)?;
+
+        let timestamp_field = self.timestamp_field();
+        let batch_size = self.batch_size();
+        self.search_body_base = Some(json!({
+            "query": self.config.query.clone().unwrap_or_else(|| json!({ "match_all": {} })),
+            "size": batch_size,
+            "sort": [
+                { timestamp_field: { "order": "asc" } },
+                { "_id": { "order": "asc" } }
+            ]
+        }));
 
         info!(
             "Opening OpenSearch source connector with ID: {} for URL: {}, index: {}",
@@ -764,7 +801,7 @@ impl Source for OpenSearchSource {
         let client = self
             .client
             .as_ref()
-            .ok_or_else(|| Error::Storage("OpenSearch client not initialized".to_string()))?;
+            .ok_or_else(|| Error::Connection("OpenSearch client not initialized".to_string()))?;
 
         match self.search_documents(client).await {
             Ok(outcome) => {
@@ -859,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn given_persisted_state_should_restore_total_documents_published() {
+    fn given_persisted_runtime_state_when_new_should_restore_counts() {
         let state = test_state();
         let serialized = rmp_serde::to_vec(&state).expect("Failed to serialize state");
         let connector_state = ConnectorState(serialized);
@@ -881,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn given_no_state_should_start_fresh() {
+    fn given_no_runtime_state_when_new_should_start_fresh() {
         let source = OpenSearchSource::new(1, test_config(), None);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -896,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_state_should_set_state_restore_error() {
+    fn given_invalid_runtime_state_when_new_should_set_restore_error() {
         let invalid_state = ConnectorState(b"not valid msgpack".to_vec());
         let source = OpenSearchSource::new(1, test_config(), Some(invalid_state));
 
@@ -938,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unparsable_timestamp_value_should_return_none() {
+    fn given_unparsable_timestamp_when_parsed_should_return_none() {
         let value = json!("not-a-timestamp");
         assert!(parse_document_timestamp(&value).is_none());
     }
@@ -988,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn given_unsupported_file_state_version_should_fail() {
+    fn given_unsupported_file_state_version_when_applied_should_fail() {
         use crate::state_manager::SourceState;
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1053,19 +1090,19 @@ mod tests {
     }
 
     #[test]
-    fn given_rfc3339_timestamp_value_should_parse() {
+    fn given_rfc3339_timestamp_when_parsed_should_succeed() {
         let value = json!("2024-01-15T10:30:00Z");
         assert!(parse_document_timestamp(&value).is_some());
     }
 
     #[test]
-    fn given_epoch_millis_timestamp_value_should_parse() {
+    fn given_epoch_millis_timestamp_when_parsed_should_succeed() {
         let value = json!(1_705_312_200_000_i64);
         assert!(parse_document_timestamp(&value).is_some());
     }
 
     #[test]
-    fn given_state_should_round_trip_serialization() {
+    fn given_state_when_serialized_should_round_trip() {
         let original = test_state();
 
         let serialized = rmp_serde::to_vec(&original).expect("Failed to serialize");
@@ -1082,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn given_state_when_serialize_helper_should_produce_connector_state() {
+    fn given_state_when_serialized_should_produce_connector_state() {
         let source = OpenSearchSource::new(1, test_config(), None);
         let state = test_state();
 
