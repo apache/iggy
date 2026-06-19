@@ -53,7 +53,6 @@ mod data_integrity;
 #[cfg(not(feature = "vsr"))]
 mod mcp;
 mod sdk;
-#[cfg(not(feature = "vsr"))]
 mod server;
 #[cfg(not(feature = "vsr"))]
 mod state;

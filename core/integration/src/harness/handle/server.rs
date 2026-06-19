@@ -177,6 +177,19 @@ impl ServerHandle {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
 
+    /// True once this node has logged that its replica mesh is fully formed
+    /// (connected to all expected peers). Cluster-only; a single-node server
+    /// never emits the marker. Used by the cluster-readiness gate to ensure
+    /// every replica has joined before the first client op, so no replica is
+    /// a late joiner that misses early ops.
+    #[must_use]
+    pub fn replica_mesh_complete(&self) -> bool {
+        self.stdout_path
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|log| log.contains("replica mesh complete"))
+    }
+
     /// Returns a `ClientBuilder` using the test transport.
     ///
     /// Returns an error if no test transport is configured.
@@ -551,11 +564,14 @@ impl ServerHandle {
                     .and_then(|p| fs::read_to_string(p).ok())
                     .unwrap_or_else(|| "[No stderr log]".to_string());
 
+                let exit_status = super::common::reap_exit_status(pid)
+                    .unwrap_or_else(|| "unavailable (already reaped)".to_string());
+
                 panic!(
-                    "Server process (PID {}) has died unexpectedly!\n\
+                    "Server process (PID {}) has died unexpectedly! Exit status: {}\n\
                      === STDOUT ===\n{}\n\n\
                      === STDERR ===\n{}",
-                    pid, stdout_content, stderr_content
+                    pid, exit_status, stdout_content, stderr_content
                 );
             }
 
