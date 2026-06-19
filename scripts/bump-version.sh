@@ -53,6 +53,7 @@ Components:
   connectors-all       runtime + all sink + all source crates
   --all                All components (Rust + connectors + SDKs + web-ui)
   sdk-python           foreign/python/Cargo.toml + foreign/python/pyproject.toml
+  sdk-php              foreign/php/Cargo.toml + foreign/php/composer.json
   sdk-node             foreign/node/package.json
   sdk-go               foreign/go/contracts/version.go
   sdk-csharp           foreign/csharp/Iggy_SDK/Iggy_SDK.csproj
@@ -90,11 +91,11 @@ RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli 
 CONNECTOR_SINK_COMPONENTS="rust-connector-delta-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-stdout-sink"
 CONNECTOR_SOURCE_COMPONENTS="rust-connector-elasticsearch-source rust-connector-influxdb-source rust-connector-postgres-source rust-connector-random-source"
 CONNECTOR_COMPONENTS="rust-connector-runtime ${CONNECTOR_SINK_COMPONENTS} ${CONNECTOR_SOURCE_COMPONENTS}"
-SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java"
+SDK_COMPONENTS="sdk-python sdk-php sdk-node sdk-go sdk-csharp sdk-java"
 ALL_COMPONENTS="${RUST_COMPONENTS} ${CONNECTOR_COMPONENTS} ${SDK_COMPONENTS} web-ui"
 
 # Returns "file:format" lines per component.
-# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, json, csproj, gradle, go
+# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, php-cargo, composer, json, csproj, gradle, go
 get_version_files() {
     local component="$1"
     case "$component" in
@@ -151,6 +152,10 @@ get_version_files() {
         sdk-python)
             echo "foreign/python/Cargo.toml:python-cargo"
             echo "foreign/python/pyproject.toml:pyproject"
+            ;;
+        sdk-php)
+            echo "foreign/php/Cargo.toml:php-cargo"
+            echo "foreign/php/composer.json:composer"
             ;;
         sdk-node)
             echo "foreign/node/package.json:json"
@@ -257,6 +262,11 @@ translate_version() {
                 edge)   echo "${base}.dev${pre_num}" ;;
                 stable) echo "$base" ;;
             esac ;;
+        php-cargo|composer)
+            case "$pre_type" in
+                edge)   echo "${base}-dev${pre_num}" ;;
+                stable) echo "$base" ;;
+            esac ;;
         gradle)
             case "$pre_type" in
                 edge)   echo "${base}-SNAPSHOT" ;;
@@ -284,6 +294,12 @@ canonicalize_version() {
         pyproject)
             # Handle both old (0.7.2.dev.1) and new (0.7.2.dev1) formats
             if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev\.?([0-9]+)$ ]]; then
+                echo "${BASH_REMATCH[1]}-edge.${BASH_REMATCH[2]}"
+            else
+                echo "$raw"
+            fi ;;
+        php-cargo|composer)
+            if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev\.?([0-9]+)$ ]]; then
                 echo "${BASH_REMATCH[1]}-edge.${BASH_REMATCH[2]}"
             else
                 echo "$raw"
@@ -319,6 +335,10 @@ read_current_version() {
             grep '^version = ' "$abs_file" | head -1 | sed 's/version = "\(.*\)"/\1/' ;;
         pyproject)
             grep '^version = ' "$abs_file" | head -1 | sed 's/version = "\(.*\)"/\1/' ;;
+        php-cargo)
+            grep '^version = ' "$abs_file" | head -1 | sed 's/version = "\(.*\)"/\1/' ;;
+        composer)
+            grep '"version"' "$abs_file" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' ;;
         json)
             grep '"version"' "$abs_file" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' ;;
         csproj)
@@ -363,6 +383,10 @@ write_version() {
             sedi "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
         pyproject)
             sedi '/^\[project\]/,/^\[/{s/^version = ".*"/version = "'"${translated}"'"/;}' "$abs_file" ;;
+        php-cargo)
+            sedi "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
+        composer)
+            sedi "1,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/;}" "$abs_file" ;;
         json)
             sedi "1,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/;}" "$abs_file" ;;
         csproj)
