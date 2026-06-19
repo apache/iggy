@@ -19,6 +19,7 @@ use compio::runtime::Runtime;
 
 const DEFAULT_SHARD_RUNTIME_CAPACITY: u32 = 4096;
 const SHARD_RUNTIME_CAPACITY_ENV: &str = "IGGY_SHARD_RUNTIME_CAPACITY";
+const SHARD_COOP_TASKRUN_ENV: &str = "IGGY_SHARD_RUNTIME_COOP_TASKRUN";
 
 /// Resolves the per-shard io_uring SQ/CQ capacity from `IGGY_SHARD_RUNTIME_CAPACITY`,
 /// falling back to [`DEFAULT_SHARD_RUNTIME_CAPACITY`] when the var is missing or
@@ -28,6 +29,24 @@ fn shard_capacity_from_env() -> u32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SHARD_RUNTIME_CAPACITY)
+}
+
+/// Whether to request `IORING_SETUP_COOP_TASKRUN` + `IORING_SETUP_TASKRUN_FLAG`.
+///
+/// These flags require Linux >= 5.19; on older kernels (e.g. 5.15) the shard
+/// `io_uring` setup fails with `EINVAL` even though the default-flag main-thread
+/// runtime initializes fine. Defaults to `true` (recommended, lowest latency).
+/// Set `IGGY_SHARD_RUNTIME_COOP_TASKRUN=false` to drop the flags and run on a
+/// 5.10..5.19 kernel at a small latency cost.
+fn coop_taskrun_from_env() -> bool {
+    std::env::var(SHARD_COOP_TASKRUN_ENV)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 /// Creates a compio runtime for a shard thread, with shard-specific `io_uring` flags.
@@ -43,19 +62,20 @@ fn shard_capacity_from_env() -> u32 {
 /// On `InvalidInput` the kernel rejected the required flags; on `OutOfMemory` or
 /// `PermissionDenied` the caller should print the appropriate diagnostic before panicking.
 ///
-/// Shard executors require `IORING_SETUP_COOP_TASKRUN` for predictable latency.
-/// Falling back to default flags would silently degrade shard performance -
-/// do not add a retry with reduced flags here.
+/// Shard executors request `IORING_SETUP_COOP_TASKRUN` for predictable latency.
+/// This is opt-out (not a silent fallback): the flags stay on by default and are
+/// only dropped when `IGGY_SHARD_RUNTIME_COOP_TASKRUN=false` is set explicitly,
+/// which is the documented escape hatch for kernels older than 5.19.
 pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
     let mut proactor = compio::driver::ProactorBuilder::new();
 
-    proactor
-        .capacity(shard_capacity_from_env())
-        .coop_taskrun(true)
-        .taskrun_flag(true);
+    proactor.capacity(shard_capacity_from_env());
+    if coop_taskrun_from_env() {
+        proactor.coop_taskrun(true).taskrun_flag(true);
+    }
 
     // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
     // This causes a freeze on macOS with compio fs operations
@@ -72,28 +92,33 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SHARD_RUNTIME_CAPACITY, SHARD_RUNTIME_CAPACITY_ENV, shard_capacity_from_env,
+        DEFAULT_SHARD_RUNTIME_CAPACITY, SHARD_COOP_TASKRUN_ENV, SHARD_RUNTIME_CAPACITY_ENV,
+        coop_taskrun_from_env, shard_capacity_from_env,
     };
     use serial_test::serial;
 
-    fn with_capacity_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
         // SAFETY: tests in this module are #[serial], so no other thread races
         // on the process-wide environment while the guard is active.
-        let prev = std::env::var(SHARD_RUNTIME_CAPACITY_ENV).ok();
+        let prev = std::env::var(key).ok();
         unsafe {
             match value {
-                Some(v) => std::env::set_var(SHARD_RUNTIME_CAPACITY_ENV, v),
-                None => std::env::remove_var(SHARD_RUNTIME_CAPACITY_ENV),
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
         let out = f();
         unsafe {
             match prev {
-                Some(v) => std::env::set_var(SHARD_RUNTIME_CAPACITY_ENV, v),
-                None => std::env::remove_var(SHARD_RUNTIME_CAPACITY_ENV),
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
             }
         }
         out
+    }
+
+    fn with_capacity_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        with_env(SHARD_RUNTIME_CAPACITY_ENV, value, f)
     }
 
     #[test]
@@ -126,5 +151,33 @@ mod tests {
         with_capacity_env(Some("-1"), || {
             assert_eq!(shard_capacity_from_env(), DEFAULT_SHARD_RUNTIME_CAPACITY);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn coop_taskrun_defaults_to_true_when_unset() {
+        with_env(SHARD_COOP_TASKRUN_ENV, None, || {
+            assert!(coop_taskrun_from_env());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn coop_taskrun_disabled_by_falsey_values() {
+        for value in ["false", "0", "no", "off", "OFF", "False"] {
+            with_env(SHARD_COOP_TASKRUN_ENV, Some(value), || {
+                assert!(!coop_taskrun_from_env(), "{value} should disable");
+            });
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn coop_taskrun_enabled_by_truthy_values() {
+        for value in ["true", "1", "yes", "on"] {
+            with_env(SHARD_COOP_TASKRUN_ENV, Some(value), || {
+                assert!(coop_taskrun_from_env(), "{value} should enable");
+            });
+        }
     }
 }
