@@ -29,6 +29,7 @@ readme = "../../README.md"
 publish = false
 
 [dependencies]
+ahash = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }

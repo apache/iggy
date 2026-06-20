@@ -1,23 +1,24 @@
-// // Licensed to the Apache Software Foundation (ASF) under one
-// // or more contributor license agreements.  See the NOTICE file
-// // distributed with this work for additional information
-// // regarding copyright ownership.  The ASF licenses this file
-// // to you under the Apache License, Version 2.0 (the
-// // "License"); you may not use this file except in compliance
-// // with the License.  You may obtain a copy of the License at
-// //
-// //   http://www.apache.org/licenses/LICENSE-2.0
-// //
-// // Unless required by applicable law or agreed to in writing,
-// // software distributed under the License is distributed on an
-// // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// // KIND, either express or implied.  See the License for the
-// // specific language governing permissions and limitations
-// // under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 using System.Text;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -45,8 +46,6 @@ public class IggyPublisherTests
         return new TestStreamInfo(streamId, topicId, partitionsCount);
     }
 
-    private record TestStreamInfo(string StreamId, string TopicId, uint PartitionsCount);
-
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_Should_Initialize_Successfully(Protocol protocol)
@@ -71,7 +70,7 @@ public class IggyPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_NewClient_Should_Initialize_Successfully(Protocol protocol)
     {
-        var client = Fixture.GetIggyAddress(protocol); ;
+        var client = Fixture.GetIggyAddress(protocol);
 
         var stream = Guid.NewGuid().ToString();
         var topic = Guid.NewGuid().ToString();
@@ -123,10 +122,7 @@ public class IggyPublisherTests
             .WithPartitioning(Partitioning.PartitionId(1))
             .Build();
 
-        var messages = new List<Message>
-        {
-            new(Guid.NewGuid(), Encoding.UTF8.GetBytes("Test message"))
-        };
+        var messages = new List<Message> { new(Guid.NewGuid(), Encoding.UTF8.GetBytes("Test message")) };
 
         await Should.ThrowAsync<PublisherNotInitializedException>(() => publisher.SendMessagesAsync(messages));
         await publisher.DisposeAsync();
@@ -150,7 +146,7 @@ public class IggyPublisherTests
         await publisher.InitAsync();
 
         var messages = new List<Message>();
-        for (int i = 0; i < 10; i++)
+        for (var i = 0; i < 10; i++)
         {
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i}")));
         }
@@ -158,8 +154,7 @@ public class IggyPublisherTests
         await Should.NotThrowAsync(() => publisher.SendMessagesAsync(messages));
 
         // Verify messages were sent by polling them
-        var polledMessages = await client.PollMessagesAsync(
-            Identifier.String(testStream.StreamId),
+        var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
             Identifier.String(testStream.TopicId),
             null,
             Consumer.New(0),
@@ -204,7 +199,7 @@ public class IggyPublisherTests
         var streamId = $"auto_stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
         var topicId = "auto_topic";
 
-        // First create topic manually to test only stream creation
+        // Auto-create both stream and topic via the builder; this test asserts the stream was created.
         var publisher = IggyPublisherBuilder
             .Create(client, Identifier.String(streamId), Identifier.String(topicId))
             .CreateStreamIfNotExists(streamId)
@@ -309,7 +304,7 @@ public class IggyPublisherTests
         var publisher = IggyPublisherBuilder
             .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
             .WithPartitioning(Partitioning.PartitionId(0))
-            .WithBackgroundSending(true, queueCapacity: 1000, batchSize: 10, flushInterval: TimeSpan.FromMilliseconds(50))
+            .WithBackgroundSending(true, 1000, 10, TimeSpan.FromMilliseconds(50))
             .Build();
 
         await publisher.InitAsync();
@@ -324,8 +319,7 @@ public class IggyPublisherTests
         await publisher.WaitUntilAllSendsAsync();
 
         // Verify messages were sent
-        var polledMessages = await client.PollMessagesAsync(
-            Identifier.String(testStream.StreamId),
+        var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
             Identifier.String(testStream.TopicId),
             null,
             Consumer.New(2),
@@ -350,13 +344,13 @@ public class IggyPublisherTests
         var publisher = IggyPublisherBuilder
             .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
             .WithPartitioning(Partitioning.PartitionId(1))
-            .WithBackgroundSending(true, queueCapacity: 1000, batchSize: 10, flushInterval: TimeSpan.FromMilliseconds(100))
+            .WithBackgroundSending(true, 1000, 10, TimeSpan.FromMilliseconds(100))
             .Build();
 
         await publisher.InitAsync();
 
         var messages = new List<Message>();
-        for (int i = 0; i < 20; i++)
+        for (var i = 0; i < 20; i++)
         {
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Wait test message {i}")));
         }
@@ -405,7 +399,7 @@ public class IggyPublisherTests
             ? await Fixture.CreateTcpClient()
             : await Fixture.CreateHttpClient();
 
-        var testStream = await CreateTestStream(client, protocol, partitionsCount: 5);
+        var testStream = await CreateTestStream(client, protocol);
 
         // Send messages to different partitions
         for (uint partitionId = 0; partitionId < 5; partitionId++)
@@ -418,7 +412,7 @@ public class IggyPublisherTests
             await publisher.InitAsync();
 
             var messages = new List<Message>();
-            for (int i = 0; i < 10; i++)
+            for (var i = 0; i < 10; i++)
             {
                 messages.Add(new Message(Guid.NewGuid(),
                     Encoding.UTF8.GetBytes($"Partition {partitionId} message {i}")));
@@ -431,8 +425,7 @@ public class IggyPublisherTests
         // Verify messages are in different partitions
         for (uint partitionId = 0; partitionId < 5; partitionId++)
         {
-            var polledMessages = await client.PollMessagesAsync(
-                Identifier.String(testStream.StreamId),
+            var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
                 Identifier.String(testStream.TopicId),
                 partitionId,
                 Consumer.New((int)partitionId + 10),
@@ -453,7 +446,7 @@ public class IggyPublisherTests
             ? await Fixture.CreateTcpClient()
             : await Fixture.CreateHttpClient();
 
-        var testStream = await CreateTestStream(client, protocol, partitionsCount: 3);
+        var testStream = await CreateTestStream(client, protocol, 3);
 
         var publisher = IggyPublisherBuilder
             .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
@@ -463,7 +456,7 @@ public class IggyPublisherTests
         await publisher.InitAsync();
 
         var messages = new List<Message>();
-        for (int i = 0; i < 30; i++)
+        for (var i = 0; i < 30; i++)
         {
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Balanced message {i}")));
         }
@@ -474,8 +467,7 @@ public class IggyPublisherTests
         var totalMessages = 0;
         for (uint partitionId = 0; partitionId < 3; partitionId++)
         {
-            var polledMessages = await client.PollMessagesAsync(
-                Identifier.String(testStream.StreamId),
+            var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
                 Identifier.String(testStream.TopicId),
                 partitionId,
                 Consumer.New((int)partitionId + 20),
@@ -599,13 +591,13 @@ public class IggyPublisherTests
         var publisher = IggyPublisherBuilder
             .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
             .WithPartitioning(Partitioning.PartitionId(0))
-            .WithBackgroundSending(true, queueCapacity: 1000, batchSize: 50)
+            .WithBackgroundSending(true, 1000, 50)
             .Build();
 
         await publisher.InitAsync();
 
         var messages = new List<Message>();
-        for (int i = 0; i < 200; i++)
+        for (var i = 0; i < 200; i++)
         {
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Large batch message {i}")));
         }
@@ -614,8 +606,7 @@ public class IggyPublisherTests
         await publisher.WaitUntilAllSendsAsync();
 
         // Verify at least most messages were sent
-        var polledMessages = await client.PollMessagesAsync(
-            Identifier.String(testStream.StreamId),
+        var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
             Identifier.String(testStream.TopicId),
             null,
             Consumer.New(40),
@@ -626,4 +617,102 @@ public class IggyPublisherTests
         polledMessages.Messages.Count.ShouldBeGreaterThanOrEqualTo(200);
         await publisher.DisposeAsync();
     }
+
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendAsync_RentedBatch_WithBackgroundSending_Should_RoundTrip(Protocol protocol)
+    {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStream(client, protocol);
+
+        var publisher = IggyPublisherBuilder
+            .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
+            .WithPartitioning(Partitioning.PartitionId(0))
+            .WithBackgroundSending(true, 1000, 10,
+                TimeSpan.FromMilliseconds(50))
+            .Build();
+
+        await publisher.InitAsync();
+
+        const int count = 20;
+        var sent = new Dictionary<UInt128, byte[]>();
+        var builder = new RentedMessageBatchBuilder();
+        for (var i = 0; i < count; i++)
+        {
+            var id = Guid.NewGuid();
+            var payload = Encoding.UTF8.GetBytes($"bg-rented-batch-{i}-{Guid.NewGuid():N}");
+            sent[id.ToUInt128()] = payload;
+            builder.Add(payload, id);
+        }
+
+        var batch = builder.Build();
+
+        await publisher.SendAsync(batch);
+        await publisher.WaitUntilAllSendsAsync();
+
+        var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
+            0,
+            Consumer.New(60),
+            PollingStrategy.Next(),
+            count,
+            false);
+
+        polledMessages.Messages.Count.ShouldBeGreaterThanOrEqualTo(count);
+        foreach (var message in polledMessages.Messages)
+        {
+            sent.ShouldContainKey(message.Header.Id);
+            message.Payload.ShouldBe(sent[message.Header.Id]);
+        }
+
+        await publisher.DisposeAsync();
+    }
+
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendAsync_SingleMessageRentedBatch_WithBackgroundSending_Should_RoundTrip(Protocol protocol)
+    {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStream(client, protocol);
+
+        var publisher = IggyPublisherBuilder
+            .Create(client, Identifier.String(testStream.StreamId), Identifier.String(testStream.TopicId))
+            .WithPartitioning(Partitioning.PartitionId(0))
+            .WithBackgroundSending(true, 1000, 10,
+                TimeSpan.FromMilliseconds(50))
+            .Build();
+
+        await publisher.InitAsync();
+
+        var id = Guid.NewGuid();
+        var payload = Encoding.UTF8.GetBytes("bg-rented-single-payload");
+        var builder = new RentedMessageBatchBuilder();
+        builder.Add(payload, id);
+        var batch = builder.Build();
+
+        await publisher.SendAsync(batch);
+        await publisher.WaitUntilAllSendsAsync();
+
+        var polledMessages = await client.PollMessagesAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
+            0,
+            Consumer.New(61),
+            PollingStrategy.Next(),
+            1,
+            false);
+
+        polledMessages.Messages.Count.ShouldBeGreaterThanOrEqualTo(1);
+        polledMessages.Messages[0].Header.Id.ShouldBe(id.ToUInt128());
+        polledMessages.Messages[0].Payload.ShouldBe(payload);
+
+        await publisher.DisposeAsync();
+    }
+
+    private record TestStreamInfo(string StreamId, string TopicId, uint PartitionsCount);
 }

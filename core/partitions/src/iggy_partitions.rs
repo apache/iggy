@@ -19,13 +19,14 @@
 
 use crate::IggyPartition;
 use crate::types::PartitionsConfig;
+use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
 use message_bus::MessageBus;
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -44,13 +45,27 @@ where
 {
     shard_id: ShardId,
     config: PartitionsConfig,
-    /// Collection of partitions, the index of each partition isn't it's ID, but rather a local index (`LocalIdx`) which is used for lookups.
+    /// Index is `LocalIdx`, not `partition_id`.
     ///
-    /// Wrapped in `UnsafeCell` for interior mutability — matches the single-threaded
-    /// per-shard execution model. Consensus trait methods take `&self` but need to
-    /// mutate partition state (segments, offsets, journal).
+    /// # Safety invariant
+    ///
+    /// Container-level mutation (`Vec::push` / `swap_remove`) must run
+    /// only on the shard's pump task. Reconciler routes mutations
+    /// through `ReconcileOp` + `ReconcileApply`. Cross-task
+    /// access would be UB under cooperative `.await` interleaving.
     partitions: UnsafeCell<Vec<IggyPartition<B>>>,
-    namespace_to_local: HashMap<IggyNamespace, LocalIdx>,
+    /// Same single-pump invariant as `partitions`.
+    namespace_to_local: UnsafeCell<HashMap<IggyNamespace, LocalIdx>>,
+    /// Tombstone gate: reconciler sets it synchronously before awaiting
+    /// disk delete; pump clears on `ConfirmRemove`. Pump's `Plane::on_*`
+    /// short-circuits frames hitting a tombstoned namespace.
+    ///
+    /// `RefCell` (not `UnsafeCell`) because both the reconciler task and
+    /// the pump task mutate it, so the single-pump invariant protecting
+    /// `partitions` / `namespace_to_local` does NOT hold here. Compio's
+    /// per-shard runtime is single-threaded, so runtime borrow checks
+    /// suffice; callers must not hold a borrow across `.await`.
+    tombstoned: RefCell<AHashSet<IggyNamespace>>,
 }
 
 impl<B> IggyPartitions<B>
@@ -63,7 +78,8 @@ where
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::new()),
-            namespace_to_local: HashMap::new(),
+            namespace_to_local: UnsafeCell::new(HashMap::new()),
+            tombstoned: RefCell::new(AHashSet::new()),
         }
     }
 
@@ -73,7 +89,8 @@ where
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::with_capacity(capacity)),
-            namespace_to_local: HashMap::with_capacity(capacity),
+            namespace_to_local: UnsafeCell::new(HashMap::with_capacity(capacity)),
+            tombstoned: RefCell::new(AHashSet::new()),
         }
     }
 
@@ -84,6 +101,17 @@ where
     fn partitions(&self) -> &Vec<IggyPartition<B>> {
         // Safety: single-threaded per-shard model, no concurrent access.
         unsafe { &*self.partitions.get() }
+    }
+
+    fn namespace_map(&self) -> &HashMap<IggyNamespace, LocalIdx> {
+        // Safety: single-threaded per-shard model, no concurrent access.
+        unsafe { &*self.namespace_to_local.get() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn namespace_map_mut(&self) -> &mut HashMap<IggyNamespace, LocalIdx> {
+        // Safety: single-threaded per-shard model, no concurrent access.
+        unsafe { &mut *self.namespace_to_local.get() }
     }
 
     pub const fn shard_id(&self) -> ShardId {
@@ -112,81 +140,133 @@ where
 
     /// Lookup local index by namespace.
     pub fn local_idx(&self, namespace: &IggyNamespace) -> Option<LocalIdx> {
-        self.namespace_to_local.get(namespace).copied()
+        self.namespace_map().get(namespace).copied()
     }
 
     /// Insert a new partition and return its local index.
-    pub fn insert(&mut self, namespace: IggyNamespace, partition: IggyPartition<B>) -> LocalIdx {
-        let partitions = self.partitions.get_mut();
+    ///
+    /// # Safety discipline (compiler cannot enforce)
+    ///
+    /// Must only be called from the shard's pump task (i.e. inside
+    /// `IggyShard::apply_reconcile_ops`). `Vec::push` may reallocate +
+    /// invalidate any live `&mut IggyPartition` returned by
+    /// [`Self::get_mut_by_ns`] / [`Self::get_mut`] held by a sibling
+    /// task across an `.await`. New external call sites MUST route
+    /// through `ReconcileOp::InsertOwned` instead.
+    #[doc(hidden)]
+    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B>) -> LocalIdx {
+        // Safety: pump-only invariant, caller responsibility.
+        let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
         partitions.push(partition);
-        self.namespace_to_local.insert(namespace, local_idx);
+        self.namespace_map_mut().insert(namespace, local_idx);
         local_idx
     }
 
     /// Check if a namespace exists.
     pub fn contains(&self, namespace: &IggyNamespace) -> bool {
-        self.namespace_to_local.contains_key(namespace)
+        self.namespace_map().contains_key(namespace)
     }
 
     /// Get partition by namespace directly.
+    ///
+    /// Returns `None` for tombstoned namespaces so callers outside
+    /// [`Plane`] (view-change handlers, `tick_partitions`, loopback drain)
+    /// can't drive journal writes against a partition the reconciler has
+    /// already fenced for delete.
     pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B>> {
-        let idx = self.namespace_to_local.get(namespace)?;
+        if self.is_tombstoned(namespace) {
+            return None;
+        }
+        let idx = self.namespace_map().get(namespace)?;
         self.partitions().get(**idx)
     }
 
-    /// Get mutable partition by namespace directly.
+    /// Get mutable partition by namespace directly. Tombstone-gated like
+    /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
     pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B>> {
-        let idx = self.namespace_to_local.get(namespace)?;
+        if self.is_tombstoned(namespace) {
+            return None;
+        }
+        let idx = self.namespace_map().get(namespace)?;
         // Safety: single-threaded per-shard model, no concurrent access.
         unsafe { (&mut *self.partitions.get()).get_mut(**idx) }
     }
 
-    /// Remove a partition by namespace. Returns the removed partition if found.
-    pub fn remove(&mut self, namespace: &IggyNamespace) -> Option<IggyPartition<B>> {
-        let local_idx = self.namespace_to_local.remove(namespace)?;
+    /// Remove a partition by namespace.
+    ///
+    /// # Safety discipline (compiler cannot enforce)
+    ///
+    /// Must only be called from the shard's pump task. `Vec::swap_remove`
+    /// invalidates any live `&mut IggyPartition` returned by
+    /// [`Self::get_mut_by_ns`] / [`Self::get_mut`] held by a sibling
+    /// task across an `.await`. New external call sites MUST route
+    /// through `ReconcileOp::ConfirmRemove` instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored `LocalIdx` is past `partitions.len()`, an
+    /// invariant violation. Silent `None` would leave the map half-mutated
+    /// and prime the next `insert` for a colliding index.
+    #[doc(hidden)]
+    pub fn remove(&self, namespace: &IggyNamespace) -> Option<IggyPartition<B>> {
+        let local_idx = self.namespace_map_mut().remove(namespace)?;
         let idx = *local_idx;
-        let partitions = self.partitions.get_mut();
+        let partitions = unsafe { &mut *self.partitions.get() };
 
-        if idx >= partitions.len() {
-            return None;
-        }
+        assert!(
+            idx < partitions.len(),
+            "IggyPartitions invariant: LocalIdx({idx}) >= len {len}",
+            idx = idx,
+            len = partitions.len(),
+        );
 
         let partition = partitions.swap_remove(idx);
 
         if idx < partitions.len() {
-            for lidx in self.namespace_to_local.values_mut() {
-                if **lidx == partitions.len() {
-                    *lidx = LocalIdx::new(idx);
-                    break;
-                }
-            }
+            // `swap_remove` moved the tail entry into `idx`. Update the map
+            // by the moved partition's namespace key in O(1); the previous
+            // linear value-scan turned bulk DeleteStream into O(K²) on the
+            // pump task, stalling client traffic for ~10k-partition topics.
+            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().namespace());
+            let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
+                "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
+            );
+            *entry = LocalIdx::new(idx);
         }
 
         Some(partition)
     }
 
     /// Remove multiple partitions at once.
-    pub fn remove_many(&mut self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B>> {
+    ///
+    /// Same pump-only safety discipline as [`Self::remove`].
+    #[doc(hidden)]
+    pub fn remove_many(&self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B>> {
         namespaces.iter().filter_map(|ns| self.remove(ns)).collect()
     }
 
     /// Iterate over all namespaces owned by this shard.
     pub fn namespaces(&self) -> impl Iterator<Item = &IggyNamespace> {
-        self.namespace_to_local.keys()
+        self.namespace_map().keys()
     }
 
-    /// Get partition by namespace, initializing if not present.
-    pub fn get_or_init<F>(&mut self, namespace: IggyNamespace, init: F) -> &mut IggyPartition<B>
-    where
-        F: FnOnce() -> IggyPartition<B>,
-    {
-        if !self.namespace_to_local.contains_key(&namespace) {
-            self.insert(namespace, init());
-        }
-        let idx = *self.namespace_to_local[&namespace];
-        &mut self.partitions.get_mut()[idx]
+    pub fn is_tombstoned(&self, namespace: &IggyNamespace) -> bool {
+        self.tombstoned.borrow().contains(namespace)
+    }
+
+    /// Mark a namespace as tombstoned. Callable from any task on the
+    /// shard's runtime (reconciler sets the fence synchronously before
+    /// awaiting disk delete).
+    pub fn tombstone(&self, namespace: IggyNamespace) {
+        self.tombstoned.borrow_mut().insert(namespace);
+    }
+
+    /// Clear a namespace tombstone. Pump-side hook called from
+    /// `ReconcileOp::ConfirmRemove` after the partition is dropped.
+    pub fn untombstone(&self, namespace: &IggyNamespace) {
+        self.tombstoned.borrow_mut().remove(namespace);
     }
 }
 
@@ -196,6 +276,14 @@ where
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
+        if self.is_tombstoned(&namespace) {
+            warn!(
+                target: "iggy.partitions.diag",
+                namespace_raw = namespace.inner(),
+                "dropping request: namespace tombstoned"
+            );
+            return;
+        }
         let Some(partition) = self.get_mut_by_ns(&namespace) else {
             warn!(
                 target: "iggy.partitions.diag",
@@ -211,6 +299,14 @@ where
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
+        if self.is_tombstoned(&namespace) {
+            warn!(
+                target: "iggy.partitions.diag",
+                namespace_raw = namespace.inner(),
+                "dropping prepare: namespace tombstoned"
+            );
+            return;
+        }
         let Some(partition) = self.get_mut_by_ns(&namespace) else {
             warn!(
                 target: "iggy.partitions.diag",
@@ -228,6 +324,14 @@ where
     #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
+        if self.is_tombstoned(&namespace) {
+            warn!(
+                target: "iggy.partitions.diag",
+                namespace_raw = namespace.inner(),
+                "dropping prepare-ok: namespace tombstoned"
+            );
+            return;
+        }
         let config = self.config.clone();
         let Some(partition) = self.get_mut_by_ns(&namespace) else {
             warn!(

@@ -24,7 +24,10 @@
 
 mod common;
 
-use common::{header_only, install_replicas_locally, loopback};
+use common::{
+    header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
+    set_replica_ctx,
+};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
@@ -50,36 +53,20 @@ async fn try_send_returns_backpressure_when_queue_full() {
         // nothing and rely on the kernel TCP buffer + bus0's tiny queue
         // to apply backpressure.
     });
+    set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
+    set_replica_ctx(&bus1, CLUSTER, 1, 2, None);
     let (l1, addr1) = bind(loopback()).await.unwrap();
     let token_for_l1 = bus1.token();
     let accept_1 = install_replicas_locally(bus1.clone(), on_message1);
     let l1_handle = compio::runtime::spawn(async move {
-        run(
-            l1,
-            token_for_l1,
-            CLUSTER,
-            1,
-            2,
-            accept_1,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(l1, token_for_l1, accept_1).await;
     });
     bus1.track_background(l1_handle);
 
     // bus0 dials bus1.
     let on_message0: MessageHandler = Rc::new(|_, _| {});
-    let dial_0 = install_replicas_locally(bus0.clone(), on_message0);
-    start_connector(
-        &bus0,
-        CLUSTER,
-        0,
-        vec![(1, addr1)],
-        dial_0,
-        DEFAULT_RECONNECT_PERIOD,
-    )
-    .await;
+    let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_message0);
+    start_connector(&bus0, 0, vec![(1, addr1)], dial_0, DEFAULT_RECONNECT_PERIOD).await;
 
     // Wait for the connection to register.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

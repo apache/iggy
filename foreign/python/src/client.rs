@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use iggy::prelude::{
     Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
@@ -56,15 +55,15 @@ impl IggyClient {
     #[pyo3(signature = (conn=None))]
     fn new(
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
             .build()
-            .unwrap();
-        IggyClient {
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(IggyClient {
             inner: Arc::new(client),
-        }
+        })
     }
 
     /// Constructs a new IggyClient from a connection string.
@@ -78,7 +77,7 @@ impl IggyClient {
         connection_string: String,
     ) -> PyResult<Self> {
         let client = RustIggyClient::from_connection_string(&connection_string)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -94,7 +93,7 @@ impl IggyClient {
             inner
                 .ping()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
         })
     }
 
@@ -112,7 +111,7 @@ impl IggyClient {
             inner
                 .login_user(&username, &password)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -126,7 +125,7 @@ impl IggyClient {
             inner
                 .connect()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -141,7 +140,7 @@ impl IggyClient {
             inner
                 .create_stream(&name)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -154,14 +153,14 @@ impl IggyClient {
         py: Python<'a>,
         stream_id: PyIdentifier,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::from(stream_id);
+        let stream_id = Identifier::try_from(stream_id)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let stream = inner
                 .get_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(stream.map(StreamDetails::from))
         })
     }
@@ -191,7 +190,7 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?,
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
             None => CompressionAlgorithm::default(),
         };
 
@@ -202,7 +201,7 @@ impl IggyClient {
 
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
 
-        let stream = Identifier::from(stream);
+        let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
@@ -217,7 +216,7 @@ impl IggyClient {
                     max_size,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -231,15 +230,15 @@ impl IggyClient {
         stream_id: PyIdentifier,
         topic_id: PyIdentifier,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::from(stream_id);
-        let topic_id = Identifier::from(topic_id);
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let topic = inner
                 .get_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(topic.map(TopicDetails::from))
         })
     }
@@ -267,8 +266,8 @@ impl IggyClient {
             .map(|message| message.inner)
             .collect::<Vec<_>>();
 
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
         let partitioning = Partitioning::partition_id(partitioning);
         let inner = self.inner.clone();
 
@@ -276,7 +275,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
@@ -296,8 +295,8 @@ impl IggyClient {
         auto_commit: bool,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::default();
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = Identifier::try_from(stream)?;
+        let topic = Identifier::try_from(topic)?;
         let strategy: RustPollingStrategy = polling_strategy.into();
 
         let inner = self.inner.clone();
@@ -314,7 +313,7 @@ impl IggyClient {
                     auto_commit,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             let messages = polled_messages
                 .messages
                 .into_iter()
@@ -375,7 +374,7 @@ impl IggyClient {
         let mut builder = self
             .inner
             .consumer_group(name, stream, topic)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .without_encryptor()
             .partition(partition_id);
 
@@ -433,7 +432,7 @@ impl IggyClient {
             consumer
                 .init()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
             })

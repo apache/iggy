@@ -21,7 +21,9 @@
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{
+    install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
+};
 use message_bus::IggyMessageBus;
 use message_bus::connector::start as start_connector;
 use message_bus::replica::listener::{MessageHandler, bind, run};
@@ -40,29 +42,21 @@ async fn periodic_retry_picks_up_late_listener() {
     // yet, so the first attempt fails. The reconnect period is short so the
     // test does not have to wait long.
     let bus0 = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let period = Duration::from_millis(100);
-    let dial_delegate = install_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(&bus0, CLUSTER, 0, vec![(1, addr)], dial_delegate, period).await;
+    let dial_delegate = install_dialed_replicas_locally(bus0.clone(), on_message.clone());
+    start_connector(&bus0, 0, vec![(1, addr)], dial_delegate, period).await;
     assert!(!bus0.replicas().contains(1), "first connect should fail");
 
     // Bring bus 1 online on the same address.
     let bus1 = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus1, CLUSTER, 1, 2, None);
     let (l1, _) = bind(addr).await.unwrap();
     let token_for_l1 = bus1.token();
     let accept_delegate = install_replicas_locally(bus1.clone(), on_message.clone());
     let l1_handle = compio::runtime::spawn(async move {
-        run(
-            l1,
-            token_for_l1,
-            CLUSTER,
-            1,
-            2,
-            accept_delegate,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(l1, token_for_l1, accept_delegate).await;
     });
     bus1.track_background(l1_handle);
 

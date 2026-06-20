@@ -91,31 +91,47 @@ TOTAL_FILES=0
 FIXED_FILES=0
 
 for dockerfile in $DOCKERFILES; do
-    # Skip files without ARG RUST_VERSION
-    if ! grep -q "^ARG RUST_VERSION=" "$dockerfile" 2>/dev/null; then
+    # Two ways a Dockerfile pins the toolchain:
+    #   1. `ARG RUST_VERSION=1.96`  (+ `FROM rust:${RUST_VERSION}...`)
+    #   2. hardcoded `FROM rust:1.96-slim` / `FROM rust:1.96.0-alpine`
+    # Both must stay in sync; a Dockerfile that pins neither is skipped.
+    if grep -q "^ARG RUST_VERSION=" "$dockerfile" 2>/dev/null; then
+        SOURCE="arg"
+        CURRENT_VERSION=$(grep "^ARG RUST_VERSION=" "$dockerfile" | head -1 | sed 's/^ARG RUST_VERSION=//')
+        EXPECTED_VERSION="$RUST_VERSION_SHORT"
+    elif grep -qE "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" 2>/dev/null; then
+        SOURCE="from"
+        CURRENT_VERSION=$(grep -E "FROM[[:space:]].*\brust:[0-9]" "$dockerfile" | head -1 | sed -nE 's/.*\brust:([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p')
+        # Preserve the file's precision: full patch (1.96.0) or short (1.96).
+        if [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            EXPECTED_VERSION="$RUST_VERSION"
+        else
+            EXPECTED_VERSION="$RUST_VERSION_SHORT"
+        fi
+    else
         continue
     fi
 
     TOTAL_FILES=$((TOTAL_FILES + 1))
 
-    # Get current version in the Dockerfile
-    CURRENT_VERSION=$(grep "^ARG RUST_VERSION=" "$dockerfile" | head -1 | sed 's/^ARG RUST_VERSION=//')
-
     if [ "$MODE" = "check" ]; then
-        if [ "$CURRENT_VERSION" != "$RUST_VERSION_SHORT" ]; then
+        if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
             MISALIGNED_FILES+=("$dockerfile")
-            echo -e "${RED}✗${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} (expected: ${GREEN}$RUST_VERSION_SHORT${NC})"
+            echo -e "${RED}✗${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} (expected: ${GREEN}$EXPECTED_VERSION${NC})"
         else
             echo -e "${GREEN}✓${NC} $dockerfile: $CURRENT_VERSION"
         fi
     elif [ "$MODE" = "fix" ]; then
-        if [ "$CURRENT_VERSION" != "$RUST_VERSION_SHORT" ]; then
-            # Update the ARG RUST_VERSION line
-            sed -i "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$RUST_VERSION_SHORT/" "$dockerfile"
+        if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
+            if [ "$SOURCE" = "arg" ]; then
+                sed -i "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
+            else
+                sed -i -E "s/(\brust:)[0-9]+\.[0-9]+(\.[0-9]+)?/\1$EXPECTED_VERSION/g" "$dockerfile"
+            fi
             FIXED_FILES=$((FIXED_FILES + 1))
-            echo -e "${GREEN}Fixed${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} -> ${GREEN}$RUST_VERSION_SHORT${NC}"
+            echo -e "${GREEN}Fixed${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} -> ${GREEN}$EXPECTED_VERSION${NC}"
         else
-            echo -e "${GREEN}✓${NC} $dockerfile: already correct ($RUST_VERSION_SHORT)"
+            echo -e "${GREEN}✓${NC} $dockerfile: already correct ($CURRENT_VERSION)"
         fi
     fi
 done

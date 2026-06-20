@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use std::fs;
 use std::path::PathBuf;
@@ -79,6 +77,30 @@ pub fn is_process_alive(pid: u32) -> bool {
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn is_process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Reap a dead child by PID and describe how it exited: normal exit code,
+/// or terminating signal plus whether a core was dumped. `waitpid` only
+/// succeeds from the spawning process; returns None when the child is
+/// still running or was already reaped by another waiter.
+#[cfg(unix)]
+pub fn reap_exit_status(pid: u32) -> Option<String> {
+    let mut status: libc::c_int = 0;
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if reaped != pid as libc::pid_t {
+        return None;
+    }
+    if libc::WIFEXITED(status) {
+        return Some(format!("exited with code {}", libc::WEXITSTATUS(status)));
+    }
+    if libc::WIFSIGNALED(status) {
+        return Some(format!(
+            "killed by signal {} (core dumped: {})",
+            libc::WTERMSIG(status),
+            libc::WCOREDUMP(status)
+        ));
+    }
+    Some(format!("unrecognized wait status {status}"))
 }
 
 /// Gracefully stop a child process: SIGTERM, wait up to 5s, then SIGKILL.

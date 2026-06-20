@@ -1,0 +1,542 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Helpers shared between the recovery path in [`crate::bootstrap`] and
+//! the runtime partition reconciliation loop.
+//!
+//! Recovery hydrates an [`IggyPartition`] from on-disk state; the
+//! reconciler builds one from scratch when a committed
+//! `CreateTopic` / `CreatePartitions` metadata event has no matching
+//! local partition yet. The two paths share namespace-bounds validation,
+//! consumer-offset configuration, and initial-segment provisioning.
+
+use crate::server_error::ServerNgError;
+use compio::fs::create_dir_all;
+use configs::server_ng::ServerNgConfig;
+use consensus::{LocalPipeline, VsrConsensus};
+use iggy_common::{
+    ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats, TopicStats,
+};
+use message_bus::IggyMessageBus;
+use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
+use server::io::fs_utils::remove_dir_all;
+use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
+use server::streaming::segments::storage::create_segment_storage;
+use server_common::sharding::IggyNamespace;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::error;
+
+/// Validate that a namespace fits within the static caps declared in
+/// `config.extra.namespace`.
+///
+/// Bootstrap calls this for every recovered namespace; the reconciler
+/// calls this before materialising a freshly committed partition. Same
+/// error variant either way so operators see one root cause label.
+///
+/// # Errors
+///
+/// Returns [`ServerNgError::RecoveredNamespaceOutOfBounds`] if any of
+/// `stream_id`, `topic_id`, or `partition_id` exceed the configured
+/// maxima.
+pub const fn validate_namespace_bounds(
+    config: &ServerNgConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<(), ServerNgError> {
+    let namespace = &config.extra.namespace;
+    if stream_id < namespace.max_streams
+        && topic_id < namespace.max_topics
+        && partition_id < namespace.max_partitions
+    {
+        return Ok(());
+    }
+
+    Err(ServerNgError::RecoveredNamespaceOutOfBounds {
+        stream_id,
+        topic_id,
+        partition_id,
+        max_streams: namespace.max_streams,
+        max_topics: namespace.max_topics,
+        max_partitions: namespace.max_partitions,
+    })
+}
+
+/// Create the on-disk directory hierarchy for a partition.
+///
+/// Builds the partition root, offsets, consumer offsets, and consumer
+/// group offsets directories. Idempotent: every step short-circuits when
+/// the directory already exists, so a reconciler retry after a partial
+/// failure is safe.
+///
+/// # Errors
+///
+/// Returns [`IggyError::CannotCreatePartitionDirectory`] or
+/// [`IggyError::CannotCreatePartition`] on directory creation failure.
+pub async fn create_partition_file_hierarchy(
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    config: &ServerNgConfig,
+) -> Result<(), IggyError> {
+    let partition_path = config
+        .system
+        .get_partition_path(stream_id, topic_id, partition_id);
+    if !Path::new(&partition_path).exists() && create_dir_all(&partition_path).await.is_err() {
+        return Err(IggyError::CannotCreatePartitionDirectory(
+            partition_id,
+            stream_id,
+            topic_id,
+        ));
+    }
+
+    let offset_path = config
+        .system
+        .get_offsets_path(stream_id, topic_id, partition_id);
+    if !Path::new(&offset_path).exists() && create_dir_all(&offset_path).await.is_err() {
+        error!(
+            stream_id,
+            topic_id, partition_id, "Failed to create offsets directory for partition"
+        );
+        return Err(IggyError::CannotCreatePartition(
+            partition_id,
+            stream_id,
+            topic_id,
+        ));
+    }
+
+    let consumer_offset_path =
+        config
+            .system
+            .get_consumer_offsets_path(stream_id, topic_id, partition_id);
+    if !Path::new(&consumer_offset_path).exists()
+        && create_dir_all(&consumer_offset_path).await.is_err()
+    {
+        error!(
+            stream_id,
+            topic_id, partition_id, "Failed to create consumer offsets directory for partition"
+        );
+        return Err(IggyError::CannotCreatePartition(
+            partition_id,
+            stream_id,
+            topic_id,
+        ));
+    }
+
+    let consumer_group_offsets_path =
+        config
+            .system
+            .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+    if !Path::new(&consumer_group_offsets_path).exists()
+        && create_dir_all(&consumer_group_offsets_path).await.is_err()
+    {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            "Failed to create consumer group offsets directory for partition"
+        );
+        return Err(IggyError::CannotCreatePartition(
+            partition_id,
+            stream_id,
+            topic_id,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Populate `partition` with consumer-offset / consumer-group-offset storage.
+///
+/// Hydrates from on-disk state if files exist (recovery path) or
+/// configures empty maps (fresh partition path). `current_offset` bounds
+/// recovered offsets so a partition that lost its tail does not surface
+/// consumer offsets ahead of its current log head.
+///
+/// # Errors
+///
+/// Returns [`ServerNgError::RecoveredConsumerOffsetOutOfBounds`] when a
+/// stored offset exceeds `current_offset`, or
+/// [`ServerNgError::ConsumerOffsetsLoad`] when the on-disk files exist
+/// but fail to decode.
+pub fn configure_consumer_offsets(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    config: &ServerNgConfig,
+    namespace: IggyNamespace,
+    current_offset: u64,
+) -> Result<(), ServerNgError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
+    let consumer_offsets_path =
+        config
+            .system
+            .get_consumer_offsets_path(stream_id, topic_id, partition_id);
+    let consumer_group_offsets_path =
+        config
+            .system
+            .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+
+    let loaded_consumer_offsets = load_partition_consumer_offsets(
+        &consumer_offsets_path,
+        "consumer",
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
+    let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
+    {
+        let guard = consumer_offsets.pin();
+        for offset in loaded_consumer_offsets {
+            let recovered_offset = offset.offset.load(Ordering::Relaxed);
+            if recovered_offset > current_offset {
+                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
+                    consumer_kind: "consumer",
+                    consumer_id: offset.consumer_id as usize,
+                    offset: recovered_offset,
+                    current_offset,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                });
+            }
+            guard.insert(offset.consumer_id as usize, offset);
+        }
+    }
+
+    let loaded_group_offsets = load_partition_consumer_group_offsets(
+        &consumer_group_offsets_path,
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
+    let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
+    {
+        let guard = consumer_group_offsets.pin();
+        for (group_id, offset) in loaded_group_offsets {
+            let recovered_offset = offset.offset.load(Ordering::Relaxed);
+            if recovered_offset > current_offset {
+                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
+                    consumer_kind: "consumer group",
+                    consumer_id: group_id.0,
+                    offset: recovered_offset,
+                    current_offset,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                });
+            }
+            guard.insert(group_id, offset);
+        }
+    }
+
+    partition.configure_consumer_offset_storage(
+        consumer_offsets_path,
+        consumer_group_offsets_path,
+        consumer_offsets,
+        consumer_group_offsets,
+        config.system.partition.enforce_fsync,
+    );
+    Ok(())
+}
+
+fn load_partition_consumer_offsets(
+    path: &str,
+    consumer_kind: &'static str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<Vec<iggy_common::ConsumerOffset>, ServerNgError> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+
+    load_consumer_offsets(path).or_else(|source| {
+        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+        {
+            return Ok(Vec::new());
+        }
+
+        Err(ServerNgError::ConsumerOffsetsLoad {
+            consumer_kind,
+            stream_id,
+            topic_id,
+            partition_id,
+            path: path.to_string(),
+            source: Box::new(source),
+        })
+    })
+}
+
+fn load_partition_consumer_group_offsets(
+    path: &str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerNgError> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+
+    load_consumer_group_offsets(path).or_else(|source| {
+        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+        {
+            return Ok(Vec::new());
+        }
+
+        Err(ServerNgError::ConsumerOffsetsLoad {
+            consumer_kind: "consumer group",
+            stream_id,
+            topic_id,
+            partition_id,
+            path: path.to_string(),
+            source: Box::new(source),
+        })
+    })
+}
+
+/// Provision an initial segment + writers for a partition that has none.
+///
+/// No-op when `partition.log.has_segments()` already returns `true`
+/// (recovery hydrated existing segments), so callers can invoke this
+/// unconditionally.
+///
+/// # Errors
+///
+/// Returns [`ServerNgError`] on segment-storage creation failure or
+/// writer initialisation failure.
+pub async fn ensure_initial_segment(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    config: &ServerNgConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<(), ServerNgError> {
+    if partition.log.has_segments() {
+        return Ok(());
+    }
+
+    // TODO: decouple segment storage creation from the `server` crate.
+    let storage =
+        create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    error = %source,
+                    "failed to create initial segment storage"
+                );
+                source
+            })?;
+    let messages_path = config
+        .system
+        .get_messages_file_path(stream_id, topic_id, partition_id, 0);
+    let index_path = config
+        .system
+        .get_index_path(stream_id, topic_id, partition_id, 0);
+    partition.log.add_persisted_segment(
+        Segment::new(0, config.system.segment.size),
+        storage,
+        Some(Rc::new(
+            MessagesWriter::new(
+                &messages_path,
+                Rc::new(AtomicU64::new(0)),
+                config.system.partition.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    path = %messages_path,
+                    error = %source,
+                    "failed to initialize initial messages writer"
+                );
+                source
+            })?,
+        )),
+        Some(Rc::new(
+            IggyIndexWriter::new(
+                &index_path,
+                Rc::new(AtomicU64::new(0)),
+                config.system.partition.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    path = %index_path,
+                    error = %source,
+                    "failed to initialize initial sparse index writer"
+                );
+                source
+            })?,
+        )),
+    );
+    partition.stats.increment_segments_count(1);
+
+    Ok(())
+}
+
+/// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
+///
+/// Counterpart to bootstrap's `load_partition`, which hydrates from
+/// on-disk state during recovery; this builder is the runtime path
+/// invoked by the reconciliation loop when a committed
+/// `CreateTopic` / `CreatePartitions` metadata event names a partition
+/// the local shard has not yet materialised.
+///
+/// Steps performed (all idempotent on retry after a partial failure):
+/// 1. Validate namespace fits within the configured caps.
+/// 2. Create directory hierarchy on disk.
+/// 3. Build per-partition VSR consensus group at view 0.
+/// 4. Configure empty consumer-offset storage with the on-disk paths set.
+/// 5. Provision the initial segment + writers (offset 0).
+///
+/// The returned partition's `offset` / `dirty_offset` are `0` and
+/// `should_increment_offset` is `false`, mirroring a clean append starting
+/// at the empty segment.
+///
+/// # Errors
+///
+/// Returns [`ServerNgError`] when bounds validation, directory creation,
+/// or segment provisioning fails.
+pub async fn build_partition_fresh(
+    config: &ServerNgConfig,
+    namespace: IggyNamespace,
+    topic_stats: Arc<TopicStats>,
+    cluster_id: u128,
+    self_replica_id: u8,
+    replica_count: u8,
+    bus: Rc<IggyMessageBus>,
+) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerNgError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
+
+    validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
+    create_partition_file_hierarchy(stream_id, topic_id, partition_id, config)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to create partition file hierarchy for fresh partition"
+            );
+            source
+        })?;
+
+    let stats = Arc::new(PartitionStats::new(topic_stats));
+    let consensus = VsrConsensus::new(
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::new(),
+    );
+    consensus.init();
+
+    let mut partition = IggyPartition::new(stats, consensus);
+    partition.set_partition_dir(config.system.get_partition_path(
+        stream_id,
+        topic_id,
+        partition_id,
+    ));
+    partition.created_at = IggyTimestamp::now();
+    partition.offset.store(0, Ordering::Release);
+    partition.dirty_offset.store(0, Ordering::Relaxed);
+    partition.should_increment_offset = false;
+    partition.stats.set_current_offset(0);
+    debug_assert!(
+        !partition.log.has_segments(),
+        "fresh partition must not carry recovered segments"
+    );
+
+    configure_consumer_offsets(&mut partition, config, namespace, 0)?;
+    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+
+    Ok(partition)
+}
+
+/// Recursive delete of partition root. Idempotent: `NotFound` is treated
+/// as success so a prior crashed pass cannot arm perpetual backoff.
+///
+/// # Errors
+///
+/// [`IggyError::CannotDeletePartitionDirectory`] on any non-`NotFound`
+/// OS error.
+pub async fn delete_partitions_from_disk(
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    config: &ServerNgConfig,
+) -> Result<(), IggyError> {
+    let partition_path = config
+        .system
+        .get_partition_path(stream_id, topic_id, partition_id);
+    match remove_dir_all(&partition_path).await {
+        Ok(()) => {
+            tracing::info!(
+                stream_id,
+                topic_id,
+                partition_id,
+                path = %partition_path,
+                "deleted partition directory"
+            );
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(
+                stream_id,
+                topic_id,
+                partition_id,
+                path = %partition_path,
+                "partition directory already absent"
+            );
+            Ok(())
+        }
+        Err(source) => {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                path = %partition_path,
+                error = %source,
+                "failed to delete partition directory"
+            );
+            // Variant format: {0}=partition_id, {1}=stream_id, {2}=topic_id.
+            Err(IggyError::CannotDeletePartitionDirectory(
+                partition_id,
+                stream_id,
+                topic_id,
+            ))
+        }
+    }
+}

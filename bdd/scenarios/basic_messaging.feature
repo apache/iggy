@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+@basic-messaging
 Feature: Basic Messaging Operations
   As a developer using Apache Iggy
   I want to perform basic messaging operations

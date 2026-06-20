@@ -99,21 +99,39 @@ pub use lifecycle::{
 };
 pub use transports::tls::TlsServerCredentials;
 
-use compio::runtime::JoinHandle;
+pub use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
 use iggy_binary_protocol::GenericHeader;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::array;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum number of replicas a single cluster supports. Replica ids are
 /// `u8`, so the address space is 0..=255.
 pub const MAX_REPLICAS: usize = 256;
+
+/// Hard cap on concurrently in-flight inbound replica handshakes,
+/// enforced globally on shard 0 (the sole acceptor) regardless of which
+/// shard the delegated handshake runs on.
+///
+/// A legitimate dialer set is bounded by `self_id`
+/// (< `replica_count` <= 255), so the cap only sheds load under a
+/// hostile flood; it bounds fd / memory without ever stalling the
+/// accept loop.
+pub const MAX_INFLIGHT_REPLICA_HANDSHAKES: usize = 256;
+
+/// Extra wall-clock allowance past `handshake_grace` before a shard-0
+/// in-flight slot or pending-dial entry expires on its own. Covers the
+/// inter-shard inbox latency of the delegation frame and the outcome
+/// ack; expiry only matters when the ack is lost (full inbox or a
+/// wedged owning shard), where it prevents a permanently leaked slot or
+/// a permanently suppressed redial.
+const REPLICA_HANDSHAKE_ACK_MARGIN: Duration = Duration::from_secs(5);
 
 /// Sentinel stored in [`ReplicaOwnerTable`] slots that have no current owner.
 ///
@@ -211,6 +229,16 @@ impl ReplicaOwnerTable {
             owner => Some(owner),
         }
     }
+
+    /// Number of slots currently claimed by any shard, i.e. live peer
+    /// replica connections on this node.
+    #[must_use]
+    pub fn owned_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.load(Ordering::Acquire) != OWNER_NONE)
+            .count()
+    }
 }
 
 impl Default for ReplicaOwnerTable {
@@ -255,17 +283,34 @@ pub type ClientForwardFn = Box<dyn Fn(u128, u16, Frozen<MESSAGE_ALIGN>) -> Resul
 /// Callback invoked when a client connection metadata entry is removed.
 pub type ClientConnectionLostFn = std::rc::Rc<dyn Fn(u128)>;
 
-/// Callback invoked on every successful replica handshake.
+/// Callback invoked on every accepted inbound replica connection.
 ///
-/// Fired by the replica listener / outbound connector. The callback decides
-/// whether to install the stream locally or ship it to another shard; this
-/// crate does not need to care about that policy. Takes ownership of the
-/// `TcpStream`. On the inbound (listener) path the replica id has been
-/// validated against `replica_count`, the local `cluster_id`, and the
-/// directional rule (peer id strictly less than this replica's id). On
-/// the outbound (connector) path the dialer trusts the configured peer
-/// list and the callback receives the pre-configured peer id.
-pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
+/// Fired by the replica listener BEFORE any byte is read: the peer id is
+/// unknown (blind delegation), validation happens on the owning shard
+/// inside [`replica::handshake::acceptor_handshake`]. Takes ownership of
+/// the `TcpStream`. The callback enforces the shard-0-global in-flight
+/// handshake cap ([`IggyMessageBus::try_acquire_replica_handshake_slot`])
+/// and ships the raw fd to the owning shard.
+pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
+
+/// Callback invoked on every successfully dialed outbound replica
+/// connection.
+///
+/// Fired by the outbound connector right after the TCP connect; the
+/// dialer handshake runs on the owning shard after delegation. The
+/// dialer trusts the configured peer list, so the pre-configured peer id
+/// rides along. Takes ownership of the `TcpStream`.
+pub type DialedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
+
+/// One-shot ack a delegated replica handshake fires when it finishes,
+/// success or failure.
+///
+/// Built by the owning shard's router around its inter-shard sender to
+/// shard 0, where it releases the in-flight cap slot (inbound) or clears
+/// the pending-dial entry (outbound). Invoked exactly once at the end of
+/// the spawned handshake task. A lost ack (full inbox, wedged shard) is
+/// covered by the deadline expiry on the shard-0 entry.
+pub type ReplicaHandshakeDoneFn = Box<dyn FnOnce()>;
 
 /// Callback invoked on every accepted SDK client connection.
 ///
@@ -507,6 +552,14 @@ pub trait MessageBus {
     /// Panics on a second install on the same bus, same one-shot
     /// `OnceCell` invariant as [`Self::set_replica_forward_fn`].
     fn set_client_forward_fn(&self, f: ClientForwardFn);
+
+    /// Register a detached `compio::runtime::spawn` handle so
+    /// [`shutdown`](IggyMessageBus::shutdown) can await it before the
+    /// runtime drops. Production [`IggyMessageBus`] pushes onto a
+    /// `RefCell<Vec<JoinHandle>>` drained on shutdown. Required (no default)
+    /// so a new impl cannot silently drop detached handles by omission; a
+    /// stub that spawns nothing implements it as a no-op.
+    fn track_background(&self, handle: JoinHandle<()>);
 }
 
 /// Production message bus backed by real TCP connections.
@@ -568,6 +621,25 @@ pub struct IggyMessageBus {
     /// after a successful registry insert; CAS-cleared by
     /// `Self::notify_connection_lost`. See [`ReplicaOwnerTable`].
     owner_table: Arc<ReplicaOwnerTable>,
+    /// Identity + auth parameters for delegated replica handshakes,
+    /// installed once at bootstrap via
+    /// [`Self::set_replica_handshake_ctx`]. Read by the
+    /// `install_replica_{inbound,outbound}` paths on the owning shard.
+    replica_handshake_ctx: OnceCell<replica::handshake::ReplicaHandshakeCtx>,
+    /// Shard-0-global in-flight inbound handshake slots: slot id ->
+    /// expiry deadline. Capped at [`MAX_INFLIGHT_REPLICA_HANDSHAKES`];
+    /// expired entries are pruned lazily inside
+    /// [`Self::try_acquire_replica_handshake_slot`] so no timer task is
+    /// needed. Only shard 0's bus ever populates this.
+    replica_handshake_slots: RefCell<ahash::AHashMap<u64, Instant>>,
+    /// Monotonic id source for [`Self::replica_handshake_slots`].
+    replica_slot_seq: Cell<u64>,
+    /// Peers with a delegated outbound handshake still in flight:
+    /// replica id -> expiry deadline. Consulted by the reconnect sweep
+    /// so a peer is not redialed while its previous handshake is
+    /// pending; entries expire lazily inside [`Self::check_dial_pending`].
+    /// Only shard 0's bus ever populates this.
+    pending_dials: RefCell<ahash::AHashMap<u8, Instant>>,
 }
 
 impl IggyMessageBus {
@@ -676,6 +748,10 @@ impl IggyMessageBus {
             client_connection_lost_fn: RefCell::new(None),
             client_meta: RefCell::new(ahash::AHashMap::new()),
             owner_table,
+            replica_handshake_ctx: OnceCell::new(),
+            replica_handshake_slots: RefCell::new(ahash::AHashMap::new()),
+            replica_slot_seq: Cell::new(0),
+            pending_dials: RefCell::new(ahash::AHashMap::new()),
         }
     }
 
@@ -709,6 +785,103 @@ impl IggyMessageBus {
     pub fn clear_replica_owned(&self, replica_id: u8) -> bool {
         self.owner_table
             .clear_if_owned_by(replica_id, self.shard_id)
+    }
+
+    /// Install the identity + auth parameters used by delegated replica
+    /// handshakes on this shard. Bootstrap-only wiring; same one-shot
+    /// contract as [`Self::set_replica_forward_fn`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same bus.
+    pub fn set_replica_handshake_ctx(&self, ctx: replica::handshake::ReplicaHandshakeCtx) {
+        assert!(
+            self.replica_handshake_ctx.set(ctx).is_ok(),
+            "replica_handshake_ctx installed twice (bootstrap invariant)"
+        );
+    }
+
+    /// Parameters installed by [`Self::set_replica_handshake_ctx`], or
+    /// `None` when the bootstrap never wired the replica plane (client-
+    /// only deployments, most tests).
+    #[must_use]
+    pub fn replica_handshake_ctx(&self) -> Option<&replica::handshake::ReplicaHandshakeCtx> {
+        self.replica_handshake_ctx.get()
+    }
+
+    /// Expiry deadline for shard-0 in-flight slots and pending-dial
+    /// entries: the owning shard bounds the handshake by
+    /// `handshake_grace`, plus margin for inter-shard inbox latency.
+    fn replica_handshake_deadline(&self) -> Instant {
+        Instant::now() + self.config.handshake_grace + REPLICA_HANDSHAKE_ACK_MARGIN
+    }
+
+    /// Claim a slot in the shard-0-global in-flight inbound handshake
+    /// cap. Returns `None` when [`MAX_INFLIGHT_REPLICA_HANDSHAKES`]
+    /// non-expired slots are outstanding; the caller drops the inbound
+    /// connection. The slot is released early by the owning shard's
+    /// handshake-outcome ack ([`Self::release_replica_handshake_slot`])
+    /// or expires on its own after `handshake_grace` plus margin.
+    #[must_use]
+    pub fn try_acquire_replica_handshake_slot(&self) -> Option<u64> {
+        let mut slots = self.replica_handshake_slots.borrow_mut();
+        if slots.len() >= MAX_INFLIGHT_REPLICA_HANDSHAKES {
+            let now = Instant::now();
+            slots.retain(|_, deadline| *deadline > now);
+            if slots.len() >= MAX_INFLIGHT_REPLICA_HANDSHAKES {
+                return None;
+            }
+        }
+        let slot = self.replica_slot_seq.get();
+        self.replica_slot_seq.set(slot.wrapping_add(1));
+        slots.insert(slot, self.replica_handshake_deadline());
+        Some(slot)
+    }
+
+    /// Release an in-flight handshake slot. Idempotent: an ack arriving
+    /// after the slot already expired (and was pruned) is a no-op.
+    /// Returns whether the slot was still present.
+    pub fn release_replica_handshake_slot(&self, slot: u64) -> bool {
+        self.replica_handshake_slots
+            .borrow_mut()
+            .remove(&slot)
+            .is_some()
+    }
+
+    /// Record that an outbound connection to `replica_id` was delegated
+    /// and its dialer handshake is in flight on the owning shard. The
+    /// reconnect sweep skips pending peers; the entry is cleared by the
+    /// handshake-outcome ack ([`Self::clear_dial_pending`]) or expires
+    /// on its own after `handshake_grace` plus margin.
+    pub fn mark_dial_pending(&self, replica_id: u8) {
+        self.pending_dials
+            .borrow_mut()
+            .insert(replica_id, self.replica_handshake_deadline());
+    }
+
+    /// Whether an outbound handshake to `replica_id` is still in flight.
+    /// An expired entry is removed here (lazy expiry) and reported as
+    /// not pending, re-enabling the redial.
+    #[must_use]
+    pub fn check_dial_pending(&self, replica_id: u8) -> bool {
+        let mut pending = self.pending_dials.borrow_mut();
+        match pending.get(&replica_id) {
+            Some(deadline) if *deadline > Instant::now() => true,
+            Some(_) => {
+                pending.remove(&replica_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Clear the pending-dial entry for `replica_id`. Idempotent; returns
+    /// whether an entry was present.
+    pub fn clear_dial_pending(&self, replica_id: u8) -> bool {
+        self.pending_dials
+            .borrow_mut()
+            .remove(&replica_id)
+            .is_some()
     }
 
     /// Look up the per-connection metadata recorded for `client_id`.
@@ -757,7 +930,7 @@ impl IggyMessageBus {
     /// closure so the closure body is free to call
     /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
     /// without tripping the runtime borrow check.
-    pub(crate) fn notify_connection_lost(&self, replica_id: u8) {
+    pub(crate) fn notify_connection_lost(&self, replica_id: u8, reason: &'static str) {
         // Stand down if a live registry entry exists for this replica. A
         // reconnect that round-robined back to this same shard installs a
         // fresh entry before this stale post-loop runs; the owner-table
@@ -781,8 +954,17 @@ impl IggyMessageBus {
         tracing::warn!(
             shard_id = self.shard_id,
             replica_id,
+            reason,
             "replica connection lost"
         );
+        let expected = self.config.mesh_expected_peers;
+        if expected > 0 {
+            tracing::warn!(
+                connected = self.owner_table.owned_count(),
+                expected,
+                "replica mesh degraded"
+            );
+        }
         let cb = self
             .connection_lost_fn
             .borrow()
@@ -1024,6 +1206,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn set_client_forward_fn(&self, f: ClientForwardFn) {
         (**self).set_client_forward_fn(f);
     }
+
+    fn track_background(&self, handle: JoinHandle<()>) {
+        (**self).track_background(handle);
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1108,6 +1294,10 @@ impl MessageBus for IggyMessageBus {
 
     fn set_client_forward_fn(&self, f: ClientForwardFn) {
         Self::set_client_forward_fn(self, f);
+    }
+
+    fn track_background(&self, handle: JoinHandle<()>) {
+        Self::track_background(self, handle);
     }
 }
 
@@ -1342,10 +1532,10 @@ mod tests {
         });
         bus.set_connection_lost_fn(cb);
 
-        bus.notify_connection_lost(1); // first closure runs (+1) and swaps
+        bus.notify_connection_lost(1, "test"); // first closure runs (+1) and swaps
         assert_eq!(counter.get(), 1);
 
-        bus.notify_connection_lost(1); // second closure runs (+10)
+        bus.notify_connection_lost(1, "test"); // second closure runs (+10)
         assert_eq!(counter.get(), 11);
     }
 
@@ -1369,7 +1559,7 @@ mod tests {
         assert!(bus.mark_replica_owned(7), "owner-table claim must succeed");
 
         // Stale predecessor post-loop fires while the reinstall is live.
-        bus.notify_connection_lost(7);
+        bus.notify_connection_lost(7, "test");
         assert_eq!(
             bus.owning_shard(7),
             Some(3),
@@ -1378,7 +1568,7 @@ mod tests {
 
         // Genuine disconnect: no live entry, the slot is released.
         bus.replicas().remove(7);
-        bus.notify_connection_lost(7);
+        bus.notify_connection_lost(7, "test");
         assert_eq!(
             bus.owning_shard(7),
             None,
@@ -1451,5 +1641,87 @@ mod tests {
             "same-shard reclaim must be accepted",
         );
         assert_eq!(table.owner(42), Some(5));
+    }
+
+    fn bus_with_grace(grace: Duration) -> IggyMessageBus {
+        IggyMessageBus::with_tunables(
+            0,
+            MessageBusConfig {
+                handshake_grace: grace,
+                ..MessageBusConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn handshake_slot_cap_enforced_and_released() {
+        let bus = IggyMessageBus::new(0);
+        let mut slots = Vec::with_capacity(MAX_INFLIGHT_REPLICA_HANDSHAKES);
+        for _ in 0..MAX_INFLIGHT_REPLICA_HANDSHAKES {
+            slots.push(
+                bus.try_acquire_replica_handshake_slot()
+                    .expect("below cap must acquire"),
+            );
+        }
+        assert!(
+            bus.try_acquire_replica_handshake_slot().is_none(),
+            "cap reached: acquire must fail"
+        );
+        assert!(bus.release_replica_handshake_slot(slots[0]));
+        assert!(
+            bus.try_acquire_replica_handshake_slot().is_some(),
+            "released slot must free capacity"
+        );
+        assert!(
+            !bus.release_replica_handshake_slot(slots[0]),
+            "double release must be a no-op"
+        );
+    }
+
+    #[test]
+    fn dial_pending_marks_clears_and_expires() {
+        let bus = bus_with_grace(Duration::ZERO);
+        bus.mark_dial_pending(7);
+        assert!(bus.check_dial_pending(7), "fresh entry must be pending");
+        assert!(bus.clear_dial_pending(7), "ack clears the entry");
+        assert!(!bus.check_dial_pending(7), "cleared entry must not block");
+        assert!(!bus.clear_dial_pending(7), "double clear is a no-op");
+
+        // Force-expire: rewrite the deadline into the past, mimicking a
+        // lost ack after grace + margin elapsed.
+        bus.mark_dial_pending(9);
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test clock past epoch");
+        bus.pending_dials.borrow_mut().insert(9, past);
+        assert!(
+            !bus.check_dial_pending(9),
+            "expired entry must report not-pending"
+        );
+        assert!(
+            !bus.clear_dial_pending(9),
+            "lazy expiry must have removed the entry"
+        );
+    }
+
+    #[test]
+    fn handshake_slot_lazy_expiry_prunes_at_cap() {
+        let bus = IggyMessageBus::new(0);
+        for _ in 0..MAX_INFLIGHT_REPLICA_HANDSHAKES {
+            let _ = bus.try_acquire_replica_handshake_slot();
+        }
+        assert!(bus.try_acquire_replica_handshake_slot().is_none());
+        // Age every outstanding slot past its deadline; the next acquire
+        // at cap must prune them all and succeed.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test clock past epoch");
+        for deadline in bus.replica_handshake_slots.borrow_mut().values_mut() {
+            *deadline = expired;
+        }
+        assert!(
+            bus.try_acquire_replica_handshake_slot().is_some(),
+            "expired slots must be pruned at cap"
+        );
     }
 }

@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::metadata::PartitionMeta;
 use crate::shard::IggyShard;
@@ -33,7 +32,7 @@ use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use server_common::sharding::IggyNamespace;
-use server_common::sharding::{LocalIdx, PartitionLocation, ShardId};
+use server_common::sharding::{PartitionLocation, ShardId};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -103,9 +102,8 @@ impl IggyShard {
             let ns = IggyNamespace::new(stream, topic_id, partition_id);
             let shard_id = ShardId::new(calculate_shard_assignment(&ns, shards_count));
             let is_current_shard = self.id == *shard_id;
-            // TODO(hubcio): LocalIdx(0) is wrong.. When IggyPartitions is integrated into
-            // IggyShard, this should use the actual index returned by IggyPartitions::insert().
-            let location = PartitionLocation::new(shard_id, LocalIdx::new(0));
+            // epoch is reconciler-only; unused by legacy server.
+            let location = PartitionLocation::new(shard_id, 0);
             self.insert_shard_table_record(ns, location);
 
             if is_current_shard {

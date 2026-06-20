@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
@@ -24,8 +22,8 @@ use super::server::{
 };
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use super::sharding::{
-    CpuAllocation, INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
-    ShardingConfig,
+    CpuAllocation, INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
+    SHUTDOWN_POLL_INTERVAL_MAX, ShardingConfig,
 };
 use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
@@ -442,6 +440,25 @@ impl Validatable<ConfigurationError> for ShardingConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        let reconcile = self.reconcile_periodic_interval.get_duration();
+        if reconcile.is_zero() {
+            eprintln!(
+                "Invalid sharding configuration: reconcile_periodic_interval resolves to zero. \
+                 Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero. The \
+                 periodic reconcile tick is a safety net for dropped commit-wakes and cannot be \
+                 turned off; set a positive duration (default \"1s\", max {RECONCILE_PERIODIC_INTERVAL_MAX:?})."
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if reconcile > RECONCILE_PERIODIC_INTERVAL_MAX {
+            eprintln!(
+                "Invalid sharding configuration: reconcile_periodic_interval {:?} exceeds the \
+                 {:?} cap (a long tick makes post-failure convergence latency operator-visible)",
+                reconcile, RECONCILE_PERIODIC_INTERVAL_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         let available_cpus = available_parallelism()
             .map_err(|_| {
                 eprintln!("Failed to detect available CPU cores");
@@ -485,6 +502,11 @@ impl Validatable<ConfigurationError> for ShardingConfig {
         }
     }
 }
+
+/// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
+/// is KDF-derived from these bytes at use-site, so any encoding clearing this
+/// length is accepted.
+const MIN_SHARED_SECRET_LEN: usize = 32;
 
 impl Validatable<ConfigurationError> for ClusterConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -586,6 +608,55 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             }
         }
 
+        // Replica-auth PSK (only reached when the cluster is enabled; the early
+        // return above skips these while it is disabled). When auth is enabled
+        // the key is mandatory; any configured key must clear the length floor -
+        // a typo guard that fires with auth off too, though only while the
+        // cluster itself is enabled.
+        let secret_len = self.auth.shared_secret.len();
+        if self.auth.enabled && self.auth.shared_secret.is_empty() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.auth.shared_secret must be set when cluster.auth.enabled is true"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if !self.auth.shared_secret.is_empty() && secret_len < MIN_SHARED_SECRET_LEN {
+            eprintln!(
+                "Invalid cluster configuration: cluster.auth.shared_secret must be >= {MIN_SHARED_SECRET_LEN} bytes"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Replica TLS. Both cert modes run one-directional TLS (no client
+        // certificate anywhere), so TLS only authenticates the acceptor to
+        // the dialer; peer authentication comes solely from the PSK
+        // handshake. Without it any TLS-capable host could register as a
+        // replica - require auth in both modes. CA mode (the default)
+        // additionally needs all three PEM paths: cert/key for this node's
+        // acceptor side, ca_file as the dialer's trust anchor.
+        if self.tls.enabled {
+            if !self.auth.enabled {
+                eprintln!(
+                    "Invalid cluster configuration: cluster.tls.enabled = true requires cluster.auth.enabled = true (TLS authenticates the acceptor only; the PSK handshake authenticates the peer)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if !self.tls.self_signed {
+                for (field, value) in [
+                    ("cert_file", &self.tls.cert_file),
+                    ("key_file", &self.tls.key_file),
+                    ("ca_file", &self.tls.ca_file),
+                ] {
+                    if value.trim().is_empty() {
+                        eprintln!(
+                            "Invalid cluster configuration: cluster.tls.{field} must be set when cluster.tls.enabled = true and self_signed = false"
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -593,7 +664,9 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 #[cfg(test)]
 mod cluster_validate_tests {
     use super::*;
-    use crate::server_config::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
+    use crate::server_config::cluster::{
+        ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
+    };
 
     fn node(name: &str, id: u8) -> ClusterNodeConfig {
         ClusterNodeConfig {
@@ -609,6 +682,8 @@ mod cluster_validate_tests {
             enabled: true,
             name: "iggy-cluster".to_string(),
             nodes,
+            auth: ClusterAuthConfig::default(),
+            tls: ClusterTlsConfig::default(),
         }
     }
 
@@ -721,6 +796,114 @@ mod cluster_validate_tests {
         n1.ports = ports;
         let c = cfg(vec![n1]);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_empty_secret_when_auth_disabled() {
+        // Default: no secret, auth off -> legacy mode, must pass.
+        let c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_missing_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_short_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_short_secret_even_when_auth_disabled() {
+        // Typo guard: a configured-but-short key fails even with auth off.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_secret_when_auth_enabled() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        assert!(c.validate().is_ok());
+    }
+
+    fn tls_files() -> ClusterTlsConfig {
+        ClusterTlsConfig {
+            enabled: true,
+            self_signed: false,
+            cert_file: "cert.pem".to_string(),
+            key_file: "key.pem".to_string(),
+            ca_file: "ca.pem".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tls_ca_mode_with_missing_files() {
+        // Auth on so the failure exercises the file check, not the auth gate.
+        for missing in ["cert_file", "key_file", "ca_file"] {
+            let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+            c.auth.enabled = true;
+            c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+            c.tls = tls_files();
+            match missing {
+                "cert_file" => c.tls.cert_file.clear(),
+                "key_file" => c.tls.key_file.clear(),
+                _ => c.tls.ca_file.clear(),
+            }
+            assert!(c.validate().is_err(), "missing {missing} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_tls_self_signed_without_auth() {
+        // Accept-any certificate without the PSK handshake = MITM-able.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.tls = ClusterTlsConfig {
+            enabled: true,
+            self_signed: true,
+            ..ClusterTlsConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_self_signed_with_auth() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.tls = ClusterTlsConfig {
+            enabled: true,
+            self_signed: true,
+            ..ClusterTlsConfig::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_tls_ca_mode_without_auth() {
+        // TLS never authenticates the dialer (no client certificates);
+        // only the PSK handshake does, so it is mandatory with TLS on.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.tls = tls_files();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_ca_mode_with_auth() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.auth.enabled = true;
+        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
+        c.tls = tls_files();
+        assert!(c.validate().is_ok());
     }
 }
 

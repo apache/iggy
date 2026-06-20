@@ -34,10 +34,10 @@ internal sealed class MessageConverter : JsonConverter<Message>
         writer.WriteStartObject();
 
         WriteMessageId(writer, value.Header.Id);
-        WritePayload(writer, value.Payload);
-        if (value.RawUserHeaders is not null)
+        WritePayload(writer, value.Payload.Span);
+        if (!value.RawUserHeaders.IsEmpty)
         {
-            writer.WriteBase64String("user_headers", value.RawUserHeaders);
+            writer.WriteBase64String("user_headers", value.RawUserHeaders.Span);
         }
         else
         {
@@ -52,9 +52,9 @@ internal sealed class MessageConverter : JsonConverter<Message>
         writer.WriteString("id", id.ToString());
     }
 
-    private static void WritePayload(Utf8JsonWriter writer, byte[] payload)
+    private static void WritePayload(Utf8JsonWriter writer, ReadOnlySpan<byte> payload)
     {
-        writer.WriteString("payload", Convert.ToBase64String(payload));
+        writer.WriteBase64String("payload", payload);
     }
 
     private static void WriteHeaders(Utf8JsonWriter writer, Dictionary<HeaderKey, HeaderValue>? userHeaders)

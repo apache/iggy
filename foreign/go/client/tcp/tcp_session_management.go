@@ -89,6 +89,7 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 		c,
 		currentAddress,
 		iggcon.Tcp,
+		c.logger,
 	)
 	if err != nil {
 		return false, err

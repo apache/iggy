@@ -22,7 +22,9 @@
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{
+    install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
+};
 use message_bus::IggyMessageBus;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
@@ -35,6 +37,8 @@ const CLUSTER: u128 = 0xBEEF;
 async fn lower_id_dials_higher_id_accepts() {
     let bus0 = Rc::new(IggyMessageBus::new(0));
     let bus1 = Rc::new(IggyMessageBus::new(0));
+    set_replica_ctx(&bus0, CLUSTER, 0, 2, None);
+    set_replica_ctx(&bus1, CLUSTER, 1, 2, None);
 
     let on_message: MessageHandler = Rc::new(|_, _| {});
 
@@ -45,52 +49,24 @@ async fn lower_id_dials_higher_id_accepts() {
     let token_for_l0 = bus0.token();
     let accept_0 = install_replicas_locally(bus0.clone(), on_message.clone());
     let l0_handle = compio::runtime::spawn(async move {
-        run(
-            l0,
-            token_for_l0,
-            CLUSTER,
-            0,
-            2,
-            accept_0,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(l0, token_for_l0, accept_0).await;
     });
     bus0.track_background(l0_handle);
 
     let token_for_l1 = bus1.token();
     let accept_1 = install_replicas_locally(bus1.clone(), on_message.clone());
     let l1_handle = compio::runtime::spawn(async move {
-        run(
-            l1,
-            token_for_l1,
-            CLUSTER,
-            1,
-            2,
-            accept_1,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(l1, token_for_l1, accept_1).await;
     });
     bus1.track_background(l1_handle);
 
     // Both buses start their connector with the full peer list.
     let peers = vec![(0u8, addr0), (1u8, addr1)];
 
-    let dial_0 = install_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(
-        &bus0,
-        CLUSTER,
-        0,
-        peers.clone(),
-        dial_0,
-        DEFAULT_RECONNECT_PERIOD,
-    )
-    .await;
-    let dial_1 = install_replicas_locally(bus1.clone(), on_message.clone());
-    start_connector(&bus1, CLUSTER, 1, peers, dial_1, DEFAULT_RECONNECT_PERIOD).await;
+    let dial_0 = install_dialed_replicas_locally(bus0.clone(), on_message.clone());
+    start_connector(&bus0, 0, peers.clone(), dial_0, DEFAULT_RECONNECT_PERIOD).await;
+    let dial_1 = install_dialed_replicas_locally(bus1.clone(), on_message.clone());
+    start_connector(&bus1, 1, peers, dial_1, DEFAULT_RECONNECT_PERIOD).await;
 
     // Wait for the directional connection to settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

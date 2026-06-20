@@ -21,9 +21,10 @@ namespace Apache.Iggy.Consumers;
 
 /// <summary>
 ///     Represents a message received from the Iggy consumer whose payload and raw headers are backed by rented memory
-///     shared across a polled batch. The caller SHOULD dispose the message once processing is complete for deterministic
-///     release of the underlying pool buffer. If the caller forgets, the buffer is still returned to the pool when the
-///     owning <see cref="PolledMessagesRental" /> becomes unreachable and its finalizer runs - non-deterministic but safe.
+///     shared across a polled batch. The caller MUST dispose the message once processing is complete; the underlying
+///     pool buffer is returned only when the batch's last message is disposed (reference counted). There is no
+///     finalizer: a batch left undisposed never returns its buffer to the pool - it is reclaimed by the GC as an
+///     ordinary allocation, so forgetting to dispose leaks pool capacity rather than corrupting data.
 /// </summary>
 public sealed class ReceivedRentedMessage : IDisposable
 {

@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Port pre-allocation to eliminate TOCTOU race conditions during server startup.
 //!
@@ -75,12 +73,14 @@ impl ReservedPort {
                 message: format!("Failed to bind TCP socket: {e}"),
             })?;
 
-        socket
-            .listen(1)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to listen on TCP socket: {e}"),
-            })?;
-
+        // Bind WITHOUT listen: a listening reservation joins the port's
+        // SO_REUSEPORT group and accepts early dials into a backlog nobody
+        // drains. During cluster startup a peer's replica connector dials
+        // ports whose reservations are still held (release happens per-node
+        // right before spawn), so each such dial used to wedge until the
+        // 2s handshake-ack timeout. A bound-only socket still holds the
+        // port against ephemeral allocation but answers RST, so dialers
+        // fail fast and the reconnect sweep retries cleanly.
         let addr = socket
             .local_addr()
             .map_err(|e| TestBinaryError::InvalidState {

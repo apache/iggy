@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::builder::TestHarnessBuilder;
 use crate::harness::config::{ClientConfig, JwksConfig};
@@ -191,6 +189,26 @@ impl TestHarness {
             const LOGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(750);
 
             let deadline = Instant::now() + CLUSTER_READY_TIMEOUT;
+
+            // Wait for the full replica mesh BEFORE the login probe below.
+            // The probe is the cluster's first metadata op; if it commits
+            // while a replica is still joining the mesh, that replica misses
+            // the op and -- with no log-repair path yet -- wedges, dropping
+            // every later op as a gap. Gating on all nodes meshed means the
+            // test runs against a fully constructed cluster with no late
+            // joiners.
+            while Instant::now() < deadline
+                && !self.servers.iter().all(ServerHandle::replica_mesh_complete)
+            {
+                sleep(CLUSTER_READY_RETRY_INTERVAL).await;
+            }
+            if !self.servers.iter().all(ServerHandle::replica_mesh_complete) {
+                return Err(TestBinaryError::InvalidState {
+                    message: "Timed out waiting for VSR replica mesh to form on all nodes"
+                        .to_string(),
+                });
+            }
+
             let mut last_error = None;
 
             while Instant::now() < deadline {
