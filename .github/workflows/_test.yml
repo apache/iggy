@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
 
       - name: Skip noop
         if: inputs.component == 'noop'
@@ -64,7 +64,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: startsWith(inputs.component, 'rust') && startsWith(inputs.task, 'test-')
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
@@ -77,7 +77,7 @@ jobs:
       # Python SDK
       - name: Set up Docker Buildx for Python
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Run Python SDK task
         if: inputs.component == 'sdk-python'
@@ -87,7 +87,7 @@ jobs:
 
       - name: Upload Python coverage to Codecov
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/python-coverage.lcov
@@ -104,6 +104,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload PHP coverage to Codecov
+        if: inputs.component == 'sdk-php' && inputs.task == 'test'
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/php-coverage.lcov
+          disable_search: true
+          flags: php
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Node SDK
       - name: Run Node SDK task
         if: inputs.component == 'sdk-node'
@@ -113,7 +125,7 @@ jobs:
 
       - name: Upload Node coverage to Codecov
         if: inputs.component == 'sdk-node' && (inputs.task == 'test' || inputs.task == 'e2e')
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/node-coverage/${{ inputs.task == 'test' && 'unit' || 'e2e' }}/lcov.info
@@ -132,7 +144,7 @@ jobs:
 
       - name: Upload Go coverage to Codecov
         if: inputs.component == 'sdk-go' && (inputs.task == 'test' || inputs.task == 'e2e')
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/${{ inputs.task == 'test' && 'go-coverage.out' || 'go-coverage-e2e.out' }}
@@ -165,7 +177,7 @@ jobs:
 
       - name: Upload Java coverage to Codecov
         if: inputs.component == 'sdk-java' && inputs.task == 'test'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/java-coverage/jacocoAggregated.xml
@@ -177,7 +189,7 @@ jobs:
 
       - name: Upload C# coverage to Codecov
         if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || inputs.task == 'e2e')
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/csharp/reports/coverage.cobertura.xml

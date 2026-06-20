@@ -40,17 +40,17 @@ pub mod ws;
 pub mod wss;
 
 pub use quic::install_client_quic;
-pub use replica::{install_replica_conn, install_replica_tcp};
+pub use replica::{install_replica_conn, install_replica_inbound, install_replica_outbound};
 pub use tcp::{install_client_conn, install_client_tcp};
 pub use tcp_tls::install_client_tcp_tls;
 pub use ws::install_client_ws;
 pub use wss::install_client_wss;
 
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
+use crate::{IggyMessageBus, ReplicaHandshakeDoneFn};
 use std::rc::Rc;
 use tracing::warn;
 
@@ -61,15 +61,40 @@ use tracing::warn;
 /// does not exercise this path; if it ever does, add a no-op impl on
 /// `SharedSimOutbox`.
 pub trait ConnectionInstaller {
-    /// Wrap a duplicated TCP fd into a `TcpStream` on the local compio
-    /// runtime, spawn writer + reader tasks, and register the replica
-    /// connection on this shard.
+    /// Wrap a blind-delegated inbound replica fd into a `TcpStream` on
+    /// the local compio runtime, run the acceptor handshake in a spawned
+    /// task (bounded by `handshake_grace`), and register the connection
+    /// on this shard on success. `on_done` is the shard-0 outcome ack;
+    /// the install path fires it exactly once, on every exit path.
     ///
-    /// Takes ownership of `fd`. On registration failure the fd is closed
-    /// by dropping the wrapping `TcpStream`; on caller-side failure (e.g.
-    /// inter-shard send drops the setup frame) the `DupedFd` closes the
-    /// fd on drop.
-    fn install_replica_tcp_fd(&self, fd: DupedFd, replica_id: u8, on_message: MessageHandler);
+    /// Takes ownership of `fd`. On any failure the fd is closed by
+    /// dropping the wrapping `TcpStream`.
+    fn install_replica_inbound_fd(
+        &self,
+        fd: DupedFd,
+        on_message: MessageHandler,
+        on_done: ReplicaHandshakeDoneFn,
+    );
+
+    /// Same for a delegated outbound replica connection: runs the dialer
+    /// handshake half toward the configured `replica_id`.
+    fn install_replica_outbound_fd(
+        &self,
+        fd: DupedFd,
+        replica_id: u8,
+        on_message: MessageHandler,
+        on_done: ReplicaHandshakeDoneFn,
+    );
+
+    /// Release a shard-0 in-flight inbound handshake slot. Routed here
+    /// when shard 0's router processes the owning shard's
+    /// handshake-outcome ack. Idempotent (the slot may have expired).
+    fn release_replica_handshake_slot(&self, slot: u64);
+
+    /// Clear a shard-0 pending-dial entry. Routed here when shard 0's
+    /// router processes the owning shard's handshake-outcome ack.
+    /// Idempotent (the entry may have expired).
+    fn clear_replica_dial_pending(&self, replica_id: u8);
 
     /// Same for an SDK client connection. The owning shard is already
     /// encoded in the top 16 bits of `meta.client_id`. `meta` is stored
@@ -90,9 +115,33 @@ pub trait ConnectionInstaller {
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
-    fn install_replica_tcp_fd(&self, fd: DupedFd, replica_id: u8, on_message: MessageHandler) {
+    fn install_replica_inbound_fd(
+        &self,
+        fd: DupedFd,
+        on_message: MessageHandler,
+        on_done: ReplicaHandshakeDoneFn,
+    ) {
         let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_tcp(self, replica_id, stream, on_message);
+        install_replica_inbound(self, stream, on_message, on_done);
+    }
+
+    fn install_replica_outbound_fd(
+        &self,
+        fd: DupedFd,
+        replica_id: u8,
+        on_message: MessageHandler,
+        on_done: ReplicaHandshakeDoneFn,
+    ) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        install_replica_outbound(self, replica_id, stream, on_message, on_done);
+    }
+
+    fn release_replica_handshake_slot(&self, slot: u64) {
+        IggyMessageBus::release_replica_handshake_slot(self, slot);
+    }
+
+    fn clear_replica_dial_pending(&self, replica_id: u8) {
+        self.clear_dial_pending(replica_id);
     }
 
     fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {

@@ -25,6 +25,10 @@ use std::mem::offset_of;
 
 pub const HEADER_SIZE: usize = 256;
 
+/// Length of [`GenericHeader::reserved_command`], the per-command scratch area
+/// the replica-auth handshake writes its nonce / MAC / reject-reason into.
+pub const RESERVED_COMMAND_LEN: usize = 128;
+
 /// Byte offset of [`GenericHeader::size`] within the on-wire header.
 ///
 /// Single source of truth for transports that decode the size field
@@ -89,7 +93,7 @@ pub struct GenericHeader {
     pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
-    pub reserved_command: [u8; 128],
+    pub reserved_command: [u8; RESERVED_COMMAND_LEN],
 }
 const _: () = {
     assert!(size_of::<GenericHeader>() == HEADER_SIZE);
@@ -101,7 +105,10 @@ const _: () = {
         offset_of!(GenericHeader, reserved_command)
             == offset_of!(GenericHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(GenericHeader, reserved_command) + size_of::<[u8; 128]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(GenericHeader, reserved_command) + size_of::<[u8; RESERVED_COMMAND_LEN]>()
+            == HEADER_SIZE
+    );
 };
 
 impl ConsensusHeader for GenericHeader {
@@ -205,7 +212,11 @@ impl ConsensusHeader for RequestHeader {
             ));
         }
         // Register: session must be 0, request must be 0.
-        // Non-register: session must be > 0, request must be > 0.
+        // NonReplicated: sessionless by design (the `ClientTable` ignores
+        // these ops and the server routes/auth-gates them by transport id),
+        // so a pre-register client may legitimately send session 0 --
+        // ping must work before authentication.
+        // Other non-register ops: session must be > 0, request must be > 0.
         if self.operation == Operation::Register {
             if self.session != 0 {
                 return Err(ConsensusError::InvalidField(
@@ -217,7 +228,9 @@ impl ConsensusHeader for RequestHeader {
                     "register: request must be 0".to_string(),
                 ));
             }
-        } else if self.operation != Operation::Reserved {
+        } else if self.operation != Operation::Reserved
+            && self.operation != Operation::NonReplicated
+        {
             if self.session == 0 {
                 return Err(ConsensusError::InvalidField(
                     "non-register: session must be > 0".to_string(),

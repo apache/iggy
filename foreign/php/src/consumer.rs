@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use std::sync::Arc;
 
@@ -27,6 +26,7 @@ use iggy::prelude::{
 use tokio::sync::Mutex;
 
 use crate::error::to_php_exception;
+use crate::message_iterator::MessageIterator;
 use crate::receive_message::ReceiveMessage;
 use crate::runtime::runtime;
 
@@ -112,8 +112,6 @@ impl IggyConsumer {
     /// PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
     /// successful callback when at-least-once callback processing is required.
     pub fn consume_messages(&self, callback: ZendCallable, limit: u32) -> PhpResult<u32> {
-        // TODO: Add an iterator-style API like Python's iter_messages() so callers
-        // can compose consumption with generators or fibers instead of callbacks only.
         let mut consumed = 0;
 
         while consumed < limit {
@@ -128,6 +126,11 @@ impl IggyConsumer {
         }
 
         Ok(consumed)
+    }
+
+    /// Returns an iterator over messages for use with foreach.
+    pub fn iter_messages(&self) -> MessageIterator {
+        MessageIterator::new(self.inner.clone())
     }
 }
 

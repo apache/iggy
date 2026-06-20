@@ -1,23 +1,20 @@
 <?php
-
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 declare(strict_types=1);
 
@@ -538,6 +535,66 @@ final class IggySdkTest extends TestCase
             );
 
             assert_same(count($messages), $count);
+            assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A consumer group iterator yields messages in order')]
+    public function testIterMessages(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-iterator');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+        $partitionId = 0;
+        $messages = array_map(
+            static fn (int $i): string => "Consumer iterator test {$i} - {$streamName}",
+            range(0, 4),
+        );
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::interval(micros(5)),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+            $iterator = $consumer->iterMessages();
+            $received = [];
+            $keys = [];
+
+            assert_instance_of(Iterator::class, $iterator);
+
+            foreach ($iterator as $key => $message) {
+                $keys[] = $key;
+                $received[] = $message->payload();
+
+                if (count($received) === count($messages)) {
+                    break;
+                }
+            }
+
+            assert_same(range(0, count($messages) - 1), $keys);
             assert_same($messages, $received);
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);

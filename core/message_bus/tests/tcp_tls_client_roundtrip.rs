@@ -14,21 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
-//! End-to-end bootstrap: `replica::io::start_on_shard_zero` binds the
-//! TCP-TLS plane (alongside replica + client TCP listeners) and the
-//! caller dials the listener address surfaced via
-//! [`message_bus::replica::io::BoundPlanes::tcp_tls`]. Mirrors the
-//! `tcp_tls_client_listener.rs` listener-level test one level up the
-//! stack: the validator, paired-presence trio, and `BoundPlanes`
-//! growth all participate.
 
 mod common;
 
 use async_channel::bounded;
 use common::{
-    header_only, install_clients_locally, install_replicas_locally, install_tls_clients_locally,
-    loopback,
+    header_only, install_clients_locally, install_dialed_replicas_locally,
+    install_replicas_locally, install_tls_clients_locally, loopback, set_replica_ctx,
 };
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command2;
@@ -70,7 +62,9 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
         .detach();
     });
 
-    let accepted_replica = install_replicas_locally(Rc::clone(&bus), on_message);
+    set_replica_ctx(&bus, CLUSTER, 0, 1, None);
+    let accepted_replica = install_replicas_locally(Rc::clone(&bus), on_message.clone());
+    let dialed_replica = install_dialed_replicas_locally(Rc::clone(&bus), on_message);
     let accepted_client = install_clients_locally(Rc::clone(&bus), Rc::clone(&on_request));
     let accepted_tls = install_tls_clients_locally(Rc::clone(&bus), on_request);
 
@@ -88,11 +82,10 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
         Some(creds),
         None,
         None,
-        CLUSTER,
         0,
-        1,
         vec![],
         accepted_replica,
+        dialed_replica,
         accepted_client,
         None,
         None,

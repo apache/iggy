@@ -117,7 +117,7 @@ where
 ///
 /// # Errors
 /// Returns a static error string if the replica is syncing, not in normal
-/// status, or the message has a newer view.
+/// status, or the message's view differs from the replica's.
 ///
 /// # Panics
 /// If `header.command` is not `Command2::Prepare`.
@@ -143,6 +143,16 @@ where
 
     if header.view > consensus.view() {
         return Err(IgnoreReason::NewerView);
+    }
+
+    // Deposed-primary prepares can still be in flight after a view change:
+    // replicate_to_next_in_chain stops the ring at primary_index(header.view),
+    // not the current view's primary, so a stale prepare reaches the new
+    // primary and would hit its sequencer invariants. Uncommitted old-view
+    // ops are decided by the view change, never by late delivery. Message
+    // repair, once it lands, fetches prepares via its own path, not here.
+    if header.view < consensus.view() {
+        return Err(IgnoreReason::OlderView);
     }
 
     if consensus.is_follower() {
@@ -454,6 +464,8 @@ mod tests {
     struct NoopBus;
 
     impl MessageBus for NoopBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             _client_id: u128,
@@ -487,6 +499,41 @@ mod tests {
                 };
             },
         )
+    }
+
+    #[test]
+    fn replicate_preflight_fences_prepare_views() {
+        let mut consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_view(2);
+
+        let prepare_with_view = |view: u32| {
+            Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
+                |_, new| {
+                    *new = PrepareHeader {
+                        command: Command2::Prepare,
+                        op: 1,
+                        view,
+                        ..Default::default()
+                    };
+                },
+            )
+        };
+
+        let stale = prepare_with_view(1);
+        assert_eq!(
+            replicate_preflight(&consensus, stale.header()),
+            Err(IgnoreReason::OlderView)
+        );
+
+        let ahead = prepare_with_view(3);
+        assert_eq!(
+            replicate_preflight(&consensus, ahead.header()),
+            Err(IgnoreReason::NewerView)
+        );
+
+        let current = prepare_with_view(2);
+        assert!(replicate_preflight(&consensus, current.header()).is_ok());
     }
 
     #[test]
@@ -661,6 +708,8 @@ mod tests {
 
     #[allow(clippy::future_not_send)]
     impl MessageBus for SpyBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             _client_id: u128,

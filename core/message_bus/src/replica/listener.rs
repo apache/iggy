@@ -22,77 +22,43 @@
 //! This module is TCP-only by design, not by omission. Do NOT add WS,
 //! QUIC, or HTTP paths here. The VSR chain-hash safety proof
 //! (`last_prepare_checksum` in `core/consensus/src/plane_helpers.rs`),
-//! the fd-delegation path (`F_DUPFD_CLOEXEC` needs a dupable plaintext
-//! fd), the `writev` batching inside the TCP transport, and the single-digit
-//! RTT assumptions used by the view-change timer all rest on a FIFO
-//! byte stream between a bounded set of replicas on a trusted LAN. A
-//! datagram-oriented or gateway-terminated transport violates one or
-//! more of those assumptions.
+//! the fd-delegation path (`F_DUPFD_CLOEXEC` dups the raw TCP fd before
+//! any protocol state exists), and the single-digit RTT assumptions
+//! used by the view-change timer all rest on a FIFO byte stream between
+//! a bounded set of replicas. A datagram-oriented or gateway-terminated
+//! transport violates one or more of those assumptions.
 //!
-//! Runs only on shard 0. On every accepted `Ping` frame the listener
-//! hands the accepted `TcpStream` to an `on_accepted` callback provided
-//! by the shard bootstrap, which dup-and-ships the fd to the owning
-//! shard via the inter-shard channel
-//! (see `shard::coordinator::ShardZeroCoordinator`). This module no
-//! longer installs writer / reader tasks itself.
+//! Runs only on shard 0. The listener reads NOTHING from an accepted
+//! connection: every accepted `TcpStream` is handed as-is to the
+//! `on_accepted` callback provided by the shard bootstrap, which
+//! dup-and-ships the raw fd to the owning shard via the inter-shard
+//! channel (blind delegation - the peer id is unknown until the owning
+//! shard reads the `ReplicaHello`). The owning shard runs the full
+//! handshake (see [`crate::replica::handshake`]) and installs the
+//! connection locally, so no connection state ever crosses shards.
+//!
+//! Admission control also lives in the callback: it acquires a slot
+//! from the shard-0-global in-flight handshake cap
+//! (`IggyMessageBus::try_acquire_replica_handshake_slot`) and drops the
+//! connection when the cap is reached. The slot is released by the
+//! owning shard's handshake-outcome ack, with a deadline-based expiry
+//! as the lost-ack backstop.
 //!
 //! Duplicate connections are eliminated by directionality: each replica
 //! only dials peers with strictly greater ids and only accepts inbound
-//! from peers with strictly lower ids. No race, no tiebreaker.
-//!
-//! # Trust boundary (regression vs prior MAC)
-//!
-//! The current listener has NO transport-layer authentication. The
-//! `Ping` frame announces the dialing replica's id in plaintext; the
-//! bus uses it to key the registry and to enforce the directional rule
-//! (only inbound from peers with strictly lower ids), but cannot
-//! cryptographically verify the announced id. This is a hard regression
-//! versus the previous BLAKE3-keyed MAC over `Ping::reserved_command`
-//! bytes paired with a per-peer nonce ring (see TODO at the end of this
-//! module preamble). An attacker on the wire who learns the cluster id
-//! can register as any peer with a smaller replica id and feed forged
-//! consensus traffic until `server-ng` rejects it at the application
-//! layer.
-//!
-//! Until `LOGIN_REPLICA` lands and re-establishes per-peer mutual
-//! authentication, operators MUST deploy the replica port on a trusted
-//! L2 boundary (cluster-local VPC, dedicated private subnet, encrypted
-//! overlay such as `WireGuard`, or an air-gapped management network).
-//! Treating "no public exposure of the replica port" as the only gate
-//! is the supported configuration; do NOT assume any authentication
-//! beyond that boundary.
-//!
-//! Identity is established post-handshake by the caller (`server-ng`)
-//! via the future `LOGIN_REPLICA` command that carries the cluster's
-//! shared secret. Until that command succeeds the caller MUST treat the
-//! replica as unauthenticated and refuse to honor consensus messages
-//! from it.
-//!
-//! TLS / encryption is NOT provided here: the trusted-boundary
-//! deployment requirement above implicitly assumes the operator
-//! supplies link-level confidentiality (VPC-level encryption, overlay
-//! tunnel, or physical isolation).
-//
-// TODO(hubcio): the prior BLAKE3-keyed MAC over the `Ping` frame's
-// `reserved_command` bytes plus the per-peer nonce ring used to gate
-// the registry insert at the transport layer. That gate is gone and
-// `LOGIN_REPLICA` is not yet implemented, so the listener currently
-// accepts any peer that knows the cluster id and directional rule.
-// Restore the transport-layer MAC, or land `LOGIN_REPLICA`, before
-// relying on the network boundary alone.
+//! from peers with strictly lower ids. No race, no tiebreaker. The
+//! directional check itself runs on the owning shard, inside the
+//! handshake.
 
-use crate::framing;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::bind_reusable_tcp_listener;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
-use compio::net::{TcpListener, TcpStream};
+use compio::net::TcpListener;
 use futures::FutureExt;
-use iggy_binary_protocol::Command2;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Handler for inbound replica consensus messages.
 ///
@@ -116,41 +82,16 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
     Ok((listener, actual))
 }
 
-/// Run the inbound replica listener accept loop until the shutdown token fires.
+/// Run the inbound replica listener accept loop until the shutdown token
+/// fires.
 ///
-/// Every accepted connection that passes the plaintext `Ping` frame
-/// check fires the `on_accepted` callback; the callback owns the
-/// accepted stream from that point on.
-///
-/// Each [`TcpStream`] returned by `accept()` is handed to its own
-/// spawned task that runs the `handshake_read` step under
-/// [`compio::time::timeout(handshake_grace, ...)`]. Spawning per-incoming
-/// is load-bearing: a single hostile or merely slow peer would otherwise
-/// hold the entire replica accept loop behind its handshake `read` until
-/// peer EOF, and subsequent peers would not be served. Mirrors the
-/// client-plane defense in [`crate::client_listener::quic`].
-///
-/// `handshake_grace` bounds the wall-clock time each spawned handshake
-/// task may take before it is cancelled and the connection dropped;
-/// threaded from [`crate::MessageBusConfig::handshake_grace`] by the
-/// bootstrap caller.
-///
-/// Completed handshake handles are reaped opportunistically at the top
-/// of the loop so the in-flight handle vector stays bounded for the
-/// listener's lifetime; remaining handles are awaited on shutdown so
-/// in-progress handshakes get a chance to finish (or hit the grace
-/// timeout) before the listener fully exits.
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
-pub async fn run(
-    listener: TcpListener,
-    token: ShutdownToken,
-    cluster_id: u128,
-    self_id: u8,
-    replica_count: u8,
-    on_accepted: AcceptedReplicaFn,
-    max_message_size: usize,
-    handshake_grace: Duration,
-) {
+/// Every accepted connection fires `on_accepted` immediately; no byte is
+/// read here. The callback owns the accepted stream and is responsible
+/// for the in-flight cap check and the fd delegation (see the module
+/// doc). The loop never awaits anything but `accept()`, so a hostile or
+/// slow peer cannot stall admission of subsequent peers.
+#[allow(clippy::future_not_send)]
+pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: AcceptedReplicaFn) {
     info!(
         "Replica listener accepting on {:?}",
         listener.local_addr().ok()
@@ -163,43 +104,8 @@ pub async fn run(
             }
             result = listener.accept().fuse() => {
                 match result {
-                    Ok((stream, peer_addr)) => {
-                        let on_accepted = on_accepted.clone();
-                        // Fire-and-forget: compio 0.19's `JoinHandle` has no
-                        // `is_finished`, so the prior bounded-handle sweep is
-                        // gone. `detach()` lets each handshake task self-manage;
-                        // on shutdown the listener drops, failing in-flight
-                        // handshakes so detached tasks exit.
-                        compio::runtime::spawn(async move {
-                            let mut stream = stream;
-                            let res = compio::time::timeout(
-                                handshake_grace,
-                                handshake_read(
-                                    &mut stream,
-                                    cluster_id,
-                                    self_id,
-                                    replica_count,
-                                    max_message_size,
-                                ),
-                            )
-                            .await;
-                            match res {
-                                Ok(Ok(peer_id)) => {
-                                    on_accepted(stream, peer_id);
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(%peer_addr, "replica handshake failed: {e}");
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        %peer_addr,
-                                        grace = ?handshake_grace,
-                                        "replica handshake exceeded handshake_grace; closing connection"
-                                    );
-                                }
-                            }
-                        })
-                        .detach();
+                    Ok((stream, _peer_addr)) => {
+                        on_accepted(stream);
                     }
                     Err(e) => {
                         error!("Replica listener accept failed: {e}");
@@ -208,32 +114,4 @@ pub async fn run(
             }
         }
     }
-}
-
-/// Read the 256 B `Ping` frame, enforce command + cluster match and the
-/// directional rule, return the announced replica id. No transport-level
-/// authentication.
-#[allow(clippy::future_not_send)]
-async fn handshake_read(
-    stream: &mut TcpStream,
-    our_cluster: u128,
-    self_id: u8,
-    replica_count: u8,
-    max_message_size: usize,
-) -> Result<u8, IggyError> {
-    let msg = framing::read_message(stream, max_message_size).await?;
-    let header = msg.header();
-    if header.command != Command2::Ping {
-        return Err(IggyError::InvalidCommand);
-    }
-    if header.cluster != our_cluster {
-        return Err(IggyError::InvalidCommand);
-    }
-    // Directional rule: a replica only accepts inbound from peers with
-    // strictly lower ids. The peer is responsible for not dialing us if
-    // it has the higher id; this is just defensive.
-    if header.replica >= replica_count || header.replica >= self_id {
-        return Err(IggyError::InvalidCommand);
-    }
-    Ok(header.replica)
 }

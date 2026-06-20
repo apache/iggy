@@ -21,11 +21,20 @@ description: >-
   pre-installed toolchains the Iggy build does not use.
   Logs reclaimed GiB and elapsed seconds.
 
+inputs:
+  aggressive:
+    description: >-
+      When "true", run jlumbroso/free-disk-space for a deep cleanup
+      (~30+ GiB) instead of the light built-in removal (~12 GiB).
+      Enable only for disk-heavy jobs (e.g. llvm-cov instrumented builds).
+    required: false
+    default: "false"
+
 runs:
   using: "composite"
   steps:
-    - name: Cleanup disk space
-      if: runner.os == 'Linux'
+    - name: Cleanup disk space (light)
+      if: runner.os == 'Linux' && inputs.aggressive != 'true'
       shell: bash
       run: |
         echo "Disk space before cleanup:"
@@ -51,3 +60,11 @@ runs:
         echo "::notice::Reclaimed ${reclaimed_gib} GiB in $((end - start))s"
         echo "Disk space after cleanup:"
         df -h
+
+    - name: Cleanup disk space (aggressive)
+      if: runner.os == 'Linux' && inputs.aggressive == 'true'
+      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+      with:
+        # Preserve the .NET SDK when actions/setup-dotnet provisioned it
+        # (DOTNET_ROOT set); removing it breaks subsequent dotnet invocations.
+        dotnet: ${{ env.DOTNET_ROOT == '' }}

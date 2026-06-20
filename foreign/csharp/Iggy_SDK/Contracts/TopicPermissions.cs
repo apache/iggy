@@ -100,7 +100,7 @@ public sealed class TopicPermissions
     ///     <para>Allowed methods:</para>
     ///     <list type="bullet">
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyPublisher.SendMessagesAsync" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyPublisher.SendMessagesAsync(Apache.Iggy.Identifier, Apache.Iggy.Identifier, Apache.Iggy.Kinds.Partitioning, System.Collections.Generic.IList{Apache.Iggy.Messages.Message}, System.Threading.CancellationToken)" />
     ///         </item>
     ///         <item>
     ///             <see cref="Apache.Iggy.IggyClient.IIggyPublisher.FlushUnsavedBufferAsync" />

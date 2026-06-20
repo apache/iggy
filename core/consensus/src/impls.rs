@@ -914,7 +914,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // push. Without this, a sibling on_request that runs while on_replicate
         // awaits journal.append would project a duplicate op + parent.
         // The late set in on_replicate (metadata.rs / iggy_partition.rs) is
-        // idempotent on primary and still needed on backup.
+        // backup-only for the same reason: re-setting on primary would rewind
+        // past a sibling prepare pipelined during the append await.
         self.sequencer.set_sequence(header.op);
         self.set_last_prepare_checksum(header.checksum);
 
@@ -1318,16 +1319,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
     fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
+        // TODO(prepare-timeout): adopt TigerBeetle's timer lifecycle
+        // (replica.zig `on_prepare_ok` / `on_prepare_timeout`). They
+        // disarm in the ack path the moment quorum drains the pipeline
+        // (`stop()`) and rearm for the next-oldest prepare when one
+        // commits with others still pending (`reset()`), giving the
+        // invariant "ticking iff pipeline non-empty" (asserted in their
+        // timeout handler) and a timeout that always measures the
+        // current oldest prepare's age. Ours arms once per idle->busy
+        // transition and disarms lazily below, so a prepare pushed late
+        // into an armed window can be retransmitted before it is
+        // `PREPARE_TICKS` old. They also special-case "all remote acks
+        // present, own journal write is the laggard" by retrying the
+        // local write instead of retransmitting.
+        //
+        // Every early return below must stop or back off the timeout.
+        // `fired()` stays true until the timer is rearmed, so returning
+        // with the fired state intact turns the next pipeline push into
+        // an instant spurious retransmit on the following tick (the push
+        // sees `is_ticking` and does not restart the timer).
         if !self.is_primary() || self.status.get() != Status::Normal {
+            self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
             return Vec::new();
         }
 
         if self.pipeline.borrow().is_empty() {
+            // Everything committed before the timeout fired; the next
+            // push restarts the timer from zero.
+            self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
             return Vec::new();
         }
 
         let targets = self.retransmit_targets();
         if targets.is_empty() {
+            // In-flight ops all have their acks; re-check after backoff.
+            self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
             return Vec::new();
         }
 

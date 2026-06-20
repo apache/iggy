@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 //! Wire-response builders for the non-replicated read path.
 //!
@@ -32,13 +30,13 @@ use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, POLL_MESSAGES_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::requests::messages::{PollMessagesRequest, SendMessagesHeader};
+use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
@@ -66,7 +64,9 @@ use iggy_binary_protocol::{
 };
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::PollFragments;
 use server_common::Message;
+use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
@@ -220,7 +220,7 @@ fn resolve_send_messages_namespace(
     )
 }
 
-fn resolve_partition_namespace(
+pub(crate) fn resolve_partition_namespace(
     shard: &Rc<ServerNgShard>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -289,13 +289,6 @@ pub(crate) fn build_non_replicated_response(
                 response.map_or(NonReplicatedResponse::Empty, |response| {
                     NonReplicatedResponse::Bytes(response.to_bytes())
                 })
-            })
-        }
-        POLL_MESSAGES_CODE => {
-            let request =
-                PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(NonReplicatedResponse::EmptyPolledMessages {
-                partition_id: request.partition_id.unwrap_or(0),
             })
         }
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
@@ -594,7 +587,6 @@ fn partition_response(
 
 pub(crate) enum NonReplicatedResponse {
     Empty,
-    EmptyPolledMessages { partition_id: u32 },
     Bytes(Bytes),
 }
 
@@ -608,13 +600,6 @@ impl NonReplicatedResponse {
     ) -> Message<ReplyHeader> {
         match self {
             Self::Empty => build_empty_reply(request_header, client_id, session, commit),
-            Self::EmptyPolledMessages { partition_id } => {
-                build_reply_with_body(request_header, client_id, session, commit, 16, |body| {
-                    body[..4].copy_from_slice(&partition_id.to_le_bytes());
-                    body[4..12].copy_from_slice(&0u64.to_le_bytes());
-                    body[12..16].copy_from_slice(&0u32.to_le_bytes());
-                })
-            }
             Self::Bytes(body) => {
                 build_reply_from_bytes(request_header, client_id, session, commit, &body)
             }
@@ -745,4 +730,126 @@ pub(crate) fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
         .consensus
         .as_ref()
         .map_or(0, VsrConsensus::commit_max)
+}
+
+/// Size of the in-storage (`IggyMessage2`) per-message header inside a
+/// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
+/// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
+/// + reserved(8). See `server_common::send_messages2::from_legacy_request`.
+const STORED_MESSAGE_HEADER_SIZE: usize = 48;
+
+/// Build the `PolledMessages` reply body from the owning shard's poll
+/// fragments.
+///
+/// Fragments carry the stored `SendMessages2` batches: a 256-byte command
+/// header followed by `IggyMessage2`-format messages
+/// (`[48B header][payload][user_headers]`, offsets/timestamps delta-encoded
+/// against the batch). The SDK decodes the legacy wire format
+/// (`[64B header][payload][user_headers]`, absolute offsets); the message
+/// sections share the legacy order, so only the header is re-encoded here
+/// and the section bytes copy through contiguously.
+///
+/// Body layout: `[partition_id:4][current_offset:8][count:4][messages...]`.
+pub(crate) fn build_polled_messages_body(
+    partition_id: u32,
+    current_offset: u64,
+    fragments: PollFragments,
+) -> Result<Bytes, IggyError> {
+    // Batches may arrive split across fragments (rewritten command header +
+    // sliced blob); concatenate into one stream before walking batches.
+    let mut stream: Vec<u8> = Vec::new();
+    for fragment in fragments {
+        let frozen = fragment.into_frozen();
+        stream.extend_from_slice(frozen.as_slice());
+    }
+
+    let mut messages: Vec<u8> = Vec::with_capacity(stream.len());
+    let mut count: u32 = 0;
+    let mut position = 0usize;
+    while position < stream.len() {
+        let batch = SendMessages2Header::decode(&stream[position..])?;
+        let batch_end = position
+            .checked_add(
+                usize::try_from(batch.batch_length).map_err(|_| IggyError::InvalidCommand)?,
+            )
+            .ok_or(IggyError::InvalidCommand)?;
+        if batch_end > stream.len() {
+            return Err(IggyError::InvalidCommand);
+        }
+        let mut cursor = position + COMMAND_HEADER_SIZE;
+        while cursor < batch_end {
+            if cursor + STORED_MESSAGE_HEADER_SIZE > batch_end {
+                return Err(IggyError::InvalidCommand);
+            }
+            let header = &stream[cursor..cursor + STORED_MESSAGE_HEADER_SIZE];
+            let checksum = &header[0..8];
+            let id = &header[8..24];
+            let offset_delta = u32::from_le_bytes(header[24..28].try_into().expect("4-byte slice"));
+            let timestamp_delta =
+                u32::from_le_bytes(header[28..32].try_into().expect("4-byte slice"));
+            let user_headers_length =
+                u32::from_le_bytes(header[32..36].try_into().expect("4-byte slice")) as usize;
+            let payload_length =
+                u32::from_le_bytes(header[36..40].try_into().expect("4-byte slice")) as usize;
+
+            let sections_start = cursor + STORED_MESSAGE_HEADER_SIZE;
+            let sections_end = sections_start + payload_length + user_headers_length;
+            if sections_end > batch_end {
+                return Err(IggyError::InvalidCommand);
+            }
+
+            let offset = batch.base_offset + u64::from(offset_delta);
+            // `base_timestamp` is the flat broker append time stamped once per
+            // batch; `timestamp_delta` is a per-message delta against the
+            // producer origin, so it only applies to `origin_timestamp`. Adding
+            // it to the broker base would mix two clocks.
+            let timestamp = batch.base_timestamp;
+            let origin_timestamp = batch.origin_timestamp + u64::from(timestamp_delta);
+
+            messages.extend_from_slice(checksum);
+            messages.extend_from_slice(id);
+            messages.extend_from_slice(&offset.to_le_bytes());
+            messages.extend_from_slice(&timestamp.to_le_bytes());
+            messages.extend_from_slice(&origin_timestamp.to_le_bytes());
+            messages.extend_from_slice(
+                &u32::try_from(user_headers_length)
+                    .expect("length came from u32")
+                    .to_le_bytes(),
+            );
+            messages.extend_from_slice(
+                &u32::try_from(payload_length)
+                    .expect("length came from u32")
+                    .to_le_bytes(),
+            );
+            messages.extend_from_slice(&0u64.to_le_bytes()); // reserved
+            // Stored sections are already in legacy order
+            // (`[payload][user_headers]`): copy through contiguously.
+            messages.extend_from_slice(&stream[sections_start..sections_end]);
+
+            count += 1;
+            cursor = sections_end;
+        }
+        position = batch_end;
+    }
+
+    let mut body = Vec::with_capacity(16 + messages.len());
+    body.extend_from_slice(&partition_id.to_le_bytes());
+    body.extend_from_slice(&current_offset.to_le_bytes());
+    body.extend_from_slice(&count.to_le_bytes());
+    body.extend_from_slice(&messages);
+    Ok(Bytes::from(body))
+}
+
+/// Build the `ConsumerOffsetResponse` reply body:
+/// `[partition_id:4][current_offset:8][stored_offset:8]`.
+pub(crate) fn build_consumer_offset_body(
+    partition_id: u32,
+    current_offset: u64,
+    stored_offset: u64,
+) -> Bytes {
+    let mut body = Vec::with_capacity(20);
+    body.extend_from_slice(&partition_id.to_le_bytes());
+    body.extend_from_slice(&current_offset.to_le_bytes());
+    body.extend_from_slice(&stored_offset.to_le_bytes());
+    Bytes::from(body)
 }

@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
@@ -62,16 +61,19 @@ impl SendMessage {
     /// This method allows for the creation of a `SendMessage` instance
     /// directly from Python using the provided string or bytes data.
     #[new]
-    pub fn new(py: Python, data: PyMessagePayload) -> Self {
-        // TODO: handle errors
+    pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
         let inner = match data {
-            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data).unwrap(),
+            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
             PyMessagePayload::Bytes(data) => {
-                let bytes = Bytes::from(data.extract::<Vec<u8>>(py).unwrap());
-                RustIggyMessage::builder().payload(bytes).build().unwrap()
+                let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
+                RustIggyMessage::builder()
+                    .payload(bytes)
+                    .build()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?
             }
         };
-        Self { inner }
+        Ok(Self { inner })
     }
 }
 

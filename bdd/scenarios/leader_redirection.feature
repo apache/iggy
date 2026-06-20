@@ -16,7 +16,6 @@
 # under the License.
 
 @requires-leader-awareness
-@rust
 Feature: Leader-Aware Client Connections
   As a developer using Apache Iggy with clustering
   I want my SDK clients to automatically connect to the leader node

@@ -1,20 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -78,6 +77,21 @@ pub const SHUTDOWN_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// at 5s so Ctrl-C latency stays bounded regardless of config.
 pub const SHUTDOWN_POLL_INTERVAL_MAX: Duration = Duration::from_secs(5);
 
+/// Default safety-tick cadence for the partition reconciliation loop.
+/// The reconciler also wakes on every `LifecycleFrame::MetadataCommitTick`
+/// broadcast by shard 0; this fallback covers dropped wake-ups (the wake
+/// channel is intentionally capacity-1) and the initial post-bootstrap
+/// convergence window before shard 0's first tick. One second is
+/// invisible to operators yet keeps idle clusters from burning CPU
+/// re-reading the same target snapshot.
+pub const DEFAULT_RECONCILE_PERIODIC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Hard upper bound on `reconcile_periodic_interval`. A tick longer
+/// than ~30s makes post-failure recovery latency operator-visible; the
+/// cap reins in pathological typos without disturbing reasonable
+/// production values.
+pub const RECONCILE_PERIODIC_INTERVAL_MAX: Duration = Duration::from_secs(30);
+
 const fn default_inbox_capacity() -> usize {
     DEFAULT_INBOX_CAPACITY
 }
@@ -88,6 +102,10 @@ fn default_shutdown_drain_timeout() -> IggyDuration {
 
 fn default_shutdown_poll_interval() -> IggyDuration {
     IggyDuration::new(DEFAULT_SHUTDOWN_POLL_INTERVAL)
+}
+
+fn default_reconcile_periodic_interval() -> IggyDuration {
+    IggyDuration::new(DEFAULT_RECONCILE_PERIODIC_INTERVAL)
 }
 
 #[serde_as]
@@ -137,6 +155,16 @@ pub struct ShardingConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub shutdown_poll_interval: IggyDuration,
+    /// Safety-tick cadence for the partition reconciliation loop; the
+    /// reconciler also wakes immediately on every
+    /// `LifecycleFrame::MetadataCommitTick` from shard 0. See
+    /// [`DEFAULT_RECONCILE_PERIODIC_INTERVAL`] for the rationale; values
+    /// above [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the
+    /// validator.
+    #[serde(default = "default_reconcile_periodic_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub reconcile_periodic_interval: IggyDuration,
 }
 
 impl Default for ShardingConfig {
@@ -146,6 +174,7 @@ impl Default for ShardingConfig {
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
             shutdown_drain_timeout: default_shutdown_drain_timeout(),
             shutdown_poll_interval: default_shutdown_poll_interval(),
+            reconcile_periodic_interval: default_reconcile_periodic_interval(),
         }
     }
 }

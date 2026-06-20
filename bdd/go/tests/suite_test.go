@@ -18,27 +18,44 @@
 package tests
 
 import (
+	"os"
 	"testing"
 
 	"github.com/cucumber/godog"
 )
 
 func TestFeatures(t *testing.T) {
-	suites := []godog.TestSuite{{
-		ScenarioInitializer: initBasicMessagingScenario,
-		Options: &godog.Options{
-			Format:   "pretty",
-			Paths:    []string{"../../scenarios/basic_messaging.feature"},
-			TestingT: t,
-		},
-	}, {
-		ScenarioInitializer: initLeaderRedirectionScenario,
-		Options: &godog.Options{
-			Format:   "pretty",
-			Paths:    []string{"../../scenarios/leader_redirection.feature"},
-			TestingT: t,
-		},
-	}}
+	feature := os.Getenv("BDD_FEATURE")
+	if feature == "" {
+		feature = "all"
+	}
+
+	var suites []godog.TestSuite
+	if feature == "all" || feature == "basic_messaging" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initBasicMessagingScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/basic_messaging.feature"},
+				TestingT: t,
+			},
+		})
+	}
+	if feature == "all" || feature == "leader_redirection" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initLeaderRedirectionScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/leader_redirection.feature"},
+				TestingT: t,
+			},
+		})
+	}
+
+	if len(suites) == 0 {
+		t.Fatalf("unknown BDD_FEATURE=%q", feature)
+	}
+
 	for _, s := range suites {
 		if s.Run() != 0 {
 			t.Fatal("failing feature tests")
