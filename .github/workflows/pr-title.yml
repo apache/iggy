@@ -95,3 +95,4 @@ jobs:
             storage
             simulator
             configs
+            gateways

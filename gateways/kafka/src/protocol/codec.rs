@@ -18,8 +18,14 @@
 //! Low-level Kafka primitive encoders/decoders (ported wire codec).
 
 #![allow(clippy::missing_const_for_fn, clippy::bool_to_int_with_if)]
-#![allow(clippy::missing_errors_doc, clippy::cast_sign_loss, clippy::must_use_candidate,clippy::missing_panics_doc, clippy::cast_possible_truncation,clippy::cast_lossless)]
-
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::cast_sign_loss,
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless
+)]
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -297,6 +303,19 @@ impl Encoder {
         Ok(())
     }
 
+    /// Infallible variant for response-encoding paths where the string originated from a decoded
+    /// Kafka request and is therefore already bounded to `i16::MAX` bytes.
+    pub fn write_nullable_string_unchecked(&mut self, v: Option<&str>) {
+        match v {
+            None => self.write_i16(-1),
+            Some(s) => {
+                debug_assert!(i16::try_from(s.len()).is_ok());
+                self.write_i16(i16::try_from(s.len()).expect("caller guarantees len <= i16::MAX"));
+                self.bytes.put_slice(s.as_bytes());
+            }
+        }
+    }
+
     /// Compact nullable string (flexible versions): varint(len+1), 0 for null.
     pub fn write_compact_nullable_string(&mut self, v: Option<&str>) {
         match v {
@@ -306,6 +325,11 @@ impl Encoder {
                 self.bytes.put_slice(s.as_bytes());
             }
         }
+    }
+
+    /// Write a null bytes field (i32 -1). Infallible; use instead of `write_nullable_bytes(None)`.
+    pub fn write_null_bytes(&mut self) {
+        self.write_i32(-1);
     }
 
     /// Legacy nullable bytes: i32 length prefix, -1 for null.

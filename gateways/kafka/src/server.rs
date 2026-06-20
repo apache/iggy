@@ -29,13 +29,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_REQUEST, encode_error_only_response, handle_request,
+    BrokerAdvertise, DEFAULT_KAFKA_PORT, ERROR_INVALID_REQUEST, encode_error_only_response,
+    handle_request,
 };
 use crate::protocol::codec::Decoder;
 use crate::protocol::header::{
     RequestHeader, ResponseHeader, request_header_version, response_header_version,
 };
 use std::io;
+
+const READ_CHUNK: usize = 65536;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -53,7 +56,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:9093".to_string(),
+            bind_addr: format!("127.0.0.1:{DEFAULT_KAFKA_PORT}"),
             advertised_host: None,
             advertised_port: None,
             max_frame_size: 8 * 1024 * 1024,
@@ -64,36 +67,35 @@ impl Default for ServerConfig {
 }
 
 impl BrokerAdvertise {
-    /// Resolve the broker endpoint advertised in Metadata from listener config.
+    /// Resolve the broker endpoint advertised in Metadata.
+    ///
+    /// `local_addr` is the address the listener is actually bound to (from `listener.local_addr()`).
     ///
     /// # Errors
     ///
-    /// Returns an error when `bind_addr` is invalid, `advertised_host` is empty, or the listener
-    /// binds to a wildcard address without an explicit advertised host.
-    pub fn from_server_config(config: &ServerConfig) -> std::result::Result<Self, String> {
-        let bind = config
-            .bind_addr
-            .parse::<SocketAddr>()
-            .map_err(|e| format!("invalid bind address `{}`: {e}", config.bind_addr))?;
-
+    /// Returns `InvalidConfig` when `advertised_host` is empty or the listener binds to a wildcard
+    /// without an explicit advertised host.
+    pub fn from_server_config(config: &ServerConfig, local_addr: SocketAddr) -> Result<Self> {
         let port = config
             .advertised_port
-            .map_or_else(|| i32::from(bind.port()), i32::from);
+            .map_or_else(|| i32::from(local_addr.port()), i32::from);
 
         let host = if let Some(ref advertised) = config.advertised_host {
             let trimmed = advertised.trim();
             if trimmed.is_empty() {
-                return Err("KAFKA_ADVERTISED_HOST must not be empty".into());
+                return Err(KafkaProtocolError::InvalidConfig(
+                    "KAFKA_ADVERTISED_HOST must not be empty".into(),
+                ));
             }
             trimmed.to_string()
-        } else if bind.ip().is_unspecified() {
-            return Err(
+        } else if local_addr.ip().is_unspecified() {
+            return Err(KafkaProtocolError::InvalidConfig(
                 "binding to a wildcard address (0.0.0.0 or ::) requires KAFKA_ADVERTISED_HOST \
                  to be set to a reachable hostname or IP for Metadata broker advertisement"
                     .into(),
-            );
+            ));
         } else {
-            bind.ip().to_string()
+            local_addr.ip().to_string()
         };
 
         Ok(Self { host, port })
@@ -114,18 +116,25 @@ impl KafkaServer {
 
     /// Accept Kafka wire connections until `shutdown` fires, then drain in-flight tasks.
     ///
+    /// `listener` must already be bound by the caller. This lets tests and `main` bind
+    /// the port before spawning the task, eliminating the TOCTOU race of bind-drop-rebind.
+    ///
     /// # Errors
     ///
-    /// Returns an error if binding fails or a non-transient `accept()` error occurs.
-    pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
-        let broker = Arc::new(
-            BrokerAdvertise::from_server_config(&self.config)
-                .map_err(KafkaProtocolError::InvalidConfig)?,
-        );
-        let listener = TcpListener::bind(&self.config.bind_addr).await?;
+    /// Returns an error on invalid config or a non-transient `accept()` error.
+    pub async fn run(
+        self,
+        listener: TcpListener,
+        mut shutdown: broadcast::Receiver<()>,
+    ) -> Result<()> {
+        let local_addr = listener.local_addr()?;
+        let broker = Arc::new(BrokerAdvertise::from_server_config(
+            &self.config,
+            local_addr,
+        )?);
         info!(
             "kafka listener bound on {} (advertised as {}:{})",
-            self.config.bind_addr, broker.host, broker.port
+            local_addr, broker.host, broker.port
         );
 
         let tracker = TaskTracker::new();
@@ -167,6 +176,10 @@ impl KafkaServer {
                             });
                         }
                         Err(e) if is_transient_accept_error(&e) => {
+                            // Brief backoff on fd exhaustion to avoid busy-spinning.
+                            if matches!(e.raw_os_error(), Some(23 | 24)) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
                             warn!(%e, "transient accept error, continuing");
                         }
                         Err(e) => return Err(e.into()),
@@ -311,8 +324,12 @@ pub async fn read_frame(
     max_frame_size: usize,
     read_timeout: Duration,
 ) -> Result<bytes::Bytes> {
+    // Single deadline for both the length-prefix read and the body read. Without this, a
+    // slow-drip sender could hold a connection open for 2x read_timeout by sending one byte
+    // per timeout window.
+    let deadline = tokio::time::Instant::now() + read_timeout;
     let mut len_buf = [0u8; 4];
-    timeout(read_timeout, stream.read_exact(&mut len_buf))
+    timeout_at(deadline, stream.read_exact(&mut len_buf))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
 
@@ -324,7 +341,6 @@ pub async fn read_frame(
     let frame_len =
         usize::try_from(frame_len_i32).map_err(|_| KafkaProtocolError::FrameTooLarge {
             max_bytes: max_frame_size,
-            // Positive i32 that does not fit in `usize` (e.g. 16-bit targets).
             actual_bytes: usize::MAX,
         })?;
     if frame_len > max_frame_size {
@@ -334,12 +350,11 @@ pub async fn read_frame(
         });
     }
 
-    // read_buf fills BytesMut spare capacity without zero-initializing it first.
-    // Single deadline for the entire body so a slow-drip sender can't stall indefinitely
-    // by delivering one byte per timeout window.
-    let deadline = tokio::time::Instant::now() + read_timeout;
-    let mut data = BytesMut::with_capacity(frame_len);
+    // Reserve in 64 KB increments so a max-size frame (8 MB by default) does not trigger a
+    // single large upfront allocation before any payload bytes have arrived.
+    let mut data = BytesMut::new();
     while data.len() < frame_len {
+        data.reserve((frame_len - data.len()).min(READ_CHUNK));
         match timeout_at(deadline, stream.read_buf(&mut data)).await {
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout").into()),
             Ok(Ok(0)) => {
@@ -351,6 +366,10 @@ pub async fn read_frame(
             Ok(Ok(_)) => {}
         }
     }
+    // read_buf may have written past frame_len if the OS returned more bytes than we
+    // reserved (capacity can round up). Truncate so pipelined frames don't bleed into
+    // decoder.read_bytes(remaining()) at the call site.
+    data.truncate(frame_len);
     Ok(data.freeze())
 }
 

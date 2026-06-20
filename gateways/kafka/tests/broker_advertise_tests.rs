@@ -17,30 +17,11 @@
 
 //! `BrokerAdvertise` parsing and metadata reflection.
 
+use std::net::SocketAddr;
+
 use iggy_gateway_kafka::ServerConfig;
 use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, BrokerAdvertise, handle_request};
 use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
-
-#[test]
-fn from_bind_addr_parses_ipv4_and_port() {
-    let b = BrokerAdvertise::from_bind_addr("192.168.1.10:19092");
-    assert_eq!(b.host, "192.168.1.10");
-    assert_eq!(b.port, 19092);
-}
-
-#[test]
-fn from_bind_addr_parses_ipv6() {
-    let b = BrokerAdvertise::from_bind_addr("[::1]:9093");
-    assert_eq!(b.host, "::1");
-    assert_eq!(b.port, 9093);
-}
-
-#[test]
-fn from_bind_addr_invalid_falls_back_to_default() {
-    let b = BrokerAdvertise::from_bind_addr("not-a-socket-addr");
-    assert_eq!(b.host, "127.0.0.1");
-    assert_eq!(b.port, 9093);
-}
 
 #[test]
 fn default_matches_standard_gateway_port() {
@@ -50,8 +31,11 @@ fn default_matches_standard_gateway_port() {
 }
 
 #[test]
-fn metadata_reflects_parsed_bind_addr() {
-    let broker = BrokerAdvertise::from_bind_addr("203.0.113.7:9093");
+fn metadata_reflects_broker_addr() {
+    let broker = BrokerAdvertise {
+        host: "203.0.113.7".to_string(),
+        port: 9093,
+    };
     let mut req = Encoder::with_capacity(4);
     req.write_i32(0);
     let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker);
@@ -72,7 +56,8 @@ fn from_server_config_uses_explicit_advertised_host_on_wildcard_bind() {
         advertised_host: Some("kafka.internal".to_string()),
         ..ServerConfig::default()
     };
-    let broker = BrokerAdvertise::from_server_config(&config).expect("valid config");
+    let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
+    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
     assert_eq!(broker.host, "kafka.internal");
     assert_eq!(broker.port, 9093);
 }
@@ -83,8 +68,9 @@ fn from_server_config_rejects_wildcard_bind_without_advertised_host() {
         bind_addr: "0.0.0.0:9093".to_string(),
         ..ServerConfig::default()
     };
-    let err = BrokerAdvertise::from_server_config(&config).unwrap_err();
-    assert!(err.contains("KAFKA_ADVERTISED_HOST"));
+    let local_addr: SocketAddr = "0.0.0.0:9093".parse().unwrap();
+    let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
+    assert!(err.to_string().contains("KAFKA_ADVERTISED_HOST"));
 }
 
 #[test]
@@ -93,7 +79,8 @@ fn from_server_config_uses_bind_ip_for_non_wildcard_listener() {
         bind_addr: "192.168.1.10:19092".to_string(),
         ..ServerConfig::default()
     };
-    let broker = BrokerAdvertise::from_server_config(&config).expect("valid config");
+    let local_addr: SocketAddr = "192.168.1.10:19092".parse().unwrap();
+    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
     assert_eq!(broker.host, "192.168.1.10");
     assert_eq!(broker.port, 19092);
 }
@@ -106,7 +93,8 @@ fn from_server_config_honors_advertised_port_override() {
         advertised_port: Some(19093),
         ..ServerConfig::default()
     };
-    let broker = BrokerAdvertise::from_server_config(&config).expect("valid config");
+    let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
+    let broker = BrokerAdvertise::from_server_config(&config, local_addr).expect("valid config");
     assert_eq!(broker.host, "broker.example.com");
     assert_eq!(broker.port, 19093);
 }

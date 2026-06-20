@@ -31,7 +31,6 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    drop(listener);
 
     let config = ServerConfig {
         bind_addr: addr.to_string(),
@@ -44,9 +43,8 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let server = KafkaServer::new(config);
     tokio::spawn(async move {
-        let _ = server.run(shutdown_rx).await;
+        let _ = server.run(listener, shutdown_rx).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     (addr, shutdown_tx)
 }

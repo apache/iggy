@@ -1,11 +1,11 @@
-# Kafka gateway (`iggy_gateway_kafka`)
+# Kafka gateway (`iggy-gateway-kafka`)
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
 ## Run
 
 ```bash
-cargo run -p iggy_gateway_kafka --bin iggy-kafka-gateway
+cargo run -p iggy-gateway-kafka
 ```
 
 Default bind: `127.0.0.1:9093`. Override with `KAFKA_BIND_ADDR` (e.g. `0.0.0.0:9093`).
@@ -13,7 +13,7 @@ Default bind: `127.0.0.1:9093`. Override with `KAFKA_BIND_ADDR` (e.g. `0.0.0.0:9
 ## Test
 
 ```bash
-cargo test -p iggy_gateway_kafka
+cargo test -p iggy-gateway-kafka
 ```
 
 103 regression tests across 12 suites — see [docs/TEST_SUITE.md](docs/TEST_SUITE.md) for the full catalog.

@@ -6753,6 +6753,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy-gateway-kafka"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iggy-mcp"
 version = "0.4.1-edge.1"
 dependencies = [
@@ -7169,18 +7181,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "iggy_gateway_kafka"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
