@@ -69,8 +69,6 @@ query = { match_all = {} }
 | `circuit_breaker_threshold` | `u32` | `5` | Consecutive poll failures before circuit opens |
 | `circuit_breaker_cool_down` | `String` | `"60s"` | Duration to skip polls when circuit is open |
 
-See [docs/RESILIENCE.md](docs/RESILIENCE.md) for retry, circuit breaker, at-least-once, and backfill semantics.
-
 ### File-backed state (optional)
 
 Runtime state is always returned from `poll()` and persisted by the connectors
@@ -219,6 +217,35 @@ Requirements for correct operation:
 | `Storage` | Network or HTTP errors; client not initialized at `poll()` |
 | `Serialization` | JSON / MessagePack failures |
 
+## Resilience
+
+### Retry policy
+
+| Category | Conditions |
+| -------- | ---------- |
+| Transient (retry) | Network errors; HTTP `429`; HTTP `5xx`; honors `Retry-After` header on `429` |
+| Permanent (no retry) | `400`, `401`, `403`, `404`; malformed responses; search DSL errors |
+
+### Circuit breaker
+
+When open, `poll()` skips the search, logs a warning, sleeps `polling_interval`, and returns an empty batch with no state update - cursor does not advance. Consecutive failures after retries exhausted increment the breaker; a successful search resets it.
+
+### Delivery semantics
+
+**At-least-once toward Iggy.** The in-memory cursor advances in `finalize_poll()` before the runtime persists `ConnectorState`. A crash after cursor advance but before the runtime save re-emits the last batch on restart.
+
+Consumer guidance: dedup on OpenSearch `_id` plus index name (for index patterns), or a business key in `_source`.
+
+### Backfill
+
+Pagination is forward-only on `(timestamp_field asc, _id asc)`. Documents indexed with `timestamp_field` values older than the current cursor are not read until state is reset.
+
+| Mode | Use case |
+| ---- | -------- |
+| Forward tail (default) | Live streaming; cursor tracks ingest order |
+| Bounded backfill | Set a time-window `query` in `plugin_config` |
+| Full rescan | Reset runtime `ConnectorState`; duplicates possible |
+
 ## Limitations
 
 - **Single sequential reader** — one `search_after` cursor, one batch per poll.
@@ -233,10 +260,11 @@ Requirements for correct operation:
   parallel export. Offset paging (`from`/`size`) is not used.
 - **At-least-once delivery** — no deduplication by `_id`. The in-memory cursor advances
   before the runtime persists `ConnectorState`; a crash can re-emit the last batch.
-  See [docs/RESILIENCE.md](docs/RESILIENCE.md).
+  See [Resilience](#resilience).
 - **HTTP retry and circuit breaker** — transient `429`/`5xx` and network errors are retried
   per `max_retries`; consecutive failures trip a circuit breaker that skips polls until
   cool-down. Permanent errors (`4xx` except `429`) are not retried.
+  See [Resilience](#resilience).
 - **Backfill gap** — documents indexed with `timestamp_field` values older than
   the current cursor are not read until connector state is reset.
 - **Full `_source` only** — entire document JSON is published; no field
