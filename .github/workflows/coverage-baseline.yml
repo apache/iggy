@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Full coverage baseline for all 6 languages (Rust, Java, C#, Python,
-# Node, Go). Runs on every push to master so Codecov has complete data
+# Full coverage baseline for all 7 languages (Rust, Java, C#, Python,
+# PHP, Node, Go). Runs on every push to master so Codecov has complete data
 # for carryforward on PR builds where only a subset of SDKs is tested.
 
 name: Coverage baseline
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Install system dependencies
         run: |
@@ -54,9 +54,13 @@ jobs:
         with:
           # Also warms the GitHub Actions build cache for subsequent PR builds
           save-cache: "true"
+          # llvm-cov instrumentation roughly doubles object sizes; the light
+          # cleanup leaves too little headroom (build hit "No space left on
+          # device" at ~34 MB free).
+          free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.79.3
+        uses: taiki-e/install-action@v2.81.8
         with:
           tool: cargo-llvm-cov
 
@@ -93,7 +97,7 @@ jobs:
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
@@ -106,7 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup Java with cache
         uses: ./.github/actions/utils/setup-java-with-cache
@@ -136,7 +140,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml
@@ -149,10 +153,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5.2.0
+        uses: actions/setup-dotnet@v5.3.0
         with:
           dotnet-version: "10.0.x"
 
@@ -208,7 +212,7 @@ jobs:
           dotnet-coverage merge ./reports/**/*.cobertura.xml -f cobertura -o ./reports/coverage.cobertura.xml
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: foreign/csharp/reports/coverage.cobertura.xml
@@ -221,7 +225,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -234,12 +238,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.79.3
+        uses: taiki-e/install-action@v2.81.8
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Install dependencies
         run: |
@@ -297,10 +301,11 @@ jobs:
           sed -i 's|^SF:src/|SF:foreign/python/src/|' ../../reports/python-coverage.lcov
 
           echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+          ../../scripts/ci/validate-lcov.sh ../../reports/python-coverage.lcov
         shell: bash
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/python-coverage.lcov
@@ -308,12 +313,33 @@ jobs:
           flags: python
           fail_ci_if_error: false
 
+  php-coverage:
+    name: PHP coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run PHP SDK tests with coverage
+        uses: ./.github/actions/php/pre-merge
+        with:
+          task: test
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/php-coverage.lcov
+          disable_search: true
+          flags: php
+          fail_ci_if_error: false
+
   node-coverage:
     name: Node coverage baseline
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -364,7 +390,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
@@ -377,7 +403,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
@@ -438,7 +464,7 @@ jobs:
           log-file: ${{ steps.iggy.outputs.log_file }}
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/go-coverage.out
@@ -451,7 +477,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
