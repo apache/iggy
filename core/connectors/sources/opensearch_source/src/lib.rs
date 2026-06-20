@@ -714,7 +714,7 @@ fn parse_document_timestamp(value: &Value) -> Option<DateTime<Utc>> {
             // Values above 1e12 are already milliseconds (Unix epoch seconds won't reach
             // 1e12 until year 33658). Values at or below are treated as seconds and
             // multiplied by 1000.
-            let millis = if raw > 1_000_000_000_000 || raw < -1_000_000_000_000 {
+            let millis = if !(-1_000_000_000_000..=1_000_000_000_000).contains(&raw) {
                 raw
             } else {
                 raw.saturating_mul(1_000)

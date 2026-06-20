@@ -16,11 +16,12 @@
 // under the License.
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_INDEX,
-    ENV_SOURCE_MAX_RETRIES, ENV_SOURCE_OPEN_RETRY_MAX_DELAY, ENV_SOURCE_PATH,
-    ENV_SOURCE_POLLING_INTERVAL, ENV_SOURCE_RETRY_DELAY, ENV_SOURCE_RETRY_MAX_DELAY,
-    ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC,
-    ENV_SOURCE_TIMESTAMP_FIELD, ENV_SOURCE_URL,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE,
+    ENV_SOURCE_CIRCUIT_BREAKER_COOL_DOWN, ENV_SOURCE_CIRCUIT_BREAKER_THRESHOLD, ENV_SOURCE_INDEX,
+    ENV_SOURCE_MAX_OPEN_RETRIES, ENV_SOURCE_MAX_RETRIES, ENV_SOURCE_OPEN_RETRY_MAX_DELAY,
+    ENV_SOURCE_PATH, ENV_SOURCE_POLLING_INTERVAL, ENV_SOURCE_RETRY_DELAY,
+    ENV_SOURCE_RETRY_MAX_DELAY, ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM,
+    ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TIMESTAMP_FIELD, ENV_SOURCE_URL,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -84,6 +85,7 @@ fn resilience_base_envs(mock_uri: &str) -> HashMap<String, String> {
         ENV_SOURCE_OPEN_RETRY_MAX_DELAY.to_string(),
         "200ms".to_string(),
     );
+    envs.insert(ENV_SOURCE_MAX_OPEN_RETRIES.to_string(), "2".to_string());
     envs
 }
 
@@ -188,6 +190,15 @@ impl TestFixture for OpenSearchSourceCircuitBreakerFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        resilience_base_envs(&self.mock_server.uri())
+        let mut envs = resilience_base_envs(&self.mock_server.uri());
+        envs.insert(
+            ENV_SOURCE_CIRCUIT_BREAKER_THRESHOLD.to_string(),
+            "3".to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_CIRCUIT_BREAKER_COOL_DOWN.to_string(),
+            "500ms".to_string(),
+        );
+        envs
     }
 }
