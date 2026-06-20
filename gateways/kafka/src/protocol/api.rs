@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::SocketAddr;
-
 use bytes::Bytes;
 
+use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
@@ -37,21 +36,13 @@ pub const API_KEY_METADATA: i16 = 3;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
 
+pub const DEFAULT_KAFKA_PORT: u16 = 9093;
+
 pub const ERROR_NONE: i16 = 0;
-pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
-pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-pub const ERROR_INVALID_FETCH_SIZE: i16 = 4;
-pub const ERROR_LEADER_NOT_AVAILABLE: i16 = 5;
-pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
-pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
-pub const ERROR_UNKNOWN_SERVER_ERROR: i16 = -1;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
-pub const ERROR_TOPIC_ALREADY_EXISTS: i16 = 36;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
-pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
-pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 = 43;
 
 /// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
 const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
@@ -62,27 +53,11 @@ pub struct BrokerAdvertise {
     pub port: i32,
 }
 
-impl BrokerAdvertise {
-    #[must_use]
-    pub fn from_bind_addr(bind_addr: &str) -> Self {
-        bind_addr.parse::<SocketAddr>().map_or_else(
-            |_| Self {
-                host: "127.0.0.1".to_string(),
-                port: 9093,
-            },
-            |addr| Self {
-                host: addr.ip().to_string(),
-                port: i32::from(addr.port()),
-            },
-        )
-    }
-}
-
 impl Default for BrokerAdvertise {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 9093,
+            port: i32::from(DEFAULT_KAFKA_PORT),
         }
     }
 }
@@ -151,7 +126,7 @@ pub fn handle_request(
             if is_supported_version(api_key, api_version) {
                 encode_metadata_response(api_version, body, broker, ERROR_NONE)
             } else {
-                encode_metadata_response(0, body, broker, ERROR_UNSUPPORTED_VERSION)
+                encode_metadata_response(api_version, body, broker, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_PRODUCE => {
@@ -159,7 +134,7 @@ pub fn handle_request(
                 match decode_produce_request(api_version, body) {
                     Ok(req) => encode_produce_response(api_version, &req),
                     Err(e) => {
-                        tracing::error!("Failed to decode Produce request: {:?}", e);
+                        tracing::warn!("Failed to decode Produce request: {:?}", e);
                         encode_produce_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
@@ -172,7 +147,7 @@ pub fn handle_request(
                 match decode_fetch_request(api_version, body) {
                     Ok(req) => encode_fetch_response(api_version, &req),
                     Err(e) => {
-                        tracing::error!("Failed to decode Fetch request: {:?}", e);
+                        tracing::warn!("Failed to decode Fetch request: {:?}", e);
                         encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
@@ -185,7 +160,7 @@ pub fn handle_request(
                 match decode_list_offsets_request(api_version, body) {
                     Ok(req) => encode_list_offsets_response(api_version, &req),
                     Err(e) => {
-                        tracing::error!("Failed to decode ListOffsets request: {:?}", e);
+                        tracing::warn!("Failed to decode ListOffsets request: {:?}", e);
                         encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
@@ -198,7 +173,7 @@ pub fn handle_request(
                 match decode_create_topics_request(api_version, body) {
                     Ok(req) => encode_create_topics_response(api_version, &req),
                     Err(e) => {
-                        tracing::error!("Failed to decode CreateTopics request: {:?}", e);
+                        tracing::warn!("Failed to decode CreateTopics request: {:?}", e);
                         encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
@@ -273,7 +248,12 @@ fn encode_metadata_response(
     top_level_error_code: i16,
 ) -> Bytes {
     let flexible = api_version >= 9;
-    let topics_count = split_metadata_request_topics(body, api_version);
+    // BufferUnderflow (empty body) → treat as 0 topics; other decode errors are truly invalid.
+    let topics_count = match split_metadata_request_topics(body, api_version) {
+        Ok(n) => n,
+        Err(KafkaProtocolError::BufferUnderflow { .. }) => 0,
+        Err(_) => return encode_error_only_response(ERROR_INVALID_REQUEST),
+    };
     let topic_error = if top_level_error_code == ERROR_NONE {
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     } else {
@@ -311,14 +291,18 @@ fn encode_metadata_response(
     } else {
         e.write_i32(1); // brokers array length
         e.write_i32(1); // node_id
-        let _ = e.write_nullable_string(Some(&broker.host));
+        // broker.host is config-derived (KAFKA_ADVERTISED_HOST), not request-decoded — use
+        // the checked variant so an overly long hostname returns an error instead of panicking.
+        if e.write_nullable_string(Some(&broker.host)).is_err() {
+            return encode_error_only_response(ERROR_INVALID_REQUEST);
+        }
         e.write_i32(broker.port);
         if api_version >= 1 {
-            let _ = e.write_nullable_string(None); // rack
+            e.write_nullable_string_unchecked(None); // rack
         }
 
         if api_version >= 2 {
-            let _ = e.write_nullable_string(None); // cluster_id
+            e.write_nullable_string_unchecked(None); // cluster_id
         }
         if api_version >= 1 {
             e.write_i32(1); // controller_id — must come before topics array
@@ -327,7 +311,7 @@ fn encode_metadata_response(
         e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
         for _ in 0..topics_count {
             e.write_i16(topic_error);
-            let _ = e.write_nullable_string(Some("unknown-topic"));
+            e.write_nullable_string_unchecked(Some("unknown-topic"));
             if api_version >= 1 {
                 e.write_bool(false); // is_internal
             }
@@ -351,12 +335,11 @@ pub fn encode_error_only_response(error_code: i16) -> Bytes {
     e.freeze()
 }
 
-#[must_use]
-pub(crate) fn split_metadata_request_topics(body: Bytes, api_version: i16) -> usize {
+pub(crate) fn split_metadata_request_topics(body: Bytes, api_version: i16) -> Result<usize> {
     let mut d = Decoder::new(body);
     if api_version >= 9 {
-        d.read_compact_array_count().unwrap_or(0)
+        d.read_compact_array_count()
     } else {
-        d.read_i32_array_count().unwrap_or(0)
+        d.read_i32_array_count()
     }
 }

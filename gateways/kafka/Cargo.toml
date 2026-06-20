@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "iggy_gateway_kafka"
+name = "iggy-gateway-kafka"
 version = "0.1.0"
 description = "Kafka wire protocol gateway foundation for Apache Iggy"
 edition = "2024"
@@ -29,7 +29,7 @@ readme = "README.md"
 publish = false
 
 [[bin]]
-name = "iggy-kafka-gateway"
+name = "iggy-gateway-kafka"
 path = "src/main.rs"
 
 [dependencies]
@@ -45,6 +45,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 
 [lints.clippy]
 enum_glob_use = "deny"
-# Ported Kafka wire codec; pedantic cleanup tracked for a follow-up PR.
+#Ported Kafka wire codec; pedantic cleanup tracked for a follow-up PR.
 pedantic = "warn"
 nursery = "warn"

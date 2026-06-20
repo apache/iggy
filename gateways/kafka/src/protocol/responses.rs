@@ -61,7 +61,7 @@ fn encode_produce_response_inner(
         if flexible {
             e.write_compact_nullable_string(Some(&topic.topic));
         } else {
-            let _ = e.write_nullable_string(Some(&topic.topic));
+            e.write_nullable_string_unchecked(Some(&topic.topic));
         }
 
         if flexible {
@@ -86,7 +86,7 @@ fn encode_produce_response_inner(
                     e.write_compact_nullable_string(None);
                 } else {
                     e.write_i32(0);
-                    let _ = e.write_nullable_string(None);
+                    e.write_nullable_string_unchecked(None);
                 }
             }
             if flexible {
@@ -160,7 +160,7 @@ fn encode_fetch_response_inner(
         if flexible {
             e.write_compact_nullable_string(Some(&topic.topic));
         } else {
-            let _ = e.write_nullable_string(Some(&topic.topic));
+            e.write_nullable_string_unchecked(Some(&topic.topic));
         }
 
         if flexible {
@@ -192,8 +192,7 @@ fn encode_fetch_response_inner(
             if flexible {
                 e.write_compact_nullable_bytes(None);
             } else {
-                e.write_nullable_bytes(None)
-                    .expect("null bytes always encode");
+                e.write_null_bytes();
             }
             if flexible {
                 e.write_empty_tagged_fields();
@@ -252,7 +251,7 @@ fn encode_list_offsets_response_inner(
         if flexible {
             e.write_compact_nullable_string(Some(&topic.topic));
         } else {
-            let _ = e.write_nullable_string(Some(&topic.topic));
+            e.write_nullable_string_unchecked(Some(&topic.topic));
         }
 
         if flexible {
@@ -328,7 +327,7 @@ fn encode_create_topics_response_inner(
         if flexible {
             e.write_compact_nullable_string(Some(&topic.name));
         } else {
-            let _ = e.write_nullable_string(Some(&topic.name));
+            e.write_nullable_string_unchecked(Some(&topic.name));
         }
 
         let error_code = if topic_error != ERROR_NONE {
@@ -344,7 +343,7 @@ fn encode_create_topics_response_inner(
             if flexible {
                 e.write_compact_nullable_string(None);
             } else {
-                let _ = e.write_nullable_string(None);
+                e.write_nullable_string_unchecked(None);
             }
         }
 

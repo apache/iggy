@@ -171,18 +171,32 @@ fn metadata_below_min_version_returns_topic_error() {
 
 #[test]
 fn metadata_above_max_version_returns_topic_error() {
+    // v10 uses flexible encoding; compact array varint(2) = 1 topic.
     let body = handle_request(
         API_KEY_METADATA,
         10,
-        metadata_request_one_topic(),
+        Bytes::from_static(&[0x02]),
         &default_broker(),
     );
+    // Response is in v9 flexible format (highest supported).
     let mut d = Decoder::new(body);
-    let _brokers = d.read_i32().unwrap();
-    let _ = d.read_i32().unwrap();
-    let _ = d.read_nullable_string().unwrap();
-    let _ = d.read_i32().unwrap();
-    assert_eq!(d.read_i32().unwrap(), 1);
+    d.read_i32().unwrap(); // throttle_time_ms (v3+)
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap(); // cluster_id
+    d.read_i32().unwrap(); // controller_id
+    let topic_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    assert_eq!(topic_count, 1);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
 
