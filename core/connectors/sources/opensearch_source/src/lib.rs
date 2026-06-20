@@ -457,7 +457,9 @@ impl OpenSearchSource {
         let mut search_body = self
             .search_body_base
             .as_ref()
-            .ok_or_else(|| Error::Connection("connector not initialized; call open() first".to_string()))?
+            .ok_or_else(|| {
+                Error::Connection("connector not initialized; call open() first".to_string())
+            })?
             .clone();
 
         if let Some(cursor) = search_after {
