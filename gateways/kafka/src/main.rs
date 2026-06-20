@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
 
@@ -39,10 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("invalid KAFKA_ADVERTISED_PORT `{advertised_port}`: {e}"))?,
         );
     }
+    let listener = TcpListener::bind(&config.bind_addr)
+        .await
+        .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
     let server = KafkaServer::new(config);
 
     let (tx, rx) = broadcast::channel(1);
-    let mut server_task = tokio::spawn(async move { server.run(rx).await });
+    let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
 
     tokio::select! {
         result = &mut server_task => {

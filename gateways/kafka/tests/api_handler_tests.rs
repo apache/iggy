@@ -103,23 +103,38 @@ fn metadata_response_has_broker_array_and_topic_array() {
 
 #[test]
 fn unsupported_version_returns_protocol_error() {
-    let mut req = Vec::new();
-    req.extend_from_slice(&1_i32.to_be_bytes());
-    let body = handle_request(API_KEY_METADATA, 99, Bytes::from(req), &test_broker());
+    // v99 client sends a compact-array body (count+1 = 2 = 0x02 for 1 topic).
+    // The gateway caps at v9 (highest supported Metadata version) for both parsing
+    // and encoding, so the response uses the flexible (v9) wire format.
+    let body = handle_request(
+        API_KEY_METADATA,
+        99,
+        Bytes::from_static(&[0x02]),
+        &test_broker(),
+    );
     let mut d = Decoder::new(body);
-    // Metadata v0: brokers[], topics[] — no controller_id (added in v1)
-    let _broker_count = d.read_i32().unwrap();
-    let _ = d.read_i32().unwrap(); // node_id
-    let _ = d.read_nullable_string().unwrap(); // host
-    let _ = d.read_i32().unwrap(); // port
-    let topic_count = d.read_i32().unwrap();
+    // v9 flexible response layout:
+    d.read_i32().unwrap(); // throttle_time_ms (v3+)
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap(); // node_id
+        d.read_compact_nullable_string().unwrap(); // host
+        d.read_i32().unwrap(); // port
+        d.read_compact_nullable_string().unwrap(); // rack
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap(); // cluster_id (v2+)
+    d.read_i32().unwrap(); // controller_id (v1+)
+    let topic_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
     assert_eq!(topic_count, 1);
     let topic_error = d.read_i16().unwrap();
     assert_eq!(topic_error, ERROR_UNSUPPORTED_VERSION);
-    let topic_name = d.read_nullable_string().unwrap().unwrap();
-    assert_eq!(topic_name, "unknown-topic");
-    let partitions_count = d.read_i32().unwrap();
-    assert_eq!(partitions_count, 0);
+    let topic_name = d.read_compact_nullable_string().unwrap();
+    assert_eq!(topic_name, Some("unknown-topic".to_string()));
 }
 
 // ── Misc ────────────────────────────────────────────────────────────────────
