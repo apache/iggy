@@ -47,7 +47,7 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
-| 0 | **Produce** | 3 †| 12 | v9 | ✅ | 🔴 Bridge |
+| 0 | **Produce** | 3 † | 12 | v9 | ✅ | 🔴 Bridge |
 | 1 | **Fetch** | 4 | 17 | v12 | ✅ | 🔴 Bridge |
 | 2 | **ListOffsets** | 1 | 9 | v6 | ✅ | 🟠 Required Stub |
 | 3 | **Metadata** | 1 | 12 | v9 | ✅ | 🔴 Bridge |

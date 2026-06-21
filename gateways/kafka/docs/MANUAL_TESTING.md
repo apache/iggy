@@ -30,7 +30,7 @@ RUST_LOG=info cargo run -p iggy-gateway-kafka
 
 Expected log:
 
-```
+```text
 kafka listener bound on 127.0.0.1:9093
 ```
 
@@ -191,7 +191,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 
 ### Frame layout (for manual hex inspection)
 
-```
+```text
 Request frame:
   [length: i32 BE]
   [api_key: i16][api_version: i16][correlation_id: i32]
@@ -222,7 +222,7 @@ First bytes after length prefix should include your correlation_id from the fixt
 
 Copy this checklist into your PR or test log:
 
-```
+```text
 Date: ___________
 Tester: ___________
 Gateway commit: ___________
