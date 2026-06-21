@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 
-use crate::error::{KafkaProtocolError, Result};
+use crate::error::Result;
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
@@ -43,6 +43,8 @@ pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
+
+const MAX_SUPPORTED_METADATA_VERSION: i16 = 9;
 
 /// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
 const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
@@ -126,7 +128,13 @@ pub fn handle_request(
             if is_supported_version(api_key, api_version) {
                 encode_metadata_response(api_version, body, broker, ERROR_NONE)
             } else {
-                encode_metadata_response(api_version, body, broker, ERROR_UNSUPPORTED_VERSION)
+                // Encode at the highest version we implement, not the client's unknown version.
+                encode_metadata_response(
+                    api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION),
+                    body,
+                    broker,
+                    ERROR_UNSUPPORTED_VERSION,
+                )
             }
         }
         API_KEY_PRODUCE => {
@@ -248,16 +256,20 @@ fn encode_metadata_response(
     top_level_error_code: i16,
 ) -> Bytes {
     let flexible = api_version >= 9;
-    // BufferUnderflow (empty body) → treat as 0 topics; other decode errors are truly invalid.
-    let topics_count = match split_metadata_request_topics(body, api_version) {
-        Ok(n) => n,
-        Err(KafkaProtocolError::BufferUnderflow { .. }) => 0,
-        Err(_) => return encode_error_only_response(ERROR_INVALID_REQUEST),
+    // Empty body = all-topics request; 0 topics is correct for this stub.
+    // Non-empty body that fails to decode = malformed request; return 0 topics.
+    // Kafka Metadata response has no top-level error code field: errors are per-topic only.
+    // 0 topics is spec-correct and unambiguous for a decode failure.
+    let (topics_count, effective_error) = if body.is_empty() {
+        (0usize, top_level_error_code)
+    } else {
+        split_metadata_request_topics(body, api_version)
+            .map_or((0, ERROR_INVALID_REQUEST), |n| (n, top_level_error_code))
     };
-    let topic_error = if top_level_error_code == ERROR_NONE {
+    let topic_error = if effective_error == ERROR_NONE {
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     } else {
-        top_level_error_code
+        effective_error
     };
 
     let mut e = Encoder::with_capacity(256);

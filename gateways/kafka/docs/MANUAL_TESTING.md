@@ -22,10 +22,10 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 
 ```bash
 # From iggy workspace root
-cargo build -p iggy_gateway_kafka --bin iggy-kafka-gateway
+cargo build -p iggy-gateway-kafka
 
 # Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy_gateway_kafka --bin iggy-kafka-gateway
+RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -50,7 +50,7 @@ cargo run -p kafka-message-gen -- generate \
 Run before manual testing to catch regressions:
 
 ```bash
-cargo test -p iggy_gateway_kafka
+cargo test -p iggy-gateway-kafka
 ```
 
 All tests must pass. If `decode_validation_tests` fail, regenerate fixtures (step above).
@@ -63,7 +63,7 @@ All tests must pass. If `decode_validation_tests` fail, regenerate fixtures (ste
 
 | ID | Test | Steps | Expected result | Pass criteria |
 |----|------|-------|-----------------|---------------|
-| A1 | Gateway starts | Run `iggy-kafka-gateway` | Binds to `:9093`, no panic | Log shows bind address |
+| A1 | Gateway starts | Run `iggy-gateway-kafka` | Binds to `:9093`, no panic | Log shows bind address |
 | A2 | ApiVersions v1 | `cargo run -p kafka-message-gen -- send --host 127.0.0.1:9093 --api-key 18 --version 1` | Response received | `ec=0`, non-zero byte count |
 | A3 | ApiVersions v3 (flexible) | Same with `--version 3` | Response received | `ec=0` |
 | A4 | Metadata v0 | `send --api-key 3 --version 0` | Stub broker in response | `ec=0` or topic error 3 (stub) |
@@ -238,8 +238,8 @@ kcat version (if used): ___________
 [ ] H1–H3  Adversarial input
 
 Automated regression:
-[ ] cargo test -p iggy_gateway_kafka — ___/103 passed
-[ ] cargo clippy -p iggy_gateway_kafka — clean / warnings noted
+[ ] cargo test -p iggy-gateway-kafka — ___/103 passed
+[ ] cargo clippy -p iggy-gateway-kafka — clean / warnings noted
 
 Notes / failures:
 _________________________________
@@ -251,7 +251,7 @@ _________________________________
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `Connection refused` on 9093 | Gateway not running | Start `iggy-kafka-gateway` |
+| `Connection refused` on 9093 | Gateway not running | Start `iggy-gateway-kafka` |
 | `decode_validation_tests` panic | Missing fixtures | Run `kafka-message-gen generate` |
 | `ec=35` for in-range version | Version not in `SUPPORTED_RANGES` | Check `SCOPE.md` and `api.rs` |
 | kcat hangs | Timeout waiting for data | Set `-m 1000`; check gateway logs |

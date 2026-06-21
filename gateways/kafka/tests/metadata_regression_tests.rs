@@ -62,6 +62,20 @@ fn read_broker_flexible(d: &mut Decoder) -> (String, i32) {
 }
 
 #[test]
+fn metadata_corrupt_partial_body_returns_zero_topics() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        Bytes::from_static(&[0x00, 0x00]),
+        &default_broker(),
+    );
+    let mut d = Decoder::new(body);
+    let _ = read_broker_legacy(&mut d);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.remaining(), 0);
+}
+
+#[test]
 fn metadata_v0_empty_topics_stub_broker() {
     let body = handle_request(
         API_KEY_METADATA,

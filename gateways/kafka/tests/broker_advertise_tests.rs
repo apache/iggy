@@ -86,6 +86,18 @@ fn from_server_config_uses_bind_ip_for_non_wildcard_listener() {
 }
 
 #[test]
+fn from_server_config_rejects_advertised_host_exceeding_kafka_string_limit() {
+    let config = ServerConfig {
+        bind_addr: "127.0.0.1:9093".to_string(),
+        advertised_host: Some("x".repeat(i16::MAX as usize + 1)),
+        ..ServerConfig::default()
+    };
+    let local_addr: SocketAddr = "127.0.0.1:9093".parse().unwrap();
+    let err = BrokerAdvertise::from_server_config(&config, local_addr).unwrap_err();
+    assert!(err.to_string().contains("KAFKA_ADVERTISED_HOST"));
+}
+
+#[test]
 fn from_server_config_honors_advertised_port_override() {
     let config = ServerConfig {
         bind_addr: "127.0.0.1:9093".to_string(),
