@@ -17,10 +17,9 @@
 
 use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::time::Duration;
-use surrealdb::Surreal;
-use surrealdb::engine::remote::ws::{Client as WsClient, Ws};
-use surrealdb::opt::auth::Root;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -72,7 +71,152 @@ pub(super) const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
     "IGGY_CONNECTORS_SINK_SURREALDB_STREAMS_0_CONSUMER_GROUP";
 pub(super) const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_SURREALDB_PATH";
 
-pub type SurrealDbClient = Surreal<WsClient>;
+#[derive(Clone)]
+pub struct SurrealDbClient {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SurrealSqlStatement {
+    status: String,
+    detail: Option<String>,
+    result: Value,
+}
+
+impl SurrealDbClient {
+    async fn new(endpoint: &str) -> Result<Self, TestBinaryError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "SurrealDbContainer".to_string(),
+                message: format!("Failed to create SurrealDB HTTP client: {e}"),
+            })?;
+        let client = Self {
+            client,
+            base_url: format!("http://{endpoint}"),
+        };
+        client.signin().await?;
+        client.health().await?;
+        Ok(client)
+    }
+
+    pub async fn health(&self) -> Result<(), TestBinaryError> {
+        let response = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "SurrealDbContainer".to_string(),
+                message: format!("Failed to check SurrealDB health: {e}"),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("failed to read response body: {e}"));
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "SurrealDbContainer".to_string(),
+            message: format!("SurrealDB health check failed with HTTP status {status}: {body}"),
+        })
+    }
+
+    pub async fn query_result(&self, query: &str) -> Result<Value, TestBinaryError> {
+        let statements = self.execute_sql(query).await?;
+        statements
+            .into_iter()
+            .next()
+            .map(|statement| statement.result)
+            .ok_or_else(|| TestBinaryError::InvalidState {
+                message: "SurrealDB returned no SQL statements".to_string(),
+            })
+    }
+
+    async fn signin(&self) -> Result<(), TestBinaryError> {
+        let response = self
+            .client
+            .post(format!("{}/signin", self.base_url))
+            .json(&json!({
+                "user": ROOT_USERNAME,
+                "pass": ROOT_PASSWORD
+            }))
+            .send()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "SurrealDbContainer".to_string(),
+                message: format!("Failed to authenticate with SurrealDB: {e}"),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("failed to read response body: {e}"));
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "SurrealDbContainer".to_string(),
+            message: format!("Failed to authenticate with SurrealDB: HTTP status {status}: {body}"),
+        })
+    }
+
+    async fn execute_sql(&self, query: &str) -> Result<Vec<SurrealSqlStatement>, TestBinaryError> {
+        let response = self
+            .client
+            .post(format!("{}/sql", self.base_url))
+            .basic_auth(ROOT_USERNAME, Some(ROOT_PASSWORD))
+            .header("Accept", "application/json")
+            .header("Content-Type", "text/plain")
+            .header("Surreal-NS", DEFAULT_NAMESPACE)
+            .header("Surreal-DB", DEFAULT_DATABASE)
+            .body(query.to_string())
+            .send()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to execute SurrealDB query: {e}"),
+            })?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to read SurrealDB response: {e}"),
+            })?;
+
+        if !status.is_success() {
+            return Err(TestBinaryError::InvalidState {
+                message: format!("SurrealDB query failed with HTTP status {status}: {body}"),
+            });
+        }
+
+        let statements: Vec<SurrealSqlStatement> =
+            serde_json::from_str(&body).map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to decode SurrealDB response: {e}; response: {body}"),
+            })?;
+
+        if let Some(statement) = statements
+            .iter()
+            .find(|statement| !statement.status.eq_ignore_ascii_case("OK"))
+        {
+            return Err(TestBinaryError::InvalidState {
+                message: statement
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| format!("SurrealDB query status: {}", statement.status)),
+            });
+        }
+
+        Ok(statements)
+    }
+}
 
 pub struct SurrealDbContainer {
     #[allow(dead_code)]
@@ -129,49 +273,26 @@ impl SurrealDbContainer {
     }
 
     pub async fn create_client(&self) -> Result<SurrealDbClient, TestBinaryError> {
-        let client = Surreal::new::<Ws>(self.endpoint.as_str())
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SurrealDbContainer".to_string(),
-                message: format!("Failed to connect to SurrealDB: {e}"),
-            })?;
-
-        client
-            .signin(Root {
-                username: ROOT_USERNAME.to_string(),
-                password: ROOT_PASSWORD.to_string(),
-            })
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SurrealDbContainer".to_string(),
-                message: format!("Failed to authenticate with SurrealDB: {e}"),
-            })?;
-
-        client
-            .use_ns(DEFAULT_NAMESPACE)
-            .use_db(DEFAULT_DATABASE)
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "SurrealDbContainer".to_string(),
-                message: format!("Failed to select namespace/database: {e}"),
-            })?;
-
-        Ok(client)
+        SurrealDbClient::new(&self.endpoint).await
     }
 
     async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
+        let mut last_error = None;
+
         for _ in 0..SURREALDB_BOOT_ATTEMPTS {
-            if let Ok(client) = self.create_client().await
-                && client.health().await.is_ok()
-            {
-                return Ok(());
+            match self.create_client().await {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error.to_string()),
             }
             sleep(Duration::from_millis(SURREALDB_BOOT_INTERVAL_MS)).await;
         }
 
+        let detail = last_error
+            .map(|error| format!(" Last error: {error}"))
+            .unwrap_or_default();
         Err(TestBinaryError::FixtureSetup {
             fixture_type: "SurrealDbContainer".to_string(),
-            message: "SurrealDB did not become ready".to_string(),
+            message: format!("SurrealDB did not become ready.{detail}"),
         })
     }
 }

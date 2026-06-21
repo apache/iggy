@@ -296,7 +296,6 @@ sqlx = { version = "0.9.0", features = [
 static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
-surrealdb = { version = "3.1.4", default-features = false, features = ["protocol-ws", "rustls"] }
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.39.2"
 tempfile = "3.27.0"

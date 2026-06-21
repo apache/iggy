@@ -26,7 +26,7 @@ use super::container::{
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -75,14 +75,8 @@ impl SurrealDbSinkFixture {
         client: &SurrealDbClient,
     ) -> Result<Vec<Value>, TestBinaryError> {
         let query = format!("SELECT * FROM {DEFAULT_TABLE} ORDER BY iggy_offset ASC;");
-        let mut response =
-            client
-                .query(query)
-                .await
-                .map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to select SurrealDB records: {e}"),
-                })?;
-        response.take(0).map_err(|e| TestBinaryError::InvalidState {
+        let value = client.query_result(&query).await?;
+        serde_json::from_value(value).map_err(|e| TestBinaryError::InvalidState {
             message: format!("Failed to decode SurrealDB records: {e}"),
         })
     }
@@ -92,17 +86,16 @@ impl SurrealDbSinkFixture {
         client: &SurrealDbClient,
         message_id: u128,
     ) -> Result<Vec<Value>, TestBinaryError> {
+        let message_id = serde_json::to_string(&message_id.to_string()).map_err(|e| {
+            TestBinaryError::InvalidState {
+                message: format!("Failed to encode SurrealDB message id: {e}"),
+            }
+        })?;
         let query = format!(
-            "SELECT * FROM {DEFAULT_TABLE} WHERE iggy_message_id = $message_id ORDER BY iggy_offset ASC;"
+            "SELECT * FROM {DEFAULT_TABLE} WHERE iggy_message_id = {message_id} ORDER BY iggy_offset ASC;"
         );
-        let mut response = client
-            .query(query)
-            .bind(serde_json::json!({ "message_id": message_id.to_string() }))
-            .await
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to select SurrealDB record by message id: {e}"),
-            })?;
-        response.take(0).map_err(|e| TestBinaryError::InvalidState {
+        let value = client.query_result(&query).await?;
+        serde_json::from_value(value).map_err(|e| TestBinaryError::InvalidState {
             message: format!("Failed to decode SurrealDB record by message id: {e}"),
         })
     }
@@ -113,25 +106,19 @@ impl SurrealDbSinkFixture {
         record_id: &str,
         message_id: u128,
     ) -> Result<(), TestBinaryError> {
-        let query = format!("INSERT INTO {DEFAULT_TABLE} $records RETURN NONE;");
-        client
-            .query(query)
-            .bind(serde_json::json!({
-                "records": [
-                    {
-                        "id": record_id,
-                        "iggy_message_id": message_id.to_string(),
-                        "seed_marker": "preseed-unchanged",
-                        "payload": "preseeded"
-                    }
-                ]
-            }))
-            .await
-            .and_then(|response| response.check())
-            .map(|_| ())
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to preseed SurrealDB record: {e}"),
-            })
+        let records = serde_json::to_string(&json!([
+            {
+                "id": record_id,
+                "iggy_message_id": message_id.to_string(),
+                "seed_marker": "preseed-unchanged",
+                "payload": "preseeded"
+            }
+        ]))
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to encode SurrealDB preseed record: {e}"),
+        })?;
+        let query = format!("INSERT INTO {DEFAULT_TABLE} {records} RETURN NONE;");
+        client.query_result(&query).await.map(|_| ())
     }
 }
 

@@ -1,11 +1,11 @@
 # SurrealDB Sink Connector
 
-Writes Apache Iggy stream messages into SurrealDB over the Rust WebSocket SDK.
+Writes Apache Iggy stream messages into SurrealDB over the HTTP API.
 
 The sink writes one SurrealQL bulk `INSERT IGNORE` per connector batch. Each
 record uses a deterministic SurrealDB record id derived from stream, topic,
-partition and Iggy message id, so replayed batches are idempotent and existing
-records are left untouched.
+partition, offset and Iggy message id, so replayed batches are idempotent and
+existing records are left untouched.
 
 ## Configuration
 
@@ -54,13 +54,13 @@ verbose_logging = false
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `endpoint` | required | SurrealDB WebSocket host and port without scheme, for example `127.0.0.1:8000`. |
+| `endpoint` | required | SurrealDB HTTP host and port without scheme, for example `127.0.0.1:8000`. Full `http://` or `https://` URLs are also accepted. |
 | `namespace` | required | SurrealDB namespace selected during `open()`. |
 | `database` | required | SurrealDB database selected during `open()`. |
 | `table` | required | Target table. Must be a safe SurrealQL identifier. |
 | `username` / `password` | none | Optional credentials. |
 | `auth_scope` | `root` | `root`, `namespace`, `database`, or `none`. |
-| `use_tls` | `false` | Uses `wss://` when true, `ws://` otherwise. |
+| `use_tls` | `false` | Uses `https://` when true and `endpoint` has no scheme, `http://` otherwise. |
 | `auto_define_table` | `false` | Runs `DEFINE TABLE IF NOT EXISTS <table> SCHEMALESS`. |
 | `define_indexes` | `false` | Defines an offset index on stream/topic/partition/offset. Requires `auto_define_table`. |
 | `batch_size` | `1000` | Maximum number of records per SurrealDB request. |
@@ -69,8 +69,8 @@ verbose_logging = false
 | `include_headers` | `true` | Stores Iggy headers as a deterministic object. Raw headers are base64 encoded. |
 | `include_checksum` | `true` | Stores `iggy_checksum`. |
 | `include_origin_timestamp` | `true` | Stores `iggy_origin_timestamp`. |
-| `query_timeout` | `30s` | SurrealDB SDK query timeout. |
-| `max_retries` | `3` | Total attempts for transient write failures. |
+| `query_timeout` | `30s` | SurrealDB HTTP request timeout. |
+| `max_retries` | `3` | Total attempts for transient write failures. Values below `1` are raised to `1`. |
 | `retry_delay` | `100ms` | Base retry delay. |
 | `max_retry_delay` | `5s` | Capped exponential retry delay. |
 | `verbose_logging` | `false` | Emits per-batch success logs at `info`. |

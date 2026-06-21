@@ -30,13 +30,15 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::time::sleep;
 
-fn build_expected_record_id(message_id: u128) -> String {
+fn build_expected_record_id(message_id: u128, offset: u64) -> String {
     let mut id = String::new();
     id.push('s');
     push_hex_component(&mut id, seeds::names::STREAM.as_bytes());
     id.push_str("_t");
     push_hex_component(&mut id, seeds::names::TOPIC.as_bytes());
-    id.push_str("_p0_m");
+    id.push_str("_p0_o");
+    id.push_str(&offset.to_string());
+    id.push_str("_m");
     id.push_str(&format!("{message_id:032x}"));
     id
 }
@@ -123,7 +125,7 @@ async fn json_messages_sink_to_surrealdb(harness: &TestHarness, fixture: Surreal
             record["id"].as_str().expect("record id should be string"),
             format!(
                 "iggy_messages:{}",
-                build_expected_record_id((idx + 1) as u128)
+                build_expected_record_id((idx + 1) as u128, idx as u64)
             )
         );
     }
@@ -259,7 +261,7 @@ async fn duplicate_record_id_is_idempotent_replay_not_overwrite(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
     fixture
-        .insert_preseeded_record(&surreal_client, &build_expected_record_id(2), 2)
+        .insert_preseeded_record(&surreal_client, &build_expected_record_id(2, 1), 2)
         .await
         .expect("Failed to preseed duplicate record");
 
