@@ -196,17 +196,35 @@ impl MeilisearchSink {
     }
 
     async fn check_connectivity(&self, client: &Client) -> Result<(), Error> {
-        let health = self
-            .retry_sdk_open_operation("health check", || client.health())
-            .await?;
-        if health.status == "available" {
-            return Ok(());
-        }
+        let mut retries = 0u32;
 
-        Err(Error::Connection(format!(
-            "Meilisearch health check returned status '{}'",
-            health.status
-        )))
+        loop {
+            let health = self
+                .retry_sdk_open_operation("health check", || client.health())
+                .await?;
+            if health.status == "available" {
+                return Ok(());
+            }
+
+            if retries >= self.config.max_open_retries {
+                return Err(Error::Connection(format!(
+                    "Meilisearch health check returned status '{}'",
+                    health.status
+                )));
+            }
+
+            retries += 1;
+            let delay = jitter(exponential_backoff(
+                self.config.retry_delay,
+                retries,
+                self.config.max_retry_delay,
+            ));
+            warn!(
+                "Meilisearch health check returned status '{}' (retry {}/{}). Retrying in {:?}...",
+                health.status, retries, self.config.max_open_retries, delay
+            );
+            sleep(delay).await;
+        }
     }
 
     async fn ensure_index_exists(&self, client: &Client) -> Result<(), Error> {
@@ -271,9 +289,8 @@ impl MeilisearchSink {
             Payload::Json(value) => {
                 Self::document_from_json_value(owned_value_to_serde_json(&value))
             }
-            Payload::Raw(bytes) => {
-                let mut bytes_copy = bytes.clone();
-                match simd_json::from_slice::<simd_json::OwnedValue>(&mut bytes_copy) {
+            Payload::Raw(mut bytes) => {
+                match simd_json::from_slice::<simd_json::OwnedValue>(&mut bytes) {
                     Ok(value) => Self::document_from_json_value(owned_value_to_serde_json(&value)),
                     Err(_) => Map::from_iter([
                         (
@@ -307,7 +324,7 @@ impl MeilisearchSink {
                 messages_metadata,
                 offset,
                 message_id,
-            );
+            )?;
             document.insert(
                 self.config.primary_key.clone(),
                 Value::String(value.clone()),
@@ -319,15 +336,16 @@ impl MeilisearchSink {
             if self.config.primary_key != DEFAULT_PRIMARY_KEY
                 && !document.contains_key(DEFAULT_PRIMARY_KEY)
             {
-                let id = generated_id.get_or_insert_with(|| {
-                    generated_document_id_from_parts(
+                let id = match &generated_id {
+                    Some(id) => id.clone(),
+                    None => generated_document_id_from_parts(
                         topic_metadata,
                         messages_metadata,
                         offset,
                         message_id,
-                    )
-                });
-                document.insert(DEFAULT_PRIMARY_KEY.to_string(), Value::String(id.clone()));
+                    )?,
+                };
+                document.insert(DEFAULT_PRIMARY_KEY.to_string(), Value::String(id));
             }
             insert_metadata_field(
                 &mut document,
@@ -437,7 +455,7 @@ impl MeilisearchSink {
             .await
             .map_err(|error| PartialIndexError {
                 accepted: documents.len(),
-                failed: documents.len(),
+                failed: 0,
                 error,
             })?;
         Ok(documents.len())
@@ -584,11 +602,19 @@ impl MeilisearchSink {
         Op: FnMut() -> Fut,
         Fut: Future<Output = Result<T, MeilisearchSdkError>>,
     {
-        // One retry budget covers both SDK errors and per-attempt timeouts.
+        let started = Instant::now();
         let mut retries = 0u32;
 
         loop {
-            let result = tokio::time::timeout(self.config.timeout, operation_fn()).await;
+            let remaining = self.config.timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(Error::HttpRequestFailed(format!(
+                    "Meilisearch {operation} timed out after {:?}",
+                    self.config.timeout
+                )));
+            }
+
+            let result = tokio::time::timeout(remaining, operation_fn()).await;
             match result {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(error)) => {
@@ -605,7 +631,11 @@ impl MeilisearchSink {
                     warn!(
                         "Meilisearch {operation} failed (retry {retries}/{max_retries}): {error}. Retrying in {delay:?}..."
                     );
-                    sleep(delay).await;
+                    let remaining = self.config.timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(map_sdk_error(error));
+                    }
+                    sleep(cmp::min(delay, remaining)).await;
                 }
                 Err(_) => {
                     if retries >= max_retries {
@@ -624,7 +654,14 @@ impl MeilisearchSink {
                         "Meilisearch {operation} timed out after {:?} (retry {retries}/{max_retries}). Retrying in {delay:?}...",
                         self.config.timeout
                     );
-                    sleep(delay).await;
+                    let remaining = self.config.timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(Error::HttpRequestFailed(format!(
+                            "Meilisearch {operation} timed out after {:?}",
+                            self.config.timeout
+                        )));
+                    }
+                    sleep(cmp::min(delay, remaining)).await;
                 }
             }
         }
@@ -771,6 +808,7 @@ fn generated_document_id(
         message.offset,
         message.id,
     )
+    .expect("test generated ID components should serialize")
 }
 
 fn generated_document_id_from_parts(
@@ -778,7 +816,7 @@ fn generated_document_id_from_parts(
     messages_metadata: &MessagesMetadata,
     offset: u64,
     id: u128,
-) -> String {
+) -> Result<String, Error> {
     let components = json!([
         topic_metadata.stream.as_str(),
         topic_metadata.topic.as_str(),
@@ -788,8 +826,12 @@ fn generated_document_id_from_parts(
     ]);
     let encoded = serde_json::to_vec(&components)
         .map(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-        .expect("generated ID components are always JSON-serializable");
-    format!("iggy_{encoded}")
+        .map_err(|error| {
+            Error::Serialization(format!(
+                "Failed to serialize generated document ID: {error}"
+            ))
+        })?;
+    Ok(format!("iggy_{encoded}"))
 }
 
 fn insert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Value) {
