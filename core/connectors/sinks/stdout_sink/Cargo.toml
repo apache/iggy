@@ -30,7 +30,7 @@ readme = "../../README.md"
 publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+ignored = ["dashmap"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
