@@ -3,7 +3,7 @@
 Regression tests live under [`tests/`](../tests/). Run from the workspace root:
 
 ```bash
-cargo test -p iggy_gateway_kafka
+cargo test -p iggy-gateway-kafka
 ```
 
 **Current count:** 103 tests across 12 suites (as of #3421 foundation).
@@ -34,7 +34,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 | [`decode_validation_tests.rs`](../tests/decode_validation_tests.rs) | kafka-tool fixture decode + response structure per version | 14 | **Yes** |
 | [`version_firewall_tests.rs`](../tests/version_firewall_tests.rs) | Version boundary matrix, unsupported keys, corrupt bodies | 17 | Partial |
 | [`metadata_regression_tests.rs`](../tests/metadata_regression_tests.rs) | Metadata v0–v9, topic counts, broker advertise | 7 | No |
-| [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::from_bind_addr` parsing | 5 | No |
+| [`broker_advertise_tests.rs`](../tests/broker_advertise_tests.rs) | `BrokerAdvertise::from_server_config` parsing | 5 | No |
 | [`handler_regression_tests.rs`](../tests/handler_regression_tests.rs) | Every scoped key×version via `handle_request`, stub error codes | 5 | Partial |
 | [`server_integration_tests.rs`](../tests/server_integration_tests.rs) | `read_frame` / `write_frame` unit-level I/O | 4 | No |
 | [`server_e2e_tests.rs`](../tests/server_e2e_tests.rs) | Full `KafkaServer` TCP round-trips | 8 | Partial |
@@ -141,10 +141,10 @@ cargo run -p kafka-message-gen -- generate \
   --api-key 0 --api-key 1 --api-key 2 --api-key 19
 
 # 2. Run regression suite
-cargo test -p iggy_gateway_kafka
+cargo test -p iggy-gateway-kafka
 
 # 3. Optional lint gate
-cargo clippy -p iggy_gateway_kafka -- -D warnings
+cargo clippy -p iggy-gateway-kafka -- -D warnings
 ```
 
 ---
