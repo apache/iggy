@@ -7683,8 +7683,6 @@ dependencies = [
  "hex",
  "indexmap 2.14.0",
  "kafka-protocol",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
