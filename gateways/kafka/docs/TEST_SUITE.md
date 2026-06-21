@@ -13,12 +13,10 @@ cargo test -p iggy-gateway-kafka
 ### Wire fixtures (required for `decode_validation_tests` and some handler tests)
 
 ```bash
-cargo run -p kafka-message-gen -- generate \
-  --output gateways/kafka/tools/kafka-tool/kafka_messages \
-  --api-key 0 --api-key 1 --api-key 2 --api-key 19
+./gateways/kafka/scripts/ci-wire-fixtures.sh generate
 ```
 
-Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that need them skip gracefully when a fixture file is missing (`handler_regression_tests`) or panic with a clear path (`decode_validation_tests`).
+Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the same script before `rust-gateway` test jobs and removes the directory afterward. Tests that need fixtures skip gracefully when a file is missing (`handler_regression_tests`) or panic with a clear path (`decode_validation_tests`).
 
 ---
 
