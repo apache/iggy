@@ -25,7 +25,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ## Test file catalog
 
 | File | Suite focus | Test count (approx.) | Depends on fixtures |
-|------|-------------|----------------------|---------------------|
+| ------ | ------------- | ---------------------- | --------------------- |
 | [`codec_tests.rs`](../tests/codec_tests.rs) | Primitive encode/decode round-trips, varint, compact strings, tagged fields | 9 | No |
 | [`decode_safety_tests.rs`](../tests/decode_safety_tests.rs) | Adversarial wire input — malformed lengths, truncated bodies | 6 | No |
 | [`header_tests.rs`](../tests/header_tests.rs) | Request/response header v1/v2, version lookup table | 10 | No |
@@ -47,7 +47,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### ApiVersions (key 18, v0–v3)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Non-flexible response (v1) | `api_handler_tests` | `api_versions_v1_response_non_flexible_format` |
 | Flexible response (v3) | `api_handler_tests` | `api_versions_v3_response_flexible_format` |
 | Golden byte fixture (v1) | `golden_wire_fixtures_tests` | `golden_apiversions_v1_response_fixture` |
@@ -59,7 +59,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### Metadata (key 3, v0–v9)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Stub broker (default 127.0.0.1:9093) | `api_handler_tests`, `metadata_regression_tests` | `metadata_response_has_broker_*`, `metadata_v0_empty_*` |
 | Unsupported version → topic error 35 | `api_handler_tests`, `version_firewall_tests` | `unsupported_version_returns_protocol_error`, `metadata_*_version_returns_topic_error` |
 | Golden byte fixture (v0, 1 topic) | `golden_wire_fixtures_tests` | `golden_metadata_v0_single_topic_response_fixture` |
@@ -71,7 +71,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### Produce (key 0, v3–v9)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Decode all versions (fixture) | `decode_validation_tests` | `produce_all_supported_versions_decode` |
 | Response encode all versions | `decode_validation_tests` | `produce_response_encodes_for_all_supported_versions` |
 | v3 field layout | `decode_validation_tests` | `produce_response_v3_roundtrip` |
@@ -84,7 +84,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### Fetch (key 1, v4–v12)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Decode all versions | `decode_validation_tests` | `fetch_all_supported_versions_decode` |
 | Response encode all versions | `decode_validation_tests` | `fetch_response_encodes_for_all_supported_versions` |
 | v7 session_id / error_code layout | `decode_validation_tests` | `fetch_response_v7_roundtrip` |
@@ -95,7 +95,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### ListOffsets (key 2, v1–v6)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Decode all versions | `decode_validation_tests` | `list_offsets_all_supported_versions_decode` |
 | v1 no leader_epoch | `decode_validation_tests` | `list_offsets_response_v1_no_leader_epoch` |
 | v4 has leader_epoch | `decode_validation_tests` | `list_offsets_response_v4_has_leader_epoch` |
@@ -105,7 +105,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ### CreateTopics (key 19, v2–v5)
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Decode all versions | `decode_validation_tests` | `create_topics_all_supported_versions_decode` |
 | v2 roundtrip | `decode_validation_tests` | `create_topics_response_v2_roundtrip` |
 | v5 flexible roundtrip | `decode_validation_tests` | `create_topics_response_v5_roundtrip` |
@@ -117,7 +117,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. Tests that nee
 ## Cross-cutting scenarios
 
 | Scenario | Test file | Test name |
-|----------|-----------|-----------|
+| ---------- | ----------- | ----------- |
 | Version firewall min/max boundaries | `version_firewall_tests` | `is_supported_version_matches_scope_table` |
 | Unknown API keys (8, 9, 10, 17, 20, 999) | `version_firewall_tests`, `api_handler_tests` | `unsupported_api_keys_*`, `unknown_api_key_*` |
 | Negative i32 array length | `decode_safety_tests` | `negative_i32_array_length_returns_error_not_panic` |

@@ -11,7 +11,7 @@
 ## Legend
 
 | Symbol | Meaning |
-|--------|---------|
+| -------- | --------- |
 | 🔴 Bridge | Core data path — must be fully implemented and forwarded to Iggy |
 | 🟠 Required Stub | Client state-machine API — must return a well-formed response or clients will stall/crash |
 | 🟡 Optional Stub | Admin/observability — can safely return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` |
@@ -27,7 +27,7 @@ Kafka 4.0 removed all protocol versions older than Kafka 2.1.0 (KIP-896).
 Key new minimums:
 
 | API | Old Min | New Min (4.0) |
-|-----|:-------:|:-------------:|
+| ----- | :-------: | :-------------: |
 | Produce | 0 | 3 |
 | Fetch | 0 | 4 |
 | ListOffsets | 0 | 1 |
@@ -46,7 +46,7 @@ Key new minimums:
 ## Group 1 — Core Data Path
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 0 | **Produce** | 3 †| 12 | v9 | ✅ | 🔴 Bridge |
 | 1 | **Fetch** | 4 | 17 | v12 | ✅ | 🔴 Bridge |
 | 2 | **ListOffsets** | 1 | 9 | v6 | ✅ | 🟠 Required Stub |
@@ -59,7 +59,7 @@ Key new minimums:
 ## Group 2 — API Negotiation & Auth
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 17 | **SaslHandshake** | 0 | 1 | never | ✅ | 🔴 Bridge (auth flow) |
 | 18 | **ApiVersions** | 0 | 4 | v3 | ✅ | 🔴 Bridge (advertise Iggy caps) |
 | 36 | **SaslAuthenticate** | 0 | 2 | v2 | ✅ | 🔴 Bridge (auth flow) |
@@ -73,7 +73,7 @@ Key new minimums:
 ## Group 3 — Classic Consumer Group Protocol
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 8 | **OffsetCommit** | 2 | 9 | v8 | ✅ | 🟠 Required Stub |
 | 9 | **OffsetFetch** | 1 | 9 | v6 | ✅ | 🟠 Required Stub |
 | 10 | **FindCoordinator** | 1 | 6 | v3 | ✅ | 🟠 Required Stub |
@@ -90,7 +90,7 @@ Key new minimums:
 ## Group 4 — New Consumer Group Protocol (KIP-848, Kafka 3.7+)
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 68 | **ConsumerGroupHeartbeat** | 0 | 1 | v0 | ✅ | 🟠 Required Stub |
 | 69 | **ConsumerGroupDescribe** | 0 | 1 | v0 | ✅ | 🟡 Optional Stub |
 
@@ -102,7 +102,7 @@ Key new minimums:
 ## Group 5 — Topic Administration
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 19 | **CreateTopics** | 2 | 7 | v5 | ✅ (max v5 ⚠️) | 🟠 Required Stub |
 | 20 | **DeleteTopics** | 1 | 6 | v4 | ✅ | 🟡 Optional Stub |
 | 21 | **DeleteRecords** | 0 | 2 | v2 | ✅ | 🟡 Optional Stub |
@@ -115,7 +115,7 @@ Key new minimums:
 ## Group 6 — Transactions (EOS — Exactly Once Semantics)
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 22 | **InitProducerId** | 2 | 5 | v2 | ✅ | 🟡 Optional Stub |
 | 23 | **OffsetForLeaderEpoch** | 1 | 5 | v4 | ✅ | 🟡 Optional Stub |
 | 24 | **AddPartitionsToTxn** | 1 | 5 | v3 | ✅ | 🟡 Optional Stub |
@@ -129,7 +129,7 @@ Key new minimums:
 ## Group 7 — Security & ACLs
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 29 | **DescribeAcls** | 0 | 3 | v2 | ✅ | 🟡 Optional Stub |
 | 30 | **CreateAcls** | 0 | 3 | v2 | ✅ | 🟡 Optional Stub |
 | 31 | **DeleteAcls** | 0 | 3 | v2 | ✅ | 🟡 Optional Stub |
@@ -145,7 +145,7 @@ Key new minimums:
 ## Group 8 — Configuration & Quotas
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 32 | **DescribeConfigs** | 0 | 4 | v4 | ✅ | 🟡 Optional Stub |
 | 33 | **AlterConfigs** | 0 | 2 | v2 | ✅ | 🟡 Optional Stub |
 | 44 | **IncrementalAlterConfigs** | 0 | 1 | v1 | ✅ | 🟡 Optional Stub |
@@ -157,7 +157,7 @@ Key new minimums:
 ## Group 9 — Log & Partition Admin
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 34 | **AlterReplicaLogDirs** | 0 | 2 | v2 | ✅ | 🟡 Optional Stub |
 | 35 | **DescribeLogDirs** | 0 | 4 | v2 | ✅ | 🟡 Optional Stub |
 | 43 | **ElectLeaders** | 0 | 2 | v2 | ✅ | 🟡 Optional Stub |
@@ -171,7 +171,7 @@ Key new minimums:
 ## Group 10 — Cluster Introspection
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 55 | **DescribeQuorum** | 0 | 2 | v0 | ✅ | 🟡 Optional Stub |
 | 59 | **FetchSnapshot** | 0 | 1 | v0 | ✅ | 🟡 Optional Stub |
 | 60 | **DescribeCluster** | 0 | 1 | v0 | ✅ | 🟡 Optional Stub |
@@ -186,7 +186,7 @@ Key new minimums:
 ## Group 11 — Observability / Telemetry (KIP-714, Kafka 3.7+)
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 71 | **GetTelemetrySubscriptions** | 0 | 0 | v0 | ✅ | 🟡 Optional Stub |
 | 72 | **PushTelemetry** | 0 | 0 | v0 | ✅ | 🟡 Optional Stub |
 | 76 | **ListClientMetricsResources** | 0 | 0 | v0 | ✅ | 🟡 Optional Stub |
@@ -199,7 +199,7 @@ Key new minimums:
 > coordinator APIs and can be rejected.
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 77 | **ShareGroupHeartbeat** | 0 | 0 | v0 | ✅ | 🟠 Required Stub |
 | 78 | **ShareGroupDescribe** | 0 | 0 | v0 | ✅ | 🟡 Optional Stub |
 | 79 | **ShareFetch** | 0 | 0 | v0 | ✅ | 🔴 Bridge (share consume) |
@@ -210,7 +210,7 @@ Key new minimums:
 ## Group 13 — KRaft Raft Voter Management (NEW in Kafka 4.0)
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 81 | **AddRaftVoter** | 0 | 0 | v0 | ❌ MISSING | ❌ Reject (internal) |
 | 82 | **RemoveRaftVoter** | 0 | 0 | v0 | ❌ MISSING | ❌ Reject (internal) |
 | 83 | **UpdateRaftVoter** | 0 | 0 | v0 | ❌ MISSING | ❌ Reject (internal) |
@@ -223,7 +223,7 @@ Key new minimums:
 > Return `INVALID_REQUEST` (error code 42) with a properly framed response — **do not drop the connection**.
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Header.rs ✓ | Gateway Action |
-|:---:|----------|:---------:|:---------:|:-------------:|:-----------:|:--------------:|
+| :---: | ---------- | :---------: | :---------: | :-------------: | :-----------: | :--------------: |
 | 4 | **LeaderAndIsr** | 0 | 7 | v4 | ✅ | ❌ Reject (broker-only) |
 | 5 | **StopReplica** | 0 | 4 | v2 | ✅ | ❌ Reject (broker-only) |
 | 6 | **UpdateMetadata** | 0 | 8 | v6 | ✅ | ❌ Reject (broker-only) |
@@ -249,7 +249,7 @@ Key new minimums:
 ## Summary Counts
 
 | Category | Count | Notes |
-|----------|:-----:|-------|
+| ---------- | :-----: | ------- |
 | 🔴 Bridge (data path) | 6 | Produce, Fetch, Metadata, ApiVersions, SaslHandshake, SaslAuthenticate, ShareFetch |
 | 🟠 Required Stub (client state machine) | 14 | Consumer group, CreateTopics, ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
 | 🟡 Optional Stub (admin/observability) | 44 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
@@ -263,7 +263,7 @@ Key new minimums:
 ### `SUPPORTED_RANGES` is behind the latest Kafka 4.0 max versions
 
 | API | Declared range | Kafka 4.0 max | Gap |
-|-----|:---:|:---:|:---:|
+| ----- | :---: | :---: | :---: |
 | Produce | v3-v9 | v12 | 3 versions behind |
 | Fetch | v4-v12 | v17 | 5 versions behind |
 | ListOffsets | v1-v6 | v9 | 3 versions behind |

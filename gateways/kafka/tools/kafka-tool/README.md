@@ -56,6 +56,7 @@ cargo run -- list
 ```
 
 Output:
+
 ```
 Key    Name                                       MinVer     MaxVer     Count
 ──────────────────────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ kafka_messages/
 #### Options
 
 | Flag | Description | Default |
-|------|-------------|---------|
+| ------ | ------------- | --------- |
 | `--output` | Output directory | `kafka_messages/` |
 | `--api-key N` | Generate only for API key N | all |
 | `--version N` | Generate only for version N | all |
@@ -121,6 +122,7 @@ cargo run -- send --host 127.0.0.1:9092
 ```
 
 Output (one line per API key × version):
+
 ```
 ✓ ApiVersions v3 → 32 bytes  ec=0
 ✓ Metadata v12 → 148 bytes  ec=0
@@ -133,7 +135,7 @@ Result: 243 OK  37 failed
 #### Options
 
 | Flag | Description | Default |
-|------|-------------|---------|
+| ------ | ------------- | --------- |
 | `--host` | Server address | `127.0.0.1:9092` |
 | `--api-key N` | Test only API key N | all |
 | `--version N` | Test only version N | all |
@@ -170,7 +172,7 @@ cat kafka_messages/018_ApiVersions_v3.bin | nc 127.0.0.1 9092 | xxd | head
 ## Supported API Keys (Kafka 4.1.0)
 
 | Key | Name | Versions | Phase 1 Priority |
-|-----|------|----------|-----------------|
+| ----- | ------ | ---------- | ----------------- |
 | 0   | Produce | v3–v13 | ✅ Critical |
 | 1   | Fetch | v4–v18 | ✅ Critical |
 | 2   | ListOffsets | v1–v11 | ✅ Critical |
