@@ -791,6 +791,7 @@ impl WebSocketClient {
                 Err(_) => {
                     // Reset to prevent response desync on the shared stream.
                     *self.stream.lock().await = None;
+                    self.set_state(ClientState::Disconnected).await;
                     #[cfg(feature = "vsr")]
                     {
                         *self

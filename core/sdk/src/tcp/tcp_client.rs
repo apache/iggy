@@ -824,7 +824,10 @@ impl TcpClient {
             IggyError::TcpError
         })?;
 
-        if matches!(result, Err(IggyError::Disconnected)) {
+        if matches!(
+            result,
+            Err(IggyError::Disconnected) | Err(IggyError::RequestTimeout(_))
+        ) {
             // Reply stream state is unknown (timed out or torn mid-frame);
             // a late reply would desync framing for the next request, so
             // drop the connection and let callers reconnect.
