@@ -6,7 +6,7 @@ A Rust CLI tool that generates correct, fully-framed Kafka binary wire protocol 
 
 Each output `.bin` file is a complete, TCP-ready Kafka request:
 
-```
+```text
 [total_length: i32][api_key: i16][api_version: i16]
 [correlation_id: i32][client_id: NULLABLE_STRING]
 [tagged_fields: 0x00]  ← only for flexible versions
@@ -57,7 +57,7 @@ cargo run -- list
 
 Output:
 
-```
+```text
 Key    Name                                       MinVer     MaxVer     Count
 ──────────────────────────────────────────────────────────────────────────────
 0      Produce                                    3          13         11
@@ -80,7 +80,7 @@ cargo run -- generate --output ./kafka_messages/
 
 Creates one `.bin` file per API key × version:
 
-```
+```text
 kafka_messages/
   000_Produce_v3.bin
   000_Produce_v4.bin
@@ -123,7 +123,7 @@ cargo run -- send --host 127.0.0.1:9092
 
 Output (one line per API key × version):
 
-```
+```text
 ✓ ApiVersions v3 → 32 bytes  ec=0
 ✓ Metadata v12 → 148 bytes  ec=0
 ⚠ Produce v9 → 24 bytes  ec=3        ← ec=3 = UnknownTopicOrPartition (expected)
@@ -173,39 +173,39 @@ cat kafka_messages/018_ApiVersions_v3.bin | nc 127.0.0.1 9092 | xxd | head
 
 | Key | Name | Versions | Phase 1 Priority |
 | ----- | ------ | ---------- | ----------------- |
-| 0   | Produce | v3–v13 | ✅ Critical |
-| 1   | Fetch | v4–v18 | ✅ Critical |
-| 2   | ListOffsets | v1–v11 | ✅ Critical |
-| 3   | Metadata | v0–v13 | ✅ Critical |
-| 8   | OffsetCommit | v2–v10 | ✅ Critical |
-| 9   | OffsetFetch | v1–v10 | ✅ Critical |
-| 10  | FindCoordinator | v0–v6 | ✅ Critical |
-| 11  | JoinGroup | v0–v9 | ✅ Critical |
-| 12  | Heartbeat | v0–v4 | ✅ Critical |
-| 13  | LeaveGroup | v0–v5 | ✅ Critical |
-| 14  | SyncGroup | v0–v5 | ✅ Critical |
-| 15  | DescribeGroups | v0–v6 | 🟡 Important |
-| 16  | ListGroups | v0–v5 | 🟡 Important |
-| 17  | SaslHandshake | v0–v1 | 🟡 Important |
-| 18  | ApiVersions | v0–v5 | ✅ Critical |
-| 19  | CreateTopics | v2–v7 | ✅ Critical |
-| 20  | DeleteTopics | v1–v6 | 🟡 Important |
-| 21  | DeleteRecords | v0–v2 | 🔵 Phase 2 |
-| 22  | InitProducerId | v0–v6 | 🔵 Phase 2 |
-| 24  | AddPartitionsToTxn | v0–v5 | 🔵 Phase 2 |
-| 25  | AddOffsetsToTxn | v0–v4 | 🔵 Phase 2 |
-| 26  | EndTxn | v0–v5 | 🔵 Phase 2 |
-| 28  | TxnOffsetCommit | v0–v5 | 🔵 Phase 2 |
+| 0 | Produce | v3–v13 | ✅ Critical |
+| 1 | Fetch | v4–v18 | ✅ Critical |
+| 2 | ListOffsets | v1–v11 | ✅ Critical |
+| 3 | Metadata | v0–v13 | ✅ Critical |
+| 8 | OffsetCommit | v2–v10 | ✅ Critical |
+| 9 | OffsetFetch | v1–v10 | ✅ Critical |
+| 10 | FindCoordinator | v0–v6 | ✅ Critical |
+| 11 | JoinGroup | v0–v9 | ✅ Critical |
+| 12 | Heartbeat | v0–v4 | ✅ Critical |
+| 13 | LeaveGroup | v0–v5 | ✅ Critical |
+| 14 | SyncGroup | v0–v5 | ✅ Critical |
+| 15 | DescribeGroups | v0–v6 | 🟡 Important |
+| 16 | ListGroups | v0–v5 | 🟡 Important |
+| 17 | SaslHandshake | v0–v1 | 🟡 Important |
+| 18 | ApiVersions | v0–v5 | ✅ Critical |
+| 19 | CreateTopics | v2–v7 | ✅ Critical |
+| 20 | DeleteTopics | v1–v6 | 🟡 Important |
+| 21 | DeleteRecords | v0–v2 | 🔵 Phase 2 |
+| 22 | InitProducerId | v0–v6 | 🔵 Phase 2 |
+| 24 | AddPartitionsToTxn | v0–v5 | 🔵 Phase 2 |
+| 25 | AddOffsetsToTxn | v0–v4 | 🔵 Phase 2 |
+| 26 | EndTxn | v0–v5 | 🔵 Phase 2 |
+| 28 | TxnOffsetCommit | v0–v5 | 🔵 Phase 2 |
 | 29–31 | ACL APIs | v1–v3 | 🔵 Phase 2 |
-| 32  | DescribeConfigs | v1–v4 | 🟡 Important |
-| 36  | SaslAuthenticate | v0–v2 | 🟡 Important |
+| 32 | DescribeConfigs | v1–v4 | 🟡 Important |
+| 36 | SaslAuthenticate | v0–v2 | 🟡 Important |
 | ... | 40+ more | various | 🔵 Phase 3 |
 
 ---
 
 ## Project Structure
 
-```
+```text
 tools/kafka-tool/
 ├── Cargo.toml        ← package manifest and dependencies
 ├── src/
