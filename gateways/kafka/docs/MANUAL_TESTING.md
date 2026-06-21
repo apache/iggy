@@ -11,7 +11,7 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 ### Requirements
 
 | Tool | Purpose | Install |
-|------|---------|---------|
+| ------ | --------- | --------- |
 | Rust toolchain | Build gateway + kafka-tool | [rustup.rs](https://rustup.rs) |
 | `kafka-message-gen` | Generate/send wire fixtures | `cargo build -p kafka-message-gen` |
 | `kcat` (optional) | Real Kafka client smoke test | `brew install kcat` / `apt install kafkacat` |
@@ -62,7 +62,7 @@ All tests must pass. If `decode_validation_tests` fail, regenerate fixtures (ste
 ### Category A — Smoke tests (must pass before check-in)
 
 | ID | Test | Steps | Expected result | Pass criteria |
-|----|------|-------|-----------------|---------------|
+| ---- | ------ | ------- | ----------------- | --------------- |
 | A1 | Gateway starts | Run `iggy-gateway-kafka` | Binds to `:9093`, no panic | Log shows bind address |
 | A2 | ApiVersions v1 | `cargo run -p kafka-message-gen -- send --host 127.0.0.1:9093 --api-key 18 --version 1` | Response received | `ec=0`, non-zero byte count |
 | A3 | ApiVersions v3 (flexible) | Same with `--version 3` | Response received | `ec=0` |
@@ -78,7 +78,7 @@ All tests must pass. If `decode_validation_tests` fail, regenerate fixtures (ste
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send` with `--version N`.
 
 | API key | Name | Min | Max | Test versions |
-|---------|------|-----|-----|---------------|
+| --------- | ------ | ----- | ----- | --------------- |
 | 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
@@ -87,7 +87,7 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
 
 | ID | Test | Expected for in-range | Expected for out-of-range |
-|----|------|----------------------|---------------------------|
+| ---- | ------ | ---------------------- | --------------------------- |
 | B1 | ApiVersions negotiation | `error_code=0`; body lists 6 API keys with correct min/max | `error_code=35` (UNSUPPORTED_VERSION) |
 | B2 | Metadata out-of-range | N/A | Topic entries show `error_code=35` |
 | B3 | Produce/Fetch/ListOffsets/CreateTopics out-of-range | N/A | Version-aware response with `error_code=35` (top-level or per-topic/partition) |
@@ -102,7 +102,7 @@ cargo run -p kafka-message-gen -- generate --api-key 18 --version 3 --hex
 ### Category C — Unsupported API keys
 
 | ID | API key | Name | Steps | Expected |
-|----|---------|------|-------|----------|
+| ---- | --------- | ------ | ------- | ---------- |
 | C1 | 8 | OffsetCommit | `send --api-key 8 --version 2` | `ec=35`, connection stays open |
 | C2 | 10 | FindCoordinator | `send --api-key 10` | `ec=35` |
 | C3 | 17 | SaslHandshake | `send --api-key 17` | `ec=35` |
@@ -113,7 +113,7 @@ Follow C1 with A2 on the **same** `nc` session to confirm the connection is not 
 ### Category D — Flexible vs legacy wire encoding
 
 | ID | API key | Version | Encoding | Validation |
-|----|---------|---------|----------|------------|
+| ---- | --------- | --------- | ---------- | ------------ |
 | D1 | Produce | 8 | Legacy (i32 arrays) | `send` succeeds, `ec=0` |
 | D2 | Produce | 9 | Flexible (compact + tagged fields) | `send` succeeds, `ec=0` |
 | D3 | Fetch | 11 | Legacy | `send` succeeds |
@@ -128,7 +128,7 @@ Follow C1 with A2 on the **same** `nc` session to confirm the connection is not 
 ### Category E — Metadata stub semantics
 
 | ID | Test | Steps | Expected |
-|----|------|-------|----------|
+| ---- | ------ | ------- | ---------- |
 | E1 | Broker advertise address | Start gateway on `127.0.0.1:9093`; Metadata v0 | Broker host=`127.0.0.1`, port=`9093` |
 | E2 | Wildcard bind + advertised host | `KAFKA_BIND_ADDR=0.0.0.0:19093` + `KAFKA_ADVERTISED_HOST=kafka.internal`, restart | Metadata broker host/port match advertised values |
 | E3 | Unknown topic stub | Metadata with topic name `my-topic` | Topic error `3` (UNKNOWN_TOPIC_OR_PARTITION), name `unknown-topic` |
@@ -137,7 +137,7 @@ Follow C1 with A2 on the **same** `nc` session to confirm the connection is not 
 ### Category F — TCP / connection behavior
 
 | ID | Test | Steps | Expected |
-|----|------|-------|----------|
+| ---- | ------ | ------- | ---------- |
 | F1 | Correlation ID echoed | Send ApiVersions with known correlation_id; decode response header | Response correlation_id matches request |
 | F2 | Sequential requests | Send ApiVersions then Metadata on same TCP connection | Both get valid responses |
 | F3 | Client disconnect | Connect, send partial frame, close | Gateway logs clean disconnect, no panic |
@@ -150,7 +150,7 @@ Follow C1 with A2 on the **same** `nc` session to confirm the connection is not 
 Requires `kcat` installed. Gateway does **not** implement SASL or full broker semantics — expect limited success.
 
 | ID | Test | Command | Expected (foundation) |
-|----|------|---------|---------------------|
+| ---- | ------ | --------- | --------------------- |
 | G1 | Broker metadata | `kcat -b 127.0.0.1:9093 -L` | ApiVersions + Metadata handshake; broker appears in metadata |
 | G2 | Produce (likely fails later) | `echo "hello" \| kcat -b 127.0.0.1:9093 -t test -P` | May fail at coordinator/group stage — document actual error |
 | G3 | Consumer (likely fails later) | `kcat -b 127.0.0.1:9093 -t test -C -o beginning` | May fail without consumer groups — document actual error |
@@ -160,7 +160,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 ### Category H — Adversarial / negative input
 
 | ID | Test | Steps | Expected |
-|----|------|-------|----------|
+| ---- | ------ | ------- | ---------- |
 | H1 | Truncated Produce body | Send valid header + incomplete body | `error_code=42` (INVALID_REQUEST) or connection error; **no panic** |
 | H2 | Random bytes | `dd if=/dev/urandom bs=64 count=1 \| nc 127.0.0.1 9093` | Connection closed or protocol error; gateway stays up |
 | H3 | Empty body after header | ApiVersions with valid header, empty body | `ec=0` (ApiVersions accepts empty body) |
@@ -172,7 +172,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 ### Kafka error codes used in #3421
 
 | Code | Name | When returned |
-|------|------|---------------|
+| ------ | ------ | --------------- |
 | 0 | NONE | Successful stub response |
 | 42 | INVALID_REQUEST | Produce/Fetch/ListOffsets/CreateTopics decode failure; unsupported request header |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub per-topic error |
@@ -182,7 +182,7 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 ### Response header rules
 
 | API key | Request flexible? | Response header version |
-|---------|--------------------|-------------------------|
+| --------- | -------------------- | ------------------------- |
 | 18 ApiVersions | v3+ | Always v0 (correlation_id only) |
 | 3 Metadata | v9+ | v1 (correlation_id + tagged fields) |
 | 0 Produce | v9+ | v1 |
@@ -250,7 +250,7 @@ _________________________________
 ## 6. Troubleshooting
 
 | Symptom | Likely cause | Fix |
-|---------|--------------|-----|
+| --------- | -------------- | ----- |
 | `Connection refused` on 9093 | Gateway not running | Start `iggy-gateway-kafka` |
 | `decode_validation_tests` panic | Missing fixtures | Run `kafka-message-gen generate` |
 | `ec=35` for in-range version | Version not in `SUPPORTED_RANGES` | Check `SCOPE.md` and `api.rs` |
