@@ -49,7 +49,7 @@ runs:
         # Light legs fit in the runner's ~89 GiB default headroom; skip the
         # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
         # images on test-*, cross-builds, miri, verify-publish) keep it.
-        free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest' || (startsWith(inputs.task, 'test-') && inputs.component == 'rust-gateway')) && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -199,6 +199,11 @@ runs:
       with:
         tool: cargo-llvm-cov
 
+    - name: Generate Kafka gateway wire fixtures
+      if: startsWith(inputs.task, 'test-') && inputs.component == 'rust-gateway'
+      run: ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+      shell: bash
+
     - name: Build and test with coverage
       if: startsWith(inputs.task, 'test-')
       run: |
@@ -326,6 +331,11 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
+      shell: bash
+
+    - name: Remove Kafka gateway wire fixtures
+      if: always() && startsWith(inputs.task, 'test-') && inputs.component == 'rust-gateway'
+      run: ./gateways/kafka/scripts/ci-wire-fixtures.sh cleanup
       shell: bash
 
     - name: Backwards compatibility check
