@@ -87,6 +87,12 @@ impl BrokerAdvertise {
                     "KAFKA_ADVERTISED_HOST must not be empty".into(),
                 ));
             }
+            if trimmed.len() > i16::MAX as usize {
+                return Err(KafkaProtocolError::InvalidConfig(
+                    "KAFKA_ADVERTISED_HOST exceeds Kafka nullable string limit (32767 bytes)"
+                        .into(),
+                ));
+            }
             trimmed.to_string()
         } else if local_addr.ip().is_unspecified() {
             return Err(KafkaProtocolError::InvalidConfig(
@@ -167,6 +173,9 @@ impl KafkaServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer)) => {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                warn!(%peer, "TCP_NODELAY failed: {e}");
+                            }
                             let cfg = Arc::clone(&self.config);
                             let broker = Arc::clone(&broker);
                             tracker.spawn(async move {
@@ -350,12 +359,17 @@ pub async fn read_frame(
         });
     }
 
-    // Reserve in 64 KB increments so a max-size frame (8 MB by default) does not trigger a
-    // single large upfront allocation before any payload bytes have arrived.
-    let mut data = BytesMut::new();
+    // read_buf() exposes all BytesMut spare capacity to the OS; after reserve(n) the
+    // allocator may give more than n bytes, so the OS can fill past frame_len and silently
+    // consume bytes belonging to the next pipelined frame. Use read() with a bounded slice
+    // so each OS call is limited to exactly the remaining bytes needed.
+    let mut data = BytesMut::with_capacity(frame_len);
     while data.len() < frame_len {
-        data.reserve((frame_len - data.len()).min(READ_CHUNK));
-        match timeout_at(deadline, stream.read_buf(&mut data)).await {
+        let remaining = frame_len - data.len();
+        let chunk = remaining.min(READ_CHUNK);
+        let prev = data.len();
+        data.resize(prev + chunk, 0);
+        let n = match timeout_at(deadline, stream.read(&mut data[prev..prev + chunk])).await {
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "read timeout").into()),
             Ok(Ok(0)) => {
                 return Err(
@@ -363,13 +377,10 @@ pub async fn read_frame(
                 );
             }
             Ok(Err(e)) => return Err(e.into()),
-            Ok(Ok(_)) => {}
-        }
+            Ok(Ok(n)) => n,
+        };
+        data.truncate(prev + n);
     }
-    // read_buf may have written past frame_len if the OS returned more bytes than we
-    // reserved (capacity can round up). Truncate so pipelined frames don't bleed into
-    // decoder.read_bytes(remaining()) at the call site.
-    data.truncate(frame_len);
     Ok(data.freeze())
 }
 
