@@ -36,6 +36,7 @@ pub fn export_logs_to_messages(req: ExportLogsServiceRequest) -> Vec<ProducedMes
             .unwrap_or("")
             .to_owned();
 
+        let resource_value = Value::Object(resource_attrs);
         for scope_logs in resource_logs.scope_logs {
             for record in scope_logs.log_records {
                 let body = record.body.as_ref().map(any_value_to_json);
@@ -49,7 +50,7 @@ pub fn export_logs_to_messages(req: ExportLogsServiceRequest) -> Vec<ProducedMes
                     "trace_id": bytes_to_hex(&record.trace_id),
                     "span_id": bytes_to_hex(&record.span_id),
                     "service_name": service_name,
-                    "resource": resource_attrs.clone(),
+                    "resource": resource_value.clone(),
                     "attributes": extract_attrs(&record.attributes),
                 });
                 if let Some(obj) = doc.as_object_mut() {
@@ -102,6 +103,7 @@ pub fn export_traces_to_messages(req: ExportTraceServiceRequest) -> Vec<Produced
             .unwrap_or("")
             .to_owned();
 
+        let resource_value = Value::Object(resource_attrs);
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 let status_code = span
@@ -127,7 +129,7 @@ pub fn export_traces_to_messages(req: ExportTraceServiceRequest) -> Vec<Produced
                     "status": status_code,
                     "status_message": status_message,
                     "service_name": service_name,
-                    "resource": resource_attrs.clone(),
+                    "resource": resource_value.clone(),
                     "attributes": extract_attrs(&span.attributes),
                 });
                 if let Some(obj) = doc.as_object_mut() {
@@ -260,11 +262,14 @@ pub fn extract_attrs(attrs: &[KeyValue]) -> Map<String, Value> {
     attrs
         .iter()
         .map(|kv| {
-            let value = kv
-                .value
-                .as_ref()
-                .map(any_value_to_json)
-                .unwrap_or(Value::Null);
+            let value = match kv.value.as_ref() {
+                Some(av) if matches!(av.value, Some(any_value::Value::StringValueStrindex(_))) => {
+                    warn!(key = %kv.key, "dropping attribute with unrecognized AnyValue variant");
+                    Value::Null
+                }
+                Some(av) => any_value_to_json(av),
+                None => Value::Null,
+            };
             (kv.key.clone(), value)
         })
         .collect()
