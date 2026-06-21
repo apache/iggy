@@ -748,7 +748,7 @@ impl SurrealDbSink {
         if self.include_checksum {
             record.insert(
                 "iggy_checksum".to_string(),
-                Value::Number(message.checksum.into()),
+                Value::String(message.checksum.to_string()),
             );
         }
 
@@ -1341,10 +1341,34 @@ mod tests {
         assert_eq!(object.get("iggy_topic"), Some(&json!("test_topic")));
         assert_eq!(object.get("iggy_partition_id"), Some(&json!(7)));
         assert_eq!(object.get("iggy_offset"), Some(&json!(9)));
-        assert_eq!(object.get("iggy_checksum"), Some(&json!(123)));
+        assert_eq!(object.get("iggy_checksum"), Some(&json!("123")));
         assert_eq!(object.get("payload"), Some(&json!({"event": "created"})));
         assert_eq!(object.get("payload_encoding"), Some(&json!("json")));
         assert!(object.contains_key("iggy_headers"));
+    }
+
+    #[test]
+    fn given_large_checksum_should_build_record_with_lossless_checksum() {
+        let sink = SurrealDbSink::new(1, test_config());
+        let mut message = test_message(Payload::Text("large-checksum".to_string()));
+        message.checksum = u64::MAX;
+        let topic_metadata = test_topic_metadata();
+        let record_id_prefix = RecordIdPrefix::new(&topic_metadata);
+
+        let record = sink
+            .build_record(
+                &record_id_prefix,
+                &topic_metadata,
+                &test_messages_metadata(),
+                &message,
+            )
+            .expect("Failed to build record");
+        let object = record.as_object().expect("record should be object");
+
+        assert_eq!(
+            object.get("iggy_checksum"),
+            Some(&json!("18446744073709551615"))
+        );
     }
 
     #[test]
