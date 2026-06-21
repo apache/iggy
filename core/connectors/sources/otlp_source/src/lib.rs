@@ -107,11 +107,9 @@ impl Source for OtlpSource {
         let first = match rx.recv().await {
             Some(msg) => msg,
             None => {
-                return Ok(ProducedMessages {
-                    schema: Schema::Json,
-                    messages: vec![],
-                    state: None,
-                });
+                return Err(Error::Connection(
+                    "OTLP gRPC server terminated unexpectedly".to_string(),
+                ));
             }
         };
 
