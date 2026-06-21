@@ -163,6 +163,7 @@ struct BatchInsertOutcome {
 struct SurrealSqlStatement {
     status: String,
     detail: Option<String>,
+    result: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -314,6 +315,7 @@ impl SurrealDbSink {
         self.health_check(&client).await?;
 
         if self.auto_define_table {
+            self.ensure_namespace_database(&client).await?;
             self.ensure_table(&client).await?;
         }
 
@@ -416,6 +418,26 @@ impl SurrealDbSink {
         Ok(())
     }
 
+    async fn ensure_namespace_database(&self, client: &SurrealDbClient) -> Result<(), Error> {
+        validate_identifier("namespace", &self.config.namespace)?;
+        validate_identifier("database", &self.config.database)?;
+
+        let query = format!(
+            "DEFINE NAMESPACE IF NOT EXISTS {}; USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
+            self.config.namespace, self.config.namespace, self.config.database
+        );
+
+        self.execute_sql_without_scope(client, &query)
+            .await
+            .map_err(|e| {
+                Error::InitError(format!(
+                    "Failed to define SurrealDB namespace/database: {e}"
+                ))
+            })?;
+
+        Ok(())
+    }
+
     async fn health_check(&self, client: &SurrealDbClient) -> Result<(), Error> {
         let response = client
             .get(format!("{}/health", self.base_url))
@@ -441,17 +463,44 @@ impl SurrealDbSink {
         client: &SurrealDbClient,
         query: &str,
     ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
-        let response = self
+        self.execute_sql_request(
+            client,
+            query,
+            Some((&self.config.namespace, &self.config.database)),
+        )
+        .await
+    }
+
+    async fn execute_sql_without_scope(
+        &self,
+        client: &SurrealDbClient,
+        query: &str,
+    ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
+        self.execute_sql_request(client, query, None).await
+    }
+
+    async fn execute_sql_request(
+        &self,
+        client: &SurrealDbClient,
+        query: &str,
+        scope: Option<(&str, &str)>,
+    ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
+        let mut request = self
             .apply_auth(client.post(format!("{}/sql", self.base_url)))
             .header("Accept", "application/json")
             .header("Content-Type", "text/plain")
-            .header("Surreal-NS", &self.config.namespace)
-            .header("Surreal-DB", &self.config.database)
-            .body(query.to_string())
+            .body(query.to_string());
+
+        if let Some((namespace, database)) = scope {
+            request = request
+                .header("Surreal-NS", namespace)
+                .header("Surreal-DB", database);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(SurrealDbRequestError::Request)?;
-
         let status = response.status();
         let body = response
             .text()
@@ -476,6 +525,7 @@ impl SurrealDbSink {
                 statement
                     .detail
                     .clone()
+                    .or_else(|| statement.result.as_ref().map(value_to_error_message))
                     .unwrap_or_else(|| format!("SurrealDB query status: {}", statement.status)),
             ));
         }
@@ -900,6 +950,13 @@ fn build_base_url(endpoint: &str, use_tls: bool) -> String {
 
     let scheme = if use_tls { "https" } else { "http" };
     format!("{scheme}://{endpoint}")
+}
+
+fn value_to_error_message(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn is_transient_error(error: &SurrealDbRequestError) -> bool {

@@ -99,6 +99,7 @@ impl SurrealDbClient {
         };
         client.signin().await?;
         client.health().await?;
+        client.ensure_namespace_database().await?;
         Ok(client)
     }
 
@@ -167,16 +168,37 @@ impl SurrealDbClient {
         })
     }
 
+    async fn ensure_namespace_database(&self) -> Result<(), TestBinaryError> {
+        let query = format!(
+            "DEFINE NAMESPACE IF NOT EXISTS {DEFAULT_NAMESPACE}; USE NS {DEFAULT_NAMESPACE}; DEFINE DATABASE IF NOT EXISTS {DEFAULT_DATABASE};"
+        );
+        self.execute_sql_request(&query, false).await.map(|_| ())
+    }
+
     async fn execute_sql(&self, query: &str) -> Result<Vec<SurrealSqlStatement>, TestBinaryError> {
-        let response = self
+        self.execute_sql_request(query, true).await
+    }
+
+    async fn execute_sql_request(
+        &self,
+        query: &str,
+        include_scope: bool,
+    ) -> Result<Vec<SurrealSqlStatement>, TestBinaryError> {
+        let mut request = self
             .client
             .post(format!("{}/sql", self.base_url))
             .basic_auth(ROOT_USERNAME, Some(ROOT_PASSWORD))
             .header("Accept", "application/json")
             .header("Content-Type", "text/plain")
-            .header("Surreal-NS", DEFAULT_NAMESPACE)
-            .header("Surreal-DB", DEFAULT_DATABASE)
-            .body(query.to_string())
+            .body(query.to_string());
+
+        if include_scope {
+            request = request
+                .header("Surreal-NS", DEFAULT_NAMESPACE)
+                .header("Surreal-DB", DEFAULT_DATABASE);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| TestBinaryError::InvalidState {
