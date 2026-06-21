@@ -23,6 +23,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::metrics::v1::{Metric, metric, number_data_point};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use serde_json::{Map, Value, json};
+use std::fmt::Write as _;
 use tracing::warn;
 
 pub fn export_logs_to_messages(req: ExportLogsServiceRequest) -> Vec<ProducedMessage> {
@@ -285,10 +286,11 @@ pub fn any_value_to_json(value: &AnyValue) -> Value {
 }
 
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    s
 }
 
 fn severity_number_to_text(number: i32) -> &'static str {

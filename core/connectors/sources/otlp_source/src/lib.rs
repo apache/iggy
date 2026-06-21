@@ -71,6 +71,12 @@ impl OtlpSource {
 #[async_trait]
 impl Source for OtlpSource {
     async fn open(&mut self) -> Result<(), Error> {
+        if self.rx.lock().await.is_some() {
+            return Err(Error::InitError(
+                "OTLP source connector is already open".to_string(),
+            ));
+        }
+
         let addr = self
             .config
             .listen_addr
