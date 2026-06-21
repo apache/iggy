@@ -5,7 +5,7 @@
 Foundation layer only: a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, validates request wire formats, and returns stub responses. **No Iggy backend integration.**
 
 | Deliverable | Status | Location |
-|-------------|--------|----------|
+| ------------- | -------- | ---------- |
 | TCP listener on `127.0.0.1:9093` (configurable) | Done | `src/server.rs`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
 | Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` |
@@ -29,7 +29,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 ## Supported API keys and versions
 
 | API key | Name | Min version | Max version | Valid versions | Behavior |
-|---------|------|-------------|-------------|----------------|----------|
+| --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker from `ServerConfig.bind_addr`; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | Decode request; stub response |
@@ -44,7 +44,7 @@ A request is accepted when `min_version ≤ api_version ≤ max_version` for tha
 Use this table when configuring clients or generating wire fixtures with `kafka-message-gen`.
 
 | API key | Name | Valid versions (inclusive range) | Flexible wire encoding from |
-|---------|------|----------------------------------|----------------------------|
+| --------- | ------ | ---------------------------------- | ---------------------------- |
 | 0 | Produce | 3–9 | v9 |
 | 1 | Fetch | 4–12 | v12 |
 | 2 | ListOffsets | 1–6 | v6 |
@@ -59,7 +59,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 All API keys not listed above receive an error-only response with `UNSUPPORTED_VERSION` (35). Examples not in this foundation scope:
 
 | API key | Name | Notes |
-|---------|------|-------|
+| --------- | ------ | ------- |
 | 8 | OffsetCommit | Consumer group — later issue |
 | 9 | OffsetFetch | Consumer group — later issue |
 | 10 | FindCoordinator | Consumer group — later issue |
@@ -74,7 +74,7 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 ## Architecture (three layers)
 
 | Layer | #3421 | Description |
-|-------|-------|-------------|
+| ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs`, `codec.rs`, `header.rs` — keep custom, zero-copy frame I/O |
 | **2 — Request/response codecs** | Partial | Custom minimal-parse codecs for 6 hot-path keys; stub responses only |
 | **3 — Iggy bridge** | Out of scope | Produce/Fetch → Iggy SDK; deferred to a follow-on issue |

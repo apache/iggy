@@ -11,7 +11,7 @@ cargo run -p iggy-gateway-kafka
 Default bind: `127.0.0.1:9093`. Environment variables:
 
 | Variable | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `KAFKA_BIND_ADDR` | `127.0.0.1:9093` | TCP address to listen on |
 | `KAFKA_ADVERTISED_HOST` | bind IP | Hostname/IP clients use to reach this broker (required when binding to `0.0.0.0`/`::`) |
 | `KAFKA_ADVERTISED_PORT` | bind port | Port advertised in Metadata responses |
