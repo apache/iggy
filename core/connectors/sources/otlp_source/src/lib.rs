@@ -22,6 +22,7 @@ use iggy_connector_sdk::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tonic::transport::server::TcpIncoming;
 use tracing::info;
 
 pub mod convert;
@@ -76,19 +77,24 @@ impl Source for OtlpSource {
             .parse()
             .map_err(|err| Error::InitError(format!("Invalid listen address: {err}")))?;
 
-        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let handle = tokio::spawn(server::run_grpc_server(addr, tx, shutdown_rx));
-
-        *self.rx.lock().await = Some(rx);
-        *self.shutdown_tx.lock().await = Some(shutdown_tx);
-        *self.server_task.lock().await = Some(handle);
+        let incoming = TcpIncoming::bind(addr).map_err(|err| {
+            Error::InitError(format!("Failed to bind {}: {err}", self.config.listen_addr))
+        })?;
 
         info!(
             "OTLP source connector with ID: {} listening on {}",
             self.id, self.config.listen_addr
         );
+
+        let (tx, rx) = mpsc::channel(self.config.channel_capacity);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(server::run_grpc_server(incoming, tx, shutdown_rx));
+
+        *self.rx.lock().await = Some(rx);
+        *self.shutdown_tx.lock().await = Some(shutdown_tx);
+        *self.server_task.lock().await = Some(handle);
+
         Ok(())
     }
 

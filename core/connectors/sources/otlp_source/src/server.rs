@@ -29,22 +29,20 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
 };
-use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 use tonic::codec::CompressionEncoding;
+use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 pub async fn run_grpc_server(
-    addr: SocketAddr,
+    incoming: TcpIncoming,
     tx: mpsc::Sender<ProducedMessage>,
     shutdown: oneshot::Receiver<()>,
 ) {
     let logs_svc = LogsServiceImpl { tx: tx.clone() };
     let metrics_svc = MetricsServiceImpl { tx: tx.clone() };
     let trace_svc = TraceServiceImpl { tx };
-
-    info!("OTLP gRPC server starting on {addr}");
 
     // OTel SDKs and the Collector's OTLP exporter gzip-compress payloads by
     // default, so every service must accept gzip on the wire. Responses are tiny
@@ -64,7 +62,7 @@ pub async fn run_grpc_server(
         .add_service(logs_server)
         .add_service(metrics_server)
         .add_service(trace_server)
-        .serve_with_shutdown(addr, async {
+        .serve_with_incoming_shutdown(incoming, async {
             let _ = shutdown.await;
             info!("OTLP gRPC server received shutdown signal");
         })
