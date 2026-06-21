@@ -16,7 +16,6 @@
 // under the License.
 
 using System.Diagnostics.CodeAnalysis;
-using System.IO.Hashing;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -25,7 +24,9 @@ using Apache.Iggy.JsonConverters;
 namespace Apache.Iggy.Messages;
 
 /// <summary>
-///     A message which can be sent to the server.
+///     A message which can be sent to the server. A payload backed by caller-owned (e.g. pooled) memory
+///     must stay alive until the send copies it to the wire: for a direct send, until the send call
+///     completes; for a background/queued send, until <see cref="Publishers.IggyPublisher.WaitUntilAllSendsAsync" /> returns.
 /// </summary>
 [JsonConverter(typeof(MessageConverter))]
 public class Message
@@ -33,12 +34,20 @@ public class Message
     /// <summary>
     ///     Message header.
     /// </summary>
-    public required MessageHeader Header { get; init; }
+    public required MessageHeader Header { get; set; }
 
     /// <summary>
     ///     Message payload.
     /// </summary>
-    public required byte[] Payload { get; set; }
+    public required ReadOnlyMemory<byte> Payload { get; set; }
+
+    /// <summary>
+    ///     Whether <see cref="Payload" /> (and any user headers) already hold their encrypted form. Set by the
+    ///     publisher when its encryptor runs; marked messages are skipped, so re-sending one (e.g. a failed-batch
+    ///     snapshot) cannot double-encrypt it. Set it yourself to send an already-encrypted payload past a
+    ///     configured encryptor untouched.
+    /// </summary>
+    public bool Encrypted { get; set; }
 
     /// <summary>
     ///     User defined headers.
@@ -47,9 +56,9 @@ public class Message
 
     /// <summary>
     ///     Pre-serialized (possibly encrypted) user headers bytes.
-    ///     When set, this takes precedence over <see cref="UserHeaders"/> during serialization.
+    ///     When non-empty, this takes precedence over <see cref="UserHeaders" /> during serialization.
     /// </summary>
-    internal byte[]? RawUserHeaders { get; set; }
+    internal ReadOnlyMemory<byte> RawUserHeaders { get; set; }
 
     /// <summary>
     ///     Default constructor.
@@ -65,16 +74,9 @@ public class Message
     /// <param name="payload">Message payload.</param>
     /// <param name="userHeaders">User defined headers.</param>
     [SetsRequiredMembers]
-    public Message(Guid id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    public Message(Guid id, ReadOnlyMemory<byte> payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+        : this(id.ToUInt128(), payload, userHeaders)
     {
-        Header = new MessageHeader
-        {
-            PayloadLength = payload.Length,
-            Id = id.ToUInt128(),
-            Checksum = CalculateChecksum(payload)
-        };
-        Payload = payload;
-        UserHeaders = userHeaders;
     }
 
     /// <summary>
@@ -84,30 +86,14 @@ public class Message
     /// <param name="payload">Message payload.</param>
     /// <param name="userHeaders">User defined headers.</param>
     [SetsRequiredMembers]
-    public Message(UInt128 id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    public Message(UInt128 id, ReadOnlyMemory<byte> payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
     {
         Header = new MessageHeader
         {
             PayloadLength = payload.Length,
-            Id = id,
-            Checksum = CalculateChecksum(payload)
+            Id = id
         };
         Payload = payload;
         UserHeaders = userHeaders;
-    }
-
-    /// <summary>
-    ///     Returns the size of the message in bytes.
-    /// </summary>
-    /// <returns></returns>
-    public int GetSize()
-    {
-        //return 64 + Payload.Length + (UserHeaders?.Count ?? 0);
-        return 64 + Payload.Length;
-    }
-
-    private ulong CalculateChecksum(byte[] bytes)
-    {
-        return BitConverter.ToUInt64(Crc64.Hash(bytes));
     }
 }

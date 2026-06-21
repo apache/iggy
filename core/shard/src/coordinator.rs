@@ -23,10 +23,15 @@
 //!
 //! 1. picks the next target shard via round-robin,
 //! 2. duplicates the TCP fd,
-//! 3. sends a `LifecycleFrame::{Replica,Client}ConnectionSetup` frame to
-//!    the target shard's inbox,
+//! 3. sends a connection-setup `LifecycleFrame`
+//!    (`ReplicaInboundSetup` / `ReplicaOutboundSetup` /
+//!    `Client{,Ws}ConnectionSetup`) to the target shard's inbox,
 //! 4. drops its own `TcpStream` so only the target shard's wrapped fd
 //!    keeps the socket alive.
+//!
+//! Replica delegation is blind: no byte is read or written on shard 0,
+//! the owning shard runs the handshake and reports the outcome back via
+//! `Replica{Inbound,Outbound}HandshakeDone`.
 //!
 //! The shard-shared [`message_bus::ReplicaOwnerTable`] is the
 //! authoritative `replica_id -> owning_shard` view; the owning shard
@@ -155,34 +160,72 @@ impl ShardZeroCoordinator {
         self.mint_client_id(0)
     }
 
-    /// Ship a replica TCP connection to the next round-robin target shard.
+    /// Ship a blind-delegated inbound replica connection to the next
+    /// round-robin target shard. No byte has been read: the owning shard
+    /// runs the acceptor handshake and answers shard 0 with
+    /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`
+    /// (the in-flight cap slot acquired by the accept callback).
     ///
     /// Returns `Ok(target_shard)` on a successful `try_send`. The owning
     /// shard records itself in the shard-shared
     /// [`message_bus::ReplicaOwnerTable`] once its installer accepts the
-    /// fd, so no extra broadcast or mapping cache is needed here. On
-    /// inter-shard channel failure closes the duplicated fd and returns
-    /// `Err(SendError::RoutingFailed)`.
+    /// handshaked connection, so no extra broadcast or mapping cache is
+    /// needed here. On inter-shard channel failure closes the duplicated
+    /// fd and returns `Err(SendError::RoutingFailed)`; the caller must
+    /// release `slot`.
     ///
     /// # Errors
     ///
     /// Returns an error when `dup(2)` fails or when the target shard's
     /// inbox refuses the setup frame (full or disconnected).
-    pub fn delegate_replica(&self, stream: TcpStream, replica_id: u8) -> Result<u16, SendError> {
+    pub fn delegate_replica_inbound(&self, stream: TcpStream, slot: u64) -> Result<u16, SendError> {
+        self.ship_replica_fd(stream, "delegate_replica_inbound", |fd| {
+            LifecycleFrame::ReplicaInboundSetup { fd, slot }
+        })
+    }
+
+    /// Ship a dialed outbound replica connection to the next round-robin
+    /// target shard. The owning shard runs the dialer handshake toward
+    /// `replica_id` and answers shard 0 with
+    /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`]; on success the
+    /// caller marks the peer dial-pending so the reconnect sweep skips
+    /// it until the handshake outcome arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `dup(2)` fails or when the target shard's
+    /// inbox refuses the setup frame (full or disconnected).
+    pub fn delegate_replica_outbound(
+        &self,
+        stream: TcpStream,
+        replica_id: u8,
+    ) -> Result<u16, SendError> {
+        self.ship_replica_fd(stream, "delegate_replica_outbound", |fd| {
+            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id }
+        })
+    }
+
+    /// Shared dup-and-ship leg of the two replica delegation paths: pick
+    /// the round-robin target, dup the fd, `try_send` the built setup
+    /// frame, drop the original stream so the target's dup keeps the
+    /// socket alive.
+    fn ship_replica_fd(
+        &self,
+        stream: TcpStream,
+        label: &'static str,
+        build_frame: impl FnOnce(fd_transfer::DupedFd) -> LifecycleFrame,
+    ) -> Result<u16, SendError> {
         let target = self.next_replica_target();
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
 
-        let setup = LifecycleFrame::ReplicaConnectionSetup { fd, replica_id };
+        let setup = build_frame(fd);
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             // The frame (and the `DupedFd` inside) is returned in `e` and
             // dropped at end-of-block, which closes the dup. No explicit
             // `close_fd` needed.
             self.metrics
                 .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
-            warn!(
-                replica_id,
-                target, "delegate_replica try_send failed: {e:?}"
-            );
+            warn!(target, "{label} try_send failed: {e:?}");
             return Err(SendError::RoutingFailed(target));
         }
 
@@ -473,7 +516,7 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn delegate_replica_ships_setup_to_target_shard() {
+    async fn delegate_replica_inbound_ships_setup_to_target_shard() {
         let (senders, receivers) = build_senders_with_rx(4);
         let coord = ShardZeroCoordinator::new(
             senders,
@@ -483,31 +526,33 @@ mod tests {
         )
         .expect("coord ctor ok");
 
-        // Loopback TCP pair so delegate_replica has a real fd to dup.
+        // Loopback TCP pair so the delegation has a real fd to dup.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = compio::runtime::spawn(async move { listener.accept().await.unwrap() });
         let client = TcpStream::connect(addr).await.unwrap();
         let (_server, _peer_addr) = accept.await.unwrap();
 
-        let target = coord.delegate_replica(client, 7).expect("delegate ok");
+        let target = coord
+            .delegate_replica_inbound(client, 42)
+            .expect("delegate ok");
         assert_eq!(
             target, 1,
             "first replica target skips shard 0 under default config",
         );
 
-        // Target shard should observe ReplicaConnectionSetup.
+        // Target shard should observe ReplicaInboundSetup echoing the slot.
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame {
-            ShardFrame::Lifecycle(LifecycleFrame::ReplicaConnectionSetup { fd, replica_id }) => {
-                assert_eq!(replica_id, 7);
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaInboundSetup { fd, slot }) => {
+                assert_eq!(slot, 42);
                 drop(fd);
             }
-            _ => panic!("expected ReplicaConnectionSetup on target shard"),
+            _ => panic!("expected ReplicaInboundSetup on target shard"),
         }
 
-        // Non-target shards must not receive any frame: delegate_replica
-        // no longer broadcasts a mapping update, the shard-shared
+        // Non-target shards must not receive any frame: delegation
+        // does not broadcast a mapping update, the shard-shared
         // owner table covers cross-shard routing.
         for (idx, rx) in receivers.iter().enumerate() {
             if idx == target as usize {
@@ -515,8 +560,40 @@ mod tests {
             }
             assert!(
                 rx.try_recv().is_err(),
-                "shard {idx} unexpectedly received a frame after delegate_replica",
+                "shard {idx} unexpectedly received a frame after delegate_replica_inbound",
             );
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn delegate_replica_outbound_ships_setup_with_peer_id() {
+        let (senders, receivers) = build_senders_with_rx(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = compio::runtime::spawn(async move { listener.accept().await.unwrap() });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_server, _peer_addr) = accept.await.unwrap();
+
+        let target = coord
+            .delegate_replica_outbound(client, 7)
+            .expect("delegate ok");
+
+        let setup_frame = receivers[target as usize].recv().await.unwrap();
+        match setup_frame {
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaOutboundSetup { fd, replica_id }) => {
+                assert_eq!(replica_id, 7);
+                drop(fd);
+            }
+            _ => panic!("expected ReplicaOutboundSetup on target shard"),
         }
     }
 

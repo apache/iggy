@@ -16,13 +16,15 @@
 // under the License.
 
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
-use crate::shards_table::{ShardsTable, calculate_shard_from_consensus_ns};
+use crate::shards_table::{
+    ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
+};
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
 use journal::{Journal, JournalHandle};
-use message_bus::{ConnectionInstaller, MessageBus};
+use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
@@ -74,7 +76,7 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
 /// pump), preventing concurrent access from independent async tasks.
 impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
-    B: MessageBus + ConnectionInstaller + 'static,
+    B: MessageBus + ConnectionInstaller + Clone + 'static,
     T: ShardsTable,
 {
     /// Network-receive entry point. Classifies the raw
@@ -146,20 +148,27 @@ where
         }
         if operation.is_partition() {
             let partition_namespace = IggyNamespace::from_raw(namespace_u64);
-            let Some(target) = self.shards_table.shard_for(partition_namespace) else {
-                self.metrics.record_frame_drop(
-                    frame_drop_variant::PARTITION,
-                    frame_drop_reason::UNROUTABLE,
-                );
-                tracing::error!(
-                    shard = self.id,
-                    stream = partition_namespace.stream_id(),
-                    topic = partition_namespace.topic_id(),
-                    partition = partition_namespace.partition_id(),
-                    "namespace not found in shards_table, dropping message"
-                );
-                return;
-            };
+            // The shards table is a cache of the deterministic hash
+            // assignment (every `InsertOwned`/`InsertRouted` row stores
+            // `calculate_shard_assignment`'s result), seeded asynchronously
+            // by each shard's reconciler. A miss therefore means "not seeded
+            // yet", not "unroutable": fall back to the hash so replication
+            // frames arriving during the post-commit convergence window are
+            // not dropped (the partition plane re-checks materialisation on
+            // the owning shard).
+            let target = self
+                .shards_table
+                .shard_for(partition_namespace)
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        shard = self.id,
+                        stream = partition_namespace.stream_id(),
+                        topic = partition_namespace.topic_id(),
+                        partition = partition_namespace.partition_id(),
+                        "namespace not in shards_table; routing by hash assignment"
+                    );
+                    calculate_shard_assignment(&partition_namespace, self.shard_count)
+                });
             self.try_send_to_target(target, generic, operation);
             return;
         }
@@ -337,21 +346,58 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
     {
         match payload {
-            LifecycleFrame::ReplicaConnectionSetup { fd, replica_id } => {
+            LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
+                tracing::info!(
+                    shard = self.id,
+                    slot,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing blind-delegated inbound replica fd"
+                );
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ReleaseSlot(slot));
+                self.bus
+                    .install_replica_inbound_fd(fd, self.on_replica_message.clone(), on_done);
+            }
+            LifecycleFrame::ReplicaOutboundSetup { fd, replica_id } => {
                 tracing::info!(
                     shard = self.id,
                     replica_id,
                     raw_fd = fd.as_raw_fd(),
-                    "installing delegated replica fd"
+                    "installing delegated outbound replica fd"
                 );
-                self.bus
-                    .install_replica_tcp_fd(fd, replica_id, self.on_replica_message.clone());
+                let on_done =
+                    self.replica_handshake_done_fn(ReplicaHandshakeOutcome::ClearDial(replica_id));
+                self.bus.install_replica_outbound_fd(
+                    fd,
+                    replica_id,
+                    self.on_replica_message.clone(),
+                    on_done,
+                );
+            }
+            LifecycleFrame::ReplicaInboundHandshakeDone { slot } => {
+                // Only shard 0 tracks in-flight handshake slots; a
+                // non-zero owning shard's ack closure addresses senders[0]
+                // (shard 0 itself releases inline, no frame).
+                debug_assert_eq!(
+                    self.id, 0,
+                    "ReplicaInboundHandshakeDone routed to shard {}",
+                    self.id
+                );
+                self.bus.release_replica_handshake_slot(slot);
+            }
+            LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id } => {
+                debug_assert_eq!(
+                    self.id, 0,
+                    "ReplicaOutboundHandshakeDone routed to shard {}",
+                    self.id
+                );
+                self.bus.clear_replica_dial_pending(replica_id);
             }
             LifecycleFrame::ClientConnectionSetup { fd, meta } => {
                 tracing::info!(
@@ -421,6 +467,19 @@ where
                 // and pushes the list over `reply`.
                 (self.on_list_clients)(reply);
             }
+            LifecycleFrame::PartitionRead {
+                namespace,
+                read,
+                reply,
+            } => {
+                // Addressed to the shard owning `namespace` (the sender
+                // resolved it via the shards table). The handler (wired by
+                // server-ng) runs the read against this shard's partitions
+                // plane and pushes the result over `reply`; a dropped
+                // sender means the read is skipped and the gather side
+                // times out.
+                (self.on_partition_read)(namespace, read, reply);
+            }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
                 // single-shard tests that never enable the reconciler loop).
@@ -443,4 +502,61 @@ where
             }
         }
     }
+
+    /// Build the one-shot ack a delegated replica handshake fires when it
+    /// finishes, releasing the in-flight cap slot (inbound) or clearing
+    /// the pending-dial entry (outbound). When this shard IS shard 0 the
+    /// closure releases inline on the local bus (infallible, no frame in
+    /// flight); otherwise it `try_send`s the outcome frame to shard 0,
+    /// where a full or disconnected inbox is log-only: shard 0's
+    /// deadline expiry covers the lost ack.
+    fn replica_handshake_done_fn(
+        &self,
+        outcome: ReplicaHandshakeOutcome,
+    ) -> ReplicaHandshakeDoneFn {
+        if self.id == 0 {
+            let bus = self.bus.clone();
+            return Box::new(move || match outcome {
+                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
+                    bus.release_replica_handshake_slot(slot);
+                }
+                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
+                    bus.clear_replica_dial_pending(replica_id);
+                }
+            });
+        }
+        let to_shard_zero = self.senders[0].clone();
+        let metrics = self.metrics.clone();
+        let shard = self.id;
+        Box::new(move || {
+            let frame = match outcome {
+                ReplicaHandshakeOutcome::ReleaseSlot(slot) => {
+                    LifecycleFrame::ReplicaInboundHandshakeDone { slot }
+                }
+                ReplicaHandshakeOutcome::ClearDial(replica_id) => {
+                    LifecycleFrame::ReplicaOutboundHandshakeDone { replica_id }
+                }
+            };
+            if let Err(e) = to_shard_zero.try_send(ShardFrame::lifecycle(frame)) {
+                metrics.record_frame_drop(
+                    frame_drop_variant::REPLICA_HANDSHAKE_ACK,
+                    crate::coordinator::classify_try_send_err(&e),
+                );
+                tracing::debug!(
+                    shard,
+                    "replica handshake outcome ack dropped (shard-0 expiry covers): {e:?}"
+                );
+            }
+        })
+    }
+}
+
+/// Outcome a delegated replica handshake reports back to shard 0:
+/// release the in-flight cap slot (inbound) or clear the pending-dial
+/// entry (outbound). Becomes a [`LifecycleFrame`] only on the
+/// cross-shard send leg; shard 0 applies it inline.
+#[derive(Clone, Copy)]
+enum ReplicaHandshakeOutcome {
+    ReleaseSlot(u64),
+    ClearDial(u8),
 }

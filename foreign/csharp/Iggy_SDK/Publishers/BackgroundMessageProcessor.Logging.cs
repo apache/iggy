@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Threading.Channels;
-using Apache.Iggy.IggyClient;
-using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Publishers;
@@ -26,7 +23,7 @@ namespace Apache.Iggy.Publishers;
 ///     Internal background processor that handles asynchronous message batching and sending.
 ///     Reads messages from a bounded channel and sends them in batches with retry support.
 /// </summary>
-internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
+internal sealed partial class BackgroundMessageProcessor
 {
     // Logging methods
     [LoggerMessage(EventId = 10,
@@ -54,9 +51,9 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         Message = "Background task completed")]
     private partial void LogBackgroundTaskCompleted();
 
-    [LoggerMessage(EventId = 16,
+    [LoggerMessage(EventId = 17,
         Level = LogLevel.Debug,
-        Message = "Iggy client is disconnected. Skipping batch send")]
+        Message = "Iggy client is disconnected. Pausing background sends until reconnected")]
     private partial void LogClientIsDisconnected();
 
     [LoggerMessage(EventId = 300,
@@ -83,4 +80,15 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         Level = LogLevel.Error,
         Message = "Failed to send batch of {Count} messages after {Attempts} attempts")]
     private partial void LogFailedToSendBatchAfterRetries(Exception exception, int count, int attempts);
+
+    [LoggerMessage(EventId = 406,
+        Level = LogLevel.Error,
+        Message = "Failed to serialize or encrypt a queued message; the unit was dropped")]
+    private partial void LogFailedToMaterializeUnit(Exception exception);
+
+    [LoggerMessage(EventId = 407,
+        Level = LogLevel.Critical,
+        Message =
+            "Background message processor terminated unexpectedly; discarding {InFlightCount} queued unit(s) and all future sends")]
+    private partial void LogBackgroundProcessorCrashed(Exception exception, int inFlightCount);
 }

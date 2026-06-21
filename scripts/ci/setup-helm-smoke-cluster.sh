@@ -23,15 +23,23 @@ usage() {
 Usage: scripts/ci/setup-helm-smoke-cluster.sh
 
 Create or reuse the kind cluster used by the Helm smoke test and ensure
-ingress-nginx is installed and ready in that cluster.
+the Gateway API CRDs and Envoy Gateway are installed and ready.
 
 Environment:
-  HELM_SMOKE_KIND_NAME               kind cluster name (default: iggy-helm-smoke)
-  HELM_SMOKE_KIND_IMAGE              kind node image (default: kindest/node:v1.35.0)
-  HELM_SMOKE_KIND_PLATFORM           docker platform for the kind node image
-  HELM_SMOKE_KIND_WAIT               kind create wait timeout (default: 120s)
-  HELM_SMOKE_INGRESS_NGINX_VERSION   ingress-nginx controller tag (default: controller-v1.15.1)
-  HELM_SMOKE_INGRESS_NGINX_TIMEOUT   rollout timeout (default: 5m)
+  HELM_SMOKE_KIND_NAME              kind cluster name (default: iggy-helm-smoke)
+  HELM_SMOKE_KIND_IMAGE             kind node image (default: kindest/node:v1.35.0)
+  HELM_SMOKE_KIND_PLATFORM          docker platform for the kind node image
+  HELM_SMOKE_KIND_WAIT              kind create wait timeout (default: 120s)
+  HELM_SMOKE_GATEWAY_API_VERSION    Gateway API CRD release tag (default: v1.5.1)
+  HELM_SMOKE_ENVOY_GATEWAY_VERSION  Envoy Gateway Helm chart version (default: v1.8.1)
+  HELM_SMOKE_GATEWAY_TIMEOUT        gateway readiness timeout (default: 5m)
+  HELM_SMOKE_GATEWAY_NAMESPACE      namespace for Envoy Gateway and the Gateway resource (default: envoy-gateway-system)
+  HELM_SMOKE_GATEWAY_NAME           name of the Gateway resource (default: iggy-smoke-gateway)
+
+HELM_SMOKE_GATEWAY_NAMESPACE and HELM_SMOKE_GATEWAY_NAME must match the
+values used by scripts/ci/test-helm.sh, since the HTTPRoute parentRef there
+targets this Gateway by namespace + name. Overriding one without the other
+silently breaks route attach.
 EOF
 }
 
@@ -49,8 +57,11 @@ HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_KIND_IMAGE="${HELM_SMOKE_KIND_IMAGE:-kindest/node:v1.35.0}"
 HELM_SMOKE_KIND_PLATFORM="${HELM_SMOKE_KIND_PLATFORM:-}"
 HELM_SMOKE_KIND_WAIT="${HELM_SMOKE_KIND_WAIT:-120s}"
-HELM_SMOKE_INGRESS_NGINX_VERSION="${HELM_SMOKE_INGRESS_NGINX_VERSION:-controller-v1.15.1}"
-HELM_SMOKE_INGRESS_NGINX_TIMEOUT="${HELM_SMOKE_INGRESS_NGINX_TIMEOUT:-5m}"
+HELM_SMOKE_GATEWAY_API_VERSION="${HELM_SMOKE_GATEWAY_API_VERSION:-v1.5.1}"
+HELM_SMOKE_ENVOY_GATEWAY_VERSION="${HELM_SMOKE_ENVOY_GATEWAY_VERSION:-v1.8.1}"
+HELM_SMOKE_GATEWAY_TIMEOUT="${HELM_SMOKE_GATEWAY_TIMEOUT:-5m}"
+HELM_SMOKE_GATEWAY_NAMESPACE="${HELM_SMOKE_GATEWAY_NAMESPACE:-envoy-gateway-system}"
+HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -59,103 +70,9 @@ require_command() {
   fi
 }
 
-duration_to_seconds() {
-  local duration="$1"
-  local total=0
-  local value
-  local unit
-  local multiplier
-
-  if [[ "$duration" =~ ^[0-9]+$ ]]; then
-    echo "$duration"
-    return 0
-  fi
-
-  while [ -n "$duration" ]; do
-    if [[ "$duration" =~ ^([0-9]+)([smhd])(.*)$ ]]; then
-      value="${BASH_REMATCH[1]}"
-      unit="${BASH_REMATCH[2]}"
-      duration="${BASH_REMATCH[3]}"
-      case "$unit" in
-        s) multiplier=1 ;;
-        m) multiplier=60 ;;
-        h) multiplier=3600 ;;
-        d) multiplier=86400 ;;
-      esac
-      total=$((total + (value * multiplier)))
-      continue
-    fi
-
-    echo "Error: unsupported timeout format '$1'" >&2
-    echo "Use plain seconds or a combination of s, m, h, or d units such as 300, 5m, or 1h30m." >&2
-    return 1
-  done
-
-  echo "$total"
-}
-
-wait_for_completed_job() {
-  local job_name="$1"
-
-  if ! kubectl -n ingress-nginx get "job/${job_name}" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  kubectl -n ingress-nginx wait \
-    --for=condition=complete \
-    "job/${job_name}" \
-    --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
-}
-
-wait_for_ingress_validation() {
-  local sleep_seconds=4
-  local validation_timeout_seconds
-  local deadline
-  local probe_file
-
-  validation_timeout_seconds="$(duration_to_seconds "$HELM_SMOKE_INGRESS_NGINX_TIMEOUT")"
-  deadline=$((SECONDS + validation_timeout_seconds))
-  probe_file="$(mktemp "${TMPDIR:-/tmp}/ingress-nginx-probe.XXXXXX.yaml")"
-
-  cat > "$probe_file" <<'EOF'
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: ingress-nginx-readiness-probe
-  namespace: ingress-nginx
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: readiness-probe.iggy.local
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: ingress-nginx-controller
-                port:
-                  number: 80
-EOF
-
-  while (( SECONDS < deadline )); do
-    if kubectl apply --dry-run=server -f "$probe_file" >/dev/null 2>&1; then
-      rm -f "$probe_file"
-      return 0
-    fi
-    sleep "$sleep_seconds"
-  done
-
-  echo "Error: ingress-nginx admission webhook did not become ready within ${HELM_SMOKE_INGRESS_NGINX_TIMEOUT}" >&2
-  if ! kubectl apply --dry-run=server -f "$probe_file"; then
-    rm -f "$probe_file"
-    return 1
-  fi
-  rm -f "$probe_file"
-}
-
 require_command kind
 require_command kubectl
+require_command helm
 
 if [ -n "$HELM_SMOKE_KIND_PLATFORM" ]; then
   require_command docker
@@ -170,19 +87,6 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-    kubeadmConfigPatches:
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
-    extraPortMappings:
-      - containerPort: 80
-        hostPort: 80
-        protocol: TCP
-      - containerPort: 443
-        hostPort: 443
-        protocol: TCP
 EOF
 
 cluster_exists=false
@@ -221,13 +125,71 @@ else
 fi
 
 kubectl config use-context "$kind_context" >/dev/null
-kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${HELM_SMOKE_INGRESS_NGINX_VERSION}/deploy/static/provider/kind/deploy.yaml"
-kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
-kubectl -n ingress-nginx wait \
-  --for=condition=ready \
-  pod \
-  --selector=app.kubernetes.io/component=controller \
-  --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
-wait_for_completed_job ingress-nginx-admission-create
-wait_for_completed_job ingress-nginx-admission-patch
-wait_for_ingress_validation
+
+# Install EG first so its bundled GW API CRDs land before the v1.5 safe-upgrade VAP.
+# We then upgrade those CRDs to the pinned version via server-side apply.
+echo "Installing Envoy Gateway ${HELM_SMOKE_ENVOY_GATEWAY_VERSION}..."
+helm upgrade --install eg \
+  oci://docker.io/envoyproxy/gateway-helm \
+  --version "$HELM_SMOKE_ENVOY_GATEWAY_VERSION" \
+  --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
+  --create-namespace \
+  --wait \
+  --timeout "$HELM_SMOKE_GATEWAY_TIMEOUT"
+
+echo "Upgrading Gateway API CRDs to ${HELM_SMOKE_GATEWAY_API_VERSION}..."
+kubectl apply --server-side --force-conflicts \
+  -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${HELM_SMOKE_GATEWAY_API_VERSION}/standard-install.yaml"
+
+echo "Creating EnvoyProxy, GatewayClass, and Gateway..."
+# Envoy Gateway's default envoyService type is LoadBalancer, which never
+# gets an address on kind (no LB controller). Pin to ClusterIP - the smoke
+# test reaches Envoy via `kubectl port-forward svc/...:80`, which tunnels
+# through the apiserver to the ClusterIP, so no node port is needed.
+kubectl apply -f - <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: iggy-smoke-proxy
+  namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: iggy-smoke
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: iggy-smoke-proxy
+    namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${HELM_SMOKE_GATEWAY_NAME}
+  namespace: ${HELM_SMOKE_GATEWAY_NAMESPACE}
+spec:
+  gatewayClassName: iggy-smoke
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+EOF
+
+echo "Waiting for Gateway to be programmed..."
+kubectl wait \
+  --for=condition=Programmed \
+  "gateway/${HELM_SMOKE_GATEWAY_NAME}" \
+  --namespace "$HELM_SMOKE_GATEWAY_NAMESPACE" \
+  --timeout="$HELM_SMOKE_GATEWAY_TIMEOUT"

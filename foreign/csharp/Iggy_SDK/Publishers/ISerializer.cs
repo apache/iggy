@@ -15,40 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
+
 namespace Apache.Iggy.Publishers;
 
 /// <summary>
-///     Interface for serializing objects of type T to byte arrays.
-///     <para>
-///         No type constraints are enforced on T to provide maximum flexibility.
-///         Implementations are responsible for ensuring that the provided type can be properly serialized.
-///     </para>
+///     Serializes an instance of <typeparamref name="T" /> into a buffer supplied by the publisher.
+///     <see cref="SystemTextJsonSerializer{T}" /> is the default implementation.
 /// </summary>
-/// <typeparam name="T">
-///     The source type for serialization. Can be any type - reference or value type, nullable or non-nullable.
-///     The serializer implementation must be able to handle the specific type provided.
-/// </typeparam>
+/// <typeparam name="T">The source type for serialization.</typeparam>
 /// <remarks>
-///     Implementations should throw appropriate exceptions (e.g., <see cref="System.NotSupportedException" />,
-///     <see cref="System.ArgumentException" />, or <see cref="System.InvalidOperationException" />)
-///     if the provided data cannot be serialized. These exceptions will be caught and logged by
-///     <see cref="IggyPublisher{T}" /> during message creation.
+///     Implementations must write the complete payload and call <see cref="IBufferWriter{T}.Advance" /> for every
+///     byte produced. A serializer that throws fails the direct send it was called from; a background send drops
+///     the offending unit and reports it (with the original values) through
+///     <see cref="IggyPublisher.SubscribeOnBackgroundError" />, keeping the rest of the batch and the processor
+///     loop alive.
 /// </remarks>
 public interface ISerializer<in T>
 {
     /// <summary>
-    ///     Serializes an instance of type T into a byte array.
+    ///     Serializes <paramref name="data" /> into <paramref name="writer" />.
     /// </summary>
-    /// <param name="data">The object to serialize. May be null depending on the serializer implementation.</param>
-    /// <returns>A byte array representing the serialized data.</returns>
-    /// <exception cref="System.NotSupportedException">
-    ///     Thrown when the serializer does not support the provided type or value.
-    /// </exception>
-    /// <exception cref="System.ArgumentException">
-    ///     Thrown when the data cannot be serialized due to invalid content.
-    /// </exception>
-    /// <exception cref="System.InvalidOperationException">
-    ///     Thrown when the serialization operation fails due to state issues.
-    /// </exception>
-    byte[] Serialize(T data);
+    void Serialize(T data, IBufferWriter<byte> writer);
 }

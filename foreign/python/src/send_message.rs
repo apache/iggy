@@ -61,16 +61,19 @@ impl SendMessage {
     /// This method allows for the creation of a `SendMessage` instance
     /// directly from Python using the provided string or bytes data.
     #[new]
-    pub fn new(py: Python, data: PyMessagePayload) -> Self {
-        // TODO: handle errors
+    pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
         let inner = match data {
-            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data).unwrap(),
+            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
             PyMessagePayload::Bytes(data) => {
-                let bytes = Bytes::from(data.extract::<Vec<u8>>(py).unwrap());
-                RustIggyMessage::builder().payload(bytes).build().unwrap()
+                let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
+                RustIggyMessage::builder()
+                    .payload(bytes)
+                    .build()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?
             }
         };
-        Self { inner }
+        Ok(Self { inner })
     }
 }
 

@@ -209,6 +209,11 @@ where
         &mut self.indexes
     }
 
+    /// Index cache for segment `index`, if resident.
+    pub fn segment_indexes(&self, index: usize) -> Option<&IggyIndexCache> {
+        self.indexes.get(index).and_then(Option::as_ref)
+    }
+
     pub fn active_indexes(&self) -> Option<&IggyIndexCache> {
         self.indexes
             .last()

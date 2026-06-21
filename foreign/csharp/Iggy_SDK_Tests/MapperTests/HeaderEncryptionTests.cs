@@ -16,8 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Contracts.Tcp;
-using Apache.Iggy.Encryption;
-using Apache.Iggy.Headers;
+
 namespace Apache.Iggy.Tests.MapperTests;
 
 public class HeaderEncryptionTests
@@ -35,7 +34,7 @@ public class HeaderEncryptionTests
             { new Headers.HeaderKey { Kind = Headers.HeaderKind.String, Value = "encrypted"u8.ToArray() }, new Headers.HeaderValue { Kind = Headers.HeaderKind.Bool, Value = [1] } },
         };
 
-        var headerBytes = Contracts.Tcp.TcpContracts.GetHeadersBytes(originalHeaders);
+        var headerBytes = HeadersToBytes(originalHeaders);
         Assert.NotEmpty(headerBytes);
 
         var encrypted = encryptor.Encrypt(headerBytes);
@@ -146,7 +145,7 @@ public class HeaderEncryptionTests
             { new Headers.HeaderKey { Kind = Headers.HeaderKind.String, Value = "key"u8.ToArray() }, new Headers.HeaderValue { Kind = Headers.HeaderKind.String, Value = "value"u8.ToArray() } },
         };
 
-        var bytes = Contracts.Tcp.TcpContracts.GetHeadersBytes(headers);
+        var bytes = HeadersToBytes(headers);
         var result = Mappers.BinaryMapper.TryMapHeaders(bytes);
 
         Assert.NotNull(result);
@@ -165,10 +164,17 @@ public class HeaderEncryptionTests
             { new Headers.HeaderKey { Kind = Headers.HeaderKind.String, Value = "k5"u8.ToArray() }, new Headers.HeaderValue { Kind = Headers.HeaderKind.Double, Value = BitConverter.GetBytes(3.14) } },
         };
 
-        var bytes = Contracts.Tcp.TcpContracts.GetHeadersBytes(headers);
+        var bytes = HeadersToBytes(headers);
         var result = Mappers.BinaryMapper.TryMapHeaders(bytes);
 
         Assert.NotNull(result);
         Assert.Equal(5, result.Count);
+    }
+
+    private static byte[] HeadersToBytes(Dictionary<Headers.HeaderKey, Headers.HeaderValue> headers)
+    {
+        var bytes = new byte[TcpContracts.HeadersByteLength(headers)];
+        TcpContracts.WriteHeadersTo(bytes, headers);
+        return bytes;
     }
 }

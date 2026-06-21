@@ -110,7 +110,7 @@ clap_complete = "4.6.5"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = { version = "7.2.2", default-features = false }
-compio = { version = "=0.19.0", features = [
+compio = { version = "=0.19.1", features = [
     "runtime",
     "macros",
     "io-uring",
@@ -163,6 +163,12 @@ flume = "0.12.0"
 fs2 = "0.4.3"
 futures = "0.3.32"
 futures-core = { version = "0.3.32", default-features = false }
+# Pinned to the minor compio-tls 0.10.0 resolves to: the replica plane
+# handshakes with futures-rustls directly (TLS exporter access) and hands
+# the stream to compio-tls via its From impls, so both crates must agree
+# on the futures-rustls types. Cargo unifies within 0.26.x; drift to 0.27
+# fails compilation loudly (see the tripwire test in message_bus).
+futures-rustls = "0.26.0"
 futures-util = "0.3.32"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
