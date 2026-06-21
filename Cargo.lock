@@ -7057,9 +7057,9 @@ name = "iggy_connector_quickwit_sink"
 version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
- "dashmap",
  "iggy_connector_sdk",
  "reqwest 0.13.4",
+ "reqwest-middleware",
  "serde",
  "serde_yaml_ng",
  "simd-json",
