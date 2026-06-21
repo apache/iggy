@@ -59,12 +59,6 @@ const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 #[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "WebSocket";
-/// Bound on how long a single VSR reply read may block. The connection is
-/// lockstep and the read runs in the caller's task while holding the stream
-/// lock, so an unanswered read (lost server reply) would wedge every later
-/// request on this client forever. On expiry the stream is dropped.
-#[cfg(feature = "vsr")]
-const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct WebSocketClient {
@@ -713,47 +707,14 @@ impl WebSocketClient {
 
             #[cfg(feature = "vsr")]
             {
-                // Mirror the TCP path: header onto stack, body into its own
-                // buffer, `decode_response_split` slices without concatenation.
-                // Old path did `vec![0; HEADER_SIZE]` + `vec![0; body_size]`
-                // (two zero-fills) + `BytesMut::with_capacity(response_size)` +
-                // two `put_slice` memcopies per reply.
-                // One deadline spans both the header and body reads so a reply
-                // that delivers a header then stalls cannot wait up to 2x the
-                // timeout. On expiry drop the stream: the read runs inline here
-                // (no spawned task to cancel), so without an explicit drop a late
-                // reply would desync framing for the next request.
-                let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
                 let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                let header_read =
-                    tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
-                        .await;
-                let Ok(header_read) = header_read else {
-                    error!(
-                        "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
-                    );
-                    *stream_guard = None;
-                    return Err(IggyError::Disconnected);
-                };
-                header_read?;
+                stream.read(&mut response_header).await?;
 
                 let response_size = crate::vsr::response_size(&response_header)?;
                 let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
                 let body = if body_size > 0 {
-                    // `WebSocketStreamKind::read` reads into a slice without a
-                    // zero-fill prerequisite; we still allocate `body_size` but
-                    // skip the header concatenation.
                     let mut body = vec![0u8; body_size];
-                    let body_read =
-                        tokio::time::timeout_at(response_deadline, stream.read(&mut body)).await;
-                    let Ok(body_read) = body_read else {
-                        error!(
-                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response body for request with code: {code}"
-                        );
-                        *stream_guard = None;
-                        return Err(IggyError::Disconnected);
-                    };
-                    body_read?;
+                    stream.read(&mut body).await?;
                     Bytes::from(body)
                 } else {
                     Bytes::new()

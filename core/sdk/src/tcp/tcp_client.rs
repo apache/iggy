@@ -57,12 +57,6 @@ const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 #[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
-/// Upper bound for awaiting a reply on the lockstep VSR connection. Far
-/// beyond any healthy round-trip; only trips when the server loses the
-/// reply entirely (e.g. stalled replication quorum), which would otherwise
-/// hold the stream lock forever and wedge the client.
-#[cfg(feature = "vsr")]
-const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
@@ -733,64 +727,34 @@ impl TcpClient {
                     #[cfg(feature = "vsr")]
                     {
                         let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                        // `stream.read` delegates to `read_exact`; on success it
-                        // always returns the requested length, so no short-read
-                        // guard is needed here.
-                        //
-                        // Deadline guards against server-side reply loss (e.g. a
-                        // stalled replication quorum that never commits the op):
-                        // the connection is lockstep, so an unanswered read would
-                        // hold the stream lock forever and wedge every later
-                        // request on this client. On expiry drop the stream --
-                        // a late reply would desync framing for the next request.
-                        //
-                        // One deadline spans BOTH the header and body reads: a
-                        // reply that delivers a header then stalls must not get a
-                        // fresh full timeout for the body (which would allow up to
-                        // 2x `RESPONSE_READ_TIMEOUT` total).
-                        let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                        let header_read =
-                            tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
-                                .await;
-                        let Ok(header_read) = header_read else {
-                            error!(
-                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
-                            );
-                            return Err(IggyError::Disconnected);
-                        };
-                        header_read.map_err(|error| {
-                            error!(
-                                "Failed to read VSR response header for TCP request with code: {code}: {error}",
-                                code = code,
-                                error = error
-                            );
-                            IggyError::Disconnected
-                        })?;
+                        stream
+                            .read(&mut response_header)
+                            .await
+                            .map_err(|error| {
+                                error!(
+                                    "Failed to read VSR response header for TCP request with code: {code}: {error}",
+                                    code = code,
+                                    error = error
+                                );
+                                IggyError::Disconnected
+                            })?;
 
                         let response_size = crate::vsr::response_size(&response_header)?;
 
                         let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
                         let body = if body_size > 0 {
                             let mut body = BytesMut::with_capacity(body_size);
-                            let body_read = tokio::time::timeout_at(
-                                response_deadline,
-                                stream.read_buf(&mut body, body_size),
-                            )
-                            .await;
-                            let Ok(body_read) = body_read else {
-                                error!(
-                                    "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
-                                );
-                                return Err(IggyError::Disconnected);
-                            };
-                            body_read.map_err(|error| {
-                                error!(
-                                    "Failed to read VSR response body for TCP request with code: {code}: {error}",
-                                    code = code,
-                                    error = error
-                                );
-                                IggyError::Disconnected
-                            })?;
+                            stream
+                                .read_buf(&mut body, body_size)
+                                .await
+                                .map_err(|error| {
+                                    error!(
+                                        "Failed to read VSR response body for TCP request with code: {code}: {error}",
+                                        code = code,
+                                        error = error
+                                    );
+                                    IggyError::Disconnected
+                                })?;
                             body.freeze()
                         } else {
                             Bytes::new()
