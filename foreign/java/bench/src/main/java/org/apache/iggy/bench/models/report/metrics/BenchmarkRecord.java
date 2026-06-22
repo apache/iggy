@@ -17,25 +17,7 @@
  * under the License.
  */
 
-plugins {
-    id("iggy.java-application-conventions")
-}
+package org.apache.iggy.bench.models.report.metrics;
 
-application {
-    mainClass = "org.apache.iggy.bench.IggyBench"
-
-    // -Xms2g starts the JVM heap at 2 GB.
-    // -Xmx2g caps the JVM heap at 2 GB.
-    // -XX:+UseG1GC pins the garbage collector across runs.
-    // -XX:+AlwaysPreTouch commits heap pages up front to reduce benchmark jitter.
-    applicationDefaultJvmArgs = listOf("-Xms2g", "-Xmx2g", "-XX:+UseG1GC", "-XX:+AlwaysPreTouch")
-}
-
-dependencies {
-    implementation(project(":iggy"))
-    implementation(libs.jackson.databind)
-    implementation(libs.picocli)
-    implementation(libs.slf4j.api)
-
-    runtimeOnly(libs.logback.classic)
-}
+public record BenchmarkRecord(
+        long elapsedTimeUs, long latencyUs, long messages, long messageBatches, long userDataBytes, long totalBytes) {}

@@ -17,25 +17,28 @@
  * under the License.
  */
 
-plugins {
-    id("iggy.java-application-conventions")
-}
+package org.apache.iggy.bench.models.report.metrics;
 
-application {
-    mainClass = "org.apache.iggy.bench.IggyBench"
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import org.apache.iggy.bench.common.enums.TimeSeriesKind;
 
-    // -Xms2g starts the JVM heap at 2 GB.
-    // -Xmx2g caps the JVM heap at 2 GB.
-    // -XX:+UseG1GC pins the garbage collector across runs.
-    // -XX:+AlwaysPreTouch commits heap pages up front to reduce benchmark jitter.
-    applicationDefaultJvmArgs = listOf("-Xms2g", "-Xmx2g", "-XX:+UseG1GC", "-XX:+AlwaysPreTouch")
-}
+import java.util.List;
+import java.util.Objects;
 
-dependencies {
-    implementation(project(":iggy"))
-    implementation(libs.jackson.databind)
-    implementation(libs.picocli)
-    implementation(libs.slf4j.api)
+public record TimeSeries(List<TimePoint> points, TimeSeriesKind kind) {
 
-    runtimeOnly(libs.logback.classic)
+    public TimeSeries {
+        points = List.copyOf(Objects.requireNonNull(points, "points"));
+        kind = Objects.requireNonNull(kind, "kind");
+    }
+
+    @Override
+    @JsonIgnore
+    public TimeSeriesKind kind() {
+        return kind;
+    }
+
+    public static TimeSeries empty(TimeSeriesKind kind) {
+        return new TimeSeries(List.of(), kind);
+    }
 }
