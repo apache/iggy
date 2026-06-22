@@ -528,7 +528,7 @@ impl IggyConsumer {
             self.consumer
         );
 
-        Self::initialize_consumer_group(
+        let newly_created = Self::initialize_consumer_group(
             self.client.clone(),
             self.create_consumer_group_if_not_exists,
             self.stream_id.clone(),
@@ -537,7 +537,17 @@ impl IggyConsumer {
             &self.consumer_name,
             self.joined_consumer_group.clone(),
         )
-        .await
+        .await?;
+
+        // A brand-new consumer group starts at stored offset 0. If the topic has
+        // had retention run, offset 0 may no longer exist. Pre-arm the fallback
+        // so the very first poll uses PollingStrategy::first() instead of Next,
+        // avoiding a guaranteed InvalidOffset error on startup.
+        if newly_created {
+            self.fallback_to_first.store(true, ORDERING);
+        }
+
+        Ok(())
     }
 
     async fn subscribe_events(&self) {
@@ -558,6 +568,7 @@ impl IggyConsumer {
         let consumer_name = self.consumer_name.clone();
         let can_poll = self.can_poll.clone();
         let joined_consumer_group = self.joined_consumer_group.clone();
+        let fallback_to_first = self.fallback_to_first.clone();
         let mut reconnected = false;
         let mut disconnected = false;
 
@@ -615,7 +626,7 @@ impl IggyConsumer {
                         info!(
                             "Rejoining consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}..."
                         );
-                        if let Err(error) = Self::initialize_consumer_group(
+                        match Self::initialize_consumer_group(
                             client.clone(),
                             create_consumer_group_if_not_exists,
                             stream_id.clone(),
@@ -626,10 +637,17 @@ impl IggyConsumer {
                         )
                         .await
                         {
-                            error!(
-                                "Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}"
-                            );
-                            continue;
+                            Err(error) => {
+                                error!(
+                                    "Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}"
+                                );
+                                continue;
+                            }
+                            Ok(newly_created) => {
+                                if newly_created {
+                                    fallback_to_first.store(true, ORDERING);
+                                }
+                            }
                         }
                         info!(
                             "Rejoined consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}"
@@ -855,6 +873,10 @@ impl IggyConsumer {
         sleep(Duration::from_micros(remaining)).await;
     }
 
+    // Returns true if the consumer group was freshly created (stored offset = 0,
+    // which may be below the topic's earliest available offset after retention).
+    // Callers use this to pre-arm fallback_to_first so the very first poll uses
+    // PollingStrategy::first() and avoids an InvalidOffset error.
     async fn initialize_consumer_group(
         client: IggyRwLock<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
@@ -863,9 +885,9 @@ impl IggyConsumer {
         consumer: Arc<Consumer>,
         consumer_name: &str,
         joined_consumer_group: Arc<AtomicBool>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<bool, IggyError> {
         if joined_consumer_group.load(ORDERING) {
-            return Ok(());
+            return Ok(false);
         }
 
         let client = client.read().await;
@@ -878,7 +900,7 @@ impl IggyConsumer {
         trace!(
             "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
         );
-        if client
+        let newly_created = if client
             .get_consumer_group(&stream_id, &topic_id, &consumer_group_id)
             .await?
             .is_none()
@@ -908,7 +930,10 @@ impl IggyConsumer {
                     return Err(error);
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
 
         info!(
             "Joining consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}",
@@ -928,7 +953,7 @@ impl IggyConsumer {
         info!(
             "Joined consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
         );
-        Ok(())
+        Ok(newly_created)
     }
 }
 
