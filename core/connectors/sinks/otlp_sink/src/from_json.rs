@@ -149,7 +149,9 @@ fn json_to_span(v: &Value) -> Span {
         trace_id: hex_to_bytes(v.get("trace_id").and_then(Value::as_str).unwrap_or("")),
         span_id: hex_to_bytes(v.get("span_id").and_then(Value::as_str).unwrap_or("")),
         parent_span_id: hex_to_bytes(
-            v.get("parent_span_id").and_then(Value::as_str).unwrap_or(""),
+            v.get("parent_span_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
         ),
         name: v
             .get("name")
@@ -157,10 +159,7 @@ fn json_to_span(v: &Value) -> Span {
             .unwrap_or("")
             .to_owned(),
         kind: span_kind_from_text(v.get("kind").and_then(Value::as_str).unwrap_or("")),
-        start_time_unix_nano: v
-            .get("start_time_ns")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        start_time_unix_nano: v.get("start_time_ns").and_then(Value::as_u64).unwrap_or(0),
         end_time_unix_nano: v.get("end_time_ns").and_then(Value::as_u64).unwrap_or(0),
         attributes: json_obj_to_kv(v.get("attributes")),
         dropped_attributes_count: 0,
@@ -169,9 +168,7 @@ fn json_to_span(v: &Value) -> Span {
         links: vec![],
         dropped_links_count: 0,
         status: Some(Status {
-            code: status_code_from_text(
-                v.get("status").and_then(Value::as_str).unwrap_or("unset"),
-            ),
+            code: status_code_from_text(v.get("status").and_then(Value::as_str).unwrap_or("unset")),
             message: v
                 .get("status_message")
                 .and_then(Value::as_str)
@@ -192,10 +189,7 @@ fn json_to_metric(v: &Value) -> Option<Metric> {
         .to_owned();
     let time_ns = v.get("timestamp_ns").and_then(Value::as_u64).unwrap_or(0);
     let attrs = json_obj_to_kv(v.get("attributes"));
-    let metric_type = v
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("gauge");
+    let metric_type = v.get("type").and_then(Value::as_str).unwrap_or("gauge");
 
     let value_field = v.get("value");
     let as_double = value_field.and_then(Value::as_f64).unwrap_or(0.0);
@@ -248,10 +242,7 @@ fn json_to_metric(v: &Value) -> Option<Metric> {
 
 fn json_to_log_record(v: &Value) -> LogRecord {
     LogRecord {
-        time_unix_nano: v
-            .get("timestamp_ns")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        time_unix_nano: v.get("timestamp_ns").and_then(Value::as_u64).unwrap_or(0),
         observed_time_unix_nano: v
             .get("observed_timestamp_ns")
             .and_then(Value::as_u64)
@@ -264,11 +255,9 @@ fn json_to_log_record(v: &Value) -> LogRecord {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
-        body: v
-            .get("body")
-            .map(|b| AnyValue {
-                value: Some(any_value::Value::StringValue(b.to_string())),
-            }),
+        body: v.get("body").map(|b| AnyValue {
+            value: Some(any_value::Value::StringValue(b.to_string())),
+        }),
         attributes: json_obj_to_kv(v.get("attributes")),
         trace_id: hex_to_bytes(v.get("trace_id").and_then(Value::as_str).unwrap_or("")),
         span_id: hex_to_bytes(v.get("span_id").and_then(Value::as_str).unwrap_or("")),

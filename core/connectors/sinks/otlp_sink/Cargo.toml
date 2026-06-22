@@ -35,7 +35,9 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 iggy_connector_sdk = { workspace = true }
+reqwest = { workspace = true }
 opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
     "gen-tonic",
     "logs",
