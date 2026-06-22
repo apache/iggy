@@ -26,6 +26,11 @@ use server_ng::server_error::ServerNgError;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
+    if let Err(msg) = server_common::check_kernel_version() {
+        eprintln!("iggy-server-ng requires Linux kernel >= 6.8: {msg}");
+        std::process::exit(1);
+    }
+
     let bootstrap_runtime = match server_common::create_shard_executor(true) {
         Ok(rt) => rt,
         Err(e) => {

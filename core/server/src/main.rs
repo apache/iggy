@@ -109,6 +109,11 @@ fn print_ascii_art(text: &str) {
 
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
+    if let Err(msg) = server_common::check_kernel_version() {
+        eprintln!("iggy-server requires Linux kernel >= 6.8: {msg}");
+        std::process::exit(1);
+    }
+
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
