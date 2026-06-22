@@ -113,10 +113,10 @@ pub struct IggyConsumer {
     polling_strategy: PollingStrategy,
     // Per-partition recovery set: when a partition's stored offset falls below
     // its earliest available offset, its ID is inserted here so the next poll
-    // for that partition uses PollingStrategy::first(). Removed after the first
+    // for that partition uses PollingStrategy::last(). Removed after the first
     // successful recovery poll. Keyed by partition_id; u32::MAX is the sentinel
     // for consumers with no fixed partition (consumer-group auto-assign).
-    fallback_to_first: Arc<DashMap<u32, ()>>,
+    fallback_to_last: Arc<DashMap<u32, ()>>,
     poll_interval_micros: u64,
     batch_length: u32,
     auto_commit: AutoCommit,
@@ -176,7 +176,7 @@ impl IggyConsumer {
             topic_id: Arc::new(topic_id),
             partition_id,
             polling_strategy,
-            fallback_to_first: Arc::new(DashMap::new()),
+            fallback_to_last: Arc::new(DashMap::new()),
             poll_interval_micros: polling_interval.map_or(0, |interval| interval.as_micros()),
             last_stored_offsets: Arc::new(DashMap::new()),
             last_consumed_offsets: Arc::new(DashMap::new()),
@@ -541,10 +541,10 @@ impl IggyConsumer {
 
         // A brand-new consumer group starts at stored offset 0. If the topic has
         // had retention run, offset 0 may no longer exist. Pre-arm the fallback
-        // so the very first poll uses PollingStrategy::first() instead of Next,
+        // so the very first poll uses PollingStrategy::last() instead of Next,
         // avoiding a guaranteed InvalidOffset error on startup.
         if newly_created {
-            self.fallback_to_first.store(true, ORDERING);
+            self.fallback_to_last.insert(u32::MAX, ());
         }
 
         Ok(())
@@ -568,7 +568,7 @@ impl IggyConsumer {
         let consumer_name = self.consumer_name.clone();
         let can_poll = self.can_poll.clone();
         let joined_consumer_group = self.joined_consumer_group.clone();
-        let fallback_to_first = self.fallback_to_first.clone();
+        let fallback_to_last = self.fallback_to_last.clone();
         let mut reconnected = false;
         let mut disconnected = false;
 
@@ -645,7 +645,7 @@ impl IggyConsumer {
                             }
                             Ok(newly_created) => {
                                 if newly_created {
-                                    fallback_to_first.store(true, ORDERING);
+                                    fallback_to_last.insert(u32::MAX, ());
                                 }
                             }
                         }
@@ -671,7 +671,7 @@ impl IggyConsumer {
         let partition_id = self.partition_id;
         let consumer = self.consumer.clone();
         let configured_strategy = self.polling_strategy;
-        let fallback_to_first = self.fallback_to_first.clone();
+        let fallback_to_last = self.fallback_to_last.clone();
         let client = self.client.clone();
         let count = self.batch_length;
         let auto_commit_after_polling = self.auto_commit_after_polling;
@@ -703,8 +703,8 @@ impl IggyConsumer {
             }
 
             let effective_pid = partition_id.unwrap_or(u32::MAX);
-            let polling_strategy = if fallback_to_first.contains_key(&effective_pid) {
-                PollingStrategy::first()
+            let polling_strategy = if fallback_to_last.contains_key(&effective_pid) {
+                PollingStrategy::last()
             } else {
                 configured_strategy
             };
@@ -729,7 +729,7 @@ impl IggyConsumer {
                 if polled_messages.messages.is_empty() {
                     return Ok(polled_messages);
                 }
-                fallback_to_first.remove(&effective_pid);
+                fallback_to_last.remove(&effective_pid);
 
                 let partition_id = polled_messages.partition_id;
                 let consumed_offset;
@@ -819,14 +819,14 @@ impl IggyConsumer {
 
             // When the consumer group's stored offset falls below the topic's
             // earliest available offset (e.g. after retention removes old
-            // segments), seek to the first available message on the next poll
+            // segments), seek to the most recent message on the next poll
             // instead of looping forever at the invalid offset.
             if matches!(error, IggyError::InvalidOffset(_)) {
                 warn!(
                     "Consumer offset is before the earliest available message in topic: {topic_id}, stream: {stream_id}. \
-                     Falling back to first available offset on next poll."
+                     Falling back to latest offset on next poll."
                 );
-                fallback_to_first.insert(effective_pid, ());
+                fallback_to_last.insert(effective_pid, ());
             }
 
             // Handle connection/auth errors - disable polling until event task re-enables
@@ -875,8 +875,8 @@ impl IggyConsumer {
 
     // Returns true if the consumer group was freshly created (stored offset = 0,
     // which may be below the topic's earliest available offset after retention).
-    // Callers use this to pre-arm fallback_to_first so the very first poll uses
-    // PollingStrategy::first() and avoids an InvalidOffset error.
+    // Callers use this to pre-arm fallback_to_last so the very first poll uses
+    // PollingStrategy::last() and avoids an InvalidOffset error.
     async fn initialize_consumer_group(
         client: IggyRwLock<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
