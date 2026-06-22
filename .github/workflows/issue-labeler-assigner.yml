@@ -17,7 +17,7 @@
 
 name: Issue Labeler / Assigner
 
-# Two add-only triage steps that run when a reporter opens or edits an issue:
+# Three add-only triage steps that run when a reporter opens or edits an issue:
 #
 # 1. Label: maps the "Affected area / component" dropdown from the bug/feature
 #    issue forms (.github/ISSUE_TEMPLATE/) onto real repo labels, so reporters
@@ -28,16 +28,20 @@ name: Issue Labeler / Assigner
 #    volunteer is on record. addAssignees is idempotent and issue authors are
 #    always assignable, even as outside contributors.
 #
-# Add-only by design: neither step removes anything. Reporters rarely deselect,
-# and removing would fight maintainers who labeled or reassigned by hand. Both
-# API calls are idempotent, so re-running on `edited` is harmless.
+# 3. Good first issue: if the reporter ticked the "Good first issue" checkbox,
+#    self-tag the issue with the `good first issue` label. Maintainers remove it
+#    during triage if they disagree (add-only here, see below).
+#
+# Add-only by design: no step removes anything. Reporters rarely deselect, and
+# removing would fight maintainers who labeled or reassigned by hand. Every API
+# call is idempotent, so re-running on `edited` is harmless.
 #
 # SECURITY: the issue body is attacker-controlled text. The label step parses
 # it only for exact matches against the fixed AREA_LABELS allowlist below. The
-# assign step uses the body only as a boolean gate; the assignee comes from the
-# trusted `payload.issue.user.login`, never from body content, so the body
-# cannot inject an assignee. No checkout, no exec of issue contents, no token
-# export.
+# assign and good-first-issue steps use the body only as a boolean gate; the
+# assignee comes from the trusted `payload.issue.user.login` and the label is a
+# fixed constant, never body-derived, so the body cannot inject either. No
+# checkout, no exec of issue contents, no token export.
 
 on:
   issues:
@@ -140,4 +144,28 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
               assignees: [author],
+            });
+
+      - name: Self-tag good first issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // The "Good first issue" checkbox in both issue forms renders as a
+            // task-list line. Checked, it reads `- [x] I think this could be a
+            // good first issue ...`. Reporters self-tag; maintainers may remove
+            // the label during triage if they disagree. addLabels is idempotent
+            // and add-only, consistent with the other triage steps here.
+            const body = context.payload.issue.body || '';
+            const suggested =
+              /(^|\n)\s*-\s*\[[xX]\]\s+I think this could be a good first issue/.test(body);
+            if (!suggested) {
+              core.info('reporter did not suggest good first issue, nothing to label');
+              return;
+            }
+            core.info('applying label: good first issue');
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              labels: ['good first issue'],
             });
