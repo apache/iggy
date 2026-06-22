@@ -91,7 +91,7 @@ impl LogsService for LogsServiceImpl {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let messages = convert::export_logs_to_messages(request.into_inner());
-        let rejected = send_messages(&self.tx, messages, "logs").await;
+        let rejected = send_messages(&self.tx, messages, "logs");
         let partial_success = (rejected > 0).then(|| ExportLogsPartialSuccess {
             rejected_log_records: rejected,
             error_message: "channel full; records dropped".to_string(),
@@ -107,7 +107,7 @@ impl MetricsService for MetricsServiceImpl {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         let messages = convert::export_metrics_to_messages(request.into_inner());
-        let rejected = send_messages(&self.tx, messages, "metrics").await;
+        let rejected = send_messages(&self.tx, messages, "metrics");
         let partial_success = (rejected > 0).then(|| ExportMetricsPartialSuccess {
             rejected_data_points: rejected,
             error_message: "channel full; data points dropped".to_string(),
@@ -125,7 +125,7 @@ impl TraceService for TraceServiceImpl {
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
         let messages = convert::export_traces_to_messages(request.into_inner());
-        let rejected = send_messages(&self.tx, messages, "traces").await;
+        let rejected = send_messages(&self.tx, messages, "traces");
         let partial_success = (rejected > 0).then(|| ExportTracePartialSuccess {
             rejected_spans: rejected,
             error_message: "channel full; spans dropped".to_string(),
@@ -136,17 +136,20 @@ impl TraceService for TraceServiceImpl {
     }
 }
 
-async fn send_messages(
+fn send_messages(
     tx: &mpsc::Sender<ProducedMessage>,
     messages: Vec<ProducedMessage>,
     signal: &str,
 ) -> i64 {
+    let total = messages.len() as i64;
     let mut dropped: i64 = 0;
     for message in messages {
-        if let Err(err) = tx.try_send(message) {
-            warn!("OTLP channel full, dropping {signal} message: {err}");
+        if tx.try_send(message).is_err() {
             dropped += 1;
         }
+    }
+    if dropped > 0 {
+        warn!("OTLP channel full, dropped {dropped}/{total} {signal} messages");
     }
     dropped
 }

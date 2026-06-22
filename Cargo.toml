@@ -223,6 +223,7 @@ opentelemetry-otlp = { version = "0.32.0", features = [
     "http-proto",
     "reqwest-client",
 ] }
+opentelemetry-proto = { version = "0.32.0", default-features = false }
 opentelemetry-semantic-conventions = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = [
     "logs",

@@ -60,7 +60,7 @@ pub fn export_logs_to_messages(req: ExportLogsServiceRequest) -> Vec<ProducedMes
                     Ok(payload) => messages.push(ProducedMessage {
                         id: None,
                         checksum: None,
-                        timestamp: Some(record.time_unix_nano),
+                        timestamp: (record.time_unix_nano != 0).then_some(record.time_unix_nano),
                         origin_timestamp: None,
                         headers: None,
                         payload,
@@ -139,7 +139,8 @@ pub fn export_traces_to_messages(req: ExportTraceServiceRequest) -> Vec<Produced
                     Ok(payload) => messages.push(ProducedMessage {
                         id: None,
                         checksum: None,
-                        timestamp: Some(span.start_time_unix_nano),
+                        timestamp: (span.start_time_unix_nano != 0)
+                            .then_some(span.start_time_unix_nano),
                         origin_timestamp: None,
                         headers: None,
                         payload,

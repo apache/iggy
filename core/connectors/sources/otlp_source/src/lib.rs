@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 use tracing::info;
 
-pub mod convert;
-pub mod server;
+pub(crate) mod convert;
+pub(crate) mod server;
 
 source_connector!(OtlpSource);
 
@@ -140,9 +140,12 @@ impl Source for OtlpSource {
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
-        if let Some(task) = self.server_task.lock().await.take() {
+        let task = self.server_task.lock().await.take();
+        if let Some(task) = task {
             task.abort();
+            let _ = task.await;
         }
+        *self.rx.lock().await = None;
         info!("OTLP source connector with ID: {} closed.", self.id);
         Ok(())
     }

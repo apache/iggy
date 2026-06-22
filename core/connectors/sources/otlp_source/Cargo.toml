@@ -17,8 +17,8 @@
 
 [package]
 name = "iggy_connector_otlp_source"
-version = "0.1.0"
-description = "Iggy OTLP/gRPC source connector — receives logs, metrics, and traces from any OpenTelemetry SDK or Collector and writes them to Iggy streams as JSON"
+version = "0.4.1-edge.1"
+description = "Iggy OTLP/gRPC source connector - receives logs, metrics, and traces from any OpenTelemetry SDK or Collector and writes them to Iggy streams as JSON"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "opentelemetry", "otlp"]
@@ -45,7 +45,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = [
+opentelemetry-proto = { workspace = true, features = [
     "gen-tonic",
     "logs",
     "metrics",
