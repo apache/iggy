@@ -50,25 +50,33 @@ fn main() -> Result<(), ServerNgError> {
     // per-shard runtimes - each shard thread builds its OWN
     // `compio::runtime::Runtime` via `create_shard_executor`, pinned to
     // its CPU.
-    let bootstrap_result: Result<(configs::server_ng::ServerNgConfig, Option<u8>), ServerNgError> =
-        bootstrap_runtime.block_on(async {
-            let args = Args::parse();
-            if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
-                let _ = dotenvy::from_path(&env_path);
-            } else {
-                let _ = dotenvy::dotenv();
-            }
+    let bootstrap_result: Result<
+        (
+            configs::server_ng::ServerNgConfig,
+            Option<u8>,
+            server::log::logger::Logging,
+        ),
+        ServerNgError,
+    > = bootstrap_runtime.block_on(async {
+        let args = Args::parse();
+        if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
 
-            // TODO: decouple logging from the `server` crate.
-            let mut logging = server::log::logger::Logging::new();
-            logging.early_init();
+        // TODO: decouple logging from the `server` crate.
+        let mut logging = server::log::logger::Logging::new();
+        logging.early_init();
 
-            let config = load_config(&mut logging).await?;
-            server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
+        let config = load_config(&mut logging).await?;
+        server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
 
-            Ok((config, args.replica_id))
-        });
-    let (config, replica_id) = bootstrap_result?;
+        Ok((config, args.replica_id, logging))
+    });
+    // `_logging` owns the tracing appender worker guards; it must outlive the
+    // shard threads or every log line after bootstrap is silently dropped.
+    let (config, replica_id, _logging) = bootstrap_result?;
     drop(bootstrap_runtime);
 
     let shards = bootstrap(config, replica_id)?;

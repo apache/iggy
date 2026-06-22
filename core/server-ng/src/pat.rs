@@ -22,8 +22,7 @@
 //! hash through consensus.
 
 use crate::session_manager::SessionManager;
-use crate::wire::request_body;
-use bytes::Bytes;
+use crate::wire::{request_body, rewrite_request_body};
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
     DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
@@ -104,28 +103,4 @@ fn mint_pat_raw_and_hash() -> (String, [u8; 64]) {
     let mut out = [0u8; 64];
     out.copy_from_slice(bytes);
     (raw, out)
-}
-
-fn rewrite_request_body(
-    request: &Message<RequestHeader>,
-    body: &Bytes,
-) -> Result<Message<RequestHeader>, IggyError> {
-    let total_size = std::mem::size_of::<RequestHeader>()
-        .checked_add(body.len())
-        .ok_or(IggyError::InvalidConfiguration)?;
-    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut rewritten = Message::<RequestHeader>::new(total_size);
-    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
-        &mut rewritten.as_mut_slice()[..std::mem::size_of::<RequestHeader>()],
-    )
-    .expect("zeroed bytes are a valid request header");
-    *header = *request.header();
-    header.size = size;
-    rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
-    // TODO(vsr): the body changed but `request_checksum` / `checksum` /
-    // `checksum_body` were copied verbatim from the original header. Safe
-    // today because the SDK initializes `request_checksum` to 0 and the
-    // server does not validate it; the moment integrity checking lands,
-    // recompute these here (or zero them and re-sign in a follow-up step).
-    Ok(rewritten)
 }

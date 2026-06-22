@@ -595,7 +595,8 @@ where
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
         // sibling on_request races during journal.append await).
         // TODO: hard assert for backups once message repair lands.
-        if consensus.is_follower() {
+        let is_backup = consensus.is_follower();
+        if is_backup {
             if header.op != current_op + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
@@ -652,11 +653,14 @@ where
         self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
-        // Backup: advance sequencer + checksum post-append. Primary also
-        // reaches here; push_prepare_entry already advanced sync with the
-        // pipeline push, so calls are idempotent on primary.
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
+        // Backup only: advance sequencer + checksum post-append. Primary
+        // already advanced in push_prepare_entry; re-setting here would
+        // rewind a sibling prepare pipelined during the append await to a
+        // stale op + parent, projecting a duplicate next.
+        if is_backup {
+            consensus.sequencer().set_sequence(header.op);
+            consensus.set_last_prepare_checksum(header.checksum);
+        }
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(&header).await;
