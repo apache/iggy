@@ -111,12 +111,12 @@ pub struct IggyConsumer {
     topic_id: Arc<Identifier>,
     partition_id: Option<u32>,
     polling_strategy: PollingStrategy,
-    // Set to true when InvalidOffset is received so the next poll uses
-    // PollingStrategy::first() instead of the configured strategy, recovering
-    // from the case where the consumer group's stored offset falls below the
-    // topic's earliest available offset (e.g. after retention purges old
-    // segments). Cleared after the first successful recovery poll.
-    fallback_to_first: Arc<AtomicBool>,
+    // Per-partition recovery set: when a partition's stored offset falls below
+    // its earliest available offset, its ID is inserted here so the next poll
+    // for that partition uses PollingStrategy::first(). Removed after the first
+    // successful recovery poll. Keyed by partition_id; u32::MAX is the sentinel
+    // for consumers with no fixed partition (consumer-group auto-assign).
+    fallback_to_first: Arc<DashMap<u32, ()>>,
     poll_interval_micros: u64,
     batch_length: u32,
     auto_commit: AutoCommit,
@@ -176,7 +176,7 @@ impl IggyConsumer {
             topic_id: Arc::new(topic_id),
             partition_id,
             polling_strategy,
-            fallback_to_first: Arc::new(AtomicBool::new(false)),
+            fallback_to_first: Arc::new(DashMap::new()),
             poll_interval_micros: polling_interval.map_or(0, |interval| interval.as_micros()),
             last_stored_offsets: Arc::new(DashMap::new()),
             last_consumed_offsets: Arc::new(DashMap::new()),
@@ -684,7 +684,8 @@ impl IggyConsumer {
                 sleep(retry_interval.get_duration()).await;
             }
 
-            let polling_strategy = if fallback_to_first.load(ORDERING) {
+            let effective_pid = partition_id.unwrap_or(u32::MAX);
+            let polling_strategy = if fallback_to_first.contains_key(&effective_pid) {
                 PollingStrategy::first()
             } else {
                 configured_strategy
@@ -710,7 +711,7 @@ impl IggyConsumer {
                 if polled_messages.messages.is_empty() {
                     return Ok(polled_messages);
                 }
-                fallback_to_first.store(false, ORDERING);
+                fallback_to_first.remove(&effective_pid);
 
                 let partition_id = polled_messages.partition_id;
                 let consumed_offset;
@@ -807,7 +808,7 @@ impl IggyConsumer {
                     "Consumer offset is before the earliest available message in topic: {topic_id}, stream: {stream_id}. \
                      Falling back to first available offset on next poll."
                 );
-                fallback_to_first.store(true, ORDERING);
+                fallback_to_first.insert(effective_pid, ());
             }
 
             // Handle connection/auth errors - disable polling until event task re-enables
