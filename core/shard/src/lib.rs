@@ -137,7 +137,7 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// owns the session locally, but the consensus proposal (`Register` /
 /// `Logout`) must execute on shard 0. The peer hands just that step here
 /// and awaits the committed op number over `reply` (`None` = transient
-/// submit failure; all `RegisterSubmitError` variants are transient by
+/// submit failure; all `MetadataSubmitError` variants are transient by
 /// contract, so the caller retries rather than distinguishing them).
 pub enum MetadataSubmit {
     Register {
@@ -433,13 +433,32 @@ pub(crate) fn validate_sender_ordering(senders: &[TaggedSender]) -> Result<(), S
 /// classes.
 #[non_exhaustive]
 pub enum LifecycleFrame {
-    /// Shard 0 distributes an inbound replica TCP connection fd to the owning
-    /// shard. The receiving shard wraps the fd in a `TcpStream` and spawns
-    /// writer + reader tasks on its own compio runtime. The `fd` is an
-    /// owning [`DupedFd`] so that a frame dropped unprocessed (shutdown,
-    /// pump drain abort, router panic before `install_*_fd`) closes the
-    /// dup instead of leaking it.
-    ReplicaConnectionSetup { fd: DupedFd, replica_id: u8 },
+    /// Shard 0 distributes an inbound replica TCP connection fd to the
+    /// owning shard BEFORE any byte is read (blind delegation - the peer
+    /// id is unknown until the `ReplicaHello` is read). The receiving
+    /// shard wraps the fd, runs the acceptor handshake in its own
+    /// spawned task (`message_bus::replica::handshake`), installs the
+    /// connection on success, and answers shard 0 with
+    /// [`LifecycleFrame::ReplicaInboundHandshakeDone`] echoing `slot`.
+    /// The `fd` is an owning [`DupedFd`] so that a frame dropped
+    /// unprocessed (shutdown, pump drain abort, router panic before
+    /// `install_*_fd`) closes the dup instead of leaking it.
+    ReplicaInboundSetup { fd: DupedFd, slot: u64 },
+    /// Shard 0 dialed the higher-id peer `replica_id` and delegates the
+    /// raw connection; the receiving shard runs the dialer handshake
+    /// half, installs on success, and answers shard 0 with
+    /// [`LifecycleFrame::ReplicaOutboundHandshakeDone`] so the
+    /// pending-dial entry clears and the reconnect sweep may redial on
+    /// failure.
+    ReplicaOutboundSetup { fd: DupedFd, replica_id: u8 },
+    /// Owning shard -> shard 0: a delegated inbound handshake finished
+    /// (any outcome). Releases the global in-flight cap slot. Lost acks
+    /// are covered by the slot's deadline expiry on shard 0.
+    ReplicaInboundHandshakeDone { slot: u64 },
+    /// Owning shard -> shard 0: a delegated outbound handshake finished
+    /// (any outcome). Clears the pending-dial entry for `replica_id`.
+    /// Lost acks are covered by the entry's deadline expiry on shard 0.
+    ReplicaOutboundHandshakeDone { replica_id: u8 },
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
@@ -925,7 +944,7 @@ where
     /// Useful for the simulator where inbound messages are delivered
     /// directly via [`on_message`](Self::on_message) instead of the TCP /
     /// fd-transfer path. Installs no-op connection handlers because the
-    /// simulator never receives a `ReplicaConnectionSetup` frame.
+    /// simulator never receives a replica connection-setup frame.
     #[must_use]
     pub fn without_inbox(
         identity: ShardIdentity,
@@ -1110,6 +1129,11 @@ where
                     // on data that is already gone.
                     let removed = partitions.remove(&namespace);
                     partitions.untombstone(&namespace);
+                    // A topic created then deleted before its `InsertOwned`
+                    // pass never drains parked frames the normal way; reclaim
+                    // them here so they cannot leak across many create-delete
+                    // races (the partition is gone, so the frames are moot).
+                    self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
                     if removed.is_none() {
@@ -1122,6 +1146,7 @@ where
                 }
                 ReconcileOp::RemoveRouted { namespace } => {
                     self.shards_table.remove(&namespace);
+                    self.discard_parked_partition_frames(namespace);
                 }
             }
         }
@@ -1194,6 +1219,25 @@ where
             Err(e) => {
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
             }
+        }
+    }
+
+    /// Drop parked frames for a namespace that will never materialise (it was
+    /// removed before its `ReconcileOp::InsertOwned`), so the pending entry is
+    /// reclaimed instead of leaking until process exit.
+    fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
+        if let Some(frames) = self
+            .pending_partition_frames
+            .borrow_mut()
+            .remove(&namespace)
+            && !frames.is_empty()
+        {
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                count = frames.len(),
+                "discarding parked partition frames for removed namespace"
+            );
         }
     }
 

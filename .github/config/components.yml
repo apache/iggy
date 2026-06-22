@@ -460,6 +460,8 @@ components:
   helm:
     paths:
       - "helm/**"
+      - "scripts/ci/setup-helm-smoke-cluster.sh"
+      - "scripts/ci/test-helm.sh"
     tasks: ["validate", "smoke"]
 
   rust-bench-dashboard:

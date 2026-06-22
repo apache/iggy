@@ -211,7 +211,7 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
-    /// <param name="resetLastPolled"></param>
+    /// <param name="resetLastPolled">When true, also advances the cached last-polled offset for the partition so the next poll resumes past the stored offset.</param>
     /// <param name="ct">Cancellation token</param>
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)

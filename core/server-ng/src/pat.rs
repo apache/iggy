@@ -78,6 +78,9 @@ pub(crate) fn maybe_rewrite_pat_request(
             ReplicatedDeletePersonalAccessTokenRequest {
                 user_id,
                 name: wire.name,
+                // Client-initiated: delete by name unconditionally. Only the
+                // background cleaner sets the expiry gate.
+                only_if_expired: false,
             }
             .to_bytes()
         }

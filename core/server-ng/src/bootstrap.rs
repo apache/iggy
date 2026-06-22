@@ -43,15 +43,18 @@ use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
+use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
 use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
-    TlsServerCredentials, install_default_crypto_provider, load_pem, self_signed_for_loopback,
+    AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
+    load_ca_pem, load_pem, self_signed_for_loopback,
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, IggyMessageBus, ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, DialedReplicaFn, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES,
+    ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -64,6 +67,7 @@ use metadata::stm::user::Users;
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
+use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
 use server_common::executor::create_shard_executor;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
@@ -679,6 +683,16 @@ async fn shard_main(
         config,
         owner_table,
     ));
+    // Every shard can own a delegated replica connection, so every
+    // shard's bus needs the handshake identity (the handshake itself
+    // runs on the owning shard, not on shard 0).
+    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        cluster_id: topology.cluster_id,
+        self_id: topology.self_replica_id,
+        replica_count: topology.replica_count,
+        auth: load_replica_auth(config).map(Rc::new),
+        tls: load_replica_tls_ctx(config, &topology)?.map(Rc::new),
+    });
 
     let drain_timeout = config.system.sharding.shutdown_drain_timeout.get_duration();
     let poll_interval = config.system.sharding.shutdown_poll_interval.get_duration();
@@ -915,6 +929,28 @@ async fn shard_main(
         None
     };
 
+    // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
+    // group) and only when enabled. Each pass no-ops unless this node is
+    // the caught-up metadata primary, so the delete is proposed once and
+    // replicated to every replica.
+    let pat_cleaner_stop = if shard_id == 0 && config.personal_access_token.cleaner.enabled {
+        let (cleaner_stop_tx, cleaner_stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.personal_access_token.cleaner.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::personal_access_token_cleaner::run_pat_cleaner(
+                cleaner_shard,
+                cleaner_stop_rx,
+                interval,
+            )
+            .await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(cleaner_stop_tx)
+    } else {
+        None
+    };
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
@@ -931,17 +967,28 @@ async fn shard_main(
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
         let on_client_request = make_client_request_handler(&shard, &sessions);
-        let accepted_replica = make_delegating_replica_accept_fn(Rc::clone(&coord));
+        let (accepted_replica, dialed_replica) =
+            make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
 
-        if let Err(error) =
-            start_tcp_runtime(&shard, config, &topology, accepted_replica, accepted_client).await
+        if let Err(error) = start_tcp_runtime(
+            &shard,
+            config,
+            &topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_client,
+        )
+        .await
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
             let _ = consensus_tick_stop_tx.try_send(());
             if let Some(tx) = &heartbeat_stop_tx {
                 let _ = tx.try_send(());
+            }
+            if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+                let _ = cleaner_stop_tx.try_send(());
             }
             return Err(error);
         }
@@ -953,6 +1000,9 @@ async fn shard_main(
     let _ = consensus_tick_stop_tx.try_send(());
     if let Some(tx) = &heartbeat_stop_tx {
         let _ = tx.try_send(());
+    }
+    if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
+        let _ = cleaner_stop_tx.try_send(());
     }
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
@@ -1725,14 +1775,30 @@ async fn start_tcp_runtime(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
+    dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(shard, config, topology, accepted_replica, accepted_clients)
-            .await;
+        return start_via_replica_io(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await;
     }
 
-    start_manual_runtime(shard, config, topology, accepted_replica, accepted_clients).await
+    start_manual_runtime(
+        shard,
+        config,
+        topology,
+        accepted_replica,
+        dialed_replica,
+        accepted_clients,
+    )
+    .await
 }
 
 async fn start_via_replica_io(
@@ -1740,6 +1806,7 @@ async fn start_via_replica_io(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
+    dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     let replica_addr = topology
@@ -1763,7 +1830,6 @@ async fn start_via_replica_io(
         tcp_tls,
     } = accepted_clients;
 
-    let replica_auth = load_replica_auth(config);
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
@@ -1775,12 +1841,10 @@ async fn start_via_replica_io(
         tcp_tls_credentials,
         None,
         None,
-        topology.cluster_id,
         topology.self_replica_id,
-        topology.replica_count,
-        replica_auth,
         topology.peers.clone(),
         accepted_replica,
+        dialed_replica,
         tcp,
         topology.ws_listen_addr.map(|_| ws),
         topology.quic_listen_addr.map(|_| quic),
@@ -1841,6 +1905,7 @@ async fn start_manual_runtime(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
+    dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     let bound_replica = if config.cluster.enabled {
@@ -1859,37 +1924,15 @@ async fn start_manual_runtime(
                     source
                 })?;
         let token = shard.bus.token();
-        let max_message_size = shard.bus.config().max_message_size;
-        let handshake_grace = shard.bus.config().handshake_grace;
-        let cluster_id = topology.cluster_id;
-        let self_replica_id = topology.self_replica_id;
-        let replica_count = topology.replica_count;
-        let replica_auth = load_replica_auth(config);
-        let auth_for_listener = replica_auth.clone();
-        let accepted_replica_for_listener = accepted_replica.clone();
         let replica_handle = compio::runtime::spawn(async move {
-            replica_listener::run(
-                replica_listener,
-                token,
-                cluster_id,
-                self_replica_id,
-                replica_count,
-                auth_for_listener,
-                accepted_replica_for_listener,
-                max_message_size,
-                handshake_grace,
-            )
-            .await;
+            replica_listener::run(replica_listener, token, accepted_replica).await;
         });
         shard.bus.track_background(replica_handle);
         connector::start(
             &shard.bus,
-            cluster_id,
             topology.self_replica_id,
             topology.peers.clone(),
-            replica_auth,
-            handshake_grace,
-            accepted_replica,
+            dialed_replica,
             shard.bus.config().reconnect_period,
         )
         .await;
@@ -1963,27 +2006,66 @@ fn validate_cluster_root_bootstrap(
     })
 }
 
-/// Replica accept callback that ships every inbound connection through
-/// the shard-0 coordinator's round-robin fd-delegation. The fd lands on
-/// the target shard's inbox as a [`shard::LifecycleFrame::ReplicaConnectionSetup`]
-/// frame and is installed on that shard's bus.
-fn make_delegating_replica_accept_fn(
+/// Replica delegation callbacks for shard 0's listener and connector.
+///
+/// Inbound: acquire a slot in the shard-0-global in-flight handshake cap
+/// (drop the connection when full), then blind-delegate the raw fd
+/// through the coordinator's round-robin. The fd lands on the target
+/// shard's inbox as a [`shard::LifecycleFrame::ReplicaInboundSetup`]
+/// frame; the owning shard runs the acceptor handshake and acks the
+/// slot back. A failed delegation releases the slot immediately.
+///
+/// Outbound: delegate the dialed fd as
+/// [`shard::LifecycleFrame::ReplicaOutboundSetup`] and mark the peer
+/// dial-pending so the reconnect sweep skips it until the owning
+/// shard's handshake outcome arrives (or the entry expires).
+fn make_replica_delegation_fns(
     coord: Rc<shard::coordinator::ShardZeroCoordinator>,
-) -> AcceptedReplicaFn {
-    Rc::new(
-        move |stream, peer_id| match coord.delegate_replica(stream, peer_id) {
+    bus: &Rc<IggyMessageBus>,
+) -> (AcceptedReplicaFn, DialedReplicaFn) {
+    let inbound_bus = Rc::clone(bus);
+    let inbound_coord = Rc::clone(&coord);
+    let accepted: AcceptedReplicaFn = Rc::new(move |stream| {
+        let Some(slot) = inbound_bus.try_acquire_replica_handshake_slot() else {
+            warn!(
+                cap = MAX_INFLIGHT_REPLICA_HANDSHAKES,
+                "replica handshake in-flight cap reached; dropping inbound"
+            );
+            return;
+        };
+        match inbound_coord.delegate_replica_inbound(stream, slot) {
             Ok(target) => {
-                info!(peer_id, target, "replica connection delegated");
+                info!(slot, target, "inbound replica connection delegated");
             }
             Err(error) => {
+                inbound_bus.release_replica_handshake_slot(slot);
                 warn!(
-                    peer_id,
                     error = ?error,
-                    "delegate_replica failed; dropping inbound replica connection"
+                    "delegate_replica_inbound failed; dropping inbound replica connection"
                 );
             }
-        },
-    )
+        }
+    });
+
+    let outbound_bus = Rc::clone(bus);
+    let dialed: DialedReplicaFn =
+        Rc::new(
+            move |stream, peer_id| match coord.delegate_replica_outbound(stream, peer_id) {
+                Ok(target) => {
+                    outbound_bus.mark_dial_pending(peer_id);
+                    info!(peer_id, target, "outbound replica connection delegated");
+                }
+                Err(error) => {
+                    warn!(
+                        peer_id,
+                        error = ?error,
+                        "delegate_replica_outbound failed; dropping dialed replica connection"
+                    );
+                }
+            },
+        );
+
+    (accepted, dialed)
 }
 
 /// Shard-0 client accept callbacks. TCP and WS clients are delegated via
@@ -2183,6 +2265,110 @@ fn load_replica_auth(config: &ServerNgConfig) -> Option<ReplicaAuth> {
     Some(ReplicaAuth::new(
         config.cluster.auth.shared_secret.as_bytes(),
     ))
+}
+
+/// Build the replica TLS context from cluster config. Returns `None` when
+/// the cluster or replica TLS is disabled. Every shard calls this once at
+/// boot: CA mode re-reads the same PEM files per shard; self-signed mode
+/// mints a per-shard throwaway certificate. Neither mode carries client
+/// certificates, so TLS authenticates the acceptor only; peer
+/// authentication comes from the PSK handshake (`ClusterConfig::validate`
+/// enforces `cluster.auth.enabled` whenever `cluster.tls.enabled`).
+///
+/// Both rustls configs are TLS 1.3 only with the [`REPLICA_ALPN`]
+/// protocol pinned. The dialer's SNI / certificate-verify name for each
+/// peer is the roster entry's `ip` field (a hostname or IP literal, the
+/// same string the connector dials).
+fn load_replica_tls_ctx(
+    config: &ServerNgConfig,
+    topology: &TcpTopology,
+) -> Result<Option<ReplicaTlsCtx>, ServerNgError> {
+    let tls = &config.cluster.tls;
+    if !config.cluster.enabled || !tls.enabled {
+        return Ok(None);
+    }
+    install_default_crypto_provider();
+    let credential_error = |source: std::io::Error| ServerNgError::ListenerCredentials {
+        transport: "cluster.tls",
+        source,
+    };
+
+    let credentials = if tls.self_signed {
+        let san = config
+            .cluster
+            .nodes
+            .iter()
+            .find(|node| node.replica_id == topology.self_replica_id)
+            .map(|node| node.ip.as_str())
+            .ok_or_else(|| {
+                credential_error(std::io::Error::other(format!(
+                    "replica id {} not present in cluster.nodes",
+                    topology.self_replica_id
+                )))
+            })?;
+        let (cert_chain, key_der) = server_common::generate_self_signed_certificate(san)
+            .map_err(|error| credential_error(std::io::Error::other(error.to_string())))?;
+        TlsServerCredentials {
+            cert_chain,
+            key_der,
+        }
+    } else {
+        load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(credential_error)?
+    };
+
+    let mut server =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(credentials.cert_chain, credentials.key_der)
+            .map_err(|error| {
+                credential_error(std::io::Error::other(format!(
+                    "replica TLS server config rejected credentials: {error}"
+                )))
+            })?;
+    server.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
+
+    let client_builder =
+        rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13]);
+    let mut client = if tls.self_signed {
+        client_builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+            .with_no_client_auth()
+    } else {
+        let roots = load_ca_pem(Path::new(&tls.ca_file)).map_err(credential_error)?;
+        client_builder
+            .with_root_certificates(Arc::new(roots))
+            .with_no_client_auth()
+    };
+    client.alpn_protocols = vec![REPLICA_ALPN.to_vec()];
+
+    // Replica ids form a bijection onto 0..nodes.len() (validated at
+    // boot), so sorting by id yields a Vec indexable by replica id.
+    // TODO(hubcio): dynamic replica join will break this positional
+    // indexing (sparse ids silently map to the wrong SNI/verify name);
+    // key peer names by replica id explicitly before supporting it.
+    let mut roster: Vec<_> = config.cluster.nodes.iter().collect();
+    roster.sort_unstable_by_key(|node| node.replica_id);
+    let peer_names = roster
+        .iter()
+        .map(|node| {
+            ServerName::try_from(node.ip.clone()).map_err(|error| {
+                credential_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "cluster node '{}' ip '{}' is not a valid TLS server name: {error}",
+                        node.name, node.ip
+                    ),
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(ReplicaTlsCtx {
+        server: Arc::new(server),
+        client: Arc::new(client),
+        peer_names,
+    }))
 }
 
 fn load_tcp_tls_server_credentials(

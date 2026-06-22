@@ -47,9 +47,14 @@ pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// [`crate::transports::tcp`]) which batches many messages into a
 /// single `writev` instead.
 ///
+/// The trailing `flush` is load-bearing for TLS streams: rustls holds
+/// produced ciphertext in its internal buffer until flushed, so without
+/// it a handshake frame written here never reaches the wire. On plain
+/// TCP the flush is a no-op.
+///
 /// # Errors
 ///
-/// Returns `IggyError::TcpError` if the write fails.
+/// Returns `IggyError::TcpError` if the write or flush fails.
 #[allow(clippy::future_not_send)]
 pub async fn write_message<S: AsyncWriteExt>(
     stream: &mut S,
@@ -60,7 +65,8 @@ pub async fn write_message<S: AsyncWriteExt>(
         .write_all(buf)
         .await
         .0
-        .map_err(|_| IggyError::TcpError)
+        .map_err(|_| IggyError::TcpError)?;
+    stream.flush().await.map_err(|_| IggyError::TcpError)
 }
 
 /// Read a consensus message from a stream, rejecting frames whose

@@ -63,7 +63,7 @@ use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::{RegisterSubmitError, StreamsFrontend};
+use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
 use partitions::{Partition, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -1159,18 +1159,11 @@ async fn handle_sync_consumer_group(
     .await;
 }
 
-/// Wait (bounded) until `namespace` is routable: this shard's routing row
-/// exists and the owning shard answers a probe read (partition
-/// materialised). Fast path: row already present -> no probe, no wait.
-///
-/// Covers the post-`CreateTopic` convergence window where the metadata
-/// commit has returned to the client but the per-shard reconcilers have
-/// not yet seeded routing rows / materialised partitions.
-#[allow(clippy::future_not_send)]
 /// Ack a partition op that cannot be routed (unresolved or never-
 /// materialised namespace) with an empty Reply. The SDK connection
 /// processes replies in lockstep, so a silent drop wedges every
 /// subsequent request on that connection.
+#[allow(clippy::future_not_send)]
 async fn send_empty_partition_reply(
     shard: &Rc<ServerNgShard>,
     transport_client_id: u128,
@@ -1192,6 +1185,14 @@ async fn send_empty_partition_reply(
     }
 }
 
+/// Wait (bounded) until `namespace` is routable: this shard's routing row
+/// exists and the owning shard answers a probe read (partition
+/// materialised). Fast path: row already present -> no probe, no wait.
+///
+/// Covers the post-`CreateTopic` convergence window where the metadata
+/// commit has returned to the client but the per-shard reconcilers have
+/// not yet seeded routing rows / materialised partitions.
+#[allow(clippy::future_not_send)]
 async fn wait_for_partition_routable(shard: &Rc<ServerNgShard>, namespace: IggyNamespace) -> bool {
     const ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     const BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
@@ -1208,8 +1209,10 @@ async fn wait_for_partition_routable(shard: &Rc<ServerNgShard>, namespace: IggyN
     }
     // The local row is seeded by THIS shard's reconciler; the owner
     // materialises the partition on its own pass. Probe with a cheap read
-    // until the owner answers, so the write below cannot be dropped by the
-    // owner's "partition not initialized" guard.
+    // until the owner answers, so the write below normally clears the
+    // owner's "partition not initialized" guard. Not a hard guarantee: the
+    // partition can de-materialise between this probe and the dispatch, but
+    // the park/tombstone path re-checks and the client retries.
     while std::time::Instant::now() < deadline {
         match shard
             .partition_read(
@@ -1381,7 +1384,7 @@ fn polling_strategy_from_wire(
 pub(crate) async fn submit_register_on_owner(
     shard: &Rc<ServerNgShard>,
     vsr_client_id: u128,
-) -> Result<u64, RegisterSubmitError> {
+) -> Result<u64, MetadataSubmitError> {
     if shard.id == 0 {
         return shard
             .plane
@@ -1396,7 +1399,7 @@ pub(crate) async fn submit_register_on_owner(
     });
     match rx.recv().await {
         Ok(Some(session)) => Ok(session),
-        _ => Err(RegisterSubmitError::Canceled),
+        _ => Err(MetadataSubmitError::Canceled),
     }
 }
 
@@ -1407,7 +1410,7 @@ async fn submit_logout_on_owner(
     vsr_client_id: u128,
     session: u64,
     request: u64,
-) -> Result<u64, RegisterSubmitError> {
+) -> Result<u64, MetadataSubmitError> {
     if shard.id == 0 {
         return shard
             .plane
@@ -1424,7 +1427,7 @@ async fn submit_logout_on_owner(
     });
     match rx.recv().await {
         Ok(Some(commit)) => Ok(commit),
-        _ => Err(RegisterSubmitError::Canceled),
+        _ => Err(MetadataSubmitError::Canceled),
     }
 }
 
