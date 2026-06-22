@@ -22,10 +22,13 @@
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, ArrayValue, KeyValue, KeyValueList, any_value,
+};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::metrics::v1::{
-    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+    AggregationTemporality, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+    metric, number_data_point,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
@@ -204,12 +207,15 @@ fn json_to_metric(v: &Value) -> Option<Metric> {
             };
             Some(metric::Data::Sum(Sum {
                 data_points: vec![dp],
-                aggregation_temporality: 2, // CUMULATIVE
-                is_monotonic: false,
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                is_monotonic: v
+                    .get("is_monotonic")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
             }))
         }
         _ => {
-            // Default to gauge for gauge, histogram summary etc.
+            // Default to gauge for gauge, histogram, summary etc.
             // Histogram detail is lost in convert.rs (only count+sum stored);
             // reconstruct as gauge using count as the value.
             let dp_value = if metric_type == "histogram" || metric_type == "summary" {
@@ -255,9 +261,7 @@ fn json_to_log_record(v: &Value) -> LogRecord {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned(),
-        body: v.get("body").map(|b| AnyValue {
-            value: Some(any_value::Value::StringValue(b.to_string())),
-        }),
+        body: v.get("body").map(json_to_any_value),
         attributes: json_obj_to_kv(v.get("attributes")),
         trace_id: hex_to_bytes(v.get("trace_id").and_then(Value::as_str).unwrap_or("")),
         span_id: hex_to_bytes(v.get("span_id").and_then(Value::as_str).unwrap_or("")),
@@ -304,37 +308,31 @@ fn json_to_any_value(v: &Value) -> AnyValue {
                 any_value::Value::DoubleValue(n.as_f64().unwrap_or(0.0))
             }
         }
-        Value::Array(arr) => {
-            use opentelemetry_proto::tonic::common::v1::ArrayValue;
-            any_value::Value::ArrayValue(ArrayValue {
-                values: arr.iter().map(json_to_any_value).collect(),
-            })
-        }
-        Value::Object(obj) => {
-            use opentelemetry_proto::tonic::common::v1::KeyValueList;
-            any_value::Value::KvlistValue(KeyValueList {
-                values: obj
-                    .iter()
-                    .map(|(k, val)| KeyValue {
-                        key: k.clone(),
-                        value: Some(json_to_any_value(val)),
-                        ..Default::default()
-                    })
-                    .collect(),
-            })
-        }
+        Value::Array(arr) => any_value::Value::ArrayValue(ArrayValue {
+            values: arr.iter().map(json_to_any_value).collect(),
+        }),
+        Value::Object(obj) => any_value::Value::KvlistValue(KeyValueList {
+            values: obj
+                .iter()
+                .map(|(k, val)| KeyValue {
+                    key: k.clone(),
+                    value: Some(json_to_any_value(val)),
+                    ..Default::default()
+                })
+                .collect(),
+        }),
         Value::Null => any_value::Value::StringValue(String::new()),
     };
     AnyValue { value: Some(inner) }
 }
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
-    if s.is_empty() {
+    if !s.len().is_multiple_of(2) {
         return vec![];
     }
     (0..s.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
 }
 
@@ -358,11 +356,11 @@ fn status_code_from_text(s: &str) -> i32 {
 }
 
 fn severity_from_text(s: &str) -> i32 {
-    match s {
+    match s.to_ascii_uppercase().as_str() {
         "TRACE" => 1,
         "DEBUG" => 5,
         "INFO" => 9,
-        "WARN" => 13,
+        "WARN" | "WARNING" => 13,
         "ERROR" => 17,
         "FATAL" => 21,
         _ => 0,
@@ -417,6 +415,11 @@ mod tests {
     }
 
     #[test]
+    fn given_odd_length_hex_should_return_empty_bytes() {
+        assert!(hex_to_bytes("abc").is_empty());
+    }
+
+    #[test]
     fn given_log_json_should_reconstruct_log_record() {
         let msg = json!({
             "signal": "log",
@@ -432,5 +435,29 @@ mod tests {
         assert_eq!(req.resource_logs.len(), 1);
         let records = &req.resource_logs[0].scope_logs[0].log_records;
         assert_eq!(records[0].severity_number, 13); // WARN
+    }
+
+    #[test]
+    fn given_lowercase_severity_should_map_correctly() {
+        assert_eq!(severity_from_text("warn"), 13);
+        assert_eq!(severity_from_text("info"), 9);
+        assert_eq!(severity_from_text("error"), 17);
+        assert_eq!(severity_from_text("debug"), 5);
+    }
+
+    #[test]
+    fn given_string_log_body_should_not_double_encode() {
+        let msg = json!({
+            "body": "hello world",
+            "service_name": "svc",
+            "resource": {}
+        });
+        let req = logs_from_json(&[msg]);
+        let record = &req.resource_logs[0].scope_logs[0].log_records[0];
+        let body = record.body.as_ref().unwrap();
+        assert_eq!(
+            body.value,
+            Some(any_value::Value::StringValue("hello world".to_owned()))
+        );
     }
 }

@@ -40,8 +40,8 @@ members = [
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
     "core/connectors/sinks/mongodb_sink",
-    "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/otlp_sink",
+    "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
@@ -224,6 +224,7 @@ opentelemetry-otlp = { version = "0.32.0", features = [
     "http-proto",
     "reqwest-client",
 ] }
+opentelemetry-proto = { version = "0.32.0", default-features = false }
 opentelemetry-semantic-conventions = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = [
     "logs",

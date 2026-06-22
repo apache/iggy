@@ -18,7 +18,8 @@
 use async_trait::async_trait;
 use flate2::{Compression, write::GzEncoder};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    owned_value_to_serde_json, sink_connector,
 };
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
@@ -255,20 +256,19 @@ impl Sink for OtlpSink {
             self.id, messages_metadata.schema
         );
 
-        let result = self.export(&messages_metadata, &messages, total).await;
-
-        match &result {
-            Ok(_) => {
+        match self.export(&messages_metadata, &messages, total).await {
+            Ok(exported) => {
                 self.counters
                     .messages_sent
-                    .fetch_add(total as u64, Ordering::Relaxed);
+                    .fetch_add(exported, Ordering::Relaxed);
                 self.counters.batches_sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }
-            Err(_) => {
+            Err(e) => {
                 self.counters.batches_failed.fetch_add(1, Ordering::Relaxed);
+                Err(e)
             }
         }
-        result
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -290,7 +290,7 @@ impl OtlpSink {
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
         total: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let client = self
             .client
             .as_ref()
@@ -301,7 +301,10 @@ impl OtlpSink {
                 self.export_grpc(grpc, messages_metadata, messages, total)
                     .await
             }
-            Client::Http(http) => self.export_http(http, messages_metadata, messages).await,
+            Client::Http(http) => {
+                self.export_http(http, messages_metadata, messages, total)
+                    .await
+            }
         }
     }
 
@@ -311,12 +314,12 @@ impl OtlpSink {
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
         total: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         match client {
             GrpcClient::Traces(c) => {
                 let req = build_trace_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_spans.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 let span_count: usize = req
                     .resource_spans
@@ -327,42 +330,44 @@ impl OtlpSink {
                 c.clone()
                     .export(self.with_grpc_headers(req))
                     .await
-                    .map_err(|e| Error::HttpRequestFailed(format!("OTLP traces export: {e}")))?;
+                    .map_err(|e| Error::CannotStoreData(format!("OTLP traces export: {e}")))?;
                 debug!(
                     "OTLP sink connector ID: {} exported {span_count} spans",
                     self.id
                 );
+                Ok(total as u64)
             }
             GrpcClient::Metrics(c) => {
                 let req = build_metrics_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_metrics.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 c.clone()
                     .export(self.with_grpc_headers(req))
                     .await
-                    .map_err(|e| Error::HttpRequestFailed(format!("OTLP metrics export: {e}")))?;
+                    .map_err(|e| Error::CannotStoreData(format!("OTLP metrics export: {e}")))?;
                 debug!(
                     "OTLP sink connector ID: {} exported metrics batch ({total} messages)",
                     self.id
                 );
+                Ok(total as u64)
             }
             GrpcClient::Logs(c) => {
                 let req = build_logs_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_logs.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 c.clone()
                     .export(self.with_grpc_headers(req))
                     .await
-                    .map_err(|e| Error::HttpRequestFailed(format!("OTLP logs export: {e}")))?;
+                    .map_err(|e| Error::CannotStoreData(format!("OTLP logs export: {e}")))?;
                 debug!(
                     "OTLP sink connector ID: {} exported logs batch ({total} messages)",
                     self.id
                 );
+                Ok(total as u64)
             }
         }
-        Ok(())
     }
 
     async fn export_http(
@@ -370,36 +375,37 @@ impl OtlpSink {
         client: &reqwest::Client,
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
-    ) -> Result<(), Error> {
+        total: usize,
+    ) -> Result<u64, Error> {
         let (url_path, proto_bytes) = match &self.config.signal {
             OtlpSignal::Traces => {
                 let req = build_trace_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_spans.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 let mut buf = Vec::new();
                 req.encode(&mut buf)
-                    .map_err(|e| Error::HttpRequestFailed(format!("proto encode: {e}")))?;
+                    .map_err(|e| Error::WriteFailure(format!("proto encode traces: {e}")))?;
                 ("/v1/traces", buf)
             }
             OtlpSignal::Metrics => {
                 let req = build_metrics_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_metrics.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 let mut buf = Vec::new();
                 req.encode(&mut buf)
-                    .map_err(|e| Error::HttpRequestFailed(format!("proto encode: {e}")))?;
+                    .map_err(|e| Error::WriteFailure(format!("proto encode metrics: {e}")))?;
                 ("/v1/metrics", buf)
             }
             OtlpSignal::Logs => {
                 let req = build_logs_request(&self.config.format, messages_metadata, messages)?;
                 if req.resource_logs.is_empty() {
-                    return Ok(());
+                    return Ok(0);
                 }
                 let mut buf = Vec::new();
                 req.encode(&mut buf)
-                    .map_err(|e| Error::HttpRequestFailed(format!("proto encode: {e}")))?;
+                    .map_err(|e| Error::WriteFailure(format!("proto encode logs: {e}")))?;
                 ("/v1/logs", buf)
             }
         };
@@ -453,7 +459,7 @@ impl OtlpSink {
             "OTLP sink connector ID: {} HTTP {url_path} exported successfully",
             self.id
         );
-        Ok(())
+        Ok(total as u64)
     }
 }
 
@@ -556,15 +562,7 @@ fn collect_json_values(
     let mut out = Vec::with_capacity(messages.len());
     for msg in messages {
         match &msg.payload {
-            Payload::Json(v) => {
-                match simd_json::to_string(v)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                {
-                    Some(val) => out.push(val),
-                    None => warn!("OTLP sink: failed to convert JSON payload"),
-                }
-            }
+            Payload::Json(v) => out.push(owned_value_to_serde_json(v)),
             _ => warn!(
                 "OTLP sink (json mode): expected JSON payload, got schema: {}",
                 meta.schema

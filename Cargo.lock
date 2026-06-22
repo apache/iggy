@@ -6955,7 +6955,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_otlp_sink"
-version = "0.1.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6966,7 +6966,6 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "simd-json",
  "tokio",
  "tonic",
  "tracing",
