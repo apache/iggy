@@ -620,6 +620,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::Reserved => "reserved",
         Operation::CreateTopicWithAssignments => "create_topic_with_assignments",
         Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
+        Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
+        Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",

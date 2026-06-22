@@ -27,6 +27,7 @@
 //! transport. The coordinator fences stale selections (rebalance), prompting a
 //! re-sync that resets the cursor.
 
+use crate::Identifier;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -45,6 +46,10 @@ pub struct ConsumerGroupClientState {
     assignments: Mutex<HashMap<String, GroupAssignment>>,
     balanced_cursors: Mutex<HashMap<String, usize>>,
     partition_counts: Mutex<HashMap<String, u32>>,
+    /// Identifiers of the joined groups, so the heartbeat can rebuild a sync
+    /// request without re-deriving them from the cache key. Keyed by the same
+    /// `stream|topic|group` string as `assignments`.
+    joined_groups: Mutex<HashMap<String, (Identifier, Identifier, Identifier)>>,
 }
 
 impl ConsumerGroupClientState {
@@ -135,6 +140,39 @@ impl ConsumerGroupClientState {
             .lock()
             .expect("consumer-group state mutex poisoned")
             .insert(key, partition_count);
+    }
+
+    /// Record a joined group's identifiers so the heartbeat can re-sync it.
+    pub fn register_group(
+        &self,
+        key: String,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    ) {
+        self.joined_groups
+            .lock()
+            .expect("consumer-group state mutex poisoned")
+            .insert(key, (stream_id, topic_id, group_id));
+    }
+
+    /// Forget a group (after leave / delete) so the heartbeat stops re-syncing.
+    pub fn deregister_group(&self, key: &str) {
+        self.joined_groups
+            .lock()
+            .expect("consumer-group state mutex poisoned")
+            .remove(key);
+    }
+
+    /// Identifiers of every group the client has joined on this transport.
+    #[must_use]
+    pub fn registered_groups(&self) -> Vec<(Identifier, Identifier, Identifier)> {
+        self.joined_groups
+            .lock()
+            .expect("consumer-group state mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 }
 

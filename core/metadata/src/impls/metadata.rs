@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
+use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::Streams;
 use crate::stm::user::Users;
@@ -30,6 +31,7 @@ use consensus::{
     replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
@@ -767,6 +769,13 @@ where
                     self.client_table
                         .borrow_mut()
                         .remove_client(prepare_header.client);
+                    // Drop the disconnected client from every consumer group it
+                    // joined and rebalance. Deterministic side-effect of the
+                    // Logout commit, applied identically on every replica.
+                    self.mux_stm.streams().remove_consumer_group_member(
+                        prepare_header.client,
+                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                    );
                     reply
                 } else {
                     // Normal op: apply SM, commit_reply.
@@ -1149,6 +1158,117 @@ where
                     Err(RegisterSubmitError::Canceled)
                 }
             }
+        }
+    }
+
+    /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
+    /// metadata consensus group (shard 0). The partition reconciler calls this
+    /// to complete a cooperative revocation once the source has drained the
+    /// partition (or it timed out).
+    ///
+    /// Unlike a client op there is no session: a reserved internal client id
+    /// (never coordinator-minted) carries it, `request_preflight` is skipped
+    /// (server-originated), and the normal-op commit path skips reply-caching
+    /// when the client has no session. The op is internal (not client-allowed),
+    /// so it bypasses `prepare_request` and projects directly.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the prepare,
+    /// `InProgress` / `PipelineFull` on pipeline pressure (the reconciler
+    /// retries next tick; completion is idempotent), `Canceled` if the pending
+    /// prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata consensus
+    /// group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_complete_revocation_in_process(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+    ) -> Result<u64, RegisterSubmitError> {
+        // Reserved internal client id: never coordinator-minted (those carry the
+        // home shard in their top bits). All internal completions share it, so
+        // the pipeline dedup serializes them -- fine, completion is idempotent.
+        const INTERNAL_CLIENT_ID: u128 = u128::MAX;
+        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    RegisterSubmitError::NotCaughtUp
+                } else {
+                    RegisterSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(INTERNAL_CLIENT_ID)
+        {
+            return Err(RegisterSubmitError::InProgress);
+        }
+        if consensus.pipeline().borrow().is_full() {
+            return Err(RegisterSubmitError::PipelineFull);
+        }
+
+        let request = CompleteConsumerGroupRevocationRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id,
+            source_client_id,
+            partition_id,
+        };
+        let body = request.to_bytes();
+        let message = build_complete_revocation_request_message(
+            consensus,
+            INTERNAL_CLIENT_ID,
+            INTERNAL_REQUEST_ID,
+            &body,
+        );
+        let prepare = message.project(consensus);
+
+        consensus.verify_pipeline();
+        let view_snapshot = consensus.view();
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        self.on_replicate(prepare).await;
+        if consensus.view() != view_snapshot {
+            warn!(
+                view_before = view_snapshot,
+                view_after = consensus.view(),
+                "view changed while complete-revocation prepare replicated"
+            );
+        }
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => {
+                        warn!(error = %error, "dropping malformed PrepareOk from metadata loopback");
+                    }
+                },
+                command => {
+                    warn!(
+                        ?command,
+                        "dropping unexpected message from metadata loopback"
+                    );
+                }
+            }
+        }
+        match receiver.await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(RegisterSubmitError::Canceled),
         }
     }
 
@@ -1535,6 +1655,12 @@ where
                     .commit_register(header.client, reply, in_flight);
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
+                // Mirror the on_ack path: drop the disconnected client from
+                // every consumer group it joined and rebalance.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    header.client,
+                    iggy_common::IggyTimestamp::from(header.timestamp),
+                );
             } else {
                 // Normal op: apply SM, commit_reply.
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
@@ -1681,6 +1807,44 @@ where
         namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         ..RequestHeader::default()
     };
+    msg
+}
+
+fn build_complete_revocation_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    request: u64,
+    body: &[u8],
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::CompleteConsumerGroupRevocation,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: consensus.cluster(),
+            view: consensus.view(),
+            release: 0,
+            client: client_id,
+            // `validate()` requires session/request > 0 for non-register ops;
+            // there is no real session (the commit path skips reply-caching).
+            session: 1,
+            request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
     msg
 }
 

@@ -25,12 +25,9 @@ pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod concurrent_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_auto_commit_reconnection_scenario;
 pub mod consumer_group_join_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_new_messages_after_restart_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_offset_cleanup_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
@@ -66,7 +63,6 @@ pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod snapshot_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod stale_client_consumer_group_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod stream_size_validation_scenario;

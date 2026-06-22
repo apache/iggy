@@ -86,6 +86,12 @@ where
     pub dirty_offset: AtomicU64,
     pub consumer_offsets: Arc<ConsumerOffsets>,
     pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    /// Highest offset this partition has served (polled) to each consumer group.
+    /// The cooperative-rebalance reconciler completes a pending revocation once
+    /// the source group has committed up to what it was polled
+    /// (`committed >= last_polled`), i.e. nothing is in flight. Ephemeral (not
+    /// persisted): a fresh server treats a group as never-polled.
+    pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
     pub stats: Arc<PartitionStats>,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
@@ -178,6 +184,7 @@ where
             dirty_offset: AtomicU64::new(0),
             consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(1)),
             consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
+            last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
             stats,
             created_at: IggyTimestamp::now(),
             revision_id: 0,
@@ -651,6 +658,27 @@ where
 
         let (fragments, last_matching_offset) =
             result.unwrap_or_else(|| (PollFragments::new(), None));
+
+        // Record the highest offset served to a consumer group, so the
+        // cooperative-rebalance reconciler knows when a pending-revoked
+        // partition has been fully drained (committed >= last polled).
+        if let (PollingConsumer::ConsumerGroup(group_id, _), Some(last_offset)) =
+            (consumer, last_matching_offset)
+        {
+            let guard = self.last_polled_offsets.pin();
+            let key = ConsumerGroupId(group_id);
+            if let Some(existing) = guard.get(&key) {
+                existing.offset.fetch_max(last_offset, Ordering::Relaxed);
+            } else {
+                let created = ConsumerOffset::new(
+                    ConsumerKind::ConsumerGroup,
+                    u32::try_from(group_id).unwrap_or(u32::MAX),
+                    last_offset,
+                    String::new(),
+                );
+                guard.insert(key, created);
+            }
+        }
 
         if args.auto_commit && !fragments.is_empty() {
             let last_offset =

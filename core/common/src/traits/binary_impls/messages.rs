@@ -76,6 +76,12 @@ async fn sync_group_assignment<B: BinaryClient>(
         .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
         .await?;
     let key = group_cache_key(stream_id, topic_id, group_id);
+    client.consumer_group_state().register_group(
+        key.clone(),
+        stream_id.clone(),
+        topic_id.clone(),
+        group_id.clone(),
+    );
     if response.is_empty() {
         client
             .consumer_group_state()
@@ -88,6 +94,21 @@ async fn sync_group_assignment<B: BinaryClient>(
         .consumer_group_state()
         .set_assignment(key, assignment.generation, assignment.partitions);
     Ok(())
+}
+
+/// Re-sync every joined group's assignment from the coordinator. Heartbeat
+/// driven so a member picks up a widened assignment (e.g. after a
+/// partition-count change) without first hitting an ownership fence. A failed
+/// per-group sync is logged and skipped so one bad group can't stall the rest.
+#[cfg(feature = "vsr")]
+pub(crate) async fn refresh_group_assignments<B: BinaryClient>(client: &B) {
+    for (stream_id, topic_id, group_id) in client.consumer_group_state().registered_groups() {
+        if let Err(error) = sync_group_assignment(client, &stream_id, &topic_id, &group_id).await {
+            tracing::warn!(
+                "Failed to refresh consumer-group assignment for {stream_id}|{topic_id}|{group_id}: {error}"
+            );
+        }
+    }
 }
 
 /// Resolve (and cache) the topic's partition count for client-side produce
@@ -185,7 +206,21 @@ async fn poll_group_messages<B: BinaryClient>(
             .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
             .await
         {
-            Ok(response) => return PolledMessages::from_bytes(response),
+            Ok(response) => {
+                let polled = PolledMessages::from_bytes(response)?;
+                // The coordinator can't yet signal a generation fence as a typed
+                // error (no reply-header status), so it rides the empty-poll body
+                // as a sentinel partition id. Re-sync and retry, same as the
+                // typed error below; a genuine empty poll echoes the real id.
+                if polled.messages.is_empty()
+                    && polled.partition_id == crate::RESYNC_REQUIRED_PARTITION_SENTINEL
+                {
+                    client.consumer_group_state().invalidate_assignment(&key);
+                    sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
+                    continue;
+                }
+                return Ok(polled);
+            }
             Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
                 client.consumer_group_state().invalidate_assignment(&key);
                 sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;

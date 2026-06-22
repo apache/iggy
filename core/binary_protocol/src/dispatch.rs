@@ -298,6 +298,8 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         Operation::DeleteConsumerOffset2 => 28,
         Operation::CreateTopicWithAssignments
         | Operation::CreatePartitionsWithAssignments
+        | Operation::RemoveConsumerGroupMember
+        | Operation::CompleteConsumerGroupRevocation
         | Operation::Reserved
         | Operation::Register
         | Operation::Logout

@@ -17,7 +17,8 @@
 
 use crate::stm::StateHandler;
 use crate::stm::consumer_group::{
-    ConsumerGroup, ConsumerGroupSnapshot, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
+    CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
+    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RemoveConsumerGroupMemberRequest,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
@@ -328,6 +329,8 @@ collect_handlers! {
         DeleteConsumerGroup,
         JoinConsumerGroup,
         LeaveConsumerGroup,
+        RemoveConsumerGroupMember,
+        CompleteConsumerGroupRevocation,
     }
 }
 
@@ -426,6 +429,36 @@ impl Streams {
         })
     }
 
+    /// All consumer groups of a topic (for `GetConsumerGroups`). `None` if the
+    /// stream/topic is unknown.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+    pub fn consumer_group_list(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<Vec<ConsumerGroupResponse>> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let partitions_count = topic.partitions.len() as u32;
+            Some(
+                topic
+                    .consumer_groups
+                    .values()
+                    .map(|group| ConsumerGroupResponse {
+                        id: group.id as u32,
+                        partitions_count,
+                        members_count: group.members.len() as u32,
+                        name: WireName::new(group.name.as_ref())
+                            .unwrap_or_else(|_| WireName::new("unknown").expect("valid")),
+                    })
+                    .collect(),
+            )
+        })
+    }
+
     /// The requesting member's `(generation, partitions)` -- served by the
     /// `SyncConsumerGroup` endpoint for client-side partition selection.
     #[must_use]
@@ -448,8 +481,116 @@ impl Streams {
                 .members
                 .iter()
                 .find(|(_, m)| m.client_id == client_id)?;
-            let partitions = member.partitions.iter().map(|&p| p as u32).collect();
+            // The client polls only its non-revoked partitions; a partition
+            // pending handoff stays owned (commit fence) but is no longer polled
+            // so its consumer can drain + commit it, completing the revocation.
+            let partitions = member
+                .pollable_partitions()
+                .iter()
+                .map(|&p| p as u32)
+                .collect();
             Some((group.generation, partitions))
+        })
+    }
+
+    /// Whether any consumer group has a pending cooperative revocation. Cheap
+    /// (short-circuits); the consensus tick polls it to wake the reconciler
+    /// promptly when a source drains a revoked partition, instead of waiting for
+    /// the periodic completion pass.
+    #[must_use]
+    pub fn has_pending_revocations(&self) -> bool {
+        self.inner.read(|inner| {
+            inner.items.iter().any(|(_, stream)| {
+                stream.topics.iter().any(|(_, topic)| {
+                    topic.consumer_groups.values().any(|group| {
+                        group
+                            .members
+                            .iter()
+                            .any(|(_, m)| !m.pending_revocations.is_empty())
+                    })
+                })
+            })
+        })
+    }
+
+    /// The topic's current partition ids, for the join-time in-flight gather
+    /// (the home shard reads each partition's poll/commit state to classify the
+    /// cooperative handoff). `None` if the stream/topic does not resolve.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn topic_partition_ids(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<Vec<u32>> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            Some(topic.partitions.iter().map(|p| p.id as u32).collect())
+        })
+    }
+
+    /// Partitions currently owned by some live member of the group (union over
+    /// members, pending-revoked included since the source still owns them until
+    /// completion). The join-time in-flight gather uses this to tell a genuine
+    /// in-flight hold (a live member polled past its commit) from a stale
+    /// `last_polled` left by a since-removed member: only an owned partition can
+    /// be in flight, so an unowned one with uncommitted data is the dead-member
+    /// residue of a reconnect and must be reassigned, not protected.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_assigned_partitions(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
+    ) -> Option<std::collections::HashSet<u32>> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            let group = topic
+                .consumer_groups
+                .get(&topic.resolve_group_id(group_id)?)?;
+            Some(
+                group
+                    .members
+                    .iter()
+                    .flat_map(|(_, member)| member.partitions.iter().map(|&p| p as u32))
+                    .collect(),
+            )
+        })
+    }
+
+    /// Every pending cooperative revocation across all groups, as
+    /// `(stream_id, topic_id, group_id, source_client_id, partition_id,
+    /// created_at_micros)`. The reconciler reads this each pass to decide which
+    /// revocations to complete (source drained, or timed out).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::type_complexity)]
+    pub fn consumer_group_pending_revocations(&self) -> Vec<(u32, u32, u64, u128, u32, u64)> {
+        self.inner.read(|inner| {
+            let mut out = Vec::new();
+            for (stream_id, stream) in &inner.items {
+                for (topic_id, topic) in &stream.topics {
+                    for group in topic.consumer_groups.values() {
+                        for (source_client_id, partition_id, created_at) in
+                            group.pending_revocations()
+                        {
+                            out.push((
+                                stream_id as u32,
+                                topic_id as u32,
+                                group.id,
+                                source_client_id,
+                                partition_id as u32,
+                                created_at,
+                            ));
+                        }
+                    }
+                }
+            }
+            out
         })
     }
 
@@ -465,6 +606,7 @@ impl Streams {
         group_id: &WireIdentifier,
         client_id: u128,
         partition_id: u32,
+        require_pollable: bool,
     ) -> Option<u64> {
         self.inner.read(|inner| {
             let stream_id = inner.resolve_stream_id(stream_id)?;
@@ -477,11 +619,38 @@ impl Streams {
                 .members
                 .iter()
                 .find(|(_, m)| m.client_id == client_id)?;
-            member
-                .partitions
-                .iter()
-                .any(|&p| p as u32 == partition_id)
-                .then_some(group.id)
+            // Poll fence (`require_pollable`) rejects a pending-revoked partition
+            // so the source stops polling it (re-sync drops it from its set);
+            // commit fence keeps the full owned set so the source can still
+            // commit it and drain the handoff.
+            let owns = if require_pollable {
+                member
+                    .pollable_partitions()
+                    .contains(&(partition_id as usize))
+            } else {
+                member.partitions.iter().any(|&p| p as u32 == partition_id)
+            };
+            owns.then_some(group.id)
+        })
+    }
+
+    /// The group's monotonic id (the consumer-group offset key) regardless of
+    /// membership. `None` if the stream/topic/group no longer resolves, so a
+    /// consumer-offset read of a deleted group reports "no offset" and a write
+    /// rewrite can substitute the numeric id the partition plane keys under.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn resolve_consumer_group_id(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
+    ) -> Option<u64> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            topic.resolve_group_id(group_id)
         })
     }
 
@@ -503,6 +672,25 @@ impl Streams {
             }
             out
         })
+    }
+
+    /// Drop a disconnected client from every consumer group it joined and
+    /// rebalance. Applied through the left-right writer as a deterministic
+    /// side-effect of the `Logout` commit on each replica (not a separate
+    /// replicated op). A no-op on the reader-mode peers, where commits aren't
+    /// applied.
+    pub fn remove_consumer_group_member(&self, client_id: u128, timestamp: IggyTimestamp) {
+        let cmd = StreamsCommand::RemoveConsumerGroupMember(
+            RemoveConsumerGroupMemberRequest { client_id },
+            timestamp,
+        );
+        if let Err(error) = self.inner.try_apply(cmd) {
+            tracing::error!(
+                client_id,
+                %error,
+                "remove_consumer_group_member dispatched to reader-only Streams STM"
+            );
+        }
     }
 
     /// Total consumer-group count across all topics (for stats).

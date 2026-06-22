@@ -29,11 +29,14 @@ use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
-    POLL_MESSAGES_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE, POLL_MESSAGES_CODE,
 };
-use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
+use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::requests::consumer_groups::{
+    GetConsumerGroupRequest, GetConsumerGroupsRequest,
+};
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
@@ -46,6 +49,7 @@ use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
@@ -102,7 +106,7 @@ pub(crate) fn build_get_me_response(
                     consumer_groups_count: 0,
                 }
             },
-            |record| connected_client_to_response(&record),
+            |record| connected_client_to_response(shard, &record),
         );
 
     // The wire `consumer_groups` list keys off the connection's bound VSR
@@ -144,11 +148,24 @@ pub(crate) fn build_get_me_response(
 /// `SessionManager` or a `get_clients` gather) into the wire
 /// [`ClientResponse`]. Shared by `get_me`, `get_clients`, and `get_client`.
 ///
-/// `consumer_groups_count` is left 0 here; `get_me` overrides it from the
-/// consumer-group STM (see [`build_get_me_response`]). The `get_clients` /
-/// `get_client` gather paths report 0 until per-client membership is
-/// resolved across the shard mesh.
-pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
+/// `consumer_groups_count` is resolved from the connection's bound VSR client
+/// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
+/// transport id). Connections that never bound (pre-register) count 0.
+pub(crate) fn connected_client_to_response(
+    shard: &Rc<ServerNgShard>,
+    info: &ConnectedClientInfo,
+) -> ClientResponse {
+    let consumer_groups_count = info.vsr_client_id.map_or(0, |vsr_client_id| {
+        #[allow(clippy::cast_possible_truncation)]
+        let count = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_memberships(vsr_client_id)
+            .len() as u32;
+        count
+    });
     // The transport client id is a u128 `(shard << 112) | seq`; the wire
     // `client_id` is the u32 seq tail.
     #[allow(clippy::cast_possible_truncation)]
@@ -157,14 +174,75 @@ pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> Client
         user_id: info.user_id.unwrap_or(u32::MAX),
         transport: transport_kind_to_wire(info.transport),
         address: info.address.to_string(),
-        consumer_groups_count: 0,
+        consumer_groups_count,
     }
+}
+
+/// Fence a consumer-group offset commit/delete: a group consumer may only
+/// touch the offset of a partition it currently owns. `Ok` for individual
+/// consumers (no fence) and for owned group partitions; `Err` otherwise so a
+/// stale client re-syncs instead of corrupting the shared group offset.
+fn fence_group_offset(
+    shard: &Rc<ServerNgShard>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<(), IggyError> {
+    if consumer.kind != 2 {
+        return Ok(());
+    }
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    #[allow(clippy::cast_possible_truncation)]
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        // Commit fence: allow a pending-revoked partition (the source commits it
+        // to drain the cooperative handoff), so `require_pollable = false`.
+        .consumer_group_fence(
+            stream_id,
+            topic_id,
+            &consumer.id,
+            client_id,
+            partition_id,
+            false,
+        )
+        .map(|_| ())
+        .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
+            client_id as u32,
+            partition_id,
+        ))
+}
+
+/// Fence a consumer-group offset op then resolve its target partition
+/// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
+fn fence_and_resolve_offset_namespace(
+    shard: &Rc<ServerNgShard>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<IggyNamespace, IggyError> {
+    fence_group_offset(
+        shard,
+        consumer,
+        stream_id,
+        topic_id,
+        partition_id,
+        client_id,
+    )?;
+    resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
 pub(crate) fn resolve_partition_request_namespace(
     shard: &Rc<ServerNgShard>,
     operation: Operation,
     body: &[u8],
+    client_id: u128,
 ) -> Result<u64, IggyError> {
     let namespace = match operation {
         Operation::SendMessages => {
@@ -186,41 +264,49 @@ pub(crate) fn resolve_partition_request_namespace(
         Operation::StoreConsumerOffset => {
             let request = StoreConsumerOffsetRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteConsumerOffset => {
             let request = DeleteConsumerOffsetRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::StoreConsumerOffset2 => {
             let request = StoreConsumerOffset2Request::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteConsumerOffset2 => {
             let request = DeleteConsumerOffset2Request::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteSegments => {
@@ -349,6 +435,19 @@ pub(crate) fn build_non_replicated_response(
                 .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
             Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
                 NonReplicatedResponse::Bytes(response.to_bytes())
+            }))
+        }
+        GET_CONSUMER_GROUPS_CODE => {
+            let request = GetConsumerGroupsRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let groups = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_group_list(&request.stream_id, &request.topic_id);
+            Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
+                NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
             }))
         }
         POLL_MESSAGES_CODE => {

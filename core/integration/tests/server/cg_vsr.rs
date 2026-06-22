@@ -20,7 +20,9 @@
 //! server picks each member's partition by advancing its round-robin cursor.
 
 use crate::server::scenarios::{
-    consumer_group_join_scenario, consumer_group_with_multiple_clients_polling_messages_scenario,
+    consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
+    consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
+    consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
 };
 use integration::iggy_harness;
@@ -47,4 +49,28 @@ async fn single_client(harness: &TestHarness) {
 )]
 async fn multiple_clients(harness: &TestHarness) {
     consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn offset_cleanup(harness: &TestHarness) {
+    consumer_group_offset_cleanup_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn auto_commit_reconnection(harness: &TestHarness) {
+    consumer_group_auto_commit_reconnection_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn new_messages_after_restart(harness: &TestHarness) {
+    consumer_group_new_messages_after_restart_scenario::run(harness).await;
 }

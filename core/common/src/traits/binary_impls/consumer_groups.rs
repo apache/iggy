@@ -186,8 +186,12 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         )
         .await?;
         #[cfg(feature = "vsr")]
-        self.consumer_group_state()
-            .invalidate_assignment(&format!("{stream_id}|{topic_id}|{group_id}"));
+        {
+            let key = format!("{stream_id}|{topic_id}|{group_id}");
+            self.consumer_group_state().invalidate_assignment(&key);
+            // Stop the heartbeat from re-syncing a group we left.
+            self.consumer_group_state().deregister_group(&key);
+        }
         Ok(())
     }
 }

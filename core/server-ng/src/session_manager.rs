@@ -29,6 +29,7 @@ use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 /// Connection lifecycle states.
 ///
@@ -62,6 +63,9 @@ pub struct Connection {
     pub address: SocketAddr,
     pub transport: ClientTransportKind,
     pub state: ConnectionState,
+    /// Last time the client proved liveness (a `ping`). The heartbeat
+    /// verifier evicts connections stale past the configured threshold.
+    pub last_heartbeat: Instant,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -99,11 +103,47 @@ impl SessionManager {
         address: SocketAddr,
         transport: ClientTransportKind,
     ) {
-        self.connections.entry(connection_id).or_insert(Connection {
-            address,
-            transport,
-            state: ConnectionState::Connected,
-        });
+        self.connections
+            .entry(connection_id)
+            .or_insert_with(|| Connection {
+                address,
+                transport,
+                state: ConnectionState::Connected,
+                last_heartbeat: Instant::now(),
+            });
+    }
+
+    /// Record a liveness heartbeat (`ping`) for a connection, resetting its
+    /// staleness clock. No-op for an unknown connection.
+    pub fn record_heartbeat(&mut self, connection_id: u128) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// Connection ids whose last heartbeat is older than `max_age` -- the
+    /// stale set the heartbeat verifier evicts. Only `Bound`/`Authenticated`
+    /// connections are considered (a freshly-`Connected` socket mid-handshake
+    /// is left alone until it authenticates).
+    #[must_use]
+    pub fn collect_stale(&self, max_age: Duration, now: Instant) -> Vec<u128> {
+        self.connections
+            .iter()
+            .filter(|(_, conn)| !matches!(conn.state, ConnectionState::Connected))
+            .filter(|(_, conn)| now.duration_since(conn.last_heartbeat) > max_age)
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// The consensus client id a connection is bound to, if any. The heartbeat
+    /// verifier reads it to look up consumer-group membership before deciding
+    /// whether an eviction would actually release anything.
+    #[must_use]
+    pub fn bound_client_id(&self, connection_id: u128) -> Option<u128> {
+        match self.connections.get(&connection_id)?.state {
+            ConnectionState::Bound { client_id, .. } => Some(client_id),
+            ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+        }
     }
 
     /// Remove a connection (disconnect). Cleans up the reverse index if bound.
@@ -287,8 +327,13 @@ const fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientI
         }
         ConnectionState::Connected => None,
     };
+    let vsr_client_id = match conn.state {
+        ConnectionState::Bound { client_id, .. } => Some(client_id),
+        ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+    };
     ConnectedClientInfo {
         client_id: connection_id,
+        vsr_client_id,
         user_id,
         transport: conn.transport,
         address: conn.address,

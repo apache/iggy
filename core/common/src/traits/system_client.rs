@@ -43,6 +43,13 @@ pub trait SystemClient {
     /// Ping the server to check if it's alive.
     async fn ping(&self) -> Result<(), IggyError>;
     async fn heartbeat_interval(&self) -> IggyDuration;
+    /// Re-sync the cached consumer-group assignments from the coordinator.
+    ///
+    /// Driven off the heartbeat so a member picks up a new generation (e.g. a
+    /// partition-count change widened its assignment) without waiting for an
+    /// ownership-fence rejection. No-op for transports that resolve
+    /// partitioning server-side.
+    async fn refresh_consumer_group_assignments(&self) {}
     /// Capture and package the current system state as a snapshot.
     ///
     /// Authentication is required.
