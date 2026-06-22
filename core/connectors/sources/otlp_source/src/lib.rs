@@ -30,6 +30,22 @@ pub(crate) mod server;
 
 source_connector!(OtlpSource);
 
+/// How messages are stored in the Iggy topic.
+///
+/// `Json` (default): each OTLP signal item (span / data-point / log record)
+/// is stored as a flat JSON document. Human-readable but verbose.
+///
+/// `Proto`: the entire `Export*ServiceRequest` proto is stored as raw bytes
+/// per gRPC call. Typically 4-5x smaller than JSON and zero-copy on the sink
+/// side when paired with `otlp_sink`'s `format = "proto"`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageFormat {
+    #[default]
+    Json,
+    Proto,
+}
+
 #[derive(Debug)]
 pub struct OtlpSource {
     id: u32,
@@ -46,6 +62,8 @@ pub struct OtlpSourceConfig {
     pub channel_capacity: usize,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    #[serde(default)]
+    pub format: StorageFormat,
 }
 
 fn default_channel_capacity() -> usize {
@@ -95,7 +113,12 @@ impl Source for OtlpSource {
         let (tx, rx) = mpsc::channel(self.config.channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let handle = tokio::spawn(server::run_grpc_server(incoming, tx, shutdown_rx));
+        let handle = tokio::spawn(server::run_grpc_server(
+            incoming,
+            tx,
+            shutdown_rx,
+            self.config.format,
+        ));
 
         *self.rx.lock().await = Some(rx);
         *self.shutdown_tx.lock().await = Some(shutdown_tx);
@@ -129,8 +152,13 @@ impl Source for OtlpSource {
             }
         }
 
+        let schema = match self.config.format {
+            StorageFormat::Json => Schema::Json,
+            StorageFormat::Proto => Schema::Raw,
+        };
+
         Ok(ProducedMessages {
-            schema: Schema::Json,
+            schema,
             messages,
             state: None,
         })

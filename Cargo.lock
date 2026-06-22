@@ -6955,13 +6955,14 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_otlp_source"
-version = "0.1.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
  "iggy_connector_sdk",
  "once_cell",
  "opentelemetry-proto",
+ "prost",
  "serde",
  "serde_json",
  "tokio",

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::StorageFormat;
 use crate::convert;
 use iggy_connector_sdk::ProducedMessage;
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -29,6 +30,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
 };
+use prost::Message as ProstMessage;
 use tokio::sync::{mpsc, oneshot};
 use tonic::codec::CompressionEncoding;
 use tonic::transport::server::TcpIncoming;
@@ -39,10 +41,17 @@ pub async fn run_grpc_server(
     incoming: TcpIncoming,
     tx: mpsc::Sender<ProducedMessage>,
     shutdown: oneshot::Receiver<()>,
+    format: StorageFormat,
 ) {
-    let logs_svc = LogsServiceImpl { tx: tx.clone() };
-    let metrics_svc = MetricsServiceImpl { tx: tx.clone() };
-    let trace_svc = TraceServiceImpl { tx };
+    let logs_svc = LogsServiceImpl {
+        tx: tx.clone(),
+        format,
+    };
+    let metrics_svc = MetricsServiceImpl {
+        tx: tx.clone(),
+        format,
+    };
+    let trace_svc = TraceServiceImpl { tx, format };
 
     // OTel SDKs and the Collector's OTLP exporter gzip-compress payloads by
     // default, so every service must accept gzip on the wire. Responses are tiny
@@ -74,14 +83,17 @@ pub async fn run_grpc_server(
 
 struct LogsServiceImpl {
     tx: mpsc::Sender<ProducedMessage>,
+    format: StorageFormat,
 }
 
 struct MetricsServiceImpl {
     tx: mpsc::Sender<ProducedMessage>,
+    format: StorageFormat,
 }
 
 struct TraceServiceImpl {
     tx: mpsc::Sender<ProducedMessage>,
+    format: StorageFormat,
 }
 
 #[tonic::async_trait]
@@ -90,7 +102,7 @@ impl LogsService for LogsServiceImpl {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let messages = convert::export_logs_to_messages(request.into_inner());
+        let messages = encode_or_convert(request.into_inner(), self.format, "logs");
         let rejected = send_messages(&self.tx, messages, "logs");
         let partial_success = (rejected > 0).then(|| ExportLogsPartialSuccess {
             rejected_log_records: rejected,
@@ -106,7 +118,7 @@ impl MetricsService for MetricsServiceImpl {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let messages = convert::export_metrics_to_messages(request.into_inner());
+        let messages = encode_or_convert(request.into_inner(), self.format, "metrics");
         let rejected = send_messages(&self.tx, messages, "metrics");
         let partial_success = (rejected > 0).then(|| ExportMetricsPartialSuccess {
             rejected_data_points: rejected,
@@ -124,7 +136,7 @@ impl TraceService for TraceServiceImpl {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        let messages = convert::export_traces_to_messages(request.into_inner());
+        let messages = encode_or_convert(request.into_inner(), self.format, "traces");
         let rejected = send_messages(&self.tx, messages, "traces");
         let partial_success = (rejected > 0).then(|| ExportTracePartialSuccess {
             rejected_spans: rejected,
@@ -133,6 +145,52 @@ impl TraceService for TraceServiceImpl {
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success,
         }))
+    }
+}
+
+trait IntoMessages {
+    fn into_json_messages(self) -> Vec<ProducedMessage>;
+}
+
+impl IntoMessages for ExportLogsServiceRequest {
+    fn into_json_messages(self) -> Vec<ProducedMessage> {
+        convert::export_logs_to_messages(self)
+    }
+}
+
+impl IntoMessages for ExportMetricsServiceRequest {
+    fn into_json_messages(self) -> Vec<ProducedMessage> {
+        convert::export_metrics_to_messages(self)
+    }
+}
+
+impl IntoMessages for ExportTraceServiceRequest {
+    fn into_json_messages(self) -> Vec<ProducedMessage> {
+        convert::export_traces_to_messages(self)
+    }
+}
+
+fn encode_or_convert<R>(req: R, format: StorageFormat, signal: &str) -> Vec<ProducedMessage>
+where
+    R: ProstMessage + IntoMessages,
+{
+    match format {
+        StorageFormat::Json => req.into_json_messages(),
+        StorageFormat::Proto => {
+            let mut buf = Vec::new();
+            if let Err(e) = req.encode(&mut buf) {
+                warn!("Failed to encode {signal} proto: {e}");
+                return vec![];
+            }
+            vec![ProducedMessage {
+                id: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                headers: None,
+                payload: buf,
+            }]
+        }
     }
 }
 
