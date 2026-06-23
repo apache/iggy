@@ -516,6 +516,10 @@ impl OtlpSink {
                     continue;
                 }
             };
+            // tower::Buffer requires poll_ready before every call.
+            grpc_client.ready().await.map_err(|e| {
+                Error::CannotStoreData(format!("OTLP gRPC channel not ready: {e}"))
+            })?;
             let mut request = tonic::Request::new(Bytes::copy_from_slice(raw));
             for (k, v) in &self.metadata {
                 request.metadata_mut().insert(k.clone(), v.clone());
