@@ -15,10 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod avro;
-pub mod bson;
-pub mod flatbuffer;
-pub mod json;
-pub mod proto;
-pub mod raw;
-pub mod text;
+use crate::{Error, Payload, Schema, StreamEncoder};
+
+pub struct BsonStreamEncoder;
+
+impl StreamEncoder for BsonStreamEncoder {
+    fn schema(&self) -> Schema {
+        Schema::Bson
+    }
+
+    fn encode(&self, _payload: Payload) -> Result<Vec<u8>, Error> {
+        unimplemented!()
+    }
+}
