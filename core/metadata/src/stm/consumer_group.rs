@@ -32,7 +32,9 @@ use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::{
+    WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le, read_u128_le,
+};
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -82,16 +84,25 @@ impl ConsumerGroupMember {
     /// + commit, but it still owns it for the commit fence until completion).
     #[must_use]
     pub fn pollable_partitions(&self) -> Vec<usize> {
-        let pending: std::collections::HashSet<usize> = self
-            .pending_revocations
-            .iter()
-            .map(|revocation| revocation.partition_id)
-            .collect();
         self.partitions
             .iter()
             .copied()
-            .filter(|partition_id| !pending.contains(partition_id))
+            .filter(|&partition_id| self.is_pollable(partition_id))
             .collect()
+    }
+
+    /// Whether this member may poll `partition_id`: owned and not pending
+    /// handoff. Alloc-free -- the poll fence hits this once per poll under the
+    /// metadata read lock, so it avoids the `HashSet` + `Vec` that
+    /// `pollable_partitions` builds. `pending_revocations` is tiny (bounded by
+    /// the member's partition count), so the linear scan beats a set.
+    #[must_use]
+    pub fn is_pollable(&self, partition_id: usize) -> bool {
+        self.partitions.contains(&partition_id)
+            && !self
+                .pending_revocations
+                .iter()
+                .any(|revocation| revocation.partition_id == partition_id)
     }
 }
 
@@ -122,6 +133,15 @@ impl ConsumerGroup {
     /// Redistribute the topic's current partitions round-robin across members.
     /// Reads the live partition set each call, so it reflects repartitions and
     /// bumps the generation on any membership change.
+    ///
+    /// Deliberately asymmetric with the join path (`rebalance_cooperative`):
+    /// this clears partitions and pending revocations with no cooperative
+    /// drain, so a member's in-flight (polled-but-uncommitted) partitions move
+    /// immediately and the new owner re-reads that range. That redelivery is
+    /// exactly what the join path avoids via pending revocations -- but the
+    /// callers here (leave, remove-member on disconnect, repartition) are cases
+    /// where the departing member cannot drain anyway, so an eager move is
+    /// correct and the redelivery is benign under at-least-once.
     pub fn rebalance_members(&mut self, partition_ids: &[usize]) {
         self.generation += 1;
 
@@ -385,7 +405,10 @@ impl WireEncode for JoinConsumerGroupRequest {
         self.topic_id.encode(buf);
         self.group_id.encode(buf);
         buf.put_u128_le(self.client_id);
-        buf.put_u32_le(u32::try_from(self.in_flight.len()).unwrap_or(u32::MAX));
+        // `encoded_size` + the loop below use the true length, so a silent
+        // clamp here would desync the count header from the body. `in_flight`
+        // is bounded by the topic's partition count, so this never fires.
+        buf.put_u32_le(u32::try_from(self.in_flight.len()).expect("in_flight count fits u32"));
         for partition_id in &self.in_flight {
             buf.put_u32_le(*partition_id);
         }
@@ -401,20 +424,16 @@ impl WireDecode for JoinConsumerGroupRequest {
         pos += n;
         let client_id = read_u128_le(buf, pos)?;
         pos += 16;
-        let read_u32 = |buf: &[u8], at: usize| -> Result<u32, iggy_binary_protocol::WireError> {
-            buf.get(at..at + 4)
-                .ok_or_else(|| iggy_binary_protocol::WireError::UnexpectedEof {
-                    offset: at,
-                    need: 4,
-                    have: buf.len().saturating_sub(at),
-                })
-                .map(|slice| u32::from_le_bytes(slice.try_into().expect("4 bytes")))
-        };
-        let count = read_u32(buf, pos)? as usize;
+        let count = read_u32_le(buf, pos)? as usize;
         pos += 4;
-        let mut in_flight = Vec::with_capacity(count);
+        // Cap against the bytes actually left: `count` is read straight off a
+        // replicated prepare, so an unbounded `with_capacity` would let a
+        // corrupt/bit-rotted count (near u32::MAX) allocate gigabytes and abort
+        // every backup that applies it.
+        let mut in_flight =
+            Vec::with_capacity(capped_capacity(count, buf.len().saturating_sub(pos), 4));
         for _ in 0..count {
-            in_flight.push(read_u32(buf, pos)?);
+            in_flight.push(read_u32_le(buf, pos)?);
             pos += 4;
         }
         Ok((
@@ -475,17 +494,6 @@ impl WireDecode for LeaveConsumerGroupRequest {
             pos,
         ))
     }
-}
-
-fn read_u128_le(buf: &[u8], pos: usize) -> Result<u128, iggy_binary_protocol::WireError> {
-    let slice =
-        buf.get(pos..pos + 16)
-            .ok_or_else(|| iggy_binary_protocol::WireError::UnexpectedEof {
-                offset: pos,
-                need: 16,
-                have: buf.len().saturating_sub(pos),
-            })?;
-    Ok(u128::from_le_bytes(slice.try_into().expect("16 bytes")))
 }
 
 impl StateHandler for CreateConsumerGroupRequest {
@@ -645,14 +653,19 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
         let mut any_removed = false;
         for (_, stream) in &mut state.items {
             for (_, topic) in &mut stream.topics {
-                let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
                 for group in topic.consumer_groups.values_mut() {
                     let member_key = group
                         .members
                         .iter()
                         .find(|(_, m)| m.client_id == self.client_id)
                         .map(|(key, _)| key);
+                    // Collect the partition set only when this group actually
+                    // holds the member. This runs on every logout inside the
+                    // no-await commit critical section on every replica, so the
+                    // alloc stays out of the common (no-match) path.
                     if let Some(key) = member_key {
+                        let partition_ids: Vec<usize> =
+                            topic.partitions.iter().map(|p| p.id).collect();
                         group.members.remove(key);
                         group.rebalance_members(&partition_ids);
                         any_removed = true;
@@ -701,25 +714,11 @@ impl WireDecode for CompleteConsumerGroupRevocationRequest {
         let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
         let (topic_id, n) = WireIdentifier::decode(&buf[pos..])?;
         pos += n;
-        let group_slice = buf.get(pos..pos + 8).ok_or_else(|| {
-            iggy_binary_protocol::WireError::UnexpectedEof {
-                offset: pos,
-                need: 8,
-                have: buf.len().saturating_sub(pos),
-            }
-        })?;
-        let group_id = u64::from_le_bytes(group_slice.try_into().expect("8 bytes"));
+        let group_id = read_u64_le(buf, pos)?;
         pos += 8;
         let source_client_id = read_u128_le(buf, pos)?;
         pos += 16;
-        let partition_slice = buf.get(pos..pos + 4).ok_or_else(|| {
-            iggy_binary_protocol::WireError::UnexpectedEof {
-                offset: pos,
-                need: 4,
-                have: buf.len().saturating_sub(pos),
-            }
-        })?;
-        let partition_id = u32::from_le_bytes(partition_slice.try_into().expect("4 bytes"));
+        let partition_id = read_u32_le(buf, pos)?;
         pos += 4;
         Ok((
             Self {

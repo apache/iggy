@@ -39,7 +39,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{Operation, RequestHeader, WireIdentifier};
+use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RequestHeader, WireIdentifier};
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::consumer_group::{
@@ -100,8 +100,10 @@ pub(crate) async fn maybe_rewrite_consumer_group_request(
 /// Gather the group's in-flight partitions (`last_polled` present and
 /// `committed < last_polled`) for the cooperative-rebalance classification. A
 /// not-yet-created group, an unresolved topic, or a partition that does not
-/// answer is treated as not-in-flight (eager handoff), which the reconciler
-/// corrects on a later pass if it was wrong.
+/// answer is treated as not-in-flight (eager handoff). An eager handoff leaves
+/// no `PendingRevocation` record, so the reconciler never revisits it -- a
+/// misclassification here just redelivers the uncommitted range to the new
+/// owner, which is correct under at-least-once.
 async fn gather_in_flight(
     shard: &Rc<ServerNgShard>,
     stream_id: &WireIdentifier,
@@ -150,11 +152,10 @@ async fn gather_in_flight(
         }
         if assigned.contains(&partition_id) {
             in_flight.push(partition_id);
-        } else if let Ok(ns) =
-            resolve_partition_namespace(shard, stream_id, topic_id, Some(partition_id))
-        {
+        } else {
             // Stale mark from a removed member: drop it so a later join in this
             // same restart does not misread it once the partition is reassigned.
+            // `ns` (resolved above, `IggyNamespace: Copy`) is still valid here.
             let _ = shard
                 .partition_read(
                     ns,
@@ -190,51 +191,35 @@ pub(crate) fn maybe_rewrite_consumer_offset_request(
         return Ok(request);
     }
     let body = request_body(&request);
+    // The 4 store/delete (v1 + v2) ops differ only in the decode type; this
+    // collapses their identical decode -> resolve group id -> rewrite consumer
+    // id -> re-encode bodies. A non-group consumer or unresolved group returns
+    // the request untouched (the apply/read path handles the miss).
+    macro_rules! rewrite_group_offset {
+        ($ty:ty) => {{
+            let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            let Some(group_id) =
+                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
+            else {
+                return Ok(request);
+            };
+            // The partition-plane group-offset key is u32, so the monotonic id
+            // must stay within u32 (see `Topic::next_consumer_group_id`). Fail
+            // loudly at that ceiling instead of silently wrapping into a live
+            // group's key.
+            wire.consumer.id = WireIdentifier::Numeric(
+                u32::try_from(group_id).expect("consumer-group id exceeds u32 offset-key ceiling"),
+            );
+            wire.to_bytes()
+        }};
+    }
     let rewritten = match operation {
-        Operation::StoreConsumerOffset => {
-            let mut wire = StoreConsumerOffsetRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
-                return Ok(request);
-            };
-            wire.consumer.id = WireIdentifier::Numeric(group_id as u32);
-            wire.to_bytes()
-        }
-        Operation::StoreConsumerOffset2 => {
-            let mut wire = StoreConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
-                return Ok(request);
-            };
-            wire.consumer.id = WireIdentifier::Numeric(group_id as u32);
-            wire.to_bytes()
-        }
-        Operation::DeleteConsumerOffset => {
-            let mut wire = DeleteConsumerOffsetRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
-                return Ok(request);
-            };
-            wire.consumer.id = WireIdentifier::Numeric(group_id as u32);
-            wire.to_bytes()
-        }
-        Operation::DeleteConsumerOffset2 => {
-            let mut wire = DeleteConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
-                return Ok(request);
-            };
-            wire.consumer.id = WireIdentifier::Numeric(group_id as u32);
-            wire.to_bytes()
-        }
+        Operation::StoreConsumerOffset => rewrite_group_offset!(StoreConsumerOffsetRequest),
+        Operation::StoreConsumerOffset2 => rewrite_group_offset!(StoreConsumerOffset2Request),
+        Operation::DeleteConsumerOffset => rewrite_group_offset!(DeleteConsumerOffsetRequest),
+        Operation::DeleteConsumerOffset2 => rewrite_group_offset!(DeleteConsumerOffset2Request),
+        // The outer `matches!` already filtered to the 4 ops above, but the
+        // match is over the 37-variant `Operation`, so a catch-all is required.
         _ => return Ok(request),
     };
 
@@ -249,7 +234,7 @@ fn resolve_group_offset_id(
     consumer: &WireConsumer,
     namespace: (&WireIdentifier, &WireIdentifier),
 ) -> Option<u64> {
-    if consumer.kind != 2 {
+    if consumer.kind != KIND_CONSUMER_GROUP {
         return None;
     }
     shard

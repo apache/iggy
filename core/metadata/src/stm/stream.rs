@@ -116,7 +116,10 @@ pub struct TopicSnapshot {
     pub max_topic_size: MaxTopicSize,
     pub stats: StatsSnapshot,
     pub partitions: Vec<PartitionSnapshot>,
-    pub round_robin_counter: usize,
+    // `round_robin_counter` is intentionally NOT snapshotted. It is a local
+    // load-balancing hint advanced on the `Balanced`-send read path (outside
+    // the replicated apply), so each replica's value drifts independently;
+    // persisting it would make the snapshot diverge per replica. Restored to 0.
     #[serde(default)]
     pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
     #[serde(default)]
@@ -144,6 +147,12 @@ pub struct Topic {
     pub consumer_group_index: AHashMap<Arc<str>, u64>,
     /// Monotonic group-id counter; never reused so the partition-plane offset
     /// key (keyed by group id) can't be inherited by a recreated group.
+    ///
+    /// Ceiling: the partition-plane offset key is `u32`, so a group id must stay
+    /// within `u32::MAX` (the wire rewrite in `server-ng` truncates to u32 and
+    /// `expect`s this). ~4 billion group creates on a single topic is
+    /// unreachable in practice, but the cap is real -- past it the wire id would
+    /// wrap and could collide with a live group's offset key.
     pub next_consumer_group_id: u64,
 }
 
@@ -306,6 +315,12 @@ define_state! {
         // it onto each new Partition::created_revision. Deterministic across
         // replicas: same ops, same order.
         revision: u64,
+        // Total pending cooperative revocations across all groups, recomputed
+        // once per commit by `post_apply`. The consensus tick reads it O(1)
+        // every 10ms instead of walking every stream/topic/group/member to
+        // decide whether to wake the reconciler. Deterministic (same ops, same
+        // recompute on every replica).
+        pending_revocations_count: u64,
     }
 }
 
@@ -335,6 +350,25 @@ collect_handlers! {
 }
 
 impl StreamsInner {
+    /// Per-commit hook (see the `define_state!`/`dispatch` macro). Recomputes
+    /// `pending_revocations_count` so the consensus tick's
+    /// `has_pending_revocations` read is O(1) instead of walking every group
+    /// each 10ms. The walk runs only here -- once per metadata commit, far
+    /// rarer than the tick -- and over the small consumer-group structure.
+    fn post_apply(&mut self) {
+        let mut count: u64 = 0;
+        for (_, stream) in &self.items {
+            for (_, topic) in &stream.topics {
+                for group in topic.consumer_groups.values() {
+                    for (_, member) in &group.members {
+                        count += member.pending_revocations.len() as u64;
+                    }
+                }
+            }
+        }
+        self.pending_revocations_count = count;
+    }
+
     fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
@@ -493,24 +527,13 @@ impl Streams {
         })
     }
 
-    /// Whether any consumer group has a pending cooperative revocation. Cheap
-    /// (short-circuits); the consensus tick polls it to wake the reconciler
-    /// promptly when a source drains a revoked partition, instead of waiting for
-    /// the periodic completion pass.
+    /// Whether any consumer group has a pending cooperative revocation. O(1):
+    /// reads the `pending_revocations_count` that `post_apply` maintains per
+    /// commit. The consensus tick polls this every 10ms to wake the reconciler
+    /// promptly when a source drains a revoked partition, so it must not walk.
     #[must_use]
     pub fn has_pending_revocations(&self) -> bool {
-        self.inner.read(|inner| {
-            inner.items.iter().any(|(_, stream)| {
-                stream.topics.iter().any(|(_, topic)| {
-                    topic.consumer_groups.values().any(|group| {
-                        group
-                            .members
-                            .iter()
-                            .any(|(_, m)| !m.pending_revocations.is_empty())
-                    })
-                })
-            })
-        })
+        self.inner.read(|inner| inner.pending_revocations_count > 0)
     }
 
     /// The topic's current partition ids, for the join-time in-flight gather
@@ -624,9 +647,7 @@ impl Streams {
             // commit fence keeps the full owned set so the source can still
             // commit it and drain the handoff.
             let owns = if require_pollable {
-                member
-                    .pollable_partitions()
-                    .contains(&(partition_id as usize))
+                member.is_pollable(partition_id as usize)
             } else {
                 member.partitions.iter().any(|&p| p as u32 == partition_id)
             };
@@ -1282,9 +1303,6 @@ impl Snapshotable for Streams {
                                             created_revision: p.created_revision,
                                         })
                                         .collect(),
-                                    round_robin_counter: topic
-                                        .round_robin_counter
-                                        .load(Ordering::Relaxed),
                                     consumer_groups: topic
                                         .consumer_groups
                                         .iter()
@@ -1364,7 +1382,8 @@ impl Snapshotable for Streams {
                             created_revision: p.created_revision,
                         })
                         .collect(),
-                    round_robin_counter: Arc::new(AtomicUsize::new(topic_snap.round_robin_counter)),
+                    // Not snapshotted (see `TopicSnapshot`): start fresh.
+                    round_robin_counter: Arc::new(AtomicUsize::new(0)),
                     consumer_group_index: topic_snap
                         .consumer_groups
                         .iter()
@@ -1408,12 +1427,15 @@ impl Snapshotable for Streams {
         }
 
         let items: Slab<Stream> = stream_entries.into_iter().collect();
-        let inner = StreamsInner {
+        let mut inner = StreamsInner {
             index,
             items,
             revision: snapshot.revision,
+            // Recomputed from the restored groups just below.
+            pending_revocations_count: 0,
             last_result: None,
         };
+        inner.post_apply();
         Ok(inner.into())
     }
 }

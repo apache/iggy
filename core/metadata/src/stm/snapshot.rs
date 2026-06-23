@@ -347,7 +347,6 @@ mod tests {
                                 created_at: ts,
                                 created_revision: 0,
                             }],
-                            round_robin_counter: 0,
                             consumer_groups: Vec::new(),
                             next_consumer_group_id: 1,
                         },

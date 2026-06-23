@@ -423,6 +423,8 @@ mod tests {
             Operation::UpdatePermissions,
             Operation::CreatePersonalAccessToken,
             Operation::DeletePersonalAccessToken,
+            Operation::JoinConsumerGroup,
+            Operation::LeaveConsumerGroup,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,

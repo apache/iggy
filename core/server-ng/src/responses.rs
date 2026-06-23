@@ -66,8 +66,8 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, WireName, WirePartitioning,
+    Command2, GenericHeader, KIND_CONSUMER_GROUP, Operation, ReplyHeader, RequestHeader,
+    WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
@@ -190,7 +190,7 @@ fn fence_group_offset(
     partition_id: Option<u32>,
     client_id: u128,
 ) -> Result<(), IggyError> {
-    if consumer.kind != 2 {
+    if consumer.kind != KIND_CONSUMER_GROUP {
         return Ok(());
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;

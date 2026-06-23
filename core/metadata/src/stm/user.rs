@@ -120,6 +120,11 @@ collect_handlers! {
 }
 
 impl UsersInner {
+    /// Per-commit hook (see the `define_state!`/`dispatch` macro). The users
+    /// state derives no read-path counters, so this is a no-op.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    fn post_apply(&self) {}
+
     fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {

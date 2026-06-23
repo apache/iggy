@@ -76,13 +76,12 @@ async fn sync_group_assignment<B: BinaryClient>(
         .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
         .await?;
     let key = group_cache_key(stream_id, topic_id, group_id);
-    client.consumer_group_state().register_group(
-        key.clone(),
-        stream_id.clone(),
-        topic_id.clone(),
-        group_id.clone(),
-    );
     if response.is_empty() {
+        // Empty reply = the client is not a member of this group (or holds no
+        // partitions). Record the empty assignment but do NOT `register_group`:
+        // registering would make the heartbeat re-sync it for the connection's
+        // lifetime and leak a `joined_groups` entry per distinct non-member
+        // group ever polled. Only a real membership (non-empty reply) registers.
         client
             .consumer_group_state()
             .set_assignment(key, 0, Vec::new());
@@ -90,6 +89,12 @@ async fn sync_group_assignment<B: BinaryClient>(
     }
     let (assignment, _) =
         SyncConsumerGroupResponse::decode(&response).map_err(|_| IggyError::InvalidCommand)?;
+    client.consumer_group_state().register_group(
+        key.clone(),
+        stream_id.clone(),
+        topic_id.clone(),
+        group_id.clone(),
+    );
     client
         .consumer_group_state()
         .set_assignment(key, assignment.generation, assignment.partitions);
@@ -228,7 +233,12 @@ async fn poll_group_messages<B: BinaryClient>(
             Err(error) => return Err(error),
         }
     }
-    Err(IggyError::ConsumerGroupPartitionNotOwned(0, 0))
+    // Exhausted the retry budget on back-to-back fences (a rebalance landed on
+    // every attempt) -- rare, and the cursor is already re-synced. Surface an
+    // empty poll rather than `ConsumerGroupPartitionNotOwned(0, 0)`: the (0, 0)
+    // ids are fabricated and a normal rebalance must not look like a hard error
+    // to a CG app that doesn't special-case 5009. The caller just re-polls.
+    Ok(PolledMessages::empty())
 }
 
 #[async_trait::async_trait]
@@ -284,8 +294,18 @@ impl<B: BinaryClient> MessageClient for B {
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
+        // An explicit `PartitionId` needs no resolution, so borrow the input
+        // directly on that fast path instead of cloning its `value: Vec<u8>`.
         #[cfg(feature = "vsr")]
-        let partitioning = &resolve_partitioning(self, stream_id, topic_id, partitioning).await?;
+        let resolved_partitioning;
+        #[cfg(feature = "vsr")]
+        let partitioning = if partitioning.kind == PartitioningKind::PartitionId {
+            partitioning
+        } else {
+            resolved_partitioning =
+                resolve_partitioning(self, stream_id, topic_id, partitioning).await?;
+            &resolved_partitioning
+        };
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
         let wire_partitioning = partitioning_to_wire(partitioning)?;

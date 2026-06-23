@@ -427,6 +427,11 @@ macro_rules! collect_handlers {
                             },
                         )*
                     });
+                    // Per-commit hook, run on both left-right copies after every
+                    // apply. Each `*Inner` defines an inherent `post_apply`; the
+                    // default is a no-op and `StreamsInner` overrides it to
+                    // refresh derived counters off the read-path hot loops.
+                    self.post_apply();
                 }
             }
 

@@ -58,7 +58,9 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader, WireDecode, WireEncode};
+use iggy_binary_protocol::{
+    GenericHeader, KIND_CONSUMER_GROUP, Operation, RequestHeader, WireDecode, WireEncode,
+};
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
@@ -1262,7 +1264,7 @@ fn decode_poll_request(
     // `ConsumerGroupPartitionNotOwned`, prompting a re-sync) and resolves the
     // group's monotonic id -- the offset key the store rewrite and read path
     // both use, so `next()` reads back the offset it just committed.
-    if wire.consumer.kind == 2 {
+    if wire.consumer.kind == KIND_CONSUMER_GROUP {
         let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
         let client_id = request.header().client;
         let group_id = shard
@@ -1314,7 +1316,7 @@ fn decode_consumer_offset_request(
     // A group offset is keyed by the group's monotonic id (any client may read
     // it, member or not), the same key the write path is rewritten to. An
     // unresolved group (e.g. deleted) has no offset, so the read reports None.
-    let consumer = if wire.consumer.kind == 2 {
+    let consumer = if wire.consumer.kind == KIND_CONSUMER_GROUP {
         let group_id = shard
             .plane
             .metadata()
@@ -1348,7 +1350,7 @@ fn polling_consumer_from_wire(
             consumer_id,
             partition_id as usize,
         )),
-        2 => Ok(PollingConsumer::ConsumerGroup(
+        KIND_CONSUMER_GROUP => Ok(PollingConsumer::ConsumerGroup(
             consumer_id,
             partition_id as usize,
         )),
