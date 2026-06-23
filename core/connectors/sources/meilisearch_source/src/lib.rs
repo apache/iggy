@@ -178,17 +178,35 @@ impl MeilisearchSource {
     }
 
     async fn check_connectivity(&self, client: &Client) -> Result<(), Error> {
-        let health = self
-            .retry_sdk_open_operation("health check", || client.health())
-            .await?;
-        if health.status == "available" {
-            return Ok(());
-        }
+        let mut retries = 0u32;
 
-        Err(Error::Connection(format!(
-            "Meilisearch health check returned status '{}'",
-            health.status
-        )))
+        loop {
+            let health = self
+                .retry_sdk_open_operation("health check", || client.health())
+                .await?;
+            if health.status == "available" {
+                return Ok(());
+            }
+
+            if retries >= self.config.max_open_retries {
+                return Err(Error::Connection(format!(
+                    "Meilisearch health check returned status '{}'",
+                    health.status
+                )));
+            }
+
+            retries += 1;
+            let delay = jitter(exponential_backoff(
+                self.config.retry_delay,
+                retries,
+                self.config.max_retry_delay,
+            ));
+            warn!(
+                "Meilisearch health check returned status '{}' (retry {retries}/{}). Retrying in {delay:?}...",
+                health.status, self.config.max_open_retries
+            );
+            sleep(delay).await;
+        }
     }
 
     async fn get_primary_key(&self, client: &Client) -> Result<String, Error> {
@@ -210,10 +228,30 @@ impl MeilisearchSource {
         })
     }
 
-    async fn search_documents(
+    async fn check_sortable_primary_key(
         &self,
         client: &Client,
-    ) -> Result<(Vec<ProducedMessage>, bool), Error> {
+        primary_key: &str,
+    ) -> Result<(), Error> {
+        let settings = self
+            .retry_sdk_open_operation("get index settings", || {
+                let index = client.index(&self.config.index);
+                async move { index.get_settings().await }
+            })
+            .await?;
+
+        let sortable_attributes = settings.sortable_attributes.unwrap_or_default();
+        if primary_key_is_sortable(&sortable_attributes, primary_key) {
+            return Ok(());
+        }
+
+        Err(Error::InvalidConfigValue(format!(
+            "Meilisearch index '{}' must configure primary key '{}' in sortableAttributes for stable source polling",
+            self.config.index, primary_key
+        )))
+    }
+
+    async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
         let last_primary_key = {
             let state = self.state.lock().await;
             state.last_primary_key.clone()
@@ -246,10 +284,9 @@ impl MeilisearchSource {
             })
             .await?;
         let documents: Vec<Value> = results.hits.into_iter().map(|hit| hit.result).collect();
-        let primary_keys = document_primary_keys(&documents, primary_key)?;
-        let last_document_primary_key = primary_keys.into_iter().last();
+        let (documents, last_document_primary_key) =
+            valid_documents_and_last_primary_key(documents, primary_key, self.id);
         let messages = self.documents_to_messages(documents)?;
-        let state_changed = last_document_primary_key.is_some();
 
         let mut state = self.state.lock().await;
         if let Some(primary_key) = last_document_primary_key {
@@ -258,7 +295,7 @@ impl MeilisearchSource {
         state.documents_produced += messages.len();
         state.poll_count += 1;
 
-        Ok((messages, state_changed))
+        Ok(messages)
     }
 
     fn documents_to_messages(&self, documents: Vec<Value>) -> Result<Vec<ProducedMessage>, Error> {
@@ -393,6 +430,8 @@ impl Source for MeilisearchSource {
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
         let primary_key = self.get_primary_key(&client).await?;
+        self.check_sortable_primary_key(&client, &primary_key)
+            .await?;
         info!(
             "Meilisearch source connector with ID: {} requires integer primary key values for cursor pagination. Index: {}, primary key: {}",
             self.id, self.config.index, primary_key
@@ -415,12 +454,10 @@ impl Source for MeilisearchSource {
             .client
             .as_ref()
             .ok_or_else(|| Error::Connection("Meilisearch client not initialized".to_string()))?;
-        let (messages, state_changed) = self.search_documents(client).await?;
-        let persisted_state = if state_changed {
+        let messages = self.search_documents(client).await?;
+        let persisted_state = {
             let state = self.state.lock().await;
             self.serialize_state(&state)
-        } else {
-            None
         };
 
         Ok(ProducedMessages {
@@ -604,11 +641,33 @@ fn document_primary_key(document: &Value, primary_key: &str) -> Result<Value, Er
     Ok(value.clone())
 }
 
-fn document_primary_keys(documents: &[Value], primary_key: &str) -> Result<Vec<Value>, Error> {
-    documents
+fn primary_key_is_sortable(sortable_attributes: &[String], primary_key: &str) -> bool {
+    sortable_attributes
         .iter()
-        .map(|document| document_primary_key(document, primary_key))
-        .collect()
+        .any(|attribute| attribute == primary_key)
+}
+
+fn valid_documents_and_last_primary_key(
+    documents: Vec<Value>,
+    primary_key: &str,
+    connector_id: u32,
+) -> (Vec<Value>, Option<Value>) {
+    let mut valid_documents = Vec::with_capacity(documents.len());
+    let mut last_primary_key = None;
+
+    for document in documents {
+        match document_primary_key(&document, primary_key) {
+            Ok(primary_key_value) => {
+                last_primary_key = Some(primary_key_value);
+                valid_documents.push(document);
+            }
+            Err(error) => warn!(
+                "Skipping Meilisearch document for source connector with ID: {connector_id}. Invalid primary key '{primary_key}': {error}"
+            ),
+        }
+    }
+
+    (valid_documents, last_primary_key)
 }
 
 fn map_sdk_error(error: MeilisearchSdkError) -> Error {
@@ -623,7 +682,10 @@ fn map_sdk_error(error: MeilisearchSdkError) -> Error {
             }
         }
         MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
-            if communication_error.status_code == 429 || communication_error.status_code >= 500 {
+            if communication_error.status_code == 0
+                || communication_error.status_code == 429
+                || communication_error.status_code >= 500
+            {
                 Error::HttpRequestFailed(communication_error.to_string())
             } else {
                 Error::PermanentHttpError(communication_error.to_string())
@@ -646,7 +708,9 @@ fn is_transient_sdk_error(error: &MeilisearchSdkError) -> bool {
             meilisearch_error.error_type == MeilisearchErrorType::Internal
         }
         MeilisearchSdkError::MeilisearchCommunication(communication_error) => {
-            communication_error.status_code == 429 || communication_error.status_code >= 500
+            communication_error.status_code == 0
+                || communication_error.status_code == 429
+                || communication_error.status_code >= 500
         }
         MeilisearchSdkError::HttpError(_) | MeilisearchSdkError::Timeout => true,
         _ => false,
@@ -846,31 +910,59 @@ mod tests {
     }
 
     #[test]
-    fn document_primary_keys_should_reject_missing_middle_primary_key() {
+    fn primary_key_is_sortable_should_match_exact_attribute() {
+        let sortable_attributes = vec!["created_at".to_string(), "id".to_string()];
+
+        assert!(primary_key_is_sortable(&sortable_attributes, "id"));
+        assert!(!primary_key_is_sortable(&sortable_attributes, "user_id"));
+    }
+
+    #[test]
+    fn valid_documents_should_skip_missing_middle_primary_key() {
         let documents = vec![
             json!({"id": 1, "name": "first"}),
             json!({"name": "missing"}),
             json!({"id": 3, "name": "third"}),
         ];
 
-        let error = document_primary_keys(&documents, "id")
-            .expect_err("missing middle primary key should be rejected");
+        let (valid_documents, last_primary_key) =
+            valid_documents_and_last_primary_key(documents, "id", 1);
 
-        assert!(matches!(error, Error::InvalidConfigValue(_)));
+        assert_eq!(valid_documents.len(), 2);
+        assert_eq!(valid_documents[0]["name"], "first");
+        assert_eq!(valid_documents[1]["name"], "third");
+        assert_eq!(last_primary_key, Some(json!(3)));
     }
 
     #[test]
-    fn document_primary_keys_should_reject_non_integer_middle_primary_key() {
+    fn valid_documents_should_skip_non_integer_middle_primary_key() {
         let documents = vec![
             json!({"id": 1, "name": "first"}),
             json!({"id": 1.5, "name": "float"}),
             json!({"id": 3, "name": "third"}),
         ];
 
-        let error = document_primary_keys(&documents, "id")
-            .expect_err("non-integer middle primary key should be rejected");
+        let (valid_documents, last_primary_key) =
+            valid_documents_and_last_primary_key(documents, "id", 1);
 
-        assert!(matches!(error, Error::InvalidConfigValue(_)));
+        assert_eq!(valid_documents.len(), 2);
+        assert_eq!(valid_documents[0]["name"], "first");
+        assert_eq!(valid_documents[1]["name"], "third");
+        assert_eq!(last_primary_key, Some(json!(3)));
+    }
+
+    #[test]
+    fn valid_documents_should_return_no_cursor_for_all_invalid_primary_keys() {
+        let documents = vec![
+            json!({"id": 1.5, "name": "float"}),
+            json!({"name": "missing"}),
+        ];
+
+        let (valid_documents, last_primary_key) =
+            valid_documents_and_last_primary_key(documents, "id", 1);
+
+        assert!(valid_documents.is_empty());
+        assert_eq!(last_primary_key, None);
     }
 
     #[test]

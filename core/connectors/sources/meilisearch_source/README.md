@@ -9,7 +9,7 @@ them as JSON messages into Iggy.
 - `index`: Source index UID.
 - `api_key`: Optional Meilisearch API key sent as `Authorization: Bearer`.
 - `query`: Optional search query. Defaults to an empty query.
-- `filter`: Optional Meilisearch filter expression or array.
+- `filter`: Optional Meilisearch filter expression string or nested JSON array.
 - `batch_size`: Maximum documents fetched per poll. Defaults to `100`.
 - `polling_interval`: Delay between polls as a humantime string. Defaults to `5s`.
 - `include_metadata`: Wrap each hit with Meilisearch metadata. Defaults to `false`.
@@ -19,6 +19,26 @@ them as JSON messages into Iggy.
 - `max_retry_delay`: Maximum retry delay. Defaults to `5s`.
 - `max_open_retries`: Maximum transient retry attempts during `open()`. Defaults to `5`.
 
+## Filter Syntax
+
+String filters work in regular TOML plugin config:
+
+```toml
+filter = "category = alpha"
+```
+
+Nested array filters require JSON plugin config because the connector receives
+the field as `serde_json::Value`:
+
+```json
+{
+  "filter": [["category = alpha", "category = beta"], "enabled = true"]
+}
+```
+
+Top-level filter array entries are combined with `AND`; nested arrays are
+combined with `OR`.
+
 ## Behavior
 
 The connector requires the source index to define a primary key. Each poll sends
@@ -26,12 +46,16 @@ a `/search` request sorted by that primary key and stores the last emitted
 primary-key value in connector state. This avoids offset pagination skips when
 documents are inserted or deleted between polls.
 
-The primary-key field must be an integer, filterable, and sortable in Meilisearch,
-because the connector adds a cursor filter and primary-key sort to each search
-request. The connector logs this integer primary-key requirement during
-`open()`. String primary keys are not supported until the Meilisearch version
-used for validation supports greater-than filters on string attributes. Returned
-hits are serialized as JSON message payloads.
+The primary-key field must be an integer, filterable, and sortable in
+Meilisearch, because the connector adds a cursor filter and primary-key sort to
+each search request. The connector validates the sortable setting during
+`open()`, but Meilisearch settings do not expose document value types, so the
+integer-value requirement is validated while polling. Documents with missing or
+non-integer primary-key values are skipped with a warning, and the cursor
+advances to the last valid integer primary key in the batch. String primary keys
+are not supported until the Meilisearch version used for validation supports
+greater-than filters on string attributes. Returned hits are serialized as JSON
+message payloads.
 
 Configure the primary-key field as both filterable and sortable before starting
 the connector. For example, when the primary key is `id`:

@@ -35,6 +35,7 @@ linger_time = "5ms"
 url = "http://localhost:7700"
 index = "iggy_messages"
 query = ""
+# filter = "category = alpha"
 batch_size = 100
 polling_interval = "5s"
 include_metadata = true
