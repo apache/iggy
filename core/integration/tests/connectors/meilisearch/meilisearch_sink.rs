@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connectors::fixtures::{MeilisearchOps, MeilisearchSinkFixture};
+use crate::connectors::fixtures::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::{Identifier, MessageClient};
@@ -62,7 +62,7 @@ async fn given_json_messages_when_sink_consumes_should_index_documents(
         .expect("send messages");
 
     let documents = fixture
-        .wait_for_documents(payloads.len())
+        .wait_for_documents(TEST_INDEX, payloads.len())
         .await
         .expect("wait for Meilisearch documents");
 

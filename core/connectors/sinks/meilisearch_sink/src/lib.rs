@@ -146,9 +146,16 @@ impl From<MeilisearchSinkConfig> for ResolvedMeilisearchSinkConfig {
             DEFAULT_TASK_POLL_INTERVAL,
         );
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-        let max_retry_delay =
+        let mut retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let mut max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        if retry_delay > max_retry_delay {
+            warn!(
+                "Meilisearch sink retry_delay ({:?}) exceeds max_retry_delay ({:?}). Swapping values.",
+                retry_delay, max_retry_delay
+            );
+            std::mem::swap(&mut retry_delay, &mut max_retry_delay);
+        }
         let max_open_retries = config.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES);
 
         Self {
@@ -264,8 +271,21 @@ impl MeilisearchSink {
 
     async fn ensure_index_exists(&self, client: &Client) -> Result<(), Error> {
         match self.get_index_if_exists(client).await? {
-            Some(_) => {
+            Some(index) => {
                 info!("Meilisearch index '{}' already exists", self.config.index);
+                if let Some(primary_key) = index.primary_key.as_deref()
+                    && primary_key != self.config.primary_key
+                {
+                    warn!(
+                        "Meilisearch index '{}' primary key '{}' differs from configured primary key '{}'",
+                        self.config.index, primary_key, self.config.primary_key
+                    );
+                } else if index.primary_key.is_none() {
+                    warn!(
+                        "Meilisearch index '{}' does not currently have a primary key. Configured primary key '{}' will be sent with document indexing requests.",
+                        self.config.index, self.config.primary_key
+                    );
+                }
                 Ok(())
             }
             None if self.config.create_index_if_not_exists => self.create_index(client).await,
@@ -718,6 +738,18 @@ impl Sink for MeilisearchSink {
             sanitize_url_for_log(&self.config.url),
             self.config.index
         );
+        if self.config.document_action == MeilisearchDocumentAction::Update {
+            warn!(
+                "Meilisearch sink connector with ID: {} is using document_action=update. Runtime retries are at-least-once and partial batch success can apply non-idempotent updates more than once.",
+                self.id
+            );
+        }
+        if !self.config.wait_for_tasks {
+            warn!(
+                "Meilisearch sink connector with ID: {} is opening with wait_for_tasks=false. Submitted document tasks may still be in flight or fail after offsets are committed.",
+                self.id
+            );
+        }
 
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
@@ -1055,6 +1087,18 @@ mod tests {
             max_retry_delay: None,
             max_open_retries: None,
         }
+    }
+
+    #[test]
+    fn swaps_retry_delays_when_retry_delay_exceeds_max_retry_delay() {
+        let mut config = base_config();
+        config.retry_delay = Some("10s".to_string());
+        config.max_retry_delay = Some("1s".to_string());
+
+        let sink = sink_with_config(config);
+
+        assert_eq!(sink.config.retry_delay, Duration::from_secs(1));
+        assert_eq!(sink.config.max_retry_delay, Duration::from_secs(10));
     }
 
     #[test]

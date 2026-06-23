@@ -154,13 +154,14 @@ pub trait MeilisearchOps: Sync {
 
     fn wait_for_documents(
         &self,
+        index_name: &str,
         expected_count: usize,
     ) -> impl std::future::Future<Output = Result<Vec<serde_json::Value>, TestBinaryError>> + Send
     {
         async move {
             let mut last_count = 0usize;
             for _ in 0..POLL_ATTEMPTS {
-                if let Ok(documents) = self.list_documents(TEST_INDEX).await {
+                if let Ok(documents) = self.list_documents(index_name).await {
                     last_count = documents.len();
                     if documents.len() >= expected_count {
                         return Ok(documents);

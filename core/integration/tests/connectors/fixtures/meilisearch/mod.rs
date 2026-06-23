@@ -18,5 +18,5 @@
 mod container;
 mod sink;
 
-pub use container::MeilisearchOps;
+pub use container::{MeilisearchOps, TEST_INDEX};
 pub use sink::MeilisearchSinkFixture;
