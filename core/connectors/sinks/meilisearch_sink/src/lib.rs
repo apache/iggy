@@ -199,31 +199,66 @@ impl MeilisearchSink {
         let mut retries = 0u32;
 
         loop {
-            let health = self
-                .retry_sdk_open_operation("health check", || client.health())
-                .await?;
-            if health.status == "available" {
-                return Ok(());
+            let result = tokio::time::timeout(self.config.timeout, client.health()).await;
+            match result {
+                Ok(Ok(health)) if health.status == "available" => return Ok(()),
+                Ok(Ok(health)) => {
+                    if retries >= self.config.max_open_retries {
+                        return Err(Error::Connection(format!(
+                            "Meilisearch health check returned status '{}'",
+                            health.status
+                        )));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check returned status '{}' (retry {}/{}). Retrying in {:?}...",
+                        health.status, retries, self.config.max_open_retries, delay
+                    );
+                    sleep(delay).await;
+                }
+                Ok(Err(error)) => {
+                    let should_retry =
+                        retries < self.config.max_open_retries && is_transient_sdk_error(&error);
+                    if !should_retry {
+                        return Err(map_sdk_error(error));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check failed (retry {}/{}): {}. Retrying in {:?}...",
+                        retries, self.config.max_open_retries, error, delay
+                    );
+                    sleep(delay).await;
+                }
+                Err(_) => {
+                    if retries >= self.config.max_open_retries {
+                        return Err(Error::HttpRequestFailed(format!(
+                            "Meilisearch health check timed out after {:?}",
+                            self.config.timeout
+                        )));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check timed out after {:?} (retry {}/{}). Retrying in {:?}...",
+                        self.config.timeout, retries, self.config.max_open_retries, delay
+                    );
+                    sleep(delay).await;
+                }
             }
-
-            if retries >= self.config.max_open_retries {
-                return Err(Error::Connection(format!(
-                    "Meilisearch health check returned status '{}'",
-                    health.status
-                )));
-            }
-
-            retries += 1;
-            let delay = jitter(exponential_backoff(
-                self.config.retry_delay,
-                retries,
-                self.config.max_retry_delay,
-            ));
-            warn!(
-                "Meilisearch health check returned status '{}' (retry {}/{}). Retrying in {:?}...",
-                health.status, retries, self.config.max_open_retries, delay
-            );
-            sleep(delay).await;
         }
     }
 
@@ -289,8 +324,9 @@ impl MeilisearchSink {
             Payload::Json(value) => {
                 Self::document_from_json_value(owned_value_to_serde_json(&value))
             }
-            Payload::Raw(mut bytes) => {
-                match simd_json::from_slice::<simd_json::OwnedValue>(&mut bytes) {
+            Payload::Raw(bytes) => {
+                let mut bytes_copy = bytes.clone();
+                match simd_json::from_slice::<simd_json::OwnedValue>(&mut bytes_copy) {
                     Ok(value) => Self::document_from_json_value(owned_value_to_serde_json(&value)),
                     Err(_) => Map::from_iter([
                         (
@@ -454,8 +490,8 @@ impl MeilisearchSink {
         self.wait_for_task(client, task)
             .await
             .map_err(|error| PartialIndexError {
-                accepted: documents.len(),
-                failed: 0,
+                accepted: 0,
+                failed: documents.len(),
                 error,
             })?;
         Ok(documents.len())
@@ -780,14 +816,25 @@ impl Sink for MeilisearchSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
-        info!(
-            "Meilisearch sink connector with ID: {} is closing. Stats: {} invocations, {} documents enqueued, {} documents confirmed, {} errors",
-            self.id,
-            state.invocations_count,
-            state.documents_enqueued,
-            state.documents_confirmed,
-            state.errors_count
-        );
+        if self.config.wait_for_tasks {
+            info!(
+                "Meilisearch sink connector with ID: {} is closing. Stats: {} invocations, {} documents enqueued, {} documents confirmed, {} errors",
+                self.id,
+                state.invocations_count,
+                state.documents_enqueued,
+                state.documents_confirmed,
+                state.errors_count
+            );
+        } else {
+            warn!(
+                "Meilisearch sink connector with ID: {} is closing with wait_for_tasks=false. Submitted document tasks may still be in flight or fail after offsets are committed.",
+                self.id
+            );
+            info!(
+                "Meilisearch sink connector with ID: {} is closing. Stats: {} invocations, {} documents enqueued, documents confirmed unavailable (wait_for_tasks=false), {} errors",
+                self.id, state.invocations_count, state.documents_enqueued, state.errors_count
+            );
+        }
         drop(state);
 
         self.client = None;
@@ -1163,6 +1210,24 @@ mod tests {
             .expect("prepare document");
 
         assert_eq!(document["data"], "AAECAw==");
+        assert_eq!(document["data_encoding"], ENCODING_BASE64);
+    }
+
+    #[test]
+    fn raw_payloads_preserve_original_bytes_when_json_parse_mutates_buffer() {
+        let sink = sink_with_config(base_config());
+        let bytes = b"[1,2,3".to_vec();
+        let expected = general_purpose::STANDARD.encode(&bytes);
+
+        let document = sink
+            .prepare_document(
+                &topic_metadata(),
+                &messages_metadata(),
+                message(Payload::Raw(bytes)),
+            )
+            .expect("prepare document");
+
+        assert_eq!(document["data"], expected);
         assert_eq!(document["data_encoding"], ENCODING_BASE64);
     }
 
