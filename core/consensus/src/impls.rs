@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commit_signal::{CommitSignal, Notified};
 use crate::oneshot::{self, Receiver, Sender};
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
@@ -683,6 +684,13 @@ where
     /// Monotonic timestamp from the most recent accepted commit heartbeat.
     /// Old/replayed commit messages with a lower timestamp are ignored.
     heartbeat_timestamp: Cell<u64>,
+
+    /// Wakes in-process submit callers parked on the catch-up gate when
+    /// `commit_min` advances (fired in `advance_commit_min`). Lets a submit
+    /// that arrives during the steady-state `commit_min < commit_max`
+    /// pipelining transient wait out the microsecond lag instead of being
+    /// silently dropped.
+    commit_signal: CommitSignal,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -739,6 +747,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_timestamp: Cell::new(0),
+            commit_signal: CommitSignal::default(),
         }
     }
 
@@ -798,6 +807,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         self.commit_min.set(op);
         assert!(self.commit_max.get() >= self.commit_min.get());
+        // Single chokepoint for local-apply progress: wake any submit caller
+        // parked on the catch-up gate so it re-checks `commit_min`.
+        self.commit_signal.notify_all();
+    }
+
+    /// Arm a wait that resolves on the next `commit_min` advance. Callers MUST
+    /// build this BEFORE re-reading the catch-up gate (arm-then-check) to avoid
+    /// a lost wakeup: a commit landing between the gate read and the await is
+    /// otherwise missed. See [`CommitSignal`].
+    #[must_use]
+    pub fn commit_advanced(&self) -> Notified {
+        self.commit_signal.notified()
     }
 
     /// Restore local commit progress from already-applied state during bootstrap.
@@ -825,6 +846,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         self.commit_max.set(commit_max);
         self.commit_min.set(commit_min);
+        // No `commit_signal.notify_all()`: the fresh-instance asserts above
+        // guarantee this runs at bootstrap, before any `commit_advanced`
+        // waiter can park, so there is no edge to deliver. If this ever runs
+        // after a waiter parks, that waiter would miss the edge (masked only by
+        // the submit-side 1s catch-up timeout).
     }
 
     /// Maximum number of faulty replicas that can be tolerated.

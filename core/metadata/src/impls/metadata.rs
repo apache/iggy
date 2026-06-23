@@ -903,6 +903,61 @@ where
     }
 }
 
+/// Safety-net cap on how long an in-process submit waits for the catch-up
+/// gate to open. Far under the SDK 30s read-timeout, so a genuinely stuck or
+/// lost-primary node still falls back to the silent-drop path well before the
+/// client gives up. Never fires in steady state: the gate reopens on the next
+/// `commit_min` advance, which is microsecond-scale.
+const CAUGHT_UP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Park until this node is a caught-up primary, then return `Ok`.
+///
+/// Absorbs the steady-state `commit_min < commit_max` pipelining transient: a
+/// submit arriving while a sibling `on_ack` is mid-flight waits the microsecond
+/// lag out instead of being silently dropped (which forced the SDK into a full
+/// 30s read-timeout + reconnect).
+///
+/// Returns immediately with the caller's silent-drop variant when the node is
+/// genuinely not a primary (`NotPrimary`) or has not caught up within
+/// [`CAUGHT_UP_WAIT_TIMEOUT`] (`NotCaughtUp`); both preserve the by-design
+/// silent drop so the client retry lands on a peer or here post-catch-up.
+///
+/// # Safety
+/// The catch-up gate is correctness-critical (see
+/// [`is_caught_up_primary`]); this only waits for it to open, it never weakens
+/// it. No `RefCell` borrow of `consensus` is held across the await.
+#[allow(clippy::future_not_send)]
+async fn await_caught_up<B: MessageBus>(
+    consensus: &VsrConsensus<B>,
+) -> Result<(), MetadataSubmitError> {
+    let wait = async {
+        loop {
+            // Check FIRST so the hot already-caught-up path never arms a roster
+            // slot (arming-then-abandoning every common submit would grow the
+            // roster unboundedly).
+            if is_caught_up_primary(consensus) {
+                return Ok(());
+            }
+            if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+                // Genuinely not primary: do not wait, the client must try a peer.
+                return Err(MetadataSubmitError::NotPrimary);
+            }
+            // Must wait: arm, then re-check AFTER arming so a commit landing
+            // between the first check and the await is not lost (it fires
+            // `notify_all` into the now-armed waiter). See `CommitSignal`.
+            let notified = consensus.commit_advanced();
+            if is_caught_up_primary(consensus) {
+                return Ok(());
+            }
+            notified.await;
+        }
+    };
+    match compio::time::timeout(CAUGHT_UP_WAIT_TIMEOUT, wait).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(MetadataSubmitError::NotCaughtUp),
+    }
+}
+
 impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
 where
     B: MessageBus,
@@ -948,17 +1003,10 @@ where
             return Ok(session);
         }
 
-        // Status + catch-up gate (see doc). Split variants for telemetry:
-        // NotPrimary (try peer) vs NotCaughtUp (retry). Caller policy same.
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
-        }
+        // Status + catch-up gate (see doc). Waits out the steady-state
+        // `commit_min < commit_max` pipelining transient; only a genuine
+        // not-primary / lost-primary falls through to the silent-drop error.
+        await_caught_up(consensus).await?;
 
         // Mirror wire-path register_preflight: a racing second prepare fails
         // check_register on commit. Surface pre-synthesis.
@@ -1048,15 +1096,7 @@ where
             return Ok(consensus.commit_min());
         }
 
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
-        }
+        await_caught_up(consensus).await?;
 
         if consensus
             .pipeline()
@@ -1303,15 +1343,7 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
-        }
+        await_caught_up(consensus).await?;
 
         // Dedup / session / eviction. shard 0 cannot route by the VSR
         // consensus `client_id` (its top bits are random, not home-shard
@@ -1947,7 +1979,9 @@ mod tests {
     use super::*;
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
+    use consensus::LocalPipeline;
     use iggy_common::variadic;
+    use message_bus::IggyMessageBus;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2041,6 +2075,96 @@ mod tests {
             *second_count.borrow(),
             1,
             "cleared notifier must stay quiet"
+        );
+    }
+
+    /// Single-replica primary (`replica_count = 1` -> always primary) parked on a
+    /// closed catch-up gate (`commit_min < commit_max`), with the gate opened
+    /// one op at a time. Proves the steady-state transient is absorbed instead
+    /// of silently dropped, and that every parked waiter is woken (no
+    /// lost-wakeup) when `commit_min` finally reaches `commit_max`.
+    fn caught_up_consensus(commit_max: u64) -> Rc<VsrConsensus<IggyMessageBus>> {
+        let consensus = VsrConsensus::new(
+            0,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        consensus.advance_commit_max(commit_max);
+        Rc::new(consensus)
+    }
+
+    #[compio::test]
+    async fn given_many_parked_registers_when_commit_min_catches_up_should_wake_all() {
+        const WAITERS: u64 = 64;
+        const TARGET: u64 = 8;
+
+        let consensus = caught_up_consensus(TARGET);
+        // Gate is closed: commit_min (0) < commit_max (TARGET).
+        assert!(!is_caught_up_primary(&consensus));
+
+        let waiters: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let consensus = Rc::clone(&consensus);
+                compio::runtime::spawn(async move { await_caught_up(&consensus).await })
+            })
+            .collect();
+
+        // Let every waiter poll once and park on the closed gate before the
+        // gate is opened, so the wake path (not the fast path) is exercised.
+        compio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Open the gate one op at a time; each advance fires the commit signal.
+        for op in 1..=TARGET {
+            consensus.advance_commit_min(op);
+        }
+        assert!(is_caught_up_primary(&consensus));
+
+        for waiter in waiters {
+            match waiter.await {
+                Ok(Ok(())) => {}
+                other => panic!("waiter must resolve Ok(()), got {other:?}"),
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_non_primary_when_await_caught_up_should_return_not_primary() {
+        // replica 1 of 2 in view 0 -> primary is replica 0, so this node is a
+        // backup. The gate can never open here, so the helper must fail fast
+        // with NotPrimary instead of waiting out the timeout.
+        let consensus = VsrConsensus::<IggyMessageBus>::new(
+            0,
+            1,
+            2,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+
+        assert_eq!(
+            await_caught_up(&consensus).await,
+            Err(MetadataSubmitError::NotPrimary)
+        );
+    }
+
+    #[compio::test]
+    async fn given_primary_that_never_advances_when_await_caught_up_should_timeout_not_caught_up() {
+        // Primary with a permanently closed gate (commit_min < commit_max, no
+        // advance ever fires): the helper parks, then the safety-net timeout
+        // surfaces NotCaughtUp instead of hanging. The cancelled `Notified` is
+        // dropped, which deregisters its slot (roster bounding is asserted in
+        // the consensus-crate `CommitSignal` tests).
+        let consensus = caught_up_consensus(1);
+        assert!(!is_caught_up_primary(&consensus));
+
+        assert_eq!(
+            await_caught_up(&consensus).await,
+            Err(MetadataSubmitError::NotCaughtUp)
         );
     }
 }

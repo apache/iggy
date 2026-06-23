@@ -147,6 +147,9 @@ pub use client_table::{CachedReply, ClientTable};
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
+// Edge-triggered notify for `commit_min`-advanced waiters.
+pub(crate) mod commit_signal;
+pub use commit_signal::{CommitSignal, Notified};
 
 mod impls;
 pub use impls::*;
