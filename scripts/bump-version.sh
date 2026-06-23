@@ -33,7 +33,7 @@ Usage:
   bump-version.sh --status [<component>]
 
 Components:
-  rust-sdk             core/sdk + workspace dep + python iggy dep
+  rust-sdk             core/sdk + workspace dep + python/php iggy deps
   rust-common          core/common + workspace dep
   rust-binary-protocol core/binary_protocol + workspace dep
   rust-server          core/server
@@ -103,6 +103,7 @@ get_version_files() {
             echo "core/sdk/Cargo.toml:cargo"
             echo "Cargo.toml:cargo-ws-dep:iggy"
             echo "foreign/python/Cargo.toml:cargo-dep:iggy"
+            echo "foreign/php/Cargo.toml:cargo-dep:iggy"
             ;;
         rust-common)
             echo "core/common/Cargo.toml:cargo"

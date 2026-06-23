@@ -32,7 +32,7 @@ crate-type = ["cdylib"]
 bytes = "1.11.1"
 futures = "0.3.32"
 ext-php-rs = "=0.15.14"
-iggy = { path = "../../core/sdk" }
+iggy = { path = "../../core/sdk", version = "0.10.1-edge.2" }
 tokio = "1.52.3"
 
 [profile.release]

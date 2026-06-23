@@ -38,11 +38,11 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--check|--fix]"
             echo ""
-            echo "Validate PHP SDK Cargo version and Composer metadata"
+            echo "Validate PHP SDK Cargo, Rust SDK dependency, and Composer metadata"
             echo ""
             echo "Options:"
-            echo "  --check    Check Cargo version and Composer version metadata"
-            echo "  --fix      Remove a manual Composer version field"
+            echo "  --check    Check Cargo dependency and Composer version metadata"
+            echo "  --fix      Sync the Rust SDK dependency and remove a manual Composer version field"
             echo "  --help     Show this help message"
             exit 0
             ;;
@@ -63,54 +63,95 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-CARGO_TOML="foreign/php/Cargo.toml"
+RUST_SDK_CARGO_TOML="core/sdk/Cargo.toml"
+PHP_CARGO_TOML="foreign/php/Cargo.toml"
 COMPOSER_JSON="foreign/php/composer.json"
 
-CARGO_VERSION=$(grep '^version = ' "$CARGO_TOML" | head -1 | sed 's/version = "\(.*\)"/\1/')
+PHP_CARGO_VERSION=$(grep '^version = ' "$PHP_CARGO_TOML" | head -1 | sed 's/version = "\(.*\)"/\1/')
+RUST_SDK_VERSION=$(grep '^version = ' "$RUST_SDK_CARGO_TOML" | head -1 | sed 's/version = "\(.*\)"/\1/')
+PHP_IGGY_DEP_LINE=$(grep '^iggy = ' "$PHP_CARGO_TOML" | head -1 || true)
+PHP_IGGY_DEP_VERSION=""
+if [[ "$PHP_IGGY_DEP_LINE" == *'version = "'* ]]; then
+    PHP_IGGY_DEP_VERSION=$(printf '%s\n' "$PHP_IGGY_DEP_LINE" | sed 's/.*version = "\([^"]*\)".*/\1/')
+fi
 COMPOSER_VERSION_LINE=$(grep '"version"' "$COMPOSER_JSON" | head -1 || true)
 COMPOSER_VERSION=""
 if [ -n "$COMPOSER_VERSION_LINE" ]; then
     COMPOSER_VERSION=$(printf '%s\n' "$COMPOSER_VERSION_LINE" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
 fi
 
-if [ -z "$CARGO_VERSION" ]; then
-    echo -e "${RED}Error: Could not extract version from $CARGO_TOML${NC}"
+if [ -z "$PHP_CARGO_VERSION" ]; then
+    echo -e "${RED}Error: Could not extract version from $PHP_CARGO_TOML${NC}"
+    exit 1
+fi
+
+if [ -z "$RUST_SDK_VERSION" ]; then
+    echo -e "${RED}Error: Could not extract version from $RUST_SDK_CARGO_TOML${NC}"
     exit 1
 fi
 
 echo "PHP SDK version check:"
-echo "  Cargo.toml:    $CARGO_VERSION"
-if [ -n "$COMPOSER_VERSION" ]; then
-    echo "  composer.json: $COMPOSER_VERSION (must be removed)"
+echo "  PHP Cargo.toml:       $PHP_CARGO_VERSION"
+echo "  core/sdk Cargo.toml:  $RUST_SDK_VERSION"
+if [ -n "$PHP_IGGY_DEP_VERSION" ]; then
+    echo "  PHP iggy dependency:  $PHP_IGGY_DEP_VERSION"
 else
-    echo "  composer.json: no manual version"
+    echo "  PHP iggy dependency:  missing version"
+fi
+if [ -n "$COMPOSER_VERSION" ]; then
+    echo "  composer.json:        $COMPOSER_VERSION (must be removed)"
+else
+    echo "  composer.json:        no manual version"
 fi
 echo ""
 
 if [ "$MODE" = "check" ]; then
-    if [ -z "$COMPOSER_VERSION" ]; then
-        echo -e "${GREEN}✓ PHP SDK Composer metadata lets tags drive package versions${NC}"
+    if [ "$PHP_IGGY_DEP_VERSION" = "$RUST_SDK_VERSION" ] && [ -z "$COMPOSER_VERSION" ]; then
+        echo -e "${GREEN}✓ PHP SDK metadata is synchronized${NC}"
         exit 0
     fi
 
-    echo -e "${RED}✗ composer.json must not declare a manual version${NC}"
+    echo -e "${RED}✗ PHP SDK metadata is NOT synchronized${NC}"
     echo ""
-    echo "Packagist/Composer derive VCS package versions from tags."
-    echo "Remove the version field from $COMPOSER_JSON."
+    if [ "$PHP_IGGY_DEP_VERSION" != "$RUST_SDK_VERSION" ]; then
+        echo "The PHP iggy dependency must match $RUST_SDK_CARGO_TOML."
+    fi
+    if [ -n "$COMPOSER_VERSION" ]; then
+        echo "Packagist/Composer derive VCS package versions from tags."
+        echo "Remove the version field from $COMPOSER_JSON."
+    fi
     echo ""
-    echo -e "${YELLOW}Run '$0 --fix' to remove the Composer version field${NC}"
+    echo -e "${YELLOW}Run '$0 --fix' to sync PHP SDK metadata${NC}"
     exit 1
 fi
 
-if [ -z "$COMPOSER_VERSION" ]; then
-    echo -e "${GREEN}✓ PHP SDK Composer metadata already omits a manual version${NC}"
-    exit 0
+changed=0
+
+sedi() {
+    if sed --version 2>/dev/null | grep -q 'GNU'; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
+if [ "$PHP_IGGY_DEP_VERSION" != "$RUST_SDK_VERSION" ]; then
+    if grep -q '^iggy = .*version = ' "$PHP_CARGO_TOML"; then
+        sedi "s/^\(iggy = .*version = \"\)[^\"]*/\1${RUST_SDK_VERSION}/" "$PHP_CARGO_TOML"
+    else
+        sedi "s/^\(iggy = {[^}]*\) }/\1, version = \"${RUST_SDK_VERSION}\" }/" "$PHP_CARGO_TOML"
+    fi
+    changed=1
 fi
 
-if sed --version 2>/dev/null | grep -q 'GNU'; then
-    sed -i '/^[[:space:]]*"version"[[:space:]]*:/d' "$COMPOSER_JSON"
-else
-    sed -i '' '/^[[:space:]]*"version"[[:space:]]*:/d' "$COMPOSER_JSON"
+if [ -n "$COMPOSER_VERSION" ]; then
+    sedi '/^[[:space:]]*"version"[[:space:]]*:/d' "$COMPOSER_JSON"
+    changed=1
+fi
+
+if [ "$changed" -eq 0 ]; then
+    echo -e "${GREEN}✓ PHP SDK metadata already synchronized${NC}"
+    exit 0
 fi
 
 if grep -q '"version"' "$COMPOSER_JSON"; then
@@ -118,4 +159,14 @@ if grep -q '"version"' "$COMPOSER_JSON"; then
     exit 1
 fi
 
-echo -e "${GREEN}✓ Removed manual version field from $COMPOSER_JSON${NC}"
+PHP_IGGY_DEP_LINE=$(grep '^iggy = ' "$PHP_CARGO_TOML" | head -1 || true)
+PHP_IGGY_DEP_VERSION=""
+if [[ "$PHP_IGGY_DEP_LINE" == *'version = "'* ]]; then
+    PHP_IGGY_DEP_VERSION=$(printf '%s\n' "$PHP_IGGY_DEP_LINE" | sed 's/.*version = "\([^"]*\)".*/\1/')
+fi
+if [ "$PHP_IGGY_DEP_VERSION" != "$RUST_SDK_VERSION" ]; then
+    echo -e "${RED}Error: Failed to sync PHP iggy dependency in $PHP_CARGO_TOML${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Synchronized PHP SDK metadata${NC}"

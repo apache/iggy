@@ -43,12 +43,12 @@ jobs:
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
   php-versions:
-    name: Check PHP SDK Composer metadata
+    name: Check PHP SDK metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
-      - name: Check PHP SDK Composer metadata
+      - name: Check PHP SDK metadata
         run: ./scripts/ci/php-sdk-version-sync.sh --check
 
   python-interpreter-versions:
@@ -275,11 +275,11 @@ jobs:
           fi
 
           if [ "$PHP_VERSIONS" = "success" ]; then
-            echo "| ✅ PHP SDK Composer Metadata | success | Composer versions are tag-derived |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ✅ PHP SDK Metadata | success | Rust SDK dependency and Composer metadata synchronized |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "$PHP_VERSIONS" = "failure" ]; then
-            echo "| ❌ PHP SDK Composer Metadata | failure | composer.json declares a manual version |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ❌ PHP SDK Metadata | failure | PHP SDK metadata mismatch detected |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "| ⏭️ PHP SDK Composer Metadata | $PHP_VERSIONS | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| ⏭️ PHP SDK Metadata | $PHP_VERSIONS | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$PYTHON_INTERPRETER_VERSIONS" = "success" ]; then
