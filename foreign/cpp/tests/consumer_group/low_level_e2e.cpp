@@ -256,7 +256,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCreatedGroups) {
     const auto groups =
         client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
 
-    EXPECT_EQ(groups.size(), 2);
+    EXPECT_EQ(groups.size(), std::size_t{2});
     EXPECT_EQ(groups[0].name, first_group_name);
     EXPECT_EQ(groups[1].name, second_group_name);
 
@@ -324,7 +324,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReflectsJoinedGroupMembersCou
     const auto groups =
         client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
 
-    ASSERT_EQ(groups.size(), 2);
+    ASSERT_EQ(groups.size(), std::size_t{2});
 
     EXPECT_EQ(groups[0].id, joined_group.id);
     EXPECT_EQ(groups[0].name, joined_group.name);
@@ -399,7 +399,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsIsStableAcrossBackToBackCalls
         client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
 
     EXPECT_EQ(second_groups.size(), first_groups.size());
-    EXPECT_EQ(second_groups.size(), 2);
+    EXPECT_EQ(second_groups.size(), std::size_t{2});
 
     for (std::size_t i = 0; i < first_groups.size(); ++i) {
         EXPECT_EQ(second_groups[i].id, first_groups[i].id);
@@ -454,7 +454,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCorrectNumberOfGroups)
     const auto groups =
         client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
 
-    ASSERT_EQ(groups.size(), 1);
+    ASSERT_EQ(groups.size(), std::size_t{1});
     EXPECT_EQ(groups[0].id, remaining_group.id);
     EXPECT_EQ(groups[0].name, remaining_group.name);
     EXPECT_EQ(groups[0].partitions_count, remaining_group.partitions_count);
