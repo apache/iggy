@@ -51,6 +51,7 @@ include_headers = true
 include_checksum = true
 include_origin_timestamp = true
 query_timeout = "30s"
+# Total write attempts for transient failures. Minimum is 1. A value of 0 is raised to 1.
 max_retries = 3
 retry_delay = "100ms"
 max_retry_delay = "5s"

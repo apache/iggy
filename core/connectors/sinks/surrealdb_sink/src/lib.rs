@@ -24,7 +24,7 @@ use iggy_connector_sdk::retry::{exponential_backoff, jitter, parse_duration};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
-use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode};
+use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -139,19 +139,25 @@ enum PayloadFormat {
 }
 
 impl PayloadFormat {
-    fn from_config(value: Option<&str>) -> Self {
+    fn parse_config(value: Option<&str>) -> Result<Self, Error> {
         match value {
-            Some(value) if value.eq_ignore_ascii_case("json") => PayloadFormat::Json,
-            Some(value) if value.eq_ignore_ascii_case("text") => PayloadFormat::Text,
-            Some(value) if value.eq_ignore_ascii_case("base64") => PayloadFormat::Base64,
-            Some(value) if value.eq_ignore_ascii_case("binary") => PayloadFormat::Base64,
-            Some(value) if value.eq_ignore_ascii_case("auto") => PayloadFormat::Auto,
-            Some(value) => {
-                warn!("Unknown SurrealDB payload format '{value}', defaulting to auto");
-                PayloadFormat::Auto
-            }
-            None => PayloadFormat::Auto,
+            Some(value) if value.eq_ignore_ascii_case("json") => Ok(PayloadFormat::Json),
+            Some(value) if value.eq_ignore_ascii_case("text") => Ok(PayloadFormat::Text),
+            Some(value) if value.eq_ignore_ascii_case("base64") => Ok(PayloadFormat::Base64),
+            Some(value) if value.eq_ignore_ascii_case("binary") => Ok(PayloadFormat::Base64),
+            Some(value) if value.eq_ignore_ascii_case("auto") => Ok(PayloadFormat::Auto),
+            Some(value) => Err(Error::InvalidConfigValue(format!(
+                "SurrealDB payload_format must be one of auto, json, text, base64, or binary: {value}"
+            ))),
+            None => Ok(PayloadFormat::Auto),
         }
+    }
+
+    fn from_config(value: Option<&str>) -> Self {
+        Self::parse_config(value).unwrap_or_else(|error| {
+            warn!("{error}. Defaulting to auto until config validation runs.");
+            PayloadFormat::Auto
+        })
     }
 }
 
@@ -275,17 +281,29 @@ impl SurrealDbSink {
 impl Sink for SurrealDbSink {
     async fn open(&mut self) -> Result<(), Error> {
         self.auth_scope = AuthScope::parse_config(self.config.auth_scope.as_deref())?;
+        self.payload_format = PayloadFormat::parse_config(self.config.payload_format.as_deref())?;
+        validate_endpoint_config(&self.config.endpoint, self.config.use_tls.unwrap_or(false))?;
         validate_identifier("namespace", &self.config.namespace)?;
         validate_identifier("database", &self.config.database)?;
         validate_identifier("table", &self.table)?;
 
+        if self.auto_define_table && self.auth_scope != AuthScope::Root {
+            return Err(Error::InvalidConfigValue(
+                "SurrealDB auto_define_table requires auth_scope=root because namespace/database DDL is executed"
+                    .to_string(),
+            ));
+        }
+
+        if self.define_indexes && !self.auto_define_table {
+            warn!(
+                "SurrealDB sink ID: {} define_indexes=true requires auto_define_table=true; index DDL will not run.",
+                self.id
+            );
+        }
+
         info!(
             "Opening SurrealDB sink connector with ID: {}. Endpoint: {}, namespace: {}, database: {}, table: {}",
-            self.id,
-            redact_endpoint(&self.config.endpoint),
-            self.config.namespace,
-            self.config.database,
-            self.table
+            self.id, self.base_url, self.config.namespace, self.config.database, self.table
         );
 
         let client = self.connect_and_select().await?;
@@ -323,7 +341,7 @@ impl Sink for SurrealDbSink {
 
 impl SurrealDbSink {
     async fn connect_and_select(&self) -> Result<SurrealDbClient, Error> {
-        let client = self.connect().await?;
+        let client = self.connect()?;
         self.signin_if_configured(&client).await?;
         self.health_check(&client).await?;
 
@@ -335,7 +353,7 @@ impl SurrealDbSink {
         Ok(client)
     }
 
-    async fn connect(&self) -> Result<SurrealDbClient, Error> {
+    fn connect(&self) -> Result<SurrealDbClient, Error> {
         HttpClient::builder()
             .timeout(self.query_timeout)
             .build()
@@ -350,7 +368,7 @@ impl SurrealDbSink {
             .ok_or_else(|| Error::InitError("SurrealDB sink is not connected".to_string()))
     }
 
-    async fn reconnect(&self) -> Result<(), Error> {
+    async fn reconnect(&self) -> Result<bool, Error> {
         if self
             .reconnecting
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -360,7 +378,8 @@ impl SurrealDbSink {
                 "Skipping SurrealDB reconnect for connector ID: {} because another reconnect is in progress",
                 self.id
             );
-            return Ok(());
+            tokio::time::sleep(self.retry_delay).await;
+            return Ok(false);
         }
 
         warn!("Reconnecting SurrealDB sink connector ID: {}", self.id);
@@ -371,7 +390,7 @@ impl SurrealDbSink {
         }
         .await;
         self.reconnecting.store(false, Ordering::Release);
-        result
+        result.map(|()| true)
     }
 
     async fn signin_if_configured(&self, client: &SurrealDbClient) -> Result<(), Error> {
@@ -593,8 +612,6 @@ impl SurrealDbSink {
             if let Some(error) = outcome.error {
                 self.insertion_errors
                     .fetch_add(outcome.error_count, Ordering::Relaxed);
-                self.messages_processed
-                    .fetch_add(successful_inserts, Ordering::Relaxed);
                 error!(
                     "Failed to insert SurrealDB batch for connector ID: {}, table: {}, error: {error}",
                     self.id, self.table
@@ -643,7 +660,7 @@ impl SurrealDbSink {
                 Err(error) => {
                     return BatchInsertOutcome {
                         inserted_count: 0,
-                        error_count: 1,
+                        error_count: messages.len() as u64,
                         error: Some(error),
                     };
                 }
@@ -689,25 +706,31 @@ impl SurrealDbSink {
                     };
                 }
                 Err(error) => {
-                    attempts += 1;
                     let transient = is_transient_error(&error);
+
+                    if transient && is_connection_error(&error) {
+                        match self.reconnect().await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(reconnect_error) => {
+                                return BatchInsertOutcome {
+                                    inserted_count: 0,
+                                    error_count: record_count,
+                                    error: Some(Error::Connection(format!(
+                                        "Failed to reconnect to SurrealDB after transient write error: {reconnect_error}"
+                                    ))),
+                                };
+                            }
+                        }
+                    }
+
+                    attempts += 1;
                     if !transient || attempts >= self.max_retries {
                         return BatchInsertOutcome {
                             inserted_count: 0,
                             error_count: record_count,
                             error: Some(Error::CannotStoreData(format!(
                                 "SurrealDB batch insert failed after {attempts} attempts: {error}"
-                            ))),
-                        };
-                    }
-                    if is_connection_error(&error)
-                        && let Err(reconnect_error) = self.reconnect().await
-                    {
-                        return BatchInsertOutcome {
-                            inserted_count: 0,
-                            error_count: record_count,
-                            error: Some(Error::Connection(format!(
-                                "Failed to reconnect to SurrealDB after transient write error: {reconnect_error}"
                             ))),
                         };
                     }
@@ -978,14 +1001,64 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn build_base_url(endpoint: &str, use_tls: bool) -> String {
-    let endpoint = endpoint.trim_end_matches('/');
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return endpoint.to_string();
+fn validate_endpoint_config(endpoint: &str, use_tls: bool) -> Result<(), Error> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(Error::InvalidConfigValue(
+            "SurrealDB endpoint cannot be empty".to_string(),
+        ));
     }
 
-    let scheme = if use_tls { "https" } else { "http" };
-    format!("{scheme}://{endpoint}")
+    let has_scheme = endpoint.starts_with("http://") || endpoint.starts_with("https://");
+    if use_tls && endpoint.starts_with("http://") {
+        warn!("SurrealDB use_tls=true is ignored because endpoint has explicit http:// scheme.");
+    }
+
+    let parsed_endpoint = if has_scheme {
+        endpoint.to_string()
+    } else {
+        let scheme = if use_tls { "https" } else { "http" };
+        format!("{scheme}://{endpoint}")
+    };
+    let url = Url::parse(&parsed_endpoint).map_err(|e| {
+        Error::InvalidConfigValue(format!("Invalid SurrealDB endpoint '{endpoint}': {e}"))
+    })?;
+
+    if url.host_str().is_none() {
+        return Err(Error::InvalidConfigValue(format!(
+            "Invalid SurrealDB endpoint '{endpoint}': host is required"
+        )));
+    }
+
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::InvalidConfigValue(
+            "SurrealDB endpoint must not include a path, query, or fragment".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_base_url(endpoint: &str, use_tls: bool) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let has_scheme = endpoint.starts_with("http://") || endpoint.starts_with("https://");
+    let endpoint = if has_scheme {
+        endpoint.to_string()
+    } else {
+        let scheme = if use_tls { "https" } else { "http" };
+        format!("{scheme}://{endpoint}")
+    };
+
+    if let Ok(mut url) = Url::parse(&endpoint) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_path("");
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.as_str().trim_end_matches('/').to_string();
+    }
+
+    endpoint
 }
 
 fn value_to_error_message(value: &Value) -> String {
@@ -1007,14 +1080,14 @@ fn is_transaction_conflict(error: &SurrealDbRequestError) -> bool {
 }
 
 fn is_connection_error(error: &SurrealDbRequestError) -> bool {
-    if let SurrealDbRequestError::Request(error) = error
-        && (error.is_connect() || error.is_timeout())
-    {
-        return true;
-    }
+    let SurrealDbRequestError::Request(error) = error else {
+        return false;
+    };
 
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("connection")
+    error.is_connect()
+        || error.is_timeout()
+        || message.contains("connection")
         || message.contains("network")
         || message.contains("broken pipe")
         || message.contains("reset by peer")
@@ -1045,10 +1118,6 @@ fn is_timeout_or_service_error(error: &SurrealDbRequestError) -> bool {
         || message.contains("timed out")
         || message.contains("temporarily unavailable")
         || message.contains("service unavailable")
-}
-
-fn redact_endpoint(endpoint: &str) -> String {
-    endpoint.to_string()
 }
 
 #[cfg(test)]
@@ -1231,6 +1300,52 @@ mod tests {
     fn given_unknown_auth_scope_when_opening_should_fail_validation() {
         let mut config = test_config();
         config.auth_scope = Some("roo".to_string());
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
+    }
+
+    #[test]
+    fn given_unknown_payload_format_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.payload_format = Some("jsn".to_string());
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
+    }
+
+    #[test]
+    fn given_auto_define_table_with_scoped_auth_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.auth_scope = Some("database".to_string());
+        config.auto_define_table = Some(true);
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
+    }
+
+    #[test]
+    fn given_endpoint_path_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.endpoint = "http://127.0.0.1:8000/extra/path".to_string();
         let mut sink = SurrealDbSink::new(1, config);
 
         tokio::runtime::Runtime::new()
@@ -1469,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn given_record_build_failure_in_batch_should_count_only_failed_record() {
+    fn given_record_build_failure_in_batch_should_count_rejected_batch() {
         let mut config = test_config();
         config.payload_format = Some("json".to_string());
         let sink = SurrealDbSink::new(1, config);
@@ -1489,7 +1604,7 @@ mod tests {
             });
 
         assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
-        assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1506,6 +1621,22 @@ mod tests {
             build_base_url("http://127.0.0.1:8000/", true),
             "http://127.0.0.1:8000"
         );
+    }
+
+    #[test]
+    fn given_endpoint_credentials_should_build_sanitized_base_url() {
+        assert_eq!(
+            build_base_url("http://user:pass@127.0.0.1:8000/", false),
+            "http://127.0.0.1:8000"
+        );
+    }
+
+    #[test]
+    fn given_endpoint_shapes_should_validate_expected_values() {
+        assert!(validate_endpoint_config("127.0.0.1:8000", false).is_ok());
+        assert!(validate_endpoint_config("http://127.0.0.1:8000", true).is_ok());
+        assert!(validate_endpoint_config("http://127.0.0.1:8000/path", false).is_err());
+        assert!(validate_endpoint_config("http://127.0.0.1:8000?x=1", false).is_err());
     }
 
     #[test]
@@ -1536,15 +1667,17 @@ mod tests {
     }
 
     #[test]
+    fn given_connection_text_in_query_error_should_not_be_connection_error() {
+        let error = SurrealDbRequestError::Query("connection pool size exceeded".to_string());
+
+        assert!(!is_connection_error(&error));
+    }
+
+    #[test]
     fn given_non_transient_query_error_should_not_be_transient() {
         let error = SurrealDbRequestError::Query("syntax error".to_string());
 
         assert!(!is_transient_error(&error));
-    }
-
-    #[test]
-    fn given_minimal_endpoint_should_log_unchanged_host_port() {
-        assert_eq!(redact_endpoint("127.0.0.1:8000"), "127.0.0.1:8000");
     }
 
     #[test]
