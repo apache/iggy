@@ -59,6 +59,7 @@ verbose_logging = false
 # max_retry_delay = "5s"
 # max_open_retries = 5
 # open_retry_max_delay = "30s"
+# request_timeout = "30s"
 index = """
 version: 0.9
 

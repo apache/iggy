@@ -57,6 +57,7 @@ pub struct QuickwitSinkConfig {
     pub max_retry_delay: Option<String>,
     pub max_open_retries: Option<u32>,
     pub open_retry_max_delay: Option<String>,
+    pub request_timeout: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +131,13 @@ impl QuickwitSink {
                 self.index_id, self.id
             );
             Ok(())
+        } else if status == StatusCode::CONFLICT {
+            // Another instance beat us to it; the index exists, which is what we want.
+            info!(
+                "Quickwit index already exists (409): {} for connector ID: {}",
+                self.index_id, self.id
+            );
+            Ok(())
         } else if status.is_client_error() {
             let reason = response.text().await.unwrap_or_default();
             error!(
@@ -189,7 +197,9 @@ impl QuickwitSink {
                 "Permanent error ingesting into Quickwit index: {} for connector ID: {}. status: {status}, reason: {text}",
                 self.index_id, self.id
             );
-            Err(Error::PermanentHttpError(format!("status: {status}, reason: {text}")))
+            Err(Error::PermanentHttpError(format!(
+                "status: {status}, reason: {text}"
+            )))
         } else {
             let text = response.text().await.unwrap_or_default();
             error!(
@@ -224,7 +234,11 @@ impl Sink for QuickwitSink {
             DEFAULT_OPEN_RETRY_MAX_DELAY,
         );
 
-        let raw_client = reqwest::Client::new();
+        let request_timeout = parse_duration(self.config.request_timeout.as_deref(), "30s");
+        let raw_client = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| Error::InitError(format!("reqwest client: {e}")))?;
         let health_url = Url::parse(&format!("{}/health/livez", self.config.url))
             .map_err(|e| Error::InvalidConfigValue(format!("url: {e}")))?;
 
@@ -323,6 +337,7 @@ mod tests {
             max_retry_delay: None,
             max_open_retries: None,
             open_retry_max_delay: None,
+            request_timeout: None,
         }
     }
 
