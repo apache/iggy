@@ -456,7 +456,8 @@ pub async fn send_prepare_ok<B, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Consensus, LocalPipeline};
+    use crate::{Consensus, LocalPipeline, VsrAction};
+    use iggy_binary_protocol::StartViewChangeHeader;
     use message_bus::SendError;
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
@@ -534,6 +535,114 @@ mod tests {
 
         let current = prepare_with_view(2);
         assert!(replicate_preflight(&consensus, current.header()).is_ok());
+    }
+
+    // Regression: DVC must carry commit_max not commit_min - see
+    // `handle_start_view_change`.
+    #[test]
+    fn do_view_change_carries_commit_max_not_commit_min() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // Diverge the frontiers: applied (commit_min=5) lags known-committed
+        // (commit_max=13) by more than PIPELINE_PREPARE_QUEUE_MAX (8). op is at
+        // 13 (>= commit_max), so the op clamp on the DVC commit is a no-op here
+        // and the carried value is commit_max. The clamp itself is covered by
+        // `do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op`.
+        consensus.advance_commit_max(13);
+        consensus.sequencer().set_sequence(13);
+        for op in 1..=5 {
+            consensus.advance_commit_min(op);
+        }
+        assert_eq!(consensus.commit_min(), 5);
+        assert_eq!(consensus.commit_max(), 13);
+
+        // An SVC for a higher view from another replica moves this node into the
+        // view change; with f = 1 SVC excluding self, it emits its own DVC.
+        let svc =
+            Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, new: &mut StartViewChangeHeader| {
+                    new.command = Command2::StartViewChange;
+                    new.view = 1;
+                    new.replica = 0;
+                    new.namespace = 0;
+                });
+        let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
+
+        let dvc_commit = actions.iter().find_map(|action| match action {
+            VsrAction::SendDoViewChange { commit, .. } => Some(*commit),
+            _ => None,
+        });
+        assert_eq!(
+            dvc_commit,
+            Some(13),
+            "DVC must carry commit_max (13), not commit_min (5)"
+        );
+    }
+
+    // Regression: a backup that learned commit_max from a heartbeat before
+    // receiving the prepares has commit_max > op. The DVC must clamp commit to
+    // op so `DoViewChangeHeader::validate` (commit <= op) does not drop it;
+    // dropping a quorum DVC stalls the view change.
+    #[test]
+    fn do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op() {
+        use iggy_binary_protocol::{ConsensusHeader, DoViewChangeHeader};
+
+        let consensus = VsrConsensus::new(1, 1, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // Behind backup: op = 4, but commit_max = 5 (a heartbeat raised the
+        // commit point ahead of the prepares this replica holds).
+        consensus.sequencer().set_sequence(4);
+        consensus.advance_commit_max(5);
+        assert_eq!(consensus.commit_max(), 5);
+
+        let svc =
+            Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, new: &mut StartViewChangeHeader| {
+                    new.command = Command2::StartViewChange;
+                    new.view = 1;
+                    new.replica = 0;
+                    new.namespace = 0;
+                });
+        let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
+
+        let (dvc_op, dvc_commit) = actions
+            .iter()
+            .find_map(|action| match action {
+                VsrAction::SendDoViewChange { op, commit, .. } => Some((*op, *commit)),
+                _ => None,
+            })
+            .expect("a DoViewChange must be emitted");
+        assert_eq!(dvc_op, 4);
+        assert_eq!(
+            dvc_commit, 4,
+            "commit must be clamped to op (4), not commit_max (5)"
+        );
+
+        // The clamped value passes the wire validate gate; the unclamped
+        // commit_max (5) would be rejected and the DVC dropped.
+        let header = |commit: u64| DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 1,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            op: dvc_op,
+            commit,
+            namespace: 0,
+            log_view: 0,
+            reserved: [0; 100],
+        };
+        assert!(header(dvc_commit).validate().is_ok());
+        assert!(
+            header(5).validate().is_err(),
+            "commit > op must be rejected by the wire gate"
+        );
     }
 
     #[test]

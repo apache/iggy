@@ -27,8 +27,8 @@ pub use config::CoordinatorConfig;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer, VsrAction,
-    VsrConsensus,
+    Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer,
+    VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -1168,6 +1168,23 @@ where
                 let routing = (prepare.header().operation, prepare.header().namespace);
                 if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
                     self.on_replicate(prepare).await;
+                    // A follower learns the cluster commit point from the
+                    // commit_max piggybacked on each prepare; the Commit
+                    // heartbeat carries commit_min and stops advancing
+                    // commit_max once the piggyback has raced ahead, so
+                    // on_commit alone never drains a follower's journal. Drive
+                    // it here off the prepare, as the metadata plane does inside
+                    // its own on_replicate.
+                    if routing.0.is_partition() {
+                        let planes = self.plane.inner();
+                        let config = planes.1.0.config();
+                        let namespace = IggyNamespace::from_raw(routing.1);
+                        if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
+                            && partition.consensus().is_follower()
+                        {
+                            partition.commit_journal(config).await;
+                        }
+                    }
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1517,7 +1534,7 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
+        let config = planes.1.0.config();
         let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
         for namespace in namespaces {
             let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
@@ -1535,7 +1552,7 @@ where
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
             {
-                partition.commit_journal(&config).await;
+                partition.commit_journal(config).await;
             }
             return;
         }
@@ -1625,7 +1642,7 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
+        let config = planes.1.0.config();
         let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
         for namespace in namespaces {
             let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
@@ -1637,7 +1654,7 @@ where
             }
 
             if consensus.handle_commit(&header) {
-                partition.commit_journal(&config).await;
+                partition.commit_journal(config).await;
             }
             return;
         }
@@ -1672,9 +1689,7 @@ where
             };
 
             let consensus = partition.consensus();
-            let current_op = consensus.sequencer().current_sequence();
-            let current_commit = consensus.commit_min();
-            let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+            let actions = consensus.tick(PlaneKind::Partitions);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             dispatch_partition_journal_actions(consensus, partition, &actions).await;
         }
@@ -1696,9 +1711,7 @@ where
             return;
         };
 
-        let current_op = consensus.sequencer().current_sequence();
-        let current_commit = consensus.commit_min();
-        let actions = consensus.tick(PlaneKind::Metadata, current_op, current_commit);
+        let actions = consensus.tick(PlaneKind::Metadata);
 
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
     }
