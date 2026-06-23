@@ -36,6 +36,7 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
+http = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 reqwest = { workspace = true }
 opentelemetry-proto = { workspace = true, features = [

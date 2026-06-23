@@ -16,7 +16,9 @@
 // under the License.
 
 use async_trait::async_trait;
+use bytes::{Buf, BufMut, Bytes};
 use flate2::{Compression, write::GzEncoder};
+use http::uri::PathAndQuery;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
     owned_value_to_serde_json, sink_connector,
@@ -36,6 +38,8 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tonic::client::Grpc as TonicGrpc;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codec::CompressionEncoding;
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::Channel;
@@ -141,6 +145,8 @@ pub struct OtlpSink {
     id: u32,
     config: OtlpSinkConfig,
     client: Option<Client>,
+    // Retained for proto-mode raw passthrough: one Channel shared with typed client.
+    raw_channel: Option<Channel>,
     // Pre-parsed metadata entries derived from config.headers at open() time (gRPC only).
     metadata: Vec<(
         MetadataKey<tonic::metadata::Ascii>,
@@ -155,6 +161,7 @@ impl OtlpSink {
             id,
             config,
             client: None,
+            raw_channel: None,
             metadata: Vec::new(),
             counters: Arc::new(Counters::default()),
         }
@@ -204,6 +211,8 @@ impl Sink for OtlpSink {
                     .connect()
                     .await
                     .map_err(|e| Error::InitError(format!("OTLP endpoint: {e}")))?;
+
+                self.raw_channel = Some(channel.clone());
 
                 Client::Grpc(match self.config.signal {
                     OtlpSignal::Traces => {
@@ -273,6 +282,7 @@ impl Sink for OtlpSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         let _ = self.client.take();
+        let _ = self.raw_channel.take();
         info!(
             "Closed OTLP sink connector ID: {}. Counters: messages_sent={}, batches_sent={}, batches_failed={}",
             self.id,
@@ -298,12 +308,20 @@ impl OtlpSink {
 
         match client {
             Client::Grpc(grpc) => {
-                self.export_grpc(grpc, messages_metadata, messages, total)
-                    .await
+                if matches!(self.config.format, StorageFormat::Proto) {
+                    self.export_grpc_raw_proto(messages, total).await
+                } else {
+                    self.export_grpc(grpc, messages_metadata, messages, total)
+                        .await
+                }
             }
             Client::Http(http) => {
-                self.export_http(http, messages_metadata, messages, total)
-                    .await
+                if matches!(self.config.format, StorageFormat::Proto) {
+                    self.export_http_raw_proto(http, messages, total).await
+                } else {
+                    self.export_http(http, messages_metadata, messages, total)
+                        .await
+                }
             }
         }
     }
@@ -461,6 +479,137 @@ impl OtlpSink {
         );
         Ok(total as u64)
     }
+
+    async fn export_grpc_raw_proto(
+        &self,
+        messages: &[ConsumedMessage],
+        total: usize,
+    ) -> Result<u64, Error> {
+        let channel = self
+            .raw_channel
+            .as_ref()
+            .ok_or_else(|| Error::InitError("raw gRPC channel not initialized".into()))?;
+
+        let path = match &self.config.signal {
+            OtlpSignal::Traces => PathAndQuery::from_static(
+                "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+            ),
+            OtlpSignal::Metrics => PathAndQuery::from_static(
+                "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            ),
+            OtlpSignal::Logs => PathAndQuery::from_static(
+                "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            ),
+        };
+
+        let mut grpc_client = TonicGrpc::new(channel.clone());
+        let mut sent = 0u64;
+
+        for msg in messages {
+            let raw = match &msg.payload {
+                Payload::Raw(bytes) => bytes,
+                _ => {
+                    warn!(
+                        "OTLP sink connector ID: {} (proto mode): expected raw payload",
+                        self.id
+                    );
+                    continue;
+                }
+            };
+            let mut request = tonic::Request::new(Bytes::copy_from_slice(raw));
+            for (k, v) in &self.metadata {
+                request.metadata_mut().insert(k.clone(), v.clone());
+            }
+            grpc_client
+                .unary(request, path.clone(), RawCodec)
+                .await
+                .map_err(|e| Error::CannotStoreData(format!("OTLP raw gRPC export: {e}")))?;
+            sent += 1;
+        }
+
+        debug!(
+            "OTLP sink connector ID: {} raw proto gRPC exported {sent}/{total} messages",
+            self.id
+        );
+        Ok(sent)
+    }
+
+    async fn export_http_raw_proto(
+        &self,
+        client: &reqwest::Client,
+        messages: &[ConsumedMessage],
+        total: usize,
+    ) -> Result<u64, Error> {
+        let url_path = match &self.config.signal {
+            OtlpSignal::Traces => "/v1/traces",
+            OtlpSignal::Metrics => "/v1/metrics",
+            OtlpSignal::Logs => "/v1/logs",
+        };
+        let base = self.config.endpoint.trim_end_matches('/');
+        let url = format!("{base}{url_path}");
+        let mut sent = 0u64;
+
+        for msg in messages {
+            let raw = match &msg.payload {
+                Payload::Raw(bytes) => bytes,
+                _ => {
+                    warn!(
+                        "OTLP sink connector ID: {} (proto mode): expected raw payload",
+                        self.id
+                    );
+                    continue;
+                }
+            };
+
+            let body = if self.config.compression {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                enc.write_all(raw)
+                    .map_err(|e| Error::HttpRequestFailed(format!("gzip encode: {e}")))?;
+                enc.finish()
+                    .map_err(|e| Error::HttpRequestFailed(format!("gzip finish: {e}")))?
+            } else {
+                raw.to_vec()
+            };
+
+            let mut builder = client
+                .post(&url)
+                .header("Content-Type", "application/x-protobuf");
+            if self.config.compression {
+                builder = builder.header("Content-Encoding", "gzip");
+            }
+            for (k, v) in &self.config.headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+
+            let resp = builder
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| Error::HttpRequestFailed(format!("OTLP HTTP {url_path}: {e}")))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                if status.is_client_error() {
+                    let id = self.id;
+                    warn!(
+                        "OTLP sink connector ID: {id} HTTP {url_path} returned {status}: {body_text}"
+                    );
+                } else {
+                    return Err(Error::HttpRequestFailed(format!(
+                        "OTLP HTTP {url_path} returned {status}: {body_text}"
+                    )));
+                }
+            }
+            sent += 1;
+        }
+
+        debug!(
+            "OTLP sink connector ID: {} HTTP {url_path} raw proto exported {sent}/{total} messages",
+            self.id
+        );
+        Ok(sent)
+    }
 }
 
 fn build_trace_request(
@@ -570,6 +719,48 @@ fn collect_json_values(
         }
     }
     out
+}
+
+// Passthrough codec: encodes raw Bytes as-is into the gRPC frame, ignores the
+// response body (OTLP Export responses carry no payload, only trailers).
+#[derive(Default)]
+struct RawCodec;
+struct RawEncoder;
+struct RawDecoder;
+
+impl Encoder for RawEncoder {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn encode(&mut self, item: Bytes, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        dst.put(item);
+        Ok(())
+    }
+}
+
+impl Decoder for RawDecoder {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Self::Error> {
+        let len = src.remaining();
+        Ok(Some(src.copy_to_bytes(len)))
+    }
+}
+
+impl Codec for RawCodec {
+    type Encode = Bytes;
+    type Decode = Bytes;
+    type Encoder = RawEncoder;
+    type Decoder = RawDecoder;
+
+    fn encoder(&mut self) -> RawEncoder {
+        RawEncoder
+    }
+
+    fn decoder(&mut self) -> RawDecoder {
+        RawDecoder
+    }
 }
 
 #[cfg(test)]
