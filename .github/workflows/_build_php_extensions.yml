@@ -103,12 +103,12 @@ jobs:
             runner: ubuntu-latest
             image: php:8.4-cli-bookworm
           - php: "8.3"
-            arch: aarch64
+            arch: arm64
             libc: glibc
             runner: ubuntu-24.04-arm
             image: php:8.3-cli-bookworm
           - php: "8.4"
-            arch: aarch64
+            arch: arm64
             libc: glibc
             runner: ubuntu-24.04-arm
             image: php:8.4-cli-bookworm
@@ -123,12 +123,12 @@ jobs:
             runner: ubuntu-latest
             image: php:8.4-cli-alpine
           - php: "8.3"
-            arch: aarch64
+            arch: arm64
             libc: musl
             runner: ubuntu-24.04-arm
             image: php:8.3-cli-alpine
           - php: "8.4"
-            arch: aarch64
+            arch: arm64
             libc: musl
             runner: ubuntu-24.04-arm
             image: php:8.4-cli-alpine
@@ -156,53 +156,28 @@ jobs:
           name: php-license-binary
           path: foreign/php
 
-      - name: Setup yq
-        run: |
-          if command -v yq >/dev/null 2>&1; then
-            yq --version
-            exit 0
-          fi
+      - name: Setup PHP release tools
+        id: release
+        uses: ./.github/actions/php/setup-release-tools
+        with:
+          version: ${{ inputs.version }}
 
-          YQ_VERSION="v4.47.1"
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
-            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
-            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
-            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
-            *)
-              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
-              exit 1
-              ;;
-          esac
-
-          yq_tmp="$(mktemp -d)"
-          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
-          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
-          else
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
-          fi
-
-          mkdir -p "${RUNNER_TEMP}/yq-bin"
-          chmod +x "${yq_tmp}/${YQ_BINARY}"
-          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
-          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
-
-      - name: Resolve version
-        id: ver
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            version="${{ inputs.version }}"
-          else
-            chmod +x scripts/extract-version.sh
-            version="$(scripts/extract-version.sh sdk-php)"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Cache Linux PHP cargo state
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/php-cargo-home/registry
+            target/php-cargo-home/git
+            target/php-rustup-home
+          key: php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-php${{ matrix.php }}-${{ hashFiles('Cargo.lock', 'foreign/php/Cargo.toml') }}
+          restore-keys: |
+            php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-php${{ matrix.php }}-
+            php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-
+            php-release-linux-${{ matrix.arch }}-
 
       - name: Build and package PHP extension
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ steps.release.outputs.version }}
           PHP_VERSION: ${{ matrix.php }}
           PHP_ARCH: ${{ matrix.arch }}
           PHP_LIBC: ${{ matrix.libc }}
@@ -214,7 +189,9 @@ jobs:
 
           docker run --rm \
             -e CARGO_TERM_COLOR=always \
-            -e CARGO_TARGET_DIR=/workspace/target/php-release-${PHP_VERSION}-${PHP_ARCH}-${PHP_LIBC} \
+            -e CARGO_HOME=/workspace/target/php-cargo-home \
+            -e RUSTUP_HOME=/workspace/target/php-rustup-home \
+            -e "CARGO_TARGET_DIR=/workspace/target/php-release-${PHP_VERSION}-${PHP_ARCH}-${PHP_LIBC}" \
             -e VERSION="${VERSION}" \
             -e PHP_VERSION="${PHP_VERSION}" \
             -e PHP_ARCH="${PHP_ARCH}" \
@@ -256,9 +233,12 @@ jobs:
                   zip
               fi
 
-              curl -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-              sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
-              . "$HOME/.cargo/env"
+              mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+              if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+                curl -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+                sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
+              fi
+              . "$CARGO_HOME/env"
               rustup show
 
               php --version
@@ -307,10 +287,10 @@ jobs:
             arch: x86_64
             runner: macos-15-intel
           - php: "8.3"
-            arch: aarch64
+            arch: arm64
             runner: macos-15
           - php: "8.4"
-            arch: aarch64
+            arch: arm64
             runner: macos-15
     steps:
       - name: Download latest copy script from master
@@ -348,53 +328,15 @@ jobs:
           name: php-license-binary
           path: foreign/php
 
-      - name: Setup yq
-        run: |
-          if command -v yq >/dev/null 2>&1; then
-            yq --version
-            exit 0
-          fi
-
-          YQ_VERSION="v4.47.1"
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
-            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
-            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
-            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
-            *)
-              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
-              exit 1
-              ;;
-          esac
-
-          yq_tmp="$(mktemp -d)"
-          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
-          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
-          else
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
-          fi
-
-          mkdir -p "${RUNNER_TEMP}/yq-bin"
-          chmod +x "${yq_tmp}/${YQ_BINARY}"
-          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
-          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
-
-      - name: Resolve version
-        id: ver
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            version="${{ inputs.version }}"
-          else
-            chmod +x scripts/extract-version.sh
-            version="$(scripts/extract-version.sh sdk-php)"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Setup PHP release tools
+        id: release
+        uses: ./.github/actions/php/setup-release-tools
+        with:
+          version: ${{ inputs.version }}
 
       - name: Build and package PHP extension
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ steps.release.outputs.version }}
           PHP_VERSION: ${{ matrix.php }}
           PHP_ARCH: ${{ matrix.arch }}
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/php-release-${{ matrix.php }}-${{ matrix.arch }}-macos
@@ -418,7 +360,7 @@ jobs:
           cp foreign/php/NOTICE "$package_dir/NOTICE"
           cp foreign/php/LICENSE-binary "$package_dir/LICENSE-binary"
 
-          archive="php_iggy_php-${VERSION}_php${PHP_VERSION}-${PHP_ARCH}-macos-bsdlibc-nts.zip"
+          archive="php_iggy_php-${VERSION}_php${PHP_VERSION}-${PHP_ARCH}-darwin-bsdlibc-nts.zip"
           (cd "$package_dir" && zip -9 "${{ github.workspace }}/foreign/php/dist/${archive}" iggy_php.so LICENSE NOTICE LICENSE-binary)
           rm -rf "$package_dir"
 
@@ -453,61 +395,23 @@ jobs:
           /tmp/copy-latest-from-master.sh save .github scripts
           /tmp/copy-latest-from-master.sh apply
 
-      - name: Setup yq
-        run: |
-          if command -v yq >/dev/null 2>&1; then
-            yq --version
-            exit 0
-          fi
-
-          YQ_VERSION="v4.47.1"
-          case "$(uname -s)-$(uname -m)" in
-            Linux-x86_64)  YQ_BINARY="yq_linux_amd64" ;;
-            Linux-aarch64) YQ_BINARY="yq_linux_arm64" ;;
-            Darwin-x86_64) YQ_BINARY="yq_darwin_amd64" ;;
-            Darwin-arm64)  YQ_BINARY="yq_darwin_arm64" ;;
-            *)
-              echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
-              exit 1
-              ;;
-          esac
-
-          yq_tmp="$(mktemp -d)"
-          curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
-          curl -sSL -o "${yq_tmp}/checksums" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/checksums"
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | sha256sum -c -)
-          else
-            (cd "$yq_tmp" && grep " ${YQ_BINARY}$" checksums | shasum -a 256 -c -)
-          fi
-
-          mkdir -p "${RUNNER_TEMP}/yq-bin"
-          chmod +x "${yq_tmp}/${YQ_BINARY}"
-          mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
-          echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
-
-      - name: Resolve version
-        id: ver
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            version="${{ inputs.version }}"
-          else
-            chmod +x scripts/extract-version.sh
-            version="$(scripts/extract-version.sh sdk-php)"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Setup PHP release tools
+        id: release
+        uses: ./.github/actions/php/setup-release-tools
+        with:
+          version: ${{ inputs.version }}
 
       - name: Build source archive
         run: |
           set -euo pipefail
 
-          version="${{ steps.ver.outputs.version }}"
+          version="${{ steps.release.outputs.version }}"
           mkdir -p foreign/php/dist
           git archive \
             --format=tar.gz \
             --prefix="apache-iggy-php-${version}/" \
             --output="foreign/php/dist/apache-iggy-php-${version}-source.tar.gz" \
-            HEAD
+            HEAD:foreign/php
 
           ls -lh foreign/php/dist
 

@@ -1,0 +1,100 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: php-setup-release-tools
+description: Install release helpers and resolve the PHP SDK version
+
+inputs:
+  version:
+    description: "Explicit PHP SDK version. When empty, the version is read from publish config."
+    required: false
+    default: ""
+
+outputs:
+  version:
+    description: "Resolved PHP SDK version"
+    value: ${{ steps.version.outputs.version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup yq
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if command -v yq >/dev/null 2>&1; then
+          yq --version
+          exit 0
+        fi
+
+        YQ_VERSION="v4.47.1"
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64)
+            YQ_BINARY="yq_linux_amd64"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            ;;
+          Linux-aarch64)
+            YQ_BINARY="yq_linux_arm64"
+            YQ_CHECKSUM="b7f7c991abe262b0c6f96bbcb362f8b35429cefd59c8b4c2daa4811f1e9df599"
+            ;;
+          Darwin-x86_64)
+            YQ_BINARY="yq_darwin_amd64"
+            YQ_CHECKSUM="a9b5ca36f7750576c6ace3cc7193349cd676b3a6bf30193fb2773ff45f5af5c2"
+            ;;
+          Darwin-arm64)
+            YQ_BINARY="yq_darwin_arm64"
+            YQ_CHECKSUM="99aae3a7c9ddfe76bb339f0e7acd8224324b6527436fb6a5d890079bf5fcc590"
+            ;;
+          *)
+            echo "Unsupported yq platform: $(uname -s)-$(uname -m)"
+            exit 1
+            ;;
+        esac
+
+        yq_tmp="$(mktemp -d)"
+        trap 'rm -rf "$yq_tmp"' EXIT
+        curl -sSL -o "${yq_tmp}/${YQ_BINARY}" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}"
+        if command -v sha256sum >/dev/null 2>&1; then
+          echo "${YQ_CHECKSUM}  ${yq_tmp}/${YQ_BINARY}" | sha256sum -c -
+        else
+          echo "${YQ_CHECKSUM}  ${yq_tmp}/${YQ_BINARY}" | shasum -a 256 -c -
+        fi
+
+        mkdir -p "${RUNNER_TEMP}/yq-bin"
+        chmod +x "${yq_tmp}/${YQ_BINARY}"
+        mv "${yq_tmp}/${YQ_BINARY}" "${RUNNER_TEMP}/yq-bin/yq"
+        echo "${RUNNER_TEMP}/yq-bin" >> "$GITHUB_PATH"
+
+    - name: Resolve version
+      id: version
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -d "${RUNNER_TEMP}/yq-bin" ]; then
+          export PATH="${RUNNER_TEMP}/yq-bin:${PATH}"
+        fi
+
+        if [ -n "${{ inputs.version }}" ]; then
+          version="${{ inputs.version }}"
+        else
+          chmod +x scripts/extract-version.sh
+          version="$(scripts/extract-version.sh sdk-php)"
+        fi
+
+        echo "version=${version}" >> "$GITHUB_OUTPUT"

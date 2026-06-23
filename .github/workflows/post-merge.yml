@@ -16,8 +16,8 @@
 # under the License.
 
 # Auto-publish: detects pre-release crate/SDK versions without tags
-# and publishes them to crates.io, Docker Hub, PyPI, Packagist, npm, Maven,
-# NuGet.
+# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet,
+# and GitHub Releases.
 # Runs on every push to master.
 
 name: Post-merge

@@ -260,8 +260,8 @@ handle_check() {
 
     echo ""
 
-    # --- Check 3: PHP dual-file sync ---
-    echo "=== PHP dual-file sync ==="
+    # --- Check 3: PHP Composer metadata ---
+    echo "=== PHP Composer metadata ==="
     local php_script="$SCRIPT_DIR/ci/php-sdk-version-sync.sh"
     if [[ -x "$php_script" ]]; then
         if "$php_script" --check; then

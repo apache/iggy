@@ -53,7 +53,7 @@ Components:
   connectors-all       runtime + all sink + all source crates
   --all                All components (Rust + connectors + SDKs + web-ui)
   sdk-python           foreign/python/Cargo.toml + foreign/python/pyproject.toml
-  sdk-php              foreign/php/Cargo.toml + foreign/php/composer.json
+  sdk-php              foreign/php/Cargo.toml
   sdk-node             foreign/node/package.json
   sdk-go               foreign/go/contracts/version.go
   sdk-csharp           foreign/csharp/Iggy_SDK/Iggy_SDK.csproj
@@ -95,7 +95,7 @@ SDK_COMPONENTS="sdk-python sdk-php sdk-node sdk-go sdk-csharp sdk-java"
 ALL_COMPONENTS="${RUST_COMPONENTS} ${CONNECTOR_COMPONENTS} ${SDK_COMPONENTS} web-ui"
 
 # Returns "file:format" lines per component.
-# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, php-cargo, composer, json, csproj, gradle, go
+# Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, php-cargo, json, csproj, gradle, go
 get_version_files() {
     local component="$1"
     case "$component" in
@@ -155,7 +155,6 @@ get_version_files() {
             ;;
         sdk-php)
             echo "foreign/php/Cargo.toml:php-cargo"
-            echo "foreign/php/composer.json:composer"
             ;;
         sdk-node)
             echo "foreign/node/package.json:json"
@@ -250,7 +249,7 @@ translate_version() {
     read -r base pre_type pre_num <<< "$parsed"
 
     case "$format" in
-        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go)
+        cargo|cargo-ws-dep:*|cargo-dep:*|php-cargo|json|csproj|go)
             echo "$canonical" ;;
         python-cargo)
             case "$pre_type" in
@@ -260,11 +259,6 @@ translate_version() {
         pyproject)
             case "$pre_type" in
                 edge)   echo "${base}.dev${pre_num}" ;;
-                stable) echo "$base" ;;
-            esac ;;
-        php-cargo|composer)
-            case "$pre_type" in
-                edge)   echo "${base}-dev${pre_num}" ;;
                 stable) echo "$base" ;;
             esac ;;
         gradle)
@@ -282,7 +276,7 @@ translate_version() {
 canonicalize_version() {
     local raw="$1" format="$2"
     case "$format" in
-        cargo|cargo-ws-dep:*|cargo-dep:*|json|csproj|go)
+        cargo|cargo-ws-dep:*|cargo-dep:*|php-cargo|json|csproj|go)
             echo "$raw" ;;
         python-cargo)
             # Handle both old (0.7.2-dev.1) and new (0.7.2-dev1) formats
@@ -294,12 +288,6 @@ canonicalize_version() {
         pyproject)
             # Handle both old (0.7.2.dev.1) and new (0.7.2.dev1) formats
             if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev\.?([0-9]+)$ ]]; then
-                echo "${BASH_REMATCH[1]}-edge.${BASH_REMATCH[2]}"
-            else
-                echo "$raw"
-            fi ;;
-        php-cargo|composer)
-            if [[ "$raw" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-dev\.?([0-9]+)$ ]]; then
                 echo "${BASH_REMATCH[1]}-edge.${BASH_REMATCH[2]}"
             else
                 echo "$raw"

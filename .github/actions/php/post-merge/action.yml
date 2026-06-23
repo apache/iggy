@@ -16,7 +16,7 @@
 # under the License.
 
 name: php-post-merge
-description: PHP post-merge Packagist publishing with pre-built PIE extension archives
+description: PHP post-merge GitHub release publishing with pre-built PIE extension archives
 
 inputs:
   version:
@@ -32,10 +32,6 @@ inputs:
     description: "Dry run mode"
     required: false
     default: "false"
-  packagist_token:
-    description: "Packagist bearer credential in USERNAME:apiToken format"
-    required: false
-    default: ""
   packages_artifact:
     description: "Name of the artifact containing PHP extension archives"
     required: false
@@ -82,16 +78,16 @@ runs:
         expected=(
           "php_iggy_php-${VERSION}_php8.3-x86_64-linux-glibc-nts.zip"
           "php_iggy_php-${VERSION}_php8.4-x86_64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-aarch64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-aarch64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-arm64-linux-glibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-arm64-linux-glibc-nts.zip"
           "php_iggy_php-${VERSION}_php8.3-x86_64-linux-musl-nts.zip"
           "php_iggy_php-${VERSION}_php8.4-x86_64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-aarch64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-aarch64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-x86_64-macos-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-x86_64-macos-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-aarch64-macos-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-aarch64-macos-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-arm64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-arm64-linux-musl-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-x86_64-darwin-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-x86_64-darwin-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.3-arm64-darwin-bsdlibc-nts.zip"
+          "php_iggy_php-${VERSION}_php8.4-arm64-darwin-bsdlibc-nts.zip"
           "apache-iggy-php-${VERSION}-source.tar.gz"
         )
 
@@ -110,10 +106,13 @@ runs:
         for archive in "$PACKAGES_PATH"/*.zip; do
           filename="$(basename "$archive")"
           echo "  - $filename"
-          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'iggy_php.so'
-          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'LICENSE'
-          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'NOTICE'
-          unzip -l "$archive" | awk '{ print $4 }' | grep -qx 'LICENSE-binary'
+          members="$(unzip -Z1 "$archive")"
+          for member in iggy_php.so LICENSE NOTICE LICENSE-binary; do
+            if ! grep -qx "$member" <<< "$members"; then
+              echo "Archive $filename is missing $member"
+              exit 1
+            fi
+          done
         done
 
         echo ""
@@ -136,12 +135,12 @@ runs:
         echo "Package: apache/iggy-php"
         echo "Version: $VERSION"
         echo "Tag: $TAG"
-        echo "Registry: https://packagist.org/packages/apache/iggy-php"
+        echo "Registry: GitHub Releases"
         echo ""
         echo "Release assets that would be uploaded:"
         find "$PACKAGES_PATH" -maxdepth 1 -type f -print | sort | sed 's|.*/|  - |'
         echo ""
-        echo "Packagist would be asked to refresh https://github.com/apache/iggy"
+        echo "Packagist publishing requires a split repository with composer.json at the repository root."
       shell: bash
 
     - name: Publish GitHub release assets
@@ -160,11 +159,12 @@ runs:
         fi
         if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
           echo "PHP release tag $TAG does not exist on origin"
-          echo "Create the annotated PHP SDK tag before publishing GitHub release assets or refreshing Packagist."
+          echo "Create the annotated PHP SDK tag before publishing GitHub release assets."
           exit 1
         fi
 
         release_notes="$(mktemp)"
+        trap 'rm -f "$release_notes"' EXIT
         {
           echo "Apache Iggy PHP SDK ${VERSION}"
           echo ""
@@ -173,7 +173,7 @@ runs:
         } > "$release_notes"
 
         prerelease_flag=()
-        if [[ "$VERSION" == *-* ]]; then
+        if [ "$(scripts/extract-version.sh sdk-php --is-pre-release)" = "true" ]; then
           prerelease_flag=(--prerelease)
         fi
 
@@ -191,41 +191,3 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
-
-    - name: Trigger Packagist update
-      if: inputs.dry_run == 'false'
-      run: |
-        set -euo pipefail
-
-        if [ -z "${PACKAGIST_TOKEN:-}" ]; then
-          echo "PACKAGIST_TOKEN is not set"
-          exit 1
-        fi
-
-        if [[ "$PACKAGIST_TOKEN" != *:* ]]; then
-          echo "PACKAGIST_TOKEN must use Packagist bearer credentials in USERNAME:apiToken format"
-          exit 1
-        fi
-
-        response="$(mktemp)"
-        http_code="$(curl -sSL \
-          -o "$response" \
-          -w '%{http_code}' \
-          -X POST \
-          -H 'Content-Type: application/json' \
-          -H "Authorization: Bearer ${PACKAGIST_TOKEN}" \
-          'https://packagist.org/api/update-package' \
-          -d '{"repository":"https://github.com/apache/iggy"}')"
-
-        if [ "$http_code" != "200" ]; then
-          echo "Packagist update failed with HTTP $http_code"
-          cat "$response"
-          exit 1
-        fi
-
-        cat "$response"
-        echo ""
-        echo "Packagist update requested for apache/iggy-php"
-      shell: bash
-      env:
-        PACKAGIST_TOKEN: ${{ inputs.packagist_token }}

@@ -109,8 +109,6 @@ on:
         required: false
       NUGET_API_KEY:
         required: false
-      PACKAGIST_TOKEN:
-        required: false
 
 env:
   IGGY_CI_BUILD: true
@@ -121,7 +119,7 @@ permissions:
   id-token: write
 
 # Static group so two concurrent release dispatches cannot race the
-# crates.io / Maven Central / npm / NuGet / DockerHub / PyPI / Packagist uploads.
+# crates.io / Maven Central / npm / NuGet / DockerHub / PyPI / GitHub release uploads.
 # `run_id` in the group was effectively a no-op because it is unique
 # per dispatch. `cancel-in-progress: false` keeps any in-flight upload
 # running to completion rather than leaving partial state in registries.
@@ -262,6 +260,7 @@ jobs:
       targets: ${{ steps.mk.outputs.targets }}
       non_rust_targets: ${{ steps.mk.outputs.non_rust_targets }}
       non_docker_targets: ${{ steps.mk.outputs.non_docker_targets }}
+      php_targets: ${{ steps.mk.outputs.php_targets }}
       docker_matrix: ${{ steps.mk.outputs.docker_matrix }}
       docker_components: ${{ steps.mk.outputs.docker_components }}
       count: ${{ steps.mk.outputs.count }}
@@ -341,7 +340,7 @@ jobs:
               dockerhub: 'docker',
               crates: 'rust',
               pypi: 'python',
-              packagist: 'php',
+              'github-release': 'php',
               npm: 'node',
               maven: 'java',
               nuget: 'csharp',
@@ -388,11 +387,13 @@ jobs:
             // Separate Docker targets from other non-Rust targets
             const dockerTargets = nonRustTargets.filter(t => t.type === 'docker');
             const nonDockerTargets = nonRustTargets.filter(t => t.type !== 'docker');
+            const phpTargets = nonDockerTargets.filter(t => t.type === 'php');
+            const otherSdkTargets = nonDockerTargets.filter(t => t.type !== 'php');
 
             console.log(`Publishing ${targets.length} components:`);
             targets.forEach(t => console.log(`  - ${t.name} (${t.type}) -> ${t.registry || 'N/A'}`));
             console.log(`  (${nonRustTargets.length} non-Rust, ${targets.length - nonRustTargets.length} Rust crates)`);
-            console.log(`  (${dockerTargets.length} Docker, ${nonDockerTargets.length} other SDKs)`);
+            console.log(`  (${dockerTargets.length} Docker, ${otherSdkTargets.length} other SDKs, ${phpTargets.length} PHP SDK)`);
 
             // Output all targets for reference and tag creation
             core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop' }] }));
@@ -400,8 +401,10 @@ jobs:
             // Output only non-Rust targets for the parallel publish job
             core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
-            // Output non-Docker, non-Rust targets (SDKs only)
-            core.setOutput('non_docker_targets', JSON.stringify(nonDockerTargets.length ? { include: nonDockerTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+            // Output non-Docker, non-Rust, non-PHP targets. PHP needs its
+            // pre-built binary artifact, so it has a separate publish job.
+            core.setOutput('non_docker_targets', JSON.stringify(otherSdkTargets.length ? { include: otherSdkTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+            core.setOutput('php_targets', JSON.stringify(phpTargets.length ? { include: phpTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
             // Build Docker matrix: components × platforms for native runner builds
             const platforms = [
@@ -548,7 +551,7 @@ jobs:
             # Versioned git tags require manual publish (workflow_dispatch).
             REGISTRY=$(_jq '.registry')
             if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
-              if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              if [ "$(scripts/extract-version.sh "$KEY" --is-pre-release 2>/dev/null || echo false)" != "true" ]; then
                 echo "⏭️ $NAME: Stable Docker version in auto-publish mode, tag will be skipped"
                 echo "| $NAME | $VERSION | $TAG | ⏭️ Stable (manual publish only) |" >> $GITHUB_STEP_SUMMARY
                 continue
@@ -591,7 +594,7 @@ jobs:
                 echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> $GITHUB_STEP_SUMMARY
               # Fail-fast on wrong-target for MANUAL publish. A wrong-target tag
               # means create-git-tag would hard-fail 20-40 minutes later after
-              # publishing artifacts to crates.io / PyPI / Packagist / npm /
+              # publishing artifacts to crates.io / PyPI / npm /
               # Maven / NuGet / DockerHub. Catching it at check-tags converts that
               # into a fast, cheap failure at the top of the run.
               # Same-target is still benign (rerun convergence).
@@ -754,14 +757,13 @@ jobs:
   # Docker publishing on native runners (no QEMU emulation)
   publish-docker:
     name: Docker ${{ matrix.name }} (${{ matrix.arch }})
-    needs: [validate, plan, check-tags, build-python-wheels, build-php-extensions, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
-      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -1006,13 +1008,13 @@ jobs:
             fi
           else
             # Manual publish: always push the versioned manifest, plus :latest
-            # for stable (non edge/rc) releases.
+            # for stable releases.
             docker buildx imagetools create \
               -t "${IMAGE}:${VERSION}" \
               $(printf "${IMAGE}@sha256:%s " *)
             echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
 
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+            if [ "$(scripts/extract-version.sh "${{ matrix.key }}" --is-pre-release)" != "true" ]; then
               echo "Creating 'latest' manifest"
               docker buildx imagetools create \
                 -t "${IMAGE}:latest" \
@@ -1058,17 +1060,16 @@ jobs:
             Commit: ${{ needs.validate.outputs.commit }}
             Released by: GitHub Actions (workflow ${{ github.run_id }})
 
-  # Non-Docker, non-Rust publishing (Python, PHP, Node, Java, C#, Go SDKs)
+  # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
     name: ${{ matrix.name }}
-    needs: [validate, plan, check-tags, build-python-wheels, build-php-extensions, publish-rust-crates]
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
-      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
@@ -1083,7 +1084,6 @@ jobs:
       JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
       JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-      PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
       status: ${{ steps.status.outputs.status }}
@@ -1190,40 +1190,6 @@ jobs:
           wheels_path: dist
 
       # ─────────────────────────────────────────
-      # PHP SDK Publishing
-      # ─────────────────────────────────────────
-      - name: Tag PHP SDK release (${{ matrix.key }})
-        if: |
-          success() &&
-          inputs.dry_run == false &&
-          inputs.skip_tag_creation == false &&
-          matrix.type == 'php' &&
-          steps.ver.outputs.should_tag == 'true'
-        uses: ./.github/actions/utils/create-git-tag
-        with:
-          tag: ${{ steps.ver.outputs.tag }}
-          commit: ${{ needs.validate.outputs.commit }}
-          message: |
-            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
-
-            Component: ${{ matrix.key }}
-            Tag: ${{ steps.ver.outputs.tag }}
-            Commit: ${{ needs.validate.outputs.commit }}
-            Released by: GitHub Actions (workflow ${{ github.run_id }})
-
-      - name: Publish PHP SDK
-        if: matrix.type == 'php'
-        uses: ./.github/actions/php/post-merge
-        with:
-          version: ${{ steps.ver.outputs.version }}
-          tag: ${{ steps.ver.outputs.tag }}
-          commit: ${{ needs.validate.outputs.commit }}
-          dry_run: ${{ inputs.dry_run }}
-          packagist_token: ${{ env.PACKAGIST_TOKEN }}
-          packages_artifact: php-extensions-all
-          packages_path: dist
-
-      # ─────────────────────────────────────────
       # Node SDK Publishing
       # ─────────────────────────────────────────
       - name: Publish Node SDK
@@ -1297,52 +1263,6 @@ jobs:
           description: apache-iggy ${{ steps.ver.outputs.version }} on npm
           max_attempts: "15"
           initial_sleep_seconds: "3"
-
-      - name: Wait for Packagist availability
-        if: |
-          success() &&
-          inputs.dry_run == false &&
-          matrix.type == 'php' &&
-          steps.ver.outputs.should_tag == 'true'
-        uses: ./.github/actions/utils/wait-for-url
-        with:
-          url: https://repo.packagist.org/p2/apache/iggy-php.json
-          description: apache/iggy-php metadata on Packagist
-          max_attempts: "20"
-          initial_sleep_seconds: "3"
-
-      - name: Verify Packagist version
-        if: |
-          success() &&
-          inputs.dry_run == false &&
-          matrix.type == 'php' &&
-          steps.ver.outputs.should_tag == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.ver.outputs.version }}"
-
-          sleep_s=3
-          for attempt in $(seq 1 20); do
-            if curl -sSL https://repo.packagist.org/p2/apache/iggy-php.json \
-              | jq -e --arg version "$version" '.packages["apache/iggy-php"][] | select(.version == $version or .version == ("v" + $version))' >/dev/null; then
-              echo "apache/iggy-php ${version} is present in Packagist metadata"
-              exit 0
-            fi
-
-            if [ "$attempt" -eq 20 ]; then
-              break
-            fi
-            echo "Packagist metadata is available but ${version} is not listed yet (attempt ${attempt}/20, sleep ${sleep_s}s)"
-            sleep "$sleep_s"
-            sleep_s=$(( sleep_s * 2 ))
-            if [ "$sleep_s" -gt 30 ]; then
-              sleep_s=30
-            fi
-          done
-
-          echo "Timed out waiting for apache/iggy-php ${version} in Packagist metadata"
-          exit 1
 
       # Java publishes to ASF Nexus staging via `./gradlew publish`
       # (repository.apache.org/service/local/staging/deploy/maven2). The
@@ -1443,6 +1363,130 @@ jobs:
         if: always()
         run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
 
+  publish-php:
+    name: PHP SDK
+    needs: [validate, plan, check-tags, build-php-extensions]
+    if: |
+      !cancelled() &&
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_php == 'true' &&
+      fromJson(needs.plan.outputs.php_targets).include[0].key != 'noop' &&
+      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.php_targets) }}
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 1
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Extract version & tag
+        id: ver
+        shell: bash
+        env:
+          MATRIX_KEY: ${{ matrix.key }}
+          MATRIX_TAG_PATTERN: ${{ matrix.tag_pattern }}
+          CREATE_EDGE_DOCKER_TAG: ${{ inputs.create_edge_docker_tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(scripts/extract-version.sh "$MATRIX_KEY")
+          TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --tag)
+          SHOULD_TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --should-tag)
+
+          if [ "$SHOULD_TAG" = "true" ] \
+             && [ "$CREATE_EDGE_DOCKER_TAG" = "true" ] \
+             && [ "$(scripts/extract-version.sh "$MATRIX_KEY" --is-pre-release)" != "true" ]; then
+            SHOULD_TAG=false
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "should_tag=$SHOULD_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved $MATRIX_KEY -> version=$VERSION tag=$TAG should_tag=$SHOULD_TAG"
+
+      - name: Tag PHP SDK release (${{ matrix.key }})
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          inputs.skip_tag_creation == false &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          message: |
+            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
+
+            Component: ${{ matrix.key }}
+            Tag: ${{ steps.ver.outputs.tag }}
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
+
+      - name: Publish PHP SDK
+        if: |
+          success() &&
+          (
+            inputs.dry_run == true ||
+            (
+              inputs.skip_tag_creation == false &&
+              steps.ver.outputs.should_tag == 'true'
+            )
+          )
+        uses: ./.github/actions/php/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          dry_run: ${{ inputs.dry_run }}
+          packages_artifact: php-extensions-all
+          packages_path: dist
+
+      - name: Skip PHP SDK publishing without tag
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          (
+            inputs.skip_tag_creation == true ||
+            steps.ver.outputs.should_tag != 'true'
+          )
+        run: |
+          echo "PHP GitHub release publishing is skipped because it requires a taggable php-sdk version."
+
+      - name: Set status output
+        id: status
+        if: always()
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
   summary:
     name: Publish Summary
     needs:
@@ -1457,6 +1501,7 @@ jobs:
         publish-docker,
         docker-manifests,
         publish,
+        publish-php,
       ]
     if: ${{ !cancelled() && needs.validate.outputs.has_targets == 'true' }}
     runs-on: ubuntu-latest
@@ -1540,7 +1585,7 @@ jobs:
                 crates)     REGISTRY_DISPLAY="crates.io" ;;
                 dockerhub)  REGISTRY_DISPLAY="Docker Hub" ;;
                 pypi)       REGISTRY_DISPLAY="PyPI" ;;
-                packagist)  REGISTRY_DISPLAY="Packagist" ;;
+                github-release) REGISTRY_DISPLAY="GitHub Releases" ;;
                 npm)        REGISTRY_DISPLAY="npm" ;;
                 maven)      REGISTRY_DISPLAY="Maven" ;;
                 nuget)      REGISTRY_DISPLAY="NuGet" ;;
@@ -1593,6 +1638,17 @@ jobs:
                 success)   echo "✅ **PHP extension packages built successfully for all platforms**" ;;
                 failure)   echo "❌ **PHP extension package building failed**" ;;
                 skipped)   echo "⏭️ **PHP extension package building was skipped**" ;;
+              esac
+              echo
+            fi
+
+            if [ "${{ needs.plan.outputs.has_php }}" = "true" ]; then
+              echo "### PHP SDK Publishing"
+              case "${{ needs.publish-php.result }}" in
+                success)   echo "✅ **PHP SDK GitHub release assets published successfully**" ;;
+                failure)   echo "❌ **PHP SDK publishing failed - check logs for details**" ;;
+                cancelled) echo "🚫 **PHP SDK publishing was cancelled**" ;;
+                skipped)   echo "⏭️ **PHP SDK publishing was skipped**" ;;
               esac
               echo
             fi
@@ -1661,6 +1717,7 @@ jobs:
         publish-docker,
         docker-manifests,
         publish,
+        publish-php,
         summary,
       ]
     if: failure() && inputs.dry_run == false
