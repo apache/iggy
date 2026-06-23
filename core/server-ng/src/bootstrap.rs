@@ -844,6 +844,9 @@ async fn shard_main(
         drop(metrics_for_notifier);
     }
 
+    // The pump task also drives the consensus timer tick (heartbeats, prepare
+    // retransmit, view-change timeouts) as a select! arm, serialized with frame
+    // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
     let pump_handle = compio::runtime::spawn(async move {
@@ -878,39 +881,6 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Consensus timer driver: heartbeats, prepare retransmit, and
-    // view-change timeouts only advance when `VsrConsensus::tick` runs
-    // ("call this periodically, e.g. every 10ms"). The simulator steps it
-    // explicitly; production drives it here. Without this, a prepare lost
-    // to a transient replica-link blip is never retransmitted and its
-    // client request hangs until the SDK read timeout.
-    let (consensus_tick_stop_tx, consensus_tick_stop_rx) = channel::<()>(1);
-    let tick_shard = Rc::clone(&shard);
-    let consensus_tick_handle = compio::runtime::spawn(async move {
-        const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        loop {
-            if consensus_tick_stop_rx.try_recv().is_ok() {
-                break;
-            }
-            tick_shard.tick_metadata().await;
-            tick_shard.tick_partitions().await;
-            // While a cooperative revocation is pending, wake the reconciler each
-            // tick so it completes the handoff within ~one tick of the source
-            // draining the partition, instead of waiting for the 1s periodic pass.
-            if tick_shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .has_pending_revocations()
-            {
-                tick_shard.dispatch_metadata_commit_tick();
-            }
-            compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
-        }
-    });
-    bus.track_background(consensus_tick_handle);
-
     // Per-shard heartbeat verifier: evicts connections that stop pinging,
     // releasing their consumer-group membership. Gated on config so a
     // deployment without heartbeats never reaps live sessions.
@@ -928,7 +898,6 @@ async fn shard_main(
     } else {
         None
     };
-
     // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
     // group) and only when enabled. Each pass no-ops unless this node is
     // the caught-up metadata primary, so the delete is proposed once and
@@ -983,7 +952,6 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
-            let _ = consensus_tick_stop_tx.try_send(());
             if let Some(tx) = &heartbeat_stop_tx {
                 let _ = tx.try_send(());
             }
@@ -997,7 +965,6 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
-    let _ = consensus_tick_stop_tx.try_send(());
     if let Some(tx) = &heartbeat_stop_tx {
         let _ = tx.try_send(());
     }
