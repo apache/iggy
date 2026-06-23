@@ -57,7 +57,7 @@ public final class IggyBenchCommand implements Callable<Integer> {
 
     @Option(
             names = {"--warmup-time", "-w"},
-            defaultValue = "20000",
+            defaultValue = "60000",
             description = "Warmup time in milliseconds.")
     private long warmupTimeMs;
 

@@ -1351,12 +1351,6 @@ where
         prepare: Message<PrepareHeader>,
     ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
-        // Snapshot (view, commit_min) pre-subscribe. Validate it after
-        // `on_replicate` returns: another task could mutate either during the
-        // await and silently invalidate the catch-up gate, with release builds
-        // proceeding on a stale view-state.
-        let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
         // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
         // can drop the borrow. No commit-max advance flips the gate today;
@@ -1365,11 +1359,12 @@ where
             is_caught_up_primary(consensus),
             "dispatch_prepare_and_await: gate flipped between check and dispatch"
         );
+        // `on_replicate` awaits: a sibling in-process submit may commit
+        // (commit_min advances) or a view change may land (view advances) while
+        // parked here. Both are handled downstream - a view change drops the
+        // reply_sender so `receiver` resolves `Canceled`, and loopback acks are
+        // op-routed - so no post-await view/commit invariant holds or is needed.
         self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "dispatch_prepare_and_await: view/commit_min advanced across on_replicate await"
-        );
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
