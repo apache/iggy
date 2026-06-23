@@ -18,18 +18,19 @@
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose;
+use bytes::Bytes;
 use iggy_connector_sdk::convert::owned_value_to_serde_json;
 use iggy_connector_sdk::retry::{exponential_backoff, jitter, parse_duration};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
-use reqwest::{Client as HttpClient, RequestBuilder, StatusCode};
+use reqwest::{Body, Client as HttpClient, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -51,6 +52,7 @@ type SurrealDbClient = HttpClient;
 pub struct SurrealDbSink {
     id: u32,
     client: Mutex<Option<SurrealDbClient>>,
+    reconnecting: AtomicBool,
     base_url: String,
     config: SurrealDbSinkConfig,
     table: String,
@@ -107,18 +109,24 @@ enum AuthScope {
 }
 
 impl AuthScope {
-    fn from_config(value: Option<&str>) -> Self {
+    fn parse_config(value: Option<&str>) -> Result<Self, Error> {
         match value {
-            Some(value) if value.eq_ignore_ascii_case("namespace") => AuthScope::Namespace,
-            Some(value) if value.eq_ignore_ascii_case("database") => AuthScope::Database,
-            Some(value) if value.eq_ignore_ascii_case("none") => AuthScope::None,
-            Some(value) if value.eq_ignore_ascii_case("root") => AuthScope::Root,
-            Some(value) => {
-                warn!("Unknown SurrealDB auth scope '{value}', defaulting to root");
-                AuthScope::Root
-            }
-            None => AuthScope::Root,
+            Some(value) if value.eq_ignore_ascii_case("namespace") => Ok(AuthScope::Namespace),
+            Some(value) if value.eq_ignore_ascii_case("database") => Ok(AuthScope::Database),
+            Some(value) if value.eq_ignore_ascii_case("none") => Ok(AuthScope::None),
+            Some(value) if value.eq_ignore_ascii_case("root") => Ok(AuthScope::Root),
+            Some(value) => Err(Error::InvalidConfigValue(format!(
+                "SurrealDB auth_scope must be one of root, namespace, database, or none: {value}"
+            ))),
+            None => Ok(AuthScope::Root),
         }
+    }
+
+    fn from_config(value: Option<&str>) -> Self {
+        Self::parse_config(value).unwrap_or_else(|error| {
+            warn!("{error}. Defaulting to no authentication until config validation runs.");
+            AuthScope::None
+        })
     }
 }
 
@@ -156,6 +164,7 @@ struct PayloadDocument {
 #[derive(Debug)]
 struct BatchInsertOutcome {
     inserted_count: u64,
+    error_count: u64,
     error: Option<Error>,
 }
 
@@ -206,6 +215,7 @@ impl SurrealDbSink {
         SurrealDbSink {
             id,
             client: Mutex::new(None),
+            reconnecting: AtomicBool::new(false),
             base_url,
             config,
             table,
@@ -264,6 +274,9 @@ impl SurrealDbSink {
 #[async_trait]
 impl Sink for SurrealDbSink {
     async fn open(&mut self) -> Result<(), Error> {
+        self.auth_scope = AuthScope::parse_config(self.config.auth_scope.as_deref())?;
+        validate_identifier("namespace", &self.config.namespace)?;
+        validate_identifier("database", &self.config.database)?;
         validate_identifier("table", &self.table)?;
 
         info!(
@@ -338,10 +351,27 @@ impl SurrealDbSink {
     }
 
     async fn reconnect(&self) -> Result<(), Error> {
+        if self
+            .reconnecting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            debug!(
+                "Skipping SurrealDB reconnect for connector ID: {} because another reconnect is in progress",
+                self.id
+            );
+            return Ok(());
+        }
+
         warn!("Reconnecting SurrealDB sink connector ID: {}", self.id);
-        let client = self.connect_and_select().await?;
-        *self.client.lock().await = Some(client);
-        Ok(())
+        let result = async {
+            let client = self.connect_and_select().await?;
+            *self.client.lock().await = Some(client);
+            Ok(())
+        }
+        .await;
+        self.reconnecting.store(false, Ordering::Release);
+        result
     }
 
     async fn signin_if_configured(&self, client: &SurrealDbClient) -> Result<(), Error> {
@@ -411,7 +441,7 @@ impl SurrealDbSink {
             ));
         }
 
-        self.execute_sql(client, &query)
+        self.execute_sql(client, query)
             .await
             .map_err(|e| Error::InitError(format!("Failed to define SurrealDB table: {e}")))?;
 
@@ -419,15 +449,12 @@ impl SurrealDbSink {
     }
 
     async fn ensure_namespace_database(&self, client: &SurrealDbClient) -> Result<(), Error> {
-        validate_identifier("namespace", &self.config.namespace)?;
-        validate_identifier("database", &self.config.database)?;
-
         let query = format!(
             "DEFINE NAMESPACE IF NOT EXISTS {}; USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
             self.config.namespace, self.config.namespace, self.config.database
         );
 
-        self.execute_sql_without_scope(client, &query)
+        self.execute_sql_without_scope(client, query)
             .await
             .map_err(|e| {
                 Error::InitError(format!(
@@ -461,7 +488,7 @@ impl SurrealDbSink {
     async fn execute_sql(
         &self,
         client: &SurrealDbClient,
-        query: &str,
+        query: impl Into<Body>,
     ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
         self.execute_sql_request(
             client,
@@ -474,7 +501,7 @@ impl SurrealDbSink {
     async fn execute_sql_without_scope(
         &self,
         client: &SurrealDbClient,
-        query: &str,
+        query: impl Into<Body>,
     ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
         self.execute_sql_request(client, query, None).await
     }
@@ -482,14 +509,14 @@ impl SurrealDbSink {
     async fn execute_sql_request(
         &self,
         client: &SurrealDbClient,
-        query: &str,
+        query: impl Into<Body>,
         scope: Option<(&str, &str)>,
     ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
         let mut request = self
             .apply_auth(client.post(format!("{}/sql", self.base_url)))
             .header("Accept", "application/json")
             .header("Content-Type", "text/plain")
-            .body(query.to_string());
+            .body(query);
 
         if let Some((namespace, database)) = scope {
             request = request
@@ -555,7 +582,6 @@ impl SurrealDbSink {
         messages: &[ConsumedMessage],
     ) -> Result<(), Error> {
         let mut successful_inserts = 0u64;
-        let mut last_error = None;
         let record_id_prefix = RecordIdPrefix::new(topic_metadata);
 
         for batch in messages.chunks(self.batch_size) {
@@ -566,12 +592,14 @@ impl SurrealDbSink {
 
             if let Some(error) = outcome.error {
                 self.insertion_errors
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    .fetch_add(outcome.error_count, Ordering::Relaxed);
+                self.messages_processed
+                    .fetch_add(successful_inserts, Ordering::Relaxed);
                 error!(
                     "Failed to insert SurrealDB batch for connector ID: {}, table: {}, error: {error}",
                     self.id, self.table
                 );
-                last_error = Some(error);
+                return Err(error);
             }
         }
 
@@ -590,10 +618,6 @@ impl SurrealDbSink {
             );
         }
 
-        if let Some(error) = last_error {
-            return Err(error);
-        }
-
         Ok(())
     }
 
@@ -607,6 +631,7 @@ impl SurrealDbSink {
         if messages.is_empty() {
             return BatchInsertOutcome {
                 inserted_count: 0,
+                error_count: 0,
                 error: None,
             };
         }
@@ -618,6 +643,7 @@ impl SurrealDbSink {
                 Err(error) => {
                     return BatchInsertOutcome {
                         inserted_count: 0,
+                        error_count: 1,
                         error: Some(error),
                     };
                 }
@@ -634,6 +660,7 @@ impl SurrealDbSink {
             Err(error) => {
                 return BatchInsertOutcome {
                     inserted_count: 0,
+                    error_count: records.len() as u64,
                     error: Some(error),
                 };
             }
@@ -646,16 +673,18 @@ impl SurrealDbSink {
                 Err(error) => {
                     return BatchInsertOutcome {
                         inserted_count: 0,
+                        error_count: record_count,
                         error: Some(error),
                     };
                 }
             };
-            let result = self.execute_sql(&client, &query).await;
+            let result = self.execute_sql(&client, query.clone()).await;
 
             match result {
                 Ok(_) => {
                     return BatchInsertOutcome {
                         inserted_count: record_count,
+                        error_count: 0,
                         error: None,
                     };
                 }
@@ -665,6 +694,7 @@ impl SurrealDbSink {
                     if !transient || attempts >= self.max_retries {
                         return BatchInsertOutcome {
                             inserted_count: 0,
+                            error_count: record_count,
                             error: Some(Error::CannotStoreData(format!(
                                 "SurrealDB batch insert failed after {attempts} attempts: {error}"
                             ))),
@@ -675,6 +705,7 @@ impl SurrealDbSink {
                     {
                         return BatchInsertOutcome {
                             inserted_count: 0,
+                            error_count: record_count,
                             error: Some(Error::Connection(format!(
                                 "Failed to reconnect to SurrealDB after transient write error: {reconnect_error}"
                             ))),
@@ -786,10 +817,15 @@ impl SurrealDbSink {
     }
 }
 
-fn build_insert_query(table: &str, records: &[Value]) -> Result<String, Error> {
-    let records = serde_json::to_string(records)
+fn build_insert_query(table: &str, records: &[Value]) -> Result<Bytes, Error> {
+    let mut query = Vec::with_capacity(table.len() + records.len() * 128 + 32);
+    query.extend_from_slice(b"INSERT IGNORE INTO ");
+    query.extend_from_slice(table.as_bytes());
+    query.push(b' ');
+    serde_json::to_writer(&mut query, records)
         .map_err(|e| Error::InvalidRecordValue(format!("Invalid SurrealDB records: {e}")))?;
-    Ok(format!("INSERT IGNORE INTO {table} {records} RETURN NONE;"))
+    query.extend_from_slice(b" RETURN NONE;");
+    Ok(Bytes::from(query))
 }
 
 fn build_auto_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
@@ -896,7 +932,7 @@ fn build_record_id(
     offset: u64,
 ) -> String {
     let mut id =
-        String::with_capacity(record_id_prefix.stream.len() + record_id_prefix.topic.len() + 70);
+        String::with_capacity(record_id_prefix.stream.len() + record_id_prefix.topic.len() + 72);
     id.push('s');
     id.push_str(&record_id_prefix.stream);
     id.push_str("_t");
@@ -980,8 +1016,6 @@ fn is_connection_error(error: &SurrealDbRequestError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("connection")
         || message.contains("network")
-        || message.contains("websocket")
-        || message.contains("channel")
         || message.contains("broken pipe")
         || message.contains("reset by peer")
 }
@@ -1185,12 +1219,42 @@ mod tests {
             (Some("namespace"), AuthScope::Namespace),
             (Some("database"), AuthScope::Database),
             (Some("none"), AuthScope::None),
-            (Some("unknown"), AuthScope::Root),
+            (Some("unknown"), AuthScope::None),
         ];
 
         for (input, expected) in cases {
             assert_eq!(AuthScope::from_config(input), expected);
         }
+    }
+
+    #[test]
+    fn given_unknown_auth_scope_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.auth_scope = Some("roo".to_string());
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
+    }
+
+    #[test]
+    fn given_invalid_namespace_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.namespace = "bad-namespace".to_string();
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
     }
 
     #[test]
@@ -1223,7 +1287,12 @@ mod tests {
         })];
 
         assert_eq!(
-            build_insert_query("iggy_messages", &records).expect("query should build"),
+            String::from_utf8(
+                build_insert_query("iggy_messages", &records)
+                    .expect("query should build")
+                    .to_vec()
+            )
+            .expect("query should be valid UTF-8"),
             r#"INSERT IGNORE INTO iggy_messages [{"id":"record_1","payload":{"message":"hello"}}] RETURN NONE;"#
         );
     }
@@ -1393,6 +1462,30 @@ mod tests {
                     matches!(result, Err(Error::InvalidRecordValue(_))),
                     "batch failures should be returned to the runtime"
                 );
+            });
+
+        assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_record_build_failure_in_batch_should_count_only_failed_record() {
+        let mut config = test_config();
+        config.payload_format = Some("json".to_string());
+        let sink = SurrealDbSink::new(1, config);
+        let messages = [
+            test_message(Payload::Raw(b"not-json".to_vec())),
+            test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
+        ];
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink
+                    .process_messages(&test_topic_metadata(), &test_messages_metadata(), &messages)
+                    .await;
+
+                assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
             });
 
         assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
