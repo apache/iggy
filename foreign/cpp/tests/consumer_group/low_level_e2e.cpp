@@ -43,7 +43,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
         const auto group = client->create_consumer_group(make_string_identifier(stream_name),
                                                          make_string_identifier(topic_name), group_name);
         ASSERT_EQ(group.name, group_name);
-        ASSERT_EQ(group.members_count, 0);
+        ASSERT_EQ(group.members_count, 0u);
         ASSERT_TRUE(group.members.empty());
     });
 }
@@ -134,14 +134,14 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucce
                                          "server_default", 0, "server_default"));
 
     const auto stream_details = client->get_stream(make_string_identifier(stream_name));
-    ASSERT_EQ(stream_details.topics.size(), 1);
+    ASSERT_EQ(stream_details.topics.size(), std::size_t{1});
 
     ASSERT_NO_THROW({
         const auto group =
             client->create_consumer_group(make_numeric_identifier(stream_details.id),
                                           make_numeric_identifier(stream_details.topics[0].id), group_name);
         ASSERT_EQ(group.name, group_name);
-        ASSERT_EQ(group.members_count, 0);
+        ASSERT_EQ(group.members_count, 0u);
         ASSERT_TRUE(group.members.empty());
     });
 }
@@ -536,7 +536,7 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucc
                                                                    make_string_identifier(topic_name), group_name);
         ASSERT_EQ(recreated_group.id, 0u);
         ASSERT_EQ(recreated_group.name, group_name);
-        ASSERT_EQ(recreated_group.members_count, 0);
+        ASSERT_EQ(recreated_group.members_count, 0u);
         ASSERT_TRUE(recreated_group.members.empty());
     });
 }
