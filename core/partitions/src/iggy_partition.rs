@@ -528,9 +528,12 @@ where
             0
         };
 
-        // TODO: Replace this with monotonic broker timestamp assignment. If wall clock
-        // time goes backwards, clamp to the partition/log max timestamp instead.
-        let batch_timestamp = IggyTimestamp::now().as_micros();
+        // Reuse the prepare's monotonic timestamp, assigned once by the primary
+        // in `project()` (`next_monotonic_timestamp`) and replicated verbatim to
+        // every backup. Sourcing it here instead of a fresh local `now()` makes
+        // the persisted `base_timestamp` (and the `batch_checksum` derived from
+        // it) byte-identical across replicas; a local `now()` diverges per node.
+        let batch_timestamp = header.timestamp;
         let (message, batch, batch_messages_count) =
             stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
                 .map_err(|_| IggyError::CannotAppendMessage)?;
@@ -1159,7 +1162,6 @@ where
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
-        let previous_commit = self.consensus.commit_max();
         let current_op = {
             let consensus = self.consensus();
             match replicate_preflight(consensus, &header) {
@@ -1325,25 +1327,6 @@ where
             }
         }
 
-        let commit = self.consensus.commit_max();
-        if commit > previous_commit
-            && let Err(error) = self
-                .apply_committed_consumer_offset_commits_up_to(commit)
-                .await
-        {
-            emit_partition_diag(
-                tracing::Level::WARN,
-                &PartitionDiagEvent::new(
-                    self.diag_ctx(),
-                    "failed to apply committed consumer offset updates after commit advanced",
-                )
-                .with_operation(header.operation)
-                .with_op(header.op)
-                .with_error(error.to_string()),
-            );
-            return;
-        }
-
         if let Err(error) = replicated_result {
             emit_partition_diag(
                 tracing::Level::WARN,
@@ -1433,7 +1416,19 @@ where
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
 
-        let drained = drain_committable_prefix(self.consensus());
+        // The primary commits inline via `on_ack` (it drains its own pipeline).
+        // Backups never populate the pipeline - they journal replicated prepares
+        // in `apply_replicated_operation` - so the pipeline drain is empty for
+        // them. Fall back to the journal so backups durably persist committed
+        // data. `commit_messages` then flushes only the committed prefix and
+        // keeps the uncommitted tail journal-resident, so a later commit of that
+        // tail still finds its headers here (no wedge). Pipeline-first keeps a
+        // freshly promoted primary (rebuilt pipeline) draining there, avoiding a
+        // double-count against `advance_commit_min`.
+        let mut drained = drain_committable_prefix(self.consensus());
+        if drained.is_empty() {
+            drained = self.collect_committable_from_journal();
+        }
         if drained.is_empty() {
             return;
         }
@@ -1448,6 +1443,25 @@ where
                 consensus.pipeline().borrow().len(),
             );
         }
+    }
+
+    /// Committable entries (ops `commit_min+1 ..= commit_max`) read from the
+    /// journal, for a backup whose pipeline is empty. Stops at the first missing
+    /// op: a replication gap must not be skipped, or `advance_commit_min`'s
+    /// sequential contract breaks. Like the metadata plane's `commit_journal`,
+    /// the journal keeps its committed entries until they are flushed
+    /// (`commit_messages` drains only the committed prefix), so this read finds
+    /// every committed op while the uncommitted tail stays resident.
+    fn collect_committable_from_journal(&self) -> Vec<PipelineEntry> {
+        let from_op = self.consensus.commit_min() + 1;
+        let commit_max = self.consensus.commit_max();
+        self.log
+            .journal()
+            .inner
+            .committed_headers_from(from_op, commit_max)
+            .into_iter()
+            .map(PipelineEntry::new)
+            .collect()
     }
 
     async fn apply_replicated_operation(
@@ -1561,6 +1575,11 @@ where
             return Ok(());
         }
 
+        // `journal_info` counts the committed prefix PLUS the uncommitted tail
+        // still resident in the journal, yet only the committed prefix is
+        // flushed below. With `messages_required_to_save > 1` the tail bytes
+        // count toward the trigger, so this threshold is not "committed bytes
+        // only" - safe, since the flush still writes only committed bytes.
         let is_full = self.log.active_segment().is_full();
         let unsaved_messages_count_exceeded =
             journal_info.messages_count >= config.messages_required_to_save;
@@ -1572,18 +1591,47 @@ where
             return Ok(());
         }
 
-        let (frozen_batches, index_bytes, batch_count) = {
-            let entries = self.log.journal().inner.entries();
+        // Read (do NOT yet evict) ONLY the committed prefix (op <= commit_max,
+        // gap-stopped). A backup journals replicated prepares ahead of the
+        // commit frontier; flushing the uncommitted tail would write
+        // per-replica-timing bytes to its segment (cross-replica divergence) and
+        // drop the headers those ops need when their own commit later lands
+        // (commit_min wedge). Eviction is deferred until the bytes are durable:
+        // on a persist failure the prefix stays resident so the next commit
+        // re-reads it instead of losing a committed batch (a live-process I/O
+        // fault only; the in-memory journal does not survive a crash). All
+        // segment range / stats / durable-offset accounting below is computed
+        // from the committed entries, not the resident-journal snapshot above.
+        let commit_max = self.consensus.commit_max();
+        let committed_entries = self.log.journal().inner.committed_prefix(commit_max);
+        if committed_entries.is_empty() {
+            return Ok(());
+        }
+        let committed_count = committed_entries.len();
+
+        let (frozen_batches, index_bytes, flush_index, batch_count, committed_info) = {
             let segment = self.log.active_segment();
             let mut file_position = segment.size.as_bytes_u64();
-            self.log.ensure_indexes();
-            let indexes = self.log.active_indexes_mut().expect("indexes must exist");
             let mut flush_index = None;
-            let mut frozen = Vec::with_capacity(entries.len());
+            let mut frozen = Vec::with_capacity(committed_entries.len());
             let mut batch_count = 0u32;
+            let mut committed_info = JournalInfo::default();
 
-            for entry in entries {
+            for entry in committed_entries {
+                // Consumer-offset ops are journaled in the same prefix but carry
+                // no segment bytes; they were applied when staged, so skip them.
+                if peek_operation(&entry) != Operation::SendMessages {
+                    continue;
+                }
+                // A resident committed SendMessages entry decoded once at append
+                // (the offset index) with its checksum stamped over these exact
+                // bytes, so it must decode again here. Guard the invariant for a
+                // future disk read-back path that could make decode fallible.
                 let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                    debug_assert!(
+                        false,
+                        "resident committed SendMessages entry failed to decode"
+                    );
                     continue;
                 };
                 let message_count = batch.message_count();
@@ -1591,38 +1639,68 @@ where
                     continue;
                 }
 
-                let index = crate::iggy_index::IggyIndex::new(
-                    batch.header.base_offset,
-                    batch.header.base_timestamp,
-                    file_position,
-                );
                 if flush_index.is_none() {
-                    indexes.insert(index.offset, index.timestamp, index.position);
-                    flush_index = Some(index);
+                    // Record only; the in-mem cache insert is deferred until the
+                    // batch + index are durable (see post-persist below).
+                    flush_index = Some(crate::iggy_index::IggyIndex::new(
+                        batch.header.base_offset,
+                        batch.header.base_timestamp,
+                        file_position,
+                    ));
                 }
                 file_position += batch.header.total_size() as u64;
                 batch_count += message_count;
+                accumulate_committed_info(
+                    &mut committed_info,
+                    batch.header.base_offset,
+                    batch.header.base_timestamp,
+                    batch.header.total_size() as u64,
+                    message_count,
+                );
                 frozen.push(entry);
             }
 
-            let index_bytes =
-                flush_index.map(|index| crate::iggy_index::IggyIndexCache::serialize(&index));
+            let index_bytes = flush_index
+                .as_ref()
+                .map(crate::iggy_index::IggyIndexCache::serialize);
 
-            (frozen, index_bytes, batch_count)
+            (
+                frozen,
+                index_bytes,
+                flush_index,
+                batch_count,
+                committed_info,
+            )
         };
 
+        // No committed SendMessages batch was resident (e.g. only uncommitted
+        // ops, or a committed consumer-offset prefix that is not persisted to a
+        // segment). Nothing to flush, but the committed prefix must still be
+        // evicted; no segment bytes are at risk, so evict directly.
         let Some(index_bytes) = index_bytes else {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = self.namespace().inner(),
-                "failed to build sparse index entry from pending journal batches"
-            );
-            return Err(IggyError::InvalidCommand);
+            self.evict_committed_prefix(committed_count).await;
+            return Ok(());
         };
 
+        // Persist BEFORE eviction so a write failure leaves the committed prefix
+        // resident for retry. The persist is idempotent on failure: a batch
+        // write that lands but whose index save then fails rewinds the segment
+        // write cursor, so the retry overwrites those bytes instead of appending
+        // a duplicate. Only once the bytes are durable do we evict and rebuild
+        // the tail accounting.
         self.persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
             .await?;
+        // Insert the flushed sparse-index entry into the in-mem cache only now
+        // that the batch + index are durable. Inserting in the build loop (before
+        // persist) re-inserts a duplicate on a persist-failure retry, which
+        // re-reads the same prefix. The active segment has not rotated yet, so
+        // this targets the segment that received the batches.
+        if let Some(index) = flush_index {
+            self.log.ensure_indexes();
+            let indexes = self.log.active_indexes_mut().expect("indexes must exist");
+            indexes.insert(index.offset, index.timestamp, index.position);
+        }
+        self.evict_committed_prefix(committed_count).await;
 
         // Stamp range metadata on the segment that received the batches
         // BEFORE rotating: rotation seals it and derives the next segment's
@@ -1631,29 +1709,50 @@ where
         // subsequent segment boundary off the file contents.
         let segment_index = self.log.segments().len() - 1;
         let segment = &mut self.log.segments_mut()[segment_index];
-        if segment.start_timestamp == 0 && journal_info.first_timestamp != 0 {
-            segment.start_timestamp = journal_info.first_timestamp;
+        if segment.start_timestamp == 0 && committed_info.first_timestamp != 0 {
+            segment.start_timestamp = committed_info.first_timestamp;
         }
-        segment.end_timestamp = journal_info.end_timestamp;
-        segment.max_timestamp = segment.max_timestamp.max(journal_info.max_timestamp);
-        segment.end_offset = journal_info.current_offset;
+        segment.end_timestamp = committed_info.end_timestamp;
+        segment.max_timestamp = segment.max_timestamp.max(committed_info.max_timestamp);
+        segment.end_offset = committed_info.current_offset;
 
         if is_full {
             self.rotate_segment(config).await?;
         }
 
-        let _ = self.log.journal_mut().inner.commit();
-        self.log.journal_mut().info = JournalInfo::default();
-
         self.stats
-            .increment_size_bytes(journal_info.size.as_bytes_u64());
+            .increment_size_bytes(committed_info.size.as_bytes_u64());
         self.stats
-            .increment_messages_count(u64::from(journal_info.messages_count));
+            .increment_messages_count(u64::from(committed_info.messages_count));
 
-        let durable_offset = journal_info.current_offset;
+        let durable_offset = committed_info.current_offset;
         self.offset.store(durable_offset, Ordering::Release);
         self.stats.set_current_offset(durable_offset);
         Ok(())
+    }
+
+    /// Evict the committed prefix (the `count` front entries read by
+    /// `committed_prefix`) and reset `journal.info` to reflect only the
+    /// uncommitted tail left resident, so the next persist threshold counts that
+    /// tail alone. Call once the prefix is durable, or when there is nothing to
+    /// persist. The retained tail's accounting is folded from the meta
+    /// `evict_prefix` surfaced during its re-append, so the tail is not decoded
+    /// a second time.
+    async fn evict_committed_prefix(&mut self, count: usize) {
+        let retained = self.log.journal().inner.evict_prefix(count).await;
+        let mut retained_info = JournalInfo::default();
+        for (_, meta) in &retained {
+            if let Some(meta) = meta {
+                accumulate_committed_info(
+                    &mut retained_info,
+                    meta.base_offset,
+                    meta.base_timestamp,
+                    meta.total_size,
+                    meta.message_count,
+                );
+            }
+        }
+        self.log.journal_mut().info = retained_info;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1958,25 +2057,6 @@ where
         Ok((kind, consumer_id, offset, ack))
     }
 
-    async fn apply_committed_consumer_offset_commits_up_to(
-        &mut self,
-        commit: u64,
-    ) -> Result<(), IggyError> {
-        let mut committed_ops: Vec<_> = self
-            .pending_consumer_offset_commits
-            .keys()
-            .copied()
-            .filter(|op| *op <= commit)
-            .collect();
-        committed_ops.sort_unstable();
-
-        for op in committed_ops {
-            self.apply_staged_consumer_offset_commit(op).await?;
-        }
-
-        Ok(())
-    }
-
     async fn commit_consumer_offset_entry(
         &mut self,
         prepare_header: PrepareHeader,
@@ -2080,20 +2160,22 @@ where
                 error
             })?;
 
-        index_writer
-            .save_indexes(index_bytes)
-            .await
-            .map_err(|error| {
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    batch_count,
-                    %error,
-                    "failed to save sparse indexes"
-                );
-                error
-            })?;
+        if let Err(error) = index_writer.save_indexes(index_bytes).await {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                batch_count,
+                %error,
+                "failed to save sparse indexes; rewinding segment write cursor"
+            );
+            // The batch bytes landed but the index did not, so the whole persist
+            // fails and the committed prefix stays resident for retry. Rewind the
+            // writer cursor by exactly what this call advanced so the retry
+            // overwrites those bytes instead of appending a duplicate copy.
+            messages_writer.rewind(saved.as_bytes_u64());
+            return Err(error);
+        }
 
         debug!(
             target: "iggy.partitions.diag",
@@ -2213,6 +2295,41 @@ where
         // that reaches here is journal-backed and ACKs as durable.
         send_prepare_ok_common(self.consensus(), header, Some(true)).await;
     }
+}
+
+/// The operation tag at the front of a journal entry. Every entry begins with a
+/// `PrepareHeader`, so reading the tag is a cheap cast, not a full batch decode;
+/// it tells a committed consumer-offset op (no segment bytes) apart from a
+/// `SendMessages` batch without relying on a decode failure to do so.
+fn peek_operation(entry: &Frozen<4096>) -> Operation {
+    bytemuck::checked::try_from_bytes::<PrepareHeader>(
+        &entry[..std::mem::size_of::<PrepareHeader>()],
+    )
+    .expect("journal entry must begin with a valid prepare header")
+    .operation
+}
+
+/// Fold one `SendMessages` batch's accounting into a running `JournalInfo`,
+/// matching the field updates `append_messages` applies per append.
+/// `current_offset` is the batch's last message offset; the batch carries a
+/// contiguous offset run. Takes raw header fields so the persist-build path
+/// (decoding the committed prefix) and the eviction path (folding the meta
+/// `evict_prefix` surfaced) share one accumulator with no duplicate decode.
+fn accumulate_committed_info(
+    info: &mut JournalInfo,
+    base_offset: u64,
+    base_timestamp: u64,
+    total_size: u64,
+    count: u32,
+) {
+    info.messages_count += count;
+    info.size += IggyByteSize::from(total_size);
+    info.current_offset = base_offset + u64::from(count) - 1;
+    if info.first_timestamp == 0 {
+        info.first_timestamp = base_timestamp;
+    }
+    info.end_timestamp = base_timestamp;
+    info.max_timestamp = info.max_timestamp.max(base_timestamp);
 }
 
 /// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
