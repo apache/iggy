@@ -42,7 +42,6 @@ systemd = ["dep:sd-notify"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
@@ -79,7 +78,6 @@ opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
 prometheus-client = { workspace = true }
-rand = { workspace = true }
 ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
 rolling-file = { workspace = true }

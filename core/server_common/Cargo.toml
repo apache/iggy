@@ -25,6 +25,7 @@ publish = false
 
 [dependencies]
 aligned-vec = { workspace = true }
+argon2 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
@@ -36,6 +37,7 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 lending-iterator = { workspace = true }
 moka = { workspace = true }
+rand = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 smallvec = { workspace = true }
