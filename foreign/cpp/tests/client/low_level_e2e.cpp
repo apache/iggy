@@ -89,17 +89,45 @@ TEST_F(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
 }
 
 TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
-    RecordProperty("description", "Allows explicitly logging out a new unauthenticated client without logging in.");
+    RecordProperty("description",
+                   "Rejects logout before authentication, both before and after connect, then succeeds after login.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
+    ASSERT_THROW(client->logout_user(), std::exception);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->logout_user(), std::exception);
+
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->logout_user());
 }
 
-TEST_F(LowLevelE2E_Client, LogoutAfterLogin) {
-    RecordProperty("description", "Allows explicitly logging out after a successful login.");
+TEST_F(LowLevelE2E_Client, ReloginOnSameClientAfterLogout) {
+    RecordProperty("description", "Allows reauthenticating on the same connected client after a successful logout.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    iggy::ffi::ClientInfoDetails first_me{};
+    iggy::ffi::ClientInfoDetails second_me{};
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ first_me = client->get_me(); });
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ second_me = client->get_me(); });
+
+    EXPECT_EQ(second_me.client_id, first_me.client_id);
+    EXPECT_EQ(second_me.user_id, first_me.user_id);
+}
+
+TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
+    RecordProperty("description",
+                   "Rejects repeated logout calls once the authenticated session has already logged out.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
@@ -108,6 +136,7 @@ TEST_F(LowLevelE2E_Client, LogoutAfterLogin) {
     ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->logout_user(), std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
@@ -118,7 +147,7 @@ TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
 
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
     client = nullptr;
 }
 
@@ -139,7 +168,7 @@ TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
     client = nullptr;
 }
 
@@ -154,16 +183,16 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
     client = nullptr;
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
 }
 
 TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     RecordProperty("description", "Treats deleting a null client pointer as a no-op.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
 }
 
 TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {

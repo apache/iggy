@@ -134,7 +134,7 @@ class E2ETestFixture : public ::testing::Test {
         iggy::ffi::Client *client_to_delete = client;
         client                              = nullptr;
         ForgetClient(client_to_delete);
-        EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
+        EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
     }
 
     void Cleanup() {
@@ -172,7 +172,7 @@ class E2ETestFixture : public ::testing::Test {
             for (const auto stream_id : tracked_stream_ids_) {
                 EXPECT_NO_THROW(cleanup_client->delete_stream(make_numeric_identifier(stream_id)));
             }
-            EXPECT_NO_THROW(iggy::ffi::delete_connection(cleanup_client));
+            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
         }
 
         tracked_stream_names_.clear();
@@ -202,7 +202,7 @@ class E2ETestFixture : public ::testing::Test {
 
         if (cleanup_client != nullptr) {
             try {
-                iggy::ffi::delete_connection(cleanup_client);
+                iggy::ffi::delete_client(cleanup_client);
             } catch (...) {
             }
         }
@@ -215,7 +215,7 @@ class E2ETestFixture : public ::testing::Test {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
-            EXPECT_NO_THROW(iggy::ffi::delete_connection(client_to_delete));
+            EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
         }
         clients_.clear();
     }
@@ -225,7 +225,7 @@ class E2ETestFixture : public ::testing::Test {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
             try {
-                iggy::ffi::delete_connection(client_to_delete);
+                iggy::ffi::delete_client(client_to_delete);
             } catch (...) {
             }
         }
