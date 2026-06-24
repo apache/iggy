@@ -18,16 +18,17 @@
 use crate::{RUNTIME, ffi};
 use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
-    ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
-    IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient,
-    Partitioning, PollingStrategy, SnapshotCompression as RustSnapshotCompression, StreamClient,
-    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
-    UserClient,
+    ConsumerGroupClient, ConsumerOffsetClient, Identifier as RustIdentifier,
+    IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder,
+    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
+    MessageClient, PartitionClient, Partitioning, PollingStrategy,
+    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
+    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
 };
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
-    ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails, Stats as RustStats,
+    ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
+    ConsumerOffsetInfo as RustConsumerOffsetInfo, Stats as RustStats,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -38,6 +39,7 @@ use std::sync::Arc;
 /// partition based on the consumer/strategy. Cxx FFI does not support `Option<u32>`, so we
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
+
 impl From<RustClientInfo> for ffi::ClientInfo {
     fn from(client: RustClientInfo) -> Self {
         let has_user_id = client.user_id.is_some();
@@ -78,6 +80,21 @@ impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
         match client {
             Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
             None => Err("client not found".to_string()),
+        }
+    }
+}
+
+impl TryFrom<Option<RustConsumerOffsetInfo>> for ffi::ConsumerOffsetInfo {
+    type Error = String;
+
+    fn try_from(offset: Option<RustConsumerOffsetInfo>) -> Result<Self, Self::Error> {
+        match offset {
+            Some(offset) => Ok(ffi::ConsumerOffsetInfo {
+                partition_id: offset.partition_id,
+                current_offset: offset.current_offset,
+                stored_offset: offset.stored_offset,
+            }),
+            None => Err("consumer offset not found".to_string()),
         }
     }
 }
@@ -190,6 +207,16 @@ impl Client {
         })
     }
 
+    pub fn logout_user(&self) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .logout_user()
+                .await
+                .map_err(|error| format!("Could not logout user: {error}"))?;
+            Ok(())
+        })
+    }
+
     pub fn connect(&self) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner
@@ -219,6 +246,27 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
             Ok(ffi::StreamDetails::from(stream_details))
+        })
+    }
+
+    pub fn update_stream(
+        &self,
+        stream_id: ffi::Identifier,
+        stream_name: String,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .update_stream(&rust_stream_id, &stream_name)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not update stream '{rust_stream_id}' to '{stream_name}': {error}"
+                    )
+                })?;
+            Ok(())
         })
     }
 
@@ -326,6 +374,31 @@ impl Client {
                 )
                 .await
                 .map_err(|error| format!("Could not send messages: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn flush_unsaved_buffer(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        fsync: bool,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not flush unsaved buffer: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not flush unsaved buffer: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .flush_unsaved_buffer(&rust_stream_id, &rust_topic_id, partition_id, fsync)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not flush unsaved buffer for stream '{rust_stream_id}', topic '{rust_topic_id}', partition '{partition_id}': {error}"
+                    )
+                })?;
             Ok(())
         })
     }
@@ -822,6 +895,144 @@ impl Client {
         })
     }
 
+    pub fn store_consumer_offset(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        offset: u64,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not store consumer offset: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not store consumer offset: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not store consumer offset: {error}"))?;
+        let consumer = match consumer_kind.as_str() {
+            "consumer" => Consumer::new(rust_consumer_id),
+            "consumer_group" => Consumer::group(rust_consumer_id),
+            _ => {
+                return Err(format!(
+                    "Could not store consumer offset: invalid consumer kind: {consumer_kind}"
+                ));
+            }
+        };
+        let partition_id = if partition_id == ANY_PARTITION_ID {
+            None
+        } else {
+            Some(partition_id)
+        };
+
+        RUNTIME.block_on(async {
+            self.inner
+                .store_consumer_offset(
+                    &consumer,
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    partition_id,
+                    offset,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not store consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn get_consumer_offset(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+    ) -> Result<ffi::ConsumerOffsetInfo, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not get consumer offset: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not get consumer offset: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not get consumer offset: {error}"))?;
+        let consumer = match consumer_kind.as_str() {
+            "consumer" => Consumer::new(rust_consumer_id),
+            "consumer_group" => Consumer::group(rust_consumer_id),
+            _ => {
+                return Err(format!(
+                    "Could not get consumer offset: invalid consumer kind: {consumer_kind}"
+                ));
+            }
+        };
+        let partition_id = if partition_id == ANY_PARTITION_ID {
+            None
+        } else {
+            Some(partition_id)
+        };
+
+        RUNTIME.block_on(async {
+            let offset = self
+                .inner
+                .get_consumer_offset(&consumer, &rust_stream_id, &rust_topic_id, partition_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not get consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })?;
+            ffi::ConsumerOffsetInfo::try_from(offset).map_err(|error| {
+                format!(
+                    "Could not get consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                )
+            })
+        })
+    }
+
+    pub fn delete_consumer_offset(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
+        let consumer = match consumer_kind.as_str() {
+            "consumer" => Consumer::new(rust_consumer_id),
+            "consumer_group" => Consumer::group(rust_consumer_id),
+            _ => {
+                return Err(format!(
+                    "Could not delete consumer offset: invalid consumer kind: {consumer_kind}"
+                ));
+            }
+        };
+        let partition_id = if partition_id == ANY_PARTITION_ID {
+            None
+        } else {
+            Some(partition_id)
+        };
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_consumer_offset(&consumer, &rust_stream_id, &rust_topic_id, partition_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not delete consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
     pub fn get_stats(&self) -> Result<ffi::Stats, String> {
         RUNTIME.block_on(async {
             let stats = self
@@ -958,23 +1169,11 @@ impl Client {
 }
 
 pub unsafe fn delete_connection(client: *mut Client) -> Result<(), String> {
-    if client.is_null() {
-        return Ok(());
+    if !client.is_null() {
+        unsafe {
+            drop(Box::from_raw(client));
+        }
     }
 
-    // `Box::from_raw` below runs unconditionally, so the client is always released regardless
-    // of `logout_result`. The result is only used to surface a logout error to the caller — there
-    // is no leak path here.
-    let logout_result = RUNTIME.block_on(async { unsafe { &*client }.inner.logout_user().await });
-
-    unsafe {
-        drop(Box::from_raw(client));
-    }
-
-    match logout_result {
-        Ok(()) | Err(IggyError::Unauthenticated | IggyError::Disconnected) => Ok(()),
-        Err(error) => Err(format!(
-            "Could not logout user during deletion of client: {error}"
-        )),
-    }
+    Ok(())
 }

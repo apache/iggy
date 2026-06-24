@@ -89,13 +89,25 @@ TEST_F(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
 }
 
 TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
-    RecordProperty("description", "Allows deleting a new unauthenticated client without logging in.");
+    RecordProperty("description", "Allows explicitly logging out a new unauthenticated client without logging in.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
+    TrackClient(client);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
+    ASSERT_NO_THROW(client->logout_user());
+}
+
+TEST_F(LowLevelE2E_Client, LogoutAfterLogin) {
+    RecordProperty("description", "Allows explicitly logging out after a successful login.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
 }
 
 TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
