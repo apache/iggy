@@ -105,6 +105,12 @@ pub struct StatsSnapshot {
 }
 
 /// Topic snapshot representation for serialization.
+///
+/// Encoded by `rmp_serde::to_vec` as a **positional array**, so `serde(default)`
+/// only fills **trailing** elements absent from an older snapshot. The two
+/// consumer-group fields below are therefore deliberately last: a topic
+/// snapshot written before co-located consumer groups has a shorter array, and
+/// the defaults fill the missing tail. Any future field must also be appended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSnapshot {
     pub id: usize,
@@ -120,6 +126,9 @@ pub struct TopicSnapshot {
     // load-balancing hint advanced on the `Balanced`-send read path (outside
     // the replicated apply), so each replica's value drifts independently;
     // persisting it would make the snapshot diverge per replica. Restored to 0.
+    //
+    // The two consumer-group fields are trailing so the `serde(default)` above
+    // actually works for snapshots predating co-located consumer groups.
     #[serde(default)]
     pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
     #[serde(default)]
@@ -350,12 +359,13 @@ collect_handlers! {
 }
 
 impl StreamsInner {
-    /// Per-commit hook (see the `define_state!`/`dispatch` macro). Recomputes
-    /// `pending_revocations_count` so the consensus tick's
-    /// `has_pending_revocations` read is O(1) instead of walking every group
-    /// each 10ms. The walk runs only here -- once per metadata commit, far
-    /// rarer than the tick -- and over the small consumer-group structure.
-    fn post_apply(&mut self) {
+    /// Recompute `pending_revocations_count` so the consensus tick's
+    /// `has_pending_revocations` read (and the reconciler's fast-skip) is O(1)
+    /// instead of walking every group each 10ms. Called only by the apply
+    /// handlers that can change pending revocations (join, leave, remove,
+    /// complete, and group-dropping deletes), so non-consumer-group commits pay
+    /// nothing. Recompute (not a delta) keeps the count drift-proof.
+    pub(crate) fn recompute_pending_revocations_count(&mut self) {
         let mut count: u64 = 0;
         for (_, stream) in &self.items {
             for (_, topic) in &stream.topics {
@@ -926,6 +936,8 @@ impl StateHandler for DeleteStreamRequest {
         state.items.remove(stream_id);
         state.index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
+        // The dropped stream may have held groups with pending revocations.
+        state.recompute_pending_revocations_count();
         Bytes::new()
     }
 }
@@ -1134,6 +1146,8 @@ impl StateHandler for DeleteTopicRequest {
         stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
         state.revision = state.revision.wrapping_add(1);
+        // The dropped topic may have held groups with pending revocations.
+        state.recompute_pending_revocations_count();
         Bytes::new()
     }
 }
@@ -1435,7 +1449,7 @@ impl Snapshotable for Streams {
             pending_revocations_count: 0,
             last_result: None,
         };
-        inner.post_apply();
+        inner.recompute_pending_revocations_count();
         Ok(inner.into())
     }
 }

@@ -1110,11 +1110,17 @@ where
         source_client_id: u128,
         partition_id: u32,
     ) -> Result<u64, MetadataSubmitError> {
-        // Reserved internal client id: never coordinator-minted (those carry the
-        // home shard in their top bits). All internal completions share it, so
-        // the pipeline dedup serializes them -- fine, completion is idempotent.
-        const INTERNAL_CLIENT_ID: u128 = u128::MAX;
         const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+        // Reserved internal client id, distinct per (group, partition) target.
+        // The high 64 bits are all-ones -- never coordinator-minted (those carry
+        // a small home-shard number in the top bits) -- and the low 64 bits pack
+        // (group_id, partition_id). Distinct ids matter: the pipeline dedups by
+        // client id, so a shared id would cap internal completions at one
+        // in-flight cluster-wide and drain a wide rebalance one per consensus
+        // round-trip. Per-target ids let completions for different partitions
+        // pipeline concurrently while still deduping a retry of the same target.
+        let internal_client_id: u128 =
+            (u128::from(u64::MAX) << 64) | (u128::from(group_id) << 32) | u128::from(partition_id);
 
         let consensus = self
             .consensus
@@ -1133,7 +1139,7 @@ where
         if consensus
             .pipeline()
             .borrow()
-            .has_message_from_client(INTERNAL_CLIENT_ID)
+            .has_message_from_client(internal_client_id)
         {
             return Err(MetadataSubmitError::InProgress);
         }
@@ -1151,7 +1157,7 @@ where
         let body = request.to_bytes();
         let message = build_complete_revocation_request_message(
             consensus,
-            INTERNAL_CLIENT_ID,
+            internal_client_id,
             INTERNAL_REQUEST_ID,
             &body,
         );

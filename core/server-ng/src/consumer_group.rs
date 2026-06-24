@@ -126,12 +126,19 @@ async fn gather_in_flight(
     let assigned = streams
         .consumer_group_assigned_partitions(stream_id, topic_id, group_id)
         .unwrap_or_default();
-    let mut in_flight = Vec::new();
-    for partition_id in partition_ids {
-        let Ok(ns) = resolve_partition_namespace(shard, stream_id, topic_id, Some(partition_id))
-        else {
-            continue;
-        };
+    // Resolve namespaces up front (sync), then fire every partition's
+    // `GroupOffsetState` read concurrently. The reads are independent, so a
+    // wide-topic join must not serialize N cross-shard round-trips before the
+    // join op can even be proposed.
+    let targets: Vec<(u32, _)> = partition_ids
+        .into_iter()
+        .filter_map(|partition_id| {
+            resolve_partition_namespace(shard, stream_id, topic_id, Some(partition_id))
+                .ok()
+                .map(|ns| (partition_id, ns))
+        })
+        .collect();
+    let results = futures::future::join_all(targets.iter().map(|&(partition_id, ns)| async move {
         let reply = shard
             .partition_read(
                 ns,
@@ -140,6 +147,13 @@ async fn gather_in_flight(
                 },
             )
             .await;
+        (partition_id, ns, reply)
+    }))
+    .await;
+
+    let mut in_flight = Vec::new();
+    let mut stale_clears = Vec::new();
+    for (partition_id, ns, reply) in results {
         let Some(PartitionReadReply::GroupOffsetState {
             last_polled: Some(polled),
             committed,
@@ -155,17 +169,16 @@ async fn gather_in_flight(
         } else {
             // Stale mark from a removed member: drop it so a later join in this
             // same restart does not misread it once the partition is reassigned.
-            // `ns` (resolved above, `IggyNamespace: Copy`) is still valid here.
-            let _ = shard
-                .partition_read(
-                    ns,
-                    PartitionRead::ClearGroupLastPolled {
-                        group_id: monotonic_group_id,
-                    },
-                )
-                .await;
+            stale_clears.push(shard.partition_read(
+                ns,
+                PartitionRead::ClearGroupLastPolled {
+                    group_id: monotonic_group_id,
+                },
+            ));
         }
     }
+    // Fire the stale-mark clears concurrently too; the result is unused.
+    futures::future::join_all(stale_clears).await;
     in_flight
 }
 
@@ -203,13 +216,11 @@ pub(crate) fn maybe_rewrite_consumer_offset_request(
             else {
                 return Ok(request);
             };
-            // The partition-plane group-offset key is u32, so the monotonic id
-            // must stay within u32 (see `Topic::next_consumer_group_id`). Fail
-            // loudly at that ceiling instead of silently wrapping into a live
-            // group's key.
-            wire.consumer.id = WireIdentifier::Numeric(
-                u32::try_from(group_id).expect("consumer-group id exceeds u32 offset-key ceiling"),
-            );
+            // The partition-plane group-offset key is u32 (see the documented
+            // ceiling on `Topic::next_consumer_group_id`). Clamp on the
+            // ~4-billion-creates overflow rather than panic this live
+            // client-driven path, matching `iggy_partition.rs`'s identical cast.
+            wire.consumer.id = WireIdentifier::Numeric(u32::try_from(group_id).unwrap_or(u32::MAX));
             wire.to_bytes()
         }};
     }

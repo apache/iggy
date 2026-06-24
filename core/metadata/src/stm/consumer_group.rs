@@ -504,10 +504,13 @@ impl StateHandler for CreateConsumerGroupRequest {
             return Bytes::new();
         };
         let name: Arc<str> = Arc::from(self.name.as_str());
-        // Per-(stream,topic) name uniqueness: supersede an existing same-name
-        // group in this topic (idempotent create across a delete+recreate).
-        if let Some(stale_id) = topic.consumer_group_index.get(&name).copied() {
-            topic.consumer_groups.remove(&stale_id);
+        // Per-(stream,topic) name uniqueness. A same-name group already exists:
+        // do NOT supersede it -- removing it would drop a live group along with
+        // its members and their assignments, and the ejected members would
+        // never recover. Leave the existing group untouched and reply empty,
+        // mirroring `CreateStream`/`CreateTopic` on a duplicate name.
+        if topic.consumer_group_index.contains_key(&name) {
+            return Bytes::new();
         }
         let id = topic.next_consumer_group_id;
         topic.next_consumer_group_id += 1;
@@ -550,6 +553,8 @@ impl StateHandler for DeleteConsumerGroupRequest {
         // offsets on the topic's surviving partitions.
         if removed {
             state.revision = state.revision.wrapping_add(1);
+            // The dropped group may have held pending revocations.
+            state.recompute_pending_revocations_count();
         }
         Bytes::new()
     }
@@ -590,6 +595,7 @@ impl StateHandler for JoinConsumerGroupRequest {
         let in_flight: std::collections::HashSet<usize> =
             self.in_flight.iter().map(|&p| p as usize).collect();
         group.rebalance_cooperative(&partition_ids, &in_flight, timestamp.as_micros());
+        state.recompute_pending_revocations_count();
         Bytes::new()
     }
 }
@@ -615,6 +621,7 @@ impl StateHandler for LeaveConsumerGroupRequest {
         if let Some(key) = member_key {
             group.members.remove(key);
             group.rebalance_members(&partition_ids);
+            state.recompute_pending_revocations_count();
         }
         Bytes::new()
     }
@@ -676,6 +683,7 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
         // Only perturb the reconciler when a membership actually changed.
         if any_removed {
             state.revision = state.revision.wrapping_add(1);
+            state.recompute_pending_revocations_count();
         }
         Bytes::new()
     }
@@ -739,35 +747,48 @@ impl StateHandler for CompleteConsumerGroupRevocationRequest {
         let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
             return Bytes::new();
         };
-        if let Some(group) = topic.consumer_groups.get_mut(&self.group_id)
-            && group.complete_revocation(self.source_client_id, self.partition_id as usize)
-        {
+        let completed = topic
+            .consumer_groups
+            .get_mut(&self.group_id)
+            .is_some_and(|group| {
+                group.complete_revocation(self.source_client_id, self.partition_id as usize)
+            });
+        if completed {
             state.revision = state.revision.wrapping_add(1);
+            state.recompute_pending_revocations_count();
         }
         Bytes::new()
     }
 }
 
 /// Consumer group member snapshot representation for serialization.
+///
+/// Snapshots are encoded by `rmp_serde::to_vec` as **positional arrays** (no
+/// field-name map), so `#[serde(default)]` only fills a missing **trailing**
+/// element -- a new field is back/forward-compatible only if appended last. A
+/// field inserted mid-struct shifts every later position and corrupts decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupMemberSnapshot {
     pub id: usize,
     pub client_id: u128,
     pub partitions: Vec<usize>,
     /// `(partition_id, target_member_slab, created_at_micros)` per pending
-    /// cooperative revocation.
-    ///
-    /// Defaulted for snapshots written before cooperative rebalancing existed.
+    /// cooperative revocation. Trailing + `serde(default)` so a snapshot that
+    /// predates this field still decodes (the default fills the absent
+    /// trailing element).
     #[serde(default)]
     pub pending_revocations: Vec<(usize, usize, u64)>,
 }
 
 /// Consumer group snapshot representation for serialization (nested under the
-/// topic snapshot).
+/// topic snapshot). Positional array, same trailing-only rule as
+/// [`ConsumerGroupMemberSnapshot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupSnapshot {
     pub id: u64,
-    #[serde(default)]
+    // No `serde(default)`: `generation` is not the trailing field, so a default
+    // could not fill it positionally anyway, and every consumer-group snapshot
+    // (new with co-located groups) always writes it.
     pub generation: u64,
     pub name: String,
     pub members: Vec<(usize, ConsumerGroupMemberSnapshot)>,

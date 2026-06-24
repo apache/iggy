@@ -20,12 +20,21 @@
 //! server picks each member's partition by advancing its round-robin cursor.
 
 use crate::server::scenarios::{
-    consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
+    consumer_group_auto_commit_reconnection_scenario,
+    consumer_group_duplicate_name_create_scenario, consumer_group_join_scenario,
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
 };
 use integration::iggy_harness;
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn duplicate_name_create_preserves_live_group(harness: &TestHarness) {
+    consumer_group_duplicate_name_create_scenario::run(harness).await;
+}
 
 #[iggy_harness(
     test_client_transport = [Tcp],

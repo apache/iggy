@@ -625,13 +625,15 @@ async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut Pa
 /// transiently-failed revocation is retried next pass.
 #[allow(clippy::cast_possible_truncation)]
 fn reconcile_pending_revocations(ctx: &ReconcilerCtx) {
-    let pending = ctx
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .consumer_group_pending_revocations();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    // O(1) fast-skip before the walk: `consumer_group_pending_revocations`
+    // allocates a vec and walks every stream/topic/group/member, and the
+    // reconciler hits this every tick. `has_pending_revocations` reads the
+    // maintained counter, so the common (nothing-pending) case pays nothing.
+    if !streams.has_pending_revocations() {
+        return;
+    }
+    let pending = streams.consumer_group_pending_revocations();
     if pending.is_empty() {
         return;
     }

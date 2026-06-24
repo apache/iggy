@@ -63,7 +63,7 @@ impl ConsumerGroupClientState {
     pub fn has_assignment(&self, key: &str) -> bool {
         self.assignments
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .is_some_and(|assignment| !assignment.partitions.is_empty())
     }
@@ -74,7 +74,7 @@ impl ConsumerGroupClientState {
         let mut map = self
             .assignments
             .lock()
-            .expect("consumer-group state mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.entry(key).or_default();
         if entry.generation != generation {
             entry.cursor = 0;
@@ -88,7 +88,7 @@ impl ConsumerGroupClientState {
     pub fn invalidate_assignment(&self, key: &str) {
         self.assignments
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
     }
 
@@ -99,7 +99,7 @@ impl ConsumerGroupClientState {
         let mut map = self
             .assignments
             .lock()
-            .expect("consumer-group state mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let assignment = map.get_mut(key)?;
         if assignment.partitions.is_empty() {
             return None;
@@ -119,7 +119,7 @@ impl ConsumerGroupClientState {
         let mut map = self
             .balanced_cursors
             .lock()
-            .expect("consumer-group state mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cursor = map.entry(key.to_owned()).or_default();
         let partition = (*cursor % partition_count as usize) as u32;
         *cursor = cursor.wrapping_add(1);
@@ -130,7 +130,7 @@ impl ConsumerGroupClientState {
     pub fn partition_count(&self, key: &str) -> Option<u32> {
         self.partition_counts
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .copied()
     }
@@ -138,7 +138,7 @@ impl ConsumerGroupClientState {
     pub fn set_partition_count(&self, key: String, partition_count: u32) {
         self.partition_counts
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, partition_count);
     }
 
@@ -152,7 +152,7 @@ impl ConsumerGroupClientState {
     ) {
         self.joined_groups
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, (stream_id, topic_id, group_id));
     }
 
@@ -160,7 +160,7 @@ impl ConsumerGroupClientState {
     pub fn deregister_group(&self, key: &str) {
         self.joined_groups
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
     }
 
@@ -169,7 +169,7 @@ impl ConsumerGroupClientState {
     pub fn registered_groups(&self) -> Vec<(Identifier, Identifier, Identifier)> {
         self.joined_groups
             .lock()
-            .expect("consumer-group state mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .collect()
