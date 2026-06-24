@@ -146,6 +146,6 @@ body:
     id: good-first-issue
     attributes:
       label: Good first issue
-      description: A suggestion for triage; a maintainer decides whether to apply the label.
+      description: Ticking this self-tags the issue with the `good first issue` label. Maintainers may remove it during triage.
       options:
         - label: I think this could be a good first issue for a new contributor
