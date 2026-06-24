@@ -467,6 +467,196 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupThenLeaveRestoresMembersCount
     EXPECT_TRUE(left_group.members.empty());
 }
 
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupReducesMembersCount) {
+    RecordProperty("description", "Reduces the consumer group member count after one of two joined clients leaves.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *first      = GetLoggedInClient();
+    iggy::ffi::Client *second     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(first->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                        "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(first->create_consumer_group(make_string_identifier(stream_name),
+                                                 make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+
+    ASSERT_NO_THROW(first->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                               make_string_identifier(group_name)));
+    ASSERT_NO_THROW(second->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                                make_string_identifier(group_name)));
+
+    const auto joined_group = first->get_consumer_group(
+        make_string_identifier(stream_name), make_string_identifier(topic_name), make_string_identifier(group_name));
+    EXPECT_EQ(joined_group.members_count, 2u);
+    ASSERT_EQ(joined_group.members.size(), std::size_t{2});
+
+    ASSERT_NO_THROW(second->leave_consumer_group(
+        make_string_identifier(stream_name), make_string_identifier(topic_name), make_string_identifier(group_name)));
+
+    const auto left_group = first->get_consumer_group(
+        make_string_identifier(stream_name), make_string_identifier(topic_name), make_string_identifier(group_name));
+    EXPECT_EQ(left_group.members_count, 1u);
+    ASSERT_EQ(left_group.members.size(), std::size_t{1});
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupBeforeLoginThrows) {
+    RecordProperty("description", "Rejects leave_consumer_group before connect, and after connect but before login.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+
+    iggy::ffi::Client *setup_client = GetLoggedInClient();
+    ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
+                                                        make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+    ASSERT_NO_THROW(setup_client->join_consumer_group(
+        make_string_identifier(stream_name), make_string_identifier(topic_name), make_string_identifier(group_name)));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(unauthenticated_client->leave_consumer_group(make_string_identifier(stream_name),
+                                                              make_string_identifier(topic_name),
+                                                              make_string_identifier(group_name)),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->leave_consumer_group(make_string_identifier(stream_name),
+                                                              make_string_identifier(topic_name),
+                                                              make_string_identifier(group_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupOnNonExistentResourcesThrows) {
+    RecordProperty("description", "Rejects leave_consumer_group for streams, topics, or groups that do not exist.");
+    const std::string stream_name         = GetRandomName();
+    const std::string topic_name          = GetRandomName();
+    const std::string created_group_name  = GetRandomName();
+    const std::string missing_stream_name = GetRandomName();
+    const std::string missing_topic_name  = GetRandomName();
+    const std::string missing_group_name  = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), created_group_name));
+    TrackConsumerGroup(stream_name, topic_name, created_group_name);
+    ASSERT_NO_THROW(client->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                                make_string_identifier(created_group_name)));
+
+    ASSERT_THROW(
+        client->leave_consumer_group(make_string_identifier(missing_stream_name), make_string_identifier(topic_name),
+                                     make_string_identifier(created_group_name)),
+        std::exception);
+    ASSERT_THROW(
+        client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(missing_topic_name),
+                                     make_string_identifier(created_group_name)),
+        std::exception);
+    ASSERT_THROW(client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                              make_string_identifier(missing_group_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupAfterStreamDeletionThrows) {
+    RecordProperty("description", "Rejects leave_consumer_group after deleting the stream that owned the group.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+    ASSERT_NO_THROW(client->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                                make_string_identifier(group_name)));
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
+
+    ASSERT_THROW(client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                              make_string_identifier(group_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupAfterTopicDeletionThrows) {
+    RecordProperty("description", "Rejects leave_consumer_group after deleting the topic that owned the group.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+    ASSERT_NO_THROW(client->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                                make_string_identifier(group_name)));
+    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+    ForgetTrackedConsumerGroup(stream_name, topic_name, group_name);
+
+    ASSERT_THROW(client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                              make_string_identifier(group_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupTwiceThrows) {
+    RecordProperty("description", "Rejects leaving the same consumer group twice.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+    ASSERT_NO_THROW(client->join_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                                make_string_identifier(group_name)));
+    ASSERT_NO_THROW(client->leave_consumer_group(
+        make_string_identifier(stream_name), make_string_identifier(topic_name), make_string_identifier(group_name)));
+
+    ASSERT_THROW(client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                              make_string_identifier(group_name)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupWithoutJoiningThrows) {
+    RecordProperty("description", "Rejects leaving a consumer group when the client is not a member.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    const std::string group_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
+                                                  make_string_identifier(topic_name), group_name));
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+
+    ASSERT_THROW(client->leave_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                              make_string_identifier(group_name)),
+                 std::exception);
+}
+
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReflectsJoinedGroupMembersCount) {
     RecordProperty("description", "Reflects a joined consumer group in get_consumer_groups members_count.");
     const std::string stream_name       = GetRandomName();
