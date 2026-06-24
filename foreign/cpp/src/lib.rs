@@ -17,7 +17,6 @@
 
 mod client;
 mod consumer;
-mod consumer_group;
 mod identifier;
 mod messages;
 mod producer;
