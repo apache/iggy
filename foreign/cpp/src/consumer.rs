@@ -15,61 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::ffi;
-use iggy::prelude::{
-    ConsumerGroupDetails as RustConsumerGroupDetails, IggyConsumer as RustIggyConsumer,
-};
-use iggy_common::{
-    ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
-    ConsumerGroupMember as RustConsumerGroupMember,
-};
-
-impl From<RustConsumerGroupInfo> for ffi::ConsumerGroupInfo {
-    fn from(group: RustConsumerGroupInfo) -> Self {
-        ffi::ConsumerGroupInfo {
-            stream_id: group.stream_id,
-            topic_id: group.topic_id,
-            group_id: group.group_id,
-        }
-    }
-}
-
-impl From<RustConsumerGroupMember> for ffi::ConsumerGroupMember {
-    fn from(member: RustConsumerGroupMember) -> Self {
-        ffi::ConsumerGroupMember {
-            id: member.id,
-            partitions_count: member.partitions_count,
-            partitions: member.partitions,
-        }
-    }
-}
-
-impl From<RustConsumerGroup> for ffi::ConsumerGroup {
-    fn from(group: RustConsumerGroup) -> Self {
-        ffi::ConsumerGroup {
-            id: group.id,
-            name: group.name,
-            partitions_count: group.partitions_count,
-            members_count: group.members_count,
-        }
-    }
-}
-
-impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
-    fn from(group: RustConsumerGroupDetails) -> Self {
-        ffi::ConsumerGroupDetails {
-            id: group.id,
-            name: group.name,
-            partitions_count: group.partitions_count,
-            members_count: group.members_count,
-            members: group
-                .members
-                .into_iter()
-                .map(ffi::ConsumerGroupMember::from)
-                .collect(),
-        }
-    }
-}
+use iggy::prelude::IggyConsumer as RustIggyConsumer;
 
 #[allow(dead_code)]
 pub struct Consumer {

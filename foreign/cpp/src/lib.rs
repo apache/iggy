@@ -17,11 +17,10 @@
 
 mod client;
 mod consumer;
+mod type_conversion;
 mod identifier;
 mod messages;
 mod producer;
-mod stream;
-mod topic;
 
 use client::{Client, delete_connection as delete_client, new_connection};
 use consumer::Consumer;

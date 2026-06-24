@@ -16,51 +16,7 @@
 // under the License.
 
 use crate::ffi;
-use iggy::prelude::{IdKind, Identifier as RustIdentifier, Validatable};
-
-impl From<RustIdentifier> for ffi::Identifier {
-    fn from(identifier: RustIdentifier) -> Self {
-        let kind = match identifier.kind {
-            IdKind::Numeric => "numeric".to_string(),
-            IdKind::String => "string".to_string(),
-        };
-
-        ffi::Identifier {
-            kind,
-            length: identifier.length,
-            value: identifier.value,
-        }
-    }
-}
-
-impl TryFrom<ffi::Identifier> for RustIdentifier {
-    type Error = String;
-
-    fn try_from(identifier: ffi::Identifier) -> Result<Self, Self::Error> {
-        let kind = match identifier.kind.as_str() {
-            "numeric" => IdKind::Numeric,
-            "string" => IdKind::String,
-            _ => {
-                return Err(format!(
-                    "unsupported identifier kind '{}'. Expected 'numeric' or 'string'.",
-                    identifier.kind
-                ));
-            }
-        };
-
-        let rust_identifier = RustIdentifier {
-            kind,
-            length: identifier.length,
-            value: identifier.value,
-        };
-
-        rust_identifier
-            .validate()
-            .map_err(|error| format!("invalid identifier: {error}"))?;
-
-        Ok(rust_identifier)
-    }
-}
+use iggy::prelude::Identifier as RustIdentifier;
 
 impl ffi::Identifier {
     pub fn set_string(&mut self, id: String) -> Result<(), String> {

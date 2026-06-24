@@ -25,11 +25,6 @@ use iggy::prelude::{
     SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
 };
-use iggy_common::{
-    CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
-    ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
-    ConsumerOffsetInfo as RustConsumerOffsetInfo, Stats as RustStats,
-};
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -39,119 +34,6 @@ use std::sync::Arc;
 /// partition based on the consumer/strategy. Cxx FFI does not support `Option<u32>`, so we
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
-
-impl From<RustClientInfo> for ffi::ClientInfo {
-    fn from(client: RustClientInfo) -> Self {
-        let has_user_id = client.user_id.is_some();
-        ffi::ClientInfo {
-            client_id: client.client_id,
-            has_user_id,
-            user_id: client.user_id.unwrap_or(u32::MAX),
-            address: client.address,
-            transport: client.transport,
-            consumer_groups_count: client.consumer_groups_count,
-        }
-    }
-}
-
-impl From<RustClientInfoDetails> for ffi::ClientInfoDetails {
-    fn from(client: RustClientInfoDetails) -> Self {
-        let has_user_id = client.user_id.is_some();
-        ffi::ClientInfoDetails {
-            client_id: client.client_id,
-            has_user_id,
-            user_id: client.user_id.unwrap_or(u32::MAX),
-            address: client.address,
-            transport: client.transport,
-            consumer_groups_count: client.consumer_groups_count,
-            consumer_groups: client
-                .consumer_groups
-                .into_iter()
-                .map(ffi::ConsumerGroupInfo::from)
-                .collect(),
-        }
-    }
-}
-
-impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
-    type Error = String;
-
-    fn try_from(client: Option<RustClientInfoDetails>) -> Result<Self, Self::Error> {
-        match client {
-            Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
-            None => Err("client not found".to_string()),
-        }
-    }
-}
-
-impl TryFrom<Option<RustConsumerOffsetInfo>> for ffi::ConsumerOffsetInfo {
-    type Error = String;
-
-    fn try_from(offset: Option<RustConsumerOffsetInfo>) -> Result<Self, Self::Error> {
-        match offset {
-            Some(offset) => Ok(ffi::ConsumerOffsetInfo {
-                partition_id: offset.partition_id,
-                current_offset: offset.current_offset,
-                stored_offset: offset.stored_offset,
-            }),
-            None => Err("consumer offset not found".to_string()),
-        }
-    }
-}
-
-impl From<(RustCacheMetricsKey, RustCacheMetrics)> for ffi::CacheMetricEntry {
-    fn from((key, metrics): (RustCacheMetricsKey, RustCacheMetrics)) -> Self {
-        ffi::CacheMetricEntry {
-            stream_id: key.stream_id,
-            topic_id: key.topic_id,
-            partition_id: key.partition_id,
-            hits: metrics.hits,
-            misses: metrics.misses,
-            hit_ratio: metrics.hit_ratio,
-        }
-    }
-}
-
-impl From<RustStats> for ffi::Stats {
-    fn from(stats: RustStats) -> Self {
-        let has_server_semver = stats.iggy_server_semver.is_some();
-        ffi::Stats {
-            process_id: stats.process_id,
-            cpu_usage: stats.cpu_usage,
-            total_cpu_usage: stats.total_cpu_usage,
-            memory_usage: stats.memory_usage.as_bytes_u64(),
-            total_memory: stats.total_memory.as_bytes_u64(),
-            available_memory: stats.available_memory.as_bytes_u64(),
-            run_time_micros: stats.run_time.as_micros(),
-            start_time_epoch_micros: stats.start_time.as_micros(),
-            read_bytes: stats.read_bytes.as_bytes_u64(),
-            written_bytes: stats.written_bytes.as_bytes_u64(),
-            messages_size_bytes: stats.messages_size_bytes.as_bytes_u64(),
-            streams_count: stats.streams_count,
-            topics_count: stats.topics_count,
-            partitions_count: stats.partitions_count,
-            segments_count: stats.segments_count,
-            messages_count: stats.messages_count,
-            clients_count: stats.clients_count,
-            consumer_groups_count: stats.consumer_groups_count,
-            hostname: stats.hostname,
-            os_name: stats.os_name,
-            os_version: stats.os_version,
-            kernel_version: stats.kernel_version,
-            iggy_server_version: stats.iggy_server_version,
-            has_server_semver,
-            iggy_server_semver: stats.iggy_server_semver.unwrap_or(0),
-            cache_metrics: stats
-                .cache_metrics
-                .into_iter()
-                .map(ffi::CacheMetricEntry::from)
-                .collect(),
-            threads_count: stats.threads_count,
-            free_disk_space: stats.free_disk_space.as_bytes_u64(),
-            total_disk_space: stats.total_disk_space.as_bytes_u64(),
-        }
-    }
-}
 
 pub struct Client {
     pub inner: Arc<RustIggyClient>,
