@@ -64,7 +64,10 @@ members = [
     "examples/rust",
 ]
 exclude = ["foreign/cpp", "foreign/php", "foreign/python"]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+rust-version = "1.95"
 
 [workspace.dependencies]
 actix-cors = "0.7.1"
