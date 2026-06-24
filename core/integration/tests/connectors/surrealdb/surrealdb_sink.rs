@@ -114,8 +114,8 @@ async fn json_messages_sink_to_surrealdb(harness: &TestHarness, fixture: Surreal
             record["iggy_topic"],
             Value::String(seeds::names::TOPIC.to_string())
         );
-        assert_eq!(record["iggy_partition_id"], Value::from(0));
-        assert_eq!(record["iggy_offset"], Value::from(idx as u64));
+        assert_eq!(record["iggy_partition_id"], Value::String("0".to_string()));
+        assert_eq!(record["iggy_offset"], Value::String(idx.to_string()));
         assert_eq!(
             record["payload_encoding"],
             Value::String("json".to_string())
@@ -238,7 +238,7 @@ async fn large_batch_processed_in_chunks(
 
     assert_eq!(records.len(), LARGE_BATCH_COUNT);
     for (idx, record) in records.iter().enumerate() {
-        assert_eq!(record["iggy_offset"], Value::from(idx as u64));
+        assert_eq!(record["iggy_offset"], Value::String(idx.to_string()));
         assert_eq!(record["payload"], serde_json::json!({"idx": idx}));
     }
 }

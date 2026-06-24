@@ -74,11 +74,9 @@ impl SurrealDbSinkFixture {
         &self,
         client: &SurrealDbClient,
     ) -> Result<Vec<Value>, TestBinaryError> {
-        let query = format!("SELECT * FROM {DEFAULT_TABLE} ORDER BY iggy_offset ASC;");
+        let query = format!("SELECT * FROM {DEFAULT_TABLE};");
         let value = client.query_result(&query).await?;
-        serde_json::from_value(value).map_err(|e| TestBinaryError::InvalidState {
-            message: format!("Failed to decode SurrealDB records: {e}"),
-        })
+        decode_records_sorted_by_offset(value)
     }
 
     pub async fn select_records_by_message_id(
@@ -91,13 +89,9 @@ impl SurrealDbSinkFixture {
                 message: format!("Failed to encode SurrealDB message id: {e}"),
             }
         })?;
-        let query = format!(
-            "SELECT * FROM {DEFAULT_TABLE} WHERE iggy_message_id = {message_id} ORDER BY iggy_offset ASC;"
-        );
+        let query = format!("SELECT * FROM {DEFAULT_TABLE} WHERE iggy_message_id = {message_id};");
         let value = client.query_result(&query).await?;
-        serde_json::from_value(value).map_err(|e| TestBinaryError::InvalidState {
-            message: format!("Failed to decode SurrealDB record by message id: {e}"),
-        })
+        decode_records_sorted_by_offset(value)
     }
 
     pub async fn insert_preseeded_record(
@@ -120,6 +114,22 @@ impl SurrealDbSinkFixture {
         let query = format!("INSERT INTO {DEFAULT_TABLE} {records} RETURN NONE;");
         client.query_result(&query).await.map(|_| ())
     }
+}
+
+fn decode_records_sorted_by_offset(value: Value) -> Result<Vec<Value>, TestBinaryError> {
+    let mut records: Vec<Value> =
+        serde_json::from_value(value).map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to decode SurrealDB records: {e}"),
+        })?;
+    records.sort_by_key(|record| {
+        record
+            .get("iggy_offset")
+            .and_then(Value::as_str)
+            .and_then(|offset| offset.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    });
+
+    Ok(records)
 }
 
 #[async_trait]
