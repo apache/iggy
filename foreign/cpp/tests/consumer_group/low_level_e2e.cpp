@@ -18,7 +18,6 @@
  */
 
 #include <cstddef>
-#include <cstdint>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -477,8 +476,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupReducesMembersCount) {
 
     ASSERT_NO_THROW(first->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                        "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
+                                        0, "server_default"));
     ASSERT_NO_THROW(first->create_consumer_group(make_string_identifier(stream_name),
                                                  make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
