@@ -66,6 +66,13 @@ inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const c
     }
     return snapshot_types;
 }
+
+struct TrackedConsumerGroup {
+    std::string stream_name;
+    std::string topic_name;
+    std::string group_name;
+};
+
 class E2ETestFixture : public ::testing::Test {
   public:
     ~E2ETestFixture() { CleanupBestEffort(); }
@@ -120,14 +127,40 @@ class E2ETestFixture : public ::testing::Test {
 
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
     void TrackStream(const std::uint32_t stream_id) { tracked_stream_ids_.push_back(stream_id); }
+    void TrackConsumerGroup(const std::string &stream_name,
+                            const std::string &topic_name,
+                            const std::string &group_name) {
+        tracked_consumer_groups_.push_back({stream_name, topic_name, group_name});
+    }
     void ForgetTrackedStream(const std::string &stream_name) {
         tracked_stream_names_.erase(
             std::remove(tracked_stream_names_.begin(), tracked_stream_names_.end(), stream_name),
             tracked_stream_names_.end());
+        for (std::size_t i = 0; i < tracked_consumer_groups_.size();) {
+            const auto &group = tracked_consumer_groups_[i];
+            if (group.stream_name == stream_name) {
+                ForgetTrackedConsumerGroup(group.stream_name, group.topic_name, group.group_name);
+                continue;
+            }
+            ++i;
+        }
     }
     void ForgetTrackedStream(const std::uint32_t stream_id) {
         tracked_stream_ids_.erase(std::remove(tracked_stream_ids_.begin(), tracked_stream_ids_.end(), stream_id),
                                   tracked_stream_ids_.end());
+    }
+    void ForgetTrackedConsumerGroup(const std::string &stream_name,
+                                    const std::string &topic_name,
+                                    const std::string &group_name) {
+        for (std::size_t i = 0; i < tracked_consumer_groups_.size();) {
+            const auto &tracked_group = tracked_consumer_groups_[i];
+            if (tracked_group.stream_name == stream_name && tracked_group.topic_name == topic_name &&
+                tracked_group.group_name == group_name) {
+                tracked_consumer_groups_.erase(tracked_consumer_groups_.begin() + i);
+                continue;
+            }
+            ++i;
+        }
     }
 
     void DeleteClient(iggy::ffi::Client *&client) {
@@ -138,12 +171,14 @@ class E2ETestFixture : public ::testing::Test {
     }
 
     void Cleanup() {
+        CleanupConsumerGroups();
         CleanupStreams();
         CleanupClients();
     }
 
   private:
     void CleanupBestEffort() noexcept {
+        CleanupConsumerGroupsBestEffort();
         CleanupStreamsBestEffort();
         CleanupClientsBestEffort();
     }
@@ -179,6 +214,28 @@ class E2ETestFixture : public ::testing::Test {
         tracked_stream_ids_.clear();
     }
 
+    void CleanupConsumerGroups() {
+        if (tracked_consumer_groups_.empty()) {
+            return;
+        }
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NE(cleanup_client, nullptr);
+        if (cleanup_client != nullptr) {
+            EXPECT_NO_THROW(cleanup_client->connect());
+            EXPECT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
+            for (const auto &group : tracked_consumer_groups_) {
+                EXPECT_NO_THROW(cleanup_client->delete_consumer_group(make_string_identifier(group.stream_name),
+                                                                      make_string_identifier(group.topic_name),
+                                                                      make_string_identifier(group.group_name)));
+            }
+            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
+        }
+
+        tracked_consumer_groups_.clear();
+    }
+
     void CleanupStreamsBestEffort() noexcept {
         if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
             return;
@@ -211,6 +268,36 @@ class E2ETestFixture : public ::testing::Test {
         tracked_stream_ids_.clear();
     }
 
+    void CleanupConsumerGroupsBestEffort() noexcept {
+        if (tracked_consumer_groups_.empty()) {
+            return;
+        }
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        try {
+            cleanup_client = iggy::ffi::new_connection("");
+            if (cleanup_client != nullptr) {
+                cleanup_client->connect();
+                cleanup_client->login_user("iggy", "iggy");
+                for (const auto &group : tracked_consumer_groups_) {
+                    cleanup_client->delete_consumer_group(make_string_identifier(group.stream_name),
+                                                          make_string_identifier(group.topic_name),
+                                                          make_string_identifier(group.group_name));
+                }
+            }
+        } catch (...) {
+        }
+
+        if (cleanup_client != nullptr) {
+            try {
+                iggy::ffi::delete_client(cleanup_client);
+            } catch (...) {
+            }
+        }
+
+        tracked_consumer_groups_.clear();
+    }
+
     void CleanupClients() {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
@@ -235,4 +322,5 @@ class E2ETestFixture : public ::testing::Test {
     std::vector<iggy::ffi::Client *> clients_;
     std::vector<std::string> tracked_stream_names_;
     std::vector<std::uint32_t> tracked_stream_ids_;
+    std::vector<TrackedConsumerGroup> tracked_consumer_groups_;
 };
