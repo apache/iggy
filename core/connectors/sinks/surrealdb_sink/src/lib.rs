@@ -601,6 +601,7 @@ impl SurrealDbSink {
         messages: &[ConsumedMessage],
     ) -> Result<(), Error> {
         let mut successful_inserts = 0u64;
+        let mut last_error = None;
         let record_id_prefix = RecordIdPrefix::new(topic_metadata);
 
         for batch in messages.chunks(self.batch_size) {
@@ -609,14 +610,16 @@ impl SurrealDbSink {
                 .await;
             successful_inserts += outcome.inserted_count;
 
-            if let Some(error) = outcome.error {
+            if let Some(batch_error) = outcome.error {
                 self.insertion_errors
                     .fetch_add(outcome.error_count, Ordering::Relaxed);
                 error!(
-                    "Failed to insert SurrealDB batch for connector ID: {}, table: {}, error: {error}",
-                    self.id, self.table
+                    "Failed to insert SurrealDB batch of {} messages for connector ID: {}, table: {}, error: {batch_error}",
+                    batch.len(),
+                    self.id,
+                    self.table
                 );
-                return Err(error);
+                last_error = Some(batch_error);
             }
         }
 
@@ -635,7 +638,11 @@ impl SurrealDbSink {
             );
         }
 
-        Ok(())
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     async fn insert_batch(
@@ -654,20 +661,33 @@ impl SurrealDbSink {
         }
 
         let mut records = Vec::with_capacity(messages.len());
+        let mut record_error_count = 0u64;
+        let mut last_record_error = None;
         for message in messages {
             match self.build_record(record_id_prefix, topic_metadata, messages_metadata, message) {
                 Ok(record) => records.push(record),
                 Err(error) => {
-                    return BatchInsertOutcome {
-                        inserted_count: 0,
-                        error_count: messages.len() as u64,
-                        error: Some(error),
-                    };
+                    record_error_count += 1;
+                    last_record_error = Some(error);
                 }
             }
         }
 
-        self.insert_records_with_retry(records).await
+        if records.is_empty() {
+            return BatchInsertOutcome {
+                inserted_count: 0,
+                error_count: record_error_count,
+                error: last_record_error,
+            };
+        }
+
+        let mut outcome = self.insert_records_with_retry(records).await;
+        outcome.error_count += record_error_count;
+        if outcome.error.is_none() {
+            outcome.error = last_record_error;
+        }
+
+        outcome
     }
 
     async fn insert_records_with_retry(&self, records: Vec<Value>) -> BatchInsertOutcome {
@@ -783,15 +803,15 @@ impl SurrealDbSink {
             );
             record.insert(
                 "iggy_partition_id".to_string(),
-                Value::Number(messages_metadata.partition_id.into()),
+                Value::String(messages_metadata.partition_id.to_string()),
             );
             record.insert(
                 "iggy_offset".to_string(),
-                Value::Number(message.offset.into()),
+                Value::String(message.offset.to_string()),
             );
             record.insert(
                 "iggy_timestamp".to_string(),
-                Value::Number(message.timestamp.into()),
+                Value::String(message.timestamp.to_string()),
             );
             record.insert(
                 "iggy_schema".to_string(),
@@ -809,7 +829,7 @@ impl SurrealDbSink {
         if self.include_origin_timestamp {
             record.insert(
                 "iggy_origin_timestamp".to_string(),
-                Value::Number(message.origin_timestamp.into()),
+                Value::String(message.origin_timestamp.to_string()),
             );
         }
 
@@ -1523,19 +1543,30 @@ mod tests {
         assert_eq!(object.get("iggy_message_id"), Some(&json!("42")));
         assert_eq!(object.get("iggy_stream"), Some(&json!("test_stream")));
         assert_eq!(object.get("iggy_topic"), Some(&json!("test_topic")));
-        assert_eq!(object.get("iggy_partition_id"), Some(&json!(7)));
-        assert_eq!(object.get("iggy_offset"), Some(&json!(9)));
+        assert_eq!(object.get("iggy_partition_id"), Some(&json!("7")));
+        assert_eq!(object.get("iggy_offset"), Some(&json!("9")));
+        assert_eq!(
+            object.get("iggy_timestamp"),
+            Some(&json!("1700000000000000"))
+        );
         assert_eq!(object.get("iggy_checksum"), Some(&json!("123")));
+        assert_eq!(
+            object.get("iggy_origin_timestamp"),
+            Some(&json!("1700000000000001"))
+        );
         assert_eq!(object.get("payload"), Some(&json!({"event": "created"})));
         assert_eq!(object.get("payload_encoding"), Some(&json!("json")));
         assert!(object.contains_key("iggy_headers"));
     }
 
     #[test]
-    fn given_large_checksum_should_build_record_with_lossless_checksum() {
+    fn given_large_u64_metadata_should_build_record_with_lossless_strings() {
         let sink = SurrealDbSink::new(1, test_config());
-        let mut message = test_message(Payload::Text("large-checksum".to_string()));
+        let mut message = test_message(Payload::Text("large-metadata".to_string()));
+        message.offset = u64::MAX;
+        message.timestamp = u64::MAX;
         message.checksum = u64::MAX;
+        message.origin_timestamp = u64::MAX;
         let topic_metadata = test_topic_metadata();
         let record_id_prefix = RecordIdPrefix::new(&topic_metadata);
 
@@ -1550,7 +1581,19 @@ mod tests {
         let object = record.as_object().expect("record should be object");
 
         assert_eq!(
+            object.get("iggy_offset"),
+            Some(&json!("18446744073709551615"))
+        );
+        assert_eq!(
+            object.get("iggy_timestamp"),
+            Some(&json!("18446744073709551615"))
+        );
+        assert_eq!(
             object.get("iggy_checksum"),
+            Some(&json!("18446744073709551615"))
+        );
+        assert_eq!(
+            object.get("iggy_origin_timestamp"),
             Some(&json!("18446744073709551615"))
         );
     }
@@ -1584,13 +1627,14 @@ mod tests {
     }
 
     #[test]
-    fn given_record_build_failure_in_batch_should_count_rejected_batch() {
+    fn given_invalid_chunks_when_processing_messages_should_process_all_chunks() {
         let mut config = test_config();
         config.payload_format = Some("json".to_string());
+        config.batch_size = Some(1);
         let sink = SurrealDbSink::new(1, config);
         let messages = [
             test_message(Payload::Raw(b"not-json".to_vec())),
-            test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
+            test_message(Payload::Raw(b"also-not-json".to_vec())),
         ];
 
         tokio::runtime::Runtime::new()
@@ -1605,6 +1649,34 @@ mod tests {
 
         assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 0);
         assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn given_malformed_record_in_batch_should_still_attempt_valid_records() {
+        let mut config = test_config();
+        config.payload_format = Some("json".to_string());
+        let sink = SurrealDbSink::new(1, config);
+        let messages = [
+            test_message(Payload::Raw(b"not-json".to_vec())),
+            test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
+        ];
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let outcome = sink
+                    .insert_batch(
+                        &messages,
+                        &RecordIdPrefix::new(&test_topic_metadata()),
+                        &test_topic_metadata(),
+                        &test_messages_metadata(),
+                    )
+                    .await;
+
+                assert_eq!(outcome.inserted_count, 0);
+                assert_eq!(outcome.error_count, 2);
+                assert!(matches!(outcome.error, Some(Error::InitError(_))));
+            });
     }
 
     #[test]
