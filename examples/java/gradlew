@@ -112,7 +112,7 @@ die () {
 #
 ##############################################################################
 
-GRADLE_WRAPPER_VERSION=9.5.1
+GRADLE_WRAPPER_VERSION=9.6.0
 REQUIRED_WRAPPER_JAR_CHECKSUM="497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7"
 
 for _ in 1 2 3; do
