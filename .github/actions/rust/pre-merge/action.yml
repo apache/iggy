@@ -308,6 +308,19 @@ runs:
         ls -la codecov.json
       shell: bash
 
+    - name: Smoke-launch iggy-server (kernel version check)
+      if: inputs.task == 'test-1'
+      run: |
+        cargo build --locked --bin iggy-server 2>&1
+        timeout 3 ./target/debug/iggy-server 2>&1 | tee /tmp/iggy-smoke.log || true
+        if grep -q "requires Linux kernel" /tmp/iggy-smoke.log; then
+          echo "ERROR: kernel version check rejected the CI runner kernel"
+          cat /tmp/iggy-smoke.log
+          exit 1
+        fi
+        echo "Kernel check passed on this runner"
+      shell: bash
+
     - name: Backwards compatibility check
       if: inputs.task == 'compat' && (github.event_name != 'pull_request' || !contains(join(github.event.pull_request.labels.*.name, ','), 'breaking:storage'))
       run: |
