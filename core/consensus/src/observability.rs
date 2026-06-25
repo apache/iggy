@@ -622,6 +622,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
         Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
         Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
+        Operation::TruncatePartition => "truncate_partition",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
