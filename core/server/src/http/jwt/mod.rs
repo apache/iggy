@@ -22,12 +22,3 @@ pub mod middleware;
 pub mod storage;
 
 pub const COMPONENT: &str = "HTTP_JWT";
-
-pub fn install_default_crypto_provider() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-
-    INSTALL.call_once(|| {
-        // Cargo feature unification can enable multiple jsonwebtoken providers.
-        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
-    });
-}

@@ -7,6 +7,10 @@ record uses a deterministic SurrealDB record id derived from stream, topic,
 partition, offset and Iggy message id, so replayed batches are idempotent and
 existing records are left untouched.
 
+Persistent sink failures are at-most-once from the runtime's perspective:
+messages may already be committed in Iggy before this connector exhausts its
+write attempts, so failed writes are logged but not redelivered.
+
 ## Configuration
 
 ```toml
@@ -64,7 +68,7 @@ verbose_logging = false
 | `auto_define_table` | `false` | Runs `DEFINE TABLE IF NOT EXISTS <table> SCHEMALESS`. |
 | `define_indexes` | `false` | Defines an offset index on stream/topic/partition/offset. Requires `auto_define_table`. |
 | `batch_size` | `1000` | Maximum number of records per SurrealDB request. |
-| `payload_format` | `auto` | `auto`, `json`, `text`, or `base64`. |
+| `payload_format` | `auto` | `auto`, `json`, `text`, `base64`, or `binary` (`binary` is an alias for `base64`). |
 | `include_metadata` | `true` | Stores stream/topic/partition/offset/timestamps/schema fields. |
 | `include_headers` | `true` | Stores Iggy headers as a deterministic object. Raw headers are base64 encoded. |
 | `include_checksum` | `true` | Stores `iggy_checksum`. |
@@ -89,3 +93,7 @@ With metadata enabled, records contain:
 
 `payload_format = "auto"` stores decoded JSON payloads as queryable SurrealDB
 values, text payloads as strings, and binary payloads as base64 strings.
+
+The `messages_processed` counter reports valid records submitted to SurrealDB.
+With `INSERT IGNORE`, duplicates can be ignored by SurrealDB while still being
+counted as submitted.

@@ -54,10 +54,17 @@ pub struct SurrealDbSink {
     client: Mutex<Option<SurrealDbClient>>,
     reconnecting: AtomicBool,
     base_url: String,
-    config: SurrealDbSinkConfig,
+    endpoint: String,
+    namespace: String,
+    database: String,
     table: String,
+    username: Option<String>,
+    password: Option<SecretString>,
+    auth_scope_config: Option<String>,
     auth_scope: AuthScope,
+    payload_format_config: Option<String>,
     payload_format: PayloadFormat,
+    use_tls: bool,
     batch_size: usize,
     query_timeout: Duration,
     max_retries: u32,
@@ -121,13 +128,6 @@ impl AuthScope {
             None => Ok(AuthScope::Root),
         }
     }
-
-    fn from_config(value: Option<&str>) -> Self {
-        Self::parse_config(value).unwrap_or_else(|error| {
-            warn!("{error}. Defaulting to no authentication until config validation runs.");
-            AuthScope::None
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,13 +151,6 @@ impl PayloadFormat {
             ))),
             None => Ok(PayloadFormat::Auto),
         }
-    }
-
-    fn from_config(value: Option<&str>) -> Self {
-        Self::parse_config(value).unwrap_or_else(|error| {
-            warn!("{error}. Defaulting to auto until config validation runs.");
-            PayloadFormat::Auto
-        })
     }
 }
 
@@ -205,86 +198,88 @@ impl fmt::Display for SurrealDbRequestError {
 
 impl SurrealDbSink {
     pub fn new(id: u32, config: SurrealDbSinkConfig) -> Self {
+        let endpoint = config.endpoint.clone();
+        let namespace = config.namespace.clone();
+        let database = config.database.clone();
         let table = config.table.clone();
-        let base_url = build_base_url(&config.endpoint, config.use_tls.unwrap_or(false));
-        let auth_scope = AuthScope::from_config(config.auth_scope.as_deref());
-        let payload_format = PayloadFormat::from_config(config.payload_format.as_deref());
+        let username = config.username.clone();
+        let password = config.password.clone();
+        let auth_scope_config = config.auth_scope.clone();
+        let payload_format_config = config.payload_format.clone();
+        let use_tls = config.use_tls.unwrap_or(false);
+        let base_url = build_base_url(&endpoint, use_tls);
         let batch_size = config
             .batch_size
             .unwrap_or(DEFAULT_BATCH_SIZE as u32)
             .max(1) as usize;
         let query_timeout = parse_duration(config.query_timeout.as_deref(), DEFAULT_QUERY_TIMEOUT);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-        let max_retry_delay =
+        let mut max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        let max_retries = match config.max_retries {
+            Some(0) => {
+                warn!("SurrealDB sink ID: {id} max_retries must be at least 1. Using 1 attempt.");
+                1
+            }
+            Some(max_retries) => max_retries,
+            None => DEFAULT_MAX_RETRIES,
+        };
+        if max_retry_delay < retry_delay {
+            warn!(
+                "SurrealDB sink ID: {id} max_retry_delay is smaller than retry_delay. Using retry_delay as max_retry_delay."
+            );
+            max_retry_delay = retry_delay;
+        }
+        let include_metadata = config.include_metadata.unwrap_or(true);
+        let include_headers = config.include_headers.unwrap_or(true);
+        let include_checksum = config.include_checksum.unwrap_or(true);
+        let include_origin_timestamp = config.include_origin_timestamp.unwrap_or(true);
+        let auto_define_table = config.auto_define_table.unwrap_or(false);
+        let define_indexes = config.define_indexes.unwrap_or(false);
+        let verbose = config.verbose_logging.unwrap_or(false);
 
         SurrealDbSink {
             id,
             client: Mutex::new(None),
             reconnecting: AtomicBool::new(false),
             base_url,
-            config,
+            endpoint,
+            namespace,
+            database,
             table,
-            auth_scope,
-            payload_format,
+            username,
+            password,
+            auth_scope_config,
+            auth_scope: AuthScope::Root,
+            payload_format_config,
+            payload_format: PayloadFormat::Auto,
+            use_tls,
             batch_size,
             query_timeout,
-            max_retries: DEFAULT_MAX_RETRIES,
+            max_retries,
             retry_delay,
             max_retry_delay,
-            include_metadata: true,
-            include_headers: true,
-            include_checksum: true,
-            include_origin_timestamp: true,
-            auto_define_table: false,
-            define_indexes: false,
-            verbose: false,
+            include_metadata,
+            include_headers,
+            include_checksum,
+            include_origin_timestamp,
+            auto_define_table,
+            define_indexes,
+            verbose,
             messages_processed: AtomicU64::new(0),
             insertion_errors: AtomicU64::new(0),
         }
-        .with_config_defaults()
-    }
-
-    fn with_config_defaults(mut self) -> Self {
-        self.max_retries = match self.config.max_retries {
-            Some(0) => {
-                warn!(
-                    "SurrealDB sink ID: {} max_retries must be at least 1. Using 1 attempt.",
-                    self.id
-                );
-                1
-            }
-            Some(max_retries) => max_retries,
-            None => DEFAULT_MAX_RETRIES,
-        };
-        self.include_metadata = self.config.include_metadata.unwrap_or(true);
-        self.include_headers = self.config.include_headers.unwrap_or(true);
-        self.include_checksum = self.config.include_checksum.unwrap_or(true);
-        self.include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
-        self.auto_define_table = self.config.auto_define_table.unwrap_or(false);
-        self.define_indexes = self.config.define_indexes.unwrap_or(false);
-        self.verbose = self.config.verbose_logging.unwrap_or(false);
-
-        if self.max_retry_delay < self.retry_delay {
-            warn!(
-                "SurrealDB sink ID: {} max_retry_delay is smaller than retry_delay. Using retry_delay as max_retry_delay.",
-                self.id
-            );
-            self.max_retry_delay = self.retry_delay;
-        }
-
-        self
     }
 }
 
 #[async_trait]
 impl Sink for SurrealDbSink {
     async fn open(&mut self) -> Result<(), Error> {
-        self.auth_scope = AuthScope::parse_config(self.config.auth_scope.as_deref())?;
-        self.payload_format = PayloadFormat::parse_config(self.config.payload_format.as_deref())?;
-        validate_endpoint_config(&self.config.endpoint, self.config.use_tls.unwrap_or(false))?;
-        validate_identifier("namespace", &self.config.namespace)?;
-        validate_identifier("database", &self.config.database)?;
+        self.auth_scope = AuthScope::parse_config(self.auth_scope_config.as_deref())?;
+        self.payload_format = PayloadFormat::parse_config(self.payload_format_config.as_deref())?;
+        validate_endpoint_config(&self.endpoint, self.use_tls)?;
+        validate_identifier("namespace", &self.namespace)?;
+        validate_identifier("database", &self.database)?;
         validate_identifier("table", &self.table)?;
 
         if self.auto_define_table && self.auth_scope != AuthScope::Root {
@@ -303,7 +298,7 @@ impl Sink for SurrealDbSink {
 
         info!(
             "Opening SurrealDB sink connector with ID: {}. Endpoint: {}, namespace: {}, database: {}, table: {}",
-            self.id, self.base_url, self.config.namespace, self.config.database, self.table
+            self.id, self.base_url, self.namespace, self.database, self.table
         );
 
         let client = self.connect_and_select().await?;
@@ -321,7 +316,7 @@ impl Sink for SurrealDbSink {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.process_messages(topic_metadata, &messages_metadata, &messages)
+        self.process_messages(topic_metadata, &messages_metadata, messages)
             .await
     }
 
@@ -398,12 +393,12 @@ impl SurrealDbSink {
             return Ok(());
         }
 
-        let username = self.config.username.as_ref().ok_or_else(|| {
+        let username = self.username.as_ref().ok_or_else(|| {
             Error::InitError(
                 "SurrealDB username is required when auth_scope is not none".to_string(),
             )
         })?;
-        let password = self.config.password.as_ref().ok_or_else(|| {
+        let password = self.password.as_ref().ok_or_else(|| {
             Error::InitError(
                 "SurrealDB password is required when auth_scope is not none".to_string(),
             )
@@ -416,16 +411,10 @@ impl SurrealDbSink {
         );
 
         if matches!(self.auth_scope, AuthScope::Namespace | AuthScope::Database) {
-            payload.insert(
-                "ns".to_string(),
-                Value::String(self.config.namespace.clone()),
-            );
+            payload.insert("ns".to_string(), Value::String(self.namespace.clone()));
         }
         if matches!(self.auth_scope, AuthScope::Database) {
-            payload.insert(
-                "db".to_string(),
-                Value::String(self.config.database.clone()),
-            );
+            payload.insert("db".to_string(), Value::String(self.database.clone()));
         }
 
         let response = client
@@ -470,7 +459,7 @@ impl SurrealDbSink {
     async fn ensure_namespace_database(&self, client: &SurrealDbClient) -> Result<(), Error> {
         let query = format!(
             "DEFINE NAMESPACE IF NOT EXISTS {}; USE NS {}; DEFINE DATABASE IF NOT EXISTS {};",
-            self.config.namespace, self.config.namespace, self.config.database
+            self.namespace, self.namespace, self.database
         );
 
         self.execute_sql_without_scope(client, query)
@@ -509,12 +498,8 @@ impl SurrealDbSink {
         client: &SurrealDbClient,
         query: impl Into<Body>,
     ) -> Result<Vec<SurrealSqlStatement>, SurrealDbRequestError> {
-        self.execute_sql_request(
-            client,
-            query,
-            Some((&self.config.namespace, &self.config.database)),
-        )
-        .await
+        self.execute_sql_request(client, query, Some((&self.namespace, &self.database)))
+            .await
     }
 
     async fn execute_sql_without_scope(
@@ -584,10 +569,10 @@ impl SurrealDbSink {
             return request;
         }
 
-        let Some(username) = self.config.username.as_ref() else {
+        let Some(username) = self.username.as_ref() else {
             return request;
         };
-        let Some(password) = self.config.password.as_ref() else {
+        let Some(password) = self.password.as_ref() else {
             return request;
         };
 
@@ -598,13 +583,42 @@ impl SurrealDbSink {
         &self,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        messages: &[ConsumedMessage],
+        messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
         let mut successful_inserts = 0u64;
         let mut last_error = None;
         let record_id_prefix = RecordIdPrefix::new(topic_metadata);
+        let mut batch = Vec::with_capacity(self.batch_size);
 
-        for batch in messages.chunks(self.batch_size) {
+        for message in messages {
+            batch.push(message);
+            if batch.len() == self.batch_size {
+                let batch_len = batch.len();
+                let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(self.batch_size));
+                let outcome = self
+                    .insert_batch(
+                        full_batch,
+                        &record_id_prefix,
+                        topic_metadata,
+                        messages_metadata,
+                    )
+                    .await;
+                successful_inserts += outcome.inserted_count;
+
+                if let Some(batch_error) = outcome.error {
+                    self.insertion_errors
+                        .fetch_add(outcome.error_count, Ordering::Relaxed);
+                    error!(
+                        "Failed to insert SurrealDB batch of {batch_len} messages for connector ID: {}, table: {}, error: {batch_error}",
+                        self.id, self.table
+                    );
+                    last_error = Some(batch_error);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let batch_len = batch.len();
             let outcome = self
                 .insert_batch(batch, &record_id_prefix, topic_metadata, messages_metadata)
                 .await;
@@ -614,10 +628,8 @@ impl SurrealDbSink {
                 self.insertion_errors
                     .fetch_add(outcome.error_count, Ordering::Relaxed);
                 error!(
-                    "Failed to insert SurrealDB batch of {} messages for connector ID: {}, table: {}, error: {batch_error}",
-                    batch.len(),
-                    self.id,
-                    self.table
+                    "Failed to insert SurrealDB batch of {batch_len} messages for connector ID: {}, table: {}, error: {batch_error}",
+                    self.id, self.table
                 );
                 last_error = Some(batch_error);
             }
@@ -647,7 +659,7 @@ impl SurrealDbSink {
 
     async fn insert_batch(
         &self,
-        messages: &[ConsumedMessage],
+        messages: Vec<ConsumedMessage>,
         record_id_prefix: &RecordIdPrefix,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
@@ -683,9 +695,8 @@ impl SurrealDbSink {
 
         let mut outcome = self.insert_records_with_retry(records).await;
         outcome.error_count += record_error_count;
-        if outcome.error.is_none() {
-            outcome.error = last_record_error;
-        }
+        let db_error = outcome.error.take();
+        outcome.error = last_record_error.or(db_error);
 
         outcome
     }
@@ -727,6 +738,17 @@ impl SurrealDbSink {
                 }
                 Err(error) => {
                     let transient = is_transient_error(&error);
+                    attempts += 1;
+
+                    if !transient || attempts >= self.max_retries {
+                        return BatchInsertOutcome {
+                            inserted_count: 0,
+                            error_count: record_count,
+                            error: Some(Error::CannotStoreData(format!(
+                                "SurrealDB batch insert failed after {attempts} attempts: {error}"
+                            ))),
+                        };
+                    }
 
                     if transient && is_connection_error(&error) {
                         match self.reconnect().await {
@@ -742,17 +764,6 @@ impl SurrealDbSink {
                                 };
                             }
                         }
-                    }
-
-                    attempts += 1;
-                    if !transient || attempts >= self.max_retries {
-                        return BatchInsertOutcome {
-                            inserted_count: 0,
-                            error_count: record_count,
-                            error: Some(Error::CannotStoreData(format!(
-                                "SurrealDB batch insert failed after {attempts} attempts: {error}"
-                            ))),
-                        };
                     }
 
                     let delay = jitter(exponential_backoff(
@@ -775,7 +786,7 @@ impl SurrealDbSink {
         record_id_prefix: &RecordIdPrefix,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        message: &ConsumedMessage,
+        message: ConsumedMessage,
     ) -> Result<Value, Error> {
         let mut record = Map::new();
         record.insert(
@@ -840,7 +851,7 @@ impl SurrealDbSink {
             record.insert("iggy_headers".to_string(), encode_headers(headers)?);
         }
 
-        let payload = self.build_payload_document(&message.payload)?;
+        let payload = self.build_payload_document(message.payload)?;
         record.insert("payload".to_string(), payload.value);
         record.insert(
             "payload_encoding".to_string(),
@@ -850,7 +861,7 @@ impl SurrealDbSink {
         Ok(Value::Object(record))
     }
 
-    fn build_payload_document(&self, payload: &Payload) -> Result<PayloadDocument, Error> {
+    fn build_payload_document(&self, payload: Payload) -> Result<PayloadDocument, Error> {
         match self.payload_format {
             PayloadFormat::Auto => build_auto_payload_document(payload),
             PayloadFormat::Json => build_json_payload_document(payload),
@@ -871,14 +882,14 @@ fn build_insert_query(table: &str, records: &[Value]) -> Result<Bytes, Error> {
     Ok(Bytes::from(query))
 }
 
-fn build_auto_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
+fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(value),
+            value: owned_value_to_serde_json(&value),
             encoding: ENCODING_JSON,
         }),
         Payload::Text(text) | Payload::Proto(text) => Ok(PayloadDocument {
-            value: Value::String(text.clone()),
+            value: Value::String(text),
             encoding: ENCODING_TEXT,
         }),
         Payload::Raw(_) | Payload::FlatBuffer(_) | Payload::Avro(_) => {
@@ -887,14 +898,14 @@ fn build_auto_payload_document(payload: &Payload) -> Result<PayloadDocument, Err
     }
 }
 
-fn build_json_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
+fn build_json_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(value),
+            value: owned_value_to_serde_json(&value),
             encoding: ENCODING_JSON,
         }),
         _ => {
-            let bytes = payload.try_to_bytes()?;
+            let bytes = payload.try_into_vec()?;
             let value = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::InvalidRecordValue(format!("Invalid JSON payload: {e}")))?;
             Ok(PayloadDocument {
@@ -905,14 +916,14 @@ fn build_json_payload_document(payload: &Payload) -> Result<PayloadDocument, Err
     }
 }
 
-fn build_text_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
+fn build_text_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
     match payload {
         Payload::Text(text) | Payload::Proto(text) => Ok(PayloadDocument {
-            value: Value::String(text.clone()),
+            value: Value::String(text),
             encoding: ENCODING_TEXT,
         }),
         _ => {
-            let bytes = payload.try_to_bytes()?;
+            let bytes = payload.try_into_vec()?;
             let text = String::from_utf8(bytes)
                 .map_err(|e| Error::InvalidRecordValue(format!("Invalid UTF-8 payload: {e}")))?;
             Ok(PayloadDocument {
@@ -923,8 +934,8 @@ fn build_text_payload_document(payload: &Payload) -> Result<PayloadDocument, Err
     }
 }
 
-fn build_base64_payload_document(payload: &Payload) -> Result<PayloadDocument, Error> {
-    let bytes = payload.try_to_bytes()?;
+fn build_base64_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
+    let bytes = payload.try_into_vec()?;
     Ok(PayloadDocument {
         value: Value::String(general_purpose::STANDARD.encode(bytes)),
         encoding: ENCODING_BASE64,
@@ -1048,6 +1059,13 @@ fn validate_endpoint_config(endpoint: &str, use_tls: bool) -> Result<(), Error> 
         return Err(Error::InvalidConfigValue(format!(
             "Invalid SurrealDB endpoint '{endpoint}': host is required"
         )));
+    }
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::InvalidConfigValue(
+            "SurrealDB endpoint must not include embedded credentials; use username/password config fields instead"
+                .to_string(),
+        ));
     }
 
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
@@ -1245,8 +1263,10 @@ mod tests {
 
         let sink = SurrealDbSink::new(1, config);
 
-        assert_eq!(sink.auth_scope, AuthScope::Database);
-        assert_eq!(sink.payload_format, PayloadFormat::Base64);
+        assert_eq!(sink.auth_scope_config.as_deref(), Some("database"));
+        assert_eq!(sink.payload_format_config.as_deref(), Some("base64"));
+        assert_eq!(sink.auth_scope, AuthScope::Root);
+        assert_eq!(sink.payload_format, PayloadFormat::Auto);
         assert_eq!(sink.batch_size, 10);
         assert_eq!(sink.query_timeout, Duration::from_secs(5));
         assert_eq!(sink.max_retries, 5);
@@ -1266,7 +1286,8 @@ mod tests {
         let mut config = test_config();
         config.max_retries = Some(0);
 
-        let sink = SurrealDbSink::new(1, config);
+        let mut sink = SurrealDbSink::new(1, config);
+        sink.payload_format = PayloadFormat::Json;
 
         assert_eq!(sink.max_retries, 1);
     }
@@ -1277,7 +1298,8 @@ mod tests {
         config.retry_delay = Some("5s".to_string());
         config.max_retry_delay = Some("100ms".to_string());
 
-        let sink = SurrealDbSink::new(1, config);
+        let mut sink = SurrealDbSink::new(1, config);
+        sink.payload_format = PayloadFormat::Json;
 
         assert_eq!(sink.retry_delay, Duration::from_secs(5));
         assert_eq!(sink.max_retry_delay, Duration::from_secs(5));
@@ -1292,12 +1314,16 @@ mod tests {
             (Some("text"), PayloadFormat::Text),
             (Some("base64"), PayloadFormat::Base64),
             (Some("binary"), PayloadFormat::Base64),
-            (Some("unknown"), PayloadFormat::Auto),
         ];
 
         for (input, expected) in cases {
-            assert_eq!(PayloadFormat::from_config(input), expected);
+            assert_eq!(PayloadFormat::parse_config(input).unwrap(), expected);
         }
+
+        assert!(matches!(
+            PayloadFormat::parse_config(Some("unknown")),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     #[test]
@@ -1308,12 +1334,16 @@ mod tests {
             (Some("namespace"), AuthScope::Namespace),
             (Some("database"), AuthScope::Database),
             (Some("none"), AuthScope::None),
-            (Some("unknown"), AuthScope::None),
         ];
 
         for (input, expected) in cases {
-            assert_eq!(AuthScope::from_config(input), expected);
+            assert_eq!(AuthScope::parse_config(input).unwrap(), expected);
         }
+
+        assert!(matches!(
+            AuthScope::parse_config(Some("unknown")),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     #[test]
@@ -1399,6 +1429,8 @@ mod tests {
         assert!(validate_identifier("table", "").is_err());
         assert!(validate_identifier("table", "9messages").is_err());
         assert!(validate_identifier("table", "messages-name").is_err());
+        assert!(validate_identifier("table", "messages]").is_err());
+        assert!(validate_identifier("table", "messages\"").is_err());
         assert!(validate_identifier("table", "messages; DROP TABLE x").is_err());
     }
 
@@ -1433,9 +1465,34 @@ mod tests {
     }
 
     #[test]
+    fn given_adversarial_record_values_should_build_escaped_insert_query() {
+        let records = [json!({
+            "id": "record_\"[]",
+            "payload": {
+                "text": "quote \" bracket ] brace } semi ; newline \n"
+            }
+        })];
+        let query = String::from_utf8(
+            build_insert_query("iggy_messages", &records)
+                .expect("query should build")
+                .to_vec(),
+        )
+        .expect("query should be valid UTF-8");
+        let json_start = "INSERT IGNORE INTO iggy_messages ";
+        let json_end = " RETURN NONE;";
+        assert!(query.starts_with(json_start));
+        assert!(query.ends_with(json_end));
+
+        let encoded_records = &query[json_start.len()..query.len() - json_end.len()];
+        let decoded_records: Vec<Value> =
+            serde_json::from_str(encoded_records).expect("records should stay valid JSON");
+        assert_eq!(decoded_records, records.to_vec());
+    }
+
+    #[test]
     fn given_auto_payload_json_should_store_queryable_json() {
         let payload = json_payload(json!({"name": "Alice", "active": true}));
-        let document = build_auto_payload_document(&payload).expect("Failed to build payload");
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_JSON);
         assert_eq!(document.value, json!({"name": "Alice", "active": true}));
@@ -1444,7 +1501,7 @@ mod tests {
     #[test]
     fn given_auto_payload_text_should_store_text() {
         let payload = Payload::Text("hello".to_string());
-        let document = build_auto_payload_document(&payload).expect("Failed to build payload");
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_TEXT);
         assert_eq!(document.value, Value::String("hello".to_string()));
@@ -1453,7 +1510,7 @@ mod tests {
     #[test]
     fn given_auto_payload_raw_should_store_base64() {
         let payload = Payload::Raw(vec![0, 1, 2, 255]);
-        let document = build_auto_payload_document(&payload).expect("Failed to build payload");
+        let document = build_auto_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_BASE64);
         assert_eq!(document.value, Value::String("AAEC/w==".to_string()));
@@ -1462,7 +1519,7 @@ mod tests {
     #[test]
     fn given_json_payload_format_should_parse_raw_json() {
         let payload = Payload::Raw(br#"{"count":3}"#.to_vec());
-        let document = build_json_payload_document(&payload).expect("Failed to build payload");
+        let document = build_json_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_JSON);
         assert_eq!(document.value, json!({"count": 3}));
@@ -1471,7 +1528,7 @@ mod tests {
     #[test]
     fn given_json_payload_format_when_invalid_should_fail() {
         let payload = Payload::Raw(b"not-json".to_vec());
-        let result = build_json_payload_document(&payload);
+        let result = build_json_payload_document(payload);
 
         assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
     }
@@ -1479,7 +1536,7 @@ mod tests {
     #[test]
     fn given_text_payload_format_when_invalid_utf8_should_fail() {
         let payload = Payload::Raw(vec![0xff, 0xfe]);
-        let result = build_text_payload_document(&payload);
+        let result = build_text_payload_document(payload);
 
         assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
     }
@@ -1528,7 +1585,7 @@ mod tests {
                 &record_id_prefix,
                 &topic_metadata,
                 &test_messages_metadata(),
-                &message,
+                message,
             )
             .expect("Failed to build record");
         let object = record.as_object().expect("record should be object");
@@ -1575,7 +1632,7 @@ mod tests {
                 &record_id_prefix,
                 &topic_metadata,
                 &test_messages_metadata(),
-                &message,
+                message,
             )
             .expect("Failed to build record");
         let object = record.as_object().expect("record should be object");
@@ -1602,7 +1659,8 @@ mod tests {
     fn given_invalid_batch_when_processing_messages_should_record_error_and_return_error() {
         let mut config = test_config();
         config.payload_format = Some("json".to_string());
-        let sink = SurrealDbSink::new(1, config);
+        let mut sink = SurrealDbSink::new(1, config);
+        sink.payload_format = PayloadFormat::Json;
         let message = test_message(Payload::Raw(b"not-json".to_vec()));
 
         tokio::runtime::Runtime::new()
@@ -1612,13 +1670,13 @@ mod tests {
                     .process_messages(
                         &test_topic_metadata(),
                         &test_messages_metadata(),
-                        &[message],
+                        vec![message],
                     )
                     .await;
 
                 assert!(
                     matches!(result, Err(Error::InvalidRecordValue(_))),
-                    "batch failures should be returned to the runtime"
+                    "batch failures should be observable by direct plugin callers"
                 );
             });
 
@@ -1631,8 +1689,9 @@ mod tests {
         let mut config = test_config();
         config.payload_format = Some("json".to_string());
         config.batch_size = Some(1);
-        let sink = SurrealDbSink::new(1, config);
-        let messages = [
+        let mut sink = SurrealDbSink::new(1, config);
+        sink.payload_format = PayloadFormat::Json;
+        let messages = vec![
             test_message(Payload::Raw(b"not-json".to_vec())),
             test_message(Payload::Raw(b"also-not-json".to_vec())),
         ];
@@ -1641,7 +1700,7 @@ mod tests {
             .expect("runtime should start")
             .block_on(async {
                 let result = sink
-                    .process_messages(&test_topic_metadata(), &test_messages_metadata(), &messages)
+                    .process_messages(&test_topic_metadata(), &test_messages_metadata(), messages)
                     .await;
 
                 assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
@@ -1656,7 +1715,7 @@ mod tests {
         let mut config = test_config();
         config.payload_format = Some("json".to_string());
         let sink = SurrealDbSink::new(1, config);
-        let messages = [
+        let messages = vec![
             test_message(Payload::Raw(b"not-json".to_vec())),
             test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
         ];
@@ -1666,7 +1725,7 @@ mod tests {
             .block_on(async {
                 let outcome = sink
                     .insert_batch(
-                        &messages,
+                        messages,
                         &RecordIdPrefix::new(&test_topic_metadata()),
                         &test_topic_metadata(),
                         &test_messages_metadata(),
@@ -1707,6 +1766,7 @@ mod tests {
     fn given_endpoint_shapes_should_validate_expected_values() {
         assert!(validate_endpoint_config("127.0.0.1:8000", false).is_ok());
         assert!(validate_endpoint_config("http://127.0.0.1:8000", true).is_ok());
+        assert!(validate_endpoint_config("http://user:pass@127.0.0.1:8000", false).is_err());
         assert!(validate_endpoint_config("http://127.0.0.1:8000/path", false).is_err());
         assert!(validate_endpoint_config("http://127.0.0.1:8000?x=1", false).is_err());
     }
@@ -1769,7 +1829,7 @@ mod tests {
                 &record_id_prefix,
                 &topic_metadata,
                 &test_messages_metadata(),
-                &message,
+                message,
             )
             .expect("Failed to build record");
         let object = record.as_object().expect("record should be object");

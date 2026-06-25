@@ -28,24 +28,54 @@ use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
 
-pub struct SurrealDbSinkFixture {
-    container: SurrealDbContainer,
-    schema: &'static str,
-    payload_format: &'static str,
-    batch_size: Option<usize>,
+pub trait SurrealDbSinkProfile {
+    const SCHEMA: &'static str;
+    const BATCH_SIZE: Option<usize>;
 }
 
-impl SurrealDbOps for SurrealDbSinkFixture {
+pub struct SurrealDbSinkJsonProfile;
+pub struct SurrealDbSinkRawProfile;
+pub struct SurrealDbSinkBatchProfile;
+
+impl SurrealDbSinkProfile for SurrealDbSinkJsonProfile {
+    const SCHEMA: &'static str = "json";
+    const BATCH_SIZE: Option<usize> = None;
+}
+
+impl SurrealDbSinkProfile for SurrealDbSinkRawProfile {
+    const SCHEMA: &'static str = "raw";
+    const BATCH_SIZE: Option<usize> = None;
+}
+
+impl SurrealDbSinkProfile for SurrealDbSinkBatchProfile {
+    const SCHEMA: &'static str = "json";
+    const BATCH_SIZE: Option<usize> = Some(10);
+}
+
+pub type SurrealDbSinkJsonFixture = SurrealDbSinkFixture<SurrealDbSinkJsonProfile>;
+pub type SurrealDbSinkRawFixture = SurrealDbSinkFixture<SurrealDbSinkRawProfile>;
+pub type SurrealDbSinkBatchFixture = SurrealDbSinkFixture<SurrealDbSinkBatchProfile>;
+
+pub struct SurrealDbSinkFixture<P = SurrealDbSinkJsonProfile> {
+    container: SurrealDbContainer,
+    profile: PhantomData<P>,
+}
+
+impl<P> SurrealDbOps for SurrealDbSinkFixture<P>
+where
+    P: Sync,
+{
     fn container(&self) -> &SurrealDbContainer {
         &self.container
     }
 }
 
-impl SurrealDbSinkFixture {
+impl<P> SurrealDbSinkFixture<P> {
     pub async fn wait_for_records(
         &self,
         client: &SurrealDbClient,
@@ -133,14 +163,15 @@ fn decode_records_sorted_by_offset(value: Value) -> Result<Vec<Value>, TestBinar
 }
 
 #[async_trait]
-impl TestFixture for SurrealDbSinkFixture {
+impl<P> TestFixture for SurrealDbSinkFixture<P>
+where
+    P: SurrealDbSinkProfile + Send + Sync,
+{
     async fn setup() -> Result<Self, TestBinaryError> {
         let container = SurrealDbContainer::start().await?;
         Ok(Self {
             container,
-            schema: "json",
-            payload_format: "auto",
-            batch_size: None,
+            profile: PhantomData,
         })
     }
 
@@ -161,10 +192,7 @@ impl TestFixture for SurrealDbSinkFixture {
         envs.insert(ENV_SINK_AUTH_SCOPE.to_string(), "root".to_string());
         envs.insert(ENV_SINK_AUTO_DEFINE_TABLE.to_string(), "true".to_string());
         envs.insert(ENV_SINK_DEFINE_INDEXES.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SINK_PAYLOAD_FORMAT.to_string(),
-            self.payload_format.to_string(),
-        );
+        envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_string(), "auto".to_string());
         envs.insert(
             ENV_SINK_STREAMS_0_STREAM.to_string(),
             DEFAULT_TEST_STREAM.to_string(),
@@ -173,116 +201,20 @@ impl TestFixture for SurrealDbSinkFixture {
             ENV_SINK_STREAMS_0_TOPICS.to_string(),
             format!("[{}]", DEFAULT_TEST_TOPIC),
         );
-        envs.insert(
-            ENV_SINK_STREAMS_0_SCHEMA.to_string(),
-            self.schema.to_string(),
-        );
+        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), P::SCHEMA.to_string());
         envs.insert(
             ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
-            format!("surrealdb_sink_{}_cg", self.schema),
+            format!("surrealdb_sink_{}_cg", P::SCHEMA),
         );
         envs.insert(
             ENV_SINK_PATH.to_string(),
             "../../target/debug/libiggy_connector_surrealdb_sink".to_string(),
         );
 
-        if let Some(batch_size) = self.batch_size {
+        if let Some(batch_size) = P::BATCH_SIZE {
             envs.insert(ENV_SINK_BATCH_SIZE.to_string(), batch_size.to_string());
         }
 
         envs
-    }
-}
-
-pub struct SurrealDbSinkJsonFixture {
-    inner: SurrealDbSinkFixture,
-}
-
-impl std::ops::Deref for SurrealDbSinkJsonFixture {
-    type Target = SurrealDbSinkFixture;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-#[async_trait]
-impl TestFixture for SurrealDbSinkJsonFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        let container = SurrealDbContainer::start().await?;
-        Ok(Self {
-            inner: SurrealDbSinkFixture {
-                container,
-                schema: "json",
-                payload_format: "auto",
-                batch_size: None,
-            },
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
-    }
-}
-
-pub struct SurrealDbSinkRawFixture {
-    inner: SurrealDbSinkFixture,
-}
-
-impl std::ops::Deref for SurrealDbSinkRawFixture {
-    type Target = SurrealDbSinkFixture;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-#[async_trait]
-impl TestFixture for SurrealDbSinkRawFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        let container = SurrealDbContainer::start().await?;
-        Ok(Self {
-            inner: SurrealDbSinkFixture {
-                container,
-                schema: "raw",
-                payload_format: "auto",
-                batch_size: None,
-            },
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
-    }
-}
-
-pub struct SurrealDbSinkBatchFixture {
-    inner: SurrealDbSinkFixture,
-}
-
-impl std::ops::Deref for SurrealDbSinkBatchFixture {
-    type Target = SurrealDbSinkFixture;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-#[async_trait]
-impl TestFixture for SurrealDbSinkBatchFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
-        let container = SurrealDbContainer::start().await?;
-        Ok(Self {
-            inner: SurrealDbSinkFixture {
-                container,
-                schema: "json",
-                payload_format: "auto",
-                batch_size: Some(10),
-            },
-        })
-    }
-
-    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
     }
 }

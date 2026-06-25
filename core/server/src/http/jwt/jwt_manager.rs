@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::configs::http::{HttpJwtConfig, TrustedIssuerConfig};
+use crate::http::jwt::COMPONENT;
 use crate::http::jwt::json_web_token::{Audience, GeneratedToken, JwtClaims, RevokedAccessToken};
 use crate::http::jwt::jwks::JwksClient;
 use crate::http::jwt::storage::TokenStorage;
-use crate::http::jwt::{COMPONENT, install_default_crypto_provider};
 use crate::streaming::persistence::persister::PersisterKind;
 use ahash::AHashMap;
 use err_trail::ErrContext;
@@ -68,8 +68,6 @@ impl JwtManager {
         issuer: IssuerOptions,
         validator: ValidatorOptions,
     ) -> Result<Self, IggyError> {
-        install_default_crypto_provider();
-
         let validation = JwtManager::create_validation(
             issuer.algorithm,
             &validator.valid_issuers,
