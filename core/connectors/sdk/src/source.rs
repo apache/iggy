@@ -213,12 +213,13 @@ macro_rules! source_connector {
         };
 
         use dashmap::DashMap;
-        use once_cell::sync::Lazy;
+        use std::sync::LazyLock;
         use $crate::LogCallback;
         use $crate::source::SendCallback;
         use $crate::source::SourceContainer;
 
-        static INSTANCES: Lazy<DashMap<u32, SourceContainer<$type>>> = Lazy::new(DashMap::new);
+        static INSTANCES: LazyLock<DashMap<u32, SourceContainer<$type>>> =
+            LazyLock::new(DashMap::new);
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
