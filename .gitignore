@@ -42,3 +42,5 @@ go.work
 core/bench/dashboard/frontend/dist
 LICENSE-binary
 **/LICENSE-binary
+local_test_connectors
+local_test_runtime.toml
