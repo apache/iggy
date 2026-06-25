@@ -54,6 +54,29 @@ mod ffi {
         partitions_count: u32,
     }
 
+    struct Partition {
+        id: u32,
+        created_at: u64,
+        segments_count: u32,
+        current_offset: u64,
+        size_bytes: u64,
+        messages_count: u64,
+    }
+
+    struct TopicDetails {
+        id: u32,
+        created_at: u64,
+        name: String,
+        size_bytes: u64,
+        message_expiry: u64,
+        compression_algorithm: String,
+        max_topic_size: u64,
+        replication_factor: u8,
+        messages_count: u64,
+        partitions_count: u32,
+        partitions: Vec<Partition>,
+    }
+
     struct Stream {
         id: u32,
         created_at: u64,
@@ -113,6 +136,13 @@ mod ffi {
         partitions_count: u32,
         members_count: u32,
         members: Vec<ConsumerGroupMember>,
+    }
+
+    struct ConsumerGroup {
+        id: u32,
+        name: String,
+        partitions_count: u32,
+        members_count: u32,
     }
 
     struct ConsumerGroupInfo {
@@ -191,7 +221,7 @@ mod ffi {
         fn new_connection(connection_string: String) -> Result<*mut Client>;
         fn login_user(self: &Client, username: String, password: String) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
-        fn create_stream(self: &Client, stream_name: String) -> Result<()>;
+        fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
@@ -207,7 +237,26 @@ mod ffi {
             message_expiry_kind: String,
             message_expiry_value: u64,
             max_topic_size: String,
+        ) -> Result<TopicDetails>;
+        fn get_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<TopicDetails>;
+        fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
+        #[allow(clippy::too_many_arguments)]
+        fn update_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            topic_name: String,
+            compression_algorithm: String,
+            replication_factor: u8,
+            message_expiry_kind: String,
+            message_expiry_value: u64,
+            max_topic_size: String,
         ) -> Result<()>;
+        fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
@@ -233,6 +282,11 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<ConsumerGroupDetails>;
+        fn get_consumer_groups(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<Vec<ConsumerGroup>>;
         fn delete_consumer_group(
             self: &Client,
             stream_id: Identifier,

@@ -16,7 +16,22 @@
 // under the License.
 
 use crate::ffi;
-use iggy::prelude::Topic as RustTopic;
+use iggy::prelude::{
+    Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
+};
+
+impl From<RustPartition> for ffi::Partition {
+    fn from(partition: RustPartition) -> Self {
+        ffi::Partition {
+            id: partition.id,
+            created_at: partition.created_at.as_micros(),
+            segments_count: partition.segments_count,
+            current_offset: partition.current_offset,
+            size_bytes: partition.size.as_bytes_u64(),
+            messages_count: partition.messages_count,
+        }
+    }
+}
 
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
@@ -31,6 +46,28 @@ impl From<RustTopic> for ffi::Topic {
             replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
+        }
+    }
+}
+
+impl From<RustTopicDetails> for ffi::TopicDetails {
+    fn from(topic: RustTopicDetails) -> Self {
+        ffi::TopicDetails {
+            id: topic.id,
+            created_at: topic.created_at.as_micros(),
+            name: topic.name,
+            size_bytes: topic.size.as_bytes_u64(),
+            message_expiry: u64::from(topic.message_expiry),
+            compression_algorithm: topic.compression_algorithm.to_string(),
+            max_topic_size: u64::from(topic.max_topic_size),
+            replication_factor: topic.replication_factor,
+            messages_count: topic.messages_count,
+            partitions_count: topic.partitions_count,
+            partitions: topic
+                .partitions
+                .into_iter()
+                .map(ffi::Partition::from)
+                .collect(),
         }
     }
 }
