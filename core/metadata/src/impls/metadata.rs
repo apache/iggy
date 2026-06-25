@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
-use crate::stm::consumer_group::ConsumerGroups;
+use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::Streams;
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
@@ -31,6 +31,7 @@ use consensus::{
     replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
@@ -63,21 +64,15 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
-    #[must_use]
-    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
-impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
     fn users(&self) -> &Users {
         &self.inner().0
     }
 
     fn streams(&self) -> &Streams {
         &self.inner().1.0
-    }
-
-    fn consumer_groups(&self) -> &ConsumerGroups {
-        &self.inner().1.1.0
     }
 }
 
@@ -783,6 +778,13 @@ where
                     self.client_table
                         .borrow_mut()
                         .remove_client(prepare_header.client);
+                    // Drop the disconnected client from every consumer group it
+                    // joined and rebalance. Deterministic side-effect of the
+                    // Logout commit, applied identically on every replica.
+                    self.mux_stm.streams().remove_consumer_group_member(
+                        prepare_header.client,
+                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                    );
                     reply
                 } else {
                     // Normal op: apply SM, commit_reply.
@@ -1076,6 +1078,94 @@ where
                     Err(MetadataSubmitError::Canceled)
                 }
             }
+        }
+    }
+
+    /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
+    /// metadata consensus group (shard 0). The partition reconciler calls this
+    /// to complete a cooperative revocation once the source has drained the
+    /// partition (or it timed out).
+    ///
+    /// Unlike a client op there is no session: a reserved internal client id
+    /// (never coordinator-minted) carries it, `request_preflight` is skipped
+    /// (server-originated), and the normal-op commit path skips reply-caching
+    /// when the client has no session. The op is internal (not client-allowed),
+    /// so it bypasses `prepare_request` and projects directly.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the prepare,
+    /// `InProgress` / `PipelineFull` on pipeline pressure (the reconciler
+    /// retries next tick; completion is idempotent), `Canceled` if the pending
+    /// prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata consensus
+    /// group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_complete_revocation_in_process(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+    ) -> Result<u64, MetadataSubmitError> {
+        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+        // Reserved internal client id, distinct per (group, partition) target.
+        // The high 64 bits are all-ones -- never coordinator-minted (those carry
+        // a small home-shard number in the top bits) -- and the low 64 bits pack
+        // (group_id, partition_id). Distinct ids matter: the pipeline dedups by
+        // client id, so a shared id would cap internal completions at one
+        // in-flight cluster-wide and drain a wide rebalance one per consensus
+        // round-trip. Per-target ids let completions for different partitions
+        // pipeline concurrently while still deduping a retry of the same target.
+        let internal_client_id: u128 =
+            (u128::from(u64::MAX) << 64) | (u128::from(group_id) << 32) | u128::from(partition_id);
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(internal_client_id)
+        {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline().borrow().is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        let request = CompleteConsumerGroupRevocationRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id,
+            source_client_id,
+            partition_id,
+        };
+        let body = request.to_bytes();
+        let message = build_complete_revocation_request_message(
+            consensus,
+            internal_client_id,
+            INTERNAL_REQUEST_ID,
+            &body,
+        );
+        let prepare = message.project(consensus);
+
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
         }
     }
 
@@ -1567,6 +1657,12 @@ where
                     .commit_register(header.client, reply, in_flight);
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
+                // Mirror the on_ack path: drop the disconnected client from
+                // every consumer group it joined and rebalance.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    header.client,
+                    iggy_common::IggyTimestamp::from(header.timestamp),
+                );
             } else {
                 // Normal op: apply SM, commit_reply.
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
@@ -1716,6 +1812,44 @@ where
     msg
 }
 
+fn build_complete_revocation_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    request: u64,
+    body: &[u8],
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::CompleteConsumerGroupRevocation,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: consensus.cluster(),
+            view: consensus.view(),
+            release: 0,
+            client: client_id,
+            // `validate()` requires session/request > 0 for non-register ops;
+            // there is no real session (the commit path skips reply-caching).
+            session: 1,
+            request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
+    msg
+}
+
 fn build_prepare_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     request: &RequestHeader,
@@ -1771,14 +1905,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::consumer_group::ConsumerGroups;
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
     use iggy_common::variadic;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    type TestMux = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+    type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
     /// `journal`, and `snapshot` all `None`. Enough to test the

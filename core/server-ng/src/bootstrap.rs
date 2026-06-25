@@ -60,7 +60,6 @@ use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -98,13 +97,13 @@ use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
 
-type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
 /// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
 /// state. Shard 0 mints one after `recover()` and broadcasts a clone to
 /// every peer shard; each peer rebuilds a reader-mode
 /// [`ServerNgMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerNgMetadataBundle = <variadic!(Users, Streams, ConsumerGroups) as WithFactory>::Bundle;
+type ServerNgMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 
 pub(crate) type ServerNgMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,
@@ -895,10 +894,40 @@ async fn shard_main(
             }
             tick_shard.tick_metadata().await;
             tick_shard.tick_partitions().await;
+            // While a cooperative revocation is pending, wake the reconciler each
+            // tick so it completes the handoff within ~one tick of the source
+            // draining the partition, instead of waiting for the 1s periodic pass.
+            if tick_shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .has_pending_revocations()
+            {
+                tick_shard.dispatch_metadata_commit_tick();
+            }
             compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
         }
     });
     bus.track_background(consensus_tick_handle);
+
+    // Per-shard heartbeat verifier: evicts connections that stop pinging,
+    // releasing their consumer-group membership. Gated on config so a
+    // deployment without heartbeats never reaps live sessions.
+    let heartbeat_stop_tx = if config.heartbeat.enabled {
+        let (hb_stop_tx, hb_stop_rx) = channel::<()>(1);
+        let hb_shard = Rc::clone(&shard);
+        let hb_sessions = Rc::clone(&sessions);
+        let hb_interval = config.heartbeat.interval.get_duration();
+        let hb_handle = compio::runtime::spawn(async move {
+            crate::dispatch::run_heartbeat_verifier(hb_shard, hb_sessions, hb_interval, hb_stop_rx)
+                .await;
+        });
+        bus.track_background(hb_handle);
+        Some(hb_stop_tx)
+    } else {
+        None
+    };
 
     // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
     // group) and only when enabled. Each pass no-ops unless this node is
@@ -955,6 +984,9 @@ async fn shard_main(
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
             let _ = consensus_tick_stop_tx.try_send(());
+            if let Some(tx) = &heartbeat_stop_tx {
+                let _ = tx.try_send(());
+            }
             if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
                 let _ = cleaner_stop_tx.try_send(());
             }
@@ -966,6 +998,9 @@ async fn shard_main(
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
     let _ = consensus_tick_stop_tx.try_send(());
+    if let Some(tx) = &heartbeat_stop_tx {
+        let _ = tx.try_send(());
+    }
     if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
         let _ = cleaner_stop_tx.try_send(());
     }
