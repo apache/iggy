@@ -56,9 +56,15 @@ const PRODUCERS: u32 = 4;
 const CONSUMERS: u32 = 4;
 const PRODUCER_BATCH: u32 = 16;
 const CONSUMER_BATCH: u32 = 64;
-const HAMMER_DURATION: Duration = Duration::from_secs(2);
+const HAMMER_DURATION: Duration = Duration::from_secs(20);
 // Safety net so a wedged consumer fails loudly instead of hanging the suite.
-const MAX_TEST_DURATION: Duration = Duration::from_secs(60);
+const MAX_TEST_DURATION: Duration = Duration::from_secs(120);
+// Whole-test wall-clock guard. A server that dies at boot leaves the harness
+// client retrying connect with no cap, and a parked poll never re-checks
+// MAX_TEST_DURATION, so without this the suite hangs indefinitely instead of
+// failing. Set above MAX_TEST_DURATION so a slow-but-progressing consumer
+// trips its own informative deadline first.
+const WALL_CLOCK_TIMEOUT: Duration = Duration::from_secs(150);
 // Empty polls observed after producers stop before the partition is declared drained.
 const DRAIN_EMPTY_POLLS: u32 = 20;
 
@@ -87,6 +93,12 @@ async fn given_cluster_when_produce_consume_hammered_should_not_lose_messages(
 }
 
 async fn run_hammer(harness: &TestHarness) {
+    tokio::time::timeout(WALL_CLOCK_TIMEOUT, run_hammer_inner(harness))
+        .await
+        .expect("stress test exceeded WALL_CLOCK_TIMEOUT; server likely crashed at boot or a poll wedged");
+}
+
+async fn run_hammer_inner(harness: &TestHarness) {
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
 
     let setup = harness.tcp_root_client().await.unwrap();
