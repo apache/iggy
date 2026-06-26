@@ -129,12 +129,6 @@ pub struct StatsSnapshot {
 }
 
 /// Topic snapshot representation for serialization.
-///
-/// Encoded by `rmp_serde::to_vec` as a **positional array**, so `serde(default)`
-/// only fills **trailing** elements absent from an older snapshot. The two
-/// consumer-group fields below are therefore deliberately last: a topic
-/// snapshot written before co-located consumer groups has a shorter array, and
-/// the defaults fill the missing tail. Any future field must also be appended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSnapshot {
     pub id: usize,
@@ -150,9 +144,6 @@ pub struct TopicSnapshot {
     // load-balancing hint advanced on the `Balanced`-send read path (outside
     // the replicated apply), so each replica's value drifts independently;
     // persisting it would make the snapshot diverge per replica. Restored to 0.
-    //
-    // The two consumer-group fields are trailing so the `serde(default)` above
-    // actually works for snapshots predating co-located consumer groups.
     #[serde(default)]
     pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
     #[serde(default)]
