@@ -15,9 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy::prelude::Topic as RustTopic;
 use iggy::prelude::TopicDetails as RustTopicDetails;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct Topic {
+    pub(crate) inner: RustTopic,
+}
+
+impl From<RustTopic> for Topic {
+    fn from(topic: RustTopic) -> Self {
+        Self { inner: topic }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Topic {
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[getter]
+    pub fn name(&self) -> String {
+        self.inner.name.to_string()
+    }
+
+    #[getter]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
+    }
+
+    #[getter]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+}
 
 #[gen_stub_pyclass]
 #[pyclass]
@@ -54,5 +91,15 @@ impl TopicDetails {
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
+    }
+
+    #[getter]
+    pub fn compression_algorithm(&self) -> String {
+        self.inner.compression_algorithm.to_string()
+    }
+
+    #[getter]
+    pub fn replication_factor(&self) -> u8 {
+        self.inner.replication_factor
     }
 }

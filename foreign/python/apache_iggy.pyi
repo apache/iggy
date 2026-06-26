@@ -34,6 +34,7 @@ __all__ = [
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "Topic",
     "TopicDetails",
 ]
 
@@ -302,6 +303,45 @@ class IggyClient:
         Gets topic by stream and id.
         Returns Option of topic details or a PyRuntimeError on failure.
         """
+    def get_topics(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[list[Topic]]:
+        r"""
+        Gets all topics in the given stream.
+        Returns a list of topics or a PyRuntimeError on failure.
+        """
+    def update_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+        compression_algorithm: builtins.str | None = None,
+        replication_factor: builtins.int | None = None,
+        message_expiry: datetime.timedelta | None = None,
+        max_topic_size: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Updates an existing topic with the given parameters.
+        Returns Ok(()) on successful topic update or a PyRuntimeError on failure.
+        """
+    def delete_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes the topic with the given id from the given stream.
+        Returns Ok(()) on successful topic deletion or a PyRuntimeError on failure.
+        """
+    def purge_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Purges all messages from the topic with the given id in the given stream.
+        Returns Ok(()) on successful topic purge or a PyRuntimeError on failure.
+        """
     def send_messages(
         self,
         stream: builtins.str | builtins.int,
@@ -520,6 +560,17 @@ class StreamDetails:
     def topics_count(self) -> builtins.int: ...
 
 @typing.final
+class Topic:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+
+@typing.final
 class TopicDetails:
     @property
     def id(self) -> builtins.int: ...
@@ -529,3 +580,7 @@ class TopicDetails:
     def messages_count(self) -> builtins.int: ...
     @property
     def partitions_count(self) -> builtins.int: ...
+    @property
+    def compression_algorithm(self) -> builtins.str: ...
+    @property
+    def replication_factor(self) -> builtins.int: ...
