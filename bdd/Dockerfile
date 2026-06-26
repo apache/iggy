@@ -27,7 +27,8 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM rust:1.96.0-alpine3.22 AS builder
+ARG RUST_VERSION=1.96
+FROM rust:${RUST_VERSION}-slim-trixie AS builder
 RUN apk add musl-dev
 
 WORKDIR /app
@@ -36,7 +37,7 @@ COPY . .
 # Build server in debug mode for faster compilation
 RUN cargo build --bin iggy-server
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install curl for healthcheck
 RUN apt-get update && \
