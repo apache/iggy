@@ -2473,11 +2473,12 @@ where
             }
 
             let segment_size = segment.size.as_bytes_u64();
-            let messages_in_segment = if segment.start_offset == segment.end_offset {
-                0
-            } else {
-                segment.end_offset - segment.start_offset + 1
-            };
+            // The removal loop above only reaches sealed segments, which always
+            // hold at least one message, so the count is inclusive end..=start.
+            // A one-message sealed segment has `start_offset == end_offset`, so
+            // the `+ 1` is required (a `start == end -> 0` special case would
+            // undercount it).
+            let messages_in_segment = segment.end_offset - segment.start_offset + 1;
             self.stats.decrement_size_bytes(segment_size);
             self.stats.decrement_segments_count(1);
             self.stats.decrement_messages_count(messages_in_segment);
@@ -2671,6 +2672,12 @@ where
         for path in consumer_paths.into_iter().chain(group_paths) {
             let _ = delete_persisted_offset(&path).await;
         }
+
+        // Clear the ephemeral cooperative-rebalance tracking too: after the
+        // reset to offset 0 a stale `last_polled` (a high pre-purge offset)
+        // would make the reconciler's completion check `committed >= last_polled`
+        // unsatisfiable, stalling a pending revocation until its timeout.
+        self.last_polled_offsets.pin().clear();
 
         // Reset stats to a single empty segment.
         self.stats.zero_out_all();
