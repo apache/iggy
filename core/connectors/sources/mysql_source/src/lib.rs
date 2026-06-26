@@ -88,6 +88,17 @@ struct ProcessedRow {
     row_pk: Option<String>,
 }
 
+/// One table's fully processed but not-yet-committed work. Built in the
+/// side-effect-free first phase of `poll_tables`, then marked/deleted and
+/// published in the second phase so a table's messages are emitted only once
+/// its rows are marked.
+struct TableBatch {
+    table: String,
+    messages: Vec<ProducedMessage>,
+    processed_ids: Vec<String>,
+    max_offset: Option<String>,
+}
+
 impl PayloadFormat {
     fn from_config(s: Option<&str>) -> Self {
         match s.map(|s| s.to_lowercase()).as_deref() {
@@ -428,50 +439,39 @@ impl MySqlSource {
             .collect::<Vec<_>>()
             .join(", ");
 
-        if self.config.delete_after_read.unwrap_or(false) {
-            let delete_query =
-                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})");
-
+        let query = if self.config.delete_after_read.unwrap_or(false) {
             if self.verbose {
                 info!("Deleting {} processed rows from '{table}'", ids.len());
             } else {
                 debug!("Deleting {} processed rows from '{table}'", ids.len());
             }
-
-            sqlx::query(sqlx::AssertSqlSafe(delete_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to delete processed rows: {e}");
-                    Error::InvalidRecord
-                })?;
+            format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})")
         } else if let Some(processed_col) = &self.config.processed_column {
             let quoted_processed = quote_identifier(processed_col)?;
-            let update_query = format!(
-                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
-            );
-
             if self.verbose {
                 info!("Marking {} rows as processed in '{table}'", ids.len());
             } else {
                 debug!("Marking {} rows as processed in '{table}'", ids.len());
             }
+            format!(
+                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
+            )
+        } else {
+            // Offset-tracking only: nothing to mark or delete.
+            return Ok(());
+        };
 
-            sqlx::query(sqlx::AssertSqlSafe(update_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to mark rows as processed: {e}");
-                    Error::InvalidRecord
-                })?;
-        }
-
-        Ok(())
+        with_retry(
+            || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).execute(pool),
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self.get_pool()?;
-        let mut messages = Vec::new();
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
         let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
@@ -491,71 +491,81 @@ impl MySqlSource {
             include_metadata: self.config.include_metadata.unwrap_or(true),
         };
 
-        // Collect state updates to apply after processing
-        let mut state_updates: Vec<(String, String)> = Vec::new();
-        let mut total_processed: u64 = 0;
+        // Phase 1: fetch and process every table into its own buffer without any
+        // side effect. A `process_row` failure is deterministic (a row that cannot
+        // be decoded fails identically every cycle), so a failing table is logged
+        // with its resume offset and skipped rather than aborting the whole poll:
+        // nothing has been marked yet, its rows stay in MySQL, and the remaining
+        // tables still make progress. The operator sees exactly which table and
+        // offset to fix.
+        let mut batches: Vec<TableBatch> = Vec::with_capacity(self.config.tables.len());
 
         for table in &self.config.tables {
-            let table_config = RowProcessingConfig {
-                table,
-                ..row_config
-            };
-
             // Get last offset with minimal lock time
             let last_offset = {
                 let state = self.state.lock().await;
                 state.tracking_offsets.get(table).cloned()
             };
 
-            let query = if let Some(custom_query) = &self.config.custom_query {
-                self.validate_custom_query(custom_query)?;
-                self.substitute_query_params(custom_query, table, &last_offset, batch_size)
-            } else {
-                self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
-            };
-
-            // Database I/O without holding the lock
-            let rows = with_retry(
-                || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
-                self.get_max_retries(),
-                self.retry_delay.as_millis() as u64,
-            )
-            .await?;
-
-            let mut max_offset: Option<String> = None;
-            let mut processed_ids: Vec<String> = Vec::new();
-
-            let mut count_per_table = 0;
-            for row in rows {
-                let processed = self.process_row(&row, &table_config)?;
-
-                if let Some(pk) = processed.row_pk {
-                    processed_ids.push(pk);
+            match self
+                .fetch_table_batch(
+                    table,
+                    &row_config,
+                    tracking_column,
+                    batch_size,
+                    &last_offset,
+                )
+                .await
+            {
+                Ok(batch) => {
+                    if self.verbose {
+                        info!("Fetched {} rows from table '{table}'", batch.messages.len());
+                    } else {
+                        debug!("Fetched {} rows from table '{table}'", batch.messages.len());
+                    }
+                    batches.push(batch);
                 }
-                if let Some(offset) = processed.max_offset {
-                    max_offset = Some(offset);
+                Err(error) => {
+                    error!(
+                        "Failed to process table '{table}' at offset {}, skipping this cycle: {error}",
+                        last_offset.as_deref().unwrap_or("<start>")
+                    );
                 }
+            }
+        }
 
-                messages.push(processed.message);
-                count_per_table += 1;
-                total_processed += 1;
+        // Phase 2: commit each table independently. A table's messages are emitted
+        // only after its rows are marked or deleted, so a failure here can never
+        // leave a table marked-but-unpublished. `mark_or_delete_processed_rows`
+        // retries transient errors; a permanent failure isolates that one table
+        // (its rows stay in MySQL and are retried next cycle) while the others
+        // still flow.
+        let mut messages = Vec::new();
+        let mut state_updates: Vec<(String, String)> = Vec::new();
+        let mut total_processed: u64 = 0;
+
+        for mut batch in batches {
+            if !batch.processed_ids.is_empty()
+                && let Err(error) = self
+                    .mark_or_delete_processed_rows(
+                        pool,
+                        &batch.table,
+                        pk_column,
+                        &batch.processed_ids,
+                    )
+                    .await
+            {
+                error!(
+                    "Failed to mark or delete processed rows for table '{}', skipping this cycle: {error}",
+                    batch.table
+                );
+                continue;
             }
 
-            // Database I/O without holding the lock
-            if !processed_ids.is_empty() {
-                self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
-                    .await?;
-            }
-
-            // Collect offset update for later
-            if let Some(offset) = max_offset {
-                state_updates.push((table.clone(), offset));
-            }
-
-            if self.verbose {
-                info!("Fetched {} rows from table '{table}'", count_per_table);
-            } else {
-                debug!("Fetched {} rows from table '{table}'", count_per_table);
+            total_processed += batch.messages.len() as u64;
+            messages.append(&mut batch.messages);
+            if let Some(offset) = batch.max_offset {
+                state_updates.push((batch.table, offset));
             }
         }
 
@@ -570,6 +580,57 @@ impl MySqlSource {
         }
 
         Ok(messages)
+    }
+
+    async fn fetch_table_batch(
+        &self,
+        table: &str,
+        row_config: &RowProcessingConfig<'_>,
+        tracking_column: &str,
+        batch_size: u32,
+        last_offset: &Option<String>,
+    ) -> Result<TableBatch, Error> {
+        let pool = self.get_pool()?;
+        let table_config = RowProcessingConfig {
+            table,
+            ..*row_config
+        };
+
+        let query = if let Some(custom_query) = &self.config.custom_query {
+            self.validate_custom_query(custom_query)?;
+            self.substitute_query_params(custom_query, table, last_offset, batch_size)
+        } else {
+            self.build_polling_query(table, tracking_column, last_offset, batch_size)?
+        };
+
+        // Database I/O without holding the lock
+        let rows = with_retry(
+            || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await?;
+
+        let mut batch = TableBatch {
+            table: table.to_string(),
+            messages: Vec::with_capacity(rows.len()),
+            processed_ids: Vec::new(),
+            max_offset: None,
+        };
+        for row in rows {
+            let processed = self.process_row(&row, &table_config)?;
+
+            if let Some(pk) = processed.row_pk {
+                batch.processed_ids.push(pk);
+            }
+            if let Some(offset) = processed.max_offset {
+                batch.max_offset = Some(offset);
+            }
+
+            batch.messages.push(processed.message);
+        }
+
+        Ok(batch)
     }
 
     fn process_row(
@@ -740,8 +801,7 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                 .try_get(column_index)
                 .map_err(|_| Error::InvalidRecord)?;
             Ok(value
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(serde_json::Value::from)
+                .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null))
         }
         "BIT" => {
@@ -925,7 +985,7 @@ fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
 }
 
 fn format_offset_value(value: &str) -> String {
-    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+    if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok_and(|v| v.is_finite()) {
         value.to_string()
     } else {
         let escaped = value

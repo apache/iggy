@@ -253,7 +253,7 @@ The connector handles these MySQL types in JSON mode:
 | `BIGINT UNSIGNED` | number (u64) |
 | `FLOAT` | number (f32 → f64) |
 | `DOUBLE` | number (f64) |
-| `DECIMAL` | number (parsed as f64, precision may be lost) |
+| `DECIMAL` | string (exact value preserved) |
 | `BIT` | number (u64) |
 | `YEAR` | number (u16 → u64) |
 | `DATE` | string (YYYY-MM-DD) |
@@ -267,7 +267,7 @@ The connector handles these MySQL types in JSON mode:
 | `NULL` | null |
 | Unknown | string (text fallback), or base64 string (binary fallback) |
 
-> **DECIMAL precision:** MySQL `DECIMAL` is an arbitrary-precision decimal type. The connector reads it as a string then parses it as `f64`, which introduces floating-point rounding for high-precision values. If exactness is required, use a custom query to cast the column to `CHAR` and handle it as a string in the consumer.
+> **DECIMAL precision:** MySQL `DECIMAL` is an arbitrary-precision decimal type. The connector emits it as a JSON string verbatim (e.g. `"99999999999999999"`), preserving the exact value. Parse it as a decimal in the consumer if you need to do arithmetic; do not assume it arrives as a JSON number.
 
 ## Reliability Features
 
