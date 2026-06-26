@@ -650,6 +650,7 @@ mod tests {
             MessageLookup::Offset {
                 offset: 1,
                 count: 1,
+                ceiling: u64::MAX,
             },
         )
         .expect("raw snapshot walk still returns the post-gap batch");
@@ -677,6 +678,7 @@ mod tests {
             MessageLookup::Offset {
                 offset: from_offset,
                 count: 1,
+                ceiling: u64::MAX,
             },
         )
         .expect("offset 3 is resident, continuation must serve it");
@@ -684,6 +686,57 @@ mod tests {
             contiguous_offset,
             Some(3),
             "contiguous continuation returns the resident tail starting at 3",
+        );
+    }
+
+    /// The resident journal holds replicated-but-uncommitted prepares ahead of
+    /// the commit frontier. A poll must clamp at `ceiling` (the commit offset)
+    /// so it never returns a dirty read of view-change-rollbackable data, even
+    /// when the requested count would otherwise reach into the uncommitted tail.
+    #[compio::test]
+    async fn poll_clamps_at_commit_ceiling() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partition = build_partition();
+
+        // Offsets 0..=5 all resident; only 0..=2 are committed.
+        for offset in 0..=5u64 {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(build_send_messages_entry(namespace, offset + 1, offset))
+                .await
+                .expect("append journal entry");
+        }
+
+        let entries = partition.log.journal().inner.resident_entries();
+        let (_, last) = crate::journal::select_resident(
+            &entries,
+            MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: 2,
+            },
+        )
+        .expect("offsets 0..=2 are within the ceiling and must be served");
+        assert_eq!(
+            last,
+            Some(2),
+            "poll must stop at the commit ceiling, never serving 3..=5",
+        );
+
+        // A poll starting past the ceiling returns nothing.
+        assert!(
+            crate::journal::select_resident(
+                &entries,
+                MessageLookup::Offset {
+                    offset: 3,
+                    count: 10,
+                    ceiling: 2,
+                },
+            )
+            .is_none(),
+            "no committed message at or after offset 3, so the poll is empty",
         );
     }
 }

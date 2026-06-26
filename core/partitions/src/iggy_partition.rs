@@ -397,21 +397,35 @@ where
             .collect()
     }
 
-    /// Reclaim a deleted consumer group's offset on this partition (in-memory
-    /// entry + persisted file). A no-op if the group has no stored offset here.
+    /// Reclaim every stored consumer-group offset whose group id is no longer
+    /// `is_live`, returning the owned persisted-file paths the caller must unlink.
     ///
-    /// # Errors
-    /// Returns an I/O error if deleting the persisted offset file fails.
+    /// Fully synchronous (no `.await`): the in-memory papaya remove happens here,
+    /// the disk unlink is deferred to the caller on owned `String` data so no
+    /// borrow of `self` survives across the await. This is the only safe shape
+    /// for the reconciler, which runs on a sibling task to the pump that may
+    /// realloc the partitions vec during that await. The remove-then-unlink
+    /// ordering matches the crash-safe GC invariant (monotonic, never-reused
+    /// group ids mean a recreated group never reads a dead group's offset).
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn delete_consumer_group_offset(&self, group_id: u64) -> Result<(), IggyError> {
-        self.consumer_group_offsets
-            .pin()
-            .remove(&ConsumerGroupId(group_id as usize));
-        if let Some(path) = self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
-        {
-            delete_persisted_offset(&path).await?;
+    pub fn reclaim_dead_group_offsets(&self, is_live: impl Fn(u64) -> bool) -> Vec<String> {
+        let pinned = self.consumer_group_offsets.pin();
+        let dead: Vec<u64> = pinned
+            .keys()
+            .map(|key| key.0 as u64)
+            .filter(|group_id| !is_live(*group_id))
+            .collect();
+        let mut paths = Vec::with_capacity(dead.len());
+        for group_id in dead {
+            pinned.remove(&ConsumerGroupId(group_id as usize));
+            if let Some(path) =
+                self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
+            {
+                paths.push(path);
+            }
         }
-        Ok(())
+        paths
     }
 
     /// Cooperative-rebalance classification: a group's `(last_polled, committed)`
@@ -569,6 +583,7 @@ where
             PollingKind::Timestamp => MessageLookup::Timestamp {
                 timestamp: args.strategy.value,
                 count: args.count,
+                ceiling: commit_offset,
             },
             kind => {
                 let start_offset = match kind {
@@ -591,6 +606,7 @@ where
                 MessageLookup::Offset {
                     offset: start_offset,
                     count: args.count,
+                    ceiling: commit_offset,
                 }
             }
         };
@@ -715,9 +731,19 @@ where
     /// owned data; see [`ResidentTailSnapshot`].
     fn resident_tail_snapshot(&self) -> ResidentTailSnapshot {
         let journal = &self.log.journal().inner;
+        let oldest_resident = journal.oldest_resident_offset();
+        // Only clone the entries (a Vec + per-entry `Frozen` refcount bumps)
+        // when a resident tail actually exists. A fully drained journal yields
+        // `None`, and an empty `entries` makes `select_resident` return `None`
+        // (empty poll) on both the straddle and retention-recovery paths.
+        let entries = if oldest_resident.is_some() {
+            journal.resident_entries()
+        } else {
+            Vec::new()
+        };
         ResidentTailSnapshot {
-            oldest_resident: journal.oldest_resident_offset(),
-            entries: journal.resident_entries(),
+            oldest_resident,
+            entries,
         }
     }
 }
@@ -2282,9 +2308,73 @@ mod tests {
     use crate::poll_plan::DiskReadOutcome;
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
+    use consensus::LocalPipeline;
     use server_common::send_messages2::{
         COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
     };
+
+    const TEST_CLUSTER: u128 = 1;
+
+    fn test_partition() -> IggyPartition<IggyMessageBus> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        )
+    }
+
+    /// `reclaim_dead_group_offsets` must drop exactly the not-`is_live` groups
+    /// from the in-memory map and hand back their owned persisted-file paths,
+    /// leaving live groups untouched. The returned `Vec<String>` is what the
+    /// reconciler unlinks off-borrow, so it carries no partition reference.
+    ///
+    /// TODO: a true cross-task interleave (pump reallocs the partitions vec
+    /// while the reconciler awaits the unlink) needs a two-future sim oracle
+    /// that does not exist yet; this covers the synchronous removal contract
+    /// the off-borrow split relies on.
+    #[compio::test]
+    async fn reclaim_dead_group_offsets_drops_dead_keeps_live() {
+        let mut partition = test_partition();
+        let group_offsets_path = "/iggy-test-cg-offsets".to_owned();
+        partition.consumer_group_offsets_path = Some(group_offsets_path.clone());
+
+        let dead: u32 = 1;
+        let live: u32 = 2;
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(dead as usize),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, dead, 7, String::new()),
+        );
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(live as usize),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, live, 9, String::new()),
+        );
+
+        let paths = partition.reclaim_dead_group_offsets(|group_id| group_id == u64::from(live));
+
+        assert_eq!(
+            paths,
+            vec![format!("{group_offsets_path}/{dead}")],
+            "only the dead group's persisted path is returned for unlink"
+        );
+        let mut remaining = partition.consumer_group_offset_ids();
+        remaining.sort_unstable();
+        assert_eq!(
+            remaining,
+            vec![u64::from(live)],
+            "dead group removed in-memory; live group retained"
+        );
+    }
 
     /// One-message segment record in on-disk layout `[256B command header][blob]`
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
@@ -2369,6 +2459,7 @@ mod tests {
             .read_disk(MessageLookup::Offset {
                 offset: 0,
                 count: 10,
+                ceiling: u64::MAX,
             })
             .await;
 
@@ -2451,6 +2542,7 @@ mod tests {
             .read_disk(MessageLookup::Offset {
                 offset: 0,
                 count: 10,
+                ceiling: u64::MAX,
             })
             .await;
 

@@ -35,6 +35,7 @@ pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use messages_writer::MessagesWriter;
+pub use offset_storage::delete_persisted_offset;
 pub use poll_plan::PollPlan;
 pub use segment::Segment;
 use server_common::Message;

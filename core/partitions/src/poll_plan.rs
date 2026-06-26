@@ -29,9 +29,8 @@
 //! sound on a detached task concurrently with the pump's own writes.
 
 use crate::PollFragments;
-use crate::journal::{MessageLookup, select_batch_slice};
+use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
 use crate::offset_storage::persist_offset;
-use crate::types::Fragment;
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
@@ -129,7 +128,12 @@ impl ResidentTailSnapshot {
     /// point-in-time, so the gate (`oldest_resident <= last + 1`) is race-free:
     /// a commit after the snapshot cannot have evicted the run. Without it,
     /// splicing the next resident op over an evicted run silently skips offsets.
-    fn straddle_continuation(&self, last_offset: u64, remaining: u32) -> Option<MessageLookup> {
+    fn straddle_continuation(
+        &self,
+        last_offset: u64,
+        remaining: u32,
+        ceiling: u64,
+    ) -> Option<MessageLookup> {
         (remaining > 0
             && self
                 .oldest_resident
@@ -137,6 +141,7 @@ impl ResidentTailSnapshot {
         .then_some(MessageLookup::Offset {
             offset: last_offset + 1,
             count: remaining,
+            ceiling,
         })
     }
 }
@@ -160,7 +165,16 @@ impl PollPlan {
     /// so the pump is not blocked on file IO.
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
-        matches!(self.tier, PollTier::Disk { .. }) || self.auto_commit.is_some()
+        if matches!(self.tier, PollTier::Disk { .. }) {
+            return true;
+        }
+        // A resident poll only needs a detached task when its auto-commit must
+        // hit disk. With no `offset_path` (sim/dev) the apply is a sync,
+        // in-memory store the pump runs inline via `execute_resident`.
+        match &self.auto_commit {
+            Some(auto_commit) => auto_commit.needs_persist(),
+            None => false,
+        }
     }
 
     /// Execute this plan off the partition borrow: disk read (if any), straddle
@@ -206,7 +220,11 @@ impl PollPlan {
                     let remaining = query.count().saturating_sub(matched);
                     let continuation = last_matching_offset
                         .and_then(|last_offset| {
-                            resident_tail.straddle_continuation(last_offset, remaining)
+                            resident_tail.straddle_continuation(
+                                last_offset,
+                                remaining,
+                                query.ceiling(),
+                            )
                         })
                         .and_then(|query| {
                             crate::journal::select_resident(&resident_tail.entries, query)
@@ -265,6 +283,16 @@ impl PollPlan {
         };
         if let (Some(last_polled), Some(last_offset)) = (&self.last_polled, last_matching_offset) {
             last_polled.record(last_offset);
+        }
+        // An auto-commit reaches the resident fast path only when it needs no
+        // disk persist (`needs_off_pump_io` gate), so apply the offset to the
+        // in-memory map inline. `execute()` does the same after its persist;
+        // skipping it here would silently drop the committed offset.
+        if let Some(auto_commit) = self.auto_commit
+            && !fragments.is_empty()
+            && let Some(last_offset) = last_matching_offset
+        {
+            auto_commit.apply(last_offset);
         }
         (fragments, commit_offset)
     }
@@ -484,6 +512,13 @@ impl DiskReadPlan {
 }
 
 impl AutoCommitCtx {
+    /// Whether applying this auto-commit needs a real disk persist. `false` for
+    /// sim/dev partitions with no `offset_path`, where the apply is a sync,
+    /// in-memory `papaya` store that the pump can run inline.
+    pub(crate) const fn needs_persist(&self) -> bool {
+        self.offset_path.is_some()
+    }
+
     /// Persist the committed offset to disk, off the partition borrow.
     pub(crate) async fn persist(&self, offset: u64) -> Result<(), IggyError> {
         match &self.offset_path {
@@ -493,9 +528,10 @@ impl AutoCommitCtx {
     }
 
     /// Apply the committed offset to the in-memory map on the owned `Arc`
-    /// handle, with NO partition reference. Shares [`upsert_offset`] with
-    /// [`IggyPartition::apply_consumer_offset_commit`]; the maps are lock-free
-    /// (`papaya`), so this is sound off the pump task.
+    /// handle, with NO partition reference. Uses the monotone
+    /// [`upsert_offset_max`] so a stale off-pump auto-commit cannot rewind a
+    /// newer explicit store; the maps are lock-free (`papaya`), so this is
+    /// sound off the pump task.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn apply(&self, offset: u64) {
         match &self.target {
@@ -506,7 +542,7 @@ impl AutoCommitCtx {
             } => {
                 let consumer_id = *consumer_id;
                 let map: &ConsumerOffsets = offsets;
-                upsert_offset(map, consumer_id as usize, offset, || {
+                upsert_offset_max(map, consumer_id as usize, offset, || {
                     create_path.as_deref().map_or_else(
                         || {
                             ConsumerOffset::new(
@@ -528,7 +564,7 @@ impl AutoCommitCtx {
                 let group_id = *group_id;
                 let key = ConsumerGroupId(group_id as usize);
                 let map: &ConsumerGroupOffsets = offsets;
-                upsert_offset(map, key, offset, || {
+                upsert_offset_max(map, key, offset, || {
                     create_path.as_deref().map_or_else(
                         || {
                             ConsumerOffset::new(
@@ -569,6 +605,29 @@ pub fn upsert_offset<K>(
     }
 }
 
+/// Monotone variant of [`upsert_offset`] for the off-pump auto-commit: an
+/// existing entry is bumped via `fetch_max` so a stale auto-commit racing a
+/// newer explicit `StoreConsumerOffset` cannot rewind it backward. The
+/// on-miss create branch is identical. The explicit pump path keeps
+/// [`upsert_offset`] (`store`), since an explicit store may legitimately rewind.
+fn upsert_offset_max<K>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    offset: u64,
+    create_on_miss: impl FnOnce() -> ConsumerOffset,
+) where
+    K: Hash + Eq + Clone + Send + Sync,
+{
+    let guard = map.pin();
+    if let Some(existing) = guard.get(&key) {
+        existing.offset.fetch_max(offset, Ordering::Relaxed);
+    } else {
+        let created = create_on_miss();
+        created.offset.store(offset, Ordering::Relaxed);
+        guard.insert(key, created);
+    }
+}
+
 /// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
@@ -593,34 +652,147 @@ fn walk_disk_chunk(
         let total_size = batch.header.total_size();
 
         if let Some(selection) = select_batch_slice(&batch, query, *matched) {
-            let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
-            if full_body_selected {
-                fragments.push(Fragment::slice(chunk.clone(), cursor, cursor + total_size));
-            } else {
-                let mut rewritten = batch.header;
-                rewritten.batch_length =
-                    u64::try_from(COMMAND_HEADER_SIZE + (selection.end - selection.start))
-                        .expect("sliced batch length exceeds u64::MAX");
-                rewritten.message_count = selection.matched_messages;
-                rewritten.batch_checksum = rewritten.checksum_for_blob(
-                    batch
-                        .blob()
-                        .get(selection.start..selection.end)
-                        .expect("selected batch slice must stay within blob bounds"),
-                );
-                fragments.push(Fragment::whole(rewritten.into_frozen()));
-                fragments.push(Fragment::slice(
-                    chunk.clone(),
-                    cursor + COMMAND_HEADER_SIZE + selection.start,
-                    cursor + COMMAND_HEADER_SIZE + selection.end,
-                ));
-            }
-            *last_matching_offset = Some(selection.last_matching_offset);
-            *matched += selection.matched_messages;
+            // On disk a batch is the bare `[256B header][blob]`, so the batch
+            // base is the chunk cursor (no preceding prepare header).
+            push_selected_batch_fragments(
+                fragments,
+                last_matching_offset,
+                matched,
+                chunk,
+                cursor,
+                &batch,
+                selection,
+            );
         }
 
         cursor += total_size;
     }
 
     cursor.min(bytes.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use server_common::iobuf::Owned;
+
+    fn non_empty_fragments() -> PollFragments<4096> {
+        let mut fragments = PollFragments::new();
+        fragments.push(crate::types::Fragment::whole(
+            Owned::<4096>::zeroed(8).into(),
+        ));
+        fragments
+    }
+
+    fn consumer_auto_commit(
+        offsets: Arc<ConsumerOffsets>,
+        consumer_id: u32,
+        offset_path: Option<String>,
+    ) -> AutoCommitCtx {
+        AutoCommitCtx {
+            offset_path,
+            enforce_fsync: false,
+            target: AutoCommitTarget::Consumer {
+                offsets,
+                consumer_id,
+                create_path: None,
+            },
+        }
+    }
+
+    #[test]
+    fn resident_auto_commit_without_offset_path_applies_inline() {
+        // sim/dev partition: auto_commit is requested but there is no
+        // `offset_path`, so the apply is a sync in-memory store. The plan must
+        // stay on the resident fast path (no detached task) AND still record
+        // the committed offset, which the resident path used to drop.
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
+        let plan = PollPlan {
+            commit_offset: 42,
+            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7, None)),
+            last_polled: None,
+            tier: PollTier::Resident {
+                fragments: non_empty_fragments(),
+                last_matching_offset: Some(5),
+            },
+        };
+
+        assert!(
+            !plan.needs_off_pump_io(),
+            "no offset_path means the apply is sync; the pump must not spawn",
+        );
+
+        let (fragments, commit_offset) = plan.execute_resident();
+        assert!(!fragments.is_empty(), "resident fragments must be returned");
+        assert_eq!(commit_offset, 42, "commit offset is forwarded verbatim");
+
+        let stored = offsets
+            .pin()
+            .get(&7usize)
+            .map(|entry| entry.offset.load(Ordering::Relaxed));
+        assert_eq!(
+            stored,
+            Some(5),
+            "the in-memory auto-commit must be applied on the resident path",
+        );
+    }
+
+    #[test]
+    fn resident_auto_commit_with_offset_path_needs_off_pump_io() {
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
+        let plan = PollPlan {
+            commit_offset: 0,
+            auto_commit: Some(consumer_auto_commit(
+                offsets,
+                7,
+                Some("some/path".to_owned()),
+            )),
+            last_polled: None,
+            tier: PollTier::Resident {
+                fragments: non_empty_fragments(),
+                last_matching_offset: Some(5),
+            },
+        };
+        assert!(
+            plan.needs_off_pump_io(),
+            "a real offset_path persist must be spawned off the pump",
+        );
+    }
+
+    #[test]
+    fn auto_commit_apply_is_monotone_but_explicit_store_rewinds() {
+        // Auto-commit must never rewind a newer offset (anti-rewind via
+        // fetch_max); an explicit StoreConsumerOffset may legitimately rewind.
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
+        let auto_commit = consumer_auto_commit(offsets.clone(), 7, None);
+
+        auto_commit.apply(10);
+        let after_high = offsets
+            .pin()
+            .get(&7usize)
+            .map(|entry| entry.offset.load(Ordering::Relaxed));
+        assert_eq!(after_high, Some(10));
+
+        // A stale auto-commit with a smaller offset must not rewind.
+        auto_commit.apply(4);
+        let after_stale = offsets
+            .pin()
+            .get(&7usize)
+            .map(|entry| entry.offset.load(Ordering::Relaxed));
+        assert_eq!(after_stale, Some(10), "auto-commit fetch_max must hold");
+
+        // The explicit pump path (store-semantics) still rewinds to 4.
+        upsert_offset(&offsets, 7usize, 4, || {
+            ConsumerOffset::new(ConsumerKind::Consumer, 7, 0, String::new())
+        });
+        let after_explicit = offsets
+            .pin()
+            .get(&7usize)
+            .map(|entry| entry.offset.load(Ordering::Relaxed));
+        assert_eq!(
+            after_explicit,
+            Some(4),
+            "explicit store may rewind below the auto-committed offset",
+        );
+    }
 }

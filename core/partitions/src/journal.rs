@@ -48,18 +48,37 @@ pub struct RetainedBatchMeta {
 }
 
 /// Lookup key for querying messages from the journal.
+///
+/// `ceiling` is the inclusive commit-frontier bound: the resident journal holds
+/// replicated-but-uncommitted prepares (a pipeline ahead of the commit
+/// frontier), so a poll must never return a message past `ceiling` or it leaks
+/// a dirty read of view-change-rollbackable data.
 #[derive(Debug, Clone, Copy)]
 pub enum MessageLookup {
-    #[allow(dead_code)]
-    Offset { offset: u64, count: u32 },
-    #[allow(dead_code)]
-    Timestamp { timestamp: u64, count: u32 },
+    Offset {
+        offset: u64,
+        count: u32,
+        ceiling: u64,
+    },
+    Timestamp {
+        timestamp: u64,
+        count: u32,
+        ceiling: u64,
+    },
 }
 
 impl MessageLookup {
     pub const fn count(self) -> u32 {
         match self {
             Self::Offset { count, .. } | Self::Timestamp { count, .. } => count,
+        }
+    }
+
+    /// Inclusive commit-frontier upper bound: no message with a greater offset
+    /// may be served (uncommitted, rollbackable on a view change).
+    pub const fn ceiling(self) -> u64 {
+        match self {
+            Self::Offset { ceiling, .. } | Self::Timestamp { ceiling, .. } => ceiling,
         }
     }
 }
@@ -610,8 +629,16 @@ pub fn select_batch_slice(
     let mut matched = 0u32;
     let mut last_matching_offset = None;
 
+    let ceiling = query.ceiling();
     for record in batch.iter_with_offsets() {
         let offset = batch.header.base_offset + u64::from(record.message.header.offset_delta);
+
+        // Offsets within a batch ascend with the record index, so once we pass
+        // the commit frontier every later record is uncommitted too: stop here
+        // rather than skipping, which would punch a hole into the byte slice.
+        if offset > ceiling {
+            break;
+        }
 
         let selected = match query {
             MessageLookup::Offset {
@@ -645,24 +672,30 @@ pub fn select_batch_slice(
     })
 }
 
-fn push_selected_batch_fragments(
+/// Push the fragments for one selected batch, shared by the resident-journal
+/// walk and the disk-chunk walk. `source` holds a stamped
+/// `[256B SendMessages2Header][blob]` batch starting at byte `batch_base`
+/// (the disk walk passes the chunk cursor; the resident walk passes
+/// `size_of::<PrepareHeader>()`, the batch's offset past the prepare header).
+/// A full-body selection forwards the original batch bytes by reference; a
+/// partial selection emits a rewritten header (clamped length/count/checksum)
+/// plus a body slice.
+pub fn push_selected_batch_fragments(
     fragments: &mut PollFragments<4096>,
     last_matching_offset: &mut Option<u64>,
     matched_messages: &mut u32,
-    prepare: &Frozen<4096>,
-    prepare_header: &PrepareHeader,
+    source: &Frozen<4096>,
+    batch_base: usize,
     batch: &SendMessages2Ref<'_>,
     selection: SelectedBatchSlice,
 ) {
-    let prepare_header_size = std::mem::size_of::<PrepareHeader>();
-    let prepare_size = prepare_header.size as usize;
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
 
     if full_body_selected {
         fragments.push(Fragment::slice(
-            prepare.clone(),
-            prepare_header_size,
-            prepare_size,
+            source.clone(),
+            batch_base,
+            batch_base + batch.header.total_size(),
         ));
     } else {
         let mut rewritten = batch.header;
@@ -678,9 +711,9 @@ fn push_selected_batch_fragments(
         );
         fragments.push(Fragment::whole(rewritten.into_frozen()));
         fragments.push(Fragment::slice(
-            prepare.clone(),
-            prepare_header_size + COMMAND_HEADER_SIZE + selection.start,
-            prepare_header_size + COMMAND_HEADER_SIZE + selection.end,
+            source.clone(),
+            batch_base + COMMAND_HEADER_SIZE + selection.start,
+            batch_base + COMMAND_HEADER_SIZE + selection.end,
         ));
     }
 
@@ -718,12 +751,14 @@ fn try_push_resident_entry(
     let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {
         return;
     };
+    // The batch's 256B header sits right after the prepare header in a resident
+    // entry (see `decode_prepare_slice`), so the batch base is `PREPARE_HEADER_SIZE`.
     push_selected_batch_fragments(
         fragments,
         last_matching_offset,
         matched_messages,
         prepare,
-        header,
+        PREPARE_HEADER_SIZE,
         &batch,
         selection,
     );
