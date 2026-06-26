@@ -27,7 +27,9 @@ use iggy_binary_protocol::{
 };
 use message_bus::MessageBus;
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
-use std::cell::{Cell, RefCell, UnsafeCell};
+#[cfg(debug_assertions)]
+use std::cell::Cell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use tracing::warn;
 
