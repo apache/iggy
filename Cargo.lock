@@ -11728,7 +11728,6 @@ dependencies = [
 name = "shard"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "compio",
  "consensus",
  "crossfire",

@@ -20,6 +20,11 @@ use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
     JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RemoveConsumerGroupMemberRequest,
 };
+use crate::stm::result::{
+    ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
+    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, PurgeStreamResult,
+    PurgeTopicResult, UpdateStreamResult, UpdateTopicResult,
+};
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
@@ -415,26 +420,28 @@ impl WireDecode for TruncatePartitionRequest {
 
 impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        // Internal op (no client result enum): a missing parent / partition is
+        // an idempotent no-op, like the other reconciler-fed internal ops.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-                return Bytes::new();
+                return ApplyReply::ok(Bytes::new());
             };
             let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-                return Bytes::new();
+                return ApplyReply::ok(Bytes::new());
             };
             let Some(stream) = state.items.get_mut(stream_id) else {
-                return Bytes::new();
+                return ApplyReply::ok(Bytes::new());
             };
             let Some(topic) = stream.topics.get_mut(topic_id) else {
-                return Bytes::new();
+                return ApplyReply::ok(Bytes::new());
             };
             let Some(partition) = topic
                 .partitions
                 .iter_mut()
                 .find(|partition| partition.id == self.partition_id as usize)
             else {
-                return Bytes::new();
+                return ApplyReply::ok(Bytes::new());
             };
             // Monotonic: a stale or duplicate replay never rewinds the watermark.
             if self.up_to_offset > partition.deleted_up_to_offset {
@@ -449,7 +456,7 @@ impl StateHandler for TruncatePartitionRequest {
         // watermark itself stays monotonic (set above); only the
         // reconcile-trigger fires unconditionally.
         state.revision = state.revision.wrapping_add(1);
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -1042,10 +1049,10 @@ impl Streams {
 impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if state.index.contains_key(&name_arc) {
-            return Bytes::new();
+            return ApplyReply::err(CreateStreamResult::NameAlreadyExists);
         }
 
         let stream = Stream {
@@ -1066,54 +1073,56 @@ impl StateHandler for CreateStreamRequest {
         // Reply body: a freshly created stream has no topics. The SDK
         // `create_stream` decodes a `GetStreamResponse`. Serialization is
         // local to this state machine (it owns the committed shape).
-        GetStreamResponse {
-            stream: StreamResponse {
-                id: id as u32,
-                created_at: timestamp.as_micros(),
-                topics_count: 0,
-                size_bytes: 0,
-                messages_count: 0,
-                name: self.name.clone(),
-            },
-            topics: Vec::new(),
-        }
-        .to_bytes()
+        ApplyReply::ok(
+            GetStreamResponse {
+                stream: StreamResponse {
+                    id: id as u32,
+                    created_at: timestamp.as_micros(),
+                    topics_count: 0,
+                    size_bytes: 0,
+                    messages_count: 0,
+                    name: self.name.clone(),
+                },
+                topics: Vec::new(),
+            }
+            .to_bytes(),
+        )
     }
 }
 
 impl StateHandler for UpdateStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
 
         let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
         if let Some(&existing_id) = state.index.get(&new_name_arc)
             && existing_id != stream_id
         {
-            return Bytes::new();
+            return ApplyReply::err(UpdateStreamResult::NameAlreadyExists);
         }
 
         state.index.remove(&stream.name);
         stream.name = new_name_arc.clone();
         state.index.insert(new_name_arc, stream_id);
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for DeleteStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
 
         let Some(stream) = state.items.get(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
         let name = stream.name.clone();
         state.items.remove(stream_id);
@@ -1121,24 +1130,33 @@ impl StateHandler for DeleteStreamRequest {
         state.revision = state.revision.wrapping_add(1);
         // The dropped stream may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
-        // TODO
-        todo!();
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        // Message data lives in the partition plane, not metadata. A purge leaves
+        // the metadata shape (streams, topics, partition ids) intact, so apply
+        // only validates the parent and acks: no mutation, no `revision` bump
+        // (the reconciler keys off partition shape, which a purge preserves). The
+        // partition-journal segment drop is not yet wired off this committed op,
+        // so a committed purge is a metadata-plane no-op for now.
+        // TODO: partition-plane purge off the committed op.
+        if state.resolve_stream_id(&self.stream_id).is_none() {
+            return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+        }
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for CreateTopicWithAssignmentsRequest {
     type State = StreamsInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
         let name_arc: Arc<str> = Arc::from(self.request.name.as_str());
@@ -1146,10 +1164,10 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         // revision bump below takes `&mut state`.
         {
             let Some(stream) = state.items.get(stream_id) else {
-                return Bytes::new();
+                return ApplyReply::err(CreateTopicResult::StreamNotFound);
             };
             if stream.topic_index.contains_key(&name_arc) {
-                return Bytes::new();
+                return ApplyReply::err(CreateTopicResult::NameAlreadyExists);
             }
         }
 
@@ -1159,7 +1177,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         state.revision = new_revision;
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
         let replication_factor = if self.request.replication_factor == 0 {
@@ -1207,9 +1225,9 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         stream.topic_index.insert(name_arc, topic_id);
 
         let Some(topic) = stream.topics.get(topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
-        encode_create_topic_reply(&self.request, topic_id, topic)
+        ApplyReply::ok(encode_create_topic_reply(&self.request, topic_id, topic))
     }
 }
 
@@ -1275,26 +1293,26 @@ fn encode_create_topic_reply(
 
 impl StateHandler for UpdateTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateTopicResult::StreamNotFound);
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateTopicResult::StreamNotFound);
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
 
         let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
         if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
             && existing_id != topic_id
         {
-            return Bytes::new();
+            return ApplyReply::err(UpdateTopicResult::NameAlreadyExists);
         }
 
         stream.topic_index.remove(&topic.name);
@@ -1307,25 +1325,25 @@ impl StateHandler for UpdateTopicRequest {
             topic.replication_factor = self.replication_factor;
         }
         stream.topic_index.insert(new_name_arc, topic_id);
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for DeleteTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
 
         let Some(topic) = stream.topics.get(topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
         let name = topic.name.clone();
         stream.topics.remove(topic_id);
@@ -1333,31 +1351,31 @@ impl StateHandler for DeleteTopicRequest {
         state.revision = state.revision.wrapping_add(1);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for PurgeTopicRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         // Purge keeps the topic, its partitions, and consumer-group membership;
-        // it wipes message data and consumer offsets per partition. The actual
-        // on-disk reset happens on every replica's reconciler -- here we only
-        // advance each partition's monotonic purge generation, which the
-        // reconciler observes (committed generation > locally applied) and
-        // turns into a single empty segment at offset 0 plus cleared offsets.
+        // it wipes message data and consumer offsets per partition. The on-disk
+        // reset happens on every replica's reconciler -- here we only advance
+        // each partition's monotonic purge generation, which the reconciler
+        // observes (committed generation > locally applied) and turns into a
+        // single empty segment at offset 0 plus cleared offsets.
         let advanced = {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-                return Bytes::new();
+                return ApplyReply::err(PurgeTopicResult::StreamNotFound);
             };
             let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-                return Bytes::new();
+                return ApplyReply::err(PurgeTopicResult::TopicNotFound);
             };
             let Some(stream) = state.items.get_mut(stream_id) else {
-                return Bytes::new();
+                return ApplyReply::err(PurgeTopicResult::StreamNotFound);
             };
             let Some(topic) = stream.topics.get_mut(topic_id) else {
-                return Bytes::new();
+                return ApplyReply::err(PurgeTopicResult::TopicNotFound);
             };
             for partition in &mut topic.partitions {
                 partition.purge_generation = partition.purge_generation.wrapping_add(1);
@@ -1367,18 +1385,18 @@ impl StateHandler for PurgeTopicRequest {
         if advanced {
             state.revision = state.revision.wrapping_add(1);
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for CreatePartitionsWithAssignmentsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.request.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
 
         // Resolve absolute partition ids under a borrow that ends before
@@ -1387,10 +1405,10 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         // re-base over a partial set and mint duplicate ids.
         let resolved: Vec<usize> = {
             let Some(stream) = state.items.get_mut(stream_id) else {
-                return Bytes::new();
+                return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
             };
             let Some(topic) = stream.topics.get_mut(topic_id) else {
-                return Bytes::new();
+                return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
             };
 
             let base_partition_id = topic
@@ -1401,17 +1419,17 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 .and_then(|partition_id| partition_id.checked_add(1))
                 .unwrap_or(0);
             let Ok(base_partition_id) = u32::try_from(base_partition_id) else {
-                return Bytes::new();
+                return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
             };
 
             let mut resolved: Vec<usize> = Vec::with_capacity(self.partitions.len());
             for partition in &self.partitions {
                 let Some(resolved_id_u32) = partition.partition_id.checked_add(base_partition_id)
                 else {
-                    return Bytes::new();
+                    return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
                 };
                 let Ok(resolved_id_usize) = usize::try_from(resolved_id_u32) else {
-                    return Bytes::new();
+                    return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
                 };
                 resolved.push(resolved_id_usize);
             }
@@ -1422,10 +1440,10 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         state.revision = new_revision;
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreatePartitionsResult::StreamNotFound);
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
         for (resolved_id_usize, partition) in resolved.into_iter().zip(self.partitions.iter()) {
             topic.partitions.push(Partition {
@@ -1443,25 +1461,25 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         // Matches legacy CreatePartitions wire contract: empty-ok body on
         // success. SDK discards the reply payload (resolved ids are derivable
         // from the request's base + count).
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for DeletePartitionsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeletePartitionsResult::StreamNotFound);
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeletePartitionsResult::TopicNotFound);
         };
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeletePartitionsResult::StreamNotFound);
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeletePartitionsResult::TopicNotFound);
         };
 
         let count_to_delete = self.partitions_count as usize;
@@ -1476,7 +1494,7 @@ impl StateHandler for DeletePartitionsRequest {
         if did_delete {
             state.revision = state.revision.wrapping_add(1);
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -1827,31 +1845,16 @@ mod tests {
             ],
         };
 
-        let bytes = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
-        let (reply, consumed) = GetTopicResponse::decode(&bytes).expect("reply decodes");
-        assert_eq!(consumed, bytes.len());
+        let apply = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+        let (reply, consumed) = GetTopicResponse::decode(&apply.body).expect("reply decodes");
+        assert_eq!(consumed, apply.body.len());
         assert_eq!(reply.topic.id, 0);
         assert_eq!(reply.topic.partitions_count, 2);
         assert_eq!(reply.topic.name.as_str(), "topic");
         assert_eq!(reply.partitions.len(), 2);
         assert_eq!(reply.partitions[0].id, 0);
         assert_eq!(reply.partitions[1].id, 1);
-    }
-
-    #[test]
-    fn create_topic_apply_returns_empty_on_validation_failure() {
-        // Unknown stream id rejects the command; legacy contract returns
-        // empty body so SDK decodes failure.
-        let mut inner = StreamsInner::new();
-        let create_topic = CreateTopicWithAssignmentsRequest {
-            request: make_topic_request(42, 1, "topic"),
-            partitions: vec![CreatedPartitionAssignment {
-                partition_id: 0,
-                consensus_group_id: 1,
-            }],
-        };
-        let bytes = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
-        assert!(bytes.is_empty());
     }
 
     #[test]
@@ -1896,8 +1899,9 @@ mod tests {
             ],
         };
 
-        let bytes = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
-        assert!(bytes.is_empty());
+        let apply = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+        assert!(apply.body.is_empty());
 
         let partitions = &inner.items[0].topics[0].partitions;
         assert_eq!(partitions.len(), 4);
@@ -1908,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn create_partitions_apply_returns_empty_on_validation_failure() {
+    fn given_missing_topic_when_apply_create_partitions_should_return_topic_not_found() {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         // Topic missing => validation failure path
@@ -1923,7 +1927,96 @@ mod tests {
                 consensus_group_id: 1,
             }],
         };
-        let bytes = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
-        assert!(bytes.is_empty());
+        let apply = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, u32::from(CreatePartitionsResult::TopicNotFound));
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_live_stream_when_apply_purge_stream_should_return_ok_with_empty_body() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let request = PurgeStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        let apply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+        assert!(apply.body.is_empty());
+        // Purge leaves the metadata shape intact: stream still present.
+        assert_eq!(inner.items.len(), 1);
+    }
+
+    #[test]
+    fn given_missing_topic_when_apply_purge_topic_should_return_topic_not_found() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let request = PurgeTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(99),
+        };
+        let apply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, u32::from(PurgeTopicResult::TopicNotFound));
+    }
+
+    // Drives the real `State::apply` path (parse -> dispatch -> left/right ->
+    // read-back) so both `absorb_first` and `absorb_second` run, and pins that
+    // they agree: a duplicate create returns the conflict code AND leaves
+    // exactly one stream.
+    #[test]
+    fn given_duplicate_create_when_applied_through_state_should_converge_both_buffers() {
+        use crate::stm::State;
+        use iggy_common::Either;
+
+        let streams = Streams::default();
+        let Either::Left(first) = streams
+            .apply(make_create_stream_prepare("dup", 1))
+            .expect("first apply ok")
+        else {
+            panic!("CreateStream must be handled by the Streams state");
+        };
+        assert_eq!(first.code, 0);
+
+        let Either::Left(second) = streams
+            .apply(make_create_stream_prepare("dup", 2))
+            .expect("second apply ok")
+        else {
+            panic!("CreateStream must be handled by the Streams state");
+        };
+        assert_eq!(
+            second.code,
+            u32::from(CreateStreamResult::NameAlreadyExists)
+        );
+
+        let count = streams.read(|inner| inner.items.len());
+        assert_eq!(count, 1, "duplicate must not insert a second stream");
+    }
+
+    fn make_create_stream_prepare(
+        name: &str,
+        op: u64,
+    ) -> server_common::Message<iggy_binary_protocol::PrepareHeader> {
+        use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+        use server_common::Message;
+        use server_common::iobuf::Owned;
+        use std::mem::size_of;
+
+        let body = CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+        }
+        .to_bytes();
+        let header_size = size_of::<PrepareHeader>();
+        let total = header_size + body.len();
+        let mut buffer = Owned::<4096>::zeroed(total);
+        {
+            let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+                &mut buffer.as_mut_slice()[..header_size],
+            );
+            header.command = Command2::Prepare;
+            header.operation = Operation::CreateStream;
+            header.op = op;
+            header.size = u32::try_from(total).unwrap();
+        }
+        buffer.as_mut_slice()[header_size..].copy_from_slice(&body);
+        Message::try_from(buffer).unwrap()
     }
 }

@@ -73,7 +73,7 @@ pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
     RESERVED_COMMAND_LEN, ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
-    StartViewHeader, read_size_field,
+    StartViewHeader, read_size_field, result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

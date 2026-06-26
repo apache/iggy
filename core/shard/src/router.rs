@@ -252,7 +252,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -335,7 +335,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {

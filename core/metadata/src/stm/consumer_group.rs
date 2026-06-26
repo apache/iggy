@@ -27,6 +27,7 @@
 //! offset -- making a metadata->offset purge unnecessary for correctness.
 
 use crate::stm::StateHandler;
+use crate::stm::result::{ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult};
 use crate::stm::stream::StreamsInner;
 use bytes::Bytes;
 
@@ -499,18 +500,22 @@ impl WireDecode for LeaveConsumerGroupRequest {
 impl StateHandler for CreateConsumerGroupRequest {
     type State = StreamsInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut StreamsInner, _timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut StreamsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> ApplyReply {
         let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let name: Arc<str> = Arc::from(self.name.as_str());
         // Per-(stream,topic) name uniqueness. A same-name group already exists:
         // do NOT supersede it -- removing it would drop a live group along with
         // its members and their assignments, and the ejected members would
-        // never recover. Leave the existing group untouched and reply empty,
-        // mirroring `CreateStream`/`CreateTopic` on a duplicate name.
+        // never recover. Leave the existing group untouched, mirroring
+        // `CreateStream`/`CreateTopic` on a duplicate name.
         if topic.consumer_group_index.contains_key(&name) {
-            return Bytes::new();
+            return ApplyReply::err(CreateConsumerGroupResult::NameAlreadyExists);
         }
         let id = topic.next_consumer_group_id;
         topic.next_consumer_group_id += 1;
@@ -519,25 +524,31 @@ impl StateHandler for CreateConsumerGroupRequest {
             .insert(id, ConsumerGroup::new(id, name.clone()));
         topic.consumer_group_index.insert(name, id);
 
-        ConsumerGroupDetailsResponse {
-            group: ConsumerGroupResponse {
-                id: id as u32,
-                partitions_count: 0,
-                members_count: 0,
-                name: self.name.clone(),
-            },
-            members: Vec::new(),
-        }
-        .to_bytes()
+        ApplyReply::ok(
+            ConsumerGroupDetailsResponse {
+                group: ConsumerGroupResponse {
+                    id: id as u32,
+                    partitions_count: 0,
+                    members_count: 0,
+                    name: self.name.clone(),
+                },
+                members: Vec::new(),
+            }
+            .to_bytes(),
+        )
     }
 }
 
 impl StateHandler for DeleteConsumerGroupRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut StreamsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> ApplyReply {
         let removed = {
             let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-                return Bytes::new();
+                return ApplyReply::err(DeleteConsumerGroupResult::NotFound);
             };
             if let Some(group_id) = topic.resolve_group_id(&self.group_id)
                 && let Some(group) = topic.consumer_groups.remove(&group_id)
@@ -548,32 +559,33 @@ impl StateHandler for DeleteConsumerGroupRequest {
                 false
             }
         };
+        if !removed {
+            return ApplyReply::err(DeleteConsumerGroupResult::NotFound);
+        }
         // Bump the partition-shaping revision so the reconciler's fast-skip
         // doesn't pass over the delete: it reclaims the group's leftover
         // offsets on the topic's surviving partitions.
-        if removed {
-            state.revision = state.revision.wrapping_add(1);
-            // The dropped group may have held pending revocations.
-            state.recompute_pending_revocations_count();
-        }
-        Bytes::new()
+        state.revision = state.revision.wrapping_add(1);
+        // The dropped group may have held pending revocations.
+        state.recompute_pending_revocations_count();
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for JoinConsumerGroupRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut StreamsInner, timestamp: iggy_common::IggyTimestamp) -> ApplyReply {
         let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         // Snapshot the live partition ids before taking a mutable borrow of the
         // group (both borrow the topic).
         let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         // Idempotent: a re-join from the same client keeps its membership.
         let already = group
@@ -581,7 +593,7 @@ impl StateHandler for JoinConsumerGroupRequest {
             .iter()
             .any(|(_, m)| m.client_id == self.client_id);
         if already {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         }
         let member_key = group
             .members
@@ -596,22 +608,26 @@ impl StateHandler for JoinConsumerGroupRequest {
             self.in_flight.iter().map(|&p| p as usize).collect();
         group.rebalance_cooperative(&partition_ids, &in_flight, timestamp.as_micros());
         state.recompute_pending_revocations_count();
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for LeaveConsumerGroupRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut StreamsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> ApplyReply {
         let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let member_key = group
             .members
@@ -623,7 +639,7 @@ impl StateHandler for LeaveConsumerGroupRequest {
             group.rebalance_members(&partition_ids);
             state.recompute_pending_revocations_count();
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -656,7 +672,11 @@ impl WireDecode for RemoveConsumerGroupMemberRequest {
 
 impl StateHandler for RemoveConsumerGroupMemberRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut StreamsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> ApplyReply {
         let mut any_removed = false;
         for (_, stream) in &mut state.items {
             for (_, topic) in &mut stream.topics {
@@ -685,7 +705,7 @@ impl StateHandler for RemoveConsumerGroupMemberRequest {
             state.revision = state.revision.wrapping_add(1);
             state.recompute_pending_revocations_count();
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -743,9 +763,13 @@ impl WireDecode for CompleteConsumerGroupRevocationRequest {
 
 impl StateHandler for CompleteConsumerGroupRevocationRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: iggy_common::IggyTimestamp) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut StreamsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> ApplyReply {
         let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return Bytes::new();
+            return ApplyReply::ok(Bytes::new());
         };
         let completed = topic
             .consumer_groups
@@ -757,7 +781,7 @@ impl StateHandler for CompleteConsumerGroupRevocationRequest {
             state.revision = state.revision.wrapping_add(1);
             state.recompute_pending_revocations_count();
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -863,5 +887,89 @@ impl ConsumerGroupSnapshot {
             name: Arc::from(self.name.as_str()),
             members,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::WireName;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_common::IggyTimestamp;
+
+    // Groups co-locate in the topic node, so an apply resolves its parent through
+    // `topic_mut`. Build a `StreamsInner` holding stream 0 / topic 0 via the same
+    // handlers the commit path drives.
+    fn streams_with_topic() -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        let _ = StateHandler::apply(
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+            },
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                compression_algorithm: 0,
+                message_expiry: 0,
+                max_topic_size: 0,
+                replication_factor: 1,
+                name: WireName::new("topic").unwrap(),
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        inner
+    }
+
+    fn create_group(state: &mut StreamsInner, name: &str) -> ApplyReply {
+        StateHandler::apply(
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new(name).unwrap(),
+            },
+            state,
+            IggyTimestamp::now(),
+        )
+    }
+
+    #[test]
+    fn given_duplicate_name_when_apply_create_consumer_group_should_return_name_already_exists() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+
+        let apply = create_group(&mut state, "group");
+        assert_eq!(
+            apply.code,
+            u32::from(CreateConsumerGroupResult::NameAlreadyExists)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_group_when_apply_delete_consumer_group_should_return_not_found() {
+        let mut state = streams_with_topic();
+        let apply = StateHandler::apply(
+            &DeleteConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(999),
+            },
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, u32::from(DeleteConsumerGroupResult::NotFound));
+        assert!(apply.body.is_empty());
     }
 }

@@ -18,7 +18,7 @@
 //! `StoreConsumerOffset` op. Pre-`AckLevel` manual encoding. Live
 //! namespace via shadow, fabricated consumer kind/id. Samples Success.
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -55,11 +55,10 @@ pub fn sample(
             let ns = shadow.pick_namespace(prng)?;
             let consumer_kind: u8 = u8::from(prng.random::<bool>());
             let consumer_id: u32 = prng.random_range(0..options.consumer_pool_size.max(1));
-            // Draw against the configured ceiling, then clamp to the
-            // partition's committed reality so the offset is reachable.
-            // Clamping post-draw preserves the PRNG draw order (and the
-            // determinism hash baseline) while keeping the request
-            // semantically valid once server-ng validates offsets.
+            // Draw against the configured ceiling, then clamp to committed
+            // reality so the offset is reachable. Clamping post-draw keeps
+            // the PRNG draw order (and determinism hash baseline) intact
+            // while staying valid once server-ng validates offsets.
             let raw: u64 = prng.random_range(0..options.max_offset.max(1));
             let high = shadow.sends_committed(ns).max(1);
             let offset = raw % high;
@@ -84,7 +83,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
 }
 
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
+pub const fn classify_reply(_code: u32) -> Outcome {
     Outcome::Success
 }
 
