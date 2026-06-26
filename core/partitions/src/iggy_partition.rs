@@ -86,6 +86,12 @@ where
     pub dirty_offset: AtomicU64,
     pub consumer_offsets: Arc<ConsumerOffsets>,
     pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+    /// Highest offset this partition has served (polled) to each consumer group.
+    /// The cooperative-rebalance reconciler completes a pending revocation once
+    /// the source group has committed up to what it was polled
+    /// (`committed >= last_polled`), i.e. nothing is in flight. Ephemeral (not
+    /// persisted): a fresh server treats a group as never-polled.
+    pub last_polled_offsets: Arc<ConsumerGroupOffsets>,
     pub stats: Arc<PartitionStats>,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
@@ -178,6 +184,7 @@ where
             dirty_offset: AtomicU64::new(0),
             consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(1)),
             consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
+            last_polled_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(1)),
             stats,
             created_at: IggyTimestamp::now(),
             revision_id: 0,
@@ -388,6 +395,35 @@ where
             }
             _ => Ok(()),
         }
+    }
+
+    /// Group ids that currently have a stored offset on this partition. Used by
+    /// the reconciler to find offsets belonging to deleted consumer groups.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn consumer_group_offset_ids(&self) -> Vec<u64> {
+        self.consumer_group_offsets
+            .pin()
+            .keys()
+            .map(|key| key.0 as u64)
+            .collect()
+    }
+
+    /// Reclaim a deleted consumer group's offset on this partition (in-memory
+    /// entry + persisted file). A no-op if the group has no stored offset here.
+    ///
+    /// # Errors
+    /// Returns an I/O error if deleting the persisted offset file fails.
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn delete_consumer_group_offset(&self, group_id: u64) -> Result<(), IggyError> {
+        self.consumer_group_offsets
+            .pin()
+            .remove(&ConsumerGroupId(group_id as usize));
+        if let Some(path) = self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
+        {
+            delete_persisted_offset(&path).await?;
+        }
+        Ok(())
     }
 
     async fn store_consumer_offset_and_persist(
@@ -625,6 +661,27 @@ where
 
         let (fragments, last_matching_offset) =
             result.unwrap_or_else(|| (PollFragments::new(), None));
+
+        // Record the highest offset served to a consumer group, so the
+        // cooperative-rebalance reconciler knows when a pending-revoked
+        // partition has been fully drained (committed >= last polled).
+        if let (PollingConsumer::ConsumerGroup(group_id, _), Some(last_offset)) =
+            (consumer, last_matching_offset)
+        {
+            let guard = self.last_polled_offsets.pin();
+            let key = ConsumerGroupId(group_id);
+            if let Some(existing) = guard.get(&key) {
+                existing.offset.fetch_max(last_offset, Ordering::Relaxed);
+            } else {
+                let created = ConsumerOffset::new(
+                    ConsumerKind::ConsumerGroup,
+                    u32::try_from(group_id).unwrap_or(u32::MAX),
+                    last_offset,
+                    String::new(),
+                );
+                guard.insert(key, created);
+            }
+        }
 
         if args.auto_commit && !fragments.is_empty() {
             let last_offset =

@@ -171,7 +171,6 @@ sink_connector!(StdoutSink);
 At a bare minimum, we need to add the following dependencies to the `Cargo.toml` file to compile the plugin at all:
 
 - dashmap
-- once_cell
 - tracing
 
 Now, let's implement the `Sink` trait for our `StdoutSink` struct.

@@ -254,6 +254,7 @@ fn map_eviction_reason(reason: EvictionReason) -> IggyError {
         | EvictionReason::NoSession
         | EvictionReason::SessionTooLow
         | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
+        EvictionReason::StaleClient => IggyError::StaleClient,
         _ => IggyError::InvalidCommand,
     }
 }

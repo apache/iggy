@@ -47,7 +47,6 @@ http = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy_common = { workspace = true }
-once_cell = { workspace = true }
 postcard = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
