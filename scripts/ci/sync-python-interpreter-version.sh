@@ -317,15 +317,15 @@ ensure_classifiers "$SOURCE_FILE"
 
 ensure_line \
     "foreign/python/Dockerfile.test" \
-    "^(FROM python:)[0-9]+\\.[0-9]+(-slim AS base)$" \
-    "^FROM python:${PYTHON_VERSION_REGEX}-slim AS base$" \
+    "^(FROM python:)[0-9]+\\.[0-9]+(-slim-trixie AS base)$" \
+    "^FROM python:${PYTHON_VERSION_REGEX}-slim-trixie AS base$" \
     "\\1${PYTHON_VERSION}\\2" \
     "Docker image Python version"
 
 ensure_line \
     "foreign/python/.devcontainer/Dockerfile" \
-    "^(FROM mcr\\.microsoft\\.com/devcontainers/python:1-)[0-9]+\\.[0-9]+(-bullseye)$" \
-    "^FROM mcr\\.microsoft\\.com/devcontainers/python:1-${PYTHON_VERSION_REGEX}-bullseye$" \
+    "^(FROM mcr\\.microsoft\\.com/devcontainers/python:1-)[0-9]+\\.[0-9]+(-trixie)$" \
+    "^FROM mcr\\.microsoft\\.com/devcontainers/python:1-${PYTHON_VERSION_REGEX}-trixie$" \
     "\\1${PYTHON_VERSION}\\2" \
     "devcontainer Python image version"
 

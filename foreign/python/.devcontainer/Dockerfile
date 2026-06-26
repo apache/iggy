@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM mcr.microsoft.com/devcontainers/python:1-3.10-slim-trixie
+FROM mcr.microsoft.com/devcontainers/python:1-3.10-trixie
 
 ENV VIRTUAL_ENV=/opt/venv
 RUN python -m venv $VIRTUAL_ENV

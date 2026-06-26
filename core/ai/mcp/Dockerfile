@@ -16,8 +16,9 @@
 # under the License.
 
 ARG RUST_VERSION=1.96
+ARG ALPINE_VERSION=3.23
 
-FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-slim-trixie AS chef
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef
 WORKDIR /app
 RUN apk add --no-cache musl-dev pkgconfig
 

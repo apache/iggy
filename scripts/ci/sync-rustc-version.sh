@@ -78,9 +78,6 @@ fi
 
 # Strip trailing ".0" -> e.g., 1.89.0 -> 1.89 (no change if it doesn't end in .0)
 RUST_VERSION_SHORT=$(echo "$RUST_VERSION" | sed -E 's/^([0-9]+)\.([0-9]+)\.0$/\1.\2/')
-RUST_IMAGE_VARIANT="slim-trixie"
-RUST_IMAGE_PATTERN="FROM[[:space:]].*(\\brust:|latest-rust-)"
-RUST_IMAGE_TAG_PATTERN="(rust:[^-[:space:]]+|latest-rust-[^-[:space:]]+)"
 
 echo "Rust version from rust-toolchain.toml: ${GREEN}$RUST_VERSION${NC} (using ${GREEN}$RUST_VERSION_SHORT${NC} for Dockerfiles)"
 echo ""
@@ -97,8 +94,6 @@ for dockerfile in $DOCKERFILES; do
     SOURCE=""
     CURRENT_VERSION=""
     EXPECTED_VERSION=""
-    HAS_RUST_IMAGE="false"
-    RUST_IMAGE_MISMATCH="false"
 
     # Two ways a Dockerfile pins the toolchain:
     #   1. `ARG RUST_VERSION=1.96`  (+ `FROM rust:${RUST_VERSION}...`)
@@ -119,67 +114,30 @@ for dockerfile in $DOCKERFILES; do
         fi
     fi
 
-    if grep -qE "$RUST_IMAGE_PATTERN" "$dockerfile" 2>/dev/null; then
-        HAS_RUST_IMAGE="true"
-        if grep -E "$RUST_IMAGE_PATTERN" "$dockerfile" | grep -qvE -- "-$RUST_IMAGE_VARIANT([[:space:]]|$)"; then
-            RUST_IMAGE_MISMATCH="true"
-        fi
-    fi
-
-    if [ -z "$SOURCE" ] && [ "$HAS_RUST_IMAGE" = "false" ]; then
+    if [ -z "$SOURCE" ]; then
         continue
     fi
 
     TOTAL_FILES=$((TOTAL_FILES + 1))
-    STATUS_DETAILS="$CURRENT_VERSION"
-    if [ "$HAS_RUST_IMAGE" = "true" ]; then
-        STATUS_DETAILS="${STATUS_DETAILS:+$STATUS_DETAILS, }$RUST_IMAGE_VARIANT"
-    fi
 
     if [ "$MODE" = "check" ]; then
-        if { [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; } || [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
+        if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
             MISALIGNED_FILES+=("$dockerfile")
-            MESSAGE=""
-            if [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
-                MESSAGE="Rust version ${RED}$CURRENT_VERSION${NC} (expected: ${GREEN}$EXPECTED_VERSION${NC})"
-            fi
-            if [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
-                if [ -n "$MESSAGE" ]; then
-                    MESSAGE="$MESSAGE; "
-                fi
-                MESSAGE="${MESSAGE}Rust base image must use ${GREEN}$RUST_IMAGE_VARIANT${NC}"
-            fi
-            echo -e "${RED}✗${NC} $dockerfile: $MESSAGE"
+            echo -e "${RED}✗${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} (expected: ${GREEN}$EXPECTED_VERSION${NC})"
         else
-            echo -e "${GREEN}✓${NC} $dockerfile${STATUS_DETAILS:+: $STATUS_DETAILS}"
+            echo -e "${GREEN}✓${NC} $dockerfile: $CURRENT_VERSION"
         fi
     elif [ "$MODE" = "fix" ]; then
-        if { [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; } || [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
-            if [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ] && [ "$SOURCE" = "arg" ]; then
+        if [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
+            if [ "$SOURCE" = "arg" ]; then
                 sed -i "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
-            elif [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
-                sed -i -E "s/(\brust:)[0-9]+\.[0-9]+(\.[0-9]+)?/\1$EXPECTED_VERSION/g" "$dockerfile"
+            else
+                sed -i -E "/FROM[[:space:]].*\\brust:[0-9]/ s#(\\brust:)[0-9]+\\.[0-9]+(\\.[0-9]+)?#\\1$EXPECTED_VERSION#g" "$dockerfile"
             fi
-
-            if [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
-                sed -i -E "/$RUST_IMAGE_PATTERN/ s#$RUST_IMAGE_TAG_PATTERN-[^[:space:]]+#\\1-$RUST_IMAGE_VARIANT#g" "$dockerfile"
-                sed -i -E "/$RUST_IMAGE_PATTERN/ { /-$RUST_IMAGE_VARIANT([[:space:]]|$)/! s#$RUST_IMAGE_TAG_PATTERN([[:space:]]|$)#\\1-$RUST_IMAGE_VARIANT\\2#g; }" "$dockerfile"
-            fi
-
             FIXED_FILES=$((FIXED_FILES + 1))
-            MESSAGE=""
-            if [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
-                MESSAGE="Rust version ${RED}$CURRENT_VERSION${NC} -> ${GREEN}$EXPECTED_VERSION${NC}"
-            fi
-            if [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
-                if [ -n "$MESSAGE" ]; then
-                    MESSAGE="$MESSAGE; "
-                fi
-                MESSAGE="${MESSAGE}Rust base image -> ${GREEN}$RUST_IMAGE_VARIANT${NC}"
-            fi
-            echo -e "${GREEN}Fixed${NC} $dockerfile: $MESSAGE"
+            echo -e "${GREEN}Fixed${NC} $dockerfile: ${RED}$CURRENT_VERSION${NC} -> ${GREEN}$EXPECTED_VERSION${NC}"
         else
-            echo -e "${GREEN}✓${NC} $dockerfile${STATUS_DETAILS:+: already correct ($STATUS_DETAILS)}"
+            echo -e "${GREEN}✓${NC} $dockerfile: already correct ($CURRENT_VERSION)"
         fi
     fi
 done
