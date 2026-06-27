@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Example JDBC Sink Connector Configuration for PostgreSQL.
+# Consumes messages from the configured stream/topic and INSERTs each one as a
+# row into the target table.
+
+type = "sink"
+key = "jdbc_sink_postgres_example"
+enabled = true
+version = 0
+name = "JDBC PostgreSQL Sink"
+path = "target/release/libiggy_connector_jdbc_sink"
+plugin_config_format = "toml"
+
+[[streams]]
+stream = "test"
+topics = ["events"]
+schema = "json"
+
+[plugin_config]
+# PostgreSQL connection URL
+jdbc_url = "jdbc:postgresql://localhost:5432/mydb"
+
+# PostgreSQL JDBC driver
+driver_class = "org.postgresql.Driver"
+
+# Path to the PostgreSQL driver JAR
+# Download from: https://jdbc.postgresql.org/download/postgresql-42.7.1.jar
+driver_jar_path = "/tmp/jdbc-drivers/postgresql-42.7.1.jar"
+
+# Credentials (alternatively embed them in jdbc_url)
+username = "postgres"
+password = "postgres"
+
+# Destination table (created automatically when auto_create_table = true)
+target_table = "iggy_events"
+auto_create_table = true
+
+# Write tuning
+batch_size = 100
+max_retries = 3
+retry_delay = "1s"
+
+# Store the payload as JSON text; set to "text" or "bytes" as needed
+payload_format = "json"
+
+# Iggy metadata columns
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+
+# Optional HikariCP connection pool
+enable_connection_pool = false
+max_pool_size = 10
+min_idle = 2
+connection_timeout_ms = 30000

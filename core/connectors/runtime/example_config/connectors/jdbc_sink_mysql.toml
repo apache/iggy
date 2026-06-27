@@ -1,0 +1,63 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Example JDBC Sink Connector Configuration for MySQL, with HikariCP pooling.
+
+type = "sink"
+key = "jdbc_sink_mysql_example"
+enabled = true
+version = 0
+name = "JDBC MySQL Sink"
+path = "target/release/libiggy_connector_jdbc_sink"
+plugin_config_format = "toml"
+
+[[streams]]
+stream = "test"
+topics = ["events"]
+schema = "json"
+
+[plugin_config]
+jdbc_url = "jdbc:mysql://localhost:3306/mydb"
+driver_class = "com.mysql.cj.jdbc.Driver"
+
+# Download from: https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.3.0/mysql-connector-j-8.3.0.jar
+driver_jar_path = "/tmp/jdbc-drivers/mysql-connector-j-8.3.0.jar"
+
+username = "root"
+password = "root"
+
+target_table = "iggy_events"
+auto_create_table = false
+
+batch_size = 500
+max_retries = 5
+retry_delay = "2s"
+
+payload_format = "text"
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+
+# HikariCP connection pool (requires HikariCP on the classpath alongside the
+# MySQL driver JAR, or a shaded driver JAR that bundles it).
+enable_connection_pool = true
+max_pool_size = 20
+min_idle = 5
+connection_timeout_ms = 30000
+
+# Extra JVM options
+jvm_options = ["-Xmx512m"]

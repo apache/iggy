@@ -83,6 +83,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **Doris Sink** - loads JSON messages into Apache Doris tables via the Stream Load HTTP API
 - **Elasticsearch Sink** - sends messages to Elasticsearch indices
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
+- **JDBC Sink** - writes messages as rows into any JDBC-compliant database (PostgreSQL, MySQL, Oracle, SQL Server, H2) via an embedded JVM
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
 - **Stdout Sink** - prints messages to standard output (useful for debugging/development)
@@ -96,6 +97,7 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 ### Available Sources
 
 - **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **JDBC Source** - reads rows from any JDBC-compliant database (PostgreSQL, MySQL, Oracle, SQL Server, H2) via an embedded JVM; bulk and incremental modes
 - **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
 - **Random Source** - generates random test messages (useful for testing/development)
 
