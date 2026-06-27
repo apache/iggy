@@ -11,12 +11,12 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 
 ## How it works
 
-1. For each batch of messages, the connector serializes the JSON payloads into a JSON array.
+1. For each batch of messages, the connector serializes the JSON payloads into the configured output format: a JSON array by default, or CSV when `output_format = "csv"` (see Configuration).
 2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first_offset}-{last_offset}`.
    - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(label_prefix, stream, topic)` triple. So identities that sanitize to the same string get distinct labels — whether the collision is in the names (`events.v1` vs `events_v1`) or in two tenants' prefixes that truncate alike (`prod_events_us_east_1` vs `..._2`) — and no boundary-shift aliasing is possible (`("ab","c")` ≠ `("a","bc")`).
    - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
    - Doris dedupes loads by label inside its `label_keep_max_second` window. The in-request retry (step 6) re-PUTs a transiently-failed batch under the same label, so a prior attempt that actually landed (e.g. a `2xx` whose body we couldn't read) is absorbed, not doubled. This protects **in-request retry only**: the runtime commits the offset before `consume()` runs and discards its return, so a failure outliving the retry budget or a crash mid-load is **at-most-once**.
-3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it. Where the HTTP stack negotiates the handshake it also lets Doris reject auth/4xx before the body uploads — a secondary benefit, not relied on for correctness.)
+3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth, `Expect: 100-continue`, `label: <label>`, and the format headers (`format: json` + `strip_outer_array: true` for JSON; `format: csv` with control-char `column_separator`/`line_delimiter` + `enclose`/`escape` for CSV). `Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it; it also lets Doris reject auth/4xx before the body uploads.
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
    `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 (or a redirect with no usable `Location`) are rejected as a permanent `PermanentHttpError`, since retrying a malformed/looping redirect cannot help.
 5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
@@ -45,6 +45,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |
+| `output_format` | no | `json` | Stream Load output format: `json` or `csv`. CSV is opt-in for throughput; it **requires `columns`** (CSV is positional, unlike name-mapped JSON) and emits control-char-framed, `enclose`/`escape`-quoted rows. `open()` fails if `output_format = "csv"` and `columns` is unset. (Named `output_format`, not `format`, to avoid an env-override collision with `plugin_config_format`.) |
 | `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |
 | `allowed_redirect_hosts` | no | unset | Allowlist of redirect targets. Each entry is `host` (pins the host, any port) or `host:port` (pins the exact endpoint). When set and non-empty, any other redirect target is refused. |
 
@@ -97,7 +98,7 @@ timeout = "30s"
 
 ## Limitations
 
-- JSON payload only. CSV and raw-text payloads are not supported yet.
+- Output is JSON (default) or CSV (`output_format = "csv"`, which requires `columns`). Both serialize from `Payload::Json`; raw-text/CSV passthrough and Parquet are not supported. CSV maps JSON `null` and missing keys to SQL `NULL` (`\N`), an empty string to `""`, emits numbers and booleans bare (`true`/`false`), and stringifies nested objects/arrays as JSON.
 - HTTP Basic auth only.
 - No automatic table creation.
 - In-request retry only. Transient backend failures are retried within a single `consume()` call (step 6), but the runtime commits the consumer offset at poll time and discards `consume()`'s return value, so there is no cross-poll redrive or DLQ — delivery is at-most-once under a crash or a failure that outlives the retry budget.
