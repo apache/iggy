@@ -108,6 +108,7 @@ const ENV_SINK_PASSWORD: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_PASSWO
 const ENV_SINK_LABEL_PREFIX: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_LABEL_PREFIX";
 const ENV_SINK_MAX_FILTER_RATIO: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_MAX_FILTER_RATIO";
 const ENV_SINK_COLUMNS: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_COLUMNS";
+const ENV_SINK_FORMAT: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_OUTPUT_FORMAT";
 const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_BATCH_SIZE";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_DORIS_STREAMS_0_STREAM";
 const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_DORIS_STREAMS_0_TOPICS";
@@ -165,6 +166,11 @@ PROPERTIES (
 /// instructs Doris to derive the seventh column from the loaded `count`.
 pub const COLUMNS_MAPPING_HEADER: &str =
     "id, name, count, amount, active, timestamp, calculated = count + 1";
+
+/// Stream Load `columns` header for `DorisSinkCsvFixture`. CSV is positional, so
+/// the connector needs the explicit column order to map each message's JSON
+/// values into the right CSV fields. Matches `TEST_TABLE_DDL_TEMPLATE`'s order.
+const CSV_COLUMNS_HEADER: &str = "id, name, count, amount, active, timestamp";
 
 /// Linux-only host precheck. macOS / Windows have no `/proc/sys/vm/max_map_count`
 /// (and the all-in-one image is already unusable on macOS for the BE-redirect
@@ -710,6 +716,45 @@ impl TestFixture for DorisSinkColumnsMappingFixture {
             ENV_SINK_COLUMNS.to_string(),
             COLUMNS_MAPPING_HEADER.to_string(),
         );
+        envs
+    }
+}
+
+/// Pre-creates the standard test table and configures the connector to emit
+/// `format = "csv"`. CSV is positional, so it also sets the matching `columns`
+/// header; a passing load proves the connector's JSON->CSV serialization
+/// (control-char framing, enclose/escape, column order) round-trips through Doris.
+pub struct DorisSinkCsvFixture {
+    inner: DorisSinkFixture,
+}
+
+impl std::ops::Deref for DorisSinkCsvFixture {
+    type Target = DorisSinkFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DorisOps for DorisSinkCsvFixture {
+    fn container(&self) -> &DorisContainer {
+        self.inner.container()
+    }
+}
+
+#[async_trait]
+impl TestFixture for DorisSinkCsvFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = DorisSinkFixture::setup().await?;
+        inner
+            .create_table(inner.container.database(), DEFAULT_TEST_TABLE)
+            .await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_FORMAT.to_string(), "csv".to_string());
+        envs.insert(ENV_SINK_COLUMNS.to_string(), CSV_COLUMNS_HEADER.to_string());
         envs
     }
 }

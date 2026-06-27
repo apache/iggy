@@ -41,6 +41,11 @@ password = "replace_with_secret"
 label_prefix = "iggy"
 batch_size = 1000
 timeout = "30s"
+# Output format: "json" (default) or "csv". CSV is opt-in for throughput and is
+# positional, so it REQUIRES `columns` to pin the column order (JSON is
+# name-mapped). open() fails if output_format="csv" without columns.
+# output_format = "json"
+# columns = "id, name, count, amount, active, timestamp"
 # TCP connect timeout (default "5s"). Independent of timeout; raise it for
 # cross-region or cold-start FEs that are slow to accept the connection.
 # connect_timeout = "5s"
