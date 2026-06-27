@@ -621,8 +621,33 @@ class TestGetTopics:
             )
 
         topics = await iggy_client.get_topics(stream_name)
-        assert len(topics) == topic_count
+        assert len(topics) == len(topic_names)
         assert {topic.name for topic in topics} == topic_names
+        # Only assert fields supplied at creation or deterministically set by
+        # the server: each topic keeps its partition count and a fresh topic
+        # holds no messages. The numeric id is server-assigned and not checked.
+        assert all(topic.partitions_count == 1 for topic in topics)
+        assert all(topic.messages_count == 0 for topic in topics)
+
+    @pytest.mark.asyncio
+    async def test_get_topics_returns_same_result_when_called_repeatedly(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test repeated get_topics calls return a stable view of the stream."""
+        stream_name = unique_name()
+        topic_names = {unique_name() for _ in range(3)}
+
+        await iggy_client.create_stream(stream_name)
+        for name in topic_names:
+            await iggy_client.create_topic(
+                stream=stream_name, name=name, partitions_count=1
+            )
+
+        first = await iggy_client.get_topics(stream_name)
+        second = await iggy_client.get_topics(stream_name)
+        assert {topic.name for topic in first} == topic_names
+        assert {topic.name for topic in second} == topic_names
+        assert {topic.id for topic in first} == {topic.id for topic in second}
 
     @pytest.mark.asyncio
     async def test_get_topics_accepts_numeric_stream_id(
@@ -654,23 +679,16 @@ class TestGetTopics:
         assert topics == []
 
     @pytest.mark.asyncio
-    async def test_get_topics_before_connect_fails(self, unique_name):
-        """Test get_topics requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
-
-        with pytest.raises(RuntimeError):
-            await client.get_topics(unique_name())
-
-    @pytest.mark.asyncio
-    async def test_get_topics_before_login_fails(self, unique_name):
-        """Test get_topics requires authentication."""
+    async def test_get_topics_requires_connection_and_auth(self, unique_name):
+        """Test get_topics fails both before connecting and before logging in."""
         host, port = get_server_config()
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.get_topics(unique_name())
 
+        await client.connect()
         with pytest.raises(RuntimeError):
             await client.get_topics(unique_name())
 
@@ -914,6 +932,86 @@ class TestUpdateTopic:
             )
 
     @pytest.mark.asyncio
+    async def test_update_topic_with_message_expiry(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_topic accepts an explicit message expiry."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.update_topic(
+            stream_id=stream_name,
+            topic_id=topic_name,
+            name=topic_name,
+            message_expiry=timedelta(minutes=10),
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.name == topic_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_topic_size", [0, 2_000_000_000, 2**64 - 1])
+    async def test_update_topic_with_valid_max_topic_size(
+        self, iggy_client: IggyClient, unique_name, max_topic_size: int
+    ):
+        """Test update_topic accepts supported maximum topic size values."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.update_topic(
+            stream_id=stream_name,
+            topic_id=topic_name,
+            name=topic_name,
+            max_topic_size=max_topic_size,
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.name == topic_name
+
+    @pytest.mark.asyncio
+    async def test_update_topic_applies_repeated_updates(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test successive update_topic calls each take effect."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        first_rename = unique_name()
+        second_rename = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.update_topic(
+            stream_id=stream_name, topic_id=topic_name, name=first_rename
+        )
+        after_first = await iggy_client.get_topic(stream_name, first_rename)
+        assert after_first is not None
+        assert after_first.name == first_rename
+        assert await iggy_client.get_topic(stream_name, topic_name) is None
+
+        await iggy_client.update_topic(
+            stream_id=stream_name, topic_id=first_rename, name=second_rename
+        )
+        after_second = await iggy_client.get_topic(stream_name, second_rename)
+        assert after_second is not None
+        assert after_second.name == second_rename
+        assert await iggy_client.get_topic(stream_name, first_rename) is None
+
+    @pytest.mark.asyncio
     async def test_update_nonexistent_topic_fails(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -928,25 +1026,50 @@ class TestUpdateTopic:
             )
 
     @pytest.mark.asyncio
-    async def test_update_topic_before_connect_fails(self, unique_name):
-        """Test update_topic requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+    async def test_update_topic_in_nonexistent_stream_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_topic raises when the stream does not exist."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_topic(
+                stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
+            )
 
+    @pytest.mark.asyncio
+    async def test_update_topic_to_existing_name_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_topic rejects renaming a topic to a name already in use."""
+        stream_name = unique_name()
+        first_topic = unique_name()
+        second_topic = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=first_topic, partitions_count=1
+        )
+        await iggy_client.create_topic(
+            stream=stream_name, name=second_topic, partitions_count=1
+        )
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_topic(
+                stream_id=stream_name, topic_id=second_topic, name=first_topic
+            )
+
+    @pytest.mark.asyncio
+    async def test_update_topic_requires_connection_and_auth(self, unique_name):
+        """Test update_topic fails both before connecting and before logging in."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
 
-    @pytest.mark.asyncio
-    async def test_update_topic_before_login_fails(self, unique_name):
-        """Test update_topic requires authentication."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
-
-        client = IggyClient(f"{host}:{port}")
         await client.connect()
-
         with pytest.raises(RuntimeError):
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
@@ -1033,23 +1156,33 @@ class TestDeleteTopic:
             await iggy_client.delete_topic(stream_name, unique_name())
 
     @pytest.mark.asyncio
-    async def test_delete_topic_before_connect_fails(self, unique_name):
-        """Test delete_topic requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+    async def test_delete_topic_twice_fails_second_time(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test deleting an already-deleted topic raises on the second call."""
+        stream_name = unique_name()
+        topic_name = unique_name()
 
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.delete_topic(stream_name, topic_name)
         with pytest.raises(RuntimeError):
-            await client.delete_topic(unique_name(), unique_name())
+            await iggy_client.delete_topic(stream_name, topic_name)
 
     @pytest.mark.asyncio
-    async def test_delete_topic_before_login_fails(self, unique_name):
-        """Test delete_topic requires authentication."""
+    async def test_delete_topic_requires_connection_and_auth(self, unique_name):
+        """Test delete_topic fails both before connecting and before logging in."""
         host, port = get_server_config()
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.delete_topic(unique_name(), unique_name())
 
+        await client.connect()
         with pytest.raises(RuntimeError):
             await client.delete_topic(unique_name(), unique_name())
 
@@ -1082,6 +1215,12 @@ class TestPurgeTopic:
         after = await iggy_client.get_topic(stream_name, topic_name)
         assert after is not None
         assert after.messages_count == 0
+        # Purging clears messages only; every other field is left unchanged.
+        assert after.id == before.id
+        assert after.name == before.name
+        assert after.partitions_count == before.partitions_count
+        assert after.compression_algorithm == before.compression_algorithm
+        assert after.replication_factor == before.replication_factor
 
     @pytest.mark.asyncio
     async def test_purge_empty_topic_succeeds(
@@ -1103,10 +1242,33 @@ class TestPurgeTopic:
         assert topic.messages_count == 0
 
     @pytest.mark.asyncio
+    async def test_purge_topic_is_idempotent_when_called_repeatedly(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test purge_topic succeeds when called repeatedly on the same topic."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        messages = [SendMessage(f"payload-{index}") for index in range(5)]
+        await iggy_client.send_messages(stream_name, topic_name, 0, messages)
+
+        await iggy_client.purge_topic(stream_name, topic_name)
+        await iggy_client.purge_topic(stream_name, topic_name)
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert topic.messages_count == 0
+
+    @pytest.mark.asyncio
     async def test_purge_nonexistent_topic_fails(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test purge_topic raises for a non-existent topic."""
+        """Test purge_topic raises for a non-existent topic in an existing stream."""
         stream_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
@@ -1115,22 +1277,23 @@ class TestPurgeTopic:
             await iggy_client.purge_topic(stream_name, unique_name())
 
     @pytest.mark.asyncio
-    async def test_purge_topic_before_connect_fails(self, unique_name):
-        """Test purge_topic requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
-
+    async def test_purge_topic_in_nonexistent_stream_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test purge_topic raises when the stream does not exist."""
         with pytest.raises(RuntimeError):
-            await client.purge_topic(unique_name(), unique_name())
+            await iggy_client.purge_topic(unique_name(), unique_name())
 
     @pytest.mark.asyncio
-    async def test_purge_topic_before_login_fails(self, unique_name):
-        """Test purge_topic requires authentication."""
+    async def test_purge_topic_requires_connection_and_auth(self, unique_name):
+        """Test purge_topic fails both before connecting and before logging in."""
         host, port = get_server_config()
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.purge_topic(unique_name(), unique_name())
 
+        await client.connect()
         with pytest.raises(RuntimeError):
             await client.purge_topic(unique_name(), unique_name())
