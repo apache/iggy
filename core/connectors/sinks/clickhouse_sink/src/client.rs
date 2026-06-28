@@ -249,9 +249,10 @@ impl ClickHouseClient {
                         );
                         tokio::time::sleep(jittered_backoff(retry_delay, attempts)).await;
                     } else {
-                        // Non-retryable: 4xx data error — log and fail immediately.
+                        // Non-retryable 4xx data error. PermanentHttpError keeps
+                        // the runtime circuit breaker from tripping on bad data.
                         error!("ClickHouse insert error HTTP {status}: {body_text}");
-                        return Err(Error::CannotStoreData(format!(
+                        return Err(Error::PermanentHttpError(format!(
                             "HTTP {status}: {body_text}"
                         )));
                     }
@@ -309,7 +310,10 @@ struct SchemaRow {
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+    ) || status.is_server_error()
 }
 
 /// Exponential backoff with full jitter.
