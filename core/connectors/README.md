@@ -97,6 +97,7 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 ### Available Sources
 
 - **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **JDBC Source** - reads rows from any JDBC-compliant database (PostgreSQL, MySQL, Oracle, SQL Server, H2) via an embedded JVM; bulk and incremental modes
 - **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
 - **Random Source** - generates random test messages (useful for testing/development)
 

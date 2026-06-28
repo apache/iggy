@@ -46,6 +46,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/jdbc_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
