@@ -19,7 +19,6 @@ use iggy_binary_protocol::PrepareHeader;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;
-use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use server_common::{Message, iobuf::Owned};
@@ -163,4 +162,4 @@ impl JournalHandle for SimJournal<MemStorage> {
 pub struct SimSnapshot {}
 
 /// Type alias for simulator state machine
-pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;

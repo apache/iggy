@@ -90,6 +90,7 @@ pub const CREATE_CONSUMER_GROUP_CODE: u32 = 602;
 pub const DELETE_CONSUMER_GROUP_CODE: u32 = 603;
 pub const JOIN_CONSUMER_GROUP_CODE: u32 = 604;
 pub const LEAVE_CONSUMER_GROUP_CODE: u32 = 605;
+pub const SYNC_CONSUMER_GROUP_CODE: u32 = 606;
 
 /// Lookup the human-readable name for a command code.
 ///
@@ -158,6 +159,7 @@ mod tests {
         DELETE_CONSUMER_GROUP_CODE,
         JOIN_CONSUMER_GROUP_CODE,
         LEAVE_CONSUMER_GROUP_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     ];
 
     #[test]

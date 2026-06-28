@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteTopic` op. Live (stream, topic) picked from shadow.
+//! `DeleteTopic` op. Targets `Ok` (a live topic), `StreamNotFound` (a
+//! fabricated parent stream), or `TopicNotFound` (a live stream with a
+//! fabricated topic).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -26,18 +28,15 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::DeleteTopicResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub stream: String,
     pub topic: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::StreamNotFound, Outcome::TopicNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -46,9 +45,20 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => shadow
+        Outcome::Ok => shadow
             .pick_topic_pair(prng)
             .map(|(stream, topic)| Input { stream, topic }),
+        Outcome::StreamNotFound => Some(Input {
+            stream: shadow.fabricate_absent_name("stream"),
+            topic: shadow.fabricate_absent_name("topic"),
+        }),
+        Outcome::TopicNotFound => {
+            let stream = shadow.pick_stream_name(prng)?;
+            Some(Input {
+                stream,
+                topic: shadow.fabricate_absent_name("topic"),
+            })
+        }
     }
 }
 
@@ -57,17 +67,22 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.delete_topic(&input.stream, &input.topic)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::RemoveTopic {
+        Outcome::Ok => Effect::RemoveTopic {
             stream: input.stream.clone(),
             name: input.topic.clone(),
         },
+        _ => Effect::None,
     }
 }

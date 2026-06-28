@@ -27,8 +27,8 @@ pub use config::CoordinatorConfig;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer, VsrAction,
-    VsrConsensus,
+    Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer,
+    VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -160,6 +160,19 @@ pub enum MetadataSubmit {
         request: Message<GenericHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
+    /// A shard's partition reconciler asks shard 0 to complete a cooperative
+    /// consumer-group revocation (the source drained the partition or it timed
+    /// out). Server-originated: shard 0 proposes it through metadata consensus
+    /// with no client session. Fire-and-forget + idempotent -- `reply` carries
+    /// the commit op (or `None` on a transient submit failure) for logging only.
+    CompleteRevocation {
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+        reply: Sender<Option<u64>>,
+    },
 }
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].
@@ -180,6 +193,10 @@ pub struct ConnectedClientInfo {
     /// Transport (coordinator-minted) client id; top 16 bits are the home
     /// shard. The wire `client_id` is the `u32` seq tail.
     pub client_id: u128,
+    /// Bound VSR client id, if the connection completed register. Keys the
+    /// connection to its consumer-group memberships (stored by VSR id, not
+    /// transport id).
+    pub vsr_client_id: Option<u128>,
     pub user_id: Option<u32>,
     pub transport: ClientTransportKind,
     pub address: std::net::SocketAddr,
@@ -207,6 +224,22 @@ pub enum PartitionRead {
     ConsumerOffset {
         consumer: PollingConsumer,
     },
+    /// Cooperative-rebalance classification: the group's last-polled and
+    /// committed offsets on this partition, so the join enrichment can tell an
+    /// in-flight partition (committed < last-polled) from a never-polled/drained
+    /// one. `group_id` is the monotonic consumer-group id (offset key).
+    GroupOffsetState {
+        group_id: u64,
+    },
+    /// Drop the group's ephemeral `last_polled` mark on this partition. The
+    /// join-time gather issues this when it finds an uncommitted `last_polled`
+    /// for a partition no live member owns: the residue of a since-removed
+    /// member (reconnect). Clearing it stops a later join in the same restart
+    /// from misreading the dead mark as a live in-flight hold. `group_id` is the
+    /// monotonic consumer-group id (offset key).
+    ClearGroupLastPolled {
+        group_id: u64,
+    },
 }
 
 /// Reply to a [`PartitionRead`].
@@ -220,6 +253,14 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
+    /// committed offsets on this partition (each `None` if absent).
+    GroupOffsetState {
+        last_polled: Option<u64>,
+        committed: Option<u64>,
+    },
+    /// Acknowledges a [`PartitionRead::ClearGroupLastPolled`].
+    Ack,
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
@@ -1153,7 +1194,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1168,6 +1209,23 @@ where
                 let routing = (prepare.header().operation, prepare.header().namespace);
                 if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
                     self.on_replicate(prepare).await;
+                    // A follower learns the cluster commit point from the
+                    // commit_max piggybacked on each prepare; the Commit
+                    // heartbeat carries commit_min and stops advancing
+                    // commit_max once the piggyback has raced ahead, so
+                    // on_commit alone never drains a follower's journal. Drive
+                    // it here off the prepare, as the metadata plane does inside
+                    // its own on_replicate.
+                    if routing.0.is_partition() {
+                        let planes = self.plane.inner();
+                        let config = planes.1.0.config();
+                        let namespace = IggyNamespace::from_raw(routing.1);
+                        if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
+                            && partition.consensus().is_follower()
+                        {
+                            partition.commit_journal(config).await;
+                        }
+                    }
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1260,7 +1318,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1279,7 +1337,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1298,7 +1356,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1332,7 +1390,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1496,7 +1554,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1517,7 +1575,7 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
+        let config = planes.1.0.config();
         let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
         for namespace in namespaces {
             let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
@@ -1535,7 +1593,7 @@ where
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
             {
-                partition.commit_journal(&config).await;
+                partition.commit_journal(config).await;
             }
             return;
         }
@@ -1609,7 +1667,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1625,7 +1683,7 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
+        let config = planes.1.0.config();
         let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
         for namespace in namespaces {
             let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
@@ -1637,7 +1695,7 @@ where
             }
 
             if consensus.handle_commit(&header) {
-                partition.commit_journal(&config).await;
+                partition.commit_journal(config).await;
             }
             return;
         }
@@ -1672,9 +1730,7 @@ where
             };
 
             let consensus = partition.consensus();
-            let current_op = consensus.sequencer().current_sequence();
-            let current_commit = consensus.commit_min();
-            let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+            let actions = consensus.tick(PlaneKind::Partitions);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             dispatch_partition_journal_actions(consensus, partition, &actions).await;
         }
@@ -1696,9 +1752,7 @@ where
             return;
         };
 
-        let current_op = consensus.sequencer().current_sequence();
-        let current_commit = consensus.commit_min();
-        let actions = consensus.tick(PlaneKind::Metadata, current_op, current_commit);
+        let actions = consensus.tick(PlaneKind::Metadata);
 
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
     }

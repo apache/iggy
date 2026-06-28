@@ -85,6 +85,18 @@ impl SystemClient for ClientWrapper {
         }
     }
 
+    async fn refresh_consumer_group_assignments(&self) {
+        match self {
+            ClientWrapper::Iggy(client) => client.refresh_consumer_group_assignments().await,
+            ClientWrapper::Http(client) => client.refresh_consumer_group_assignments().await,
+            ClientWrapper::Tcp(client) => client.refresh_consumer_group_assignments().await,
+            ClientWrapper::Quic(client) => client.refresh_consumer_group_assignments().await,
+            ClientWrapper::WebSocket(client) => {
+                client.refresh_consumer_group_assignments().await;
+            }
+        }
+    }
+
     async fn snapshot(
         &self,
         compression: SnapshotCompression,

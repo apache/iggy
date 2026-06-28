@@ -32,6 +32,19 @@ use crate::{Fragment, PollFragments, PollQueryResult};
 const ZERO_LEN: usize = 0;
 type JournalBuffer = Frozen<4096>;
 
+/// Decoded `SendMessages` header fields surfaced from a journal (re-)append so a
+/// caller can fold segment accounting without a second decode of the same bytes.
+/// Raw header values only: the journal stays agnostic of partition-layer
+/// accounting types (`JournalInfo` lives in the log layer). `None` is surfaced
+/// for non-`SendMessages` ops, which carry no segment bytes.
+#[derive(Clone, Copy)]
+pub struct RetainedBatchMeta {
+    pub base_offset: u64,
+    pub base_timestamp: u64,
+    pub total_size: u64,
+    pub message_count: u32,
+}
+
 /// Lookup key for querying messages from the journal.
 #[derive(Debug, Clone, Copy)]
 pub enum MessageLookup {
@@ -209,11 +222,6 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
-    pub fn entries(&self) -> Vec<JournalBuffer> {
-        let inner = unsafe { &*self.inner.get() };
-        inner.storage.entries()
-    }
-
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
     pub fn commit(&self) -> Vec<JournalBuffer> {
         let entries = {
@@ -231,6 +239,150 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         timestamp_to_op.clear();
 
         entries
+    }
+
+    /// Entries forming the contiguous committed op-run from the front of the
+    /// journal up to and including `commit_max`, WITHOUT evicting them.
+    ///
+    /// A backup journals replicated prepares up to a full pipeline ahead of the
+    /// commit frontier. Only this gapless prefix may be flushed to a segment;
+    /// persisting the uncommitted tail would write per-replica-timing bytes to
+    /// disk (cross-replica divergence) and drop the headers those ops need when
+    /// their own commit later lands (`commit_min` wedge). Stopping at the first
+    /// gap keeps a post-gap op (even one `<= commit_max`) resident until its
+    /// predecessor lands, so nothing is persisted ahead of a replication hole.
+    /// Entries are append-ordered, op-ascending on a backup, so the prefix is
+    /// the front. Read-only: the caller evicts via `evict_prefix` only once the
+    /// bytes are durable, so a persist failure leaves the prefix recoverable.
+    pub fn committed_prefix(&self, commit_max: u64) -> Vec<JournalBuffer> {
+        let headers = unsafe { &*self.headers.get() };
+        let entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.entries()
+        };
+        let mut committed = Vec::new();
+        let mut expected: Option<u64> = None;
+        for (header, entry) in headers.iter().zip(entries) {
+            let contiguous = expected.is_none_or(|next| header.op == next);
+            if header.op > commit_max || !contiguous {
+                break;
+            }
+            expected = Some(header.op + 1);
+            committed.push(entry);
+        }
+        committed
+    }
+
+    /// Evict the first `count` entries (the committed prefix just read via
+    /// `committed_prefix`) and keep the rest resident with the op / offset /
+    /// timestamp indexes rebuilt for the compacted layout. Returns each retained
+    /// entry paired with its `RetainedBatchMeta`, surfaced from the re-append
+    /// decode, so the caller folds its accounting without decoding the tail a
+    /// second time. Re-appending replays the original bytes, valid when first
+    /// appended, so it cannot fail. Call only after the evicted bytes are
+    /// durable: on a persist failure the prefix must stay resident for recovery.
+    pub async fn evict_prefix(
+        &self,
+        count: usize,
+    ) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
+        let all_entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+
+        {
+            let headers = unsafe { &mut *self.headers.get() };
+            headers.clear();
+            let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+            op_to_storage_offset.clear();
+            let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+            offset_to_op.clear();
+            let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+            timestamp_to_op.clear();
+        }
+
+        let retained: Vec<JournalBuffer> = all_entries.into_iter().skip(count).collect();
+        let mut result = Vec::with_capacity(retained.len());
+        for entry in retained {
+            let meta = self
+                .append_with_meta(entry.clone())
+                .await
+                .expect("re-appending a retained journal entry must not fail");
+            result.push((entry, meta));
+        }
+
+        result
+    }
+
+    /// `append`, additionally returning the decoded `RetainedBatchMeta` for a
+    /// `SendMessages` entry so the eviction path folds its accounting without a
+    /// second decode of the same bytes.
+    ///
+    /// INVARIANT (length-lock): the header is pushed before `storage.write_at`,
+    /// so `headers[i]` and the entry at storage index `i` stay positionally
+    /// paired - `committed_prefix`'s zip relies on that. `MemStorage::write_at`
+    /// is infallible, so the push never runs ahead of a failed write. A future
+    /// fallible `Storage` MUST roll the header push back on a write error (or
+    /// write before pushing the header) or the zip desyncs.
+    async fn append_with_meta(
+        &self,
+        entry: JournalBuffer,
+    ) -> io::Result<Option<RetainedBatchMeta>> {
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let header_bytes = &entry[..header_size];
+        let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+            .expect("partition journal append expects a valid prepare header");
+        let op = header.op;
+        // One decode feeds both the offset/timestamp index (keyed on
+        // `origin_timestamp`) and the surfaced accounting meta (`base_timestamp`,
+        // size, count); the two timestamps are distinct fields, do not conflate.
+        let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
+            match decode_prepare_slice(entry.as_slice()) {
+                Ok(batch) if batch.message_count() != 0 => {
+                    let message_count = batch.message_count();
+                    let meta = RetainedBatchMeta {
+                        base_offset: batch.header.base_offset,
+                        base_timestamp: batch.header.base_timestamp,
+                        total_size: batch.header.total_size() as u64,
+                        message_count,
+                    };
+                    (
+                        Some((batch.header.base_offset, batch.header.origin_timestamp)),
+                        Some(meta),
+                    )
+                }
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        {
+            let headers = unsafe { &mut *self.headers.get() };
+            headers.push(header);
+        };
+
+        let storage_offset = {
+            let inner = unsafe { &*self.inner.get() };
+            let storage_offset = inner.storage.current_offset();
+            inner.storage.write_at(storage_offset, entry).await?;
+            storage_offset
+        };
+
+        {
+            let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+            op_to_storage_offset.insert(op, storage_offset);
+        }
+
+        if let Some((offset, timestamp)) = index_offset_timestamp {
+            let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+            offset_to_op.insert(offset, op);
+
+            let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+            timestamp_to_op.insert((timestamp, op), op);
+        }
+
+        Ok(meta)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -257,6 +409,29 @@ where
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().find(|header| header.op == op).copied()
+    }
+
+    /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
+    /// stopping at the first missing op. A replication gap must not be skipped:
+    /// the caller advances `commit_min` strictly by one, so a hole would break
+    /// that contract. Headers are append-ordered, which is op-ascending on a
+    /// backup, so this is a single linear scan: drop ops below `from_op`, take
+    /// while contiguous, stop at the first gap or past `commit_max`.
+    pub fn committed_headers_from(&self, from_op: u64, commit_max: u64) -> Vec<PrepareHeader> {
+        let headers = unsafe { &*self.headers.get() };
+        let mut result = Vec::new();
+        let mut expected = from_op;
+        for header in headers {
+            if header.op < from_op {
+                continue;
+            }
+            if header.op != expected || header.op > commit_max {
+                break;
+            }
+            result.push(*header);
+            expected += 1;
+        }
+        result
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -416,48 +591,7 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let header_bytes = &entry[..header_size];
-        let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
-            .expect("partition journal append expects a valid prepare header");
-        let op = header.op;
-        let first_offset_and_timestamp = if header.operation == Operation::SendMessages {
-            decode_prepare_slice(entry.as_slice())
-                .ok()
-                .and_then(|batch| {
-                    (batch.message_count() != 0)
-                        .then_some((batch.header.base_offset, batch.header.origin_timestamp))
-                })
-        } else {
-            None
-        };
-
-        {
-            let headers = unsafe { &mut *self.headers.get() };
-            headers.push(header);
-        };
-
-        let storage_offset = {
-            let inner = unsafe { &*self.inner.get() };
-            let storage_offset = inner.storage.current_offset();
-            inner.storage.write_at(storage_offset, entry).await?;
-            storage_offset
-        };
-
-        {
-            let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
-            op_to_storage_offset.insert(op, storage_offset);
-        }
-
-        if let Some((offset, timestamp)) = first_offset_and_timestamp {
-            let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-            offset_to_op.insert(offset, op);
-
-            let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamp_to_op.insert((timestamp, op), op);
-        }
-
-        Ok(())
+        self.append_with_meta(entry).await.map(|_| ())
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
@@ -619,6 +753,124 @@ mod tests {
             cloned.as_slice(),
             entry.as_slice(),
             "cloning a journal entry must yield identical bytes (refcount bump, not deep copy)"
+        );
+    }
+
+    #[compio::test]
+    async fn committed_prefix_reads_then_evict_retains_uncommitted_tail() {
+        // A backup journals ops ahead of the commit frontier. Reading the
+        // committed prefix (op <= commit_max) must return only those without
+        // evicting; evicting it must keep the uncommitted tail resident +
+        // readable, with its headers intact, so a later commit of that tail
+        // still finds it (no commit_min wedge).
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in 1..=4 {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        let committed = journal.committed_prefix(2);
+        assert_eq!(
+            committed.len(),
+            2,
+            "ops 1 and 2 are the committed prefix and must be returned"
+        );
+        // Reading does not evict: the prefix stays resident until persisted.
+        assert!(
+            journal.header_by_op(1).is_some(),
+            "read must not evict op 1"
+        );
+
+        let retained = journal.evict_prefix(committed.len()).await;
+        assert_eq!(
+            retained.len(),
+            2,
+            "ops 3 and 4 stay resident after eviction"
+        );
+
+        // Committed ops are evicted from the index; uncommitted ops remain.
+        assert!(journal.header_by_op(1).is_none(), "op 1 must be evicted");
+        assert!(journal.header_by_op(2).is_none(), "op 2 must be evicted");
+        let header3 = journal.header_by_op(3).expect("op 3 must be retained");
+        let header4 = journal.header_by_op(4).expect("op 4 must be retained");
+
+        // Retained entries are still byte-readable after the storage rebuild.
+        for header in [header3, header4] {
+            let entry = journal
+                .entry(&header)
+                .await
+                .expect("retained entry must read back");
+            let stored = bytemuck::checked::try_from_bytes::<PrepareHeader>(
+                &entry[..std::mem::size_of::<PrepareHeader>()],
+            )
+            .expect("retained entry must hold a valid prepare header");
+            assert_eq!(stored.op, header.op);
+        }
+
+        // Advancing the frontier flushes the rest with no gap.
+        let committed = journal.committed_prefix(4);
+        let rest = journal.evict_prefix(committed.len()).await;
+        assert!(rest.is_empty(), "ops 3 and 4 flush on the next evict");
+        assert!(journal.is_empty(), "journal is empty once all ops flushed");
+    }
+
+    #[compio::test]
+    async fn committed_prefix_stops_at_gap() {
+        // Ops {1,2,4} resident, commit_max = 4. The contiguous committed prefix
+        // is {1,2}; op 4 must stay retained because op 3 is missing - flushing
+        // it would put op-4 bytes on the segment ahead of the op-3 hole and
+        // skew the durable offset past a gap advance_commit_min cannot cross.
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1u64, 2, 4] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        let committed = journal.committed_prefix(4);
+        let ops: Vec<u64> = committed
+            .iter()
+            .map(|entry| {
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(
+                    &entry[..std::mem::size_of::<PrepareHeader>()],
+                )
+                .expect("entry holds a valid prepare header")
+                .op
+            })
+            .collect();
+        assert_eq!(ops, vec![1, 2], "prefix stops before the op 3 gap");
+
+        let retained = journal.evict_prefix(committed.len()).await;
+        assert_eq!(retained.len(), 1, "op 4 stays retained past the gap");
+        assert!(journal.header_by_op(4).is_some(), "op 4 still resident");
+    }
+
+    #[compio::test]
+    async fn committed_headers_from_stops_at_gap() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1u64, 2, 4] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        // Contiguous run from op 1 stops before the missing op 3 even though
+        // op 4 is resident and within commit_max.
+        let run = journal.committed_headers_from(1, 4);
+        let ops: Vec<u64> = run.iter().map(|header| header.op).collect();
+        assert_eq!(
+            ops,
+            vec![1, 2],
+            "must stop at the op 3 gap, not skip to op 4"
+        );
+
+        assert!(
+            journal.committed_headers_from(5, 4).is_empty(),
+            "from_op past commit_max yields nothing"
         );
     }
 }

@@ -28,7 +28,36 @@
 use crate::harness::config::{IpAddrKind, TestServerConfig};
 use crate::harness::error::TestBinaryError;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
+
+/// Ports already handed out by any reservation in this process.
+///
+/// The reservation sockets set `SO_REUSEPORT` so the server can later bind the
+/// same port the reserver held. But `SO_REUSEPORT` also lets the kernel assign
+/// the *same* ephemeral port to two `bind(0)` calls from different threads, so
+/// under a multi-threaded test run two clusters can reserve the same port and
+/// the second server aborts on the cluster config's port-conflict validator.
+/// Tracking every handed-out port and rebinding on collision makes reservations
+/// unique across the whole process. Ports are claimed for the process lifetime
+/// (never returned to the pool): a release frees the socket so the server can
+/// bind, but re-handing the number out could still collide with that server.
+static RESERVED_PORTS: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+
+/// Bind retries before giving up. The ephemeral range dwarfs the ports a single
+/// test run consumes, so a fresh port is found almost immediately; the cap only
+/// guards against a pathological kernel that keeps returning claimed ports.
+const MAX_BIND_ATTEMPTS: usize = 100;
+
+/// Claim `port` process-wide. Returns `false` if it was already handed out.
+fn claim_port(port: u16) -> bool {
+    RESERVED_PORTS
+        .lock()
+        .expect("reserved-ports mutex poisoned")
+        .get_or_insert_with(HashSet::new)
+        .insert(port)
+}
 
 /// A socket bound to a specific port, held to prevent reuse until released.
 struct ReservedPort {
@@ -38,109 +67,84 @@ struct ReservedPort {
 
 impl ReservedPort {
     fn tcp(ip_kind: IpAddrKind) -> Result<Self, TestBinaryError> {
-        let domain = match ip_kind {
-            IpAddrKind::V4 => Domain::IPV4,
-            IpAddrKind::V6 => Domain::IPV6,
-        };
-
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|e| {
-            TestBinaryError::InvalidState {
-                message: format!("Failed to create TCP socket: {e}"),
-            }
-        })?;
-
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to set SO_REUSEADDR: {e}"),
-            })?;
-
-        #[cfg(unix)]
-        socket
-            .set_reuse_port(true)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to set SO_REUSEPORT: {e}"),
-            })?;
-
-        let bind_addr: SocketAddr = match ip_kind {
-            IpAddrKind::V4 => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
-            IpAddrKind::V6 => SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0),
-        };
-
-        socket
-            .bind(&bind_addr.into())
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to bind TCP socket: {e}"),
-            })?;
-
-        // Bind WITHOUT listen: a listening reservation joins the port's
-        // SO_REUSEPORT group and accepts early dials into a backlog nobody
-        // drains. During cluster startup a peer's replica connector dials
-        // ports whose reservations are still held (release happens per-node
-        // right before spawn), so each such dial used to wedge until the
-        // 2s handshake-ack timeout. A bound-only socket still holds the
-        // port against ephemeral allocation but answers RST, so dialers
-        // fail fast and the reconnect sweep retries cleanly.
-        let addr = socket
-            .local_addr()
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to get local address: {e}"),
-            })?
-            .as_socket()
-            .ok_or_else(|| TestBinaryError::InvalidState {
-                message: "Socket address is not an IP address".to_string(),
-            })?;
-
-        Ok(Self { socket, addr })
+        Self::reserve_unique(ip_kind, Type::STREAM, Protocol::TCP)
     }
 
     fn udp(ip_kind: IpAddrKind) -> Result<Self, TestBinaryError> {
+        Self::reserve_unique(ip_kind, Type::DGRAM, Protocol::UDP)
+    }
+
+    /// Bind an ephemeral port and claim it process-wide, rebinding until the
+    /// kernel hands back a port no other reservation holds (see
+    /// [`RESERVED_PORTS`]).
+    fn reserve_unique(
+        ip_kind: IpAddrKind,
+        sock_type: Type,
+        protocol: Protocol,
+    ) -> Result<Self, TestBinaryError> {
         let domain = match ip_kind {
             IpAddrKind::V4 => Domain::IPV4,
             IpAddrKind::V6 => Domain::IPV6,
         };
-
-        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|e| {
-            TestBinaryError::InvalidState {
-                message: format!("Failed to create UDP socket: {e}"),
-            }
-        })?;
-
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to set SO_REUSEADDR: {e}"),
-            })?;
-
-        #[cfg(unix)]
-        socket
-            .set_reuse_port(true)
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to set SO_REUSEPORT: {e}"),
-            })?;
-
         let bind_addr: SocketAddr = match ip_kind {
             IpAddrKind::V4 => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0),
             IpAddrKind::V6 => SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0),
         };
 
-        socket
-            .bind(&bind_addr.into())
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to bind UDP socket: {e}"),
+        for _ in 0..MAX_BIND_ATTEMPTS {
+            let socket = Socket::new(domain, sock_type, Some(protocol)).map_err(|e| {
+                TestBinaryError::InvalidState {
+                    message: format!("Failed to create socket: {e}"),
+                }
             })?;
 
-        let addr = socket
-            .local_addr()
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to get local address: {e}"),
-            })?
-            .as_socket()
-            .ok_or_else(|| TestBinaryError::InvalidState {
-                message: "Socket address is not an IP address".to_string(),
-            })?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to set SO_REUSEADDR: {e}"),
+                })?;
 
-        Ok(Self { socket, addr })
+            #[cfg(unix)]
+            socket
+                .set_reuse_port(true)
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to set SO_REUSEPORT: {e}"),
+                })?;
+
+            socket
+                .bind(&bind_addr.into())
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to bind socket: {e}"),
+                })?;
+
+            // Bind WITHOUT listen: a listening reservation joins the port's
+            // SO_REUSEPORT group and accepts early dials into a backlog nobody
+            // drains. During cluster startup a peer's replica connector dials
+            // ports whose reservations are still held (release happens per-node
+            // right before spawn), so each such dial used to wedge until the
+            // 2s handshake-ack timeout. A bound-only socket still holds the
+            // port against ephemeral allocation but answers RST, so dialers
+            // fail fast and the reconnect sweep retries cleanly.
+            let addr = socket
+                .local_addr()
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to get local address: {e}"),
+                })?
+                .as_socket()
+                .ok_or_else(|| TestBinaryError::InvalidState {
+                    message: "Socket address is not an IP address".to_string(),
+                })?;
+
+            // SO_REUSEPORT lets the kernel reuse a port another reservation
+            // already holds; rebind (dropping this socket) until the claim wins.
+            if claim_port(addr.port()) {
+                return Ok(Self { socket, addr });
+            }
+        }
+
+        Err(TestBinaryError::InvalidState {
+            message: format!("Failed to reserve a unique port after {MAX_BIND_ATTEMPTS} attempts"),
+        })
     }
 
     fn addr(&self) -> SocketAddr {

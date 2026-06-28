@@ -15,7 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Restart-based verifiers stay `not(vsr)`: they restart cluster nodes and
+// assert on-disk state afterward, which VSR can't satisfy until replica state
+// transfer lands (a restarted replica has no way to catch up).
+#[cfg(not(feature = "vsr"))]
 mod verify_after_server_restart;
-mod verify_consumer_group_partition_assignment;
+#[cfg(not(feature = "vsr"))]
 mod verify_no_plaintext_credentials_on_disk;
+#[cfg(not(feature = "vsr"))]
 mod verify_user_login_after_restart;
+
+// The cooperative-rebalance matrix runs under vsr too: it exercises server-ng's
+// consumer-group rebalancing (a VSR feature) and never restarts the cluster, so
+// the no-state-transfer limitation above does not apply. Green at 95/95.
+mod verify_consumer_group_partition_assignment;
+
+// Cross-replica on-disk data identity is VSR-only.
+#[cfg(feature = "vsr")]
+mod verify_cluster_replica_data_identical;

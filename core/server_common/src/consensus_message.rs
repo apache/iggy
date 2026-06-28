@@ -423,6 +423,17 @@ where
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
         header.validate()?;
 
+        // `size` is the whole-frame length and must at least span the header, or
+        // a consumer slicing `[size_of::<H>()..size]` underflows (start > end).
+        // Every consensus header is `HEADER_SIZE`, so this floor also covers a
+        // later `try_into_typed` conversion.
+        if (header.size() as usize) < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
         if bytes.len() < header.size() as usize {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
@@ -458,6 +469,15 @@ where
         let header = bytemuck::checked::try_from_bytes::<H>(&first.as_slice()[..size_of::<H>()])
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
         header.validate()?;
+
+        // See `TryFrom<Owned>`: `size` must at least span the header so a
+        // `[size_of::<H>()..size]` body slice cannot underflow.
+        if (header.size() as usize) < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
 
         let total_len = fragments.iter().map(Frozen::len).sum::<usize>();
         if total_len < header.size() as usize {
@@ -576,7 +596,11 @@ mod tests {
     const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RequestHeader, session);
 
     fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
-        let mut o = Owned::<MESSAGE_ALIGN>::zeroed(256);
+        header_bytes_sized(command, size, 256)
+    }
+
+    fn header_bytes_sized(command: Command2, size: u32, buffer_len: usize) -> Owned<MESSAGE_ALIGN> {
+        let mut o = Owned::<MESSAGE_ALIGN>::zeroed(buffer_len);
         {
             let buf = o.as_mut_slice();
             buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&size.to_le_bytes());
@@ -626,6 +650,17 @@ mod tests {
         let owned = header_bytes(Command2::Request, 999);
         // header_bytes already produces a 256-byte buffer; size=999 > 256,
         // so try_from rejects via `bytes.len() < header.size()`.
+        let result = Message::<RequestHeader>::try_from(owned);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn try_from_owned_size_below_header_size_returns_err() {
+        // `size` claims a frame smaller than the header. The buffer is full-size,
+        // so only the construction-time `size` floor rejects it (the
+        // buffer-length check passes). Guards the `[size_of::<H>()..size]`
+        // underflow at every downstream call site.
+        let owned = header_bytes(Command2::Request, size_of::<RequestHeader>() as u32 - 1);
         let result = Message::<RequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -728,13 +763,17 @@ mod tests {
 
     #[test]
     fn messagebag_dispatch_commit_with_invalid_size_returns_err() {
-        // `CommitHeader::validate` rejects size != 256.
-        let owned = header_bytes(Command2::Commit, 128);
+        // `CommitHeader::validate` rejects size != 256. Use size 300 (> header
+        // size) with a 512-byte buffer so the frame clears generic parse and the
+        // `size` floor, reaching typed dispatch. A size below the header size is
+        // now rejected earlier by the floor (see
+        // `try_from_owned_size_below_header_size_returns_err`).
+        let owned = header_bytes_sized(Command2::Commit, 300, 512);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         let result = MessageBag::try_from(generic);
         assert!(matches!(
             result,
-            Err(ConsensusError::CommitInvalidSize(128))
+            Err(ConsensusError::CommitInvalidSize(300))
         ));
     }
 
@@ -801,6 +840,17 @@ mod tests {
     #[test]
     fn response_backing_first_fragment_too_short_returns_err() {
         let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
+        let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
+        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn response_backing_size_below_header_size_returns_err() {
+        // First fragment is full-size, but its `size` field claims less than
+        // the header; the floor must reject before any consumer slices a body.
+        let owned = header_bytes(Command2::Reply, size_of::<ReplyHeader>() as u32 - 1);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
         let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);

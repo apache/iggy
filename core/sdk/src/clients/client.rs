@@ -259,6 +259,13 @@ impl Client for IggyClient {
                     }
                 } else {
                     debug!("Heartbeat was sent successfully.");
+                    // Picks up a widened assignment (e.g. partition-count
+                    // change) without waiting for an ownership-fence rejection.
+                    client
+                        .read()
+                        .await
+                        .refresh_consumer_group_assignments()
+                        .await;
                 }
                 sleep(heartbeat_interval.get_duration()).await
             }

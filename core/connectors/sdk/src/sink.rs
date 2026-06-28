@@ -243,11 +243,12 @@ macro_rules! sink_connector {
             assert_trait::<$type>();
         };
 
-        use $crate::connector_macro_support::{DashMap, Lazy};
+        use $crate::connector_macro_support::DashMap;
         use $crate::LogCallback;
         use $crate::sink::SinkContainer;
+        use std::sync::LazyLock;
 
-        static INSTANCES: Lazy<DashMap<u32, SinkContainer<$type>>> = Lazy::new(DashMap::new);
+        static INSTANCES: LazyLock<DashMap<u32, SinkContainer<$type>>> = LazyLock::new(DashMap::new);
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]

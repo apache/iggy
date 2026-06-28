@@ -369,6 +369,9 @@ pub enum EvictionReason {
     InvalidToken = 10,
     UserInactive = 11,
     SessionError = 12,
+    /// Client missed heartbeats past the configured threshold; the server
+    /// evicted the session (and dropped it from any consumer groups).
+    StaleClient = 13,
 }
 
 // EvictionHeader - primary -> client (session-terminal, no body)
@@ -1075,6 +1078,7 @@ mod tests {
         assert_eq!(EvictionReason::InvalidToken as u8, 10);
         assert_eq!(EvictionReason::UserInactive as u8, 11);
         assert_eq!(EvictionReason::SessionError as u8, 12);
+        assert_eq!(EvictionReason::StaleClient as u8, 13);
     }
 
     #[test]
