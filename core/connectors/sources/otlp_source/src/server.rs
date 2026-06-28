@@ -102,11 +102,11 @@ impl LogsService for LogsServiceImpl {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let messages = encode_or_convert(request.into_inner(), self.format, "logs");
-        let rejected = send_messages(&self.tx, messages, "logs");
+        let (messages, rejected) = encode_or_convert(request.into_inner(), self.format, "logs");
+        send_messages(&self.tx, messages, "logs")?;
         let partial_success = (rejected > 0).then(|| ExportLogsPartialSuccess {
             rejected_log_records: rejected,
-            error_message: "channel full; records dropped".to_string(),
+            error_message: "log records could not be serialized".to_string(),
         });
         Ok(Response::new(ExportLogsServiceResponse { partial_success }))
     }
@@ -118,11 +118,11 @@ impl MetricsService for MetricsServiceImpl {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let messages = encode_or_convert(request.into_inner(), self.format, "metrics");
-        let rejected = send_messages(&self.tx, messages, "metrics");
+        let (messages, rejected) = encode_or_convert(request.into_inner(), self.format, "metrics");
+        send_messages(&self.tx, messages, "metrics")?;
         let partial_success = (rejected > 0).then(|| ExportMetricsPartialSuccess {
             rejected_data_points: rejected,
-            error_message: "channel full; data points dropped".to_string(),
+            error_message: "data points could not be serialized".to_string(),
         });
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success,
@@ -136,11 +136,11 @@ impl TraceService for TraceServiceImpl {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        let messages = encode_or_convert(request.into_inner(), self.format, "traces");
-        let rejected = send_messages(&self.tx, messages, "traces");
+        let (messages, rejected) = encode_or_convert(request.into_inner(), self.format, "traces");
+        send_messages(&self.tx, messages, "traces")?;
         let partial_success = (rejected > 0).then(|| ExportTracePartialSuccess {
             rejected_spans: rejected,
-            error_message: "channel full; spans dropped".to_string(),
+            error_message: "spans could not be serialized".to_string(),
         });
         Ok(Response::new(ExportTraceServiceResponse {
             partial_success,
@@ -170,26 +170,32 @@ impl IntoMessages for ExportTraceServiceRequest {
     }
 }
 
-fn encode_or_convert<R>(req: R, format: StorageFormat, signal: &str) -> Vec<ProducedMessage>
+/// Returns the messages to enqueue plus the count of records that could not be
+/// serialized. Those rejects are permanent (the same bytes will fail again), so
+/// the caller surfaces them via OTLP `partial_success` rather than retrying.
+fn encode_or_convert<R>(req: R, format: StorageFormat, signal: &str) -> (Vec<ProducedMessage>, i64)
 where
     R: ProstMessage + IntoMessages,
 {
     match format {
-        StorageFormat::Json => req.into_json_messages(),
+        StorageFormat::Json => (req.into_json_messages(), 0),
         StorageFormat::Proto => {
             let mut buf = Vec::new();
             if let Err(e) = req.encode(&mut buf) {
                 warn!("Failed to encode {signal} proto: {e}");
-                return vec![];
+                // Proto mode packs the whole request into a single message, so a
+                // re-encode failure rejects it wholesale.
+                return (Vec::new(), 1);
             }
-            vec![ProducedMessage {
+            let message = ProducedMessage {
                 id: None,
                 checksum: None,
                 timestamp: None,
                 origin_timestamp: None,
                 headers: None,
                 payload: buf,
-            }]
+            };
+            (vec![message], 0)
         }
     }
 }
@@ -198,16 +204,23 @@ fn send_messages(
     tx: &mpsc::Sender<ProducedMessage>,
     messages: Vec<ProducedMessage>,
     signal: &str,
-) -> i64 {
-    let total = messages.len() as i64;
-    let mut dropped: i64 = 0;
+) -> Result<(), Status> {
     for message in messages {
-        if tx.try_send(message).is_err() {
-            dropped += 1;
+        if let Err(err) = tx.try_send(message) {
+            // OTLP treats partial_success as a permanent reject, so a full or closed
+            // channel must surface as a retryable gRPC error instead. Dropping into
+            // partial_success here would lose telemetry under load with no retry.
+            return match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    warn!("OTLP ingest channel full, asking {signal} client to retry");
+                    Err(Status::resource_exhausted("ingest channel full"))
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    warn!("OTLP ingest channel closed while receiving {signal}");
+                    Err(Status::unavailable("ingest channel closed"))
+                }
+            };
         }
     }
-    if dropped > 0 {
-        warn!("OTLP channel full, dropped {dropped}/{total} {signal} messages");
-    }
-    dropped
+    Ok(())
 }

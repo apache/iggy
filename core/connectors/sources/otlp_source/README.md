@@ -22,13 +22,13 @@ gzip on all three services.
 Each message has a `signal` field (`"log"`, `"metric"`, or `"trace"`) plus
 signal-specific fields:
 
-**Logs** — `timestamp_ns`, `observed_timestamp_ns`, `severity`,
+**Logs**: `timestamp_ns`, `observed_timestamp_ns`, `severity`,
 `severity_text`, `body`, `trace_id`, `span_id`, `service_name`, `attributes`
 
-**Metrics** — `name`, `description`, `unit`, `kind` (gauge/sum/histogram/…),
+**Metrics**: `name`, `description`, `unit`, `kind` (gauge/sum/histogram/...),
 `data_points`, `resource`, `attributes`
 
-**Traces** — `trace_id`, `span_id`, `parent_span_id`, `name`, `kind`,
+**Traces**: `trace_id`, `span_id`, `parent_span_id`, `name`, `kind`,
 `start_time_ns`, `end_time_ns`, `status`, `service_name`, `attributes`,
 `events`, `links`
 

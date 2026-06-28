@@ -236,7 +236,7 @@ fn push_metric_doc(doc: Value, time_ns: u64, messages: &mut Vec<ProducedMessage>
         Ok(payload) => messages.push(ProducedMessage {
             id: None,
             checksum: None,
-            timestamp: Some(time_ns),
+            timestamp: (time_ns != 0).then_some(time_ns),
             origin_timestamp: None,
             headers: None,
             payload,
