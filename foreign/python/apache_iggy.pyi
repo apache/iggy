@@ -63,91 +63,100 @@ class AutoCommit:
     class Interval(AutoCommit):
         r"""
         Commit offsets on a fixed interval.
-        Payload: `datetime.timedelta`.
+
+        Args:
+            interval: Interval between automatic offset commits as
+                `datetime.timedelta`.
         """
 
-        __match_args__ = ("_0",)
+        __match_args__ = ("interval",)
         @property
-        def _0(self) -> datetime.timedelta: ...
-        def __new__(cls, _0: datetime.timedelta) -> AutoCommit.Interval: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+        def interval(self) -> datetime.timedelta: ...
+        def __new__(cls, interval: datetime.timedelta) -> AutoCommit.Interval: ...
 
     @typing.final
     class IntervalOrWhen(AutoCommit):
         r"""
         Commit offsets on a fixed interval or according to an `AutoCommitWhen` mode.
-        Payload: `(datetime.timedelta, AutoCommitWhen)`.
+
+        Args:
+            interval: Interval between automatic offset commits as
+                `datetime.timedelta`.
+            when: Additional event that can trigger an offset commit as
+                `AutoCommitWhen`.
         """
 
         __match_args__ = (
-            "_0",
-            "_1",
+            "interval",
+            "when",
         )
         @property
-        def _0(self) -> datetime.timedelta: ...
+        def interval(self) -> datetime.timedelta: ...
         @property
-        def _1(self) -> AutoCommitWhen: ...
+        def when(self) -> AutoCommitWhen: ...
         def __new__(
-            cls, _0: datetime.timedelta, _1: AutoCommitWhen
+            cls, interval: datetime.timedelta, when: AutoCommitWhen
         ) -> AutoCommit.IntervalOrWhen: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     @typing.final
     class IntervalOrAfter(AutoCommit):
         r"""
         Commit offsets on a fixed interval or according to an `AutoCommitAfter` mode.
-        Payload: `(datetime.timedelta, AutoCommitAfter)`.
+
+        Args:
+            interval: Interval between automatic offset commits as
+                `datetime.timedelta`.
+            after: Post-consumption condition that can also trigger an offset
+                commit as `AutoCommitAfter`.
         """
 
         __match_args__ = (
-            "_0",
-            "_1",
+            "interval",
+            "after",
         )
         @property
-        def _0(self) -> datetime.timedelta: ...
+        def interval(self) -> datetime.timedelta: ...
         @property
-        def _1(self) -> AutoCommitAfter: ...
+        def after(self) -> AutoCommitAfter: ...
         def __new__(
-            cls, _0: datetime.timedelta, _1: AutoCommitAfter
+            cls, interval: datetime.timedelta, after: AutoCommitAfter
         ) -> AutoCommit.IntervalOrAfter: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     @typing.final
     class When(AutoCommit):
         r"""
         Commit offsets according to an `AutoCommitWhen` mode.
-        Payload: `AutoCommitWhen`.
+
+        Args:
+            when: Event that triggers an offset commit as `AutoCommitWhen`.
         """
 
-        __match_args__ = ("_0",)
+        __match_args__ = ("when",)
         @property
-        def _0(self) -> AutoCommitWhen: ...
-        def __new__(cls, _0: AutoCommitWhen) -> AutoCommit.When: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+        def when(self) -> AutoCommitWhen: ...
+        def __new__(cls, when: AutoCommitWhen) -> AutoCommit.When: ...
 
     @typing.final
     class After(AutoCommit):
         r"""
         Commit offsets according to an `AutoCommitAfter` mode.
-        Payload: `AutoCommitAfter`.
+
+        Args:
+            after: Post-consumption condition that triggers an offset commit as
+                `AutoCommitAfter`.
         """
 
-        __match_args__ = ("_0",)
+        __match_args__ = ("after",)
         @property
-        def _0(self) -> AutoCommitAfter: ...
-        def __new__(cls, _0: AutoCommitAfter) -> AutoCommit.After: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+        def after(self) -> AutoCommitAfter: ...
+        def __new__(cls, after: AutoCommitAfter) -> AutoCommit.After: ...
 
     ...
 
 class AutoCommitAfter:
     r"""
-    The auto-commit mode for storing the offset on the server **after** receiving the messages.
+    The auto-commit mode for storing the offset on the server after receiving
+    the messages.
 
     Use this type inside `AutoCommit.After(...)` or `AutoCommit.IntervalOrAfter(...)`.
     """
@@ -177,17 +186,17 @@ class AutoCommitAfter:
     class ConsumingEveryNthMessage(AutoCommitAfter):
         r"""
         Store the offset after every Nth consumed message.
-        Payload: `int`.
+
+        Args:
+            count: Number of consumed messages between offset commits as `int`.
         """
 
-        __match_args__ = ("_0",)
+        __match_args__ = ("count",)
         @property
-        def _0(self) -> builtins.int: ...
+        def count(self) -> builtins.int: ...
         def __new__(
-            cls, _0: builtins.int
+            cls, count: builtins.int
         ) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
 
@@ -234,17 +243,17 @@ class AutoCommitWhen:
     class ConsumingEveryNthMessage(AutoCommitWhen):
         r"""
         Store the offset after every Nth consumed message.
-        Payload: `int`.
+
+        Args:
+            count: Number of consumed messages between offset commits as `int`.
         """
 
-        __match_args__ = ("_0",)
+        __match_args__ = ("count",)
         @property
-        def _0(self) -> builtins.int: ...
+        def count(self) -> builtins.int: ...
         def __new__(
-            cls, _0: builtins.int
+            cls, count: builtins.int
         ) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
-        def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
 
@@ -393,13 +402,16 @@ class IggyClient:
                 `None` to use the TCP transport default, currently `False`.
             tls_domain: Server name as `str` to validate against the TLS certificate.
                 Pass `None` to use the TCP transport default, currently an empty
-                string that triggers auto-detection from `server_address`.
+                string that triggers auto-detection from `server_address`. This
+                option is ignored when `tls_enabled` is `False`.
             tls_ca_file: Path as `str` to a CA certificate file used to validate
                 the server certificate. Pass `None` to use the TCP transport
-                default, currently no CA file.
+                default, currently no CA file. This option is ignored when
+                `tls_enabled` is `False`.
             tls_validate_certificate: Whether to validate the server certificate.
                 Accepts `bool | None`. Pass `None` to use the TCP transport
-                default, currently `True`.
+                default, currently `True`. This option is ignored when
+                `tls_enabled` is `False`.
             no_delay: Whether to send packets immediately instead of allowing the
                 socket to coalesce small writes. Accepts `bool`. Defaults to
                 `False`.
@@ -1080,14 +1092,60 @@ class SendMessage:
 
 @typing.final
 class StreamDetails:
+    r"""
+    Metadata returned for a stream.
+
+    This object is returned by `IggyClient.create_stream()` and
+    `IggyClient.get_stream()`.
+    """
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        Get the stream id.
+
+        Returns:
+            The stream id as `int`.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        Get the stream name.
+
+        Returns:
+            The stream name as `str`.
+        """
     @property
-    def messages_count(self) -> builtins.int: ...
+    def created_at(self) -> builtins.int:
+        r"""
+        Get the stream creation timestamp.
+
+        Returns:
+            The creation timestamp in microseconds since the Unix epoch as `int`.
+        """
     @property
-    def topics_count(self) -> builtins.int: ...
+    def size(self) -> builtins.int:
+        r"""
+        Get the stream size in bytes.
+
+        Returns:
+            The total stream size in bytes as `int`.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        Get the number of messages in the stream.
+
+        Returns:
+            The message count as `int`.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        Get the number of topics in the stream.
+
+        Returns:
+            The topic count as `int`.
+        """
 
 @typing.final
 class Topic:

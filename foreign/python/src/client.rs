@@ -70,13 +70,16 @@ impl IggyClient {
     ///         `None` to use the TCP transport default, currently `False`.
     ///     tls_domain: Server name as `str` to validate against the TLS certificate.
     ///         Pass `None` to use the TCP transport default, currently an empty
-    ///         string that triggers auto-detection from `server_address`.
+    ///         string that triggers auto-detection from `server_address`. This
+    ///         option is ignored when `tls_enabled` is `False`.
     ///     tls_ca_file: Path as `str` to a CA certificate file used to validate
     ///         the server certificate. Pass `None` to use the TCP transport
-    ///         default, currently no CA file.
+    ///         default, currently no CA file. This option is ignored when
+    ///         `tls_enabled` is `False`.
     ///     tls_validate_certificate: Whether to validate the server certificate.
     ///         Accepts `bool | None`. Pass `None` to use the TCP transport
-    ///         default, currently `True`.
+    ///         default, currently `True`. This option is ignored when
+    ///         `tls_enabled` is `False`.
     ///     no_delay: Whether to send packets immediately instead of allowing the
     ///         socket to coalesce small writes. Accepts `bool`. Defaults to
     ///         `False`.
@@ -131,15 +134,17 @@ impl IggyClient {
         if let Some(duration) = reestablish_after {
             builder = builder.with_reestablish_after(py_delta_to_iggy_duration(&duration));
         }
-        builder = builder.with_tls_enabled(tls_enabled);
-        if let Some(domain) = tls_domain {
-            builder = builder.with_tls_domain(domain);
-        }
-        if let Some(ca_file) = tls_ca_file {
-            builder = builder.with_tls_ca_file(ca_file);
-        }
-        if let Some(validate) = tls_validate_certificate {
-            builder = builder.with_tls_validate_certificate(validate);
+        if tls_enabled {
+            builder = builder.with_tls_enabled(true);
+            if let Some(domain) = tls_domain {
+                builder = builder.with_tls_domain(domain);
+            }
+            if let Some(ca_file) = tls_ca_file {
+                builder = builder.with_tls_ca_file(ca_file);
+            }
+            if let Some(validate) = tls_validate_certificate {
+                builder = builder.with_tls_validate_certificate(validate);
+            }
         }
         if no_delay {
             builder = builder.with_no_delay();

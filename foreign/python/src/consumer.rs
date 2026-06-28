@@ -492,41 +492,70 @@ impl MessageConsumer for PyCallbackConsumer {
 pub enum AutoCommit {
     /// Disable automatic offset commits. Offsets must be stored manually.
     Disabled(),
+
     /// Commit offsets on a fixed interval.
-    /// Payload: `datetime.timedelta`.
-    Interval(Py<PyDelta>),
+    ///
+    /// Args:
+    ///     interval: Interval between automatic offset commits as
+    ///         `datetime.timedelta`.
+    Interval { interval: Py<PyDelta> },
+
     /// Commit offsets on a fixed interval or according to an `AutoCommitWhen` mode.
-    /// Payload: `(datetime.timedelta, AutoCommitWhen)`.
-    IntervalOrWhen(Py<PyDelta>, AutoCommitWhen),
+    ///
+    /// Args:
+    ///     interval: Interval between automatic offset commits as
+    ///         `datetime.timedelta`.
+    ///     when: Additional event that can trigger an offset commit as
+    ///         `AutoCommitWhen`.
+    IntervalOrWhen {
+        interval: Py<PyDelta>,
+        when: AutoCommitWhen,
+    },
+
     /// Commit offsets on a fixed interval or according to an `AutoCommitAfter` mode.
-    /// Payload: `(datetime.timedelta, AutoCommitAfter)`.
-    IntervalOrAfter(Py<PyDelta>, AutoCommitAfter),
+    ///
+    /// Args:
+    ///     interval: Interval between automatic offset commits as
+    ///         `datetime.timedelta`.
+    ///     after: Post-consumption condition that can also trigger an offset
+    ///         commit as `AutoCommitAfter`.
+    IntervalOrAfter {
+        interval: Py<PyDelta>,
+        after: AutoCommitAfter,
+    },
+
     /// Commit offsets according to an `AutoCommitWhen` mode.
-    /// Payload: `AutoCommitWhen`.
-    When(AutoCommitWhen),
+    ///
+    /// Args:
+    ///     when: Event that triggers an offset commit as `AutoCommitWhen`.
+    When { when: AutoCommitWhen },
+
     /// Commit offsets according to an `AutoCommitAfter` mode.
-    /// Payload: `AutoCommitAfter`.
-    After(AutoCommitAfter),
+    ///
+    /// Args:
+    ///     after: Post-consumption condition that triggers an offset commit as
+    ///         `AutoCommitAfter`.
+    After { after: AutoCommitAfter },
 }
 
 impl From<&AutoCommit> for RustAutoCommit {
     fn from(val: &AutoCommit) -> RustAutoCommit {
         match val {
             AutoCommit::Disabled() => RustAutoCommit::Disabled,
-            AutoCommit::Interval(delta) => {
-                let duration = py_delta_to_iggy_duration(delta);
+            AutoCommit::Interval { interval } => {
+                let duration = py_delta_to_iggy_duration(interval);
                 RustAutoCommit::Interval(duration)
             }
-            AutoCommit::IntervalOrWhen(delta, when) => {
-                let duration = py_delta_to_iggy_duration(delta);
+            AutoCommit::IntervalOrWhen { interval, when } => {
+                let duration = py_delta_to_iggy_duration(interval);
                 RustAutoCommit::IntervalOrWhen(duration, when.into())
             }
-            AutoCommit::IntervalOrAfter(delta, after) => {
-                let duration = py_delta_to_iggy_duration(delta);
+            AutoCommit::IntervalOrAfter { interval, after } => {
+                let duration = py_delta_to_iggy_duration(interval);
                 RustAutoCommit::IntervalOrAfter(duration, after.into())
             }
-            AutoCommit::When(when) => RustAutoCommit::When(when.into()),
-            AutoCommit::After(after) => RustAutoCommit::After(after.into()),
+            AutoCommit::When { when } => RustAutoCommit::When(when.into()),
+            AutoCommit::After { after } => RustAutoCommit::After(after.into()),
         }
     }
 }
@@ -540,13 +569,18 @@ impl From<&AutoCommit> for RustAutoCommit {
 pub enum AutoCommitWhen {
     /// Store the offset when messages are polled from the server.
     PollingMessages(),
+
     /// Store the offset after all messages from a poll have been consumed.
     ConsumingAllMessages(),
+
     /// Store the offset after each consumed message.
     ConsumingEachMessage(),
+
     /// Store the offset after every Nth consumed message.
-    /// Payload: `int`.
-    ConsumingEveryNthMessage(u32),
+    ///
+    /// Args:
+    ///     count: Number of consumed messages between offset commits as `int`.
+    ConsumingEveryNthMessage { count: u32 },
 }
 
 impl From<&AutoCommitWhen> for RustAutoCommitWhen {
@@ -555,8 +589,8 @@ impl From<&AutoCommitWhen> for RustAutoCommitWhen {
             AutoCommitWhen::PollingMessages() => RustAutoCommitWhen::PollingMessages,
             AutoCommitWhen::ConsumingAllMessages() => RustAutoCommitWhen::ConsumingAllMessages,
             AutoCommitWhen::ConsumingEachMessage() => RustAutoCommitWhen::ConsumingEachMessage,
-            AutoCommitWhen::ConsumingEveryNthMessage(n) => {
-                RustAutoCommitWhen::ConsumingEveryNthMessage(n.to_owned())
+            AutoCommitWhen::ConsumingEveryNthMessage { count } => {
+                RustAutoCommitWhen::ConsumingEveryNthMessage(count.to_owned())
             }
         }
     }
@@ -568,7 +602,8 @@ impl PyStubType for AutoCommitWhen {
     }
 }
 
-/// The auto-commit mode for storing the offset on the server **after** receiving the messages.
+/// The auto-commit mode for storing the offset on the server after receiving
+/// the messages.
 ///
 /// Use this type inside `AutoCommit.After(...)` or `AutoCommit.IntervalOrAfter(...)`.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -578,11 +613,15 @@ impl PyStubType for AutoCommitWhen {
 pub enum AutoCommitAfter {
     /// Store the offset after all messages from a poll have been consumed.
     ConsumingAllMessages(),
+
     /// Store the offset after each consumed message.
     ConsumingEachMessage(),
+
     /// Store the offset after every Nth consumed message.
-    /// Payload: `int`.
-    ConsumingEveryNthMessage(u32),
+    ///
+    /// Args:
+    ///     count: Number of consumed messages between offset commits as `int`.
+    ConsumingEveryNthMessage { count: u32 },
 }
 
 impl From<&AutoCommitAfter> for RustAutoCommitAfter {
@@ -590,8 +629,8 @@ impl From<&AutoCommitAfter> for RustAutoCommitAfter {
         match val {
             AutoCommitAfter::ConsumingAllMessages() => RustAutoCommitAfter::ConsumingAllMessages,
             AutoCommitAfter::ConsumingEachMessage() => RustAutoCommitAfter::ConsumingEachMessage,
-            AutoCommitAfter::ConsumingEveryNthMessage(n) => {
-                RustAutoCommitAfter::ConsumingEveryNthMessage(n.to_owned())
+            AutoCommitAfter::ConsumingEveryNthMessage { count } => {
+                RustAutoCommitAfter::ConsumingEveryNthMessage(count.to_owned())
             }
         }
     }
