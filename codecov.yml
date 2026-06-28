@@ -109,6 +109,7 @@ comment:
 
 ignore:
   - "core/bench/**"
+  - "foreign/java/bench/**"
   - "core/integration/**"
   - "core/tools/**"
   - "core/harness_derive/**"

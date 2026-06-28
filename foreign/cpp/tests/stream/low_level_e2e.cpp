@@ -17,10 +17,8 @@
  * under the License.
  */
 
-#include <chrono>
 #include <cstdint>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -249,7 +247,7 @@ TEST_F(LowLevelE2E_Stream, GetStreamsReturnsEmptyAfterCleanup) {
     }
 
     streams = client->get_streams();
-    ASSERT_EQ(streams.size(), 0);
+    ASSERT_EQ(streams.size(), 0u);
 }
 
 TEST_F(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
@@ -260,7 +258,7 @@ TEST_F(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
     client->create_stream(stream_name);
     TrackStream(stream_name);
     auto streams = client->get_streams();
-    ASSERT_GE(streams.size(), 1);
+    ASSERT_GE(streams.size(), 1u);
 
     bool found = false;
     for (const auto &s : streams) {

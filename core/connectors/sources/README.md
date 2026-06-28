@@ -178,7 +178,6 @@ source_connector!(TestSource);
 At a bare minimum, we need to add the following dependencies to the `Cargo.toml` file to compile the plugin at all:
 
 - dashmap
-- once_cell
 - tracing
 
 Before we make use of the `Source` trait, let's define the internal payload of the message that will be produced (e.g. as if it was pulled from some external database or so).

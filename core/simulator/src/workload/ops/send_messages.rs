@@ -22,7 +22,7 @@
 //! 3. one `prng.random()` per payload to disambiguate body bytes
 
 use bytes::Bytes;
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -79,7 +79,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
 }
 
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
+pub const fn classify_reply(_code: u32) -> Outcome {
     Outcome::Success
 }
 

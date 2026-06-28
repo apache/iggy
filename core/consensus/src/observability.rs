@@ -620,6 +620,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::Reserved => "reserved",
         Operation::CreateTopicWithAssignments => "create_topic_with_assignments",
         Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
+        Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
+        Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
@@ -633,6 +635,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::DeleteSegments => "delete_segments",
         Operation::CreateConsumerGroup => "create_consumer_group",
         Operation::DeleteConsumerGroup => "delete_consumer_group",
+        Operation::JoinConsumerGroup => "join_consumer_group",
+        Operation::LeaveConsumerGroup => "leave_consumer_group",
         Operation::CreateUser => "create_user",
         Operation::UpdateUser => "update_user",
         Operation::DeleteUser => "delete_user",
@@ -666,10 +670,14 @@ where
     event.emit(sim_event);
 }
 
+// INFO, not DEBUG: only view-change completion flows through here
+// (PrimaryElected / ReplicaStateChanged) - rare fault-path transitions and
+// the primary diagnostic for stalled clusters. Default test/prod filters
+// drop DEBUG, which made wedged view changes invisible in logs.
 pub fn emit_replica_event(sim_event: SimEventKind, ctx: &ReplicaLogContext) {
     tracing::event!(
         target: "iggy.sim",
-        tracing::Level::DEBUG,
+        tracing::Level::INFO,
         sim_event = sim_event.as_str(),
         plane = ctx.plane.as_str(),
         cluster_id = ctx.cluster_id,
@@ -829,9 +837,11 @@ impl StructuredSimEvent for CommitLogEvent {
 impl StructuredSimEvent for ViewChangeLogEvent {
     fn emit(&self, sim_event: SimEventKind) {
         let ctx = self.replica;
+        // INFO for the same reason as emit_replica_event: view-change starts
+        // must be visible under default log filters.
         tracing::event!(
             target: "iggy.sim",
-            tracing::Level::DEBUG,
+            tracing::Level::INFO,
             sim_event = sim_event.as_str(),
             plane = ctx.plane.as_str(),
             cluster_id = ctx.cluster_id,

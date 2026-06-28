@@ -33,6 +33,7 @@ application {
 
 dependencies {
     implementation(project(":iggy"))
+    implementation(libs.jackson.databind)
     implementation(libs.picocli)
     implementation(libs.slf4j.api)
 

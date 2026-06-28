@@ -17,45 +17,45 @@
 
 [versions]
 # Flink
-flink = "2.1.1"
+flink = "2.2.1"
 
 # Pinot
-pinot = "1.4.0"
+pinot = "1.5.0"
 
 # Jackson
-jackson = "3.0.2"
-jackson2 = "2.18.2"
+jackson = "3.2.0"
+jackson2 = "2.22.0"
 
 # Apache Commons
 commons-lang3 = "3.20.0"
 
 # HTTP Client
-httpclient5 = "5.5.1"
+httpclient5 = "5.6.1"
 
 # Logging
-slf4j = "2.0.17"
-logback = "1.5.21"
+slf4j = "2.0.18"
+logback = "1.5.34"
 
 # Testing
-junit = "6.0.1"
-assertj = "3.27.6"
-testcontainers = "2.0.2"
+junit = "6.1.0"
+assertj = "3.27.7"
+testcontainers = "2.0.5"
 
 # Netty
-netty = "4.2.7.Final"
+netty = "4.2.15.Final"
 
 # Spotbugs
-spotbugs = "4.9.8"
+spotbugs = "4.10.2"
 
 # Config
-typesafe-config = "1.4.5"
+typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.1.0"
-shadow = "9.2.2"
-checkstyle = "12.1.2"
-jacoco = "0.8.14"
+spotless = "8.7.0"
+shadow = "9.4.2"
+checkstyle = "12.3.1"
+jacoco = "0.8.15"
 
 [libraries]
 # Jackson

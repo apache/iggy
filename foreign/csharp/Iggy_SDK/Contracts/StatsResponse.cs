@@ -149,7 +149,7 @@ public sealed class StatsResponse
     public required string IggyServerVersion { get; init; }
 
     /// <summary>
-    ///     Aemantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 +
+    ///     Semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 +
     ///     patch).
     /// </summary>
     public uint IggyServerSemver { get; init; }

@@ -294,7 +294,11 @@ impl PrepareJournal {
             // Until a producer computes them, verification here would be
             // trivially-passing noise. Without it, a body bit-flip that
             // leaves the header valid is replayed silently as corrupt
-            // state.
+            // state. Committed bytes are meant to be byte-identical across
+            // replicas (deterministic apply, timestamp replicated not
+            // re-projected), so once the producer computes the integrity fields
+            // they should agree on every node and this check can be turned on
+            // without per-replica false positives.
 
             // Check if the full entry fits
             if pos + entry_size > file_len {
@@ -656,7 +660,6 @@ impl Journal<FileStorage> for PrepareJournal {
             }
         }
 
-        let offset = self.storage.file_len();
         // `truncate_or_fail` classifies any post-`pos` trailing region
         // larger than `MAX_ENTRY_SIZE` as mid-file damage rather than a
         // torn tail. That classification is only sound because this WAL
@@ -675,8 +678,10 @@ impl Journal<FileStorage> for PrepareJournal {
         // Hand the message's owned aligned buffer straight to compio: avoids a
         // per-append heap alloc + memcpy of up to MAX_ENTRY_SIZE bytes on the
         // consensus replicate hot path. `Owned` already implements `IoBuf`, so
-        // `write_append` consumes it without copying.
-        self.storage.write_append(entry.into_owned()).await?;
+        // `write_append` consumes it without copying, reserving its file
+        // offset synchronously and returning it so the index records the
+        // exact bytes written even when two appends interleave.
+        let offset = self.storage.write_append(entry.into_owned()).await?;
         self.storage.fsync().await?;
 
         let mut headers = self.headers.borrow_mut();
@@ -808,6 +813,42 @@ mod tests {
             assert_eq!(header.op, op as u64);
             let entry = journal.entry_at(&header).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op as u64);
+        }
+    }
+
+    #[compio::test]
+    async fn reopen_restores_write_cursor_so_next_append_does_not_overwrite() {
+        // Recovery must restore the write cursor (FileStorage::write_offset)
+        // to the end of the scanned entries. If it were left at 0, the first
+        // post-boot append would reserve offset 0 and overwrite op 1 -- the
+        // recovery-side counterpart of the offset-reservation append fix.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal.append(make_prepare(1, 64)).await.unwrap();
+            journal.append(make_prepare(2, 128)).await.unwrap();
+            journal.storage.fsync().await.unwrap();
+        }
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        let end_after_scan = journal.storage.file_len();
+        assert_eq!(end_after_scan, (2 * HEADER_SIZE + 64 + 128) as u64);
+
+        // A fresh append must land AFTER the recovered entries.
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        assert_eq!(
+            journal.storage.file_len(),
+            end_after_scan + (HEADER_SIZE + 32) as u64
+        );
+
+        // All three entries remain intact and readable at distinct offsets.
+        for (op, payload) in [(1u64, 64usize), (2, 128), (3, 32)] {
+            let header = *journal.header(op as usize).unwrap();
+            let entry = journal.entry(&header).await.unwrap();
+            assert_eq!(entry.header().op, op);
+            assert_eq!(entry.as_slice()[HEADER_SIZE..].len(), payload);
         }
     }
 

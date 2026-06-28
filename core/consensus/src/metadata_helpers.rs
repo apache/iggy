@@ -344,7 +344,7 @@ where
 /// Build + best-effort send `Eviction`. `SendError` dropped: eviction is
 /// terminal one-way; gone connection has nothing to recover.
 #[allow(clippy::future_not_send)]
-async fn send_eviction_to_client<B, P>(
+pub async fn send_eviction_to_client<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     reason: EvictionReason,
@@ -387,6 +387,8 @@ mod tests {
 
     #[allow(clippy::future_not_send)]
     impl MessageBus for ClientSpyBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
         async fn send_to_client(
             &self,
             client_id: u128,

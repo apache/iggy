@@ -55,7 +55,7 @@ pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -96,18 +96,20 @@ macro_rules! op_dispatch {
             pub request_namespace: u64,
         }
 
-        /// Sample an `Input` for `action`, picking the `Success` outcome.
-        /// `None` when sampling preconditions fail (e.g. no live namespace).
+        /// Sample an `Input` for `action` realizing the outcome at `outcome_id`
+        /// within the op's `OUTCOMES`. `None` when sampling preconditions fail
+        /// (e.g. no live namespace).
         pub fn sample(
             action: Action,
             shadow: &mut Shadow,
             prng: &mut Xoshiro256Plus,
             options: &WorkloadOptions,
+            outcome_id: usize,
         ) -> Option<(InFlightInput, InFlightOutcome)> {
             match action {
                 $(
                     Action::$variant => {
-                        let outcome = $module::Outcome::Success;
+                        let outcome = $module::OUTCOMES[outcome_id];
                         let input = $module::sample(shadow, outcome, prng, options)?;
                         Some((
                             InFlightInput::$variant(input),
@@ -118,6 +120,15 @@ macro_rules! op_dispatch {
             }
         }
 
+        /// Number of declared outcomes for `action` (its `OUTCOMES` length).
+        /// The workload targets one by picking an `outcome_id` in `0..count`.
+        #[must_use]
+        pub const fn outcome_count(action: Action) -> usize {
+            match action {
+                $( Action::$variant => $module::OUTCOMES.len(), )*
+            }
+        }
+
         #[must_use]
         pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RequestHeader> {
             match input {
@@ -125,19 +136,16 @@ macro_rules! op_dispatch {
             }
         }
 
-        /// Each op's `classify_reply` currently returns `Outcome::Success`
-        /// unconditionally.
+        /// Classify a reply into its op's declared outcome.
         ///
-        /// This is because server-ng hardcodes
-        /// `ReplyHeader.context = 0` for every reply (see
-        /// `core/consensus/src/plane_helpers.rs`, `build_reply_*` call
-        /// sites). Once server-ng (encode `IggyError`
-        /// discriminant into `context`) lands, expand each op's `Outcome`
-        /// enum and switch `classify_reply` on `reply.context`.
+        /// Decodes the committed result `code` (read off the reply body upstream;
+        /// `0` for the partition plane, which has no result section) through the
+        /// op's result enum. `Workload::on_reply` rejects an unrecognized code
+        /// before this runs.
         #[must_use]
-        pub const fn classify_reply(action: Action, reply: &ReplyHeader) -> InFlightOutcome {
+        pub const fn classify_reply(action: Action, code: u32) -> InFlightOutcome {
             match action {
-                $( Action::$variant => InFlightOutcome::$variant($module::classify_reply(reply)), )*
+                $( Action::$variant => InFlightOutcome::$variant($module::classify_reply(code)), )*
             }
         }
 

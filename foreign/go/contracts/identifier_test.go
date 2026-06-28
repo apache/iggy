@@ -80,3 +80,24 @@ func TestSerializeIdentifier_EmptyStringId(t *testing.T) {
 		t.Errorf("Expected error: %v, got: %v", ierror.ErrInvalidIdentifier, err)
 	}
 }
+
+// TestIdentifier_ValueMutationDoesNotCorruptEncoded guards that mutating
+// the exported Value field after construction leaves the cached wire bytes
+// intact.
+func TestIdentifier_ValueMutationDoesNotCorruptEncoded(t *testing.T) {
+	id, _ := NewIdentifier("hello")
+	before, err := id.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range id.value {
+		id.value[i] ^= 0xFF
+	}
+	after, err := id.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("encoded bytes changed after mutating Value: before=%v after=%v", before, after)
+	}
+}

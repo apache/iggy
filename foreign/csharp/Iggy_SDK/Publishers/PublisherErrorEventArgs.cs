@@ -38,14 +38,22 @@ public class PublisherErrorEventArgs : EventArgs
     public DateTime Timestamp { get; }
 
     /// <summary>
+    ///     Gets the original values of messages that were dropped because their serializer or encryptor threw, so
+    ///     they can be persisted or re-sent through the typed publisher. Null when the error is not a message drop.
+    /// </summary>
+    public IReadOnlyList<object?>? DroppedValues { get; }
+
+    /// <summary>
     ///     Initializes a new instance of the <see cref="PublisherErrorEventArgs" /> class.
     /// </summary>
     /// <param name="exception">The exception that occurred.</param>
     /// <param name="message">A descriptive message about the error.</param>
-    public PublisherErrorEventArgs(Exception exception, string message)
+    /// <param name="droppedValues">Original values of dropped messages, when the error is a message drop.</param>
+    public PublisherErrorEventArgs(Exception exception, string message, IReadOnlyList<object?>? droppedValues = null)
     {
         Exception = exception;
         Message = message;
         Timestamp = DateTime.UtcNow;
+        DroppedValues = droppedValues;
     }
 }

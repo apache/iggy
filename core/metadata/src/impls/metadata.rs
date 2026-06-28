@@ -16,31 +16,34 @@
 // under the License.
 
 use crate::MuxStateMachine;
-use crate::stm::consumer_group::ConsumerGroups;
+use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::Streams;
-use crate::stm::user::Users;
+use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, EvictionContext, Pipeline,
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
+    build_reply_message_with, drain_committable_prefix, emit_sim_event,
+    fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
-    replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RequestHeader, WireDecode, WireEncode,
+    Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::IggyError;
+use iggy_common::UserId;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -48,6 +51,7 @@ use server_common::Message;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::Path;
+use std::rc::Rc;
 use tracing::{debug, error, warn};
 
 fn freeze_client_reply(
@@ -61,21 +65,15 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
-    #[must_use]
-    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
-impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
     fn users(&self) -> &Users {
         &self.inner().0
     }
 
     fn streams(&self) -> &Streams {
         &self.inner().1.0
-    }
-
-    fn consumer_groups(&self) -> &ConsumerGroups {
-        &self.inner().1.1.0
     }
 }
 
@@ -278,39 +276,47 @@ impl<M> SnapshotCoordinator<M> {
     }
 }
 
-/// Failures for [`IggyMetadata::submit_register_in_process`]. All transient;
-/// the login/register handler wraps every variant in
-/// `LoginRegisterError::Transient` so SDK read-timeout replays.
+/// Failures shared by the in-process metadata submit helpers.
+///
+/// Returned by [`IggyMetadata::submit_register_in_process`],
+/// [`IggyMetadata::submit_logout_in_process`],
+/// [`IggyMetadata::submit_request_in_process`], and
+/// [`IggyMetadata::submit_delete_personal_access_token_in_process`]. Every variant is
+/// transient: the caller retries on a later attempt, and the login/register
+/// handler wraps them in `LoginRegisterError::Transient` so the SDK
+/// read-timeout replays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum RegisterSubmitError {
+pub enum MetadataSubmitError {
     /// Not primary / not Normal.
     NotPrimary,
-    /// Primary but `commit_min < commit_max`. Fresh dispatch would race an
-    /// inherited register and panic `commit_register`'s session-eq assert.
+    /// Primary but `commit_min < commit_max` (committed prefix not yet
+    /// drained). Dispatching now would race ops inherited from a prior view;
+    /// for `Register` that trips `commit_register`'s session-eq assert.
     NotCaughtUp,
     /// Prepare queue full.
     PipelineFull,
     /// In-flight prepare from this client.
     InProgress,
-    /// Receiver `Canceled` and post-await re-check showed no session.
-    /// SDK replay hits new primary via cached register reply or `New`.
+    /// The pending prepare was canceled before commit (a view change reset
+    /// the pipeline). The caller retries; the SDK read-timeout replay reaches
+    /// the new primary.
     Canceled,
 }
 
-impl std::fmt::Display for RegisterSubmitError {
+impl std::fmt::Display for MetadataSubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotPrimary => f.write_str("not primary in normal status"),
             Self::NotCaughtUp => f.write_str("primary not yet caught up on commit_journal"),
             Self::PipelineFull => f.write_str("metadata prepare queue is full"),
-            Self::InProgress => f.write_str("another register from this client is in flight"),
-            Self::Canceled => f.write_str("view change canceled the pending register"),
+            Self::InProgress => f.write_str("another in-flight prepare from this client"),
+            Self::Canceled => f.write_str("view change canceled the pending prepare"),
         }
     }
 }
 
-impl std::error::Error for RegisterSubmitError {}
+impl std::error::Error for MetadataSubmitError {}
 
 /// Log + surface `None` when a metadata callback runs on a peer shard
 /// (whose `consensus` / `journal` slot is `None`). The `Plane` trait
@@ -334,6 +340,16 @@ fn require_shard_zero<'a, T>(
     }
     slot
 }
+
+/// Late-bound callback invoked after every successful
+/// `mux_stm.update(prepare)` on shard 0's metadata commit path.
+///
+/// Wired by server-ng bootstrap once the metadata bundle has broadcast;
+/// receives the committed [`Operation`] so the recipient can filter (the
+/// partition reconciliation loop only cares about partition-shaped
+/// events). Wrapped in [`RefCell`] for late binding; the per-shard
+/// single-thread invariant keeps access safe without [`Sync`].
+pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
 
 pub struct IggyMetadata<C, J, S, M> {
     /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
@@ -359,6 +375,12 @@ pub struct IggyMetadata<C, J, S, M> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
+    /// Late-bound post-commit notifier. Fires once per committed
+    /// operation after [`crate::stm::StateMachine::update`] succeeds in
+    /// both [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
+    /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
+    /// 0 sets it; peer shards and tests leave it `None`).
+    commit_notifier: RefCell<Option<CommitNotifier>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -388,6 +410,26 @@ where
             allocator,
             coordinator,
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
+            commit_notifier: RefCell::new(None),
+        }
+    }
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Install (or replace) the post-commit notifier. Passing `None`
+    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// only; peer shards never commit metadata locally.
+    pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
+        *self.commit_notifier.borrow_mut() = notifier;
+    }
+
+    /// Fire post-commit notifier. Clones the `Rc` out under a short
+    /// borrow so a re-entrant `set_commit_notifier` from inside the
+    /// closure cannot panic on `borrow_mut`.
+    fn fire_commit_notifier(&self, operation: Operation) {
+        let notifier = self.commit_notifier.borrow().as_ref().map(Rc::clone);
+        if let Some(notifier) = notifier {
+            notifier(operation);
         }
     }
 }
@@ -401,7 +443,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -465,13 +507,20 @@ where
         let prepare = match self.prepare_request(message) {
             Ok(prepare) => prepare,
             Err(error) => {
+                // Structurally-invalid request (not client-allowed, undecodable
+                // body, or partition-id overflow). Evict instead of dropping: a
+                // silent drop leaves the client unable to tell rejection from
+                // loss, retrying forever.
+                let reason = eviction_reason_for_invalid(operation);
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     error = %error,
-                    "failed to transform metadata request into prepare"
+                    ?reason,
+                    "rejecting invalid metadata request with eviction"
                 );
+                send_eviction_to_client(consensus, client_id, reason).await;
                 return;
             }
         };
@@ -549,7 +598,8 @@ where
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
         // sibling on_request races during journal.append await).
         // TODO: hard assert for backups once message repair lands.
-        if consensus.is_follower() {
+        let is_backup = consensus.is_follower();
+        if is_backup {
             if header.op != current_op + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
@@ -606,11 +656,14 @@ where
         self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
-        // Backup: advance sequencer + checksum post-append. Primary also
-        // reaches here; push_prepare_entry already advanced sync with the
-        // pipeline push, so calls are idempotent on primary.
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
+        // Backup only: advance sequencer + checksum post-append. Primary
+        // already advanced in push_prepare_entry; re-setting here would
+        // rewind a sibling prepare pipelined during the append await to a
+        // stale op + parent, projecting a duplicate next.
+        if is_backup {
+            consensus.sequencer().set_sequence(header.op);
+            consensus.set_last_prepare_checksum(header.checksum);
+        }
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(&header).await;
@@ -733,16 +786,32 @@ where
                     self.client_table
                         .borrow_mut()
                         .remove_client(prepare_header.client);
+                    // Drop the disconnected client from every consumer group it
+                    // joined and rebalance. Deterministic side-effect of the
+                    // Logout commit, applied identically on every replica.
+                    self.mux_stm.streams().remove_consumer_group_member(
+                        prepare_header.client,
+                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                    );
                     reply
                 } else {
-                    // Normal op: apply SM, commit_reply.
-                    let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                    // only; a business rejection commits as a deterministic no-op
+                    // whose `code` rides the reply body, replayed on retry.
+                    let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                         panic!(
                             "on_ack: committed metadata op={} failed to apply: {err}",
                             prepare_header.op
                         );
                     });
-                    let reply = build_reply_message(&prepare_header, &response);
+                    // Post-commit notifier (e.g. partition reconciler
+                    // wake-up). Filtering by operation is the
+                    // recipient's responsibility.
+                    self.fire_commit_notifier(prepare_header.operation);
+                    let reply =
+                        build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
+                            apply.write_reply_body(dst);
+                        });
                     // Cache only if session exists. Client evicted between
                     // prepare and commit: skip cache (`commit_reply` no-ops),
                     // wire reply still ships.
@@ -842,7 +911,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -853,7 +922,7 @@ where
     /// Session number (= commit op). Idempotent: existing session short-circuits.
     ///
     /// # Errors
-    /// [`RegisterSubmitError`] (all transient): `NotPrimary`, `NotCaughtUp`,
+    /// [`MetadataSubmitError`] (all transient): `NotPrimary`, `NotCaughtUp`,
     /// `PipelineFull`, `InProgress`, `Canceled`. `Canceled` dominates on view
     /// change; new primary inherits via `commit_journal`, SDK retries.
     ///
@@ -867,7 +936,7 @@ where
     pub async fn submit_register_in_process(
         &self,
         client_id: u128,
-    ) -> Result<u64, RegisterSubmitError> {
+    ) -> Result<u64, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
             .consensus
@@ -884,9 +953,9 @@ where
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    RegisterSubmitError::NotCaughtUp
+                    MetadataSubmitError::NotCaughtUp
                 } else {
-                    RegisterSubmitError::NotPrimary
+                    MetadataSubmitError::NotPrimary
                 },
             );
         }
@@ -898,13 +967,13 @@ where
             .borrow()
             .has_message_from_client(client_id)
         {
-            return Err(RegisterSubmitError::InProgress);
+            return Err(MetadataSubmitError::InProgress);
         }
 
         // TODO(pipeline-backpressure): in-process has no request_queue yet;
         // terminal on full. Wire path buffers.
         if consensus.pipeline().borrow().is_full() {
-            return Err(RegisterSubmitError::PipelineFull);
+            return Err(MetadataSubmitError::PipelineFull);
         }
 
         let request = build_register_request_message(consensus, client_id);
@@ -924,47 +993,7 @@ where
             .prepare_request(request)
             .expect("Operation::Register is client-allowed; prepare projection cannot fail");
 
-        // Subscribe before await so receiver registers before any self-loopback
-        // ack fires. compio is single-threaded; explicit anyway.
-        consensus.verify_pipeline();
-        // Snapshot (view, commit_min) pre-subscribe. Validate it after
-        // `on_replicate` returns and again on receiver completion: another
-        // task could mutate either during the awaits and silently invalidate
-        // the gate, with release builds proceeding on a stale view-state.
-        let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
-        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
-        // can drop the borrow. No commit-max advance flips the gate today;
-        // pin against future await between check and dispatch.
-        debug_assert!(
-            is_caught_up_primary(consensus),
-            "submit_register_in_process: gate flipped between check and dispatch"
-        );
-        self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "submit_register_in_process: view/commit_min advanced across on_replicate await"
-        );
-        let mut loopback = Vec::new();
-        consensus.drain_loopback_into(&mut loopback);
-        for message in loopback {
-            match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
-                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
-                    Err(error) => warn!(
-                        error = %error,
-                        "dropping malformed PrepareOk from metadata loopback queue"
-                    ),
-                },
-                command => warn!(
-                    ?command,
-                    "dropping unexpected message from metadata loopback queue"
-                ),
-            }
-        }
-
-        match receiver.await {
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.header().commit),
             Err(Canceled) => {
                 // View-change cancel. Re-check is correct-by-VSR: any
@@ -977,7 +1006,7 @@ where
                 self.client_table
                     .borrow()
                     .get_session(client_id)
-                    .ok_or(RegisterSubmitError::Canceled)
+                    .ok_or(MetadataSubmitError::Canceled)
             }
         }
     }
@@ -1003,7 +1032,7 @@ where
         client_id: u128,
         session: u64,
         request: u64,
-    ) -> Result<u64, RegisterSubmitError> {
+    ) -> Result<u64, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
             .consensus
@@ -1022,9 +1051,9 @@ where
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    RegisterSubmitError::NotCaughtUp
+                    MetadataSubmitError::NotCaughtUp
                 } else {
-                    RegisterSubmitError::NotPrimary
+                    MetadataSubmitError::NotPrimary
                 },
             );
         }
@@ -1034,11 +1063,11 @@ where
             .borrow()
             .has_message_from_client(client_id)
         {
-            return Err(RegisterSubmitError::InProgress);
+            return Err(MetadataSubmitError::InProgress);
         }
 
         if consensus.pipeline().borrow().is_full() {
-            return Err(RegisterSubmitError::PipelineFull);
+            return Err(MetadataSubmitError::PipelineFull);
         }
 
         let request = build_logout_request_message(consensus, client_id, session, request);
@@ -1053,46 +1082,184 @@ where
             .prepare_request(request)
             .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
 
-        consensus.verify_pipeline();
-        let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
-        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        debug_assert!(
-            is_caught_up_primary(consensus),
-            "submit_logout_in_process: gate flipped between check and dispatch"
-        );
-        self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "submit_logout_in_process: view/commit_min advanced across on_replicate await"
-        );
-        let mut loopback = Vec::new();
-        consensus.drain_loopback_into(&mut loopback);
-        for message in loopback {
-            match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
-                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
-                    Err(error) => warn!(
-                        error = %error,
-                        "dropping malformed PrepareOk from metadata loopback queue"
-                    ),
-                },
-                command => warn!(
-                    ?command,
-                    "dropping unexpected message from metadata loopback queue"
-                ),
-            }
-        }
-
-        match receiver.await {
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.header().commit),
             Err(Canceled) => {
                 if self.client_table.borrow().get_session(client_id).is_none() {
                     Ok(consensus.commit_min())
                 } else {
-                    Err(RegisterSubmitError::Canceled)
+                    Err(MetadataSubmitError::Canceled)
                 }
             }
+        }
+    }
+
+    /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
+    /// metadata consensus group (shard 0). The partition reconciler calls this
+    /// to complete a cooperative revocation once the source has drained the
+    /// partition (or it timed out).
+    ///
+    /// Unlike a client op there is no session: a reserved internal client id
+    /// (never coordinator-minted) carries it, `request_preflight` is skipped
+    /// (server-originated), and the normal-op commit path skips reply-caching
+    /// when the client has no session. The op is internal (not client-allowed),
+    /// so it bypasses `prepare_request` and projects directly.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the prepare,
+    /// `InProgress` / `PipelineFull` on pipeline pressure (the reconciler
+    /// retries next tick; completion is idempotent), `Canceled` if the pending
+    /// prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata consensus
+    /// group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_complete_revocation_in_process(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+    ) -> Result<u64, MetadataSubmitError> {
+        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+        // Reserved internal client id, distinct per (group, partition) target.
+        // The high 64 bits are all-ones -- never coordinator-minted (those carry
+        // a small home-shard number in the top bits) -- and the low 64 bits pack
+        // (group_id, partition_id). Distinct ids matter: the pipeline dedups by
+        // client id, so a shared id would cap internal completions at one
+        // in-flight cluster-wide and drain a wide rebalance one per consensus
+        // round-trip. Per-target ids let completions for different partitions
+        // pipeline concurrently while still deduping a retry of the same target.
+        let internal_client_id: u128 =
+            (u128::from(u64::MAX) << 64) | (u128::from(group_id) << 32) | u128::from(partition_id);
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(internal_client_id)
+        {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline().borrow().is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        let request = CompleteConsumerGroupRevocationRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id,
+            source_client_id,
+            partition_id,
+        };
+        let body = request.to_bytes();
+        let message = build_complete_revocation_request_message(
+            consensus,
+            internal_client_id,
+            INTERNAL_REQUEST_ID,
+            &body,
+        );
+        let prepare = message.project(consensus);
+
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
+    /// `true` when this node is the caught-up primary of the metadata
+    /// consensus group. Gates leader-only maintenance (the PAT cleaner)
+    /// off backups and lagging primaries.
+    #[must_use]
+    pub fn is_caught_up_primary(&self) -> bool {
+        self.consensus.as_ref().is_some_and(is_caught_up_primary)
+    }
+
+    /// Submit a replicated `DeletePersonalAccessToken` originated by the
+    /// server (the PAT cleaner), not a client.
+    ///
+    /// No client session exists, so this skips `request_preflight` (like
+    /// the logout precedent) and uses the reserved internal `client` id
+    /// `0`: never registered, so the commit path's `get_session(0)` is
+    /// `None` and skips `commit_reply` (and its `assert!(client_id != 0)`),
+    /// while the preflight and register asserts never run. Delete is
+    /// idempotent, so the dropped dedup is harmless and a re-proposal on the
+    /// next tick is a no-op.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (shard 0 only), or if the prepare gate
+    /// flips between validation and dispatch.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_delete_personal_access_token_in_process(
+        &self,
+        user_id: UserId,
+        name: WireName,
+    ) -> Result<u64, MetadataSubmitError> {
+        let consensus = self.consensus.as_ref().expect(
+            "submit_delete_personal_access_token_in_process: consensus only exists on shard 0",
+        );
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+
+        if consensus.pipeline().borrow().is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        let body = DeletePersonalAccessTokenRequest {
+            user_id,
+            name,
+            // Expiry-gated: a token recreated under the same name between the
+            // cleaner's snapshot and this commit must not be purged. Apply
+            // re-checks the stored token's expiry against the prepare timestamp.
+            only_if_expired: true,
+        }
+        .to_bytes();
+        // Build the prepare directly so the `client = 0` header skips the
+        // client-header validation in `prepare_request` / `Project::project`
+        // (the in-process path `build_prepare_message` documents).
+        let header = RequestHeader {
+            client: 0,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+        let prepare = build_prepare_message(
+            consensus,
+            &header,
+            Operation::DeletePersonalAccessToken,
+            &body,
+        );
+
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
         }
     }
 
@@ -1125,7 +1292,7 @@ where
     pub async fn submit_request_in_process(
         &self,
         message: Message<RequestHeader>,
-    ) -> Result<Message<GenericHeader>, RegisterSubmitError> {
+    ) -> Result<Message<GenericHeader>, MetadataSubmitError> {
         let request_header = *message.header();
         let client_id = request_header.client;
         let session = request_header.session;
@@ -1139,9 +1306,9 @@ where
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    RegisterSubmitError::NotCaughtUp
+                    MetadataSubmitError::NotCaughtUp
                 } else {
-                    RegisterSubmitError::NotPrimary
+                    MetadataSubmitError::NotPrimary
                 },
             );
         }
@@ -1160,36 +1327,68 @@ where
                         reply.as_slice(),
                     ),
                 )
-                .map_err(|_| RegisterSubmitError::Canceled);
+                .map_err(|_| MetadataSubmitError::Canceled);
             }
             PreflightOutcome::Evict(reason) => {
                 let ctx = EvictionContext::from_consensus(consensus);
                 return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
             }
-            PreflightOutcome::Drop => return Err(RegisterSubmitError::Canceled),
+            PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
         if consensus.pipeline().borrow().is_full() {
-            return Err(RegisterSubmitError::PipelineFull);
+            return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let prepare = self
-            .prepare_request(message)
-            .map_err(|_| RegisterSubmitError::Canceled)?;
+        let Ok(prepare) = self.prepare_request(message) else {
+            // Structurally-invalid request. Return an eviction frame (relayed to
+            // the socket by the home shard) rather than `Canceled`, which leaves
+            // the shard silent and the SDK retrying forever.
+            let reason = eviction_reason_for_invalid(request_header.operation);
+            let ctx = EvictionContext::from_consensus(consensus);
+            return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+        };
 
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(server_common::Message::into_generic)
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
+    }
+
+    /// Subscribe to a prepared metadata write, dispatch it into the pipeline,
+    /// drain the self-loopback acks, and await the committed reply.
+    ///
+    /// Shared tail of every in-process submit path
+    /// ([`Self::submit_register_in_process`],
+    /// [`Self::submit_logout_in_process`], [`Self::submit_request_in_process`],
+    /// and [`Self::submit_delete_personal_access_token_in_process`]). The
+    /// caller owns its own preflight / dedup gate and builds `prepare`; this
+    /// owns the dispatch mechanics. The view-change `Canceled` is returned
+    /// verbatim so each caller can apply its own idempotent recheck.
+    ///
+    /// Subscribes before dispatch so the receiver is registered before any
+    /// self-loopback ack fires (compio is single-threaded; explicit anyway).
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_prepare_and_await(
+        &self,
+        consensus: &VsrConsensus<B>,
+        prepare: Message<PrepareHeader>,
+    ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
-        let view_snapshot = consensus.view();
-        let commit_min_snapshot = consensus.commit_min();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
+        // can drop the borrow. No commit-max advance flips the gate today;
+        // pin against a future await between check and dispatch.
         debug_assert!(
             is_caught_up_primary(consensus),
-            "submit_request_in_process: gate flipped between check and dispatch"
+            "dispatch_prepare_and_await: gate flipped between check and dispatch"
         );
+        // `on_replicate` awaits: a sibling in-process submit may commit
+        // (commit_min advances) or a view change may land (view advances) while
+        // parked here. Both are handled downstream - a view change drops the
+        // reply_sender so `receiver` resolves `Canceled`, and loopback acks are
+        // op-routed - so no post-await view/commit invariant holds or is needed.
         self.on_replicate(prepare).await;
-        debug_assert!(
-            consensus.view() == view_snapshot && consensus.commit_min() == commit_min_snapshot,
-            "submit_request_in_process: view/commit_min advanced across on_replicate await"
-        );
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
@@ -1208,10 +1407,7 @@ where
             }
         }
 
-        receiver
-            .await
-            .map(server_common::Message::into_generic)
-            .map_err(|Canceled| RegisterSubmitError::Canceled)
+        receiver.await
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after
@@ -1246,13 +1442,20 @@ where
             let prepare = match self.prepare_request(req.message) {
                 Ok(prepare) => prepare,
                 Err(error) => {
+                    // Same invariant as `on_request`: a structurally-invalid
+                    // request evicts, never a silent drop, or the SDK retries
+                    // forever. Reachable here because requests are queued
+                    // unvalidated (prepare queue full at arrival), projected now.
+                    let reason = eviction_reason_for_invalid(operation);
                     warn!(
                         target: "iggy.metadata.diag",
                         plane = "metadata",
                         replica_id = consensus.replica(),
                         error = %error,
-                        "drain_request_queue: failed to project queued request into prepare"
+                        ?reason,
+                        "drain_request_queue: rejecting invalid queued request with eviction"
                     );
+                    send_eviction_to_client(consensus, client_id, reason).await;
                     continue;
                 }
             };
@@ -1273,7 +1476,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -1360,10 +1563,11 @@ where
             Operation::CreatePartitions => {
                 let request = WireCreatePartitionsRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                self.mux_stm
-                    .streams()
-                    .current_partition_count(&request.stream_id, &request.topic_id)
-                    .ok_or(IggyError::InvalidCommand)?;
+                // Parent-existence is validated at apply, returning
+                // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
+                // read here would decide against possibly-uncommitted state and
+                // drop without a reply (TOCTOU + wedge). See the metadata
+                // validation design doc.
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1479,12 +1683,27 @@ where
                     .commit_register(header.client, reply, in_flight);
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
+                // Mirror the on_ack path: drop the disconnected client from
+                // every consumer group it joined and rebalance.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    header.client,
+                    iggy_common::IggyTimestamp::from(header.timestamp),
+                );
             } else {
-                // Normal op: apply SM, commit_reply.
-                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                // only; a business rejection commits as a deterministic no-op
+                // whose `code` rides the reply body, replayed on retry.
+                let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
-                let reply = build_reply_message(&header, &response);
+                // Post-commit notifier (e.g. partition reconciler
+                // wake-up). Same hook fires on backups so reconcilers
+                // converge after replicated commits, not only quorum-acked
+                // ones reached via `on_ack` on the primary.
+                self.fire_commit_notifier(header.operation);
+                let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
+                    apply.write_reply_body(dst);
+                });
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
                 let session = self.client_table.borrow().get_session(header.client);
@@ -1623,6 +1842,44 @@ where
     msg
 }
 
+fn build_complete_revocation_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    request: u64,
+    body: &[u8],
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::CompleteConsumerGroupRevocation,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: consensus.cluster(),
+            view: consensus.view(),
+            release: 0,
+            client: client_id,
+            // `validate()` requires session/request > 0 for non-register ops;
+            // there is no real session (the commit path skips reply-caching).
+            session: 1,
+            request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
+    msg
+}
+
 fn build_prepare_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     request: &RequestHeader,
@@ -1645,10 +1902,13 @@ where
     // Match `Project::project` (core/consensus/src/impls.rs): the primary
     // stamps wall-clock once here so every replica's `StateHandler::apply`
     // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
-    // `created_at` on every CreateStream/CreateTopic/CreatePartitions, since
-    // submit_command_in_process bypasses `Project::project` and calls this
-    // helper directly. Shared `next_monotonic_timestamp` keeps the in-process
-    // path on the same monotonic-clock guard as the wire path.
+    // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
+    // in-process callers that bypass `Project::project` build their prepare
+    // through this helper directly (the CreateTopic/CreatePartitions
+    // assignment rewrites, and the PAT-cleaner delete); the stamp is
+    // load-bearing for the creates and inert for the delete, whose apply
+    // ignores it. Shared `next_monotonic_timestamp` keeps the in-process path
+    // on the same monotonic-clock guard as the wire path.
     let timestamp = consensus.next_monotonic_timestamp();
     *new_header = PrepareHeader {
         cluster: consensus.cluster(),
@@ -1670,4 +1930,117 @@ where
     };
 
     prepare
+}
+
+/// Eviction reason for a request `prepare_request` rejected as structurally
+/// invalid.
+const fn eviction_reason_for_invalid(operation: Operation) -> EvictionReason {
+    if operation.is_client_allowed() {
+        EvictionReason::InvalidRequestBody
+    } else {
+        EvictionReason::InvalidRequestOperation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stm::stream::Streams;
+    use crate::stm::user::Users;
+    use iggy_common::variadic;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn eviction_reason_splits_client_and_internal_ops() {
+        // Client-allowed op with a bad body evicts InvalidRequestBody; an internal
+        // / unknown op (here `CreateTopicWithAssignments`) evicts
+        // InvalidRequestOperation.
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateStream),
+            EvictionReason::InvalidRequestBody,
+        );
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateTopicWithAssignments),
+            EvictionReason::InvalidRequestOperation,
+        );
+    }
+
+    type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
+
+    /// Build a peer-shard-style `IggyMetadata` with `consensus`,
+    /// `journal`, and `snapshot` all `None`. Enough to test the
+    /// commit-notifier slot without standing up VSR / WAL infrastructure:
+    /// the test picks `()` for `C` / `J` / `S` since no notifier code path
+    /// touches their methods.
+    fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
+        IggyMetadata::new(None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn commit_notifier_fires_with_received_operation() {
+        let md = peer_metadata();
+        let captured: Rc<RefCell<Vec<Operation>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let observer = Rc::clone(&captured);
+        md.set_commit_notifier(Some(Rc::new(move |op| {
+            observer.borrow_mut().push(op);
+        })));
+
+        md.fire_commit_notifier(Operation::CreateTopicWithAssignments);
+        md.fire_commit_notifier(Operation::DeletePartitions);
+        md.fire_commit_notifier(Operation::DeleteStream);
+
+        let seen = captured.borrow();
+        assert_eq!(
+            seen.as_slice(),
+            &[
+                Operation::CreateTopicWithAssignments,
+                Operation::DeletePartitions,
+                Operation::DeleteStream,
+            ],
+            "notifier must observe every fired operation in order"
+        );
+    }
+
+    #[test]
+    fn commit_notifier_is_no_op_when_unset() {
+        // No notifier installed: firing must not panic, must not allocate.
+        // Mirrors the production-side guarantee that peer shards (no
+        // notifier) take the same commit path as shard 0 (with notifier).
+        let md = peer_metadata();
+        md.fire_commit_notifier(Operation::CreateStream);
+    }
+
+    #[test]
+    fn commit_notifier_can_be_replaced_and_cleared() {
+        let md = peer_metadata();
+        let first_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let second_count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        let first_observer = Rc::clone(&first_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *first_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::CreateStream);
+        assert_eq!(*first_count.borrow(), 1);
+
+        // Replace: the first closure must no longer run.
+        let second_observer = Rc::clone(&second_count);
+        md.set_commit_notifier(Some(Rc::new(move |_op| {
+            *second_observer.borrow_mut() += 1;
+        })));
+        md.fire_commit_notifier(Operation::DeleteStream);
+        assert_eq!(*first_count.borrow(), 1, "old notifier must be detached");
+        assert_eq!(*second_count.borrow(), 1, "new notifier must take over");
+
+        // Clear: subsequent fires must be no-ops.
+        md.set_commit_notifier(None);
+        md.fire_commit_notifier(Operation::DeleteTopic);
+        assert_eq!(
+            *second_count.borrow(),
+            1,
+            "cleared notifier must stay quiet"
+        );
+    }
 }

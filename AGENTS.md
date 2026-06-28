@@ -59,7 +59,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/license-headers.sh   # Apache headers
 ./scripts/ci/trailing-whitespace.sh
 ./scripts/ci/trailing-newline.sh
-./scripts/ci/sync-rust-version.sh
+./scripts/ci/sync-rustc-version.sh
 ./scripts/ci/python-sdk-version-sync.sh
 ./scripts/ci/uv-lock-check.sh
 ./scripts/ci/binary-artifacts.sh --check
@@ -136,7 +136,7 @@ description). Load `connectors-overview` first as router.
 
 ## Repo-wide principles
 
-1. **Apache 2.0 header on every new source file:** Follow the comment style configured in `licenserc.toml`; common examples: .rs uses // ..., Cargo.toml and shell use # ....
+1. **Apache 2.0 header on every new source file:** Follow the comment style configured in `licenserc.toml`; common examples: `.rs` uses `// ...`, `Cargo.toml` and shell use `# ...`.
 2. **Verification order:** `fmt --all` -> `sort --no-format --workspace` -> `clippy --all-features --all-targets -- -D warnings` -> `test`. Plus `taplo.sh --check`. CI enforces all.
 3. **Always pass `--no-format` to `cargo sort`.** Without it multi-line feature arrays flatten and `taplo` re-expands them, churning the workspace.
 4. **Avoid LLM-slop tells: em dashes, gratuitous semicolons, hedging narrative, trailing summaries.** Defaults, not absolute bans. Same rule for code, comments, commits, PR descriptions.

@@ -109,6 +109,22 @@ impl MessagesWriter {
         Ok(IggyByteSize::from(messages_size))
     }
 
+    /// Roll the in-memory write cursor back by `bytes`, undoing the advance of a
+    /// `save_frozen_batches` whose batch was written but whose companion index
+    /// save then failed. The committed prefix stays resident and is
+    /// re-persisted on the next `commit_messages`; rewinding the cursor makes
+    /// that retry overwrite the same region instead of appending a second copy
+    /// of the committed batch. The on-disk bytes are left in place (they are
+    /// committed data the retry overwrites), and after a crash the cursor
+    /// reinitializes from the file length, so no truncation is needed.
+    pub(crate) fn rewind(&self, bytes: u64) {
+        debug_assert!(
+            bytes <= self.messages_size_bytes.load(Ordering::Relaxed),
+            "rewind underflow: bytes ({bytes}) exceeds the write cursor"
+        );
+        self.messages_size_bytes.fetch_sub(bytes, Ordering::Release);
+    }
+
     #[must_use]
     pub fn path(&self) -> String {
         self.file_path.clone()
@@ -116,12 +132,16 @@ impl MessagesWriter {
 
     /// Flushes buffered segment file contents to disk.
     ///
+    /// Uses `fdatasync` (data only): segment files are append-only and the
+    /// size change is tracked in datasync metadata on Linux, so the inode
+    /// metadata fsync of `sync_all` adds latency without correctness gain.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
-            .sync_all()
+            .sync_data()
             .await
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())

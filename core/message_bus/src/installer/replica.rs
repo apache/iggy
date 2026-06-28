@@ -18,40 +18,291 @@
 //! Replica plane install paths. TCP only by design.
 
 use super::common::drain_rejected_registration;
-use crate::IggyMessageBus;
 use crate::lifecycle::{FusedShutdown, InstanceToken, Shutdown, ShutdownToken};
+use crate::replica::auth::{ChannelBinding, EXPORTER_LABEL, EXPORTER_LEN};
+use crate::replica::handshake::{self, ReplicaHandshakeCtx};
 use crate::replica::listener::MessageHandler;
 use crate::socket_opts::apply_nodelay_for_connection;
 use crate::transports::tcp::TcpTransportConn;
+use crate::transports::tcp_tls::TcpTlsTransportConn;
 use crate::transports::{ActorContext, TransportConn};
+use crate::{IggyMessageBus, ReplicaHandshakeDoneFn};
 use async_channel::Receiver;
+use compio::io::compat::AsyncStream;
+use compio::io::{AsyncRead, AsyncWrite};
 use compio::net::TcpStream;
+use compio::tls::TlsStream;
 use futures::FutureExt;
 use iggy_binary_protocol::GenericHeader;
 use server_common::Message;
 use std::cell::Cell;
+use std::future::Future;
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// TCP entry point: apply `TCP_NODELAY` on the raw stream and delegate
-/// to the transport-generic install path.
+/// Shared scaffold for both delegated install directions: shutdown
+/// gate, handshake ctx fetch, `TCP_NODELAY`, then the direction's
+/// handshake future (built by `make`) spawned under one
+/// `handshake_grace` budget. Fires `on_done` (the shard-0 outcome ack)
+/// on every exit path. The handshake runs in its own spawned task so a
+/// slow or hostile peer never stalls the shard's frame pump; handshake
+/// failures are logged at their cause site, only the grace timeout is
+/// logged here.
+///
+/// The shutdown gate skips handshake work during teardown; a shutdown
+/// that begins mid-handshake is caught again by the pre-install checks
+/// in [`accept_and_install`] / [`dial_and_install`].
 ///
 /// Linux does not propagate `TCP_NODELAY` from the listener to the
 /// accepted fd, so we toggle it here on every installed stream. A miss
 /// means we stay Nagle-on for this peer, not a failure. Liveness is NOT
-/// detected via `SO_KEEPALIVE` here — the replica plane observes peer
+/// detected via `SO_KEEPALIVE` here - the replica plane observes peer
 /// death via VSR heartbeats.
+fn spawn_replica_install<Fut>(
+    bus: &Rc<IggyMessageBus>,
+    stream: TcpStream,
+    peer: String,
+    on_done: ReplicaHandshakeDoneFn,
+    make: impl FnOnce(Rc<IggyMessageBus>, ReplicaHandshakeCtx, TcpStream, String) -> Fut,
+) where
+    Fut: Future<Output = Result<(), ()>> + 'static,
+{
+    if bus.is_shutting_down() {
+        on_done();
+        return;
+    }
+    let Some(ctx) = bus.replica_handshake_ctx().cloned() else {
+        warn!(
+            peer = %peer,
+            "dropping delegated replica connection: no handshake ctx installed"
+        );
+        on_done();
+        return;
+    };
+    if let Err(e) = apply_nodelay_for_connection(&stream) {
+        warn!(peer = %peer, "nodelay failed on delegated fd: {e}");
+    }
+    let grace = bus.config().handshake_grace;
+    let fut = make(Rc::clone(bus), ctx, stream, peer.clone());
+    let handle = compio::runtime::spawn(async move {
+        if compio::time::timeout(grace, fut).await.is_err() {
+            warn!(
+                peer = %peer,
+                grace = ?grace,
+                "delegated replica handshake exceeded handshake_grace; closing connection"
+            );
+        }
+        on_done();
+    });
+    bus.track_background(handle);
+}
+
+/// Owning-shard entry for a blind-delegated INBOUND replica connection.
+///
+/// When `cluster.tls` is configured, wraps the raw stream as a TLS
+/// server first; the acceptor handshake then runs over the encrypted
+/// stream. TLS wrap + replica handshake share ONE `handshake_grace`
+/// budget, so a peer cannot stretch admission to two grace windows by
+/// stalling between the steps.
+///
+/// Mirrors the WS-upgrade install path
+/// (`ConnectionInstaller::install_client_ws_fd`). The peer id is unknown
+/// until the handshake reads the `ReplicaHello`, hence no id parameter.
 #[allow(clippy::future_not_send)]
-pub fn install_replica_tcp(
+pub fn install_replica_inbound(
+    bus: &Rc<IggyMessageBus>,
+    stream: TcpStream,
+    on_message: MessageHandler,
+    on_done: ReplicaHandshakeDoneFn,
+) {
+    let peer = stream
+        .peer_addr()
+        .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
+    spawn_replica_install(bus, stream, peer, on_done, |bus, ctx, stream, peer| {
+        async move {
+            match ctx.tls.clone() {
+                None => {
+                    accept_and_install(
+                        &bus,
+                        stream,
+                        &ctx,
+                        ChannelBinding::Plaintext,
+                        TcpTransportConn::new,
+                        on_message,
+                        &peer,
+                    )
+                    .await
+                }
+                Some(tls) => {
+                    // Handshake with futures-rustls directly (compio-tls's
+                    // TlsAcceptor hides the rustls connection, so the
+                    // exporter is unreachable through it), mirroring
+                    // compio-tls's own adapter: compat-wrap, pin, accept,
+                    // then convert into the compio TlsStream the pump runs
+                    // on via compio-tls's public From impls.
+                    let tls_stream = futures_rustls::TlsAcceptor::from(Arc::clone(&tls.server))
+                        .accept(Box::pin(AsyncStream::new(stream)))
+                        .await
+                        .map_err(|e| warn!(peer = %peer, "replica TLS accept failed: {e}"))?;
+                    let binding = exporter_binding(tls_stream.get_ref().1)
+                        .map_err(|e| warn!(peer = %peer, "replica TLS exporter failed: {e}"))?;
+                    let close_grace = bus.config().close_grace;
+                    accept_and_install(
+                        &bus,
+                        TlsStream::from(tls_stream),
+                        &ctx,
+                        binding,
+                        |tls_stream| {
+                            TcpTlsTransportConn::from_established(tls_stream)
+                                .with_close_grace(close_grace)
+                        },
+                        on_message,
+                        &peer,
+                    )
+                    .await
+                }
+            }
+        }
+    });
+}
+
+/// Shared tail of the inbound path: run the acceptor handshake over
+/// `stream` (plaintext or TLS) and install the connection built by
+/// `make_conn` under the verified peer id.
+#[allow(clippy::future_not_send)]
+async fn accept_and_install<S, C, F>(
+    bus: &Rc<IggyMessageBus>,
+    mut stream: S,
+    ctx: &ReplicaHandshakeCtx,
+    binding: ChannelBinding,
+    make_conn: F,
+    on_message: MessageHandler,
+    peer: &str,
+) -> Result<(), ()>
+where
+    S: AsyncRead + AsyncWrite,
+    C: TransportConn,
+    F: FnOnce(S) -> C,
+{
+    let max_message_size = bus.config().max_message_size;
+    let peer_id = handshake::acceptor_handshake(&mut stream, ctx, binding, max_message_size)
+        .await
+        .map_err(|e| warn!(peer = %peer, "delegated replica handshake failed: {e}"))?;
+    if !bus.is_shutting_down() {
+        install_replica_conn(bus, peer_id, make_conn(stream), on_message);
+    }
+    Ok(())
+}
+
+/// Derive the PSK channel binding from an established rustls session.
+///
+/// Both ends call this with the same label and empty context, so the
+/// values agree exactly when the two PSK handshake halves run inside the
+/// SAME TLS session; a relay MITM terminates two sessions and the MACs
+/// fail. TLS 1.3 (the only version the replica plane negotiates) defines
+/// the exporter for every session, so an error here is unexpected and
+/// drops the connection.
+fn exporter_binding<Data>(
+    conn: &rustls::ConnectionCommon<Data>,
+) -> Result<ChannelBinding, rustls::Error> {
+    let exporter = conn.export_keying_material([0u8; EXPORTER_LEN], EXPORTER_LABEL, None)?;
+    Ok(ChannelBinding::Tls(exporter))
+}
+
+/// Owning-shard entry for a delegated OUTBOUND replica connection: run
+/// the dialer handshake under `handshake_grace` and install on success.
+///
+/// When `cluster.tls` is configured the dialer wraps the raw stream as a
+/// TLS client first (SNI + certificate-verify name from the roster via
+/// `ReplicaTlsCtx::peer_names`); TLS wrap + replica handshake share ONE
+/// `handshake_grace` budget. The peer id is known upfront (configured
+/// roster); failures are log-only - the shard-0 reconnect sweep redials
+/// once the ack clears the pending entry.
+#[allow(clippy::future_not_send)]
+pub fn install_replica_outbound(
     bus: &Rc<IggyMessageBus>,
     peer_id: u8,
     stream: TcpStream,
     on_message: MessageHandler,
+    on_done: ReplicaHandshakeDoneFn,
 ) {
-    if let Err(e) = apply_nodelay_for_connection(&stream) {
-        warn!(replica = peer_id, "nodelay failed on delegated fd: {e}");
+    let peer = format!("replica {peer_id}");
+    spawn_replica_install(bus, stream, peer, on_done, |bus, ctx, stream, peer| {
+        async move {
+            match ctx.tls.clone() {
+                None => {
+                    dial_and_install(
+                        &bus,
+                        stream,
+                        &ctx,
+                        peer_id,
+                        ChannelBinding::Plaintext,
+                        TcpTransportConn::new,
+                        on_message,
+                    )
+                    .await
+                }
+                Some(tls) => {
+                    let Some(peer_name) = tls.peer_names.get(usize::from(peer_id)) else {
+                        warn!(
+                            peer = %peer,
+                            "no TLS peer name for replica id; dropping dialed connection"
+                        );
+                        return Err(());
+                    };
+                    // Direct futures-rustls handshake for exporter access;
+                    // see the inbound twin for the rationale.
+                    let tls_stream = futures_rustls::TlsConnector::from(Arc::clone(&tls.client))
+                        .connect(peer_name.clone(), Box::pin(AsyncStream::new(stream)))
+                        .await
+                        .map_err(|e| warn!(peer = %peer, "replica TLS connect failed: {e}"))?;
+                    let binding = exporter_binding(tls_stream.get_ref().1)
+                        .map_err(|e| warn!(peer = %peer, "replica TLS exporter failed: {e}"))?;
+                    let close_grace = bus.config().close_grace;
+                    dial_and_install(
+                        &bus,
+                        TlsStream::from(tls_stream),
+                        &ctx,
+                        peer_id,
+                        binding,
+                        |tls_stream| {
+                            TcpTlsTransportConn::from_established(tls_stream)
+                                .with_close_grace(close_grace)
+                        },
+                        on_message,
+                    )
+                    .await
+                }
+            }
+        }
+    });
+}
+
+/// Shared tail of the outbound path: run the dialer handshake over
+/// `stream` (plaintext or TLS) and install the connection built by
+/// `make_conn` under the dialed peer id.
+#[allow(clippy::future_not_send)]
+async fn dial_and_install<S, C, F>(
+    bus: &Rc<IggyMessageBus>,
+    mut stream: S,
+    ctx: &ReplicaHandshakeCtx,
+    peer_id: u8,
+    binding: ChannelBinding,
+    make_conn: F,
+    on_message: MessageHandler,
+) -> Result<(), ()>
+where
+    S: AsyncRead + AsyncWrite,
+    C: TransportConn,
+    F: FnOnce(S) -> C,
+{
+    let max_message_size = bus.config().max_message_size;
+    handshake::dialer_handshake(&mut stream, ctx, peer_id, binding, max_message_size).await?;
+    if !bus.is_shutting_down() {
+        install_replica_conn(bus, peer_id, make_conn(stream), on_message);
     }
-    install_replica_conn(bus, peer_id, TcpTransportConn::new(stream), on_message);
+    Ok(())
 }
 
 /// Install a pre-wrapped replica connection on the bus.
@@ -59,9 +310,10 @@ pub fn install_replica_tcp(
 /// Generic over [`TransportConn`] so alternate transports (WS via
 /// shard-0 TLS terminator, QUIC via `compio-quic`) plug in behind the
 /// same registry-insert + instance-token fencing + install-race
-/// handling. TCP-specific socket options live in
-/// [`install_replica_tcp`]; transports with no equivalent layer call
-/// this entry directly with their already-configured connection.
+/// handling. TCP-specific socket options live in the
+/// `spawn_replica_install` scaffold; transports with no equivalent
+/// layer call this entry directly with their already-configured
+/// connection.
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub fn install_replica_conn<C: TransportConn>(
     bus: &Rc<IggyMessageBus>,
@@ -194,7 +446,7 @@ pub fn install_replica_conn<C: TransportConn>(
                 return;
             }
             if !notified_transport.replace(true) {
-                bus_for_transport.notify_connection_lost(peer_id);
+                bus_for_transport.notify_connection_lost(peer_id, "transport task exited");
             }
         });
         conn.run(ctx).await;
@@ -246,7 +498,8 @@ pub fn install_replica_conn<C: TransportConn>(
                 .remove_if_token_matches(peer_id, token)
                 && !notified_dispatch_guard.replace(true)
             {
-                bus_for_dispatch_guard.notify_connection_lost(peer_id);
+                bus_for_dispatch_guard
+                    .notify_connection_lost(peer_id, "dispatch task panicked or aborted");
             }
         });
 
@@ -275,7 +528,10 @@ pub fn install_replica_conn<C: TransportConn>(
                 .close_peer_if_token_matches(peer_id, token, close_peer_timeout)
                 .await;
             if closed && !notified_dispatch.replace(true) {
-                bus_for_dispatch.notify_connection_lost(peer_id);
+                bus_for_dispatch.notify_connection_lost(
+                    peer_id,
+                    "dispatch loop ended (inbound channel closed)",
+                );
             }
         }
         info!(replica = peer_id, "peer replica disconnected");
@@ -294,6 +550,18 @@ pub fn install_replica_conn<C: TransportConn>(
             // CAS-clear runs from `IggyMessageBus::notify_connection_lost`
             // on either of the post-loop guards firing.
             install_token.set(Some(token));
+            let expected = bus.config().mesh_expected_peers;
+            if expected > 0 {
+                let connected = bus.owner_table().owned_count();
+                if connected == expected {
+                    info!(
+                        expected,
+                        "replica mesh complete: all peer connections established"
+                    );
+                } else {
+                    info!(connected, expected, "replica mesh forming");
+                }
+            }
         }
         Err(rejected) => {
             // Defensive: on single-threaded compio there is no `.await`

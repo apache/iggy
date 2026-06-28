@@ -78,6 +78,11 @@ pub mod frame_drop_variant {
     pub const PARTITION: &str = "partition";
     pub const FORWARD_CLIENT_SEND: &str = "forward_client_send";
     pub const FORWARD_REPLICA_SEND: &str = "forward_replica_send";
+    pub const METADATA_COMMIT_TICK: &str = "metadata_commit_tick";
+    /// A delegated replica handshake's outcome ack to shard 0 was
+    /// dropped; the shard-0 deadline expiry recovers the slot / pending
+    /// entry, so this stays informational.
+    pub const REPLICA_HANDSHAKE_ACK: &str = "replica_handshake_ack";
 }
 
 /// Reason labels used in `frame_drops_total`.
@@ -97,7 +102,7 @@ pub mod frame_drop_reason {
     pub const MISROUTED: &str = "misrouted";
 }
 
-const VARIANT_COUNT: usize = 5;
+const VARIANT_COUNT: usize = 7;
 const REASON_COUNT: usize = 5;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
@@ -106,6 +111,8 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::PARTITION,
     frame_drop_variant::FORWARD_CLIENT_SEND,
     frame_drop_variant::FORWARD_REPLICA_SEND,
+    frame_drop_variant::METADATA_COMMIT_TICK,
+    frame_drop_variant::REPLICA_HANDSHAKE_ACK,
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
@@ -132,10 +139,18 @@ fn reason_index(s: &str) -> Option<usize> {
 /// at construction so the drop-site hot path never re-enters
 /// `Family::get_or_create` (which acquires a `RwLock` read guard per
 /// drop and stalls under VSR retransmit / drop-burst storms).
+///
+/// `partitions_materialised_total` / `partitions_removed_total` /
+/// `partitions_reconcile_failures_total` are simple unlabelled counters
+/// bumped by the partition reconciliation loop; shard id is
+/// resolved at scrape time via the per-shard registry, not as a label.
 #[derive(Clone)]
 pub struct ShardMetrics {
     frame_drops_total: Family<FrameDropLabel, Counter>,
     cached_counters: [[Counter; REASON_COUNT]; VARIANT_COUNT],
+    partitions_materialised_total: Counter,
+    partitions_removed_total: Counter,
+    partitions_reconcile_failures_total: Counter,
 }
 
 impl ShardMetrics {
@@ -162,6 +177,9 @@ impl ShardMetrics {
         Self {
             frame_drops_total,
             cached_counters,
+            partitions_materialised_total: Counter::default(),
+            partitions_removed_total: Counter::default(),
+            partitions_reconcile_failures_total: Counter::default(),
         }
     }
 
@@ -180,6 +198,50 @@ impl ShardMetrics {
                 .get_or_create(&FrameDropLabel { variant, reason })
                 .inc();
         }
+    }
+
+    /// Bumped on the owning shard each time the partition reconciliation
+    /// loop materialises a newly committed namespace via
+    /// `build_partition_fresh`.
+    pub fn record_partition_materialised(&self) {
+        self.partitions_materialised_total.inc();
+    }
+
+    /// Bumped on the owning shard each time the partition reconciliation
+    /// loop drops an `IggyPartition` whose namespace left the committed
+    /// metadata.
+    pub fn record_partition_removed(&self) {
+        self.partitions_removed_total.inc();
+    }
+
+    /// Bumped each time `build_partition_fresh` or
+    /// `delete_partitions_from_disk` returns `Err`. The reconciler retries
+    /// next tick, but a sustained climb surfaces a stuck partition (disk
+    /// full, permission denied, ENOENT on a path it cannot recreate, etc.).
+    pub fn record_partition_reconcile_failure(&self) {
+        self.partitions_reconcile_failures_total.inc();
+    }
+
+    /// Snapshot of `partitions_materialised_total`. Test-only accessor;
+    /// production scrape goes through the prometheus registry.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partitions_materialised_value(&self) -> u64 {
+        self.partitions_materialised_total.get()
+    }
+
+    /// Snapshot of `partitions_removed_total`. Test-only accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partitions_removed_value(&self) -> u64 {
+        self.partitions_removed_total.get()
+    }
+
+    /// Snapshot of `partitions_reconcile_failures_total`. Test-only accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partitions_reconcile_failures_value(&self) -> u64 {
+        self.partitions_reconcile_failures_total.get()
     }
 }
 

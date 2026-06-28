@@ -25,9 +25,12 @@
 
 mod common;
 
-use common::{header_only, install_replicas_locally, loopback};
+use common::{
+    header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
+    set_replica_ctx,
+};
 use compio::net::TcpListener;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::{Command2, HEADER_SIZE};
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
@@ -46,21 +49,12 @@ async fn slow_peer_does_not_block_other_peers() {
     let on_a: MessageHandler = Rc::new(move |_, _| {
         received_a_clone.set(received_a_clone.get() + 1);
     });
+    set_replica_ctx(&bus_a, CLUSTER, 1, 3, None);
     let (la, addr_a) = bind(loopback()).await.unwrap();
     let token_a = bus_a.token();
     let accept_a = install_replicas_locally(bus_a.clone(), on_a.clone());
     let la_handle = compio::runtime::spawn(async move {
-        run(
-            la,
-            token_a,
-            CLUSTER,
-            1,
-            3,
-            accept_a,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-            Duration::from_secs(10),
-        )
-        .await;
+        run(la, token_a, accept_a).await;
     });
     bus_a.track_background(la_handle);
 
@@ -76,18 +70,29 @@ async fn slow_peer_does_not_block_other_peers() {
         Rc::new(std::cell::RefCell::new(Vec::new()));
     let held_streams_clone = held_streams.clone();
     let accept_b_handle = compio::runtime::spawn(async move {
-        while let Ok((stream, _)) = lb.accept().await {
+        while let Ok((mut stream, _)) = lb.accept().await {
+            // Complete the two-way mesh handshake (consume the dialer's
+            // Ping, ack it) so the dial installs; only then go mute. The
+            // head-of-line scenario needs an installed peer that stops
+            // reading, not a peer that never joins.
+            if message_bus::framing::read_message(&mut stream, HEADER_SIZE)
+                .await
+                .is_ok()
+            {
+                let ack = header_only(Command2::Ping, CLUSTER, 2);
+                let _ = message_bus::framing::write_message(&mut stream, ack).await;
+            }
             held_streams_clone.borrow_mut().push(stream);
         }
     });
 
     // Sender bus 0 dials both A and B.
     let bus0 = Rc::new(IggyMessageBus::with_capacity(0, 16));
+    set_replica_ctx(&bus0, CLUSTER, 0, 3, None);
     let dial_0: MessageHandler = Rc::new(|_, _| {});
-    let dial_delegate = install_replicas_locally(bus0.clone(), dial_0);
+    let dial_delegate = install_dialed_replicas_locally(bus0.clone(), dial_0);
     start_connector(
         &bus0,
-        CLUSTER,
         0,
         vec![(1, addr_a), (2, addr_b)],
         dial_delegate,

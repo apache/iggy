@@ -47,7 +47,7 @@ jobs:
       crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
       sdks_to_publish: ${{ steps.check.outputs.sdks_to_publish }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.3
         with:
           fetch-depth: 0
 
@@ -63,10 +63,10 @@ jobs:
 
       # cargo-rail computes the affected crate set for the Docker :edge gate.
       # Metadata-only `cargo rail plan` (no compile), so it runs on the runner's
-      # preinstalled cargo (rust-toolchain.toml pins 1.95.0) and skips the
+      # preinstalled cargo (rust-toolchain.toml pins 1.96.0) and skips the
       # heavyweight build-cache restore.
       - name: Install cargo-rail
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.81.11
         with:
           tool: cargo-rail
 

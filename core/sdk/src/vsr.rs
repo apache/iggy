@@ -25,7 +25,7 @@ use iggy_binary_protocol::codes::{
 };
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
-    read_size_field,
+    read_size_field, result_code, result_section_len,
 };
 use iggy_binary_protocol::namespace::{
     MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE, PARTITION_MASK,
@@ -75,7 +75,6 @@ pub(crate) fn encode_request_header(
         }
         _ => {
             let operation = operation_for_code(code)?;
-            let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
             // NonReplicated ops (ping, reads) bypass server-side dedup --
             // `ClientTable` only tracks request_ids for replicated ops. If
             // they consumed the monotonic counter, the next replicated
@@ -83,12 +82,30 @@ pub(crate) fn encode_request_header(
             // would see a `RequestGap` and silently drop it. Read the
             // current id without advancing; the server ignores it for
             // NonReplicated.
-            let request_id = if operation == Operation::NonReplicated {
-                session.current_request_id()
+            //
+            // They are also sessionless on the server (routed by transport
+            // id; protected codes are auth-gated server-side), so send with
+            // session 0 when unregistered -- preserving the legacy "ping
+            // works without auth" contract. Replicated ops still require a
+            // bound session for dedup and fail fast here.
+            if operation == Operation::NonReplicated {
+                (
+                    operation,
+                    session.current_request_id(),
+                    session.session().unwrap_or(0),
+                )
+            } else if operation.is_partition() {
+                // Partition ops replicate in their own per-partition group,
+                // which is at-least-once with no `ClientTable` dedup -- the
+                // metadata table never records their request ids. Consuming
+                // the counter here would gap the NEXT metadata op's id and
+                // `request_preflight` would silently drop it (`RequestGap`).
+                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
+                (operation, session.current_request_id(), session_id)
             } else {
-                session.next_request_id()
-            };
-            (operation, request_id, session_id)
+                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
+                (operation, session.next_request_id(), session_id)
+            }
         }
     };
     let namespace = namespace_for_request(code, payload, operation)?;
@@ -151,6 +168,19 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
         return Err(IggyError::EmptyResponse);
     }
 
+    // Session-terminal Eviction frames map to typed errors, mirroring
+    // `decode_response_split` (the TCP/WS path) so every transport
+    // surfaces e.g. `Unauthenticated` instead of `InvalidCommand`.
+    let header_bytes: &[u8; HEADER_SIZE] = response[..HEADER_SIZE]
+        .try_into()
+        .map_err(|_| IggyError::InvalidCommand)?;
+    if peek_command(header_bytes) == Command2::Eviction {
+        if let Ok(header) = bytemuck::checked::try_from_bytes::<EvictionHeader>(header_bytes) {
+            return Err(map_eviction_reason(header.reason));
+        }
+        return Err(IggyError::Unauthenticated);
+    }
+
     let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(&response[..HEADER_SIZE])
         .map_err(|_| IggyError::InvalidCommand)?;
     if header.command != Command2::Reply {
@@ -162,7 +192,8 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
         return Err(IggyError::InvalidCommand);
     }
 
-    Ok(response.slice(HEADER_SIZE..total_size))
+    let operation = header.operation;
+    split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
 }
 
 /// Decode a reply when the header and body have been read into separate
@@ -200,7 +231,36 @@ pub(crate) fn decode_response_split(
     if body.len() < expected_body {
         return Err(IggyError::InvalidCommand);
     }
-    Ok(body.slice(..expected_body))
+    split_metadata_result(header.operation, body.slice(..expected_body))
+}
+
+/// Interpret the committed result section that leads a metadata reply body.
+///
+/// Metadata ops ([`Operation::is_metadata`]) commit a result
+/// section ahead of their typed payload (encode mirror:
+/// `metadata::stm::result::ApplyReply::write_reply_body`): success carries
+/// `count == 0` then the payload; a committed business rejection carries one
+/// `{index, result}` entry and no payload. Strip the section on success and map
+/// a nonzero committed code to its [`IggyError`] -- the result discriminants
+/// share the `IggyError` code space, so this is the same [`IggyError::from_code`]
+/// mapping the legacy transport applies to a status word.
+///
+/// Reads, the partition data plane, and Register/Logout carry no result section
+/// and pass through untouched. A metadata body that is not a well-formed result
+/// section is corruption, never a silent success, so it maps to `InvalidCommand`
+/// rather than risk a rejection decoding as `Ok`.
+fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, IggyError> {
+    if !operation.is_metadata() {
+        return Ok(body);
+    }
+    match result_code(&body) {
+        Some(0) => {
+            let payload_start = result_section_len(&body).ok_or(IggyError::InvalidCommand)?;
+            Ok(body.slice(payload_start..))
+        }
+        Some(code) => Err(IggyError::from_code(code)),
+        None => Err(IggyError::InvalidCommand),
+    }
 }
 
 /// `Command2` lives at a fixed offset shared by every consensus header
@@ -224,6 +284,7 @@ fn map_eviction_reason(reason: EvictionReason) -> IggyError {
         | EvictionReason::NoSession
         | EvictionReason::SessionTooLow
         | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
+        EvictionReason::StaleClient => IggyError::StaleClient,
         _ => IggyError::InvalidCommand,
     }
 }
@@ -503,5 +564,45 @@ mod tests {
         assert_eq!((namespace >> STREAM_SHIFT) & STREAM_MASK, 2);
         assert_eq!((namespace >> TOPIC_SHIFT) & TOPIC_MASK, 3);
         assert_eq!((namespace >> PARTITION_SHIFT) & PARTITION_MASK, 4);
+    }
+
+    #[test]
+    fn metadata_success_reply_strips_result_section_and_returns_payload() {
+        let mut body = BytesMut::new();
+        body.put_u32_le(0); // count = 0 (success)
+        body.put_slice(b"payload");
+        let payload = split_metadata_result(Operation::CreateStream, body.freeze()).unwrap();
+        assert_eq!(&payload[..], b"payload");
+    }
+
+    #[test]
+    fn metadata_rejection_reply_maps_committed_code_to_iggy_error() {
+        let mut body = BytesMut::new();
+        body.put_u32_le(1); // count = 1 (one rejection entry)
+        body.put_u32_le(0); // index
+        body.put_u32_le(IggyError::StreamIdNotFound(Default::default()).as_code());
+        let err = split_metadata_result(Operation::DeleteStream, body.freeze()).unwrap_err();
+        assert_eq!(
+            err.as_code(),
+            IggyError::StreamIdNotFound(Default::default()).as_code()
+        );
+    }
+
+    #[test]
+    fn metadata_reply_with_truncated_section_is_invalid_command_never_ok() {
+        // count claims an entry the body cannot hold: corruption, never a
+        // rejection silently flipping to success.
+        let mut body = BytesMut::new();
+        body.put_u32_le(1);
+        let err = split_metadata_result(Operation::CreateStream, body.freeze()).unwrap_err();
+        assert!(matches!(err, IggyError::InvalidCommand));
+    }
+
+    #[test]
+    fn non_metadata_reply_passes_through_without_a_result_section() {
+        // Reads / partition-plane / Register-Logout replies carry no section.
+        let body = Bytes::from_static(b"raw-non-metadata-body");
+        let out = split_metadata_result(Operation::NonReplicated, body.clone()).unwrap();
+        assert_eq!(out, body);
     }
 }
