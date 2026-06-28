@@ -35,6 +35,7 @@ const DEFAULT_RETRY_DELAY: &str = "200ms";
 const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 5;
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "30s";
+const DEFAULT_REQUEST_TIMEOUT: &str = "30s";
 
 #[derive(Debug)]
 pub struct QuickwitSink {
@@ -48,7 +49,7 @@ pub struct QuickwitSink {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QuickwitSinkConfig {
     pub url: String,
-    /// Full Quickwit index config YAML — passed to `POST /api/v1/indexes` on first open.
+    /// Full Quickwit index config YAML, passed to `POST /api/v1/indexes` on first open.
     /// `index_id` is extracted from this YAML to build ingest URLs.
     pub index: String,
     pub verbose_logging: Option<bool>,
@@ -141,7 +142,7 @@ impl QuickwitSink {
         } else if status.is_client_error() {
             let reason = response.text().await.unwrap_or_default();
             error!(
-                "Permanent error creating Quickwit index: {} for connector ID: {}. status: {status}, reason: {reason}",
+                "Permanent client error creating Quickwit index: {} for connector ID: {}. status: {status}, reason: {reason}",
                 self.index_id, self.id
             );
             Err(Error::InitError(format!(
@@ -150,6 +151,10 @@ impl QuickwitSink {
             )))
         } else {
             let reason = response.text().await.unwrap_or_default();
+            error!(
+                "Server error creating Quickwit index: {} for connector ID: {}. status: {status}, reason: {reason}",
+                self.index_id, self.id
+            );
             Err(Error::InitError(format!(
                 "Failed to create index '{0}': {status} {reason}",
                 self.index_id
@@ -159,6 +164,8 @@ impl QuickwitSink {
 
     pub async fn ingest(&self, messages: Vec<simd_json::OwnedValue>) -> Result<(), Error> {
         let client = self.client()?;
+        // At-least-once: Quickwit ingest carries no dedup key, so a retry after a
+        // 5xx/timeout that actually committed (commit=auto) double-writes those rows.
         let url = format!(
             "{}/api/v1/{}/ingest?commit=auto",
             self.config.url, self.index_id
@@ -217,7 +224,7 @@ impl QuickwitSink {
 impl Sink for QuickwitSink {
     async fn open(&mut self) -> Result<(), Error> {
         let parsed: IndexIdExtract = serde_yaml_ng::from_str(&self.config.index)
-            .map_err(|e| Error::InvalidConfigValue(format!("index: invalid YAML — {e}")))?;
+            .map_err(|e| Error::InvalidConfigValue(format!("index: invalid YAML: {e}")))?;
         self.index_id = parsed.index_id;
 
         let retry_delay = parse_duration(self.config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
@@ -234,7 +241,10 @@ impl Sink for QuickwitSink {
             DEFAULT_OPEN_RETRY_MAX_DELAY,
         );
 
-        let request_timeout = parse_duration(self.config.request_timeout.as_deref(), "30s");
+        let request_timeout = parse_duration(
+            self.config.request_timeout.as_deref(),
+            DEFAULT_REQUEST_TIMEOUT,
+        );
         let raw_client = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
