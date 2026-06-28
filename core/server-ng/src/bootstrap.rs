@@ -70,10 +70,10 @@ use partitions::{
 use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
 use server_common::executor::create_shard_executor;
+use server_common::shard_allocator::{ShardAllocator, ShardInfo};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use server::log::logger::Logging;
-use server::shard_allocator::{ShardAllocator, ShardInfo};
 use server::streaming::users::user::User as LegacyUser;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;

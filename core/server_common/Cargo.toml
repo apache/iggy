@@ -38,14 +38,22 @@ lending-iterator = { workspace = true }
 moka = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+serde = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 twox-hash = { workspace = true }
 
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 serial_test = { workspace = true }
 tokio = { workspace = true }

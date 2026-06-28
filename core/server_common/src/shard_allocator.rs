@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::sharding::{CpuAllocation, NumaConfig};
+use crate::sharding::{CpuAllocation, NumaConfig};
 use hwlocality::Topology;
 use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;

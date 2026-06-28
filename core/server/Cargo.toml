@@ -107,11 +107,5 @@ tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
 
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-hwlocality = { workspace = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-hwlocality = { workspace = true, features = ["vendored"] }
-
 [build-dependencies]
 vergen-git2 = { workspace = true }
