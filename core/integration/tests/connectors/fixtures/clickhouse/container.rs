@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest::Client as HttpClient;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -93,6 +94,7 @@ impl ClickHouseContainer {
             .with_mapped_port(0, CLICKHOUSE_HTTP_PORT.tcp())
             .with_env_var("CLICKHOUSE_USER", CLICKHOUSE_TEST_USER)
             .with_env_var("CLICKHOUSE_PASSWORD", CLICKHOUSE_TEST_PASSWORD)
+            .with_container_name(fixtures::unique_container_name("clickhouse"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
