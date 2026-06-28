@@ -1,0 +1,81 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Example JDBC Source Connector Configuration - BULK MODE
+# Bulk mode works with ALL JDBC databases without any special requirements
+# No tracking column needed - just executes your query and fetches results
+
+type = "source"
+key = "jdbc_bulk_example"
+enabled = true
+version = 0
+name = "JDBC Bulk Mode Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
+
+[plugin_config]
+# This example uses PostgreSQL, but bulk mode works identically with:
+# MySQL, Oracle, SQL Server, H2, Derby, DB2, etc.
+jdbc_url = "jdbc:postgresql://localhost:5432/warehouse"
+
+# Database credentials can be in URL or separate
+# jdbc_url = "jdbc:postgresql://localhost:5432/warehouse?user=myuser&password=mypass"
+username = "warehouse_user"
+password = "secret"
+
+driver_class = "org.postgresql.Driver"
+driver_jar_path = "/opt/jdbc-drivers/postgresql-42.6.0.jar"
+
+# Bulk mode: Any valid SELECT query
+# Can include JOINs, aggregations, complex WHERE clauses, etc.
+query = """
+SELECT
+    p.product_id,\
+    p.product_name,
+    p.category,
+    p.price,
+    COUNT(o.order_id) as total_orders,
+    SUM(o.quantity) as total_quantity
+FROM products p
+LEFT JOIN orders o ON p.product_id = o.product_id
+GROUP BY p.product_id, p.product_name, p.category, p.price
+"""
+
+# Poll once per hour for daily snapshots
+poll_interval = "1h"
+
+# Large batch size for full table scans
+batch_size = 10000
+
+# BULK MODE - no tracking column needed!
+mode = "bulk"
+
+# Bulk mode benefits:
+# - No tracking column required
+# - Works with any SELECT query
+# - Supports complex queries (JOINs, aggregations, window functions)
+# - Perfect for periodic snapshots
+# - Universal compatibility with all databases
+
+snake_case_columns = true
+include_metadata = false
+
+[[streams]]
+stream = "warehouse"
+topic = "product_summary"
+partition_id = 1
+schema = "json"

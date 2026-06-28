@@ -1,0 +1,66 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Example JDBC Source Connector Configuration for Microsoft SQL Server
+
+type = "source"
+key = "jdbc_sqlserver_example"
+enabled = true
+version = 0
+name = "JDBC SQL Server Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
+
+[plugin_config]
+# JDBC connection URL
+# Option 1: Separate credentials
+jdbc_url = "jdbc:sqlserver://localhost:1433;databaseName=Sales;encrypt=false"
+
+# Option 2: Embedded credentials in URL
+# jdbc_url = "jdbc:sqlserver://localhost:1433;databaseName=Sales;user=sa;password=YourPassword123;encrypt=false"
+
+# JDBC driver class name
+driver_class = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+
+# Path to JDBC driver JAR file
+# Download from: https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/
+driver_jar_path = "/opt/jdbc-drivers/mssql-jdbc-12.4.1.jre11.jar"
+
+# Database credentials (optional if included in jdbc_url)
+username = "sa"
+password = "YourPassword123"
+
+# SQL query to execute
+query = "SELECT * FROM Orders WHERE OrderDate > {last_offset} ORDER BY OrderDate"
+
+poll_interval = "15s"
+batch_size = 2000
+tracking_column = "OrderDate"
+initial_offset = "2024-01-01"
+mode = "incremental"
+
+# Convert SQL Server naming to snake_case
+snake_case_columns = true
+include_metadata = true
+
+connection_timeout_ms = 30000
+
+[[streams]]
+stream = "sales"
+topic = "orders"
+partition_id = 1
+schema = "json"
