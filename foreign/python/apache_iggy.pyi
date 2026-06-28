@@ -965,7 +965,9 @@ class PollingStrategy:
     class Offset(PollingStrategy):
         r"""
         Start reading from an absolute offset.
-        Payload: `int`.
+
+        Args:
+            value: Absolute message offset as `int`.
         """
 
         __match_args__ = ("value",)
@@ -977,7 +979,9 @@ class PollingStrategy:
     class Timestamp(PollingStrategy):
         r"""
         Start reading from the first message at or after a timestamp.
-        Payload: `int`.
+
+        Args:
+            value: Unix timestamp in microseconds as `int`.
         """
 
         __match_args__ = ("value",)
@@ -1021,6 +1025,7 @@ class ReceiveMessage:
 
     This object exposes the payload and metadata for a single received message.
     """
+    @property
     def payload(self) -> bytes:
         r"""
         Get the message payload.
@@ -1028,6 +1033,7 @@ class ReceiveMessage:
         Returns:
             The payload as `bytes`.
         """
+    @property
     def offset(self) -> builtins.int:
         r"""
         Get the message offset.
@@ -1035,6 +1041,7 @@ class ReceiveMessage:
         Returns:
             The message offset as `int`.
         """
+    @property
     def timestamp(self) -> builtins.int:
         r"""
         Get the message timestamp.
@@ -1042,6 +1049,7 @@ class ReceiveMessage:
         Returns:
             The message timestamp as `int`.
         """
+    @property
     def id(self) -> builtins.int:
         r"""
         Get the message id.
@@ -1049,6 +1057,7 @@ class ReceiveMessage:
         Returns:
             The message id as `int`.
         """
+    @property
     def checksum(self) -> builtins.int:
         r"""
         Get the message checksum.
@@ -1056,6 +1065,7 @@ class ReceiveMessage:
         Returns:
             The checksum as `int`.
         """
+    @property
     def length(self) -> builtins.int:
         r"""
         Get the payload length.
@@ -1063,6 +1073,7 @@ class ReceiveMessage:
         Returns:
             The payload length in bytes as `int`.
         """
+    @property
     def partition_id(self) -> builtins.int:
         r"""
         Get the partition id for this message.

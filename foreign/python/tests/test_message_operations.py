@@ -58,7 +58,7 @@ class TestMessageOperations:
             auto_commit=True,
         )
 
-        assert [message.payload().decode() for message in polled_messages] == (
+        assert [message.payload.decode() for message in polled_messages] == (
             test_messages
         )
 
@@ -95,7 +95,7 @@ class TestMessageOperations:
             auto_commit=True,
         )
 
-        assert [message.payload().decode() for message in polled_messages] == (
+        assert [message.payload.decode() for message in polled_messages] == (
             test_messages
         )
 
@@ -132,12 +132,12 @@ class TestMessageOperations:
         assert len(polled_messages) >= 1
         msg = polled_messages[0]
 
-        assert msg.payload().decode("utf-8") == test_payload
-        assert isinstance(msg.offset(), int) and msg.offset() >= 0
-        assert isinstance(msg.id(), int) and msg.id() > 0
-        assert isinstance(msg.timestamp(), int) and msg.timestamp() > 0
-        assert isinstance(msg.checksum(), int)
-        assert isinstance(msg.length(), int) and msg.length() > 0
+        assert msg.payload.decode("utf-8") == test_payload
+        assert isinstance(msg.offset, int) and msg.offset >= 0
+        assert isinstance(msg.id, int) and msg.id > 0
+        assert isinstance(msg.timestamp, int) and msg.timestamp > 0
+        assert isinstance(msg.checksum, int)
+        assert isinstance(msg.length, int) and msg.length > 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -186,9 +186,9 @@ class TestMessageOperations:
 
         assert len(polled_messages) == 1
         message = polled_messages[0]
-        assert message.payload() == expected_payload
-        assert message.payload().decode("utf-8") == payload
-        assert message.length() == len(expected_payload)
+        assert message.payload == expected_payload
+        assert message.payload.decode("utf-8") == payload
+        assert message.length == len(expected_payload)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -227,8 +227,8 @@ class TestMessageOperations:
 
         assert len(polled_messages) == 1
         message = polled_messages[0]
-        assert message.payload() == expected_payload
-        assert message.length() == len(expected_payload)
+        assert message.payload == expected_payload
+        assert message.length == len(expected_payload)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -266,8 +266,8 @@ class TestMessageOperations:
 
         assert len(polled_messages) == 1
         message = polled_messages[0]
-        assert message.payload() == payload
-        assert message.length() == len(payload)
+        assert message.payload == payload
+        assert message.length == len(payload)
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_count_one_returns_one_message(
@@ -301,7 +301,7 @@ class TestMessageOperations:
         )
 
         assert len(polled_messages) == 1
-        assert polled_messages[0].payload().decode("utf-8") == test_messages[0]
+        assert polled_messages[0].payload.decode("utf-8") == test_messages[0]
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_large_count_returns_all_available_messages(
@@ -335,7 +335,7 @@ class TestMessageOperations:
         )
 
         assert len(polled_messages) == len(test_messages)
-        assert [message.payload().decode("utf-8") for message in polled_messages] == (
+        assert [message.payload.decode("utf-8") for message in polled_messages] == (
             test_messages
         )
 
@@ -440,7 +440,7 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(last_messages) == 1
-        assert last_messages[0].payload().decode("utf-8") == test_messages[-1]
+        assert last_messages[0].payload.decode("utf-8") == test_messages[-1]
 
     @pytest.mark.asyncio
     async def test_polling_strategy_last_with_count_two_returns_last_two_messages(
@@ -474,7 +474,7 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(last_messages) == 2
-        assert [message.payload().decode("utf-8") for message in last_messages] == (
+        assert [message.payload.decode("utf-8") for message in last_messages] == (
             test_messages[-2:]
         )
 
@@ -509,7 +509,7 @@ class TestMessageOperations:
             count=10,
             auto_commit=False,
         )
-        start_offset = first_messages[2].offset()
+        start_offset = first_messages[2].offset
 
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
@@ -520,8 +520,8 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(offset_messages) == len(test_messages[2:])
-        assert offset_messages[0].offset() == start_offset
-        assert [message.payload().decode("utf-8") for message in offset_messages] == (
+        assert offset_messages[0].offset == start_offset
+        assert [message.payload.decode("utf-8") for message in offset_messages] == (
             test_messages[2:]
         )
 
@@ -555,7 +555,7 @@ class TestMessageOperations:
             count=10,
             auto_commit=False,
         )
-        offset_beyond_newest = first_messages[-1].offset() + 1
+        offset_beyond_newest = first_messages[-1].offset + 1
 
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
@@ -600,7 +600,7 @@ class TestMessageOperations:
             count=10,
             auto_commit=False,
         )
-        start_timestamp = first_messages[2].timestamp()
+        start_timestamp = first_messages[2].timestamp
 
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
@@ -611,9 +611,9 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(timestamp_messages) == len(test_messages[2:])
-        assert timestamp_messages[0].timestamp() >= start_timestamp
+        assert timestamp_messages[0].timestamp >= start_timestamp
         assert [
-            message.payload().decode("utf-8") for message in timestamp_messages
+            message.payload.decode("utf-8") for message in timestamp_messages
         ] == test_messages[2:]
 
     @pytest.mark.asyncio
@@ -648,7 +648,7 @@ class TestMessageOperations:
             count=10,
             auto_commit=False,
         )
-        timestamp_after_newest = first_messages[-1].timestamp() + 1
+        timestamp_after_newest = first_messages[-1].timestamp + 1
 
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
@@ -695,7 +695,7 @@ class TestMessageOperations:
             auto_commit=True,
         )
         assert [
-            message.payload().decode("utf-8")
+            message.payload.decode("utf-8")
             for message in first_messages[: len(existing_messages)]
         ] == existing_messages
 
@@ -715,7 +715,7 @@ class TestMessageOperations:
             auto_commit=True,
         )
         assert len(next_messages) == len(new_messages)
-        assert [message.payload().decode("utf-8") for message in next_messages] == (
+        assert [message.payload.decode("utf-8") for message in next_messages] == (
             new_messages
         )
 
@@ -753,7 +753,7 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert [
-            message.payload().decode("utf-8")
+            message.payload.decode("utf-8")
             for message in first_messages[: len(existing_messages)]
         ] == existing_messages
 
@@ -773,6 +773,6 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(next_messages) == len(existing_messages) + len(new_messages)
-        assert [message.payload().decode("utf-8") for message in next_messages] == (
+        assert [message.payload.decode("utf-8") for message in next_messages] == (
             existing_messages + new_messages
         )

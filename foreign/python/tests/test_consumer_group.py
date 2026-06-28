@@ -523,7 +523,7 @@ class TestConsumerGroup:
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
         assert len(received_messages) == len(first_batch_messages)
 
@@ -543,7 +543,7 @@ class TestConsumerGroup:
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -597,10 +597,10 @@ class TestConsumerGroup:
 
         await consumer.consume_messages(take_first_batch, first_shutdown)
 
-        await consumer.store_offset(received_messages[-1].offset(), partition_id)
+        await consumer.store_offset(received_messages[-1].offset, partition_id)
         assert (
             consumer.get_last_stored_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
         assert len(received_messages) == len(first_batch_messages)
 
@@ -618,10 +618,10 @@ class TestConsumerGroup:
 
         await consumer.consume_messages(take_remaining, second_shutdown)
 
-        await consumer.store_offset(received_messages[-1].offset(), partition_id)
+        await consumer.store_offset(received_messages[-1].offset, partition_id)
         assert (
             consumer.get_last_stored_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -672,10 +672,10 @@ class TestConsumerGroup:
 
         await consumer.consume_messages(take, shutdown_event)
 
-        await consumer.store_offset(received_messages[-1].offset(), partition_id)
+        await consumer.store_offset(received_messages[-1].offset, partition_id)
         assert (
             consumer.get_last_stored_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
         await consumer.delete_offset(partition_id)
@@ -710,7 +710,7 @@ class TestConsumerGroup:
         )
 
         async def take(message: ReceiveMessage) -> None:
-            received_messages.append(message.payload().decode())
+            received_messages.append(message.payload.decode())
             if len(received_messages) == len(test_messages):
                 shutdown_event.set()
 
@@ -764,7 +764,7 @@ class TestConsumerGroup:
         iterator = consumer.iter_messages()
         for _ in range(len(test_messages)):
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            received_messages.append(message.payload().decode())
+            received_messages.append(message.payload.decode())
 
         assert received_messages == test_messages
 
@@ -810,7 +810,7 @@ class TestConsumerGroup:
         iterator = consumer.iter_messages()
         for _ in range(len(test_messages)):
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            received_messages.append(message.payload().decode())
+            received_messages.append(message.payload.decode())
 
         assert received_messages == test_messages
 
@@ -855,12 +855,12 @@ class TestConsumerGroup:
         message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
         received_messages.append(message)
 
-        assert [message.payload().decode() for message in received_messages] == [
+        assert [message.payload.decode() for message in received_messages] == [
             test_messages[-1]
         ]
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -903,7 +903,7 @@ class TestConsumerGroup:
         iterator = consumer.iter_messages()
         for _ in range(2):
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            received_messages.append(message.payload().decode())
+            received_messages.append(message.payload.decode())
 
         assert received_messages == test_messages[-2:]
 
@@ -951,12 +951,12 @@ class TestConsumerGroup:
 
         await consumer.consume_messages(take, shutdown_event)
 
-        assert [message.payload().decode() for message in received_messages] == [
+        assert [message.payload.decode() for message in received_messages] == [
             test_messages[-1]
         ]
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1001,7 +1001,7 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             initial_messages.append(message)
 
-        start_offset = initial_messages[2].offset()
+        start_offset = initial_messages[2].offset
 
         offset_consumer = await iggy_client.consumer_group(
             unique_name(),
@@ -1019,13 +1019,13 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             offset_messages.append(message)
 
-        assert offset_messages[0].offset() == start_offset
-        assert [message.payload().decode() for message in offset_messages] == (
+        assert offset_messages[0].offset == start_offset
+        assert [message.payload.decode() for message in offset_messages] == (
             test_messages[2:]
         )
         assert (
             offset_consumer.get_last_consumed_offset(partition_id)
-            == offset_messages[-1].offset()
+            == offset_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1071,7 +1071,7 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             initial_messages.append(message)
 
-        start_offset = initial_messages[2].offset()
+        start_offset = initial_messages[2].offset
 
         offset_consumer = await iggy_client.consumer_group(
             unique_name(),
@@ -1091,13 +1091,13 @@ class TestConsumerGroup:
 
         await offset_consumer.consume_messages(take, shutdown_event)
 
-        assert offset_messages[0].offset() == start_offset
-        assert [message.payload().decode() for message in offset_messages] == (
+        assert offset_messages[0].offset == start_offset
+        assert [message.payload.decode() for message in offset_messages] == (
             test_messages[2:]
         )
         assert (
             offset_consumer.get_last_consumed_offset(partition_id)
-            == offset_messages[-1].offset()
+            == offset_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1146,7 +1146,7 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             initial_messages.append(message)
 
-        start_timestamp = initial_messages[1].timestamp()
+        start_timestamp = initial_messages[1].timestamp
 
         timestamp_consumer = await iggy_client.consumer_group(
             unique_name(),
@@ -1164,13 +1164,13 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             timestamp_messages.append(message)
 
-        assert timestamp_messages[0].timestamp() >= start_timestamp
-        assert [message.payload().decode() for message in timestamp_messages] == (
+        assert timestamp_messages[0].timestamp >= start_timestamp
+        assert [message.payload.decode() for message in timestamp_messages] == (
             test_messages[1:]
         )
         assert (
             timestamp_consumer.get_last_consumed_offset(partition_id)
-            == timestamp_messages[-1].offset()
+            == timestamp_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1220,7 +1220,7 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             initial_messages.append(message)
 
-        start_timestamp = initial_messages[1].timestamp()
+        start_timestamp = initial_messages[1].timestamp
 
         timestamp_consumer = await iggy_client.consumer_group(
             unique_name(),
@@ -1240,13 +1240,13 @@ class TestConsumerGroup:
 
         await timestamp_consumer.consume_messages(take, shutdown_event)
 
-        assert timestamp_messages[0].timestamp() >= start_timestamp
-        assert [message.payload().decode() for message in timestamp_messages] == (
+        assert timestamp_messages[0].timestamp >= start_timestamp
+        assert [message.payload.decode() for message in timestamp_messages] == (
             test_messages[1:]
         )
         assert (
             timestamp_consumer.get_last_consumed_offset(partition_id)
-            == timestamp_messages[-1].offset()
+            == timestamp_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1295,7 +1295,7 @@ class TestConsumerGroup:
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
         for _ in range(len(test_messages) - len(received_messages)):
@@ -1304,7 +1304,7 @@ class TestConsumerGroup:
 
         assert (
             consumer.get_last_consumed_offset(partition_id)
-            == received_messages[-1].offset()
+            == received_messages[-1].offset
         )
 
     @pytest.mark.asyncio
@@ -1347,7 +1347,7 @@ class TestConsumerGroup:
         iterator = consumer.iter_messages()
         for _ in range(len(test_messages)):
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            received_messages.append(message.payload().decode())
+            received_messages.append(message.payload.decode())
 
         assert received_messages == test_messages
 
@@ -1399,7 +1399,7 @@ class TestConsumerGroup:
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
             received_messages.append(message)
 
-        offsets = [message.offset() for message in received_messages]
+        offsets = [message.offset for message in received_messages]
 
         await consumer.store_offset(offsets[-1], partition_id)
         assert consumer.get_last_stored_offset(partition_id) == offsets[-1]
@@ -1423,7 +1423,7 @@ class TestConsumerGroup:
         if allow_replay:
             iterator = replay_consumer.iter_messages()
             message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
-            replayed_messages.append(message.payload().decode())
+            replayed_messages.append(message.payload.decode())
             assert replayed_messages == [test_messages[-1]]
         else:
             with pytest.raises(asyncio.TimeoutError):

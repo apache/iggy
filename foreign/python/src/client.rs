@@ -228,7 +228,7 @@ impl IggyClient {
                 .login_user(&username, &password)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(IdentityInfo::from(identity_info))
+            Python::attach(|py| Py::new(py, IdentityInfo::from(identity_info)))
         })
     }
 

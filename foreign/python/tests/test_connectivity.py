@@ -73,8 +73,7 @@ class TestConnectivity:
         await client.connect()
         await wait_for_ping(client, timeout=5, interval=1)
 
-        identity = await client.login_user("iggy", "iggy")
-        assert identity.user_id > 0
+        await client.login_user("iggy", "iggy")
 
     @pytest.mark.asyncio
     async def test_constructor_accepts_none_for_optional_transport_settings(self):

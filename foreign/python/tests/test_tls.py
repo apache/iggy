@@ -148,7 +148,7 @@ class TestTlsConnectivity:
         # Verify message payloads
         for i, expected_msg in enumerate(test_messages):
             if i < len(polled):
-                assert polled[i].payload().decode("utf-8") == expected_msg
+                assert polled[i].payload.decode("utf-8") == expected_msg
 
 
 @pytest.mark.integration

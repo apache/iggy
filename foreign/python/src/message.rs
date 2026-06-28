@@ -111,6 +111,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The payload as `bytes`.
+    #[getter]
     pub fn payload<'a>(&self, py: Python<'a>) -> Bound<'a, PyBytes> {
         PyBytes::new(py, &self.inner.payload)
     }
@@ -119,6 +120,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The message offset as `int`.
+    #[getter]
     pub fn offset(&self) -> u64 {
         self.inner.header.offset
     }
@@ -127,6 +129,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The message timestamp as `int`.
+    #[getter]
     pub fn timestamp(&self) -> u64 {
         self.inner.header.timestamp
     }
@@ -135,6 +138,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The message id as `int`.
+    #[getter]
     pub fn id(&self) -> u128 {
         self.inner.header.id
     }
@@ -143,6 +147,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The checksum as `int`.
+    #[getter]
     pub fn checksum(&self) -> u64 {
         self.inner.header.checksum
     }
@@ -151,6 +156,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The payload length in bytes as `int`.
+    #[getter]
     pub fn length(&self) -> u32 {
         self.inner.header.payload_length
     }
@@ -159,6 +165,7 @@ impl ReceiveMessage {
     ///
     /// Returns:
     ///     The partition id as `int`.
+    #[getter]
     pub fn partition_id(&self) -> u32 {
         self.partition_id
     }
@@ -173,15 +180,23 @@ impl ReceiveMessage {
 #[pyclass(from_py_object)]
 pub enum PollingStrategy {
     /// Start reading from an absolute offset.
-    /// Payload: `int`.
+    ///
+    /// Args:
+    ///     value: Absolute message offset as `int`.
     Offset { value: u64 },
+
     /// Start reading from the first message at or after a timestamp.
-    /// Payload: `int`.
+    ///
+    /// Args:
+    ///     value: Unix timestamp in microseconds as `int`.
     Timestamp { value: u64 },
+
     /// Start reading from the first available message.
     First {},
+
     /// Start reading from the most recent available message.
     Last {},
+
     /// Start reading from the next message after the stored consumer offset.
     Next {},
 }
