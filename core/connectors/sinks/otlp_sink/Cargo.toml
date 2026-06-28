@@ -18,7 +18,7 @@
 [package]
 name = "iggy_connector_otlp_sink"
 version = "0.4.1-edge.1"
-description = "Iggy OTLP/gRPC sink connector — forwards logs, metrics, and traces from Iggy streams to any OpenTelemetry-compatible backend via the OTLP protocol"
+description = "Iggy OTLP/gRPC sink connector - forwards logs, metrics, and traces from Iggy streams to any OpenTelemetry-compatible backend via the OTLP protocol"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "opentelemetry", "otlp"]
@@ -38,7 +38,6 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 http = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-reqwest = { workspace = true }
 opentelemetry-proto = { workspace = true, features = [
     "gen-tonic",
     "logs",
@@ -46,6 +45,7 @@ opentelemetry-proto = { workspace = true, features = [
     "trace",
 ] }
 prost = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

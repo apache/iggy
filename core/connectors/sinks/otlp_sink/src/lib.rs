@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes};
 use flate2::{Compression, write::GzEncoder};
 use http::uri::PathAndQuery;
+use iggy_connector_sdk::retry::parse_duration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
     owned_value_to_serde_json, sink_connector,
@@ -39,8 +40,8 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tonic::client::Grpc as TonicGrpc;
-use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codec::CompressionEncoding;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::metadata::{MetadataKey, MetadataValue};
 use tonic::transport::Channel;
 use tracing::{debug, info, warn};
@@ -109,6 +110,11 @@ pub struct OtlpSinkConfig {
     ///   qw-otel-logs-index   = "otel-logs-v0_7"
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Per-request timeout in humantime format, e.g. "30s". Bounds each gRPC
+    /// unary call (and channel connect) and each HTTP request so a hung backend
+    /// cannot stall `consume()` indefinitely. Defaults to 30s.
+    #[serde(default)]
+    pub request_timeout: Option<String>,
 }
 
 enum GrpcClient {
@@ -190,9 +196,11 @@ impl std::fmt::Debug for Client {
 #[async_trait]
 impl Sink for OtlpSink {
     async fn open(&mut self) -> Result<(), Error> {
+        let request_timeout = parse_duration(self.config.request_timeout.as_deref(), "30s");
         self.client = Some(match self.config.transport {
             Transport::Http => Client::Http(
                 reqwest::Client::builder()
+                    .timeout(request_timeout)
                     .build()
                     .map_err(|e| Error::InitError(format!("HTTP client: {e}")))?,
             ),
@@ -208,6 +216,8 @@ impl Sink for OtlpSink {
 
                 let channel = Channel::from_shared(self.config.endpoint.clone())
                     .map_err(|e| Error::InvalidConfigValue(format!("endpoint: {e}")))?
+                    .timeout(request_timeout)
+                    .connect_timeout(request_timeout)
                     .connect()
                     .await
                     .map_err(|e| Error::InitError(format!("OTLP endpoint: {e}")))?;
@@ -517,9 +527,10 @@ impl OtlpSink {
                 }
             };
             // tower::Buffer requires poll_ready before every call.
-            grpc_client.ready().await.map_err(|e| {
-                Error::CannotStoreData(format!("OTLP gRPC channel not ready: {e}"))
-            })?;
+            grpc_client
+                .ready()
+                .await
+                .map_err(|e| Error::CannotStoreData(format!("OTLP gRPC channel not ready: {e}")))?;
             let mut request = tonic::Request::new(Bytes::copy_from_slice(raw));
             for (k, v) in &self.metadata {
                 request.metadata_mut().insert(k.clone(), v.clone());
@@ -779,6 +790,7 @@ mod tests {
             format: StorageFormat::Json,
             compression: false,
             headers: HashMap::new(),
+            request_timeout: None,
         }
     }
 

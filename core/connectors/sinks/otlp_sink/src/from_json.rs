@@ -34,33 +34,21 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
 pub fn traces_from_json(messages: &[Value]) -> ExportTraceServiceRequest {
-    // Group spans by service_name so each service gets one ResourceSpans.
-    let mut groups: HashMap<String, (Value, Vec<Span>)> = HashMap::new();
-
-    for msg in messages {
-        let service = msg
-            .get("service_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+    let groups = group_by_resource(messages.iter().map(|msg| {
         let resource = msg.get("resource").cloned().unwrap_or(Value::Null);
-        let span = json_to_span(msg);
-        groups
-            .entry(service)
-            .or_insert_with(|| (resource, Vec::new()))
-            .1
-            .push(span);
-    }
+        (resource, json_to_span(msg))
+    }));
 
     ExportTraceServiceRequest {
         resource_spans: groups
-            .into_values()
+            .into_iter()
             .map(|(resource, spans)| ResourceSpans {
                 resource: Some(json_to_resource(&resource)),
                 scope_spans: vec![ScopeSpans {
@@ -75,27 +63,15 @@ pub fn traces_from_json(messages: &[Value]) -> ExportTraceServiceRequest {
 }
 
 pub fn metrics_from_json(messages: &[Value]) -> ExportMetricsServiceRequest {
-    let mut groups: HashMap<String, (Value, Vec<Metric>)> = HashMap::new();
-
-    for msg in messages {
-        let service = msg
-            .get("service_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+    let groups = group_by_resource(messages.iter().filter_map(|msg| {
+        let metric = json_to_metric(msg)?;
         let resource = msg.get("resource").cloned().unwrap_or(Value::Null);
-        if let Some(metric) = json_to_metric(msg) {
-            groups
-                .entry(service)
-                .or_insert_with(|| (resource, Vec::new()))
-                .1
-                .push(metric);
-        }
-    }
+        Some((resource, metric))
+    }));
 
     ExportMetricsServiceRequest {
         resource_metrics: groups
-            .into_values()
+            .into_iter()
             .map(|(resource, metrics)| ResourceMetrics {
                 resource: Some(json_to_resource(&resource)),
                 scope_metrics: vec![ScopeMetrics {
@@ -110,26 +86,14 @@ pub fn metrics_from_json(messages: &[Value]) -> ExportMetricsServiceRequest {
 }
 
 pub fn logs_from_json(messages: &[Value]) -> ExportLogsServiceRequest {
-    let mut groups: HashMap<String, (Value, Vec<LogRecord>)> = HashMap::new();
-
-    for msg in messages {
-        let service = msg
-            .get("service_name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+    let groups = group_by_resource(messages.iter().map(|msg| {
         let resource = msg.get("resource").cloned().unwrap_or(Value::Null);
-        let record = json_to_log_record(msg);
-        groups
-            .entry(service)
-            .or_insert_with(|| (resource, Vec::new()))
-            .1
-            .push(record);
-    }
+        (resource, json_to_log_record(msg))
+    }));
 
     ExportLogsServiceRequest {
         resource_logs: groups
-            .into_values()
+            .into_iter()
             .map(|(resource, log_records)| ResourceLogs {
                 resource: Some(json_to_resource(&resource)),
                 scope_logs: vec![ScopeLogs {
@@ -140,6 +104,76 @@ pub fn logs_from_json(messages: &[Value]) -> ExportLogsServiceRequest {
                 schema_url: String::new(),
             })
             .collect(),
+    }
+}
+
+/// Group records by full resource identity, not by `service.name` alone.
+///
+/// Two records can share a `service.name` yet carry different resources
+/// (distinct pod, host, or instance attributes). Keying only on the service
+/// emitted every such record under the first resource seen, silently
+/// corrupting the others' resource attributes. A canonical string of the whole
+/// `resource` value is the grouping key instead, so each distinct resource gets
+/// its own `Resource{Spans,Metrics,Logs}`. Insertion order is preserved (first
+/// occurrence wins its slot) to keep output stable across runs.
+fn group_by_resource<T>(items: impl Iterator<Item = (Value, T)>) -> Vec<(Value, Vec<T>)> {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(Value, Vec<T>)> = Vec::new();
+    for (resource, item) in items {
+        let next = groups.len();
+        let slot = *index
+            .entry(canonical_resource_key(&resource))
+            .or_insert(next);
+        if slot == next {
+            groups.push((resource, vec![item]));
+        } else {
+            groups[slot].1.push(item);
+        }
+    }
+    groups
+}
+
+/// Stable identity string for a `resource` value.
+///
+/// `serde_json` is built with `preserve_order` in this workspace, so its `Map`
+/// keeps insertion order and `to_string` would render two equivalent resources
+/// with differently ordered keys as different strings. Emitting object keys in
+/// sorted order at every level makes the key canonical regardless of input
+/// ordering.
+fn canonical_resource_key(v: &Value) -> String {
+    let mut out = String::new();
+    write_canonical(v, &mut out);
+    out
+}
+
+fn write_canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(map) => {
+            out.push('{');
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (i, (key, val)) in entries.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{key:?}:");
+                write_canonical(val, out);
+            }
+            out.push('}');
+        }
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        scalar => {
+            let _ = write!(out, "{scalar}");
+        }
     }
 }
 
@@ -327,12 +361,21 @@ fn json_to_any_value(v: &Value) -> AnyValue {
 }
 
 fn hex_to_bytes(s: &str) -> Vec<u8> {
-    if !s.len().is_multiple_of(2) {
+    // Iterate raw bytes, not string slices: a multibyte UTF-8 char landing on an
+    // even index would make `&s[i..i + 2]` panic on a non-char-boundary before
+    // any radix check could reject it. Treating each byte as a candidate hex
+    // digit rejects non-ASCII input gracefully (skipped) instead.
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return vec![];
     }
-    (0..s.len())
-        .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .filter_map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
         .collect()
 }
 
@@ -371,6 +414,17 @@ fn severity_from_text(s: &str) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn pod_name(res: &Resource) -> Option<&str> {
+        res.attributes
+            .iter()
+            .find(|kv| kv.key == "k8s.pod.name")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match v.value.as_ref() {
+                Some(any_value::Value::StringValue(s)) => Some(s.as_str()),
+                _ => None,
+            })
+    }
 
     #[test]
     fn given_empty_messages_should_return_empty_request() {
@@ -459,5 +513,104 @@ mod tests {
             body.value,
             Some(any_value::Value::StringValue("hello world".to_owned()))
         );
+    }
+
+    #[test]
+    fn given_non_ascii_even_byte_hex_should_not_panic() {
+        // "a\u{20ac}" is 4 bytes with a multibyte char straddling an even index;
+        // the old `&s[i..i + 2]` slicing panicked on the non-char-boundary.
+        assert!(hex_to_bytes("a\u{20ac}").is_empty());
+    }
+
+    #[test]
+    fn given_same_service_distinct_resources_should_emit_separate_resource_spans() {
+        let mk = |pod: &str, span: &str| {
+            json!({
+                "service_name": "svc",
+                "resource": { "service.name": "svc", "k8s.pod.name": pod },
+                "name": span,
+                "trace_id": "0102030405060708090a0b0c0d0e0f10",
+                "span_id": "0102030405060708"
+            })
+        };
+        let req = traces_from_json(&[
+            mk("pod-a", "span-a"),
+            mk("pod-b", "span-b"),
+            mk("pod-a", "span-c"),
+        ]);
+
+        assert_eq!(req.resource_spans.len(), 2);
+
+        let first = &req.resource_spans[0];
+        assert_eq!(pod_name(first.resource.as_ref().unwrap()), Some("pod-a"));
+        let first_names: Vec<&str> = first.scope_spans[0]
+            .spans
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(first_names, vec!["span-a", "span-c"]);
+
+        let second = &req.resource_spans[1];
+        assert_eq!(pod_name(second.resource.as_ref().unwrap()), Some("pod-b"));
+        assert_eq!(second.scope_spans[0].spans.len(), 1);
+        assert_eq!(second.scope_spans[0].spans[0].name, "span-b");
+    }
+
+    #[test]
+    fn given_same_service_distinct_resources_should_emit_separate_resource_metrics() {
+        let mk = |pod: &str, name: &str| {
+            json!({
+                "service_name": "svc",
+                "resource": { "service.name": "svc", "k8s.pod.name": pod },
+                "name": name,
+                "type": "gauge",
+                "value": 1.0
+            })
+        };
+        let req = metrics_from_json(&[mk("pod-a", "m1"), mk("pod-b", "m2")]);
+
+        assert_eq!(req.resource_metrics.len(), 2);
+        assert_eq!(
+            pod_name(req.resource_metrics[0].resource.as_ref().unwrap()),
+            Some("pod-a")
+        );
+        assert_eq!(
+            pod_name(req.resource_metrics[1].resource.as_ref().unwrap()),
+            Some("pod-b")
+        );
+    }
+
+    #[test]
+    fn given_same_service_distinct_resources_should_emit_separate_resource_logs() {
+        let mk = |pod: &str, body: &str| {
+            json!({
+                "service_name": "svc",
+                "resource": { "service.name": "svc", "k8s.pod.name": pod },
+                "body": body
+            })
+        };
+        let req = logs_from_json(&[mk("pod-a", "l1"), mk("pod-b", "l2")]);
+
+        assert_eq!(req.resource_logs.len(), 2);
+        assert_eq!(
+            pod_name(req.resource_logs[0].resource.as_ref().unwrap()),
+            Some("pod-a")
+        );
+        assert_eq!(
+            pod_name(req.resource_logs[1].resource.as_ref().unwrap()),
+            Some("pod-b")
+        );
+    }
+
+    #[test]
+    fn given_same_resource_keys_in_different_order_should_group_together() {
+        // preserve_order keeps insertion order, so equivalent resources with
+        // keys in a different order must still collapse into one group.
+        let a = json!({ "resource": { "a": "1", "b": "2" }, "body": "x" });
+        let b = json!({ "resource": { "b": "2", "a": "1" }, "body": "y" });
+        let req = logs_from_json(&[a, b]);
+
+        assert_eq!(req.resource_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].scope_logs[0].log_records.len(), 2);
     }
 }
