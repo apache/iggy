@@ -307,8 +307,16 @@ class IggyClient:
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
-        Gets all topics in the given stream.
-        Returns a list of topics or a PyRuntimeError on failure.
+        Get all topics in a stream.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[Topic]`.
+
+        Raises:
+            PyRuntimeError: If the identifier is invalid or the request fails.
         """
     def update_topic(
         self,
@@ -321,8 +329,25 @@ class IggyClient:
         max_topic_size: builtins.int | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Updates an existing topic with the given parameters.
-        Returns Ok(()) on successful topic update or a PyRuntimeError on failure.
+        Update an existing topic.
+
+        This is a full replacement: any optional parameter left unset is reset to
+        its server default rather than preserved.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: New topic name as `str`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            replication_factor: Replication factor as `int | None`.
+            message_expiry: Message expiry as `datetime.timedelta | None`.
+            max_topic_size: Maximum topic size in bytes as `int | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is updated.
+
+        Raises:
+            PyRuntimeError: If an argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -330,8 +355,17 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Deletes the topic with the given id from the given stream.
-        Returns Ok(()) on successful topic deletion or a PyRuntimeError on failure.
+        Delete a topic from a stream.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is deleted.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def purge_topic(
         self,
@@ -339,8 +373,17 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Purges all messages from the topic with the given id in the given stream.
-        Returns Ok(()) on successful topic purge or a PyRuntimeError on failure.
+        Purge all messages from a topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is purged.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def send_messages(
         self,
