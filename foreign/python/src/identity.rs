@@ -99,6 +99,7 @@ impl IdentityInfo {
     ///
     /// Returns:
     ///     The user id as `int`.
+    #[getter]
     pub fn user_id(&self) -> u32 {
         self.user_id
     }
@@ -107,6 +108,7 @@ impl IdentityInfo {
     ///
     /// Returns:
     ///     The access token as `str`, or `None` if no access token was returned.
+    #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.str | None"))]
     pub fn access_token_value(&self) -> Option<String> {
         self.access_token_value.clone()
@@ -117,6 +119,7 @@ impl IdentityInfo {
     /// Returns:
     ///     The encoded expiry value as `int`, or `None` if no access token expiry
     ///     was returned.
+    #[getter]
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     pub fn access_token_expiry(&self) -> Option<u64> {
         self.access_token_expiry

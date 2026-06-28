@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from datetime import timedelta
+
 import pytest
 
 from apache_iggy import IggyClient
@@ -49,6 +51,72 @@ class TestConnectivity:
         client = IggyClient.from_connection_string(connection_string)
         await client.connect()
         await wait_for_ping(client, timeout=5, interval=1)
+
+    @pytest.mark.asyncio
+    async def test_constructor_with_explicit_tcp_options_can_connect_and_login(self):
+        """Test keyword arguments for TCP options still allow connect and login."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(
+            server_address=f"{host}:{port}",
+            reconnection_max_retries=3,
+            reconnection_interval=timedelta(seconds=1),
+            reestablish_after=timedelta(seconds=5),
+            tls_enabled=False,
+            tls_domain="localhost",
+            tls_ca_file="unused.pem",
+            tls_validate_certificate=False,
+            no_delay=True,
+        )
+
+        await client.connect()
+        await wait_for_ping(client, timeout=5, interval=1)
+
+        identity = await client.login_user("iggy", "iggy")
+        assert identity.user_id > 0
+
+    @pytest.mark.asyncio
+    async def test_constructor_accepts_none_for_optional_transport_settings(self):
+        """Test `None` preserves defaults for optional transport settings."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(
+            server_address=f"{host}:{port}",
+            reconnection_max_retries=None,
+            reconnection_interval=None,
+            reestablish_after=None,
+            tls_enabled=None,
+            tls_domain=None,
+            tls_ca_file=None,
+            tls_validate_certificate=None,
+            no_delay=False,
+        )
+
+        await client.connect()
+        await wait_for_ping(client, timeout=5, interval=1)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_exception"),
+        [
+            ({"server_address": 1234}, TypeError),
+            ({"reconnection_max_retries": "3"}, TypeError),
+            ({"reconnection_interval": 1}, TypeError),
+            ({"reestablish_after": "5s"}, TypeError),
+            ({"tls_enabled": "false"}, TypeError),
+            ({"tls_domain": 1234}, TypeError),
+            ({"tls_ca_file": 1234}, TypeError),
+            ({"tls_validate_certificate": "false"}, TypeError),
+            ({"no_delay": None}, TypeError),
+        ],
+    )
+    def test_constructor_rejects_invalid_keyword_argument_types(
+        self, kwargs, expected_exception
+    ):
+        """Test the keyword-argument constructor validates Python argument types."""
+        with pytest.raises(expected_exception):
+            IggyClient(**kwargs)
 
     @pytest.mark.parametrize(
         ("invalid_value", "expected_error"),

@@ -325,6 +325,7 @@ class IdentityInfo:
     This object contains the authenticated user id and any access token details
     returned by the server.
     """
+    @property
     def user_id(self) -> builtins.int:
         r"""
         Get the authenticated user id.
@@ -332,6 +333,7 @@ class IdentityInfo:
         Returns:
             The user id as `int`.
         """
+    @property
     def access_token_value(self) -> builtins.str | None:
         r"""
         Get the access token value.
@@ -339,6 +341,7 @@ class IdentityInfo:
         Returns:
             The access token as `str`, or `None` if no access token was returned.
         """
+    @property
     def access_token_expiry(self) -> builtins.int | None:
         r"""
         Get the access token expiry value.
@@ -375,23 +378,31 @@ class IggyClient:
         explicit keyword arguments instead of a connection string.
 
         Args:
-            server_address: Server address as `str` in `host:port` form. Defaults to
-                `127.0.0.1:8090`.
+            server_address: Server address as `str` in `host:port` form. Pass `None`
+                to use the TCP transport default, currently `127.0.0.1:8090`.
             reconnection_max_retries: Maximum number of reconnect attempts as `int`
-                after a disconnect. If `None`, retries are unlimited.
+                after a disconnect. Pass `None` to use the TCP transport default,
+                currently unlimited retries.
             reconnection_interval: Delay between reconnect attempts as
-                `datetime.timedelta`. Defaults to 1 second.
+                `datetime.timedelta`. Pass `None` to use the TCP transport default,
+                currently 1 second.
             reestablish_after: Delay before attempting to reestablish the
-                connection as `datetime.timedelta`. Defaults to 5 seconds.
-            tls_enabled: Whether to use TLS for the connection as `bool`. Defaults
-                to `False`.
+                connection as `datetime.timedelta`. Pass `None` to use the TCP
+                transport default, currently 5 seconds.
+            tls_enabled: Whether to use TLS for the connection as `bool`. Pass
+                `None` to use the TCP transport default, currently `False`.
             tls_domain: Server name as `str` to validate against the TLS certificate.
+                Pass `None` to use the TCP transport default, currently an empty
+                string that triggers auto-detection from `server_address`.
             tls_ca_file: Path as `str` to a CA certificate file used to validate
-                the server certificate.
+                the server certificate. Pass `None` to use the TCP transport
+                default, currently no CA file.
             tls_validate_certificate: Whether to validate the server certificate.
-                Accepts `bool | None`. Defaults to `True`.
+                Accepts `bool | None`. Pass `None` to use the TCP transport
+                default, currently `True`.
             no_delay: Whether to send packets immediately instead of allowing the
-                socket to coalesce small writes. Accepts `bool`. Defaults to `False`.
+                socket to coalesce small writes. Accepts `bool`. Defaults to
+                `False`.
 
         Returns:
             A configured `IggyClient`.
