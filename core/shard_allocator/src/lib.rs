@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::sharding::{CpuAllocation, NumaConfig};
 use hwlocality::Topology;
 use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
@@ -23,6 +22,7 @@ use hwlocality::memory::binding::{MemoryBindingFlags, MemoryBindingPolicy};
 use hwlocality::object::types::ObjectType::{self, NUMANode};
 #[cfg(target_os = "linux")]
 use nix::{sched::sched_setaffinity, unistd::Pid};
+use server_common::sharding::{CpuAllocation, NumaConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::available_parallelism;

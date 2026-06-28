@@ -18,8 +18,8 @@
 use metadata::impls::recovery::RecoveryError;
 // TODO: decouple logging errors from the `server` crate.
 use server::server_error::LogError;
-use server_common::shard_allocator::ShardingError;
 use shard::ShardCtorError;
+use shard_allocator::ShardingError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -41,7 +41,7 @@ pub mod quic;
 pub mod sender;
 pub mod server_error;
 pub mod shard;
-pub use server_common::shard_allocator;
+pub use shard_allocator;
 pub mod state;
 pub mod streaming;
 pub mod tcp;

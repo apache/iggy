@@ -16,38 +16,23 @@
 # under the License.
 
 [package]
-name = "server_common"
+name = "shard_allocator"
 version = "0.1.0"
-description = "Server-only primitives shared between iggy server crates. Not part of the public SDK surface."
+description = "CPU and NUMA shard allocation for the iggy server, backed by hwloc."
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
-aligned-vec = { workspace = true }
-bytemuck = { workspace = true }
-bytes = { workspace = true }
-compio = { workspace = true }
-compio-buf = { workspace = true }
-crossbeam = { workspace = true }
-err_trail = { workspace = true }
-human-repr = { workspace = true }
-iggy_binary_protocol = { workspace = true }
-iggy_common = { workspace = true }
-lending-iterator = { workspace = true }
-moka = { workspace = true }
-rcgen = { workspace = true }
-rustls = { workspace = true }
-serde = { workspace = true }
-smallvec = { workspace = true }
+server_common = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-twox-hash = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
-serial_test = { workspace = true }
-tokio = { workspace = true }

@@ -11543,6 +11543,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server_common",
+ "shard_allocator",
  "slab",
  "socket2 0.6.4",
  "strum 0.28.0",
@@ -11624,6 +11625,7 @@ dependencies = [
  "server",
  "server_common",
  "shard",
+ "shard_allocator",
  "slab",
  "socket2 0.6.4",
  "strum 0.28.0",
@@ -11653,7 +11655,6 @@ dependencies = [
  "crossbeam",
  "err_trail",
  "human-repr",
- "hwlocality",
  "iggy_binary_protocol",
  "iggy_common",
  "lending-iterator",
@@ -11743,6 +11744,17 @@ dependencies = [
  "papaya",
  "partitions",
  "prometheus-client",
+ "server_common",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "shard_allocator"
+version = "0.1.0"
+dependencies = [
+ "hwlocality",
+ "nix",
  "server_common",
  "thiserror 2.0.18",
  "tracing",

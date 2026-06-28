@@ -43,7 +43,6 @@ mod messages_batch_mut;
 mod messages_batch_set;
 mod segment_storage;
 pub mod send_messages2;
-pub mod shard_allocator;
 pub mod sharding;
 
 pub use bootstrap::create_directories;
