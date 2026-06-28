@@ -18,9 +18,16 @@
 //! HTTP request body builders for each INSERT format.
 //!
 //! Each function accepts a slice of [`ConsumedMessage`]s and returns the raw
-//! bytes that will be sent to ClickHouse. Payloads of the wrong type for the
-//! chosen format are skipped with a warning rather than erroring, so a mixed
-//! batch never causes a complete failure.
+//! bytes that will be sent to ClickHouse. A payload whose type does not match
+//! the chosen format is always skipped with a warning, never an error.
+//!
+//! The JSON and string builders can only skip, so a mixed batch never fails as
+//! a whole. The RowBinary builder is different: turning a row into binary can
+//! fail on its own (a value that does not fit the table column), and it writes
+//! each row straight into the shared output buffer. A failure halfway through a
+//! row would leave broken bytes that ClickHouse rejects anyway, so there is
+//! nothing safe to skip to. RowBinary therefore fails the whole batch on the
+//! first bad row instead. See the README "Reliability" section.
 
 use crate::StringFormat;
 use crate::schema::Column;
@@ -55,6 +62,11 @@ pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
 
 /// Build a RowBinaryWithDefaults body.
 /// Each `Payload::Json` message is serialised to binary using the table schema.
+///
+/// Returns `Err` on the first row that fails to serialise. Unlike the JSON and
+/// string builders this cannot skip the bad row: rows are written directly into
+/// the shared buffer, so a partial row would corrupt every following row. The
+/// whole batch is rejected so the caller can retry or drop it as a unit.
 pub(crate) fn build_row_binary_body(
     messages: &[ConsumedMessage],
     schema: &[Column],

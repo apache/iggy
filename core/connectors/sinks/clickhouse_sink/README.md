@@ -170,6 +170,14 @@ The connector retries failed inserts up to `max_retries` times with a fixed dela
 
 On shutdown the connector logs the total number of messages processed.
 
+### Bad rows in a batch
+
+A message whose payload type does not match the chosen format (for example a text payload in JSON mode) is always skipped with a warning. The rest of the batch is still sent.
+
+The `rowbinary` format has one extra case. It turns each row into binary and writes it straight into the batch buffer, so a row that cannot be converted (a value that does not fit the target column) cannot be skipped cleanly — a half-written row would corrupt the rows after it. In that case the **whole batch fails** on the first bad row and is retried as a unit per the rules above.
+
+If a single malformed row keeps failing, every retry of that batch will fail too. Fix or remove the bad message at the source, or switch to the `json` / `string` format, which skip bad rows instead of failing the batch.
+
 ### Delivery semantics: at-least-once
 
 This connector provides **at-least-once** delivery — not exactly-once. Retries resend the full batch body without an `insert_deduplication_token`, so if the server applied a batch but the acknowledgement was lost in transit (network drop, timeout), the retry will insert the same rows again.
