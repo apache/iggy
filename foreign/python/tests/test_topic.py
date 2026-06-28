@@ -495,25 +495,18 @@ class TestCreateTopic:
             )
 
     @pytest.mark.asyncio
-    async def test_create_topic_before_connect_fails(self, unique_name):
-        """Test create_topic requires an established connection."""
+    async def test_create_topic_requires_connection_and_auth(self, unique_name):
+        """Test create_topic fails both before connecting and before logging in."""
         host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+        wait_for_server(host, port)
 
+        client = IggyClient(f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
             )
 
-    @pytest.mark.asyncio
-    async def test_create_topic_before_login_fails(self, unique_name):
-        """Test create_topic requires authentication."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
-
-        client = IggyClient(f"{host}:{port}")
         await client.connect()
-
         with pytest.raises(RuntimeError):
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
@@ -573,23 +566,16 @@ class TestGetTopic:
         assert topic is None
 
     @pytest.mark.asyncio
-    async def test_get_topic_before_connect_fails(self, unique_name):
-        """Test get_topic requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
-
-        with pytest.raises(RuntimeError):
-            await client.get_topic(unique_name(), unique_name())
-
-    @pytest.mark.asyncio
-    async def test_get_topic_before_login_fails(self, unique_name):
-        """Test get_topic requires authentication."""
+    async def test_get_topic_requires_connection_and_auth(self, unique_name):
+        """Test get_topic fails both before connecting and before logging in."""
         host, port = get_server_config()
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.get_topic(unique_name(), unique_name())
 
+        await client.connect()
         with pytest.raises(RuntimeError):
             await client.get_topic(unique_name(), unique_name())
 
