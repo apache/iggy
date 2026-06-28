@@ -24,8 +24,8 @@ from apache_iggy import IggyClient, SendMessage
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
 
-class TestTopicOperations:
-    """Test topic creation, retrieval, and management."""
+class TestCreateTopic:
+    """Test topic creation via create_topic."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -110,30 +110,6 @@ class TestTopicOperations:
             )
 
     @pytest.mark.asyncio
-    async def test_get_topic_by_name_and_id(self, iggy_client: IggyClient, unique_name):
-        """Test repeated topic lookup works by both name and numeric id."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        topic_by_name = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic_by_name is not None
-
-        topic_by_name_again = await iggy_client.get_topic(stream_name, topic_name)
-        assert topic_by_name_again is not None
-        assert topic_by_name_again.id == topic_by_name.id
-        assert topic_by_name_again.name == topic_by_name.name
-
-        topic_by_id = await iggy_client.get_topic(stream_name, topic_by_name.id)
-        assert topic_by_id is not None
-        assert topic_by_id.id == topic_by_name.id
-        assert topic_by_id.name == topic_by_name.name
-
-    @pytest.mark.asyncio
     async def test_create_and_get_topic_with_numeric_stream_id(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -176,31 +152,6 @@ class TestTopicOperations:
             )
 
         assert "already exists" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_get_nonexistent_topic(self, iggy_client: IggyClient, unique_name):
-        """Test getting a non-existent topic by name or numeric id."""
-        stream_name = unique_name()
-        nonexistent_topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-
-        topic_by_name = await iggy_client.get_topic(stream_name, nonexistent_topic_name)
-        assert topic_by_name is None
-
-        topic_by_id = await iggy_client.get_topic(stream_name, 999999)
-        assert topic_by_id is None
-
-    @pytest.mark.asyncio
-    async def test_get_topic_in_nonexistent_stream(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test getting a topic from a non-existent stream returns no topic."""
-        nonexistent_stream = unique_name()
-        topic_name = unique_name()
-
-        topic = await iggy_client.get_topic(nonexistent_stream, topic_name)
-        assert topic is None
 
     @pytest.mark.asyncio
     async def test_topic_names_can_repeat_across_different_streams(
@@ -544,27 +495,6 @@ class TestTopicOperations:
             )
 
     @pytest.mark.asyncio
-    async def test_get_topic_before_connect_fails(self, unique_name):
-        """Test get_topic requires an established connection."""
-        host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
-
-        with pytest.raises(RuntimeError):
-            await client.get_topic(unique_name(), unique_name())
-
-    @pytest.mark.asyncio
-    async def test_get_topic_before_login_fails(self, unique_name):
-        """Test get_topic requires authentication."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
-
-        client = IggyClient(f"{host}:{port}")
-        await client.connect()
-
-        with pytest.raises(RuntimeError):
-            await client.get_topic(unique_name(), unique_name())
-
-    @pytest.mark.asyncio
     async def test_create_topic_before_connect_fails(self, unique_name):
         """Test create_topic requires an established connection."""
         host, port = get_server_config()
@@ -588,6 +518,80 @@ class TestTopicOperations:
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
             )
+
+
+class TestGetTopic:
+    """Test topic retrieval via get_topic."""
+
+    @pytest.mark.asyncio
+    async def test_get_topic_by_name_and_id(self, iggy_client: IggyClient, unique_name):
+        """Test repeated topic lookup works by both name and numeric id."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        topic_by_name = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic_by_name is not None
+
+        topic_by_name_again = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic_by_name_again is not None
+        assert topic_by_name_again.id == topic_by_name.id
+        assert topic_by_name_again.name == topic_by_name.name
+
+        topic_by_id = await iggy_client.get_topic(stream_name, topic_by_name.id)
+        assert topic_by_id is not None
+        assert topic_by_id.id == topic_by_name.id
+        assert topic_by_id.name == topic_by_name.name
+
+    @pytest.mark.asyncio
+    async def test_get_nonexistent_topic(self, iggy_client: IggyClient, unique_name):
+        """Test getting a non-existent topic by name or numeric id."""
+        stream_name = unique_name()
+        nonexistent_topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+
+        topic_by_name = await iggy_client.get_topic(stream_name, nonexistent_topic_name)
+        assert topic_by_name is None
+
+        topic_by_id = await iggy_client.get_topic(stream_name, 999999)
+        assert topic_by_id is None
+
+    @pytest.mark.asyncio
+    async def test_get_topic_in_nonexistent_stream(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test getting a topic from a non-existent stream returns no topic."""
+        nonexistent_stream = unique_name()
+        topic_name = unique_name()
+
+        topic = await iggy_client.get_topic(nonexistent_stream, topic_name)
+        assert topic is None
+
+    @pytest.mark.asyncio
+    async def test_get_topic_before_connect_fails(self, unique_name):
+        """Test get_topic requires an established connection."""
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+
+        with pytest.raises(RuntimeError):
+            await client.get_topic(unique_name(), unique_name())
+
+    @pytest.mark.asyncio
+    async def test_get_topic_before_login_fails(self, unique_name):
+        """Test get_topic requires authentication."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+
+        with pytest.raises(RuntimeError):
+            await client.get_topic(unique_name(), unique_name())
 
 
 class TestGetTopics:
