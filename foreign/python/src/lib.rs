@@ -17,6 +17,7 @@
 
 pub mod client;
 mod consumer;
+mod consumer_group;
 mod identifier;
 mod receive_message;
 mod send_message;
@@ -25,6 +26,7 @@ mod topic;
 
 use client::IggyClient;
 use consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceiveMessageIterator};
+use consumer_group::{ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;
@@ -40,6 +42,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
+    m.add_class::<ConsumerGroup>()?;
+    m.add_class::<ConsumerGroupDetails>()?;
+    m.add_class::<ConsumerGroupMember>()?;
     m.add_class::<PollingStrategy>()?;
     m.add_class::<IggyConsumer>()?;
     m.add_class::<AutoCommit>()?;
