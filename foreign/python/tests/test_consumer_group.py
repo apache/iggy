@@ -38,6 +38,145 @@ class TestConsumerGroup:
     """Test consumer groups."""
 
     @pytest.mark.asyncio
+    async def test_create_and_get_consumer_group(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test consumer group creation and retrieval."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=2,
+        )
+        await iggy_client.create_consumer_group(
+            stream_name,
+            topic_name,
+            group_name,
+        )
+
+        group_by_name = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            group_name,
+        )
+        assert group_by_name is not None
+        assert group_by_name.name == group_name
+        assert group_by_name.partitions_count == 2
+        assert group_by_name.members == []
+
+    @pytest.mark.asyncio
+    async def test_get_consumer_group_by_name_and_id(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test repeated consumer group lookup works by both name and numeric id."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+        await iggy_client.create_consumer_group(
+            stream_name,
+            topic_name,
+            group_name,
+        )
+
+        group_by_name = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            group_name,
+        )
+        assert group_by_name is not None
+
+        group_by_name_again = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            group_name,
+        )
+        assert group_by_name_again is not None
+        assert group_by_name_again.id == group_by_name.id
+        assert group_by_name_again.name == group_by_name.name
+
+        group_by_id = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            group_by_name.id,
+        )
+        assert group_by_id is not None
+        assert group_by_id.id == group_by_name.id
+        assert group_by_id.name == group_name
+
+    @pytest.mark.asyncio
+    async def test_get_nonexistent_consumer_group(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test getting a non-existent consumer group by name or numeric id."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        group_by_name = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            unique_name(),
+        )
+        assert group_by_name is None
+
+        group_by_id = await iggy_client.get_consumer_group(
+            stream_name,
+            topic_name,
+            999999,
+        )
+        assert group_by_id is None
+
+    @pytest.mark.asyncio
+    async def test_get_consumer_groups_lists_topic_groups(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test listing consumer groups returns groups for the requested topic."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        first_group_name = unique_name()
+        second_group_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+        await iggy_client.create_consumer_group(
+            stream_name,
+            topic_name,
+            first_group_name,
+        )
+        await iggy_client.create_consumer_group(
+            stream_name,
+            topic_name,
+            second_group_name,
+        )
+
+        groups = await iggy_client.get_consumer_groups(stream_name, topic_name)
+
+        group_names = {group.name for group in groups}
+        assert len(groups) == 2
+        assert group_names == {first_group_name, second_group_name}
+
+    @pytest.mark.asyncio
     async def test_consumer_group_metadata(self, iggy_client: IggyClient, unique_name):
         """Test that metadata information can be read about the consumer group."""
         consumer_name = unique_name()

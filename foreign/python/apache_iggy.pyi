@@ -28,6 +28,9 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "ConsumerGroup",
+    "ConsumerGroupDetails",
+    "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
     "PollingStrategy",
@@ -231,6 +234,39 @@ class AutoCommitWhen:
     ...
 
 @typing.final
+class ConsumerGroup:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+
+@typing.final
+class ConsumerGroupDetails:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+    @property
+    def members(self) -> builtins.list[ConsumerGroupMember]: ...
+
+@typing.final
+class ConsumerGroupMember:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def partitions(self) -> builtins.list[builtins.int]: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -301,6 +337,35 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns Option of topic details or a PyRuntimeError on failure.
+        """
+    def create_consumer_group(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        name: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Creates a new consumer group for the given stream and topic.
+        Returns Ok(()) on successful consumer group creation or a PyRuntimeError on failure.
+        """
+    def get_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
+        r"""
+        Gets consumer group by stream, topic, and group id.
+        Returns Option of consumer group details or a PyRuntimeError on failure.
+        """
+    def get_consumer_groups(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
+        r"""
+        Gets consumer groups by stream and topic.
+        Returns a list of consumer groups or a PyRuntimeError on failure.
         """
     def send_messages(
         self,
