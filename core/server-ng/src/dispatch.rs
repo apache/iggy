@@ -27,6 +27,9 @@ use crate::auth::{
     verify_login_credentials, verify_pat_credentials,
 };
 use crate::bootstrap::{ServerNgShard, ServerNgShardHandle};
+use crate::consumer_group::{
+    maybe_rewrite_consumer_group_request, maybe_rewrite_consumer_offset_request,
+};
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
@@ -42,23 +45,28 @@ use bytes::Bytes;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
+use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
-use iggy_binary_protocol::{GenericHeader, Operation, RequestHeader, WireDecode, WireEncode};
+use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+use iggy_binary_protocol::{
+    GenericHeader, KIND_CONSUMER_GROUP, Operation, RequestHeader, WireDecode, WireEncode,
+};
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::MetadataSubmitError;
-use partitions::{Partition, PollingArgs, PollingConsumer};
+use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
+use partitions::{PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -133,62 +141,91 @@ pub(crate) fn make_partition_read_handler(
     shard_handle: &ServerNgShardHandle,
 ) -> PartitionReadHandler {
     let shard_handle = Rc::clone(shard_handle);
+    // Runs synchronously on the shard pump (see `process_lifecycle` ->
+    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
+    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
+    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
+    // poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
-        let shard_handle = Rc::clone(&shard_handle);
-        // The poll awaits journal reads; run it as a task so the shard pump
-        // is not blocked. Same single-threaded-runtime discipline as the
-        // pump's own `on_request` path: the partition reference is resolved
-        // after the tombstone check and the read races only reconciler
-        // removal, which tombstones the namespace first.
-        compio::runtime::spawn(async move {
-            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-                return;
-            };
-            let partitions = shard.plane.partitions();
-            if partitions.is_tombstoned(&namespace) {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            }
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            };
-            let result = match read {
-                PartitionRead::Poll { consumer, args } => {
-                    let poll_started = std::time::Instant::now();
-                    let poll_result = partition.poll_messages(consumer, args).await;
-                    let elapsed = poll_started.elapsed();
-                    if elapsed > std::time::Duration::from_secs(1) {
-                        warn!(
-                            namespace_raw = namespace.inner(),
-                            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                            "slow partition poll; gather side may have timed out"
-                        );
+        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+            return;
+        };
+        let partitions = shard.plane.partitions();
+        match read {
+            PartitionRead::Poll { consumer, args } => {
+                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
+                    None => {
+                        let _ = reply.try_send(PartitionReadReply::NotFound);
                     }
-                    match poll_result {
-                        Ok((fragments, _last_matching_offset)) => PartitionReadReply::Poll {
+                    Some(plan) if plan.needs_off_pump_io() => {
+                        spawn_poll_io(namespace, plan, reply);
+                    }
+                    Some(plan) => {
+                        let (fragments, current_offset) = plan.execute_resident();
+                        let _ = reply.try_send(PartitionReadReply::Poll {
                             fragments,
-                            current_offset: partition.offsets().commit_offset,
-                        },
-                        Err(error) => {
-                            warn!(
-                                namespace_raw = namespace.inner(),
-                                error = %error,
-                                "partition poll failed"
-                            );
-                            PartitionReadReply::NotFound
-                        }
+                            current_offset,
+                        });
                     }
                 }
-                PartitionRead::ConsumerOffset { consumer } => PartitionReadReply::ConsumerOffset {
-                    stored: partition.get_consumer_offset(consumer),
-                    current_offset: partition.offsets().commit_offset,
-                },
-            };
-            let _ = reply.try_send(result);
-        })
-        .detach();
+            }
+            PartitionRead::ConsumerOffset { consumer } => {
+                let result = match partitions.consumer_offset_read(&namespace, consumer) {
+                    Some((stored, current_offset)) => PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::GroupOffsetState { group_id } => {
+                let result = match partitions.group_offset_state(&namespace, group_id) {
+                    Some((last_polled, committed)) => PartitionReadReply::GroupOffsetState {
+                        last_polled,
+                        committed,
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ClearGroupLastPolled { group_id } => {
+                let result = match partitions.clear_group_last_polled(&namespace, group_id) {
+                    Some(()) => PartitionReadReply::Ack,
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+        }
     })
+}
+
+/// Spawn the off-pump leg of a partition poll: disk read + auto-commit
+/// persist/apply on the OWNED plan (disk descriptors, resident-tail `Frozen`
+/// clones, `Arc` offset map), then send the reply. Holds no partition
+/// reference, so it is sound concurrently with the pump's `&mut` writes.
+fn spawn_poll_io(
+    namespace: IggyNamespace,
+    plan: PollPlan,
+    reply: shard::Sender<PartitionReadReply>,
+) {
+    compio::runtime::spawn(async move {
+        let poll_started = std::time::Instant::now();
+        let (fragments, current_offset) = plan.execute().await;
+        let elapsed = poll_started.elapsed();
+        if elapsed > std::time::Duration::from_secs(1) {
+            warn!(
+                namespace_raw = namespace.inner(),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "slow partition poll; gather side may have timed out"
+            );
+        }
+        let _ = reply.try_send(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        });
+    })
+    .detach();
 }
 
 pub(crate) fn make_deferred_replica_message_handler(
@@ -304,6 +341,28 @@ pub(crate) fn make_metadata_submit_handler(
                     };
                     let _ = reply.try_send(committed);
                 }
+                shard::MetadataSubmit::CompleteRevocation {
+                    stream_id,
+                    topic_id,
+                    group_id,
+                    source_client_id,
+                    partition_id,
+                    reply,
+                } => {
+                    let commit = shard
+                        .plane
+                        .metadata()
+                        .submit_complete_revocation_in_process(
+                            stream_id,
+                            topic_id,
+                            group_id,
+                            source_client_id,
+                            partition_id,
+                        )
+                        .await
+                        .ok();
+                    let _ = reply.try_send(commit);
+                }
             }
         })
         .detach();
@@ -390,6 +449,12 @@ async fn handle_client_request(
 
     ensure_transport_connection(shard, sessions, transport_client_id);
 
+    // Any request is liveness proof, not just PING: an idle-but-active client
+    // (e.g. an admin issuing reads between long sleeps) must not be evicted by
+    // the heartbeat verifier. A genuinely dead connection sends nothing, so the
+    // intended stale-client eviction still fires. No-ops for an unbound client.
+    sessions.borrow_mut().record_heartbeat(transport_client_id);
+
     let header = *request.header();
     if header.operation == Operation::NonReplicated {
         // Auth bypass guard: only `PING` and `GET_CLUSTER_METADATA` are
@@ -465,10 +530,15 @@ async fn handle_client_request(
     // TRANSPORT id (home-shard routing bits), not the VSR session id --
     // partition ops are sessionless ("session lifecycle is metadata-only").
     if header.operation.is_partition() {
+        // The consumer-group offset fence keys on the bound VSR client id (the
+        // member id), not the transport id stamped into the partition-op
+        // header. `bound` is Some here (unbound transports returned above).
+        let vsr_client_id = bound.map_or(0, |(client_id, _)| client_id);
         let namespace = match resolve_partition_request_namespace(
             shard,
             header.operation,
             request_body(&request),
+            vsr_client_id,
         ) {
             Ok(namespace) => namespace,
             Err(error) => {
@@ -503,6 +573,24 @@ async fn handle_client_request(
             send_empty_partition_reply(shard, transport_client_id, &header).await;
             return;
         }
+        // A group consumer-offset op carries the group NAME on the wire; the
+        // partition plane keys the offset by the group's monotonic id (the same
+        // key the poll path auto-commits under and the read path resolves), so
+        // rewrite the consumer id before replication -- the apply layer has no
+        // metadata access to resolve it.
+        let request = match maybe_rewrite_consumer_offset_request(shard, request) {
+            Ok(rewritten) => rewritten,
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "failed to rewrite consumer-offset request; replying empty"
+                );
+                send_empty_partition_reply(shard, transport_client_id, &header).await;
+                return;
+            }
+        };
         let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
             *new_header = header;
             new_header.namespace = namespace;
@@ -553,6 +641,20 @@ async fn handle_client_request(
                 error = %error,
                 operation = ?header.operation,
                 "dropping user request with invalid password payload"
+            );
+            return;
+        }
+    };
+    // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
+    // partition count for Join) before replication; see `crate::consumer_group`.
+    let request = match maybe_rewrite_consumer_group_request(shard, request).await {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "dropping consumer-group request with invalid payload"
             );
             return;
         }
@@ -615,6 +717,9 @@ async fn handle_non_replicated_request(
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
         PING_CODE => {
+            // A ping is the client's liveness proof; reset its staleness clock
+            // so the heartbeat verifier doesn't evict an active connection.
+            sessions.borrow_mut().record_heartbeat(transport_client_id);
             let commit = current_metadata_commit(shard);
             let reply = build_empty_reply(
                 request.header(),
@@ -639,7 +744,7 @@ async fn handle_non_replicated_request(
             // sourced from this shard's `SessionManager` (not `IggyMetadata`),
             // so it is built here rather than in
             // `build_non_replicated_response`.
-            let response = build_get_me_response(sessions, transport_client_id);
+            let response = build_get_me_response(shard, sessions, transport_client_id);
             send_non_replicated_bytes(
                 shard,
                 &request,
@@ -654,7 +759,10 @@ async fn handle_non_replicated_request(
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
             let response = GetClientsResponse {
-                clients: infos.iter().map(connected_client_to_response).collect(),
+                clients: infos
+                    .iter()
+                    .map(|info| connected_client_to_response(shard, info))
+                    .collect(),
             };
             send_non_replicated_bytes(
                 shard,
@@ -677,9 +785,26 @@ async fn handle_non_replicated_request(
             let found = target.and_then(|id| infos.iter().find(|info| info.client_id as u32 == id));
             // The SDK decodes an empty body as `None` (client not found).
             let bytes = found.map_or_else(Bytes::new, |info| {
+                let consumer_groups = info.vsr_client_id.map_or_else(Vec::new, |vsr_client_id| {
+                    shard
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .consumer_group_memberships(vsr_client_id)
+                        .into_iter()
+                        .map(
+                            |(stream_id, topic_id, group_id)| ConsumerGroupInfoResponse {
+                                stream_id,
+                                topic_id,
+                                group_id,
+                            },
+                        )
+                        .collect()
+                });
                 ClientDetailsResponse {
-                    client: connected_client_to_response(info),
-                    consumer_groups: Vec::new(),
+                    client: connected_client_to_response(shard, info),
+                    consumer_groups,
                 }
                 .to_bytes()
             });
@@ -691,6 +816,9 @@ async fn handle_non_replicated_request(
         }
         GET_CONSUMER_OFFSET_CODE => {
             handle_get_consumer_offset(shard, transport_client_id, &request).await;
+        }
+        SYNC_CONSUMER_GROUP_CODE => {
+            handle_sync_consumer_group(shard, transport_client_id, &request).await;
         }
         _ => handle_default_non_replicated(shard, transport_client_id, code, &request).await,
     }
@@ -798,6 +926,100 @@ async fn send_unauthenticated_eviction(shard: &Rc<ServerNgShard>, transport_clie
     }
 }
 
+/// Per-shard heartbeat verifier: evict connections that have not pinged within
+/// `1.2 x interval`. Mirrors the legacy `verify_heartbeats` periodic task.
+/// Eviction reuses the disconnect path (drops the client from its consumer
+/// groups + rebalances via the replicated `Logout`) and sends a session-
+/// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
+#[allow(clippy::future_not_send)]
+pub(crate) async fn run_heartbeat_verifier(
+    shard: Rc<ServerNgShard>,
+    sessions: Rc<RefCell<SessionManager>>,
+    interval: std::time::Duration,
+    stop_rx: shard::Receiver<()>,
+) {
+    // Legacy `MAX_THRESHOLD`: a client is stale once it misses ~1.2 intervals.
+    let max_age = interval.mul_f64(1.2);
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        let stale = sessions
+            .borrow()
+            .collect_stale(max_age, std::time::Instant::now());
+        for transport_client_id in stale {
+            // The heartbeat verifier exists to release a dead client's
+            // consumer-group membership (so the group rebalances off it). A
+            // connection that holds no membership has nothing for the eviction
+            // to clean up; reaping it would only drop a still-usable session
+            // (e.g. an idle admin connection that polls between long gaps),
+            // which the legacy server tolerates. The real transport-disconnect
+            // path still reaps it on socket close. So only evict a stale
+            // connection that is actually a group member.
+            let is_group_member = sessions
+                .borrow()
+                .bound_client_id(transport_client_id)
+                .is_some_and(|vsr_client_id| {
+                    !shard
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .consumer_group_memberships(vsr_client_id)
+                        .is_empty()
+                });
+            if is_group_member {
+                evict_stale_client(&shard, &sessions, transport_client_id).await;
+            }
+        }
+        compio::time::sleep(interval).await;
+    }
+}
+
+/// Evict one stale connection: drop its session (releasing consumer-group
+/// membership through a replicated `Logout`) and notify the client with a
+/// session-terminal `Eviction(StaleClient)`.
+#[allow(clippy::future_not_send)]
+async fn evict_stale_client(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) {
+    let bound = sessions.borrow_mut().remove_connection(transport_client_id);
+    if let Some((vsr_client_id, session)) = bound {
+        submit_disconnect_logout(Rc::clone(shard), vsr_client_id, session);
+    }
+    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
+        consensus::EvictionContext {
+            cluster: 0,
+            view: 0,
+            replica: 0,
+        },
+        consensus::EvictionContext::from_consensus,
+    );
+    let eviction = consensus::build_eviction_message(
+        ctx,
+        transport_client_id,
+        iggy_binary_protocol::EvictionReason::StaleClient,
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send stale-client eviction"
+        );
+    } else {
+        warn!(
+            transport_client_id,
+            "evicted stale client (missed heartbeat)"
+        );
+    }
+}
+
 /// Serve `poll_messages`: resolve the partition namespace, run the read on
 /// the owning shard ([`shard::IggyShard::partition_read`]), and re-encode
 /// the stored batches into the legacy wire `PolledMessages` body.
@@ -841,13 +1063,21 @@ async fn handle_poll_messages(
         }
         Err(error) => {
             // A zero-byte body would panic the SDK's `PolledMessages`
-            // decoder; reply the 16-byte empty-poll shape instead.
+            // decoder; reply the 16-byte empty-poll shape instead. A generation
+            // fence (the client's cached assignment is stale after a rebalance)
+            // carries the re-sync sentinel so the SDK re-syncs and retries
+            // rather than treating the empty poll as end-of-partition.
             warn!(
                 transport_client_id,
                 error = %error,
                 "poll_messages request rejected; replying empty poll"
             );
-            empty_polled_messages_body(0)
+            let partition_id = if matches!(error, IggyError::ConsumerGroupPartitionNotOwned(..)) {
+                iggy_common::RESYNC_REQUIRED_PARTITION_SENTINEL
+            } else {
+                0
+            };
+            empty_polled_messages_body(partition_id)
         }
     };
     send_non_replicated_bytes(shard, request, transport_client_id, body, "poll_messages").await;
@@ -889,6 +1119,54 @@ async fn handle_get_consumer_offset(
         transport_client_id,
         body,
         "get_consumer_offset",
+    )
+    .await;
+}
+
+/// Serve `SyncConsumerGroup`: return the requesting member's current partition
+/// assignment + group generation so the client can select partitions locally.
+/// The member is keyed by the connection's bound VSR client id
+/// (`header().client`). An empty body decodes as "no assignment" on the SDK.
+#[allow(clippy::future_not_send)]
+async fn handle_sync_consumer_group(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let body = match SyncConsumerGroupRequest::decode_from(request_body(request)) {
+        Ok(wire) => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_member_assignment(
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.group_id,
+                request.header().client,
+            )
+            .map_or_else(Bytes::new, |(generation, partitions)| {
+                SyncConsumerGroupResponse {
+                    generation,
+                    partitions,
+                }
+                .to_bytes()
+            }),
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "sync_consumer_group request rejected; replying empty"
+            );
+            Bytes::new()
+        }
+    };
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        body,
+        "sync_consumer_group",
     )
     .await;
 }
@@ -980,23 +1258,60 @@ fn empty_polled_messages_body(partition_id: u32) -> Bytes {
 
 type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
 
+#[allow(clippy::cast_possible_truncation)]
 fn decode_poll_request(
     shard: &Rc<ServerNgShard>,
     request: &Message<RequestHeader>,
 ) -> Result<DecodedPollRequest, IggyError> {
     let wire = PollMessagesRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
+    let strategy = polling_strategy_from_wire(&wire.strategy)?;
+    let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
+
+    // Consumer-group poll: the client selects which of its assigned partitions
+    // to read and sends it explicitly. The coordinator FENCES ownership (a stale
+    // client whose partition was reassigned is rejected with
+    // `ConsumerGroupPartitionNotOwned`, prompting a re-sync) and resolves the
+    // group's monotonic id -- the offset key the store rewrite and read path
+    // both use, so `next()` reads back the offset it just committed.
+    if wire.consumer.kind == KIND_CONSUMER_GROUP {
+        let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+        let client_id = request.header().client;
+        let group_id = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_fence(
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.consumer.id,
+                client_id,
+                partition_id,
+                // Poll fence: reject a pending-revoked partition so the source
+                // re-syncs and skips it (it still commits it via the offset fence).
+                true,
+            )
+            .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
+                client_id as u32,
+                partition_id,
+            ))?;
+        let namespace = resolve_partition_namespace(
+            shard,
+            &wire.stream_id,
+            &wire.topic_id,
+            Some(partition_id),
+        )?;
+        #[allow(clippy::cast_possible_truncation)]
+        let consumer = PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize);
+        return Ok((namespace, partition_id, consumer, args));
+    }
+
     let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
-    let strategy = polling_strategy_from_wire(&wire.strategy)?;
-    Ok((
-        namespace,
-        partition_id,
-        consumer,
-        PollingArgs::new(strategy, wire.count, wire.auto_commit),
-    ))
+    Ok((namespace, partition_id, consumer, args))
 }
 
 fn decode_consumer_offset_request(
@@ -1008,7 +1323,22 @@ fn decode_consumer_offset_request(
     let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
-    let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
+    // A group offset is keyed by the group's monotonic id (any client may read
+    // it, member or not), the same key the write path is rewritten to. An
+    // unresolved group (e.g. deleted) has no offset, so the read reports None.
+    let consumer = if wire.consumer.kind == KIND_CONSUMER_GROUP {
+        let group_id = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
+            .ok_or(IggyError::InvalidIdentifier)?;
+        #[allow(clippy::cast_possible_truncation)]
+        PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize)
+    } else {
+        polling_consumer_from_wire(&wire.consumer, partition_id)?
+    };
     Ok((namespace, partition_id, consumer))
 }
 
@@ -1030,7 +1360,7 @@ fn polling_consumer_from_wire(
             consumer_id,
             partition_id as usize,
         )),
-        2 => Ok(PollingConsumer::ConsumerGroup(
+        KIND_CONSUMER_GROUP => Ok(PollingConsumer::ConsumerGroup(
             consumer_id,
             partition_id as usize,
         )),

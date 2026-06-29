@@ -25,17 +25,14 @@ pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod concurrent_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_auto_commit_reconnection_scenario;
-#[cfg(not(feature = "vsr"))]
+// Only consumed by `cg_vsr` (server-ng); legacy `cg.rs` has no equivalent.
+#[cfg(feature = "vsr")]
+pub mod consumer_group_duplicate_name_create_scenario;
 pub mod consumer_group_join_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_new_messages_after_restart_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_offset_cleanup_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod consumer_group_with_single_client_polling_messages_scenario;
 pub mod consumer_timestamp_polling_scenario;
 pub mod create_message_payload;
@@ -69,10 +66,11 @@ pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod snapshot_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod stale_client_consumer_group_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod stream_size_validation_scenario;
+#[cfg(feature = "vsr")]
+pub mod stress_produce_consume_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod system_scenario;
 #[cfg(not(feature = "vsr"))]
@@ -94,7 +92,6 @@ const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
-#[cfg(not(feature = "vsr"))]
 const CONSUMER_GROUP_NAME: &str = "test-consumer-group";
 const USERNAME_1: &str = "user1";
 const USERNAME_2: &str = "user2";
@@ -147,7 +144,6 @@ async fn create_client(harness: &TestHarness) -> IggyClient {
         .expect("Failed to create new client")
 }
 
-#[cfg(not(feature = "vsr"))]
 async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
     client
         .get_consumer_group(
@@ -160,7 +156,6 @@ async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
         .expect("Failed to get consumer group")
 }
 
-#[cfg(not(feature = "vsr"))]
 async fn join_consumer_group(client: &IggyClient) {
     client
         .join_consumer_group(

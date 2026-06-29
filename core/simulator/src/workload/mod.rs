@@ -34,7 +34,8 @@ pub mod shadow;
 
 use std::collections::HashMap;
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{ReplyHeader, RequestHeader, result_code};
+use metadata::stm::result::result_code_recognized;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
@@ -64,10 +65,14 @@ pub struct Workload {
     /// TODO: reap on client disconnect; bounded today by the fixed
     /// `Simulator::new` set.
     in_flight_per_client: HashMap<u128, usize>,
-    /// Debug counter for `sample()` returning `None`. Useful when an
-    /// outcome-first generation lands and divergence in `apply` branches
-    /// could silently shift the PRNG trace.
+    /// Debug counter for `sample()` returning `None` (a targeted outcome whose
+    /// shadow precondition is unmet). Flags PRNG-trace drift during development.
     samples_none: u64,
+    /// Assert the targeted outcome equals the committed one. Sound only for a
+    /// fully serial run (one client, one in-flight slot), where the shadow equals
+    /// committed server state at sample time so the target is always realized.
+    /// Gated on `client_count == 1 && CLIENT_REQUEST_QUEUE_MAX == 1`.
+    strict_outcome_oracle: bool,
 }
 
 impl Workload {
@@ -75,6 +80,11 @@ impl Workload {
     pub fn new(options: WorkloadOptions) -> Self {
         let prng = Xoshiro256Plus::seed_from_u64(options.seed);
         let shadow = Shadow::new(options.namespaces.clone(), ids::IdPermutation::Identity);
+        // Both halves of the soundness precondition (see the field doc). Coupling
+        // to the queue max disarms strict equality if it is raised, rather than
+        // letting the assert fire on a legitimately raced outcome (a 2nd in-flight
+        // request sampled against the shadow before the 1st commits).
+        let strict_outcome_oracle = options.client_count == 1 && CLIENT_REQUEST_QUEUE_MAX == 1;
         Self {
             prng,
             auditor: ServerAuditor::new(),
@@ -82,6 +92,7 @@ impl Workload {
             options,
             in_flight_per_client: HashMap::new(),
             samples_none: 0,
+            strict_outcome_oracle,
         }
     }
 
@@ -99,13 +110,10 @@ impl Workload {
     /// replica index, or `None` if the client has no idle slot or
     /// `ops::sample` could not synthesize an input.
     ///
-    /// Note: `pick_action` and `pick_target_replica` advance the PRNG
-    /// even when `sample` returns `None` (e.g. an op needs a live stream
-    /// but the shadow is empty). Today this is harmless because every
-    /// op classifies as `Outcome::Success`. Once outcome-first generation
-    /// lands, a divergence in the Success/Failure split inside `sample`
-    /// could shift the PRNG trace; the `samples_none` counter exists to
-    /// flag that case during development.
+    /// Note: `pick_action`/`pick_target_replica`/`pick_outcome` draw from the
+    /// PRNG before `sample` runs, so they advance the trace even when `sample`
+    /// returns `None` (a targeted outcome whose precondition is unmet, e.g. a
+    /// duplicate-name target with an empty shadow). `samples_none` counts these.
     pub fn build_request(&mut self, client: &SimClient) -> Option<(u8, Message<RequestHeader>)> {
         if !self.client_idle(client.client_id()) {
             return None;
@@ -113,10 +121,15 @@ impl Workload {
 
         let action = self.pick_action();
         let target = self.pick_target_replica();
+        let outcome_id = self.pick_outcome(action);
 
-        let Some((input, outcome)) =
-            ops::sample(action, &mut self.shadow, &mut self.prng, &self.options)
-        else {
+        let Some((input, outcome)) = ops::sample(
+            action,
+            &mut self.shadow,
+            &mut self.prng,
+            &self.options,
+            outcome_id,
+        ) else {
             self.samples_none += 1;
             return None;
         };
@@ -148,6 +161,10 @@ impl Workload {
     /// Returns an empty `Vec` for unknown replies (duplicate or stale
     /// at-least-once) and for `OnReply::NsMismatch`. See
     /// [`auditor::ServerAuditor::on_reply`] for the per-variant contract.
+    ///
+    /// # Panics
+    /// If a metadata reply carries a committed result code outside the op's
+    /// declared result enum (a server bug).
     #[must_use = "returned SimCommands must be applied; call apply_sim_commands or use Workload::run"]
     pub fn on_reply(&mut self, reply: &Message<ReplyHeader>) -> Vec<SimCommand> {
         let header = reply.header();
@@ -162,25 +179,80 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
-        // v2.4: every op currently classifies as `Outcome::Success`
-        // because server-ng hardcodes `ReplyHeader.context = 0`. The
-        // `debug_assert_eq!` locks the contract from day one: once
-        // outcomes split, any classify_reply / sample mismatch will
-        // panic in debug builds before silently corrupting the audit.
-        let classified = ops::classify_reply(entry.action, header);
-        debug_assert_eq!(
-            classified, entry.outcome,
-            "classify_reply produced a different outcome than sample expected: \
-             action={:?} classified={classified:?} expected={:?}",
-            entry.action, entry.outcome,
-        );
+        // Decode the committed result code. Metadata replies carry a TB-style
+        // result section (see `ApplyReply::to_reply_body`); partition-plane
+        // replies do not, hence the `is_metadata` gate.
+        let committed_code = if header.operation.is_metadata() {
+            // `size` spans header + body, but `Message::try_from` never gates
+            // `size >= size_of::<ReplyHeader>()`, so a short `size` reaches here.
+            // Assert it (loud server-bug diagnostic) before the slice below
+            // panics with start > end.
+            assert!(
+                header.size as usize >= size_of::<ReplyHeader>(),
+                "metadata op {:?} reply size {} below header size {} (client={}, request={})",
+                entry.action,
+                header.size,
+                size_of::<ReplyHeader>(),
+                header.client,
+                header.request,
+            );
+            let body = &reply.as_slice()[size_of::<ReplyHeader>()..header.size as usize];
+            // A metadata reply always carries a well-formed result section, so
+            // `None` is a truncated/corrupt one: a server bug, not a silent Ok
+            // (the rejection->success flip "classify never guesses" forbids).
+            let Some(code) = result_code(body) else {
+                panic!(
+                    "metadata op {:?} reply has a truncated or corrupt result section \
+                     (client={}, request={})",
+                    entry.action, header.client, header.request,
+                );
+            };
+            // The state machine only commits codes its own result enum declares,
+            // so an unrecognized one is a server bug (a race still yields a
+            // declared code). TB's "classify never guesses".
+            assert!(
+                result_code_recognized(header.operation, code),
+                "metadata op {:?} returned unrecognized result code {code} \
+                 (client={}, request={})",
+                entry.action,
+                header.client,
+                header.request,
+            );
+            code
+        } else {
+            0
+        };
 
-        let effect = ops::predicted_effect(&entry.input, &entry.outcome);
+        // Classify the *actual* committed outcome from the wire result code.
+        let classified = ops::classify_reply(entry.action, committed_code);
+
+        // Equality oracle: the targeted outcome must match what committed. Sound
+        // only for a fully serial run (see `strict_outcome_oracle`); with several
+        // clients a concurrent commit can flip it (a targeted duplicate races a
+        // delete), so there the recognized-code check above is the only oracle.
+        if self.strict_outcome_oracle {
+            assert_eq!(
+                classified, entry.outcome,
+                "outcome-first oracle: targeted {:?} but committed {classified:?} \
+                 (action={:?}, code={committed_code}, client={}, request={})",
+                entry.outcome, entry.action, header.client, header.request,
+            );
+        }
+
+        // Effect-follows-actual: drive the shadow off the committed outcome, never
+        // the targeted one. Success mutates; a nonzero code is a committed no-op
+        // whose `predicted_effect` is `Effect::None`. Keeps the shadow correct
+        // under at-least-once re-execution and races.
+        let effect = ops::predicted_effect(&entry.input, &classified);
+        if committed_code != 0 {
+            self.auditor.note_committed_rejection();
+        }
         let result = self.shadow.apply(effect);
 
-        // Skip note_committed on no-op apply (e.g. AddTopic after a
-        // concurrent RemoveStream) so commits_per_action tracks shadow.
-        if result.applied {
+        // Count a commit only on a success that mutated the shadow, so
+        // `commits_per_action` tracks net shadow state (rejections and no-op
+        // applies, e.g. AddTopic after a concurrent RemoveStream, are excluded).
+        if committed_code == 0 && result.applied {
             self.auditor.note_committed(entry.action);
         }
 
@@ -233,6 +305,21 @@ impl Workload {
             self.prng.random_range(1..self.options.replica_count)
         } else {
             0
+        }
+    }
+
+    /// Pick which declared outcome to target for `action`. Single-outcome ops
+    /// (the partition/offset plane: `SendMessages`, `StoreConsumerOffset`, ...)
+    /// return 0; multi-outcome ops (most metadata ops) draw one, advancing the
+    /// PRNG. Adding an outcome to a single-outcome op, or a weight change to which
+    /// ops are sampled, shifts the draw order and reply trace - see the locked
+    /// baseline in `workload_replay_is_deterministic`.
+    fn pick_outcome(&mut self, action: Action) -> usize {
+        let count = ops::outcome_count(action);
+        if count <= 1 {
+            0
+        } else {
+            self.prng.random_range(0..count)
         }
     }
 }

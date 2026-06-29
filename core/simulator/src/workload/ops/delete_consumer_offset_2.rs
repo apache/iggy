@@ -17,7 +17,7 @@
 
 //! `DeleteConsumerOffset2` op. Namespace-routed with `AckLevel`.
 
-use iggy_binary_protocol::{AckLevel, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{AckLevel, RequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -76,7 +76,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
 }
 
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
+pub const fn classify_reply(_code: u32) -> Outcome {
     Outcome::Success
 }
 

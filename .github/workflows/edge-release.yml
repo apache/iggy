@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
 
       - name: Get server version
         id: meta
@@ -108,6 +108,7 @@ jobs:
             - `iggy_connector_postgres_source`
             - `iggy_connector_quickwit_sink`
             - `iggy_connector_random_source`
+            - `iggy_connector_s3_sink`
             - `iggy_connector_stdout_sink`
 
             ## Downloads

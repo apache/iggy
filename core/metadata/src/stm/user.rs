@@ -17,6 +17,10 @@
 
 use crate::permissioner::Permissioner;
 use crate::stm::StateHandler;
+use crate::stm::result::{
+    ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
+    DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
+};
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
@@ -325,10 +329,10 @@ impl WireDecode for DeletePersonalAccessTokenRequest {
 impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
-            return Bytes::new();
+            return ApplyReply::err(CreateUserResult::UserAlreadyExists);
         }
 
         let status = UserStatus::from_code(self.status).unwrap_or_default();
@@ -358,29 +362,31 @@ impl StateHandler for CreateUserRequest {
 
         // Reply body: the SDK `create_user` decodes a `UserDetailsResponse`.
         // Serialization local to this state machine.
-        UserDetailsResponse {
-            user: UserResponse {
-                id: id as u32,
-                created_at: timestamp.as_micros(),
-                status: self.status,
-                username: self.username.clone(),
-            },
-            permissions: self.permissions.clone(),
-        }
-        .to_bytes()
+        ApplyReply::ok(
+            UserDetailsResponse {
+                user: UserResponse {
+                    id: id as u32,
+                    created_at: timestamp.as_micros(),
+                    status: self.status,
+                    username: self.username.clone(),
+                },
+                permissions: self.permissions.clone(),
+            }
+            .to_bytes(),
+        )
     }
 }
 
 impl StateHandler for UpdateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
 
         let Some(user) = state.items.get_mut(user_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdateUserResult::UserNotFound);
         };
 
         if let Some(new_username) = &self.username {
@@ -388,7 +394,7 @@ impl StateHandler for UpdateUserRequest {
             if let Some(&existing_id) = state.index.get(&new_username_arc)
                 && existing_id != user_id as UserId
             {
-                return Bytes::new();
+                return ApplyReply::err(UpdateUserResult::UsernameAlreadyExists);
             }
 
             state.index.remove(&user.username);
@@ -401,16 +407,16 @@ impl StateHandler for UpdateUserRequest {
         {
             user.status = new_status;
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for DeleteUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return Bytes::new();
+            return ApplyReply::err(DeleteUserResult::UserNotFound);
         };
 
         if let Some(user) = state.items.get(user_id) {
@@ -430,29 +436,29 @@ impl StateHandler for DeleteUserRequest {
                 }
             }
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for ChangePasswordRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return Bytes::new();
+            return ApplyReply::err(ChangePasswordResult::UserNotFound);
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
             user.password_hash = Arc::from(self.new_password.as_str());
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for UpdatePermissionsRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return Bytes::new();
+            return ApplyReply::err(UpdatePermissionsResult::UserNotFound);
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
@@ -461,7 +467,7 @@ impl StateHandler for UpdatePermissionsRequest {
                 .as_ref()
                 .map(|p| Arc::new(Permissions::from(p.clone())));
         }
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -472,21 +478,21 @@ impl StateHandler for UpdatePermissionsRequest {
 // `maybe_rewrite_pat_request`.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {
         let expiry = IggyExpiry::from(self.expiry);
         let user_tokens = state
             .personal_access_tokens
             .entry(self.user_id)
             .or_default();
         if user_tokens.contains_key(self.name.as_str()) {
-            return Bytes::new();
+            return ApplyReply::err(CreatePersonalAccessTokenResult::AlreadyExists);
         }
 
         let expiry_at = PersonalAccessToken::calculate_expiry_at(timestamp, expiry);
         if let Some(expiry_at) = expiry_at
             && expiry_at.as_micros() <= timestamp.as_micros()
         {
-            return Bytes::new();
+            return ApplyReply::err(CreatePersonalAccessTokenResult::InvalidExpiry);
         }
 
         // Replicas store the primary's hash directly via `raw`. Calling
@@ -513,32 +519,37 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
         state
             .personal_access_token_index
             .insert(token_hash, (self.user_id, name));
-        Bytes::new()
+        ApplyReply::ok(Bytes::new())
     }
 }
 
 impl StateHandler for DeletePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
-        if let Some(user_tokens) = state.personal_access_tokens.get_mut(&self.user_id) {
-            let name_arc: Arc<str> = Arc::from(self.name.as_str());
-            if self.only_if_expired {
-                // Cleaner-originated. Re-check the *currently stored* token
-                // against this prepare's replicated timestamp and skip unless
-                // it is still expired. A token deleted and recreated under the
-                // same name with a fresh expiry between the cleaner's snapshot
-                // and this commit is ordered before this delete, so apply sees
-                // the new expiry and preserves it. A never-expiring recreate
-                // (`expiry_at == None`) is likewise preserved.
-                let still_expired = user_tokens
-                    .get(&name_arc)
-                    .and_then(|pat| pat.expiry_at)
-                    .is_some_and(|expiry_at| expiry_at.as_micros() <= timestamp.as_micros());
-                if !still_expired {
-                    return Bytes::new();
-                }
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {
+        let Some(user_tokens) = state.personal_access_tokens.get_mut(&self.user_id) else {
+            return ApplyReply::err(DeletePersonalAccessTokenResult::NotFound);
+        };
+        let name_arc: Arc<str> = Arc::from(self.name.as_str());
+        if self.only_if_expired {
+            // Cleaner-originated. Re-check the *currently stored* token
+            // against this prepare's replicated timestamp and skip unless
+            // it is still expired. A token deleted and recreated under the
+            // same name with a fresh expiry between the cleaner's snapshot
+            // and this commit is ordered before this delete, so apply sees
+            // the new expiry and preserves it. A never-expiring recreate
+            // (`expiry_at == None`) is likewise preserved. A gated delete of
+            // an already-gone token is a deterministic no-op success, not a
+            // rejection, so the cleaner stays idempotent under replay.
+            let still_expired = user_tokens
+                .get(&name_arc)
+                .and_then(|pat| pat.expiry_at)
+                .is_some_and(|expiry_at| expiry_at.as_micros() <= timestamp.as_micros());
+            if !still_expired {
+                return ApplyReply::ok(Bytes::new());
             }
-            if let Some(pat) = user_tokens.remove(&name_arc) {
+        }
+        match user_tokens.remove(&name_arc) {
+            Some(pat) => {
                 state.personal_access_token_index.remove(&pat.token);
                 if let Some(expiry_at) = pat.expiry_at {
                     state.personal_access_token_expiry_index.remove(&(
@@ -547,9 +558,10 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
                         name_arc,
                     ));
                 }
+                ApplyReply::ok(Bytes::new())
             }
+            None => ApplyReply::err(DeletePersonalAccessTokenResult::NotFound),
         }
-        Bytes::new()
     }
 }
 
@@ -940,5 +952,41 @@ mod tests {
             expired,
             vec![(5, Arc::from("expired")), (9, Arc::from("stale"))]
         );
+    }
+
+    fn create_user(users: &mut UsersInner, username: &str) {
+        let request = CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+        };
+        let apply = StateHandler::apply(&request, users, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+    }
+
+    #[test]
+    fn given_duplicate_username_when_apply_create_user_should_return_user_already_exists() {
+        let mut users = UsersInner::new();
+        create_user(&mut users, "alice");
+        let request = CreateUserRequest {
+            username: WireName::new("alice").unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+        };
+        let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
+        assert_eq!(apply.code, u32::from(CreateUserResult::UserAlreadyExists));
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_user_when_apply_delete_user_should_return_user_not_found() {
+        let mut users = UsersInner::new();
+        let request = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(999),
+        };
+        let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
+        assert_eq!(apply.code, u32::from(DeleteUserResult::UserNotFound));
     }
 }

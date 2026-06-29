@@ -45,6 +45,15 @@ pub enum Operation {
     // Internal metadata operations (journal / replica-only)
     CreateTopicWithAssignments = 64,
     CreatePartitionsWithAssignments = 65,
+    /// Server-originated: drop a disconnected client from every consumer group
+    /// it joined and rebalance. Applied as a deterministic side-effect of the
+    /// `Logout` commit (not its own client command), so it has no wire code.
+    RemoveConsumerGroupMember = 66,
+
+    /// Reconciler-originated: complete a pending cooperative revocation, moving
+    /// a drained partition to its target member. Submitted through metadata
+    /// consensus by the partition reconciler; no client wire code.
+    CompleteConsumerGroupRevocation = 67,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -70,6 +79,8 @@ pub enum Operation {
     UpdatePermissions = 145,
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
+    JoinConsumerGroup = 148,
+    LeaveConsumerGroup = 149,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
@@ -121,6 +132,8 @@ impl Operation {
                 | Self::UpdatePermissions
                 | Self::CreatePersonalAccessToken
                 | Self::DeletePersonalAccessToken
+                | Self::JoinConsumerGroup
+                | Self::LeaveConsumerGroup
         )
     }
 
@@ -160,7 +173,9 @@ impl Operation {
             | Self::Logout
             | Self::NonReplicated
             | Self::CreateTopicWithAssignments
-            | Self::CreatePartitionsWithAssignments => None,
+            | Self::CreatePartitionsWithAssignments
+            | Self::RemoveConsumerGroupMember
+            | Self::CompleteConsumerGroupRevocation => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -181,6 +196,8 @@ impl Operation {
             | Self::UpdatePermissions
             | Self::CreatePersonalAccessToken
             | Self::DeletePersonalAccessToken
+            | Self::JoinConsumerGroup
+            | Self::LeaveConsumerGroup
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset
@@ -231,6 +248,8 @@ mod tests {
             Operation::UpdatePermissions,
             Operation::CreatePersonalAccessToken,
             Operation::DeletePersonalAccessToken,
+            Operation::JoinConsumerGroup,
+            Operation::LeaveConsumerGroup,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,

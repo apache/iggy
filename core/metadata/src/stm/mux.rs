@@ -33,8 +33,8 @@ use crate::stm::{State, StateMachine};
 /// state.
 ///
 /// The variadic tuple impl below recurses over the state list, so a
-/// `MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>` ends up
-/// with `Bundle = (Users::Bundle, (Streams::Bundle, (ConsumerGroups::Bundle, ())))`.
+/// `MuxStateMachine<variadic!(Users, Streams)>` ends up
+/// with `Bundle = (Users::Bundle, (Streams::Bundle, ()))`.
 pub trait WithFactory: Sized {
     type Bundle: Clone + Send + Sync;
     fn factory_bundle(&self) -> Self::Bundle;
@@ -135,11 +135,11 @@ where
 // Base case of the recursive resolution.
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
-    type Output = bytes::Bytes;
+    type Output = crate::stm::result::ApplyReply;
     type Error = iggy_common::IggyError;
 
     fn update(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
-        Ok(bytes::Bytes::new())
+        Ok(crate::stm::result::ApplyReply::default())
     }
 }
 
@@ -210,7 +210,6 @@ where
 #[allow(unused_imports)]
 mod tests {
     use super::*;
-    use crate::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
     use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshot, Snapshotable};
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{Users, UsersInner};
@@ -235,13 +234,12 @@ mod tests {
 
     #[test]
     fn mux_state_machine_snapshot_roundtrip() {
-        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+        type MuxTuple = (Users, (Streams, ()));
 
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();
-        let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
 
-        let mux = MuxStateMachine::new(variadic!(users, streams, consumer_groups));
+        let mux = MuxStateMachine::new(variadic!(users, streams));
 
         // Fill the typed snapshot
         let mut snapshot = MetadataSnapshot::new(12345);
@@ -250,7 +248,6 @@ mod tests {
         // Verify all fields are filled
         assert!(snapshot.users.is_some());
         assert!(snapshot.streams.is_some());
-        assert!(snapshot.consumer_groups.is_some());
 
         let restored: MuxStateMachine<MuxTuple> =
             MuxStateMachine::restore_snapshot(&snapshot).unwrap();
@@ -260,7 +257,6 @@ mod tests {
         restored.fill_snapshot(&mut verify_snapshot).unwrap();
         assert!(verify_snapshot.users.is_some());
         assert!(verify_snapshot.streams.is_some());
-        assert!(verify_snapshot.consumer_groups.is_some());
     }
 
     #[test]
@@ -268,14 +264,12 @@ mod tests {
         use crate::impls::metadata::IggySnapshot;
         use crate::stm::snapshot::Snapshot;
 
-        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+        type MuxTuple = (Users, (Streams, ()));
 
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();
-        let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
 
-        let mux: MuxStateMachine<MuxTuple> =
-            MuxStateMachine::new(variadic!(users, streams, consumer_groups));
+        let mux: MuxStateMachine<MuxTuple> = MuxStateMachine::new(variadic!(users, streams));
 
         let sequence_number = 12345u64;
         let snapshot = IggySnapshot::create(&mux, sequence_number).unwrap();
@@ -294,7 +288,6 @@ mod tests {
         // Verify snapshot fields are present
         assert!(decoded.snapshot().users.is_some());
         assert!(decoded.snapshot().streams.is_some());
-        assert!(decoded.snapshot().consumer_groups.is_some());
 
         // Restore MuxStateMachine from the state side (symmetric with fill_snapshot)
         let restored: MuxStateMachine<MuxTuple> =
@@ -305,12 +298,11 @@ mod tests {
         restored.fill_snapshot(&mut verify_snapshot).unwrap();
         assert!(verify_snapshot.users.is_some());
         assert!(verify_snapshot.streams.is_some());
-        assert!(verify_snapshot.consumer_groups.is_some());
     }
 
     #[test]
     fn mux_state_machine_default_initializes_empty_state() {
-        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+        type MuxTuple = (Users, (Streams, ()));
 
         let mux = MuxStateMachine::<MuxTuple>::default();
 
@@ -318,6 +310,5 @@ mod tests {
         mux.fill_snapshot(&mut verify_snapshot).unwrap();
         assert!(verify_snapshot.users.is_some());
         assert!(verify_snapshot.streams.is_some());
-        assert!(verify_snapshot.consumer_groups.is_some());
     }
 }

@@ -62,7 +62,6 @@ keyring-core = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
-once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
@@ -75,6 +74,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
