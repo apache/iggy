@@ -15,6 +15,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
+| **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
 
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 

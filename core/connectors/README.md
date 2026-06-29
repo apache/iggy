@@ -86,6 +86,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
 - **Stdout Sink** - prints messages to standard output (useful for debugging/development)
+- **SurrealDB Sink** - writes messages into SurrealDB with deterministic record IDs for idempotent replay
 
 ## Source
 
