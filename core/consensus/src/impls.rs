@@ -85,7 +85,14 @@ impl Sequencer for LocalSequencer {
 /// TODO The below numbers need to be added a consensus config
 /// TODO understand how to configure these numbers.
 /// Maximum number of prepares that can be in-flight in the pipeline.
-pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
+///
+/// Sized to absorb a synchronized client burst (e.g. the 20-way
+/// concurrent-creation race tests across TCP/QUIC/WebSocket) without
+/// `PipelineFull`-rejecting and disconnecting clients that cannot replay in
+/// time. At depth 8 the QUIC burst wedges the metadata consensus even in
+/// release. Stays well under the journal's `SLOT_COUNT` (1024) and the inbox
+/// capacity headroom.
+pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 32;
 
 /// Max accepted-but-not-yet-prepared requests buffered behind a full
 /// prepare queue. Beyond this, requests drop and the client retries.
@@ -777,6 +784,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn advance_commit_max(&self, commit: u64) {
         if commit > self.commit_max.get() {
             self.commit_max.set(commit);
+            // A prepare just committed. Re-arm the prepare-retransmit timer for
+            // the next-oldest pending prepare rather than letting it inherit the
+            // previous op's grown backoff: the push-site `start` is a no-op
+            // while ticking and nothing else clears `attempts`, so under
+            // sustained load the backoff ratchets up to 16x base and the tail
+            // op's retransmit fires too rarely to recover a lost backup ack,
+            // stalling commit. `start` (not `reset`) forces the timer ticking
+            // at the base interval - `reset` alone leaves `ticking` untouched,
+            // so a timer stopped earlier would be armed-but-dead and never
+            // fire. When nothing is pending the timer self-stops via the
+            // empty-pipeline branch in `handle_prepare_timeout`.
+            if self.sequencer.current_sequence() > commit {
+                self.timeouts.borrow_mut().start(TimeoutKind::Prepare);
+            }
         }
         assert!(self.commit_max.get() >= self.commit_min.get());
     }

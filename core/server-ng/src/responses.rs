@@ -33,6 +33,7 @@ use iggy_binary_protocol::codes::{
     GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
     GET_USERS_CODE,
 };
+use iggy_binary_protocol::consensus::RESULT_COUNT_LEN;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -836,7 +837,17 @@ pub(crate) fn build_raw_pat_reply(
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
-    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let token_payload = RawPersonalAccessTokenResponse { token }.to_bytes();
+    // Metadata reply bodies are framed `[result_count:u32][payload]`; a success
+    // is `count == 0` followed by the payload (see `ApplyReply::write_reply_body`
+    // / `result_code`). The committed reply carried an empty payload with this
+    // same framing, so reproduce it here - prepend the zero result-count rather
+    // than shipping a bare `RawPersonalAccessTokenResponse`, which the client
+    // would misread as the result-count and reject as a bogus error.
+    let mut framed = Vec::with_capacity(RESULT_COUNT_LEN + token_payload.len());
+    framed.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
+    framed.extend_from_slice(&token_payload);
+    let body = Bytes::from(framed);
     let reply = build_reply_from_bytes(
         request_header,
         request_header.client,
