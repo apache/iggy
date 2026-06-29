@@ -83,8 +83,8 @@ apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 argon2 = "0.5.3"
 # Pinned to 57 because iceberg 0.9.1 still requires arrow/parquet 57.
 arrow = "57.3.1"
-arrow-array = "57.3.1"
-arrow-json = "57.3.1"
+arrow-array = "58.3.0"
+arrow-json = "58.3.0"
 assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
@@ -234,7 +234,7 @@ opentelemetry_sdk = { version = "0.32.1", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 papaya = "0.2.4"
-parquet = "57.3.1"
+parquet = "58.3.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
