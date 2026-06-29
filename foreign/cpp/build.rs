@@ -22,10 +22,9 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/client.rs");
     println!("cargo:rerun-if-changed=src/consumer.rs");
-    println!("cargo:rerun-if-changed=src/producer.rs");
     println!("cargo:rerun-if-changed=src/identifier.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/messages.rs");
-    println!("cargo:rerun-if-changed=src/stream.rs");
-    println!("cargo:rerun-if-changed=src/topic.rs");
+    println!("cargo:rerun-if-changed=src/producer.rs");
+    println!("cargo:rerun-if-changed=src/type_conversion.rs");
 }

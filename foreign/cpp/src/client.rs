@@ -35,6 +35,22 @@ use std::sync::Arc;
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
 
+fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<Consumer, String> {
+    match consumer_kind {
+        "consumer" => Ok(Consumer::new(consumer_id)),
+        "consumer_group" => Ok(Consumer::group(consumer_id)),
+        _ => Err(format!("invalid consumer kind: {consumer_kind}")),
+    }
+}
+
+fn opt_partition(partition_id: u32) -> Option<u32> {
+    if partition_id == ANY_PARTITION_ID {
+        None
+    } else {
+        Some(partition_id)
+    }
+}
+
 pub struct Client {
     pub inner: Arc<RustIggyClient>,
 }
@@ -304,16 +320,8 @@ impl Client {
             .map_err(|error| format!("Could not poll messages: {error}"))?;
         let rust_consumer_id = RustIdentifier::try_from(consumer_id)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
-
-        let consumer = match consumer_kind.as_str() {
-            "consumer" => Consumer::new(rust_consumer_id),
-            "consumer_group" => Consumer::group(rust_consumer_id),
-            _ => {
-                return Err(format!(
-                    "Could not poll messages: invalid consumer kind: {consumer_kind}"
-                ));
-            }
-        };
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
 
         let strategy = match polling_strategy_kind.as_str() {
             "offset" => PollingStrategy::offset(polling_strategy_value),
@@ -328,19 +336,13 @@ impl Client {
             }
         };
 
-        let opt_partition = if partition_id == ANY_PARTITION_ID {
-            None
-        } else {
-            Some(partition_id)
-        };
-
         RUNTIME.block_on(async {
             let polled = self
                 .inner
                 .poll_messages(
                     &rust_stream_id,
                     &rust_topic_id,
-                    opt_partition,
+                    opt_partition(partition_id),
                     &consumer,
                     &strategy,
                     count,
@@ -792,20 +794,8 @@ impl Client {
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
         let rust_consumer_id = RustIdentifier::try_from(consumer_id)
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
-        let consumer = match consumer_kind.as_str() {
-            "consumer" => Consumer::new(rust_consumer_id),
-            "consumer_group" => Consumer::group(rust_consumer_id),
-            _ => {
-                return Err(format!(
-                    "Could not store consumer offset: invalid consumer kind: {consumer_kind}"
-                ));
-            }
-        };
-        let partition_id = if partition_id == ANY_PARTITION_ID {
-            None
-        } else {
-            Some(partition_id)
-        };
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not store consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
@@ -813,7 +803,7 @@ impl Client {
                     &consumer,
                     &rust_stream_id,
                     &rust_topic_id,
-                    partition_id,
+                    opt_partition(partition_id),
                     offset,
                 )
                 .await
@@ -840,25 +830,18 @@ impl Client {
             .map_err(|error| format!("Could not get consumer offset: {error}"))?;
         let rust_consumer_id = RustIdentifier::try_from(consumer_id)
             .map_err(|error| format!("Could not get consumer offset: {error}"))?;
-        let consumer = match consumer_kind.as_str() {
-            "consumer" => Consumer::new(rust_consumer_id),
-            "consumer_group" => Consumer::group(rust_consumer_id),
-            _ => {
-                return Err(format!(
-                    "Could not get consumer offset: invalid consumer kind: {consumer_kind}"
-                ));
-            }
-        };
-        let partition_id = if partition_id == ANY_PARTITION_ID {
-            None
-        } else {
-            Some(partition_id)
-        };
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not get consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             let offset = self
                 .inner
-                .get_consumer_offset(&consumer, &rust_stream_id, &rust_topic_id, partition_id)
+                .get_consumer_offset(
+                    &consumer,
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    opt_partition(partition_id),
+                )
                 .await
                 .map_err(|error| {
                     format!(
@@ -887,24 +870,17 @@ impl Client {
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
         let rust_consumer_id = RustIdentifier::try_from(consumer_id)
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
-        let consumer = match consumer_kind.as_str() {
-            "consumer" => Consumer::new(rust_consumer_id),
-            "consumer_group" => Consumer::group(rust_consumer_id),
-            _ => {
-                return Err(format!(
-                    "Could not delete consumer offset: invalid consumer kind: {consumer_kind}"
-                ));
-            }
-        };
-        let partition_id = if partition_id == ANY_PARTITION_ID {
-            None
-        } else {
-            Some(partition_id)
-        };
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
-                .delete_consumer_offset(&consumer, &rust_stream_id, &rust_topic_id, partition_id)
+                .delete_consumer_offset(
+                    &consumer,
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    opt_partition(partition_id),
+                )
                 .await
                 .map_err(|error| {
                     format!(
