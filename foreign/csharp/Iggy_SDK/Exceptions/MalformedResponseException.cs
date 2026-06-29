@@ -15,24 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Consumers;
+namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     Represents the status of a received message
+///     Thrown when a server response frame cannot be parsed (e.g. a negative length field). Unlike its base
+///     <see cref="InvalidResponseException" />, which also covers server-rejected commands that may succeed on
+///     retry, a malformed frame is non-transient poison: the consumer re-throws it out of the receive
+///     enumerator instead of retrying the poll forever.
 /// </summary>
-public enum MessageStatus
+public sealed class MalformedResponseException : InvalidResponseException
 {
-    /// <summary>
-    ///     Message was successfully received and processed
-    /// </summary>
-    Success = 0,
-
-    /// <summary>
-    ///     Message deserialization failed
-    /// </summary>
-    /// <remarks>
-    ///     Value 1 was DecryptionFailed (removed; decryption failure now throws MessageDecryptionException).
-    ///     Kept at 2 so persisted or compiled-in numeric values stay stable.
-    /// </remarks>
-    DeserializationFailed = 2
+    internal MalformedResponseException(string message) : base(message)
+    {
+    }
 }

@@ -28,6 +28,8 @@ public readonly record struct MessageHeader
 {
     /// <summary>
     ///     Message checksum. Computed by the server on append and populated on poll; ignored on publish.
+    ///     With a message encryptor configured, the server computes it over the stored ciphertext, so it
+    ///     does not match the decrypted payload the client exposes.
     /// </summary>
     public ulong Checksum { get; init; }
 
