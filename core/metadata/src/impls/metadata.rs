@@ -26,9 +26,10 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
+    build_reply_message_with, drain_committable_prefix, emit_sim_event,
+    fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
-    replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
     send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::WireIdentifier;
@@ -38,8 +39,8 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
+    Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::IggyError;
 use iggy_common::UserId;
@@ -442,7 +443,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -506,13 +507,20 @@ where
         let prepare = match self.prepare_request(message) {
             Ok(prepare) => prepare,
             Err(error) => {
+                // Structurally-invalid request (not client-allowed, undecodable
+                // body, or partition-id overflow). Evict instead of dropping: a
+                // silent drop leaves the client unable to tell rejection from
+                // loss, retrying forever.
+                let reason = eviction_reason_for_invalid(operation);
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     error = %error,
-                    "failed to transform metadata request into prepare"
+                    ?reason,
+                    "rejecting invalid metadata request with eviction"
                 );
+                send_eviction_to_client(consensus, client_id, reason).await;
                 return;
             }
         };
@@ -787,8 +795,10 @@ where
                     );
                     reply
                 } else {
-                    // Normal op: apply SM, commit_reply.
-                    let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                    // only; a business rejection commits as a deterministic no-op
+                    // whose `code` rides the reply body, replayed on retry.
+                    let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                         panic!(
                             "on_ack: committed metadata op={} failed to apply: {err}",
                             prepare_header.op
@@ -798,7 +808,10 @@ where
                     // wake-up). Filtering by operation is the
                     // recipient's responsibility.
                     self.fire_commit_notifier(prepare_header.operation);
-                    let reply = build_reply_message(&prepare_header, &response);
+                    let reply =
+                        build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
+                            apply.write_reply_body(dst);
+                        });
                     // Cache only if session exists. Client evicted between
                     // prepare and commit: skip cache (`commit_reply` no-ops),
                     // wire reply still ships.
@@ -898,7 +911,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -1327,9 +1340,14 @@ where
             return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let prepare = self
-            .prepare_request(message)
-            .map_err(|_| MetadataSubmitError::Canceled)?;
+        let Ok(prepare) = self.prepare_request(message) else {
+            // Structurally-invalid request. Return an eviction frame (relayed to
+            // the socket by the home shard) rather than `Canceled`, which leaves
+            // the shard silent and the SDK retrying forever.
+            let reason = eviction_reason_for_invalid(request_header.operation);
+            let ctx = EvictionContext::from_consensus(consensus);
+            return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+        };
 
         self.dispatch_prepare_and_await(consensus, prepare)
             .await
@@ -1424,13 +1442,20 @@ where
             let prepare = match self.prepare_request(req.message) {
                 Ok(prepare) => prepare,
                 Err(error) => {
+                    // Same invariant as `on_request`: a structurally-invalid
+                    // request evicts, never a silent drop, or the SDK retries
+                    // forever. Reachable here because requests are queued
+                    // unvalidated (prepare queue full at arrival), projected now.
+                    let reason = eviction_reason_for_invalid(operation);
                     warn!(
                         target: "iggy.metadata.diag",
                         plane = "metadata",
                         replica_id = consensus.replica(),
                         error = %error,
-                        "drain_request_queue: failed to project queued request into prepare"
+                        ?reason,
+                        "drain_request_queue: rejecting invalid queued request with eviction"
                     );
+                    send_eviction_to_client(consensus, client_id, reason).await;
                     continue;
                 }
             };
@@ -1451,7 +1476,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -1538,10 +1563,11 @@ where
             Operation::CreatePartitions => {
                 let request = WireCreatePartitionsRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                self.mux_stm
-                    .streams()
-                    .current_partition_count(&request.stream_id, &request.topic_id)
-                    .ok_or(IggyError::InvalidCommand)?;
+                // Parent-existence is validated at apply, returning
+                // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
+                // read here would decide against possibly-uncommitted state and
+                // drop without a reply (TOCTOU + wedge). See the metadata
+                // validation design doc.
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1664,8 +1690,10 @@ where
                     iggy_common::IggyTimestamp::from(header.timestamp),
                 );
             } else {
-                // Normal op: apply SM, commit_reply.
-                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                // only; a business rejection commits as a deterministic no-op
+                // whose `code` rides the reply body, replayed on retry.
+                let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
                 // Post-commit notifier (e.g. partition reconciler
@@ -1673,7 +1701,9 @@ where
                 // converge after replicated commits, not only quorum-acked
                 // ones reached via `on_ack` on the primary.
                 self.fire_commit_notifier(header.operation);
-                let reply = build_reply_message(&header, &response);
+                let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
+                    apply.write_reply_body(dst);
+                });
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
                 let session = self.client_table.borrow().get_session(header.client);
@@ -1902,6 +1932,16 @@ where
     prepare
 }
 
+/// Eviction reason for a request `prepare_request` rejected as structurally
+/// invalid.
+const fn eviction_reason_for_invalid(operation: Operation) -> EvictionReason {
+    if operation.is_client_allowed() {
+        EvictionReason::InvalidRequestBody
+    } else {
+        EvictionReason::InvalidRequestOperation
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1910,6 +1950,21 @@ mod tests {
     use iggy_common::variadic;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn eviction_reason_splits_client_and_internal_ops() {
+        // Client-allowed op with a bad body evicts InvalidRequestBody; an internal
+        // / unknown op (here `CreateTopicWithAssignments`) evicts
+        // InvalidRequestOperation.
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateStream),
+            EvictionReason::InvalidRequestBody,
+        );
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateTopicWithAssignments),
+            EvictionReason::InvalidRequestOperation,
+        );
+    }
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 

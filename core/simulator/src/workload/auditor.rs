@@ -22,9 +22,10 @@
 //! Stays transport-agnostic so it can drive an Antithesis-style harness
 //! against a real server binary.
 //!
-//! Server-ng currently encodes every reply as success (`context` always 0).
-//! Once the wire protocol gains an error discriminant, expand `is_success`
-//! and validate `Failure` outcomes via [`crate::workload::ops::classify_reply`].
+//! Committed result codes ride the reply body; [`crate::workload::Workload`]
+//! decodes them in `on_reply` and classifies the outcome via
+//! [`crate::workload::ops::classify_reply`]. This module stays oblivious to the
+//! wire format.
 
 use std::collections::HashMap;
 
@@ -53,6 +54,10 @@ pub struct AuditorStats {
     pub replies_unknown: u64,
     /// Per-action committed counter, indexed by `Action as usize`.
     pub commits_per_action: [u64; Action::COUNT],
+    /// Metadata replies carrying a nonzero committed result code (a business
+    /// rejection). The shadow does not mutate on these; in a serial run the
+    /// `on_reply` equality oracle asserts the rejection was the targeted outcome.
+    pub committed_rejections: u64,
 }
 
 impl Default for AuditorStats {
@@ -61,6 +66,7 @@ impl Default for AuditorStats {
             replies_seen: 0,
             replies_unknown: 0,
             commits_per_action: [0u64; Action::COUNT],
+            committed_rejections: 0,
         }
     }
 }
@@ -163,10 +169,18 @@ impl ServerAuditor {
         OnReply::Match(entry)
     }
 
-    /// Increment the per-action committed counter. Called after a reply
-    /// has been validated and its predicted effect applied to the shadow.
+    /// Increment the per-action committed counter. Called only for a committed
+    /// success that mutated the shadow, so it tracks net shadow state (rejections
+    /// and no-op applies excluded).
     pub const fn note_committed(&mut self, action: Action) {
         self.stats.commits_per_action[action as usize] += 1;
+    }
+
+    /// Record a committed business rejection (nonzero result code). Either
+    /// targeted by outcome-first generation (duplicate name, fabricated missing
+    /// entity) or produced by a race.
+    pub const fn note_committed_rejection(&mut self) {
+        self.stats.committed_rejections += 1;
     }
 
     #[must_use]
@@ -184,12 +198,4 @@ impl Default for ServerAuditor {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Reply status classification. Server-ng sets `context = 0` even for
-/// failures. Until wire-level error discriminants land, every reply is
-/// success; this hook becomes the switch point.
-#[allow(dead_code)]
-const fn is_success(_header: &ReplyHeader) -> bool {
-    true
 }

@@ -135,11 +135,11 @@ where
 // Base case of the recursive resolution.
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
-    type Output = bytes::Bytes;
+    type Output = crate::stm::result::ApplyReply;
     type Error = iggy_common::IggyError;
 
     fn update(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
-        Ok(bytes::Bytes::new())
+        Ok(crate::stm::result::ApplyReply::default())
     }
 }
 

@@ -15,20 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteSegments` op.
+//! `DeleteSegments` op. Disabled at sample time.
 //!
-//! Currently disabled at sample time. `DeleteSegments` is a partition
-//! operation (`Operation::is_partition() == true`, see
-//! `core/binary_protocol/src/consensus/operation.rs`) but the simulator's
-//! name-keyed `Shadow` has no `(stream, topic) -> IggyNamespace` binding,
-//! so the request cannot be routed to the right partition (wire-level
-//! namespace defaults to 0, which is the metadata plane and has no
-//! partition handler). Sampling returns `None` until the shadow grows
-//! a topic-to-namespace index; the op stays in `Action` and the
-//! dispatch table so the surface compiles, and so the v2.4 outcome-
-//! expansion lands cleanly when the shadow is upgraded.
+//! A partition op (`Operation::is_partition() == true`, see
+//! `core/binary_protocol/src/consensus/operation.rs`), but the name-keyed
+//! `Shadow` has no `(stream, topic) -> IggyNamespace` binding, so the
+//! request can't route to a partition (wire namespace defaults to 0, the
+//! metadata plane, which has no partition handler). Sampling returns
+//! `None` until the shadow grows a topic-to-namespace index. The op stays
+//! in `Action` and the dispatch table so the surface compiles and the v2.4
+//! outcome expansion lands cleanly post-upgrade.
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -58,8 +56,7 @@ pub const fn sample(
     _prng: &mut Xoshiro256Plus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
-    // Disabled until shadow grows a topic-to-namespace index; routing
-    // via the partition namespace requires it. See module docs.
+    // Disabled until shadow grows a topic-to-namespace index. See module docs.
     None
 }
 
@@ -74,7 +71,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
 }
 
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
+pub const fn classify_reply(_code: u32) -> Outcome {
     Outcome::Success
 }
 
