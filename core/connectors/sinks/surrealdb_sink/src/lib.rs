@@ -289,6 +289,13 @@ impl Sink for SurrealDbSink {
             ));
         }
 
+        if self.define_indexes && !self.include_metadata {
+            return Err(Error::InvalidConfigValue(
+                "SurrealDB define_indexes requires include_metadata=true because indexes use metadata fields"
+                    .to_string(),
+            ));
+        }
+
         if self.define_indexes && !self.auto_define_table {
             warn!(
                 "SurrealDB sink ID: {} define_indexes=true requires auto_define_table=true; index DDL will not run.",
@@ -696,7 +703,7 @@ impl SurrealDbSink {
         let mut outcome = self.insert_records_with_retry(records).await;
         outcome.error_count += record_error_count;
         let db_error = outcome.error.take();
-        outcome.error = last_record_error.or(db_error);
+        outcome.error = db_error.or(last_record_error);
 
         outcome
     }
@@ -1151,11 +1158,7 @@ fn is_timeout_or_service_error(error: &SurrealDbRequestError) -> bool {
         return true;
     }
 
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("timeout")
-        || message.contains("timed out")
-        || message.contains("temporarily unavailable")
-        || message.contains("service unavailable")
+    false
 }
 
 #[cfg(test)]
@@ -1381,6 +1384,22 @@ mod tests {
         let mut config = test_config();
         config.auth_scope = Some("database".to_string());
         config.auto_define_table = Some(true);
+        let mut sink = SurrealDbSink::new(1, config);
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime should start")
+            .block_on(async {
+                let result = sink.open().await;
+
+                assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+            });
+    }
+
+    #[test]
+    fn given_define_indexes_without_metadata_when_opening_should_fail_validation() {
+        let mut config = test_config();
+        config.define_indexes = Some(true);
+        config.include_metadata = Some(false);
         let mut sink = SurrealDbSink::new(1, config);
 
         tokio::runtime::Runtime::new()
@@ -1791,11 +1810,22 @@ mod tests {
     }
 
     #[test]
-    fn given_timeout_error_should_be_transient() {
+    fn given_timeout_text_in_query_error_should_not_be_transient() {
         let error = SurrealDbRequestError::Query("Query timed out".to_string());
 
-        assert!(is_transient_error(&error));
-        assert!(is_timeout_or_service_error(&error));
+        assert!(!is_transient_error(&error));
+        assert!(!is_timeout_or_service_error(&error));
+    }
+
+    #[test]
+    fn given_transient_text_in_bad_request_body_should_not_be_transient() {
+        let error = SurrealDbRequestError::HttpStatus {
+            status: StatusCode::BAD_REQUEST,
+            body: "service unavailable timeout".to_string(),
+        };
+
+        assert!(!is_transient_error(&error));
+        assert!(!is_timeout_or_service_error(&error));
     }
 
     #[test]
