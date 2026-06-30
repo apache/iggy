@@ -243,7 +243,15 @@ fn read_operation(header_bytes: &[u8; HEADER_SIZE]) -> Result<Operation, IggyErr
 /// section is corruption, never a silent success, so it maps to `InvalidCommand`
 /// rather than risk a rejection decoding as `Ok`.
 fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, IggyError> {
-    if !operation.is_metadata() {
+    // Register (login/register) replies are result-framed too, so a transient
+    // login decodes to `TransientNotCommitted` and the SDK replays it. The one
+    // exception is a terminal failure, which ships an empty body (no result
+    // section) and is passed through to fail the typed `LoginRegisterResponse`
+    // decode. Reads, the partition data plane, and Logout carry no result
+    // section and pass through untouched.
+    let result_framed =
+        operation.is_metadata() || (operation == Operation::Register && !body.is_empty());
+    if !result_framed {
         return Ok(body);
     }
     match result_code(&body) {

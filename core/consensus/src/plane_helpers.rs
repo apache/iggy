@@ -334,6 +334,65 @@ where
         .expect("reply buffer must contain a valid reply message")
 }
 
+/// Builds a `Reply` carrying only a metadata result section, no payload.
+///
+/// For a request that could not be committed *right now* (not-caught-up /
+/// in-flight / pipeline-full / view-change cancel): the body is
+/// `[count=1][index=0][result=code]`. The SDK decodes the nonzero `result` to a
+/// typed retryable error (`IggyError::TransientNotCommitted`) and replays the
+/// same `request_id` immediately, instead of waiting out its response
+/// read-timeout.
+///
+/// Stamped from the request header (no prepare exists for an uncommitted op).
+/// `commit` is the primary's current commit position and is informational here:
+/// a transient reply is sent, never cached in the `ClientTable`, so it is not
+/// subject to the `commit_reply` regression order.
+///
+/// # Panics
+/// If the constructed message buffer is not a valid reply.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_transient_reply(
+    request_header: &RequestHeader,
+    commit: u64,
+    code: u32,
+) -> Message<ReplyHeader> {
+    // `[count: u32][index: u32][result: u32]`, the single-entry rejection shape
+    // of `ApplyReply::write_reply_body` (mirrored here to avoid a metadata dep).
+    const RESULT_BODY_LEN: usize = 12;
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + RESULT_BODY_LEN;
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
+    *header = ReplyHeader {
+        cluster: request_header.cluster,
+        size: total_size as u32,
+        view: request_header.view,
+        release: request_header.release,
+        command: Command2::Reply,
+        replica: request_header.replica,
+        request_checksum: request_header.request_checksum,
+        client: request_header.client,
+        op: request_header.session,
+        commit,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+
+    let body = &mut buffer[header_size..];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes());
+    body[4..8].copy_from_slice(&0u32.to_le_bytes());
+    body[8..12].copy_from_slice(&code.to_le_bytes());
+
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("transient reply buffer must contain a valid reply message")
+}
+
 /// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
 ///
 /// Stamps `op` and `commit` with `commit_max` — monotonic, so

@@ -64,6 +64,14 @@ const NAME: &str = "Iggy";
 #[cfg(feature = "vsr")]
 const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Backoff before replaying a request the server answered with an explicit
+/// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
+/// view-change cancel). The reply arrives promptly, so a short pause keeps the
+/// replay from spinning while the primary catches up. Bounded by
+/// `RESPONSE_READ_TIMEOUT`.
+#[cfg(feature = "vsr")]
+const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
 #[derive(Debug)]
@@ -701,106 +709,121 @@ impl TcpClient {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {
                 #[cfg(feature = "vsr")]
-                let (request_header, request_size) = {
-                    let mut consensus_session = consensus_session
-                        .lock()
-                        .expect("consensus session mutex poisoned");
-                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
-                };
-                #[cfg(not(feature = "vsr"))]
-                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-                #[cfg(feature = "vsr")]
-                trace!(
-                    "Sending a TCP VSR request of size {} with code: {code}",
-                    request_size
-                );
-                #[cfg(not(feature = "vsr"))]
-                trace!("Sending a TCP request of size {payload_length} with code: {code}");
-                #[cfg(feature = "vsr")]
-                stream.write(bytemuck::bytes_of(&request_header)).await?;
-                #[cfg(feature = "vsr")]
-                if !payload.is_empty() {
-                    stream.write(&payload).await?;
-                }
-                #[cfg(not(feature = "vsr"))]
-                stream.write(&(payload_length as u32).to_le_bytes()).await?;
-                #[cfg(not(feature = "vsr"))]
-                stream.write(&code.to_le_bytes()).await?;
-                #[cfg(not(feature = "vsr"))]
-                stream.write(&payload).await?;
-                stream.flush().await?;
-                trace!("Sent a TCP request with code: {code}, waiting for a response...");
-                #[cfg(feature = "vsr")]
                 {
-                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                    // `stream.read` delegates to `read_exact`; on success it
-                    // always returns the requested length, so no short-read
-                    // guard is needed here.
-                    //
-                    // Deadline guards against server-side reply loss (e.g. a
-                    // stalled replication quorum that never commits the op):
-                    // the connection is lockstep, so an unanswered read would
-                    // hold the stream lock forever and wedge every later
-                    // request on this client. On expiry drop the stream --
-                    // a late reply would desync framing for the next request.
-                    //
-                    // One deadline spans BOTH the header and body reads: a
-                    // reply that delivers a header then stalls must not get a
-                    // fresh full timeout for the body (which would allow up to
-                    // 2x `RESPONSE_READ_TIMEOUT` total).
-                    let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                    let header_read =
-                        tokio::time::timeout_at(response_deadline, stream.read(&mut response_header))
-                            .await;
-                    let Ok(header_read) = header_read else {
-                        error!(
-                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
-                        );
-                        return Err(IggyError::Disconnected);
+                    // Encode the request header ONCE: `next_request_id` advances
+                    // here, so a transient replay must reuse the same id for the
+                    // server's dedup. The connection is lockstep (one request in
+                    // flight per client), so a complete reply leaves the stream at
+                    // a clean frame boundary -- a `TransientNotCommitted` answer
+                    // (the server could not commit yet: not-caught-up / in-flight
+                    // / pipeline-full / view-change cancel) lets us resend the
+                    // SAME request on the SAME connection with no reconnect and
+                    // the session intact. Bounded overall by RESPONSE_READ_TIMEOUT.
+                    let (request_header, request_size) = {
+                        let mut consensus_session = consensus_session
+                            .lock()
+                            .expect("consensus session mutex poisoned");
+                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                     };
-                    header_read.map_err(|error| {
-                        error!(
-                            "Failed to read VSR response header for TCP request with code: {code}: {error}",
-                            code = code,
-                            error = error
-                        );
-                        IggyError::Disconnected
-                    })?;
+                    trace!("Sending a TCP VSR request of size {request_size} with code: {code}");
+                    let header_bytes = bytemuck::bytes_of(&request_header);
+                    // One deadline bounds the whole request including transient
+                    // replays, so a slow primary cannot stretch a single call
+                    // beyond RESPONSE_READ_TIMEOUT.
+                    let retry_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                    loop {
+                        stream.write(header_bytes).await?;
+                        if !payload.is_empty() {
+                            stream.write(&payload).await?;
+                        }
+                        stream.flush().await?;
+                        trace!("Sent a TCP request with code: {code}, waiting for a response...");
 
-                    let response_size = crate::vsr::response_size(&response_header)?;
-
-                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                    let body = if body_size > 0 {
-                        let mut body = BytesMut::with_capacity(body_size);
-                        let body_read = tokio::time::timeout_at(
-                            response_deadline,
-                            stream.read_buf(&mut body, body_size),
+                        let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                        // `stream.read` delegates to `read_exact`; on success it
+                        // always returns the requested length, so no short-read
+                        // guard is needed here.
+                        //
+                        // Deadline guards against server-side reply loss (e.g. a
+                        // stalled replication quorum that never commits the op):
+                        // the connection is lockstep, so an unanswered read would
+                        // hold the stream lock forever and wedge every later
+                        // request on this client. On expiry drop the stream --
+                        // a late reply would desync framing for the next request.
+                        //
+                        // One deadline spans BOTH the header and body reads: a
+                        // reply that delivers a header then stalls must not get a
+                        // fresh full timeout for the body.
+                        let header_read = tokio::time::timeout_at(
+                            retry_deadline,
+                            stream.read(&mut response_header),
                         )
                         .await;
-                        let Ok(body_read) = body_read else {
+                        let Ok(header_read) = header_read else {
                             error!(
-                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
+                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
                             );
                             return Err(IggyError::Disconnected);
                         };
-                        body_read.map_err(|error| {
+                        header_read.map_err(|error| {
                             error!(
-                                "Failed to read VSR response body for TCP request with code: {code}: {error}",
-                                code = code,
-                                error = error
+                                "Failed to read VSR response header for TCP request with code: {code}: {error}",
                             );
                             IggyError::Disconnected
                         })?;
-                        body.freeze()
-                    } else {
-                        Bytes::new()
-                    };
 
-                    return crate::vsr::decode_response_split(&response_header, body);
+                        let response_size = crate::vsr::response_size(&response_header)?;
+                        let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                        let body = if body_size > 0 {
+                            let mut body = BytesMut::with_capacity(body_size);
+                            let body_read = tokio::time::timeout_at(
+                                retry_deadline,
+                                stream.read_buf(&mut body, body_size),
+                            )
+                            .await;
+                            let Ok(body_read) = body_read else {
+                                error!(
+                                    "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
+                                );
+                                return Err(IggyError::Disconnected);
+                            };
+                            body_read.map_err(|error| {
+                                error!(
+                                    "Failed to read VSR response body for TCP request with code: {code}: {error}",
+                                );
+                                IggyError::Disconnected
+                            })?;
+                            body.freeze()
+                        } else {
+                            Bytes::new()
+                        };
+
+                        match crate::vsr::decode_response_split(&response_header, body) {
+                            // Server could not commit yet but answered with a
+                            // complete frame; the lockstep stream is in sync, so
+                            // replay the same request id on this connection after
+                            // a short pause (no reconnect, session intact).
+                            Err(IggyError::TransientNotCommitted)
+                                if tokio::time::Instant::now() < retry_deadline =>
+                            {
+                                let remaining = retry_deadline
+                                    .saturating_duration_since(tokio::time::Instant::now());
+                                tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                            }
+                            other => return other,
+                        }
+                    }
                 }
 
                 #[cfg(not(feature = "vsr"))]
                 {
+                    let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                    trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                    stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                    stream.write(&code.to_le_bytes()).await?;
+                    stream.write(&payload).await?;
+                    stream.flush().await?;
+                    trace!("Sent a TCP request with code: {code}, waiting for a response...");
                     let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
                     let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
                         error!(

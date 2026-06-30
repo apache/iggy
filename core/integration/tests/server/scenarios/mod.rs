@@ -23,7 +23,6 @@ pub mod bench_scenario;
 // panic on the primary); skip until the metadata races are fixed.
 #[cfg(not(feature = "vsr"))]
 pub mod concurrent_produce_consume_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
 // Only consumed by `cg_vsr` (server-ng); legacy `cg.rs` has no equivalent.

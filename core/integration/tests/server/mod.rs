@@ -25,8 +25,7 @@ mod cg;
 #[cfg(feature = "vsr")]
 mod cg_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
-// the harness transport filter); revisit under vsr once basics are green.
-#[cfg(not(feature = "vsr"))]
+// the harness transport filter).
 mod concurrent_addition;
 mod general;
 // The per-shard segment cleaner deletes expired / oversize segments from disk
