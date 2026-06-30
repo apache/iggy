@@ -340,13 +340,23 @@ class IggyClient:
         """
     def create_consumer_group(
         self,
-        stream: builtins.str | builtins.int,
-        topic: builtins.str | builtins.int,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
         name: builtins.str,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Creates a new consumer group for the given stream and topic.
-        Returns Ok(()) on successful consumer group creation or a PyRuntimeError on failure.
+        Create a consumer group for a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: Consumer group name as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the consumer group is created.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def get_consumer_group(
         self,
@@ -355,8 +365,18 @@ class IggyClient:
         group_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
         r"""
-        Gets consumer group by stream, topic, and group id.
-        Returns Option of consumer group details or a PyRuntimeError on failure.
+        Get a consumer group in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupDetails | None`.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def get_consumer_groups(
         self,
@@ -364,8 +384,17 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Gets consumer groups by stream and topic.
-        Returns a list of consumer groups or a PyRuntimeError on failure.
+        Get all consumer groups in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[ConsumerGroup]`.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def send_messages(
         self,
