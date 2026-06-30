@@ -804,7 +804,13 @@ pub(crate) fn build_login_register_reply(
     let mut body = Vec::with_capacity(RESULT_COUNT_LEN + payload.len());
     body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
     body.extend_from_slice(&payload);
-    build_reply_from_bytes(request_header, client_id, session, commit, &Bytes::from(body))
+    build_reply_from_bytes(
+        request_header,
+        client_id,
+        session,
+        commit,
+        &Bytes::from(body),
+    )
 }
 
 pub(crate) fn build_reply_from_bytes(
