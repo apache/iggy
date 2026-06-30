@@ -17,7 +17,6 @@
 
 pub mod client;
 mod consumer;
-mod consumer_group;
 mod identifier;
 mod receive_message;
 mod send_message;
@@ -25,8 +24,10 @@ mod stream;
 mod topic;
 
 use client::IggyClient;
-use consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceiveMessageIterator};
-use consumer_group::{ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember};
+use consumer::{
+    AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
+};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;

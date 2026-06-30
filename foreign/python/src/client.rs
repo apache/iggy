@@ -28,9 +28,9 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::consumer::{AutoCommit, IggyConsumer, py_delta_to_iggy_duration};
-use crate::consumer_group::{
-    ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
+use crate::consumer::{
+    AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
+    IggyConsumer, py_delta_to_iggy_duration,
 };
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
@@ -410,31 +410,51 @@ impl IggyClient {
         })
     }
 
-    /// Creates a new consumer group for the given stream and topic.
-    /// Returns Ok(()) on successful consumer group creation or a PyRuntimeError on failure.
+    /// Create a consumer group for a stream topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     name: Consumer group name as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the consumer group is created.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_consumer_group<'a>(
         &self,
         py: Python<'a>,
-        stream: PyIdentifier,
-        topic: PyIdentifier,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
         name: String,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let stream = Identifier::try_from(stream)?;
-        let topic = Identifier::try_from(topic)?;
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             inner
-                .create_consumer_group(&stream, &topic, &name)
+                .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
     }
 
-    /// Gets consumer group by stream, topic, and group id.
-    /// Returns Option of consumer group details or a PyRuntimeError on failure.
+    /// Get a consumer group in a stream topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ConsumerGroupDetails | None`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails | None]", imports=("collections.abc")))]
     fn get_consumer_group<'a>(
         &self,
@@ -457,8 +477,17 @@ impl IggyClient {
         })
     }
 
-    /// Gets consumer groups by stream and topic.
-    /// Returns a list of consumer groups or a PyRuntimeError on failure.
+    /// Get all consumer groups in a stream topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[ConsumerGroup]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ConsumerGroup]]", imports=("collections.abc")))]
     fn get_consumer_groups<'a>(
         &self,

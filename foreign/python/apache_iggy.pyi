@@ -23,6 +23,7 @@ import builtins
 import collections.abc
 import datetime
 import typing
+
 __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
@@ -49,75 +50,91 @@ class AutoCommit:
         r"""
         The auto-commit is disabled and the offset must be stored manually by the consumer.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommit.Disabled: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class Interval(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> datetime.timedelta: ...
         def __new__(cls, _0: datetime.timedelta) -> AutoCommit.Interval: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class IntervalOrWhen(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
         """
-        __match_args__ = ("_0", "_1",)
+
+        __match_args__ = (
+            "_0",
+            "_1",
+        )
         @property
         def _0(self) -> datetime.timedelta: ...
         @property
         def _1(self) -> AutoCommitWhen: ...
-        def __new__(cls, _0: datetime.timedelta, _1: AutoCommitWhen) -> AutoCommit.IntervalOrWhen: ...
+        def __new__(
+            cls, _0: datetime.timedelta, _1: AutoCommitWhen
+        ) -> AutoCommit.IntervalOrWhen: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class IntervalOrAfter(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
         """
-        __match_args__ = ("_0", "_1",)
+
+        __match_args__ = (
+            "_0",
+            "_1",
+        )
         @property
         def _0(self) -> datetime.timedelta: ...
         @property
         def _1(self) -> AutoCommitAfter: ...
-        def __new__(cls, _0: datetime.timedelta, _1: AutoCommitAfter) -> AutoCommit.IntervalOrAfter: ...
+        def __new__(
+            cls, _0: datetime.timedelta, _1: AutoCommitAfter
+        ) -> AutoCommit.IntervalOrAfter: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class When(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> AutoCommitWhen: ...
         def __new__(cls, _0: AutoCommitWhen) -> AutoCommit.When: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class After(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> AutoCommitAfter: ...
         def __new__(cls, _0: AutoCommitAfter) -> AutoCommit.After: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     ...
 
 class AutoCommitAfter:
@@ -129,33 +146,38 @@ class AutoCommitAfter:
         r"""
         The offset is stored on the server after all the messages are consumed.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommitAfter.ConsumingAllMessages: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class ConsumingEachMessage(AutoCommitAfter):
         r"""
         The offset is stored on the server after consuming each message.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommitAfter.ConsumingEachMessage: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class ConsumingEveryNthMessage(AutoCommitAfter):
         r"""
         The offset is stored on the server after consuming every Nth message.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> builtins.int: ...
-        def __new__(cls, _0: builtins.int) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
+        def __new__(
+            cls, _0: builtins.int
+        ) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     ...
 
 class AutoCommitWhen:
@@ -167,43 +189,49 @@ class AutoCommitWhen:
         r"""
         The offset is stored on the server when the messages are received.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommitWhen.PollingMessages: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class ConsumingAllMessages(AutoCommitWhen):
         r"""
         The offset is stored on the server when all the messages are consumed.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommitWhen.ConsumingAllMessages: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class ConsumingEachMessage(AutoCommitWhen):
         r"""
         The offset is stored on the server when consuming each message.
         """
+
         __match_args__ = ()
         def __new__(cls) -> AutoCommitWhen.ConsumingEachMessage: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     @typing.final
     class ConsumingEveryNthMessage(AutoCommitWhen):
         r"""
         The offset is stored on the server when consuming every Nth message.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> builtins.int: ...
-        def __new__(cls, _0: builtins.int) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
+        def __new__(
+            cls, _0: builtins.int
+        ) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
-    
+
     ...
 
 @typing.final
@@ -264,7 +292,9 @@ class IggyClient:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the connection fails.
         """
-    def login_user(self, username: builtins.str, password: builtins.str) -> collections.abc.Awaitable[None]:
+    def login_user(
+        self, username: builtins.str, password: builtins.str
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
         Returns `Ok(())` on success, or a PyRuntimeError on failure.
@@ -279,41 +309,67 @@ class IggyClient:
         Creates a new stream with the provided ID and name.
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
-    def get_stream(self, stream_id: builtins.str | builtins.int) -> collections.abc.Awaitable[StreamDetails | None]:
+    def get_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[StreamDetails | None]:
         r"""
         Gets stream by id.
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-    def create_topic(self, stream: builtins.str | builtins.int, name: builtins.str, partitions_count: builtins.int, compression_algorithm: builtins.str | None = None, replication_factor: builtins.int | None = None, message_expiry: datetime.timedelta | None = None, max_topic_size: builtins.int | None = None) -> collections.abc.Awaitable[None]:
+    def create_topic(
+        self,
+        stream: builtins.str | builtins.int,
+        name: builtins.str,
+        partitions_count: builtins.int,
+        compression_algorithm: builtins.str | None = None,
+        replication_factor: builtins.int | None = None,
+        message_expiry: datetime.timedelta | None = None,
+        max_topic_size: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
         Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
         """
-    def get_topic(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int) -> collections.abc.Awaitable[TopicDetails | None]:
+    def get_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[TopicDetails | None]:
         r"""
         Gets topic by stream and id.
         Returns Option of topic details or a PyRuntimeError on failure.
         """
-    def get_topics(self, stream_id: builtins.str | builtins.int) -> collections.abc.Awaitable[list[Topic]]:
+    def get_topics(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
         Get all topics in a stream.
-        
+
         Args:
             stream_id: Stream identifier as `str | int`.
-        
+
         Returns:
             An awaitable that resolves to `list[Topic]`.
-        
+
         Raises:
             PyRuntimeError: If the identifier is invalid or the request fails.
         """
-    def update_topic(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int, name: builtins.str, compression_algorithm: builtins.str | None = None, replication_factor: builtins.int | None = None, message_expiry: datetime.timedelta | None = None, max_topic_size: builtins.int | None = None) -> collections.abc.Awaitable[None]:
+    def update_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+        compression_algorithm: builtins.str | None = None,
+        replication_factor: builtins.int | None = None,
+        message_expiry: datetime.timedelta | None = None,
+        max_topic_size: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
-        
+
         This is a full replacement: any optional parameter left unset is reset to
         its server default rather than preserved.
-        
+
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
@@ -322,67 +378,148 @@ class IggyClient:
             replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `datetime.timedelta | None`.
             max_topic_size: Maximum topic size in bytes as `int | None`.
-        
+
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
-        
+
         Raises:
             PyRuntimeError: If an argument is invalid or the request fails.
         """
-    def delete_topic(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int) -> collections.abc.Awaitable[None]:
+    def delete_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Delete a topic from a stream.
-        
+
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-        
+
         Returns:
             An awaitable that resolves to `None` when the topic is deleted.
-        
+
         Raises:
             PyRuntimeError: If an identifier is invalid or the request fails.
         """
-    def purge_topic(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int) -> collections.abc.Awaitable[None]:
+    def purge_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Purge all messages from a topic.
-        
+
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-        
+
         Returns:
             An awaitable that resolves to `None` when the topic is purged.
-        
+
         Raises:
             PyRuntimeError: If an identifier is invalid or the request fails.
         """
-    def create_consumer_group(self, stream: builtins.str | builtins.int, topic: builtins.str | builtins.int, name: builtins.str) -> collections.abc.Awaitable[None]:
+    def create_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
         r"""
-        Creates a new consumer group for the given stream and topic.
-        Returns Ok(()) on successful consumer group creation or a PyRuntimeError on failure.
+        Create a consumer group for a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: Consumer group name as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the consumer group is created.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
-    def get_consumer_group(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int, group_id: builtins.str | builtins.int) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
+    def get_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
         r"""
-        Gets consumer group by stream, topic, and group id.
-        Returns Option of consumer group details or a PyRuntimeError on failure.
+        Get a consumer group in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupDetails | None`.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
-    def get_consumer_groups(self, stream_id: builtins.str | builtins.int, topic_id: builtins.str | builtins.int) -> collections.abc.Awaitable[list[ConsumerGroup]]:
+    def get_consumer_groups(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Gets consumer groups by stream and topic.
-        Returns a list of consumer groups or a PyRuntimeError on failure.
+        Get all consumer groups in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[ConsumerGroup]`.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
-    def send_messages(self, stream: builtins.str | builtins.int, topic: builtins.str | builtins.int, partitioning: builtins.int, messages: list[SendMessage]) -> collections.abc.Awaitable[None]:
+    def send_messages(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        partitioning: builtins.int,
+        messages: list[SendMessage],
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Sends a list of messages to the specified topic.
         Returns Ok(()) on successful sending or a PyRuntimeError on failure.
         """
-    def poll_messages(self, stream: builtins.str | builtins.int, topic: builtins.str | builtins.int, partition_id: builtins.int, polling_strategy: PollingStrategy, count: builtins.int, auto_commit: builtins.bool) -> collections.abc.Awaitable[list[ReceiveMessage]]:
+    def poll_messages(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        partition_id: builtins.int,
+        polling_strategy: PollingStrategy,
+        count: builtins.int,
+        auto_commit: builtins.bool,
+    ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic and partition.
         Returns a list of received messages or a PyRuntimeError on failure.
         """
-    def consumer_group(self, name: builtins.str, stream: builtins.str, topic: builtins.str, partition_id: builtins.int | None = None, polling_strategy: PollingStrategy | None = None, batch_length: builtins.int | None = None, auto_commit: AutoCommit | None = None, create_consumer_group_if_not_exists: builtins.bool = True, auto_join_consumer_group: builtins.bool = True, poll_interval: datetime.timedelta | None = None, polling_retry_interval: datetime.timedelta | None = None, init_retries: builtins.int | None = None, init_retry_interval: datetime.timedelta | None = None, allow_replay: builtins.bool = False) -> collections.abc.Awaitable[IggyConsumer]:
+    def consumer_group(
+        self,
+        name: builtins.str,
+        stream: builtins.str,
+        topic: builtins.str,
+        partition_id: builtins.int | None = None,
+        polling_strategy: PollingStrategy | None = None,
+        batch_length: builtins.int | None = None,
+        auto_commit: AutoCommit | None = None,
+        create_consumer_group_if_not_exists: builtins.bool = True,
+        auto_join_consumer_group: builtins.bool = True,
+        poll_interval: datetime.timedelta | None = None,
+        polling_retry_interval: datetime.timedelta | None = None,
+        init_retries: builtins.int | None = None,
+        init_retry_interval: datetime.timedelta | None = None,
+        allow_replay: builtins.bool = False,
+    ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
         Returns the consumer or a PyRuntimeError on failure.
@@ -395,7 +532,9 @@ class IggyConsumer:
     It wraps the RustIggyConsumer and provides asynchronous functionality
     through the contained runtime.
     """
-    def get_last_consumed_offset(self, partition_id: builtins.int) -> builtins.int | None:
+    def get_last_consumed_offset(
+        self, partition_id: builtins.int
+    ) -> builtins.int | None:
         r"""
         Get the last consumed offset or `None` if no offset has been consumed yet.
         """
@@ -419,14 +558,18 @@ class IggyConsumer:
         r"""
         Gets the name of the topic this consumer group is configured for.
         """
-    def store_offset(self, offset: builtins.int, partition_id: builtins.int | None) -> collections.abc.Awaitable[None]:
+    def store_offset(
+        self, offset: builtins.int, partition_id: builtins.int | None
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def delete_offset(self, partition_id: builtins.int | None) -> collections.abc.Awaitable[None]:
+    def delete_offset(
+        self, partition_id: builtins.int | None
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
@@ -443,7 +586,13 @@ class IggyConsumer:
         only the interval part is applied; the `after` mode is ignored.
         Use `consume_messages()` if you need commit-after-processing semantics.
         """
-    def consume_messages(self, callback: collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]], shutdown_event: asyncio.Event | None) -> collections.abc.Awaitable[None]:
+    def consume_messages(
+        self,
+        callback: collections.abc.Callable[
+            [ReceiveMessage], collections.abc.Awaitable[None]
+        ],
+        shutdown_event: asyncio.Event | None,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
@@ -456,29 +605,29 @@ class PollingStrategy:
         @property
         def value(self) -> builtins.int: ...
         def __new__(cls, value: builtins.int) -> PollingStrategy.Offset: ...
-    
+
     @typing.final
     class Timestamp(PollingStrategy):
         __match_args__ = ("value",)
         @property
         def value(self) -> builtins.int: ...
         def __new__(cls, value: builtins.int) -> PollingStrategy.Timestamp: ...
-    
+
     @typing.final
     class First(PollingStrategy):
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.First: ...
-    
+
     @typing.final
     class Last(PollingStrategy):
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.Last: ...
-    
+
     @typing.final
     class Next(PollingStrategy):
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.Next: ...
-    
+
     ...
 
 @typing.final
@@ -602,4 +751,3 @@ class TopicDetails:
         r"""
         Replication factor for the topic.
         """
-
