@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "vsr")]
+mod catchup_stall;
 mod hello_world;
 #[cfg(feature = "vsr")]
 mod messages;
