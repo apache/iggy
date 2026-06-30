@@ -55,6 +55,10 @@ mod vsr_session_sealed {
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
+    /// SDK crate version sent in the login-register version prefix.
+    /// Implemented by the transports so the value is the SDK crate's own
+    /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
+    fn sdk_version(&self) -> &'static str;
 }
 
 #[cfg(feature = "vsr")]

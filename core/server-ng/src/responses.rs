@@ -62,12 +62,13 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, KIND_CONSUMER_GROUP, Operation, ReplyHeader, RequestHeader,
-    WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
+    Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
+    RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
@@ -777,6 +778,9 @@ pub(crate) fn build_empty_reply(
     build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
 }
 
+/// Server build version advertised in the login-register response.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub(crate) fn build_login_register_reply(
     request_header: &RequestHeader,
     client_id: u128,
@@ -784,10 +788,14 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    build_reply_with_body(request_header, client_id, session, commit, 12, |body| {
-        body[..4].copy_from_slice(&user_id.to_le_bytes());
-        body[4..12].copy_from_slice(&session.to_le_bytes());
-    })
+    let body = LoginRegisterResponse {
+        user_id,
+        session,
+        server_protocol_version: IGGY_PROTOCOL_VERSION,
+        server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
+    }
+    .to_bytes();
+    build_reply_from_bytes(request_header, client_id, session, commit, &body)
 }
 
 pub(crate) fn build_reply_from_bytes(

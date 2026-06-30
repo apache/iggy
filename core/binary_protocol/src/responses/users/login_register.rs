@@ -17,31 +17,38 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use crate::primitives::identifier::WireName;
 use bytes::{BufMut, BytesMut};
 
 /// Combined login + register response for server-ng.
 ///
-/// Returns the authenticated user's ID and the consensus session number
-/// (commit op number from the Register operation).
+/// Returns the authenticated user's ID, the consensus session number
+/// (commit op number from the Register operation), and the server's
+/// protocol version + build version so both sides know what they talk to.
 ///
-/// Wire format (12 bytes):
+/// Wire format:
 /// ```text
-/// [user_id:4 LE][session:8 LE]
+/// [user_id:u32 LE][session:u64 LE][server_protocol_version:u32 LE]
+/// [server_version_len:u8][server_version:N]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginRegisterResponse {
     pub user_id: u32,
     pub session: u64,
+    pub server_protocol_version: u32,
+    pub server_version: WireName,
 }
 
 impl WireEncode for LoginRegisterResponse {
     fn encoded_size(&self) -> usize {
-        12
+        16 + self.server_version.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.user_id);
         buf.put_u64_le(self.session);
+        buf.put_u32_le(self.server_protocol_version);
+        self.server_version.encode(buf);
     }
 }
 
@@ -49,7 +56,17 @@ impl WireDecode for LoginRegisterResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let user_id = read_u32_le(buf, 0)?;
         let session = read_u64_le(buf, 4)?;
-        Ok((Self { user_id, session }, 12))
+        let server_protocol_version = read_u32_le(buf, 12)?;
+        let (server_version, server_version_len) = WireName::decode(&buf[16..])?;
+        Ok((
+            Self {
+                user_id,
+                session,
+                server_protocol_version,
+                server_version,
+            },
+            16 + server_version_len,
+        ))
     }
 }
 
@@ -57,26 +74,33 @@ impl WireDecode for LoginRegisterResponse {
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip() {
-        let resp = LoginRegisterResponse {
+    fn sample() -> LoginRegisterResponse {
+        LoginRegisterResponse {
             user_id: 42,
             session: 100,
-        };
+            server_protocol_version: 1,
+            server_version: WireName::new("0.8.0").unwrap(),
+        }
+    }
+
+    #[test]
+    fn roundtrip() {
+        let resp = sample();
         let bytes = resp.to_bytes();
-        assert_eq!(bytes.len(), 12);
         let (decoded, consumed) = LoginRegisterResponse::decode(&bytes).unwrap();
-        assert_eq!(consumed, 12);
+        assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, resp);
     }
 
     #[test]
+    fn encoded_size_matches_output() {
+        let resp = sample();
+        assert_eq!(resp.encoded_size(), resp.to_bytes().len());
+    }
+
+    #[test]
     fn truncated_returns_error() {
-        let resp = LoginRegisterResponse {
-            user_id: 1,
-            session: 1,
-        };
-        let bytes = resp.to_bytes();
+        let bytes = sample().to_bytes();
         for i in 0..bytes.len() {
             assert!(
                 LoginRegisterResponse::decode(&bytes[..i]).is_err(),
@@ -90,6 +114,8 @@ mod tests {
         let resp = LoginRegisterResponse {
             user_id: 0x0102_0304,
             session: 0x0506_0708_090A_0B0C,
+            server_protocol_version: 0x0D0E_0F10,
+            server_version: WireName::new("v").unwrap(),
         };
         let bytes = resp.to_bytes();
         assert_eq!(
@@ -100,5 +126,11 @@ mod tests {
             u64::from_le_bytes(bytes[4..12].try_into().unwrap()),
             0x0506_0708_090A_0B0C
         );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            0x0D0E_0F10
+        );
+        assert_eq!(bytes[16], 1);
+        assert_eq!(bytes[17], b'v');
     }
 }

@@ -33,6 +33,7 @@ pub async fn handle_get_snapshot(
 ) -> Result<HandlerResult, IggyError> {
     debug!("session: {session}, command: get_snapshot");
     shard.ensure_authenticated(session)?;
+    shard.metadata.perm_get_snapshot(session.get_user_id())?;
 
     let compression = SnapshotCompression::from_code(req.compression)?;
     let snapshot_types: Vec<SystemSnapshotType> = req

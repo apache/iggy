@@ -15,16 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-services:
-  devcontainer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - ..:/workspace:cached
-    network_mode: service:iggy
-    command: sleep infinity
-
-  iggy:
-    image: apache/iggy:latest
-    restart: unless-stopped
+[connectors]
+config_type = "local"
+config_dir = "../connectors/sinks/s3_sink"

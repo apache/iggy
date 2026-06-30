@@ -67,6 +67,7 @@ pub mod namespace;
 pub mod primitives;
 pub mod requests;
 pub mod responses;
+pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
@@ -93,6 +94,10 @@ pub use primitives::polling_strategy::WirePollingStrategy;
 pub use primitives::user_headers::{
     WireHeaderKind, WireUserHeaderEntry, WireUserHeaderIterator, WireUserHeaders,
     encode_user_headers, user_headers_encoded_size, validate_user_headers,
+};
+pub use version::{
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, ProtocolVersion,
+    is_protocol_compatible,
 };
 
 /// Maximum number of partitions allowed in a single create/delete request.

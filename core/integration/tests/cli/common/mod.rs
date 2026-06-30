@@ -20,6 +20,7 @@ pub(crate) mod help;
 pub(crate) mod keyring;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
 pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
+#[allow(unused_imports)]
 pub(crate) use crate::cli::common::keyring::ensure_keyring_store;
 use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
