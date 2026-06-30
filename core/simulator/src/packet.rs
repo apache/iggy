@@ -772,16 +772,28 @@ impl std::fmt::Debug for PacketSimulator {
 mod tests {
     use super::*;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn create_test_message() -> Message<GenericHeader> {
-        Message::<GenericHeader>::new(std::mem::size_of::<GenericHeader>())
+        let size = std::mem::size_of::<GenericHeader>();
+        let mut message = Message::<GenericHeader>::new(size);
+        // `Message::new` zeroes the buffer, leaving the header `size` field 0;
+        // set it to the frame length so the message survives `try_from` (e.g.
+        // on `deep_copy`), which now floors `size >= size_of::<H>()`.
+        let header: &mut GenericHeader =
+            bytemuck::checked::try_from_bytes_mut(&mut message.as_mut_slice()[..size])
+                .expect("zeroed bytes are valid");
+        header.size = size as u32;
+        message
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn create_test_message_with_command(command: Command2) -> Message<GenericHeader> {
         let size = std::mem::size_of::<GenericHeader>();
         let mut buf = vec![0u8; size];
         let header: &mut GenericHeader =
             bytemuck::checked::try_from_bytes_mut(&mut buf).expect("zeroed bytes are valid");
         header.command = command;
+        header.size = size as u32;
         Message::try_from(server_common::iobuf::Owned::<4096>::copy_from_slice(&buf))
             .expect("generic test buffer must contain a valid generic message")
     }

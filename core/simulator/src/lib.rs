@@ -31,7 +31,7 @@ use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
-use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
+use partitions::{Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -309,18 +309,23 @@ impl Simulator {
         replica_idx: usize,
         namespace: IggyNamespace,
         consumer: PollingConsumer,
-        args: PollingArgs,
-    ) -> Result<PollQueryResult<4096>, IggyError> {
+        args: &PollingArgs,
+    ) -> Result<PollFragments<4096>, IggyError> {
         let replica = &self.replicas[replica_idx];
-        let partition =
-            replica
-                .plane
-                .partitions()
-                .get_by_ns(&namespace)
-                .ok_or(IggyError::ResourceNotFound(format!(
-                    "partition not found for namespace {namespace:?} on replica {replica_idx}"
-                )))?;
-        futures::executor::block_on(partition.poll_messages(consumer, args))
+        // Build the owned poll plan synchronously, then execute off the borrow.
+        // The sim's partitions are in-memory (no `partition_dir`), so the plan
+        // serves only the resident journal tier; `execute` performs no disk IO.
+        let Some(plan) = replica
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, args)
+        else {
+            return Err(IggyError::ResourceNotFound(format!(
+                "partition not found for namespace {namespace:?} on replica {replica_idx}"
+            )));
+        };
+        let (fragments, _commit_offset) = futures::executor::block_on(plan.execute());
+        Ok(fragments)
     }
 
     /// Partition offsets from a replica.
@@ -672,10 +677,12 @@ mod tests {
             "different seeds produced identical reply hashes; determinism collapsed"
         );
 
-        // Fragile cross-run baseline. Drifts whenever reply shape,
-        // partition commit values, or PRNG draw order change. Re-lock on
-        // intentional changes; expect re-locks until error discriminants
-        // and reply bodies stabilize the wire format.
+        // Fragile cross-run baseline, pinned to seed 0xDEAD_BEEF under the default
+        // `ActionWeights`. Drifts whenever reply shape, partition commit values, or
+        // PRNG draw order change. Draw order is sensitive to `pick_outcome`: adding
+        // an outcome to an op sampled in this seed's window, or a weight bump,
+        // shifts the trace. Re-lock on intentional changes; expect re-locks until
+        // error discriminants and reply bodies stabilize the wire format.
         assert_eq!(
             h1, 0x882B_163F_CA9B_A0BC,
             "workload reply hash drifted from locked baseline"
@@ -928,6 +935,79 @@ mod tests {
             distinct >= 2,
             "commits concentrated on a single client ({commits_per_client:?}); \
              no interleaving observed"
+        );
+    }
+
+    /// Outcome-first generation: with a single client the strict equality oracle
+    /// is on, so any targeted-vs-committed mismatch panics in `on_reply`. Populate
+    /// streams, then drive a Create/Delete mix targeting error outcomes
+    /// (`NameAlreadyExists` by reusing a live name, `StreamNotFound` by fabricating
+    /// an absent one). Assert the server committed rejections, proving the error
+    /// paths are generated and verified end-to-end.
+    #[test]
+    fn outcome_first_generation_commits_targeted_rejections() {
+        use crate::workload::{
+            Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_0E4C,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        // Phase 1: populate streams so `NameAlreadyExists` has live targets.
+        let mut options = WorkloadOptions::new(0x5EED_0E4C, replica_count, vec![ns_a]);
+        options.weights = ActionWeights::new(&[(Action::CreateStream, 100)]);
+        let mut wl = Workload::new(options);
+        for _tick in 0..2_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+            }
+        }
+
+        // Phase 2: keep creating (now hitting `NameAlreadyExists` on live names)
+        // and deleting (hitting `StreamNotFound` on fabricated names).
+        wl.options.weights =
+            ActionWeights::new(&[(Action::CreateStream, 50), (Action::DeleteStream, 50)]);
+        for _tick in 0..4_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+            }
+        }
+
+        assert!(
+            wl.auditor.stats().committed_rejections > 0,
+            "outcome-first generation produced no committed rejections; error \
+             outcomes are not being targeted, or the server is not rejecting them"
         );
     }
 

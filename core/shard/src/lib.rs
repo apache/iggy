@@ -1194,7 +1194,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1318,7 +1318,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1337,7 +1337,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1356,7 +1356,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1390,7 +1390,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1475,25 +1475,46 @@ where
         partitions.insert(namespace, partition);
     }
 
-    /// Handle incoming view-change/control message. Metadata use metadata
-    /// consensus. Partitions loop all partitions, use partition consensus.
-    ///
-    // TODO(hubcio): every VSR callback below
-    // (`on_start_view_change`, `on_do_view_change`, `on_start_view`,
-    // `on_commit`, `tick_partitions`) materialises
-    // `planes.1.0.namespaces().copied().collect::<Vec<_>>()` per call to
-    // avoid borrowing the partitions plane across the partition-consensus
-    // `.await` inside the loop. Allocs scale with VSR traffic, not with
-    // useful work: a quiet cluster still pays one Vec per heartbeat tick.
-    // Convert to the `namespace_scratch: RefCell<Vec<IggyNamespace>>`
-    // pattern already used by `process_loopback` (see :646-684) so the
-    // scratch is reused across calls. Asserts on entry/exit keep the
-    // "empty on entry, drained on exit" invariant explicit.
-    //
-    // Reproducible in `core/simulator`: sim drives these callbacks via
-    // `tick()` against `IggyShard`, so an allocation-counting variant of
-    // `MemStorage`/test harness can pin the per-VSR-cb alloc count and
-    // fail on regression after the scratch refactor lands.
+    /// Resolve the single partition a VSR control frame addresses, keyed by
+    /// `header.namespace`. Warns and returns `None` when the namespace matches
+    /// neither metadata nor a live partition consensus. Returns `&mut` because
+    /// `on_do_view_change` / `on_commit` need it for `commit_journal`; the read-
+    /// only callers reborrow `&`. Pump-only (sole mutator), so the `&mut` formed
+    /// here via interior mutability cannot alias a concurrent reconcile.
+    #[allow(clippy::mut_from_ref)]
+    fn resolve_partition_target<'a>(
+        &self,
+        partitions: &'a IggyPartitions<B>,
+        namespace: u64,
+        view: u32,
+        replica: u8,
+        frame: &'static str,
+    ) -> Option<&'a mut IggyPartition<B>>
+    where
+        B: MessageBus,
+    {
+        let Some(partition) = partitions.get_mut_by_ns(&IggyNamespace::from_raw(namespace)) else {
+            tracing::warn!(
+                shard = self.id,
+                namespace,
+                view,
+                replica,
+                frame,
+                "dropping VSR control frame: namespace matches neither metadata nor partition consensus"
+            );
+            return None;
+        };
+        debug_assert_eq!(
+            partition.consensus().namespace(),
+            namespace,
+            "keyed partition lookup must match the frame namespace"
+        );
+        Some(partition)
+    }
+
+    /// Handle an incoming VSR control frame. A metadata frame uses the metadata
+    /// consensus; a partition frame addresses exactly one partition, resolved by
+    /// [`Self::resolve_partition_target`].
     #[allow(clippy::future_not_send)]
     async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
     where
@@ -1516,29 +1537,19 @@ where
             return;
         }
 
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "StartViewChange",
+        ) else {
             return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartViewChange: namespace matches neither metadata nor partition consensus"
-        );
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -1554,7 +1565,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1576,35 +1587,25 @@ where
         }
 
         let config = planes.1.0.config();
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
-            if actions
-                .iter()
-                .any(|action| matches!(action, VsrAction::CommitJournal))
-            {
-                partition.commit_journal(config).await;
-            }
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "DoViewChange",
+        ) else {
             return;
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if actions
+            .iter()
+            .any(|action| matches!(action, VsrAction::CommitJournal))
+        {
+            partition.commit_journal(config).await;
         }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping DoViewChange: namespace matches neither metadata nor partition consensus"
-        );
     }
 
     #[allow(clippy::future_not_send)]
@@ -1629,29 +1630,19 @@ where
             return;
         }
 
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "StartView",
+        ) else {
             return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartView: namespace matches neither metadata nor partition consensus"
-        );
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -1667,7 +1658,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1684,29 +1675,19 @@ where
         }
 
         let config = planes.1.0.config();
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            if consensus.handle_commit(&header) {
-                partition.commit_journal(config).await;
-            }
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "Commit",
+        ) else {
             return;
+        };
+        let consensus = partition.consensus();
+        if consensus.handle_commit(&header) {
+            partition.commit_journal(config).await;
         }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping Commit: namespace matches neither metadata nor partition consensus"
-        );
     }
 
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
@@ -1722,6 +1703,14 @@ where
             >,
     {
         let partitions = self.plane.partitions();
+        // Fan out over every group (each partition's heartbeat/retransmit timer
+        // must advance), so the keyed single-namespace lookup the control-frame
+        // handlers use does not apply here. The namespaces are snapshotted into
+        // an owned Vec so no partitions-plane borrow is held across the tick
+        // `.await`.
+        // TODO(hubcio): reuse the pump's `namespace_scratch` (as
+        // `process_loopback` does) to drop this per-tick alloc; a quiet cluster
+        // still pays one Vec per heartbeat.
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
 
         for namespace in namespaces {
