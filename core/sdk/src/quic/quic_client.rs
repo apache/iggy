@@ -71,6 +71,14 @@ const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "vsr")]
 const TRANSIENT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Backoff before replaying a request the server answered with an explicit
+/// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
+/// view-change cancel). Unlike a silent timeout, this reply arrives promptly, so
+/// a short pause keeps the replay from spinning while the primary catches up.
+/// Bounded overall by `RESPONSE_READ_TIMEOUT`.
+#[cfg(feature = "vsr")]
+const NOT_READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// QUIC client for interacting with the Iggy API.
 #[derive(Debug)]
 pub struct QuicClient {
@@ -753,15 +761,34 @@ impl QuicClient {
                         Ok(reply) => return Ok(reply),
                         // `Disconnected` = our read timed out (server never
                         // answered). `EmptyResponse` = the server abandoned the
-                        // bidi (finished it with no body) because it could not
-                        // commit transiently and expects a replay. Both mean
-                        // "resend the same request on a fresh bidi"; the session
-                        // stays intact so no reconnect/relogin is needed.
-                        Err(IggyError::Disconnected | IggyError::EmptyResponse)
-                            if allow_resend && tokio::time::Instant::now() < deadline =>
+                        // bidi (finished it with no body). `TransientNotCommitted`
+                        // = the server replied with an explicit retry frame
+                        // because it could not commit yet (not-caught-up /
+                        // in-flight / pipeline-full / view-change cancel). All
+                        // three mean "resend the same request on a fresh bidi";
+                        // the session stays intact so no reconnect/relogin needed.
+                        // Login/register resends on `TransientNotCommitted` too
+                        // (nothing committed -> the same Register replays
+                        // idempotently, no fresh session needed); for the silent
+                        // paths login still falls through to the reconnect+relogin
+                        // path in `send_raw_with_response`.
+                        Err(
+                            error @ (IggyError::Disconnected
+                            | IggyError::EmptyResponse
+                            | IggyError::TransientNotCommitted),
+                        ) if (allow_resend || error == IggyError::TransientNotCommitted)
+                            && tokio::time::Instant::now() < deadline =>
                         {
+                            // The explicit frame returns promptly (no read
+                            // timeout elapsed), so pace the replay; the silent
+                            // paths already waited out `attempt_timeout`.
+                            if error == IggyError::TransientNotCommitted {
+                                let remaining = deadline
+                                    .saturating_duration_since(tokio::time::Instant::now());
+                                tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                            }
                             warn!(
-                                "QUIC request code {code} unanswered within {attempt_timeout:?} (transient); resending on a new stream"
+                                "QUIC request code {code} not committed (transient); resending on a new stream"
                             );
                         }
                         Err(error) => return Err(error),

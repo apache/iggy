@@ -33,7 +33,7 @@ use iggy_binary_protocol::codes::{
     GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
     GET_USERS_CODE,
 };
-use iggy_binary_protocol::consensus::RESULT_COUNT_LEN;
+use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -785,10 +785,24 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    build_reply_with_body(request_header, client_id, session, commit, 12, |body| {
-        body[..4].copy_from_slice(&user_id.to_le_bytes());
-        body[4..12].copy_from_slice(&session.to_le_bytes());
-    })
+    // Result-framed like every metadata reply: a zero result-count (success)
+    // followed by the `[user_id][session]` payload. A transient Register instead
+    // ships a `[count=1][index=0][TransientNotCommitted]` frame
+    // (`build_transient_reply`), which the SDK decodes and replays. The matching
+    // strip is in the SDK `split_metadata_result` (Register is result-framed).
+    build_reply_with_body(
+        request_header,
+        client_id,
+        session,
+        commit,
+        RESULT_COUNT_LEN + 12,
+        |body| {
+            body[..RESULT_COUNT_LEN].copy_from_slice(&0u32.to_le_bytes());
+            body[RESULT_COUNT_LEN..RESULT_COUNT_LEN + 4].copy_from_slice(&user_id.to_le_bytes());
+            body[RESULT_COUNT_LEN + 4..RESULT_COUNT_LEN + 12]
+                .copy_from_slice(&session.to_le_bytes());
+        },
+    )
 }
 
 pub(crate) fn build_reply_from_bytes(
@@ -832,6 +846,14 @@ pub(crate) fn build_raw_pat_reply(
         return Ok(committed);
     }
     let header_len = std::mem::size_of::<ReplyHeader>();
+    // A `Reply` whose result section is nonzero is not a successful commit but a
+    // committed business rejection or a `TransientNotCommitted` retry frame, both
+    // with no payload and no token to ship. Pass it through so the client decodes
+    // the typed result (and, for a transient, replays) instead of having a raw
+    // token grafted onto a rejection body.
+    if result_code(&committed.as_slice()[header_len..]) != Some(0) {
+        return Ok(committed);
+    }
     let committed_header =
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
             .map_err(|_| IggyError::InvalidFormat)?;

@@ -26,7 +26,7 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    build_reply_message_with, drain_committable_prefix, emit_sim_event,
+    build_reply_message_with, build_transient_reply, drain_committable_prefix, emit_sim_event,
     fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
     replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
@@ -1336,22 +1336,27 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
+        // Not-primary / not-caught-up is transient: the same request replayed
+        // once a primary is caught up commits fine. Reply with the explicit
+        // `TransientNotCommitted` frame (relayed to the socket by the home shard)
+        // so the client replays immediately rather than waiting out its
+        // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
+        // sync, so the client resends on the same connection (session intact).
         if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
+            return Ok(build_transient_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+            )
+            .into_generic());
         }
 
         // Dedup / session / eviction. shard 0 cannot route by the VSR
         // consensus `client_id` (its top bits are random, not home-shard
-        // routing), so a Replay/Evict is returned to the home shard as the
-        // reply -- `handle_client_request` writes it to the originating socket
-        // by transport id, exactly like a fresh commit. Drop surfaces as
-        // Canceled so the home shard stays silent and the SDK replays.
+        // routing), so a Replay/Evict/NotReady is returned to the home shard as
+        // the reply -- `handle_client_request` writes it to the originating
+        // socket by transport id, exactly like a fresh commit. Drop (client-bug
+        // stale/gap) surfaces as Canceled so the home shard stays silent.
         match request_preflight(consensus, &self.client_table, client_id, session, request) {
             PreflightOutcome::Dispatch => {}
             PreflightOutcome::Replay(reply) => {
@@ -1366,11 +1371,27 @@ where
                 let ctx = EvictionContext::from_consensus(consensus);
                 return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
             }
+            // In-flight prepare from this client: replaying the same request_id
+            // is absorbed until the original commits, then served from cache.
+            PreflightOutcome::NotReady => {
+                return Ok(build_transient_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotCommitted.as_code(),
+                )
+                .into_generic());
+            }
             PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
+        // Pipeline full: backpressure, not failure. Tell the client to replay.
         if consensus.pipeline().borrow().is_full() {
-            return Err(MetadataSubmitError::PipelineFull);
+            return Ok(build_transient_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+            )
+            .into_generic());
         }
 
         let Ok(prepare) = self.prepare_request(message) else {
@@ -1382,10 +1403,19 @@ where
             return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
         };
 
-        self.dispatch_prepare_and_await(consensus, prepare)
-            .await
-            .map(server_common::Message::into_generic)
-            .map_err(|Canceled| MetadataSubmitError::Canceled)
+        // A view change canceled the pending prepare before commit. The op may
+        // or may not have committed; replaying the same request_id is idempotent
+        // (the new primary serves it from cache if committed, else re-dispatches),
+        // so reply with the transient frame rather than staying silent.
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.into_generic()),
+            Err(Canceled) => Ok(build_transient_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::TransientNotCommitted.as_code(),
+            )
+            .into_generic()),
+        }
     }
 
     /// Subscribe to a prepared metadata write, dispatch it into the pipeline,

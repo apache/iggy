@@ -120,6 +120,8 @@ pub enum IggyError {
     UsersLimitReached = 55,
     #[error("Invalid personal access token expiry")]
     InvalidPersonalAccessTokenExpiry = 56,
+    #[error("Request transiently not committed; retry")]
+    TransientNotCommitted = 57,
     #[error("Not connected")]
     NotConnected = 61,
     #[error("Client shutdown")]
