@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod cpu_allocation;
 mod local_idx;
 mod namespace;
 mod partition_location;
 mod shard_id;
 
-pub use cpu_allocation::{CpuAllocation, NumaConfig};
 pub use local_idx::LocalIdx;
 pub use namespace::{
     IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE,

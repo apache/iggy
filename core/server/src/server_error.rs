@@ -36,7 +36,7 @@ error_set!(
 
     NumaError := {
         #[display("{0}")]
-        Sharding(crate::shard_allocator::ShardingError),
+        Sharding(shard_allocator::ShardingError),
     }
 
     ConfigurationError := {

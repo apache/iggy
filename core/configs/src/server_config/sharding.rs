@@ -22,10 +22,11 @@ use std::time::Duration;
 
 use configs::ConfigEnv;
 
-// `CpuAllocation`/`NumaConfig` live in `server_common` next to the allocator
-// that consumes them. Re-exported here to keep the `configs::sharding::*` path
-// stable and to avoid a `server_common -> configs -> server_common` cycle.
-pub use server_common::sharding::{CpuAllocation, NumaConfig};
+// `CpuAllocation`/`NumaConfig` are pure config types and live in their own
+// leaf crate so both `configs` and `shard_allocator` can share them without
+// pulling each other's heavier dependency trees. Re-exported here to keep the
+// `configs::sharding::*` path stable for existing callers.
+pub use cpu_allocation::{CpuAllocation, NumaConfig};
 
 /// Default capacity of the per-shard inter-shard inbox channel. Sized
 /// comfortably above the consensus working set, which is roughly

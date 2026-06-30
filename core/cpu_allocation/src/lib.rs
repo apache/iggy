@@ -15,9 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! `cpu_allocation`: tiny config types that say how many CPU cores the
+//! server should grab for its shards, and how.
+//!
+//! These two types ([`CpuAllocation`] and [`NumaConfig`]) are read from
+//! the server config (TOML). The config crate re-exports them, and the
+//! `shard_allocator` crate turns them into a real plan. Kept in their
+//! own little crate so neither side has to pull in the other's heavy
+//! dependencies just to share two small enums.
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::str::FromStr;
 
+/// Tell server how many CPU cores to grab for shards, and how.
+///
+/// Server make one shard per core. This say which cores. Pick one:
+/// - `All`: take every core machine have.
+/// - `Count(n)`: take first `n` cores.
+/// - `Range(a, b)`: take cores `a` up to (not including) `b`.
+/// - `NumaAware(..)`: smart pick by NUMA node, keep memory close to core.
+///
+/// Parse from a string in TOML, e.g. `"all"`, `4`, `"2..8"`,
+/// `"numa:auto"`, or `"numa:nodes=0,1;cores=4;no_ht=true"`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum CpuAllocation {
     #[default]
@@ -27,14 +46,18 @@ pub enum CpuAllocation {
     NumaAware(NumaConfig),
 }
 
-/// NUMA specific configuration
+/// Knobs for NUMA-aware core picking.
+///
+/// NUMA = machine split into groups (nodes). Each node have own cores
+/// and own memory. Memory of same node is fast; far node is slow. This
+/// struct say which nodes to use and how many cores from each.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NumaConfig {
-    /// Which NUMA nodes to use (empty = auto-detect all)
+    /// Which NUMA nodes to use. Empty means: use all of them.
     pub nodes: Vec<usize>,
-    /// Cores per node to use (0 = use all available)
+    /// How many cores to take from each node. `0` means: take all.
     pub cores_per_node: usize,
-    /// skip hyperthread sibling
+    /// `true` means skip hyperthread twins, use only one thread per core.
     pub avoid_hyperthread: bool,
 }
 
@@ -247,5 +270,105 @@ mod tests {
         let serialized = serde_json::to_string(&original).unwrap();
         let deserialized: CpuAllocation = serde_json::from_str(&serialized).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_parse_invalid_range_too_many_parts() {
+        assert!(CpuAllocation::from_str("1..2..3").is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_range_start() {
+        assert!(CpuAllocation::from_str("x..8").is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_range_end() {
+        assert!(CpuAllocation::from_str("2..y").is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_count() {
+        assert!(CpuAllocation::from_str("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_missing_prefix() {
+        assert!(CpuAllocation::parse_numa("nodes=0").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_param_without_equals() {
+        assert!(CpuAllocation::from_str("numa:nodes").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_invalid_node_number() {
+        assert!(CpuAllocation::from_str("numa:nodes=a").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_invalid_cores() {
+        assert!(CpuAllocation::from_str("numa:cores=x").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_invalid_no_ht() {
+        assert!(CpuAllocation::from_str("numa:no_ht=maybe").is_err());
+    }
+
+    #[test]
+    fn test_parse_numa_unknown_param() {
+        assert!(CpuAllocation::from_str("numa:foo=1").is_err());
+    }
+
+    #[test]
+    fn test_serialize_all() {
+        assert_eq!(
+            serde_json::to_string(&CpuAllocation::All).unwrap(),
+            "\"all\""
+        );
+    }
+
+    #[test]
+    fn test_serialize_count() {
+        assert_eq!(
+            serde_json::to_string(&CpuAllocation::Count(4)).unwrap(),
+            "4"
+        );
+    }
+
+    #[test]
+    fn test_serialize_range() {
+        assert_eq!(
+            serde_json::to_string(&CpuAllocation::Range(2, 8)).unwrap(),
+            "\"2..8\""
+        );
+    }
+
+    #[test]
+    fn test_serialize_numa_auto() {
+        let auto = CpuAllocation::NumaAware(NumaConfig {
+            nodes: vec![],
+            cores_per_node: 0,
+            avoid_hyperthread: true,
+        });
+        assert_eq!(serde_json::to_string(&auto).unwrap(), "\"numa:auto\"");
+    }
+
+    #[test]
+    fn test_deserialize_number() {
+        assert_eq!(
+            serde_json::from_str::<CpuAllocation>("4").unwrap(),
+            CpuAllocation::Count(4)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_string() {
+        assert_eq!(
+            serde_json::from_str::<CpuAllocation>("\"all\"").unwrap(),
+            CpuAllocation::All
+        );
     }
 }

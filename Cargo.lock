@@ -3088,6 +3088,7 @@ name = "configs"
 version = "0.1.0"
 dependencies = [
  "configs_derive",
+ "cpu_allocation",
  "derive_more",
  "err_trail",
  "figment",
@@ -3279,6 +3280,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "cpu_allocation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -11662,8 +11671,6 @@ dependencies = [
  "nix",
  "rcgen",
  "rustls",
- "serde",
- "serde_json",
  "serial_test",
  "smallvec",
  "thiserror 2.0.18",
@@ -11753,9 +11760,9 @@ dependencies = [
 name = "shard_allocator"
 version = "0.1.0"
 dependencies = [
+ "cpu_allocation",
  "hwlocality",
  "nix",
- "server_common",
  "thiserror 2.0.18",
  "tracing",
 ]

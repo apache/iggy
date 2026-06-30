@@ -48,6 +48,7 @@ members = [
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
+    "core/cpu_allocation",
     "core/harness_derive",
     "core/integration",
     "core/journal",
@@ -134,6 +135,7 @@ configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
+cpu_allocation = { path = "core/cpu_allocation" }
 crossbeam = "0.8.4"
 crossfire = "3.1.16"
 csv = "1.4.0"

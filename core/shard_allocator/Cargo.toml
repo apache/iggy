@@ -24,7 +24,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-server_common = { workspace = true }
+cpu_allocation = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
