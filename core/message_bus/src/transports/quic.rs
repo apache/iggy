@@ -49,7 +49,7 @@
 //! `max_concurrent_bidi_streams=1`). Keying + the timeout let a transient
 //! bidi be abandoned safely: the SDK replays with the SAME request id, so a
 //! late reply for the abandoned request matches the replay's bidi and is
-//! consumed there, never mis-delivered to a later request. A future
+//! consumed there, never misrouted to a later request. A future
 //! pipelining upgrade would additionally run per-bidi handlers concurrently.
 //!
 //! The handshake itself is driven by [`accept_handshake`] (no bidi
@@ -423,7 +423,7 @@ impl TransportConn for QuicTransportConn {
             };
             // Request id this bidi is waiting on. Used to match its reply and
             // to discard stale/duplicate replies left by an abandoned bidi.
-            // `None` (unparseable) degrades to accepting the first reply.
+            // `None` (unparsable) degrades to accepting the first reply.
             let request_id = req
                 .as_slice()
                 .get(..HEADER_SIZE)
@@ -439,7 +439,7 @@ impl TransportConn for QuicTransportConn {
             // a single unkeyed per-connection channel, so filter by id and
             // discard replies belonging to an abandoned earlier bidi (the SDK
             // replays with the SAME request id, so a late reply matches and is
-            // consumed by the replay's bidi - never mis-delivered to a later
+            // consumed by the replay's bidi - never misrouted to a later
             // request). On timeout the dispatch produced no reply (a transient
             // submit: the server stays silent expecting a replay); abandon this
             // bidi and accept the next so the replay's fresh stream is not
