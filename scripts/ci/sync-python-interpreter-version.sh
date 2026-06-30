@@ -21,7 +21,6 @@ set -euo pipefail
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Default mode
@@ -321,13 +320,6 @@ ensure_line \
     "^FROM python:${PYTHON_VERSION_REGEX}-slim-trixie AS base$" \
     "\\1${PYTHON_VERSION}\\2" \
     "Docker image Python version"
-
-ensure_line \
-    "foreign/python/.devcontainer/Dockerfile" \
-    "^(FROM mcr\\.microsoft\\.com/devcontainers/python:1-)[0-9]+\\.[0-9]+(-trixie)$" \
-    "^FROM mcr\\.microsoft\\.com/devcontainers/python:1-${PYTHON_VERSION_REGEX}-trixie$" \
-    "\\1${PYTHON_VERSION}\\2" \
-    "devcontainer Python image version"
 
 ensure_line \
     "foreign/python/README.md" \
