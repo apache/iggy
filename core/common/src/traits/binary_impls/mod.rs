@@ -28,7 +28,9 @@ mod topics;
 mod users;
 
 use crate::IggyError;
-use crate::http::users::defaults::{MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH};
+use crate::http::users::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
 use iggy_binary_protocol::WireDecode;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
@@ -60,6 +62,15 @@ pub(crate) fn validate_password(password: &str) -> Result<(), IggyError> {
     Ok(())
 }
 
+/// Same bounds and error the servers enforce for usernames, applied before
+/// encoding so an oversized username can never desync the wire name prefix.
+pub(crate) fn validate_username(username: &str) -> Result<(), IggyError> {
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username.len()) {
+        return Err(IggyError::InvalidUsername);
+    }
+    Ok(())
+}
+
 /// Decode a wire response, logging the error details before converting to `IggyError`.
 pub(crate) fn decode_response<T: WireDecode>(response: &[u8]) -> Result<T, IggyError> {
     T::decode_from(response).map_err(|e| {
@@ -78,5 +89,13 @@ mod tests {
         assert!(validate_password(&"a".repeat(MIN_PASSWORD_LENGTH)).is_ok());
         assert!(validate_password(&"a".repeat(MAX_PASSWORD_LENGTH)).is_ok());
         assert!(validate_password(&"a".repeat(MAX_PASSWORD_LENGTH + 1)).is_err());
+    }
+
+    #[test]
+    fn validate_username_enforces_server_bounds() {
+        assert!(validate_username(&"a".repeat(MIN_USERNAME_LENGTH - 1)).is_err());
+        assert!(validate_username(&"a".repeat(MIN_USERNAME_LENGTH)).is_ok());
+        assert!(validate_username(&"a".repeat(MAX_USERNAME_LENGTH)).is_ok());
+        assert!(validate_username(&"a".repeat(MAX_USERNAME_LENGTH + 1)).is_err());
     }
 }

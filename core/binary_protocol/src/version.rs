@@ -58,6 +58,15 @@
 //! [sdk_version_len: u8][sdk_version: UTF-8, 1-255 bytes]
 //! ```
 //!
+//! ## Request framing
+//!
+//! `ClientVersionInfo` is the leading bytes of the login-register request
+//! *body*, which itself rides inside a 256-byte VSR `RequestHeader` (see
+//! `consensus::header`): `command` = `Command2::Request`, `operation` =
+//! `Operation::Register`, `namespace` = `METADATA_CONSENSUS_NAMESPACE`,
+//! client id in `RequestHeader.client`. A foreign SDK emits that header,
+//! then the body starting with this prefix, to reach the gate.
+//!
 //! ## Login gate
 //!
 //! The server accepts a client when its packed version is
@@ -96,6 +105,11 @@ pub const IGGY_PROTOCOL_VERSION: u32 = parse_packed_semver(env!("CARGO_PKG_VERSI
 /// Oldest protocol version this build still accepts at login: the current
 /// version with patch zeroed (patch releases never change the wire).
 /// Widen deliberately when a minor bump stays wire-compatible.
+///
+/// Under 0.x this makes a server minor bump a client flag-day: every
+/// prior-minor client is rejected at login until MIN is widened. A rolling
+/// upgrade across a minor bump must either widen MIN (when the wire stayed
+/// compatible) or accept that old clients fail re-login -- decide per release.
 // TODO(hubcio): past 1.0.0 follow strict semver: major bump = incompatible,
 // minor/patch = compatible, so MIN derives from the current major instead
 // of the current minor. Under 0.x a minor bump may break the wire, so the

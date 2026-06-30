@@ -85,6 +85,7 @@ impl<B: BinaryClient> UserClient for B {
         permissions: Option<Permissions>,
     ) -> Result<UserInfoDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
+        super::validate_username(username)?;
         super::validate_password(password)?;
         let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
         let wire_perms = permissions.as_ref().map(permissions_to_wire);
@@ -184,6 +185,7 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
+        super::validate_username(username)?;
         super::validate_password(password)?;
         #[cfg(feature = "vsr")]
         {

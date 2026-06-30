@@ -1576,9 +1576,11 @@ async fn handle_login_register_request(
 
     // Both login-register shapes share the ClientVersionInfo prefix, so the
     // protocol gate decodes it once and runs before any credential work; the
-    // body shapes below parse from past the prefix. Clients from before the
-    // header relayout never reach this gate: their command byte sits at the
-    // old offset, so the typed-header decode drops the frame earlier.
+    // body shapes below parse from past the prefix. Only VSR clients reach
+    // this gate -- legacy SDKs use LOGIN_USER_CODE, a separate path. A
+    // pre-versioning VSR client sends the old prefix-less body, which fails
+    // ClientVersionInfo::decode (-> MalformedLogin) or the version gate
+    // (-> IncompatibleProtocol) right here, not dropped earlier.
     let Ok((version_info, prefix_len)) = ClientVersionInfo::decode(body) else {
         warn!(
             transport_client_id,
