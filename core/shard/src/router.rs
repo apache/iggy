@@ -20,7 +20,7 @@ use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
-use consensus::PartitionsHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
@@ -30,6 +30,11 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use server_common::{Message, MessageBag};
+
+/// How often the shard pump drives `VsrConsensus::tick`: heartbeats, prepare
+/// retransmit, and view-change timeouts only advance when the tick runs
+/// ("call this periodically, e.g. every 10ms").
+const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Decompose a [`MessageBag`] into the routing-relevant tuple
 /// `(operation, namespace, generic_message)`.
@@ -260,9 +265,45 @@ where
         // first-drain reallocation.
         let mut loopback_buf = Vec::with_capacity(64);
         let mut namespace_scratch: Vec<IggyNamespace> = Vec::with_capacity(64);
+        // Consensus timer driver, folded into the pump: running the tick as a
+        // select! arm (not a sibling task) serializes it with frame processing,
+        // so `tick_partitions` can no longer hold a partition reference across
+        // an `.await` while `apply_reconcile_ops` reallocates the partitions
+        // vec on this same task. The timer is created once and pinned, then
+        // re-armed only after it fires, so a busy inbox cannot drop-and-reset
+        // it (which would stall heartbeats / prepare retransmit).
+        // Single source for the timer, so the re-arm below cannot drift from the
+        // initial interval.
+        let rearm_tick = || compio::time::sleep(CONSENSUS_TICK_INTERVAL).fuse();
+        let mut consensus_tick = std::pin::pin!(rearm_tick());
         loop {
             futures::select! {
                 _ = stop.recv().fuse() => break,
+                () = consensus_tick.as_mut() => {
+                    // Sharing the pump task is what keeps `tick_partitions`
+                    // borrow-safe, but it bounds the tick's worst-case delay to
+                    // one frame body's longest `.await` (replication append +
+                    // commit_journal fsync/rotate + reply).
+                    // TODO(hubcio): if a load test shows tick starvation,
+                    // make `tick_partitions` borrow-free so the tick can be
+                    // decoupled from the pump again without reintroducing the
+                    // partition-ref-across-`.await` UB this fold closed.
+                    self.tick_metadata().await;
+                    self.tick_partitions().await;
+                    // While a cooperative revocation is pending, wake the
+                    // reconciler each tick so the handoff completes within ~one
+                    // tick of the partition draining, not the periodic pass.
+                    if self
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .has_pending_revocations()
+                    {
+                        self.dispatch_metadata_commit_tick();
+                    }
+                    consensus_tick.set(rearm_tick());
+                }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {

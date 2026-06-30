@@ -67,6 +67,8 @@ pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod stream_size_validation_scenario;
+#[cfg(feature = "vsr")]
+pub mod stress_produce_consume_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod system_scenario;
 #[cfg(not(feature = "vsr"))]

@@ -42,7 +42,10 @@ use crate::session_manager::SessionManager;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 use bytes::Bytes;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{
+    EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
+    build_incompatible_protocol_eviction_message,
+};
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
@@ -60,7 +63,8 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::{
-    GenericHeader, KIND_CONSUMER_GROUP, Operation, RequestHeader, WireDecode, WireEncode,
+    ClientVersionInfo, EvictionReason, GenericHeader, KIND_CONSUMER_GROUP, Operation,
+    ProtocolVersion, RequestHeader, WireDecode, WireEncode, is_protocol_compatible,
 };
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
@@ -69,7 +73,7 @@ use message_bus::{IggyMessageBus, MessageBus};
 use metadata::impls::metadata::{
     MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
 };
-use partitions::{Partition, PollingArgs, PollingConsumer};
+use partitions::{PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -144,86 +148,100 @@ pub(crate) fn make_partition_read_handler(
     shard_handle: &ServerNgShardHandle,
 ) -> PartitionReadHandler {
     let shard_handle = Rc::clone(shard_handle);
+    // Runs synchronously on the shard pump (see `process_lifecycle` ->
+    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
+    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
+    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
+    // poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
-        let shard_handle = Rc::clone(&shard_handle);
-        // The poll awaits journal reads; run it as a task so the shard pump
-        // is not blocked. Same single-threaded-runtime discipline as the
-        // pump's own `on_request` path: the partition reference is resolved
-        // after the tombstone check and the read races only reconciler
-        // removal, which tombstones the namespace first.
-        compio::runtime::spawn(async move {
-            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-                return;
-            };
-            let partitions = shard.plane.partitions();
-            if partitions.is_tombstoned(&namespace) {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            }
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            };
-            let result = match read {
-                PartitionRead::Poll { consumer, args } => {
-                    let poll_started = std::time::Instant::now();
-                    let poll_result = partition.poll_messages(consumer, args).await;
-                    let elapsed = poll_started.elapsed();
-                    if elapsed > std::time::Duration::from_secs(1) {
-                        warn!(
-                            namespace_raw = namespace.inner(),
-                            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                            "slow partition poll; gather side may have timed out"
-                        );
+        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+            return;
+        };
+        let partitions = shard.plane.partitions();
+        match read {
+            PartitionRead::Poll { consumer, args } => {
+                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
+                    None => {
+                        let _ = reply.try_send(PartitionReadReply::NotFound);
                     }
-                    match poll_result {
-                        Ok((fragments, _last_matching_offset)) => PartitionReadReply::Poll {
+                    Some(plan) if plan.needs_off_pump_io() => {
+                        spawn_poll_io(namespace, plan, reply);
+                    }
+                    Some(plan) => {
+                        let (fragments, current_offset) = plan.execute_resident();
+                        let _ = reply.try_send(PartitionReadReply::Poll {
                             fragments,
-                            current_offset: partition.offsets().commit_offset,
-                        },
-                        Err(error) => {
-                            warn!(
-                                namespace_raw = namespace.inner(),
-                                error = %error,
-                                "partition poll failed"
-                            );
-                            PartitionReadReply::NotFound
-                        }
+                            current_offset,
+                        });
                     }
                 }
-                PartitionRead::ConsumerOffset { consumer } => PartitionReadReply::ConsumerOffset {
-                    stored: partition.get_consumer_offset(consumer),
-                    current_offset: partition.offsets().commit_offset,
-                },
-                PartitionRead::GroupOffsetState { group_id } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let key = iggy_common::ConsumerGroupId(group_id as usize);
-                    let load = |offset: &iggy_common::ConsumerOffset| {
-                        offset.offset.load(std::sync::atomic::Ordering::Relaxed)
-                    };
-                    let committed = partition.consumer_group_offsets.pin().get(&key).map(load);
-                    let last_polled = partition.last_polled_offsets.pin().get(&key).map(load);
-                    PartitionReadReply::GroupOffsetState {
+            }
+            PartitionRead::ConsumerOffset { consumer } => {
+                let result = match partitions.consumer_offset_read(&namespace, consumer) {
+                    Some((stored, current_offset)) => PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::GroupOffsetState { group_id } => {
+                let result = match partitions.group_offset_state(&namespace, group_id) {
+                    Some((last_polled, committed)) => PartitionReadReply::GroupOffsetState {
                         last_polled,
                         committed,
-                    }
-                }
-                PartitionRead::ClearGroupLastPolled { group_id } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let key = iggy_common::ConsumerGroupId(group_id as usize);
-                    partition.last_polled_offsets.pin().remove(&key);
-                    PartitionReadReply::Ack
-                }
-                PartitionRead::ResolveSegmentDeleteOffset { count } => {
-                    PartitionReadReply::SegmentDeleteOffset {
-                        up_to_offset: partition.nth_oldest_sealed_end_offset(count),
-                    }
-                }
-            };
-            let _ = reply.try_send(result);
-        })
-        .detach();
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ClearGroupLastPolled { group_id } => {
+                let result = match partitions.clear_group_last_polled(&namespace, group_id) {
+                    Some(()) => PartitionReadReply::Ack,
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ResolveSegmentDeleteOffset { count } => {
+                let result = partitions
+                    .nth_oldest_sealed_end_offset(&namespace, count)
+                    .map_or_else(
+                        || PartitionReadReply::NotFound,
+                        |up_to_offset| PartitionReadReply::SegmentDeleteOffset { up_to_offset },
+                    );
+                let _ = reply.try_send(result);
+            }
+        }
     })
+}
+
+/// Spawn the off-pump leg of a partition poll: disk read + auto-commit
+/// persist/apply on the OWNED plan (disk descriptors, resident-tail `Frozen`
+/// clones, `Arc` offset map), then send the reply. Holds no partition
+/// reference, so it is sound concurrently with the pump's `&mut` writes.
+fn spawn_poll_io(
+    namespace: IggyNamespace,
+    plan: PollPlan,
+    reply: shard::Sender<PartitionReadReply>,
+) {
+    compio::runtime::spawn(async move {
+        let poll_started = std::time::Instant::now();
+        let (fragments, current_offset) = plan.execute().await;
+        let elapsed = poll_started.elapsed();
+        if elapsed > std::time::Duration::from_secs(1) {
+            warn!(
+                namespace_raw = namespace.inner(),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "slow partition poll; gather side may have timed out"
+            );
+        }
+        let _ = reply.try_send(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        });
+    })
+    .detach();
 }
 
 pub(crate) fn make_deferred_replica_message_handler(
@@ -1679,7 +1697,7 @@ fn ensure_transport_connection(
         .ensure_connection(transport_client_id, meta.peer_addr, meta.transport);
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_login_register_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -1689,7 +1707,49 @@ async fn handle_login_register_request(
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
-    if let Ok(wire_request) = LoginRegisterRequest::decode_from(body) {
+    // Both login-register shapes share the ClientVersionInfo prefix, so the
+    // protocol gate decodes it once and runs before any credential work; the
+    // body shapes below parse from past the prefix. Only VSR clients reach
+    // this gate -- legacy SDKs use LOGIN_USER_CODE, a separate path. A
+    // pre-versioning VSR client sends the old prefix-less body, which fails
+    // ClientVersionInfo::decode (-> MalformedLogin) or the version gate
+    // (-> IncompatibleProtocol) right here, not dropped earlier.
+    let Ok((version_info, prefix_len)) = ClientVersionInfo::decode(body) else {
+        warn!(
+            transport_client_id,
+            "rejecting login: body has no decodable version prefix"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+        )
+        .await;
+        return;
+    };
+    if !is_protocol_compatible(version_info.protocol_version) {
+        warn!(
+            transport_client_id,
+            client_protocol_version = %ProtocolVersion(version_info.protocol_version),
+            sdk_name = %version_info.sdk_name,
+            sdk_version = %version_info.sdk_version,
+            "rejecting login: incompatible protocol version"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::IncompatibleProtocol,
+        )
+        .await;
+        return;
+    }
+
+    let body_tail = &body[prefix_len..];
+    if let Ok((wire_request, _)) =
+        LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
+    {
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
@@ -1703,6 +1763,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1726,7 +1787,9 @@ async fn handle_login_register_request(
         }
     }
 
-    if let Ok(wire_request) = LoginRegisterWithPatRequest::decode_from(body) {
+    if let Ok((wire_request, _)) =
+        LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
+    {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
             Ok(user_id) => {
                 if let Err(error) = complete_login_register(
@@ -1736,6 +1799,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1766,6 +1830,46 @@ async fn handle_login_register_request(
         "dropping register request with unsupported payload shape"
     );
     send_login_failure_reply(shard, transport_client_id, request.header()).await;
+}
+
+/// Best-effort login-rejection eviction. Terminal one-way frame; a gone
+/// connection has nothing to recover, so the send error is logged and
+/// dropped. Consensus context (cluster/view/replica) is stamped on the
+/// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
+/// plus the protocol window on `IncompatibleProtocol`.
+#[allow(clippy::future_not_send)]
+async fn send_login_eviction(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    vsr_client_id: u128,
+    reason: EvictionReason,
+) {
+    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
+        EvictionContext {
+            cluster: 0,
+            view: 0,
+            replica: 0,
+        },
+        EvictionContext::from_consensus,
+    );
+    let eviction = match reason {
+        EvictionReason::IncompatibleProtocol => {
+            build_incompatible_protocol_eviction_message(ctx, vsr_client_id)
+        }
+        _ => build_eviction_message(ctx, vsr_client_id, reason),
+    };
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            reason = ?reason,
+            "failed to send login eviction"
+        );
+    }
 }
 
 pub(crate) fn upgrade_shard_handle(
