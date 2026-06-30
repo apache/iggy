@@ -7340,6 +7340,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bon",
+ "bytemuck",
  "bytes",
  "cfg_aliases",
  "compio",

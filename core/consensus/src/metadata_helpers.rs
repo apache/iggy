@@ -21,7 +21,9 @@
 
 use crate::client_table::{ClientTable, REGISTER_REQUEST_ID, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
-use iggy_binary_protocol::{EvictionHeader, EvictionReason, HEADER_SIZE};
+use iggy_binary_protocol::{
+    EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
+};
 use message_bus::MessageBus;
 use server_common::iobuf::Frozen;
 use server_common::{MESSAGE_ALIGN, Message};
@@ -302,13 +304,48 @@ pub fn build_eviction_message(
         reason != EvictionReason::Reserved,
         "build_eviction_message: Reserved is sentinel; pick a real variant"
     );
+    build_eviction_from_header(EvictionHeader::new(
+        ctx.cluster,
+        ctx.view,
+        ctx.replica,
+        client_id,
+        reason,
+    ))
+}
 
+/// `IncompatibleProtocol` eviction carrying the server's accepted protocol
+/// window, see [`EvictionHeader::incompatible_protocol`].
+///
+/// # Panics
+/// Unreachable: zeroed `HEADER_SIZE` buffer is always a valid `EvictionHeader`.
+#[must_use]
+pub fn build_incompatible_protocol_eviction_message(
+    ctx: EvictionContext,
+    client_id: u128,
+) -> Message<EvictionHeader> {
+    debug_assert!(
+        client_id != 0,
+        "build_incompatible_protocol_eviction_message: client_id != 0"
+    );
+    build_eviction_from_header(EvictionHeader::incompatible_protocol(
+        ctx.cluster,
+        ctx.view,
+        ctx.replica,
+        client_id,
+        IGGY_PROTOCOL_VERSION,
+        IGGY_PROTOCOL_VERSION_MIN,
+    ))
+}
+
+/// # Panics
+/// Unreachable: zeroed `HEADER_SIZE` buffer is always a valid `EvictionHeader`.
+fn build_eviction_from_header(header: EvictionHeader) -> Message<EvictionHeader> {
     let mut msg = Message::<EvictionHeader>::new(HEADER_SIZE);
-    let header = bytemuck::checked::try_from_bytes_mut::<EvictionHeader>(
+    let slot = bytemuck::checked::try_from_bytes_mut::<EvictionHeader>(
         &mut msg.as_mut_slice()[..HEADER_SIZE],
     )
     .expect("zeroed bytes are valid");
-    *header = EvictionHeader::new(ctx.cluster, ctx.view, ctx.replica, client_id, reason);
+    *slot = header;
     msg
 }
 

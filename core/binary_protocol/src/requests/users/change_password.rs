@@ -39,6 +39,11 @@ impl WireEncode for ChangePasswordRequest {
 
     fn encode(&self, buf: &mut BytesMut) {
         self.user_id.encode(buf);
+        debug_assert!(
+            u8::try_from(self.current_password.len()).is_ok()
+                && u8::try_from(self.new_password.len()).is_ok(),
+            "password exceeds u8 length prefix; callers must validate before encoding"
+        );
         #[allow(clippy::cast_possible_truncation)]
         buf.put_u8(self.current_password.len() as u8);
         buf.put_slice(self.current_password.as_bytes());
