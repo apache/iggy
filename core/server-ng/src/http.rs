@@ -37,6 +37,9 @@ use configs::http::HttpJwtConfig;
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
 };
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
+};
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
 };
@@ -47,6 +50,7 @@ use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     UpdateUserRequest,
 };
+use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
@@ -55,6 +59,7 @@ use iggy_binary_protocol::{
     GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::change_password::ChangePassword;
+use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
@@ -67,8 +72,8 @@ use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{identifier_to_wire, permissions_to_wire};
 use iggy_common::{
-    Identifier, IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo, TopicDetails,
-    UserInfoDetails, Validatable,
+    Identifier, IdentityInfo, IggyError, IggyTimestamp, RawPersonalAccessToken, StreamDetails,
+    TokenInfo, TopicDetails, UserInfoDetails, Validatable,
 };
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
@@ -84,6 +89,8 @@ use crate::dispatch::{submit_client_request_on_owner, submit_register_on_owner};
 use crate::http::extractor::Authenticated;
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
+use crate::pat::rewrite_pat_request_for_user;
+use crate::responses::build_raw_pat_reply;
 use crate::server_error::ServerNgError;
 use crate::users::maybe_rewrite_user_password_request;
 
@@ -382,6 +389,8 @@ fn router(state: HttpState) -> Router {
             "/streams/{stream_id}/topics/{topic_id}/purge",
             delete(purge_topic),
         )
+        .route("/personal-access-tokens", post(create_pat))
+        .route("/personal-access-tokens/{name}", delete(delete_pat))
         .with_state(state)
 }
 
@@ -770,30 +779,101 @@ async fn update_permissions(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Run one authenticated control-plane write end to end and return the committed
-/// reply's typed payload. Shared by every write route: `create_stream` decodes
-/// the payload into an entity, the update/delete/purge routes ignore it (it is
-/// empty) and answer 204.
+/// `POST /personal-access-tokens`: mint a personal access token for the caller
+/// and return its one-time raw secret as the same `{"token": ...}` JSON the
+/// legacy server returns, with HTTP 200.
 ///
-/// Serializes this session's writes behind its gate and holds it across the
-/// submit so request ids reach the primary strictly in order. The gate advances
-/// only on a committed `Reply`: a transient failure or an eviction leaves the id
-/// free for the caller's retry, which the depth-1 dedup requires (the next
-/// accepted request must be `committed + 1`, so a consumed-but-uncommitted id
-/// would wedge the session on `RequestGap`).
+/// The raw token is non-deterministic and secret, so it must never enter
+/// consensus: [`rewrite_pat_request_for_user`] (invoked inside
+/// [`submit_committed`]) mints it on shard 0 and replicates only its hash, so a
+/// successful committed reply body is empty. [`build_raw_pat_reply`] then splices
+/// the raw secret back into that reply locally, using the confirmed commit
+/// position. The token is surfaced only after the write commits; a malformed
+/// splice fails closed rather than emitting a blank token.
 ///
-/// Reply discrimination mirrors the SDK's `split_metadata_result`: the body
-/// leads with a result section (`Some(0)` is success followed by the typed
-/// payload; a nonzero first result is a committed business rejection carrying an
-/// `IggyError` code). An eviction frame carries no result section and means the
-/// session is dead (re-authenticate); a missing or short result section is a
-/// malformed committed reply, mapped to an error rather than a false success.
-async fn submit_write(
+/// A committed create can still carry a business rejection (duplicate name,
+/// invalid expiry), so the result code is honored via [`committed_payload`] -
+/// exactly as the mechanical routes do - BEFORE the secret is spliced. Only a
+/// genuine success gets a token; a rejection renders the legacy error instead of
+/// a bogus 200 + token.
+async fn create_pat(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Json(command): Json<CreatePersonalAccessToken>,
+) -> Result<Json<RawPersonalAccessToken>, WriteError> {
+    // Rejects an empty/oversized token name before any consensus work.
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = CreatePersonalAccessTokenRequest {
+        name: WireName::new(&command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidPersonalAccessTokenName))?,
+        expiry: command.expiry.into(),
+    };
+    let body = request.to_bytes();
+    let (request_header, committed, raw_token) = SendWrapper::new(submit_committed(
+        &state,
+        &identity.session,
+        Operation::CreatePersonalAccessToken,
+        &body,
+    ))
+    .await?;
+    // Reject a committed business error before splicing the secret; the success
+    // payload is empty, so the returned slice is discarded.
+    committed_payload(&committed)?;
+    let reply =
+        build_raw_pat_reply(&request_header, committed, raw_token).map_err(WriteError::Rejected)?;
+    Ok(Json(RawPersonalAccessToken {
+        token: decode_raw_pat_token(&reply)?,
+    }))
+}
+
+/// `DELETE /personal-access-tokens/{name}`: delete one of the caller's tokens by
+/// name. Returns 204 on commit. Inherits the root-only gate via [`submit_write`].
+async fn delete_pat(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(name): Path<String>,
+) -> Result<StatusCode, WriteError> {
+    let request = DeletePersonalAccessTokenRequest {
+        name: WireName::new(&name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidPersonalAccessTokenName))?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::DeletePersonalAccessToken,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Run one authenticated control-plane write to commit and hand back the
+/// committed reply `Message`, the request header, and any raw PAT token minted
+/// along the way. Shared core of every HTTP write: [`submit_write`] decodes the
+/// reply body for the stream/topic/user routes, while [`create_pat`] needs the
+/// raw `Message` + request header to substitute the one-time token.
+///
+/// Enforces the root-only admin gate, then serializes this session's writes
+/// behind its gate and holds it across the submit so request ids reach the
+/// primary strictly in order. The gate advances only on a committed `Reply`: a
+/// transient failure or an eviction leaves the id free for the caller's retry,
+/// which the depth-1 dedup requires (the next accepted request must be
+/// `committed + 1`, so a consumed-but-uncommitted id would wedge the session on
+/// `RequestGap`). An eviction means the session is dead, mapped to 401.
+///
+/// Both shard-0 request rewrites run here before consensus, mirroring the TCP
+/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
+/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes plaintext
+/// (`CreateUser` / `ChangePassword`). Both are no-ops for every other operation,
+/// so plaintext secrets never enter consensus on any write. On either rewrite's
+/// decode failure the gate is released without advancing, leaving the id free.
+async fn submit_committed(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<Bytes, WriteError> {
+) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     // Interim authorization: until server-ng has an RBAC permissioner, every
     // control-plane write is root-only. A non-root credential is authenticated
     // but unprivileged, rejected before any consensus work is spent.
@@ -808,11 +888,10 @@ async fn submit_write(
         *next_request_id,
         body,
     );
-    // Hash raw passwords on shard 0 before replication (CreateUser /
-    // ChangePassword); a no-op for every other operation. Mirrors the TCP
-    // dispatch path so plaintext never enters consensus. On decode failure the
-    // gate is released without advancing, leaving the request id free to retry.
+    let (message, raw_token) =
+        rewrite_pat_request_for_user(session.user_id, message).map_err(WriteError::Rejected)?;
     let message = maybe_rewrite_user_password_request(message).map_err(WriteError::Rejected)?;
+    let request_header = *message.header();
     let reply = submit_client_request_on_owner(&state.shard, message).await;
     let Some(reply) = reply else {
         return Err(WriteError::Unavailable);
@@ -822,23 +901,49 @@ async fn submit_write(
         Command2::Reply => {
             *next_request_id += 1;
             drop(next_request_id);
-            let size = reply.header().size as usize;
-            let reply_body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
-            match result_code(reply_body) {
-                Some(0) => {
-                    let payload_start = result_section_len(reply_body)
-                        .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
-                    let payload = reply_body
-                        .get(payload_start..)
-                        .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
-                    Ok(Bytes::copy_from_slice(payload))
-                }
-                Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
-                None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
-            }
+            Ok((request_header, reply, raw_token))
         }
         Command2::Eviction => Err(WriteError::Rejected(eviction_error(&reply))),
         _ => Err(WriteError::Rejected(IggyError::InvalidCommand)),
+    }
+}
+
+/// Run one authenticated control-plane write end to end and return the committed
+/// reply's typed payload. Wraps [`submit_committed`] and decodes the reply body
+/// via [`committed_payload`]: `create_stream` decodes the payload into an entity,
+/// the update/delete/purge routes ignore it (it is empty) and answer 204.
+async fn submit_write(
+    state: &HttpInner,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+) -> Result<Bytes, WriteError> {
+    let (_request_header, reply, _raw_token) =
+        submit_committed(state, session, operation, body).await?;
+    Ok(Bytes::copy_from_slice(committed_payload(&reply)?))
+}
+
+/// Classify a committed reply's leading result section and return the typed
+/// payload slice on success. Mirrors the SDK's `split_metadata_result`:
+/// `Some(0)` is success and the payload follows the result section; a nonzero
+/// first result is a committed business rejection carrying an `IggyError` code
+/// (e.g. a duplicate token name); a missing or short section is a malformed
+/// committed reply, mapped to an error rather than a false success. Shared by
+/// [`submit_write`] and [`create_pat`] so a committed rejection can never render
+/// as a 2xx.
+fn committed_payload(reply: &Message<GenericHeader>) -> Result<&[u8], WriteError> {
+    let size = reply.header().size as usize;
+    let reply_body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
+    match result_code(reply_body) {
+        Some(0) => {
+            let payload_start = result_section_len(reply_body)
+                .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
+            reply_body
+                .get(payload_start..)
+                .ok_or(WriteError::Rejected(IggyError::InvalidCommand))
+        }
+        Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
+        None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
 }
 
@@ -894,6 +999,18 @@ fn decode_user_details(payload: &[u8]) -> Result<UserInfoDetails, WriteError> {
     let response = UserDetailsResponse::decode_from(payload)
         .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
     UserInfoDetails::try_from(response).map_err(WriteError::Rejected)
+}
+
+/// Extract the raw one-time token from a [`build_raw_pat_reply`] output. That
+/// reply's body is a bare `RawPersonalAccessTokenResponse` (no leading result
+/// section, unlike a committed metadata reply), so decode it straight past the
+/// header.
+fn decode_raw_pat_token(reply: &Message<GenericHeader>) -> Result<String, WriteError> {
+    let size = reply.header().size as usize;
+    let body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
+    let response = RawPersonalAccessTokenResponse::decode_from(body)
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    Ok(response.token.as_str().to_string())
 }
 
 /// Map an eviction frame to the same typed [`IggyError`] the SDK's
