@@ -28,7 +28,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::LOCATION;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::map_response;
@@ -37,7 +37,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
 use configs::cluster::{ClusterConfig, ClusterNodeConfig};
-use configs::http::HttpJwtConfig;
+use configs::http::HttpConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
     GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
@@ -173,6 +173,25 @@ const FIRST_REQUEST_ID: u64 = 1;
 /// caller's behalf.
 const PARTITION_WRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-session cap on concurrently awaited partition writes (produce /
+/// consumer-offset). Bounds how much of [`MAX_IN_FLIGHT_WRITES_GLOBAL`] one
+/// credential can occupy, so a session that outruns its own commits saturates
+/// itself (429, its own backpressure signal) before it can starve every other
+/// session out of the shared budget.
+const MAX_IN_FLIGHT_WRITES_PER_SESSION: u32 = 32;
+
+/// Shard-0-global budget for concurrently awaited partition writes, across all
+/// sessions. Every admitted write parks a handler for up to
+/// [`PARTITION_WRITE_REPLY_TIMEOUT`] while pinning its buffered body, and its
+/// decode/encode/HS256 CPU runs on the same single-threaded core that pumps
+/// consensus. The budget therefore bounds both starvation terms: budget x
+/// `max_request_size` bounds the worst-case buffered bytes, and budget x
+/// per-request CPU bounds how far admitted HTTP work can delay the consensus
+/// pump. `?ack=none` produces sit outside the budget by design: they never
+/// park a handler, so their whole cost is the synchronous handler body itself,
+/// which admission could not shed anyway.
+const MAX_IN_FLIGHT_WRITES_GLOBAL: u32 = 128;
+
 /// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
 /// HTTP reads never Register a VSR client, and shard-0 client ids are minted
 /// from 1, so 0 can never name a live consumer-group member: a group-kind
@@ -234,6 +253,10 @@ struct HttpSession {
     /// session eviction can tear the registry entry down fenced by the same
     /// token.
     registry_token: Cell<Option<InstanceToken>>,
+    /// Awaited partition writes currently in flight on this session, gated by
+    /// [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]. Only [`InFlightWriteGuard`]
+    /// touches it, so every admission is paired with exactly one release.
+    in_flight_writes: Cell<u32>,
 }
 
 impl HttpSession {
@@ -309,6 +332,7 @@ impl IntoResponse for WriteError {
 /// reply distinguishable only by header (see [`classify_partition_reply`]),
 /// and an unanswered write is a distinct outcome the caller must treat as
 /// unknown rather than failed.
+#[derive(Debug)]
 enum PartitionWriteError {
     /// Caller-side rejection (bad identifier, oversized batch, the interim
     /// non-root denial) or a malformed reply frame, rendered through the
@@ -321,6 +345,15 @@ enum PartitionWriteError {
     /// The in-process reply slot could not be installed. Transient server
     /// condition -> the shared 503, retryable.
     Unavailable,
+    /// This session is already at [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]
+    /// awaited writes. 429: the caller's own concurrency is the problem, so
+    /// it must drain its outstanding writes before submitting more.
+    TooManyInFlight,
+    /// Shard 0 is already at [`MAX_IN_FLIGHT_WRITES_GLOBAL`] awaited writes
+    /// across all sessions. 503 with its own code (distinct from the shared
+    /// consensus-unavailable body) so an operator can tell admission shedding
+    /// from a consensus outage.
+    ServerBusy,
     /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], or the
     /// session's reply target was torn down mid-wait. 504: the commit may
     /// still land (at-least-once), so this is a hard "outcome unknown", not a
@@ -335,6 +368,8 @@ impl IntoResponse for PartitionWriteError {
             Self::Rejected(error) => CustomError::from(error).into_response(),
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::Unavailable => service_unavailable(),
+            Self::TooManyInFlight => too_many_in_flight_response(),
+            Self::ServerBusy => server_busy_response(),
             Self::Timeout(operation) => partition_write_timeout_response(operation),
         }
     }
@@ -385,6 +420,41 @@ fn service_unavailable() -> Response {
         Json(ErrorResponse::from_error(
             IggyError::CannotEstablishConnection,
         )),
+    )
+        .into_response()
+}
+
+/// 429 for a session at [`MAX_IN_FLIGHT_WRITES_PER_SESSION`] awaited partition
+/// writes. Shaped like every other HTTP error (`ErrorResponse`) so clients
+/// parse one error schema; the remedy is the caller's own: let outstanding
+/// writes finish, then retry.
+fn too_many_in_flight_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorResponse {
+            id: StatusCode::TOO_MANY_REQUESTS.as_u16().into(),
+            code: "too_many_in_flight_writes".to_owned(),
+            reason: "session reached its in-flight write cap; await outstanding writes and retry"
+                .to_owned(),
+            field: None,
+        }),
+    )
+        .into_response()
+}
+
+/// 503 for shard 0 at [`MAX_IN_FLIGHT_WRITES_GLOBAL`] awaited partition writes
+/// across all sessions. A distinct `server_busy` code (unlike the shared
+/// consensus-unavailable 503) so admission shedding is tellable from a
+/// consensus outage; retry with backoff.
+fn server_busy_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            id: StatusCode::SERVICE_UNAVAILABLE.as_u16().into(),
+            code: "server_busy".to_owned(),
+            reason: "shard is at its in-flight write budget; retry with backoff".to_owned(),
+            field: None,
+        }),
     )
         .into_response()
 }
@@ -562,6 +632,10 @@ struct HttpInner {
     /// across an `.await` (see [`HttpInner::resolve_session`]).
     sessions: RefCell<HashMap<String, Rc<HttpSession>>>,
     roster: ClusterRoster,
+    /// Awaited partition writes currently in flight across all sessions, gated
+    /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
+    /// it, so every admission is paired with exactly one release.
+    in_flight_writes: Cell<u32>,
 }
 
 impl HttpInner {
@@ -696,6 +770,7 @@ impl HttpInner {
             gate: Mutex::new(FIRST_REQUEST_ID),
             data_request: Cell::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
         }))
     }
 }
@@ -728,14 +803,14 @@ type HttpState = SendWrapper<Rc<HttpInner>>;
 /// # Errors
 ///
 /// Returns [`ServerNgError`] if the JWT manager cannot be built from
-/// `jwt_config` or the listener cannot bind to `addr`.
+/// `http_config.jwt` or the listener cannot bind to `addr`.
 pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
-    jwt_config: &HttpJwtConfig,
+    http_config: &HttpConfig,
     cluster: &ClusterConfig,
 ) -> Result<(), ServerNgError> {
-    let jwt = JwtManager::build(jwt_config)?;
+    let jwt = JwtManager::build(&http_config.jwt)?;
     let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
     info!(address = %bound_addr, "server-ng HTTP listener started");
 
@@ -749,8 +824,13 @@ pub async fn start(
             nodes: cluster.nodes.clone(),
             http_addr: bound_addr,
         },
+        in_flight_writes: Cell::new(0),
     }));
-    let router = router(state);
+    // Saturating: a configured limit past the pointer width (32-bit target,
+    // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
+    let max_request_size =
+        usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
+    let router = router(state, max_request_size);
 
     let shutdown = shard.bus.token();
     let handle = compio::runtime::spawn(async move {
@@ -768,7 +848,12 @@ pub async fn start(
 
 /// Assemble the shard-0 router: unauthenticated health + login routes, plus
 /// one authenticated probe that exercises the [`Authenticated`] extractor.
-fn router(state: HttpState) -> Router {
+///
+/// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
+/// it), exactly like the legacy server: it bounds the per-request term of the
+/// admission math - what one body may cost in bytes and decode CPU - while
+/// the in-flight caps bound the multiplier.
+fn router(state: HttpState, max_request_size: usize) -> Router {
     // Cloned for the response layer so `X-Iggy-View` reads the live view per
     // response; the original `state` is moved into `with_state` below.
     let view_source = state.clone();
@@ -834,6 +919,7 @@ fn router(state: HttpState) -> Router {
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(max_request_size))
         .layer(map_response(move |response: Response| {
             let view_source = view_source.clone();
             async move { insert_view_header(&view_source, response) }
@@ -2109,9 +2195,47 @@ const fn resync_required_polled_messages() -> PolledMessages {
     }
 }
 
+/// In-flight admission token for one awaited partition write. One guard owns
+/// both releases (session + global) so success, every error return, the reply
+/// timeout, and handler cancellation (the client hanging up mid-await drops
+/// this future) all decrement through the same `Drop`.
+struct InFlightWriteGuard<'a> {
+    session_in_flight: &'a Cell<u32>,
+    global_in_flight: &'a Cell<u32>,
+}
+
+impl Drop for InFlightWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.session_in_flight.set(self.session_in_flight.get() - 1);
+        self.global_in_flight.set(self.global_in_flight.get() - 1);
+    }
+}
+
+/// Admit one awaited partition write against the per-session cap and the
+/// shard-0 global budget, incrementing both counters only when both pass. The
+/// session cap is checked first so a session that saturates itself reads as
+/// its own 429 rather than as server-wide pressure.
+fn admit_partition_write<'a>(
+    session_in_flight: &'a Cell<u32>,
+    global_in_flight: &'a Cell<u32>,
+) -> Result<InFlightWriteGuard<'a>, PartitionWriteError> {
+    if session_in_flight.get() >= MAX_IN_FLIGHT_WRITES_PER_SESSION {
+        return Err(PartitionWriteError::TooManyInFlight);
+    }
+    if global_in_flight.get() >= MAX_IN_FLIGHT_WRITES_GLOBAL {
+        return Err(PartitionWriteError::ServerBusy);
+    }
+    session_in_flight.set(session_in_flight.get() + 1);
+    global_in_flight.set(global_in_flight.get() + 1);
+    Ok(InFlightWriteGuard {
+        session_in_flight,
+        global_in_flight,
+    })
+}
+
 /// Run one awaited partition write (produce / consumer-offset write) end to
-/// end: install the reply slot, dispatch into the partition plane, and wait
-/// (bounded) for the committed reply.
+/// end: admit against the in-flight caps, install the reply slot, dispatch
+/// into the partition plane, and wait (bounded) for the committed reply.
 ///
 /// Slot-before-dispatch is load-bearing: every pre-dispatch gate failure
 /// inside [`dispatch_partition_request`] replies through `send_to_client`,
@@ -2124,6 +2248,13 @@ async fn partition_write_replicated(
     operation: Operation,
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
+    // Admission sits here rather than before body decode: axum's extractors
+    // already buffered and deserialized the body (bounded by the router-wide
+    // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
+    // actually unbounded - the slot install, the dispatch, and the parked
+    // reply await that pins this request's buffers for up to the reply
+    // timeout. Held across every exit below; released by `Drop`.
+    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
     let request_id = session.next_data_request_id();
     let message = build_request_message(
@@ -2981,5 +3112,101 @@ mod tests {
             classify_partition_reply(&request.into_generic().into_frozen()),
             Err(PartitionWriteError::Rejected(IggyError::InvalidCommand))
         ));
+    }
+
+    #[test]
+    fn in_flight_write_guard_decrements_both_counters_on_drop() {
+        let session = Cell::new(0);
+        let global = Cell::new(0);
+        let guard = admit_partition_write(&session, &global).expect("below both caps");
+        assert_eq!(session.get(), 1);
+        assert_eq!(global.get(), 1);
+        drop(guard);
+        assert_eq!(session.get(), 0);
+        assert_eq!(global.get(), 0);
+    }
+
+    #[test]
+    fn admission_at_session_cap_rejects_with_too_many_in_flight() {
+        let session = Cell::new(MAX_IN_FLIGHT_WRITES_PER_SESSION);
+        let global = Cell::new(0);
+        assert!(matches!(
+            admit_partition_write(&session, &global),
+            Err(PartitionWriteError::TooManyInFlight)
+        ));
+        // A refusal must not leak a partial increment on either counter.
+        assert_eq!(session.get(), MAX_IN_FLIGHT_WRITES_PER_SESSION);
+        assert_eq!(global.get(), 0);
+    }
+
+    #[test]
+    fn admission_at_global_budget_rejects_with_server_busy() {
+        let session = Cell::new(0);
+        let global = Cell::new(MAX_IN_FLIGHT_WRITES_GLOBAL);
+        assert!(matches!(
+            admit_partition_write(&session, &global),
+            Err(PartitionWriteError::ServerBusy)
+        ));
+        assert_eq!(session.get(), 0);
+        assert_eq!(global.get(), MAX_IN_FLIGHT_WRITES_GLOBAL);
+    }
+
+    #[test]
+    fn interleaved_admission_reopens_exactly_released_session_slots() {
+        let session = Cell::new(0);
+        let global = Cell::new(0);
+        let mut guards = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_WRITES_PER_SESSION {
+            guards.push(admit_partition_write(&session, &global).expect("below both caps"));
+        }
+        assert!(matches!(
+            admit_partition_write(&session, &global),
+            Err(PartitionWriteError::TooManyInFlight)
+        ));
+        let released = 3;
+        guards.truncate((MAX_IN_FLIGHT_WRITES_PER_SESSION - released) as usize);
+        assert_eq!(session.get(), MAX_IN_FLIGHT_WRITES_PER_SESSION - released);
+        for _ in 0..released {
+            guards.push(admit_partition_write(&session, &global).expect("released slots"));
+        }
+        assert!(matches!(
+            admit_partition_write(&session, &global),
+            Err(PartitionWriteError::TooManyInFlight)
+        ));
+        drop(guards);
+        assert_eq!(session.get(), 0);
+        assert_eq!(global.get(), 0);
+    }
+
+    #[test]
+    fn global_budget_spans_sessions_and_reopens_after_release() {
+        let global = Cell::new(0);
+        let session_count =
+            MAX_IN_FLIGHT_WRITES_GLOBAL.div_ceil(MAX_IN_FLIGHT_WRITES_PER_SESSION) as usize;
+        let sessions: Vec<Cell<u32>> = (0..session_count).map(|_| Cell::new(0)).collect();
+        let mut guards = Vec::new();
+        'fill: for session in &sessions {
+            for _ in 0..MAX_IN_FLIGHT_WRITES_PER_SESSION {
+                match admit_partition_write(session, &global) {
+                    Ok(guard) => guards.push(guard),
+                    Err(PartitionWriteError::ServerBusy) => break 'fill,
+                    Err(other) => {
+                        panic!("only the global budget may refuse this fill, got {other:?}")
+                    }
+                }
+            }
+        }
+        assert_eq!(global.get(), MAX_IN_FLIGHT_WRITES_GLOBAL);
+        // A fresh session is refused on the shared budget, not its own cap.
+        let fresh = Cell::new(0);
+        assert!(matches!(
+            admit_partition_write(&fresh, &global),
+            Err(PartitionWriteError::ServerBusy)
+        ));
+        drop(guards.pop());
+        let readmitted = admit_partition_write(&fresh, &global).expect("budget slot released");
+        assert_eq!(fresh.get(), 1);
+        assert_eq!(global.get(), MAX_IN_FLIGHT_WRITES_GLOBAL);
+        drop(readmitted);
     }
 }
