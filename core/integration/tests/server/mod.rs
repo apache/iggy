@@ -24,6 +24,9 @@ mod cg;
 // The ported round-robin membership join scenario runs against server-ng.
 #[cfg(feature = "vsr")]
 mod cg_vsr;
+// Raw-HTTP data-plane contract against server-ng's shard-0 listener.
+#[cfg(feature = "vsr")]
+mod http_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter); revisit under vsr once basics are green.
 #[cfg(not(feature = "vsr"))]
