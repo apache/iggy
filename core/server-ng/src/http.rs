@@ -22,10 +22,11 @@
 mod extractor;
 mod jwt;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::header::LOCATION;
@@ -34,7 +35,7 @@ use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use configs::cluster::{ClusterConfig, ClusterNodeConfig};
 use configs::http::HttpJwtConfig;
 use consensus::{MetadataHandle, VsrConsensus};
@@ -49,6 +50,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
     GetConsumerGroupsRequest,
 };
+use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
@@ -80,7 +82,7 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
-    GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
+    GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -96,16 +98,17 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{
-    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, permissions_to_wire,
-    streams_from_wire, topics_from_wire, users_from_wire,
+    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, partitioning_to_wire,
+    permissions_to_wire, streams_from_wire, topics_from_wire, users_from_wire,
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
     ClusterNodeStatus, ConsumerGroup, ConsumerGroupDetails, Identifier, IdentityInfo, IggyError,
-    IggyTimestamp, RawPersonalAccessToken, Stats, Stream, StreamDetails, TokenInfo, Topic,
-    TopicDetails, TransportEndpoints, UserInfo, UserInfoDetails, Validatable,
+    IggyMessageView, IggyTimestamp, RawPersonalAccessToken, SendMessages, Stats, Stream,
+    StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints, UserInfo, UserInfoDetails,
+    Validatable,
 };
-use message_bus::client_listener;
+use message_bus::{BusMessage, InstanceToken, client_listener};
 use metadata::impls::metadata::StreamsFrontend;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
@@ -117,7 +120,9 @@ use tracing::{error, info, warn};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::bootstrap::ServerNgShard;
-use crate::dispatch::{submit_client_request_on_owner, submit_register_on_owner};
+use crate::dispatch::{
+    dispatch_partition_request, submit_client_request_on_owner, submit_register_on_owner,
+};
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
@@ -142,6 +147,21 @@ const MAX_HTTP_SESSIONS: usize = 100_000;
 /// First per-session request id the write path hands out. VSR request numbers
 /// are 1-based and strictly increasing within a session.
 const FIRST_REQUEST_ID: u64 = 1;
+
+/// Bound on a produce's wait for its committed partition reply. Long enough to
+/// ride out a view change (plus the dispatch gates' own routable-wait budget),
+/// short enough not to pin HTTP connections behind a dead consensus group. On
+/// expiry the caller gets 504 and must treat the outcome as unknown: the
+/// partition plane is at-least-once and the prepare may still commit after the
+/// wait gave up, so the server never retries on the caller's behalf.
+const PRODUCE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Response header attesting what durability a produce response proves:
+/// [`DURABILITY_REPLICATED_MEMORY`] after an awaited quorum commit,
+/// [`DURABILITY_NONE`] for a `?ack=none` fire-and-forget.
+const DURABILITY_HEADER: HeaderName = HeaderName::from_static("x-iggy-durability");
+const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
+const DURABILITY_NONE: &str = "none";
 
 /// Node name reported for the synthesized single self-node, matching the legacy
 /// server's single-node synthesis.
@@ -177,6 +197,27 @@ struct HttpSession {
     /// submit `.await` so each session's request numbers reach the primary in
     /// order and stay gap-free for the depth-1 consensus dedup.
     gate: Mutex<u64>,
+    /// Next data-plane request id. A separate, gate-free counter: partition ops
+    /// are at-least-once with no consensus dedup, so the id only correlates the
+    /// in-process reply slot and concurrent produces on one session are legal.
+    /// A plain `Cell` suffices on single-threaded shard 0; ids are minted
+    /// monotonically and never reused, which the slot-guard contract requires.
+    data_request: Cell<u64>,
+    /// Registry token of this session's lazily-installed in-process reply
+    /// target (`None` until the first awaited produce). Stored so session
+    /// eviction can tear the registry entry down fenced by the same token.
+    registry_token: Cell<Option<InstanceToken>>,
+}
+
+impl HttpSession {
+    /// Mint the next data-plane request id. Also consumed by the `?ack=none`
+    /// path, which installs no slot: sharing one counter keeps a shed reply's
+    /// id from ever colliding with a live awaited slot on this session.
+    fn next_data_request_id(&self) -> u64 {
+        let id = self.data_request.get();
+        self.data_request.set(id + 1);
+        id
+    }
 }
 
 /// Rejection for protected routes.
@@ -233,6 +274,58 @@ impl IntoResponse for WriteError {
     }
 }
 
+/// Rejection for a data-plane produce (`POST .../messages`).
+///
+/// Split differently from [`WriteError`] because the partition plane replies
+/// carry no committed error code: a pre-dispatch gate failure is an empty
+/// reply distinguishable only by header (see [`classify_partition_reply`]),
+/// and an unanswered produce is a distinct outcome the caller must treat as
+/// unknown rather than failed.
+enum ProduceError {
+    /// Caller-side rejection (bad identifier, oversized batch, the interim
+    /// non-root denial) or a malformed reply frame, rendered through the
+    /// legacy `IggyError -> status` map for SDK-identical bodies.
+    Rejected(IggyError),
+    /// The dispatch gates could not route the produce: the stream, topic, or
+    /// partition does not resolve (or never materialised within the routable
+    /// budget). Rendered as the legacy 404 body.
+    NotFound,
+    /// The in-process reply slot could not be installed. Transient server
+    /// condition -> the shared 503, retryable.
+    Unavailable,
+    /// No committed reply within [`PRODUCE_REPLY_TIMEOUT`], or the session's
+    /// reply target was torn down mid-wait. 504: the commit may still land
+    /// (at-least-once), so this is a hard "outcome unknown", not a failure
+    /// the server may transparently retry.
+    Timeout,
+}
+
+impl IntoResponse for ProduceError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::NotFound => CustomError::ResourceNotFound.into_response(),
+            Self::Unavailable => service_unavailable(),
+            Self::Timeout => produce_timeout_response(),
+        }
+    }
+}
+
+/// 504 body for a produce whose commit outcome is unknown. Shaped like every
+/// other HTTP error (`ErrorResponse`) so clients parse one error schema.
+fn produce_timeout_response() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(ErrorResponse {
+            id: StatusCode::GATEWAY_TIMEOUT.as_u16().into(),
+            code: "produce_timeout".to_owned(),
+            reason: "produce was not acknowledged in time; the write may still commit".to_owned(),
+            field: None,
+        }),
+    )
+        .into_response()
+}
+
 /// The shared 503 body for a request that could not commit right now: no
 /// caught-up primary, a full pipeline, or a view-change cancel. Retryable, and
 /// rendered with the `CannotEstablishConnection` code the SDKs treat as a
@@ -267,6 +360,28 @@ enum Consistency {
 struct ConsistencyQuery {
     #[serde(default)]
     consistency: Consistency,
+}
+
+/// Produce acknowledgement selected by the `?ack=` query param.
+///
+/// `replicated` (the default) answers 201 only after the partition group's
+/// quorum commit. `none` is fire-and-forget: the request is validated,
+/// dispatched, and answered 202 immediately; the commit still happens, but its
+/// reply is shed at the bus (no reply slot is installed).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ProduceAck {
+    #[default]
+    Replicated,
+    None,
+}
+
+/// `?ack=` query wrapper. An absent param defaults to
+/// [`ProduceAck::Replicated`]; an unrecognized value is a 400 (axum `Query`).
+#[derive(Default, Deserialize)]
+struct ProduceQuery {
+    #[serde(default)]
+    ack: ProduceAck,
 }
 
 /// Rejection for an authenticated read route (`GET /streams`,
@@ -456,7 +571,22 @@ impl HttpInner {
         if let Some(session) = live_entry(&table, &key, now) {
             return Ok(session);
         }
-        table.retain(|_, session| session.expiry > now);
+        table.retain(|_, session| {
+            if session.expiry > now {
+                return true;
+            }
+            // Evicting the session also tears down its in-process reply
+            // target (if a produce ever installed one), cancelling any
+            // still-parked reply waiters. Token-fenced so a stale sweep can
+            // never remove a later occupant of the key.
+            if let Some(token) = session.registry_token.get() {
+                self.shard
+                    .bus
+                    .clients()
+                    .remove_if_token_matches(session.client_id, token);
+            }
+            false
+        });
         if table.len() >= MAX_HTTP_SESSIONS {
             // Still full after dropping expired entries: too many genuinely live
             // sessions. Refuse rather than evict a live one; the client retries.
@@ -507,6 +637,8 @@ impl HttpInner {
             user_id,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
+            data_request: Cell::new(FIRST_REQUEST_ID),
+            registry_token: Cell::new(None),
         }))
     }
 }
@@ -615,6 +747,10 @@ fn router(state: HttpState) -> Router {
         .route(
             "/streams/{stream_id}/topics/{topic_id}/purge",
             delete(purge_topic),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages",
+            post(send_messages),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
@@ -1176,6 +1312,59 @@ async fn purge_topic(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /streams/{stream_id}/topics/{topic_id}/messages`: produce a batch of
+/// messages to a topic. The JSON body is the same `SendMessages` shape the
+/// legacy server accepts (partitioning + base64 messages); stream and topic
+/// come from the path.
+///
+/// Data plane, not control plane: the batch rides the partition group's own
+/// consensus (at-least-once, no dedup, no session gate - concurrent produces
+/// on one credential are legal), and the committed reply comes back through
+/// the session's in-process reply slot rather than a submit return value.
+/// The default answers 201 + `X-Iggy-Durability: replicated-memory` only
+/// after the quorum commit; `?ack=none` answers 202 + `X-Iggy-Durability:
+/// none` immediately after dispatch.
+async fn send_messages(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<ProduceQuery>,
+    Json(command): Json<SendMessages>,
+) -> Result<Response, ProduceError> {
+    // Interim authorization: root-only until server-ng has an RBAC
+    // permissioner, mirroring the control-plane gate in `submit_committed`.
+    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
+        return Err(ProduceError::Rejected(IggyError::Unauthorized));
+    }
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ProduceError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ProduceError::Rejected)?;
+    // Rejects an oversized partitioning key and an empty or oversized batch.
+    command.validate().map_err(ProduceError::Rejected)?;
+    let body =
+        encode_send_messages(&stream_id, &topic_id, &command).map_err(ProduceError::Rejected)?;
+    match query.ack {
+        ProduceAck::Replicated => {
+            SendWrapper::new(produce_replicated(&state, &identity.session, &body)).await?;
+            Ok((
+                StatusCode::CREATED,
+                [(
+                    DURABILITY_HEADER,
+                    HeaderValue::from_static(DURABILITY_REPLICATED_MEMORY),
+                )],
+            )
+                .into_response())
+        }
+        ProduceAck::None => {
+            SendWrapper::new(produce_unacked(&state, &identity.session, &body)).await;
+            Ok((
+                StatusCode::ACCEPTED,
+                [(DURABILITY_HEADER, HeaderValue::from_static(DURABILITY_NONE))],
+            )
+                .into_response())
+        }
+    }
+}
+
 /// `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups`: create a
 /// consumer group under a topic and render the committed reply as the same
 /// `ConsumerGroupDetails` JSON the legacy server returns.
@@ -1526,6 +1715,165 @@ async fn submit_write(
     Ok(Bytes::copy_from_slice(committed_payload(&reply)?))
 }
 
+/// Encode a validated HTTP `SendMessages` into the `SendMessagesRequest` wire
+/// body, mirroring the SDK's TCP produce encode: identifier + partitioning
+/// wire conversion, then `RawMessage` borrows into [`SendMessagesEncoder`].
+/// Balanced / messages-key partitioning passes through untouched; the
+/// dispatch gates resolve it to a concrete partition server-side.
+fn encode_send_messages(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    command: &SendMessages,
+) -> Result<Bytes, IggyError> {
+    let wire_stream_id = identifier_to_wire(stream_id)?;
+    let wire_topic_id = identifier_to_wire(topic_id)?;
+    let wire_partitioning = partitioning_to_wire(&command.partitioning)?;
+    // Two passes because the view accessors' return borrows are tied to the
+    // view value, not the batch buffer, so the views must outlive the borrows.
+    let views: Vec<IggyMessageView<'_>> = command.batch.iter().collect();
+    let raw_messages: Vec<RawMessage<'_>> = views
+        .iter()
+        .map(|view| RawMessage {
+            id: view.header().id(),
+            origin_timestamp: view.header().origin_timestamp(),
+            headers: view.user_headers(),
+            payload: view.payload(),
+        })
+        .collect();
+    let size = SendMessagesEncoder::encoded_size(
+        &wire_stream_id,
+        &wire_topic_id,
+        &wire_partitioning,
+        &raw_messages,
+    );
+    let mut buf = BytesMut::with_capacity(size);
+    SendMessagesEncoder::encode(
+        &mut buf,
+        &wire_stream_id,
+        &wire_topic_id,
+        &wire_partitioning,
+        &raw_messages,
+    );
+    Ok(buf.freeze())
+}
+
+/// Run one awaited produce end to end: install the reply slot, dispatch into
+/// the partition plane, and wait (bounded) for the committed reply.
+///
+/// Slot-before-dispatch is load-bearing: every pre-dispatch gate failure
+/// inside [`dispatch_partition_request`] replies through `send_to_client`,
+/// which fires an installed slot, so one slot catches every exit. The slot
+/// guard borrows the registry, which is why this whole future runs inside
+/// the caller's `SendWrapper` on shard 0.
+async fn produce_replicated(
+    state: &HttpInner,
+    session: &HttpSession,
+    body: &[u8],
+) -> Result<(), ProduceError> {
+    ensure_in_process_reply_target(state, session);
+    let request_id = session.next_data_request_id();
+    let message = build_request_message(
+        Operation::SendMessages,
+        session.client_id,
+        session.session,
+        request_id,
+        body,
+    );
+    let (guard, receiver) = state
+        .shard
+        .bus
+        .clients()
+        .install_reply_slot(session.client_id, request_id)
+        .map_err(|error| {
+            warn!(?error, "server-ng HTTP: produce reply slot install failed");
+            ProduceError::Unavailable
+        })?;
+    dispatch_partition_request(
+        &state.shard,
+        message,
+        session.client_id,
+        session.session,
+        session.client_id,
+    )
+    .await;
+    let outcome = compio::time::timeout(PRODUCE_REPLY_TIMEOUT, receiver).await;
+    // Removes the slot unless the reply already fired, so a late commit
+    // reply after a timeout sheds at the bus instead of leaking a waiter.
+    drop(guard);
+    match outcome {
+        Ok(Ok(reply)) => classify_partition_reply(&reply),
+        // Cancelled (reply target torn down by session eviction mid-wait) or
+        // elapsed: same caller contract either way - outcome unknown, 504.
+        Ok(Err(_)) | Err(_) => Err(ProduceError::Timeout),
+    }
+}
+
+/// Fire-and-forget produce (`?ack=none`): no reply slot, no wait. The commit
+/// still happens; its reply (and any gate-failure reply) targets a request id
+/// with no slot installed and is shed at the bus by design.
+async fn produce_unacked(state: &HttpInner, session: &HttpSession, body: &[u8]) {
+    let request_id = session.next_data_request_id();
+    let message = build_request_message(
+        Operation::SendMessages,
+        session.client_id,
+        session.session,
+        request_id,
+        body,
+    );
+    dispatch_partition_request(
+        &state.shard,
+        message,
+        session.client_id,
+        session.session,
+        session.client_id,
+    )
+    .await;
+}
+
+/// Install this session's in-process reply target on first data-plane use.
+///
+/// The registry key is the session's shard-0 client id - the same id stamped
+/// into `RequestHeader.client` - so a partition reply routed through
+/// `send_to_client` lands on this entry and resolves the request-keyed slot.
+/// `None` from the registry means the key is already occupied; treat it as
+/// installed but leave the token unset so this session never tears down an
+/// entry it does not own.
+fn ensure_in_process_reply_target(state: &HttpInner, session: &HttpSession) {
+    if session.registry_token.get().is_some() {
+        return;
+    }
+    if let Some(token) = state
+        .shard
+        .bus
+        .clients()
+        .insert_in_process(session.client_id)
+    {
+        session.registry_token.set(Some(token));
+    }
+}
+
+/// Discriminate a produce reply. Partition replies carry no result section
+/// and no error code - success and gate failure are both empty-bodied - so
+/// the only wire discriminator is the reply's `op`: a committed reply is
+/// built from its prepare header, whose op (the partition group's commit
+/// number) is always >= 1, while the pre-dispatch gate failures reply through
+/// `build_empty_reply` with 0 in that field. The gate reply cannot name which
+/// entity was missing, hence the generic legacy 404 body.
+fn classify_partition_reply(reply: &BusMessage) -> Result<(), ProduceError> {
+    let header = reply
+        .as_slice()
+        .get(..HEADER_SIZE)
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
+        .ok_or(ProduceError::Rejected(IggyError::InvalidCommand))?;
+    if header.command != Command2::Reply {
+        return Err(ProduceError::Rejected(IggyError::InvalidCommand));
+    }
+    if header.op == 0 {
+        return Err(ProduceError::NotFound);
+    }
+    Ok(())
+}
+
 /// The two cross-cutting gates every authenticated read enforces before it
 /// touches state. Factored out of [`read_local`] so the cross-shard client
 /// reads (`get_clients` / `get_client`) - which serve from the shard session
@@ -1819,8 +2167,11 @@ const fn login_error_to_iggy(error: &LoginRegisterError) -> IggyError {
 #[cfg(test)]
 mod tests {
     use configs::cluster::TransportPorts;
+    use iggy_binary_protocol::PrepareHeader;
+    use iggy_common::{IggyMessage, IggyMessagesBatch, Partitioning, PartitioningKind};
 
     use super::*;
+    use crate::responses::build_empty_reply;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
 
@@ -1885,5 +2236,125 @@ mod tests {
             primary_redirect_location(&roster, 0, READ_PATH),
             Some("http://[::1]:8080/streams?consistency=linearizable".to_owned())
         );
+    }
+
+    // -- encode_send_messages --
+
+    fn produce_command(partitioning: Partitioning) -> SendMessages {
+        let first = IggyMessage::builder()
+            .id(7)
+            .payload(Bytes::from_static(b"first"))
+            .build()
+            .expect("valid message");
+        // Raw pre-encoded user headers, mirroring the HTTP deserializer's
+        // base64 branch.
+        let mut second = IggyMessage::builder()
+            .id(8)
+            .payload(Bytes::from_static(b"second"))
+            .build()
+            .expect("valid message");
+        let raw_headers = Bytes::from_static(b"raw-header-bytes");
+        second.header.user_headers_length =
+            u32::try_from(raw_headers.len()).expect("test headers fit u32");
+        second.user_headers = Some(raw_headers);
+        let messages = vec![first, second];
+        SendMessages {
+            partitioning,
+            batch: IggyMessagesBatch::from(&messages),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encode_send_messages_round_trips_through_wire_decoders() {
+        use iggy_binary_protocol::WireMessageIterator;
+        use iggy_binary_protocol::message_layout::WIRE_MESSAGE_INDEX_SIZE;
+        use iggy_binary_protocol::requests::messages::SendMessagesHeader;
+
+        let stream_id = Identifier::from_str_value("1").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("orders").expect("valid topic id");
+        let command = produce_command(Partitioning::partition_id(3));
+        let origin_timestamps: Vec<u64> = command
+            .batch
+            .iter()
+            .map(|view| view.header().origin_timestamp())
+            .collect();
+
+        let bytes = encode_send_messages(&stream_id, &topic_id, &command).expect("encodes");
+
+        let metadata_length =
+            u32::from_le_bytes(bytes[..4].try_into().expect("length prefix")) as usize;
+        let (header, consumed) =
+            SendMessagesHeader::decode(&bytes[4..4 + metadata_length]).expect("valid metadata");
+        assert_eq!(consumed, metadata_length);
+        assert_eq!(header.stream_id, identifier_to_wire(&stream_id).unwrap());
+        assert_eq!(header.topic_id, identifier_to_wire(&topic_id).unwrap());
+        assert_eq!(
+            header.partitioning,
+            partitioning_to_wire(&command.partitioning).unwrap()
+        );
+        assert_eq!(header.messages_count, 2);
+
+        let data_offset = 4 + metadata_length + 2 * WIRE_MESSAGE_INDEX_SIZE;
+        let views: Vec<_> = WireMessageIterator::new(&bytes[data_offset..], 2)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("valid message frames");
+        assert_eq!(views[0].id(), 7);
+        assert_eq!(views[0].payload(), b"first");
+        assert_eq!(views[0].user_headers(), b"");
+        assert_eq!(views[0].origin_timestamp(), origin_timestamps[0]);
+        assert_eq!(views[1].id(), 8);
+        assert_eq!(views[1].payload(), b"second");
+        assert_eq!(views[1].user_headers(), b"raw-header-bytes");
+        assert_eq!(views[1].origin_timestamp(), origin_timestamps[1]);
+    }
+
+    #[test]
+    fn send_messages_validate_rejects_oversized_partitioning_key() {
+        let command = produce_command(Partitioning {
+            kind: PartitioningKind::MessagesKey,
+            length: 0,
+            value: vec![0u8; 256],
+        });
+        assert!(command.validate().is_err());
+    }
+
+    // -- classify_partition_reply --
+
+    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> BusMessage {
+        reply.into_generic().into_frozen()
+    }
+
+    #[test]
+    fn committed_partition_reply_classifies_as_success() {
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::SendMessages,
+            client: 42,
+            op: 1,
+            request: 1,
+            ..Default::default()
+        };
+        let reply = frozen(consensus::build_reply_message(&prepare, &Bytes::new()));
+        assert!(classify_partition_reply(&reply).is_ok());
+    }
+
+    #[test]
+    fn gate_failure_empty_reply_classifies_as_not_found() {
+        let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
+        let reply = frozen(build_empty_reply(request.header(), 42, 0, 9));
+        assert!(matches!(
+            classify_partition_reply(&reply),
+            Err(ProduceError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn non_reply_frame_classifies_as_rejected() {
+        let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
+        assert!(matches!(
+            classify_partition_reply(&request.into_generic().into_frozen()),
+            Err(ProduceError::Rejected(IggyError::InvalidCommand))
+        ));
     }
 }
