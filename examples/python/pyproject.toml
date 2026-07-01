@@ -25,8 +25,8 @@ dependencies = [
     "apache-iggy",
     "argparse==1.4.0",
     "loguru==0.7.3",
-    "pyrefly>=1.0.0",
-    "ruff>=0.15.15",
+    "pyrefly>=1.1.1",
+    "ruff>=0.15.19",
 ]
 
 [tool.ruff.lint]
