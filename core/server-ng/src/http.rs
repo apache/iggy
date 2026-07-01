@@ -39,6 +39,7 @@ use bytes::{Bytes, BytesMut};
 use configs::cluster::{ClusterConfig, ClusterNodeConfig};
 use configs::http::HttpConfig;
 use consensus::{MetadataHandle, VsrConsensus};
+use futures::channel::oneshot;
 use iggy_binary_protocol::codes::{
     GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
     GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
@@ -1975,23 +1976,18 @@ async fn delete_pat(
 /// reply body for the stream/topic/user routes, while [`create_pat`] needs the
 /// raw `Message` + request header to substitute the one-time token.
 ///
-/// Enforces the root-only admin gate, then serializes this session's writes
-/// behind its gate and holds it across the submit so request ids reach the
-/// primary strictly in order. The gate advances only on a committed `Reply`: a
-/// transient failure or an eviction leaves the id free for the caller's retry,
-/// which the depth-1 dedup requires (the next accepted request must be
-/// `committed + 1`, so a consumed-but-uncommitted id would wedge the session on
-/// `RequestGap`). An eviction means the session is dead, mapped to 401.
-///
-/// Both shard-0 request rewrites run here before consensus, mirroring the TCP
-/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
-/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes plaintext
-/// (`CreateUser` / `ChangePassword`). Both are no-ops for every other operation,
-/// so plaintext secrets never enter consensus on any write. On either rewrite's
-/// decode failure the gate is released without advancing, leaving the id free.
+/// Enforces the root-only admin gate, then runs the gate-locked submit
+/// ([`submit_gated`]) on a detached shard-0 task and awaits its outcome over a
+/// oneshot. Axum drops this handler future the moment the HTTP client
+/// disconnects; were the gate held here, that drop could land between the
+/// pump-driven consensus commit and the id advance, leaving the committed op's
+/// reply cached under an id the session still considers unused - the next
+/// write would collide into `Duplicate` and silently receive the prior op's
+/// reply. Detaching moves the whole critical section out of the cancellable
+/// future; a disconnect now only drops the receiver half.
 async fn submit_committed(
     state: &HttpInner,
-    session: &HttpSession,
+    session: &Rc<HttpSession>,
     operation: Operation,
     body: &[u8],
 ) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
@@ -2001,17 +1997,45 @@ async fn submit_committed(
     if session.user_id != DEFAULT_ROOT_USER_ID {
         return Err(WriteError::Rejected(IggyError::Unauthorized));
     }
-    // Per-session gate: serialize this session's request ids across the commit
-    // await, advancing the id only after an observed Reply so a transient
-    // failure leaves it free to retry.
-    //
-    // TODO(hubcio): cancellation-unsafe. If the client disconnects while parked
-    // on the await below, this handler is dropped without advancing the id, yet
-    // the prepare still commits pump-driven. The next write on this session then
-    // reuses the id, gets the prior op's cached reply (Duplicate), silently loses
-    // its own write, and returns a foreign success. Fix by moving the submit into
-    // a detached shard-0 task that owns the id advance and signals the handler
-    // via a oneshot, so the commit is recorded regardless of client liveness.
+    let (result_slot, committed) = oneshot::channel();
+    let shard = Rc::clone(&state.shard);
+    let session = Rc::clone(session);
+    let body = body.to_vec();
+    // Detached so a client disconnect cannot split a commit from its id
+    // advance; both happen inside the task regardless of handler liveness.
+    compio::runtime::spawn(async move {
+        let result = submit_gated(&shard, &session, operation, &body).await;
+        // A failed send means the handler died mid-await. The id advance
+        // already happened above, which is the invariant that matters.
+        let _ = result_slot.send(result);
+    })
+    .detach();
+    // `Canceled` = the task was dropped before sending (runtime teardown), a
+    // transient server condition like an unanswered submit.
+    committed.await.map_err(|_| WriteError::Unavailable)?
+}
+
+/// Gate-locked core of [`submit_committed`], run on a task the HTTP client
+/// cannot cancel: serializes this session's writes behind its gate and holds
+/// it across the submit so request ids reach the primary strictly in order.
+/// The gate advances only on a committed `Reply`: a transient failure or an
+/// eviction leaves the id free for the caller's retry, which the depth-1
+/// dedup requires (the next accepted request must be `committed + 1`, so a
+/// consumed-but-uncommitted id would wedge the session on `RequestGap`). An
+/// eviction means the session is dead, mapped to 401.
+///
+/// Both shard-0 request rewrites run here before consensus, mirroring the TCP
+/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
+/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes plaintext
+/// (`CreateUser` / `ChangePassword`). Both are no-ops for every other operation,
+/// so plaintext secrets never enter consensus on any write. On either rewrite's
+/// decode failure the gate is released without advancing, leaving the id free.
+async fn submit_gated(
+    shard: &Rc<ServerNgShard>,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
     let message = build_request_message(
         operation,
@@ -2024,7 +2048,7 @@ async fn submit_committed(
         rewrite_pat_request_for_user(session.user_id, message).map_err(WriteError::Rejected)?;
     let message = maybe_rewrite_user_password_request(message).map_err(WriteError::Rejected)?;
     let request_header = *message.header();
-    let reply = submit_client_request_on_owner(&state.shard, message).await;
+    let reply = submit_client_request_on_owner(shard, message).await;
     let Some(reply) = reply else {
         return Err(WriteError::Unavailable);
     };
@@ -2046,7 +2070,7 @@ async fn submit_committed(
 /// the update/delete/purge routes ignore it (it is empty) and answer 204.
 async fn submit_write(
     state: &HttpInner,
-    session: &HttpSession,
+    session: &Rc<HttpSession>,
     operation: Operation,
     body: &[u8],
 ) -> Result<Bytes, WriteError> {
@@ -3208,5 +3232,43 @@ mod tests {
         assert_eq!(fresh.get(), 1);
         assert_eq!(global.get(), MAX_IN_FLIGHT_WRITES_GLOBAL);
         drop(readmitted);
+    }
+
+    // -- detached control-plane submit --
+
+    /// Pins the platform contract `submit_committed`'s cancellation safety
+    /// rests on: a detached compio task keeps running after the handler side
+    /// is gone, the gate advance it performs sticks, and sending the result
+    /// into a dropped oneshot receiver is an ignorable `Err`, never a panic.
+    /// The full hazard window (client disconnect between the consensus commit
+    /// and the id advance) needs a live commit round-trip, so it is covered by
+    /// construction plus the live cancellation smoke, not faked here.
+    #[compio::test]
+    async fn detached_task_advances_gate_and_ignores_dead_receiver() {
+        let session = Rc::new(HttpSession {
+            client_id: 7,
+            session: 1,
+            user_id: DEFAULT_ROOT_USER_ID,
+            expiry: u64::MAX,
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_request: Cell::new(FIRST_REQUEST_ID),
+            registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
+        });
+        let (result_slot, committed) = oneshot::channel::<u64>();
+        // The handler future dies (client disconnect) before the task runs.
+        drop(committed);
+        let (done_slot, done) = oneshot::channel::<()>();
+        let task_session = Rc::clone(&session);
+        compio::runtime::spawn(async move {
+            let mut next_request_id = task_session.gate.lock().await;
+            *next_request_id += 1;
+            let _ = result_slot.send(*next_request_id);
+            drop(next_request_id);
+            let _ = done_slot.send(());
+        })
+        .detach();
+        done.await.expect("detached task must run to completion");
+        assert_eq!(*session.gate.lock().await, FIRST_REQUEST_ID + 1);
     }
 }
