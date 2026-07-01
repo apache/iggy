@@ -16,16 +16,18 @@
 // under the License.
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::retry::{
     ConnectivityConfig, build_retry_client, check_connectivity_with_retry, parse_duration,
 };
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Schema, Sink, TopicMetadata, sink_connector,
 };
 use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
+use simd_json::OwnedValue;
 use tracing::{debug, error, info, warn};
 
 sink_connector!(QuickwitSink);
@@ -171,11 +173,15 @@ impl QuickwitSink {
             self.config.url, self.index_id
         );
         let messages_count = messages.len();
-        let ndjson = messages
-            .into_iter()
-            .filter_map(|record| simd_json::to_string(&record).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut ndjson = String::new();
+        for record in messages {
+            if let Ok(json_str) = simd_json::to_string(&record) {
+                if !ndjson.is_empty() {
+                    ndjson.push('\n');
+                }
+                ndjson.push_str(&json_str);
+            }
+        }
 
         let response = client
             .post(&url)
@@ -217,6 +223,51 @@ impl QuickwitSink {
                 "status: {status}, reason: {text}"
             )))
         }
+    }
+
+    fn extract_json_payloads(
+        &self,
+        messages: Vec<ConsumedMessage>,
+        schema: Schema,
+    ) -> Vec<OwnedValue> {
+        let mut json_payloads = Vec::with_capacity(messages.len());
+        for message in messages {
+            let val = match message.payload {
+                Payload::Json(value) => value,
+                Payload::Raw(bytes) => {
+                    let mut bytes_copy = bytes.clone();
+                    match simd_json::from_slice::<OwnedValue>(&mut bytes_copy) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                                simd_json::json!({
+                                    "data": text,
+                                    "data_type": "raw"
+                                })
+                            } else {
+                                simd_json::json!({
+                                    "data": general_purpose::STANDARD.encode(&bytes),
+                                    "data_type": "raw"
+                                })
+                            }
+                        }
+                    }
+                }
+                Payload::Text(text) => simd_json::json!({
+                    "text": text,
+                    "data_type": "text"
+                }),
+                _ => {
+                    warn!(
+                        "Quickwit sink connector ID: {} unsupported payload schema: {}",
+                        self.id, schema
+                    );
+                    continue;
+                }
+            };
+            json_payloads.push(val);
+        }
+        json_payloads
     }
 }
 
@@ -306,19 +357,7 @@ impl Sink for QuickwitSink {
             );
         }
 
-        let mut json_payloads = Vec::with_capacity(total);
-        for message in messages {
-            match message.payload {
-                Payload::Json(value) => json_payloads.push(value),
-                _ => {
-                    warn!(
-                        "Quickwit sink connector ID: {} unsupported payload schema: {}",
-                        self.id, messages_metadata.schema
-                    );
-                }
-            }
-        }
-
+        let json_payloads = self.extract_json_payloads(messages, messages_metadata.schema);
         if json_payloads.is_empty() {
             return Ok(());
         }
@@ -383,5 +422,94 @@ mod tests {
     fn given_new_sink_index_id_should_be_empty() {
         let sink = QuickwitSink::new(1, test_config());
         assert!(sink.index_id.is_empty());
+    }
+
+    fn test_message(payload: Payload) -> ConsumedMessage {
+        ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn given_json_payload_should_extract_it_directly() {
+        let sink = QuickwitSink::new(1, test_config());
+        let val = simd_json::json!({"key": "value"});
+        let msg = test_message(Payload::Json(val.clone()));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::Json);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], val);
+    }
+
+    #[test]
+    fn given_raw_json_payload_should_parse_and_extract_it() {
+        let sink = QuickwitSink::new(1, test_config());
+        let val = simd_json::json!({"key": "value"});
+        let raw_bytes = simd_json::to_vec(&val).unwrap();
+        let msg = test_message(Payload::Raw(raw_bytes));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::Raw);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], val);
+    }
+
+    #[test]
+    fn given_raw_invalid_json_text_should_wrap_in_raw_object() {
+        let sink = QuickwitSink::new(1, test_config());
+        let raw_text = "invalid json text";
+        let msg = test_message(Payload::Raw(raw_text.as_bytes().to_vec()));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::Raw);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            extracted[0],
+            simd_json::json!({
+                "data": raw_text,
+                "data_type": "raw"
+            })
+        );
+    }
+
+    #[test]
+    fn given_raw_binary_should_encode_base64_in_raw_object() {
+        let sink = QuickwitSink::new(1, test_config());
+        let binary_data = vec![0, 15, 255];
+        let msg = test_message(Payload::Raw(binary_data.clone()));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::Raw);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            extracted[0],
+            simd_json::json!({
+                "data": general_purpose::STANDARD.encode(&binary_data),
+                "data_type": "raw"
+            })
+        );
+    }
+
+    #[test]
+    fn given_text_payload_should_wrap_in_text_object() {
+        let sink = QuickwitSink::new(1, test_config());
+        let text = "hello quickwit";
+        let msg = test_message(Payload::Text(text.to_string()));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::Text);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(
+            extracted[0],
+            simd_json::json!({
+                "text": text,
+                "data_type": "text"
+            })
+        );
+    }
+
+    #[test]
+    fn given_unsupported_payload_should_ignore_it() {
+        let sink = QuickwitSink::new(1, test_config());
+        let msg = test_message(Payload::FlatBuffer(vec![1, 2, 3]));
+        let extracted = sink.extract_json_payloads(vec![msg], Schema::FlatBuffer);
+        assert!(extracted.is_empty());
     }
 }
