@@ -90,6 +90,11 @@ impl FromRequestParts<HttpState> for Authenticated {
 /// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
 pub struct Identity {
     pub user_id: u32,
+    /// Original request path + query (e.g. `/streams?consistency=linearizable`),
+    /// captured so a linearizable read that reaches a follower can build the
+    /// `Location` for its 307 redirect to the primary. Empty only when the URI
+    /// carries neither, which a routed read never is.
+    pub path_and_query: String,
 }
 
 impl FromRequestParts<HttpState> for Identity {
@@ -112,7 +117,15 @@ impl FromRequestParts<HttpState> for Identity {
         // no `SendWrapper` bridge (contrast [`Authenticated`], which awaits the
         // `!Send` `resolve_session`).
         let (_key, user_id, _expiry) = resolve_credential(state, bearer)?;
-        Ok(Self { user_id })
+        let path_and_query = parts
+            .uri
+            .path_and_query()
+            .map(|value| value.as_str().to_owned())
+            .unwrap_or_default();
+        Ok(Self {
+            user_id,
+            path_and_query,
+        })
     }
 }
 

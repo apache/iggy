@@ -24,10 +24,11 @@ mod jwt;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::header::LOCATION;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
@@ -279,10 +280,15 @@ enum ReadError {
     Rejected(IggyError),
     /// Requested entity is absent -> 404 with the legacy not-found body.
     NotFound,
-    /// A linearizable read reached a follower. Transient from the caller's view
-    /// -> 503, retryable; becomes a 307-to-leader once the roster + redirect
-    /// land (see [`not_primary_response`]).
+    /// A linearizable read reached a follower and the primary's HTTP address was
+    /// not resolvable from the roster. Fail-closed 503, retryable against the
+    /// leader (see [`not_primary_response`]).
     NotPrimary,
+    /// A linearizable read reached a follower and the current VSR primary's HTTP
+    /// address resolved: 307 to that address carrying the original path and
+    /// query, so the caller re-issues the read against the leader (see
+    /// [`primary_redirect_response`]).
+    RedirectToPrimary(String),
 }
 
 impl IntoResponse for ReadError {
@@ -293,15 +299,17 @@ impl IntoResponse for ReadError {
             // the legacy server's `CustomError::ResourceNotFound` does.
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::NotPrimary => not_primary_response(),
+            Self::RedirectToPrimary(location) => primary_redirect_response(&location),
         }
     }
 }
 
-/// The 503 body for a linearizable read that reached a follower. No node roster
-/// exists at the HTTP layer yet (F7), so this node cannot 307-redirect to the
-/// primary nor emit a `Location` (F3); the caller must retry, ideally against
-/// the leader. Once both land this branch becomes a 307. Rendered as an
-/// `ErrorResponse` so the body shape matches every other HTTP error.
+/// The 503 fail-closed body for a linearizable read that reached a follower
+/// whose primary HTTP address could not be resolved (absent consensus, a roster
+/// with no node at the primary index, or a port-less node). The resolvable case
+/// is a 307 via [`primary_redirect_response`] instead. Rendered as an
+/// `ErrorResponse` so the body shape matches every other HTTP error; the caller
+/// retries against the leader.
 fn not_primary_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -313,6 +321,45 @@ fn not_primary_response() -> Response {
         }),
     )
         .into_response()
+}
+
+/// 307 Temporary Redirect to the current VSR primary for a linearizable read
+/// that reached a follower. `Location` is the primary's HTTP base plus the
+/// original path and query, so the caller re-issues the identical read against
+/// the leader. Dormant on a single node (always primary) and followed by no SDK
+/// yet. A `Location` that is not a valid header value falls back to the 503.
+fn primary_redirect_response(location: &str) -> Response {
+    HeaderValue::from_str(location).map_or_else(
+        |_| not_primary_response(),
+        |value| {
+            let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+            response.headers_mut().insert(LOCATION, value);
+            response
+        },
+    )
+}
+
+/// Build the `Location` for a 307 redirect of a linearizable read to the VSR
+/// primary: `http://<host>:<http-port><path_and_query>`. `None` when the roster
+/// has no node at `primary_index`, that node exposes no HTTP port, or its `ip`
+/// is not a valid address, so the caller fails closed to a 503 rather than
+/// pointing at an unreachable target. Formats through [`SocketAddr`] so an IPv6
+/// host is bracketed (`http://[::1]:8080/...`) rather than left ambiguous. Pure
+/// (no consensus or axum dependency) so the redirect target is unit-tested in
+/// isolation.
+fn primary_redirect_location(
+    roster: &ClusterRoster,
+    primary_index: u8,
+    path_and_query: &str,
+) -> Option<String> {
+    let node = roster
+        .nodes
+        .iter()
+        .find(|node| node.replica_id == primary_index)?;
+    let http_port = node.ports.http?;
+    let ip = node.ip.parse::<IpAddr>().ok()?;
+    let socket = SocketAddr::new(ip, http_port);
+    Some(format!("http://{socket}{path_and_query}"))
 }
 
 /// Owned snapshot of the cluster topology `GET /cluster/metadata` reports.
@@ -359,6 +406,25 @@ impl HttpInner {
             .consensus
             .as_ref()
             .is_some_and(VsrConsensus::is_primary)
+    }
+
+    /// Grade a linearizable read that reached a follower: redirect (307) to the
+    /// current VSR primary's HTTP address when it resolves from the roster, else
+    /// fail closed to the 503. The target is the roster node whose `replica_id`
+    /// equals `primary_index(view)`; an absent consensus, an unmatched id, or a
+    /// port-less node all fall back to [`ReadError::NotPrimary`].
+    fn not_primary_read_error(&self, path_and_query: &str) -> ReadError {
+        let location = self
+            .shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .and_then(|consensus| {
+                let primary_index = consensus.primary_index(consensus.view());
+                primary_redirect_location(&self.roster, primary_index, path_and_query)
+            });
+        location.map_or(ReadError::NotPrimary, ReadError::RedirectToPrimary)
     }
 
     /// Resolve the VSR session for `key`, minting and Registering one on first
@@ -623,7 +689,7 @@ async fn get_streams(
     let body = GetStreamsRequest.to_bytes();
     let bytes = read_local(
         &state,
-        identity.user_id,
+        &identity,
         query.consistency,
         GET_STREAMS_CODE,
         &body,
@@ -647,13 +713,7 @@ async fn get_stream(
         stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_STREAM_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_STREAM_CODE, &body)?;
     let response = GetStreamResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -675,13 +735,7 @@ async fn get_topics(
         stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_TOPICS_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_TOPICS_CODE, &body)?;
     let response = GetTopicsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -705,13 +759,7 @@ async fn get_topic(
         topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_TOPIC_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_TOPIC_CODE, &body)?;
     let response = GetTopicResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -727,13 +775,7 @@ async fn get_users(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<UserInfo>>, ReadError> {
     let body = GetUsersRequest.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_USERS_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_USERS_CODE, &body)?;
     let response = GetUsersResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -755,13 +797,7 @@ async fn get_user(
         user_id: identifier_to_wire(&user_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_USER_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_USER_CODE, &body)?;
     let response = UserDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -787,7 +823,7 @@ async fn get_cgs(
     let body = request.to_bytes();
     let bytes = read_local(
         &state,
-        identity.user_id,
+        &identity,
         query.consistency,
         GET_CONSUMER_GROUPS_CODE,
         &body,
@@ -818,7 +854,7 @@ async fn get_cg(
     let body = request.to_bytes();
     let bytes = read_local(
         &state,
-        identity.user_id,
+        &identity,
         query.consistency,
         GET_CONSUMER_GROUP_CODE,
         &body,
@@ -838,13 +874,7 @@ async fn get_stats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Stats>, ReadError> {
     let body = GetStatsRequest.to_bytes();
-    let bytes = read_local(
-        &state,
-        identity.user_id,
-        query.consistency,
-        GET_STATS_CODE,
-        &body,
-    )?;
+    let bytes = read_local(&state, &identity, query.consistency, GET_STATS_CODE, &body)?;
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
@@ -879,7 +909,7 @@ async fn get_clients(
     identity: Identity,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<ClientInfo>>, ReadError> {
-    authorize_read(&state, identity.user_id, query.consistency)?;
+    authorize_read(&state, &identity, query.consistency)?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     let response = GetClientsResponse {
         clients: infos
@@ -904,7 +934,7 @@ async fn get_client(
     Path(client_id): Path<u32>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<ClientInfoDetails>, ReadError> {
-    authorize_read(&state, identity.user_id, query.consistency)?;
+    authorize_read(&state, &identity, query.consistency)?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     // The wire client id is the u32 seq tail of the u128 transport id.
     #[allow(clippy::cast_possible_truncation)]
@@ -1505,20 +1535,20 @@ async fn submit_write(
 ///
 /// Root-only: until server-ng has an RBAC permissioner, every read is root-only,
 /// mirroring the write gate in [`submit_committed`]. A non-root credential is
-/// authenticated but unprivileged -> 403. Linearizable reads must come from the
-/// primary; on a follower we cannot yet 307-redirect (no roster: F7) nor emit
-/// the Location (F3), so 503 and let the client retry. This becomes a
-/// 307-to-leader once both land.
+/// authenticated but unprivileged -> 403. A linearizable read must come from the
+/// primary; on a follower it redirects (307) to the primary's HTTP address when
+/// resolvable, else fails closed to a 503 (see
+/// [`HttpInner::not_primary_read_error`]).
 fn authorize_read(
     state: &HttpInner,
-    user_id: u32,
+    identity: &Identity,
     consistency: Consistency,
 ) -> Result<(), ReadError> {
-    if user_id != DEFAULT_ROOT_USER_ID {
+    if identity.user_id != DEFAULT_ROOT_USER_ID {
         return Err(ReadError::Rejected(IggyError::Unauthorized));
     }
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
-        return Err(ReadError::NotPrimary);
+        return Err(state.not_primary_read_error(&identity.path_and_query));
     }
     Ok(())
 }
@@ -1537,12 +1567,12 @@ fn authorize_read(
 /// whose entity can be missing shares that not-found shape.
 fn read_local(
     state: &HttpInner,
-    user_id: u32,
+    identity: &Identity,
     consistency: Consistency,
     code: u32,
     body: &[u8],
 ) -> Result<Bytes, ReadError> {
-    authorize_read(state, user_id, consistency)?;
+    authorize_read(state, identity, consistency)?;
     match build_non_replicated_response(&state.shard, code, body).map_err(ReadError::Rejected)? {
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
@@ -1783,5 +1813,77 @@ const fn login_error_to_iggy(error: &LoginRegisterError) -> IggyError {
         LoginRegisterError::InvalidToken => IggyError::InvalidPersonalAccessToken,
         LoginRegisterError::UserInactive => IggyError::UserInactive,
         _ => IggyError::Unauthenticated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use configs::cluster::TransportPorts;
+
+    use super::*;
+
+    const READ_PATH: &str = "/streams?consistency=linearizable";
+
+    fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: format!("node-{replica_id}"),
+            ip: ip.to_owned(),
+            replica_id,
+            ports: TransportPorts {
+                tcp: None,
+                quic: None,
+                http,
+                websocket: None,
+                tcp_replica: None,
+            },
+        }
+    }
+
+    fn roster(nodes: Vec<ClusterNodeConfig>) -> ClusterRoster {
+        ClusterRoster {
+            enabled: true,
+            name: "test-cluster".to_owned(),
+            nodes,
+            http_addr: "127.0.0.1:3000".parse().expect("valid socket addr"),
+        }
+    }
+
+    #[test]
+    fn primary_redirect_location_targets_primary_http_addr_with_path_passthrough() {
+        let roster = roster(vec![
+            node(0, "10.0.0.1", Some(8080)),
+            node(1, "10.0.0.2", Some(8090)),
+        ]);
+        assert_eq!(
+            primary_redirect_location(&roster, 1, READ_PATH),
+            Some("http://10.0.0.2:8090/streams?consistency=linearizable".to_owned())
+        );
+    }
+
+    #[test]
+    fn primary_redirect_location_is_none_when_no_node_matches_primary_index() {
+        let roster = roster(vec![node(0, "10.0.0.1", Some(8080))]);
+        assert_eq!(primary_redirect_location(&roster, 2, READ_PATH), None);
+    }
+
+    #[test]
+    fn primary_redirect_location_is_none_when_primary_has_no_http_port() {
+        let roster = roster(vec![node(0, "10.0.0.1", None)]);
+        assert_eq!(primary_redirect_location(&roster, 0, READ_PATH), None);
+    }
+
+    #[test]
+    fn primary_redirect_location_is_none_for_empty_roster() {
+        let roster = roster(Vec::new());
+        assert_eq!(primary_redirect_location(&roster, 0, READ_PATH), None);
+    }
+
+    #[test]
+    fn primary_redirect_location_brackets_ipv6_host() {
+        let roster = roster(vec![node(0, "::1", Some(8080))]);
+        assert_eq!(
+            primary_redirect_location(&roster, 0, READ_PATH),
+            Some("http://[::1]:8080/streams?consistency=linearizable".to_owned())
+        );
     }
 }
