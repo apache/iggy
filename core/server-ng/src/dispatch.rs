@@ -1624,7 +1624,7 @@ fn submit_disconnect_logout(shard: Rc<ServerNgShard>, vsr_client_id: u128, sessi
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
 /// `None` = transient submit failure (SDK read-timeout replays).
 #[allow(clippy::future_not_send)]
-async fn submit_client_request_on_owner(
+pub(crate) async fn submit_client_request_on_owner(
     shard: &Rc<ServerNgShard>,
     request: Message<RequestHeader>,
 ) -> Option<Message<GenericHeader>> {

@@ -33,19 +33,30 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use configs::http::HttpJwtConfig;
+use iggy_binary_protocol::consensus::{
+    Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
+};
+use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
+use iggy_binary_protocol::{
+    GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
+};
+use iggy_common::create_stream::CreateStream;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IdentityInfo, IggyError, IggyTimestamp, TokenInfo};
+use iggy_common::{IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo};
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
 use server::http::error::{CustomError, ErrorResponse};
+use server_common::Message;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::bootstrap::ServerNgShard;
-use crate::dispatch::submit_register_on_owner;
+use crate::dispatch::{submit_client_request_on_owner, submit_register_on_owner};
 use crate::http::extractor::Authenticated;
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
@@ -61,8 +72,8 @@ const PONG: &str = "pong";
 /// entries are dropped first, so the cap only bites on live oversubscription.
 const MAX_HTTP_SESSIONS: usize = 100_000;
 
-/// First per-session request id the write path (2c) will hand out. VSR request
-/// numbers are 1-based and strictly increasing within a session.
+/// First per-session request id the write path hands out. VSR request numbers
+/// are 1-based and strictly increasing within a session.
 const FIRST_REQUEST_ID: u64 = 1;
 
 /// One VSR session established for a single login credential (a JWT `jti` or a
@@ -71,32 +82,22 @@ const FIRST_REQUEST_ID: u64 = 1;
 struct HttpSession {
     /// Shard-0 client id minted for this credential; its top 16 bits are 0, so
     /// it shares the shard-0 id space with TCP virtual clients without
-    /// colliding. Consumed by the write path (2c).
-    #[expect(
-        dead_code,
-        reason = "read by the write path (2c) to fill RequestHeader.client"
-    )]
+    /// colliding. Fills `RequestHeader.client` on every write.
     client_id: u128,
-    /// Cluster session number returned by the VSR `Register` commit. Consumed
-    /// by the write path (2c).
-    #[expect(
-        dead_code,
-        reason = "read by the write path (2c) to fill RequestHeader.session"
-    )]
+    /// Cluster session number returned by the VSR `Register` commit. Fills
+    /// `RequestHeader.session` on every write.
     session: u64,
-    /// User the credential authenticated as. Consumed by the write path (2c).
-    #[expect(dead_code, reason = "read by the write path (2c) for authorization")]
+    /// User the credential authenticated as. Consumed by the write path for
+    /// authorization.
+    #[expect(dead_code, reason = "read once authorization is wired for writes")]
     user_id: u32,
     /// Credential expiry in unix seconds (`u64::MAX` = never). Drives lazy
     /// eviction of stale table entries.
     expiry: u64,
-    /// Serializes the write path (2c): the guarded value is the NEXT request
-    /// id. A `tokio::sync::Mutex` because 2c holds it across the submit `.await`
-    /// so each session's request numbers stay monotonic and gap-free.
-    #[expect(
-        dead_code,
-        reason = "locked by the write path (2c) to serialize per-session writes"
-    )]
+    /// Serializes this session's writes: the guarded value is the NEXT request
+    /// id. A `tokio::sync::Mutex` because the write path holds it across the
+    /// submit `.await` so each session's request numbers reach the primary in
+    /// order and stay gap-free for the depth-1 consensus dedup.
     gate: Mutex<u64>,
 }
 
@@ -126,15 +127,46 @@ impl IntoResponse for AuthError {
             Self::Unauthenticated(error) => CustomError::from(error).into_response(),
             // Register could not commit (no caught-up primary, pipeline full, or
             // a view-change cancel). Transient server condition -> 503, retryable.
-            Self::SessionUnavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::from_error(
-                    IggyError::CannotEstablishConnection,
-                )),
-            )
-                .into_response(),
+            Self::SessionUnavailable => service_unavailable(),
         }
     }
+}
+
+/// Rejection for an authenticated control-plane write (`POST /streams` and the
+/// writes that follow it).
+///
+/// Same two-class split as [`AuthError`], for the same reasons: a caller-side
+/// validation failure or a committed business rejection (e.g. a duplicate
+/// stream name) renders through the legacy `IggyError -> CustomError` map so
+/// SDK error bodies stay byte-identical, while a write that cannot commit right
+/// now is a transient server condition (503) and must never surface as a
+/// business error or, worse, a 200 with a stale body.
+enum WriteError {
+    Rejected(IggyError),
+    Unavailable,
+}
+
+impl IntoResponse for WriteError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::Unavailable => service_unavailable(),
+        }
+    }
+}
+
+/// The shared 503 body for a request that could not commit right now: no
+/// caught-up primary, a full pipeline, or a view-change cancel. Retryable, and
+/// rendered with the `CannotEstablishConnection` code the SDKs treat as a
+/// connection-level retry rather than a terminal error.
+fn service_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse::from_error(
+            IggyError::CannotEstablishConnection,
+        )),
+    )
+        .into_response()
 }
 
 /// Shared shard-0 HTTP state.
@@ -307,6 +339,7 @@ fn router(state: HttpState) -> Router {
             post(login_with_personal_access_token),
         )
         .route("/users/me", get(get_me))
+        .route("/streams", post(create_stream))
         .with_state(state)
 }
 
@@ -348,6 +381,152 @@ async fn get_me(identity: Authenticated) -> Json<IdentityInfo> {
         user_id: identity.user_id,
         access_token: None,
     })
+}
+
+/// `POST /streams`: create a stream through the per-session gate and the
+/// in-process VSR dispatch spine, then render the committed reply as the same
+/// `StreamDetails` JSON the legacy server returns.
+///
+/// The accepted body is name-only (`{"name": ...}`), matching the legacy
+/// request; server-ng's wire `CreateStreamRequest` is likewise name-only and
+/// auto-assigns the id, so there is no client-supplied stream id to honor.
+async fn create_stream(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Json(command): Json<CreateStream>,
+) -> Result<Json<StreamDetails>, WriteError> {
+    let request = CreateStreamRequest {
+        name: WireName::new(command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
+    };
+
+    let client_id = identity.session.client_id;
+    let session_id = identity.session.session;
+
+    // Serialize this session's writes behind the gate and take the next VSR
+    // request id. The gate is held across the commit so ids reach the primary
+    // strictly in order, and it advances only once the request commits (a
+    // `Reply` frame): a transient failure or an eviction leaves the id free for
+    // the caller's retry, which the depth-1 dedup requires (the next accepted
+    // request must be `committed_request + 1`, so a consumed-but-uncommitted id
+    // would wedge the session on `RequestGap`).
+    let mut next_request_id = identity.session.gate.lock().await;
+    let message = build_create_stream_message(client_id, session_id, *next_request_id, &request);
+    // `submit_client_request_on_owner` is `!Send` (Rc-based); `SendWrapper`
+    // bridges it onto axum's `Send` handler future, sound because the whole
+    // handler runs pinned to shard 0's compio thread.
+    let reply = SendWrapper::new(submit_client_request_on_owner(&state.shard, message)).await;
+    let Some(reply) = reply else {
+        return Err(WriteError::Unavailable);
+    };
+
+    // Peek the reply frame before decoding: an eviction carries no result
+    // section and means the session is dead (re-authenticate), so unlike a
+    // committed `Reply` it must not consume this request id.
+    match reply.header().command {
+        Command2::Reply => {
+            // Committed: the cluster consumed this id, so advance the gate before
+            // rendering, whether or not the body decodes.
+            *next_request_id += 1;
+            drop(next_request_id);
+            Ok(Json(decode_committed_stream(&reply)?))
+        }
+        Command2::Eviction => Err(WriteError::Rejected(eviction_error(&reply))),
+        _ => Err(WriteError::Rejected(IggyError::InvalidCommand)),
+    }
+}
+
+/// Build the `Message<RequestHeader>` for a create-stream by filling a zeroed
+/// `#[repr(C)]` header, mirroring `wire::rewrite_request_body` and the
+/// partition reconciler's prepare builder.
+fn build_create_stream_message(
+    client_id: u128,
+    session_id: u64,
+    request_id: u64,
+    request: &CreateStreamRequest,
+) -> Message<RequestHeader> {
+    let body = request.to_bytes();
+    let total = HEADER_SIZE + body.len();
+    let mut message = Message::<RequestHeader>::new(total);
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        &mut message.as_mut_slice()[..HEADER_SIZE],
+    )
+    .expect("zeroed bytes form a valid RequestHeader");
+    header.command = Command2::Request;
+    header.operation = Operation::CreateStream;
+    header.client = client_id;
+    header.session = session_id;
+    header.request = request_id;
+    header.size = u32::try_from(total).expect("create-stream message size fits u32");
+    message
+}
+
+/// Decode a committed `Reply` frame's body into `StreamDetails`, mirroring the
+/// SDK's `split_metadata_result`. A metadata reply body leads with a result
+/// section (`[count][{index, result}]*`): `count == 0` is success followed by
+/// the `GetStreamResponse` payload, and a nonzero first `result` is a committed
+/// business rejection carrying an `IggyError` code (e.g. duplicate name). The
+/// caller has already confirmed the frame is a `Reply`, so a missing result
+/// section is a malformed committed reply, mapped to an error rather than a 200
+/// with a stale body.
+fn decode_committed_stream(reply: &Message<GenericHeader>) -> Result<StreamDetails, WriteError> {
+    let size = reply.header().size as usize;
+    let body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
+    match result_code(body) {
+        Some(0) => {
+            let payload_start =
+                result_section_len(body).ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
+            let payload = body
+                .get(payload_start..)
+                .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
+            let response = GetStreamResponse::decode_from(payload)
+                .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+            StreamDetails::try_from(response).map_err(WriteError::Rejected)
+        }
+        Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
+        None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
+    }
+}
+
+/// Map an eviction frame to the same typed [`IggyError`] the SDK's
+/// `decode_eviction` produces, so an HTTP caller sees the identical status a TCP
+/// caller would (session-terminal reasons render as 401 -> re-authenticate).
+/// Reuses the shared [`EvictionHeader`] primitive rather than hand-decoding
+/// offsets; an unreadable frame falls back to re-authentication.
+fn eviction_error(reply: &Message<GenericHeader>) -> IggyError {
+    let Some(eviction) = reply
+        .as_slice()
+        .get(..HEADER_SIZE)
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<EvictionHeader>(bytes).ok())
+    else {
+        return IggyError::Unauthenticated;
+    };
+    match eviction.reason {
+        EvictionReason::InvalidCredentials => IggyError::InvalidCredentials,
+        EvictionReason::InvalidToken => IggyError::InvalidPersonalAccessToken,
+        EvictionReason::UserInactive
+        | EvictionReason::SessionError
+        | EvictionReason::NoSession
+        | EvictionReason::SessionTooLow
+        | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
+        EvictionReason::StaleClient => IggyError::StaleClient,
+        EvictionReason::IncompatibleProtocol => {
+            let server_max = eviction.server_protocol_version;
+            let server_min = eviction.server_protocol_version_min;
+            if server_min == 0 || server_max < server_min {
+                IggyError::Unauthenticated
+            } else {
+                IggyError::IncompatibleProtocolVersion(
+                    IGGY_PROTOCOL_VERSION,
+                    server_min,
+                    server_max,
+                )
+            }
+        }
+        EvictionReason::MalformedLogin => IggyError::InvalidFormat,
+        _ => IggyError::InvalidCommand,
+    }
 }
 
 /// Issue a fresh access token for `user_id` and wrap it in the exact

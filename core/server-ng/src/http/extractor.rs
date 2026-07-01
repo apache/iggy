@@ -40,7 +40,7 @@ const PAT_KEY_PREFIX: &str = "pat:";
 /// shared VSR session established once per presenting credential.
 pub struct Authenticated {
     pub user_id: u32,
-    /// Per-credential VSR session. The write path (2c) reads its client id and
+    /// Per-credential VSR session. The write path reads its client id and
     /// session number and serializes writes through its gate; `get_me` and
     /// other read-only probes ignore it.
     ///
@@ -48,10 +48,6 @@ pub struct Authenticated {
     /// `Rc` is not; this mirrors the `HttpState` bridge. Sound for the same
     /// reason: the extractor mints it on shard 0's compio thread and every
     /// handler runs on that same thread, so the wrapper is never crossed.
-    #[expect(
-        dead_code,
-        reason = "read by the write path (2c) via client id, session, and gate"
-    )]
     pub session: SendWrapper<Rc<HttpSession>>,
 }
 
