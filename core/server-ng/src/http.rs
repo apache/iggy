@@ -27,16 +27,22 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use bytes::Bytes;
 use configs::http::HttpJwtConfig;
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
 };
-use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::requests::streams::{
+    CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
+};
+use iggy_binary_protocol::requests::topics::{
+    DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+};
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
@@ -45,7 +51,12 @@ use iggy_binary_protocol::{
 use iggy_common::create_stream::CreateStream;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo};
+use iggy_common::update_stream::UpdateStream;
+use iggy_common::update_topic::UpdateTopic;
+use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::{
+    Identifier, IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo, Validatable,
+};
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
@@ -340,6 +351,19 @@ fn router(state: HttpState) -> Router {
         )
         .route("/users/me", get(get_me))
         .route("/streams", post(create_stream))
+        .route(
+            "/streams/{stream_id}",
+            put(update_stream).delete(delete_stream),
+        )
+        .route("/streams/{stream_id}/purge", delete(purge_stream))
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}",
+            put(update_topic).delete(delete_topic),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/purge",
+            delete(purge_topic),
+        )
         .with_state(state)
 }
 
@@ -383,8 +407,7 @@ async fn get_me(identity: Authenticated) -> Json<IdentityInfo> {
     })
 }
 
-/// `POST /streams`: create a stream through the per-session gate and the
-/// in-process VSR dispatch spine, then render the committed reply as the same
+/// `POST /streams`: create a stream and render the committed reply as the same
 /// `StreamDetails` JSON the legacy server returns.
 ///
 /// The accepted body is name-only (`{"name": ...}`), matching the legacy
@@ -399,94 +422,258 @@ async fn create_stream(
         name: WireName::new(command.name)
             .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
     };
+    let body = request.to_bytes();
+    let payload = SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::CreateStream,
+        &body,
+    ))
+    .await?;
+    Ok(Json(decode_stream_details(&payload)?))
+}
 
-    let client_id = identity.session.client_id;
-    let session_id = identity.session.session;
+/// `PUT /streams/{stream_id}`: rename a stream. A committed write returns 204
+/// with no body, matching the legacy server.
+async fn update_stream(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(stream_id): Path<String>,
+    Json(command): Json<UpdateStream>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let request = UpdateStreamRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        name: WireName::new(command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidStreamName))?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::UpdateStream,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
-    // Serialize this session's writes behind the gate and take the next VSR
-    // request id. The gate is held across the commit so ids reach the primary
-    // strictly in order, and it advances only once the request commits (a
-    // `Reply` frame): a transient failure or an eviction leaves the id free for
-    // the caller's retry, which the depth-1 dedup requires (the next accepted
-    // request must be `committed_request + 1`, so a consumed-but-uncommitted id
-    // would wedge the session on `RequestGap`).
-    let mut next_request_id = identity.session.gate.lock().await;
-    let message = build_create_stream_message(client_id, session_id, *next_request_id, &request);
-    // `submit_client_request_on_owner` is `!Send` (Rc-based); `SendWrapper`
-    // bridges it onto axum's `Send` handler future, sound because the whole
-    // handler runs pinned to shard 0's compio thread.
-    let reply = SendWrapper::new(submit_client_request_on_owner(&state.shard, message)).await;
+/// `DELETE /streams/{stream_id}`: delete a stream. Returns 204 on commit.
+async fn delete_stream(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(stream_id): Path<String>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let request = DeleteStreamRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::DeleteStream,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /streams/{stream_id}/purge`: drop a stream's messages. Returns 204.
+async fn purge_stream(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(stream_id): Path<String>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let request = PurgeStreamRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::PurgeStream,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /streams/{stream_id}/topics/{topic_id}`: update a topic. Returns 204.
+async fn update_topic(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Json(command): Json<UpdateTopic>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
+    // Also rejects replication_factor == Some(0), which `WireName` cannot see.
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = UpdateTopicRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+        compression_algorithm: command.compression_algorithm.as_code(),
+        message_expiry: command.message_expiry.into(),
+        max_topic_size: command.max_topic_size.into(),
+        replication_factor: command.replication_factor.unwrap_or(0),
+        name: WireName::new(command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::UpdateTopic,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /streams/{stream_id}/topics/{topic_id}`: delete a topic. Returns 204.
+async fn delete_topic(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
+    let request = DeleteTopicRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::DeleteTopic,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /streams/{stream_id}/topics/{topic_id}/purge`: drop a topic's
+/// messages. Returns 204.
+async fn purge_topic(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
+    let request = PurgeTopicRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::PurgeTopic,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Run one authenticated control-plane write end to end and return the committed
+/// reply's typed payload. Shared by every write route: `create_stream` decodes
+/// the payload into an entity, the update/delete/purge routes ignore it (it is
+/// empty) and answer 204.
+///
+/// Serializes this session's writes behind its gate and holds it across the
+/// submit so request ids reach the primary strictly in order. The gate advances
+/// only on a committed `Reply`: a transient failure or an eviction leaves the id
+/// free for the caller's retry, which the depth-1 dedup requires (the next
+/// accepted request must be `committed + 1`, so a consumed-but-uncommitted id
+/// would wedge the session on `RequestGap`).
+///
+/// Reply discrimination mirrors the SDK's `split_metadata_result`: the body
+/// leads with a result section (`Some(0)` is success followed by the typed
+/// payload; a nonzero first result is a committed business rejection carrying an
+/// `IggyError` code). An eviction frame carries no result section and means the
+/// session is dead (re-authenticate); a missing or short result section is a
+/// malformed committed reply, mapped to an error rather than a false success.
+async fn submit_write(
+    state: &HttpInner,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+) -> Result<Bytes, WriteError> {
+    let mut next_request_id = session.gate.lock().await;
+    let message = build_request_message(
+        operation,
+        session.client_id,
+        session.session,
+        *next_request_id,
+        body,
+    );
+    let reply = submit_client_request_on_owner(&state.shard, message).await;
     let Some(reply) = reply else {
         return Err(WriteError::Unavailable);
     };
 
-    // Peek the reply frame before decoding: an eviction carries no result
-    // section and means the session is dead (re-authenticate), so unlike a
-    // committed `Reply` it must not consume this request id.
     match reply.header().command {
         Command2::Reply => {
-            // Committed: the cluster consumed this id, so advance the gate before
-            // rendering, whether or not the body decodes.
             *next_request_id += 1;
             drop(next_request_id);
-            Ok(Json(decode_committed_stream(&reply)?))
+            let size = reply.header().size as usize;
+            let reply_body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
+            match result_code(reply_body) {
+                Some(0) => {
+                    let payload_start = result_section_len(reply_body)
+                        .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
+                    let payload = reply_body
+                        .get(payload_start..)
+                        .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
+                    Ok(Bytes::copy_from_slice(payload))
+                }
+                Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
+                None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
+            }
         }
         Command2::Eviction => Err(WriteError::Rejected(eviction_error(&reply))),
         _ => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
 }
 
-/// Build the `Message<RequestHeader>` for a create-stream by filling a zeroed
-/// `#[repr(C)]` header, mirroring `wire::rewrite_request_body` and the
-/// partition reconciler's prepare builder.
-fn build_create_stream_message(
+/// Build a `Message<RequestHeader>` for a control-plane write by filling a zeroed
+/// `#[repr(C)]` header, mirroring `wire::rewrite_request_body` and the partition
+/// reconciler's prepare builder. `body` is the already-encoded wire request,
+/// copied in after the header.
+fn build_request_message(
+    operation: Operation,
     client_id: u128,
     session_id: u64,
     request_id: u64,
-    request: &CreateStreamRequest,
+    body: &[u8],
 ) -> Message<RequestHeader> {
-    let body = request.to_bytes();
     let total = HEADER_SIZE + body.len();
     let mut message = Message::<RequestHeader>::new(total);
-    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(body);
     let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
         &mut message.as_mut_slice()[..HEADER_SIZE],
     )
     .expect("zeroed bytes form a valid RequestHeader");
     header.command = Command2::Request;
-    header.operation = Operation::CreateStream;
+    header.operation = operation;
     header.client = client_id;
     header.session = session_id;
     header.request = request_id;
-    header.size = u32::try_from(total).expect("create-stream message size fits u32");
+    header.size = u32::try_from(total).expect("control-plane message size fits u32");
     message
 }
 
-/// Decode a committed `Reply` frame's body into `StreamDetails`, mirroring the
-/// SDK's `split_metadata_result`. A metadata reply body leads with a result
-/// section (`[count][{index, result}]*`): `count == 0` is success followed by
-/// the `GetStreamResponse` payload, and a nonzero first `result` is a committed
-/// business rejection carrying an `IggyError` code (e.g. duplicate name). The
-/// caller has already confirmed the frame is a `Reply`, so a missing result
-/// section is a malformed committed reply, mapped to an error rather than a 200
-/// with a stale body.
-fn decode_committed_stream(reply: &Message<GenericHeader>) -> Result<StreamDetails, WriteError> {
-    let size = reply.header().size as usize;
-    let body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
-    match result_code(body) {
-        Some(0) => {
-            let payload_start =
-                result_section_len(body).ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
-            let payload = body
-                .get(payload_start..)
-                .ok_or(WriteError::Rejected(IggyError::InvalidCommand))?;
-            let response = GetStreamResponse::decode_from(payload)
-                .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
-            StreamDetails::try_from(response).map_err(WriteError::Rejected)
-        }
-        Some(code) => Err(WriteError::Rejected(IggyError::from_code(code))),
-        None => Err(WriteError::Rejected(IggyError::InvalidCommand)),
-    }
+/// Decode the `GetStreamResponse` payload of a committed create-stream reply into
+/// `StreamDetails`. `payload` is the slice past the result section that
+/// [`submit_write`] already validated as a success.
+fn decode_stream_details(payload: &[u8]) -> Result<StreamDetails, WriteError> {
+    let response = GetStreamResponse::decode_from(payload)
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    StreamDetails::try_from(response).map_err(WriteError::Rejected)
 }
 
 /// Map an eviction frame to the same typed [`IggyError`] the SDK's
