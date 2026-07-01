@@ -51,6 +51,7 @@ use iggy_binary_protocol::{
 };
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::update_stream::UpdateStream;
@@ -103,7 +104,6 @@ struct HttpSession {
     session: u64,
     /// User the credential authenticated as. Consumed by the write path for
     /// authorization.
-    #[expect(dead_code, reason = "read once authorization is wired for writes")]
     user_id: u32,
     /// Credential expiry in unix seconds (`u64::MAX` = never). Drives lazy
     /// eviction of stale table entries.
@@ -644,6 +644,12 @@ async fn submit_write(
     operation: Operation,
     body: &[u8],
 ) -> Result<Bytes, WriteError> {
+    // Interim authorization: until server-ng has an RBAC permissioner, every
+    // control-plane write is root-only. A non-root credential is authenticated
+    // but unprivileged, rejected before any consensus work is spent.
+    if session.user_id != DEFAULT_ROOT_USER_ID {
+        return Err(WriteError::Rejected(IggyError::Unauthorized));
+    }
     let mut next_request_id = session.gate.lock().await;
     let message = build_request_message(
         operation,
