@@ -20,6 +20,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod config_writer;
+pub mod consumer_group;
 pub mod dispatch;
 pub mod login_register;
 pub mod partition_helpers;
@@ -27,6 +28,7 @@ pub mod partition_reconciler;
 pub mod pat;
 pub(crate) mod personal_access_token_cleaner;
 pub mod responses;
+pub(crate) mod segment_cleaner;
 pub mod server_error;
 pub mod session_manager;
 pub mod users;

@@ -118,6 +118,8 @@ pub enum IggyError {
     PersonalAccessTokenExpired(String, u32) = 54,
     #[error("Users limit reached.")]
     UsersLimitReached = 55,
+    #[error("Invalid personal access token expiry")]
+    InvalidPersonalAccessTokenExpiry = 56,
     #[error("Not connected")]
     NotConnected = 61,
     #[error("Client shutdown")]
@@ -439,6 +441,10 @@ pub enum IggyError {
         "Failed to delete consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}."
     )]
     CannotDeleteConsumerGroupInfo(usize, Identifier, Identifier) = 5008,
+    #[error(
+        "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
+    )]
+    ConsumerGroupPartitionNotOwned(u32, u32) = 5009,
     #[error("Base offset is missing")]
     MissingBaseOffsetRetainedMessageBatch = 6000,
     #[error("Last offset delta is missing")]
@@ -512,6 +518,15 @@ pub enum IggyError {
     InvalidSession(u64) = 14001,
     #[error("Replicated command with unknown code {0}")]
     UnknownReplicatedCommand(u32) = 14002,
+    /// Packed protocol versions, see `iggy_binary_protocol::ProtocolVersion`.
+    /// Field order: `(client_version, server_min, server_max)`.
+    #[error(
+        "Incompatible binary protocol version: client {}, server accepts [{}, {}]",
+        iggy_binary_protocol::ProtocolVersion(*.0),
+        iggy_binary_protocol::ProtocolVersion(*.1),
+        iggy_binary_protocol::ProtocolVersion(*.2)
+    )]
+    IncompatibleProtocolVersion(u32, u32, u32) = 14003,
 }
 
 impl IggyError {

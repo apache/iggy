@@ -85,6 +85,8 @@ impl<B: BinaryClient> UserClient for B {
         permissions: Option<Permissions>,
     ) -> Result<UserInfoDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
+        super::validate_username(username)?;
+        super::validate_password(password)?;
         let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
         let wire_perms = permissions.as_ref().map(permissions_to_wire);
         let response = self
@@ -166,6 +168,8 @@ impl<B: BinaryClient> UserClient for B {
         new_password: &str,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
+        super::validate_password(current_password)?;
+        super::validate_password(new_password)?;
         let wire_id = identifier_to_wire(user_id)?;
         self.send_raw_with_response(
             CHANGE_PASSWORD_CODE,
@@ -181,6 +185,8 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
+        super::validate_username(username)?;
+        super::validate_password(password)?;
         #[cfg(feature = "vsr")]
         {
             let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
@@ -188,10 +194,10 @@ impl<B: BinaryClient> UserClient for B {
                 .send_raw_with_response(
                     LOGIN_REGISTER_CODE,
                     LoginRegisterRequest {
+                        version_info: super::rust_sdk_version_info(self.sdk_version())?,
                         username: wire_name,
                         password: SecretString::from(password.to_string()),
-                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                        client_context: Some(String::new()),
+                        client_context: None,
                     }
                     .to_bytes(),
                 )
@@ -214,6 +220,11 @@ impl<B: BinaryClient> UserClient for B {
                 self.reset_vsr_session().await?;
                 return Err(error);
             }
+            tracing::debug!(
+                server_version = %wire_resp.server_version,
+                server_protocol_version = wire_resp.server_protocol_version,
+                "authenticated against iggy server"
+            );
             self.set_state(ClientState::Authenticated).await;
             self.publish_event(DiagnosticEvent::SignedIn).await;
             return Ok(IdentityInfo {

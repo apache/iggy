@@ -25,6 +25,7 @@ mod journal;
 mod log;
 mod messages_writer;
 mod offset_storage;
+mod poll_plan;
 mod segment;
 mod types;
 
@@ -34,6 +35,8 @@ pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use messages_writer::MessagesWriter;
+pub use offset_storage::delete_persisted_offset;
+pub use poll_plan::PollPlan;
 pub use segment::Segment;
 use server_common::Message;
 pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
@@ -51,15 +54,6 @@ pub trait Partition {
         &mut self,
         message: Message<PrepareHeader>,
     ) -> impl Future<Output = Result<AppendResult, IggyError>>;
-
-    fn poll_messages(
-        &self,
-        consumer: PollingConsumer,
-        args: PollingArgs,
-    ) -> impl Future<Output = Result<PollQueryResult<4096>, IggyError>> {
-        let _ = (consumer, args);
-        async { Err(IggyError::FeatureUnavailable) }
-    }
 
     /// # Errors
     /// Returns `IggyError::FeatureUnavailable` by default.

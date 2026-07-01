@@ -71,7 +71,11 @@ impl Segment {
 
     #[must_use]
     pub fn is_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
-        if !self.sealed {
+        // A sealed segment whose newest-message timestamp is unknown (0, e.g.
+        // sealed before any index was written) must not count as expired:
+        // `0 + duration <= now` is otherwise always true and would delete it
+        // instantly. Mirrors the #2924 fix on the common Segment type.
+        if !self.sealed || self.max_timestamp == 0 {
             return false;
         }
 
@@ -81,5 +85,56 @@ impl Segment {
                 self.max_timestamp + duration.as_micros() <= now.as_micros()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::IggyDuration;
+    use std::time::Duration;
+
+    fn sealed_segment(max_timestamp: u64) -> Segment {
+        let mut segment = Segment::new(0, IggyByteSize::from(1024u64));
+        segment.sealed = true;
+        segment.max_timestamp = max_timestamp;
+        segment
+    }
+
+    #[test]
+    fn unsealed_segment_is_never_expired() {
+        let mut segment = sealed_segment(1);
+        segment.sealed = false;
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)));
+        assert!(!segment.is_expired(IggyTimestamp::now(), expiry));
+    }
+
+    #[test]
+    fn zero_max_timestamp_segment_is_not_expired() {
+        let segment = sealed_segment(0);
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)));
+        assert!(!segment.is_expired(IggyTimestamp::now(), expiry));
+    }
+
+    #[test]
+    fn old_sealed_segment_is_expired() {
+        let segment = sealed_segment(1);
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)));
+        assert!(segment.is_expired(IggyTimestamp::now(), expiry));
+    }
+
+    #[test]
+    fn recent_sealed_segment_is_not_expired() {
+        let now = IggyTimestamp::now();
+        let segment = sealed_segment(now.as_micros());
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_hours(1)));
+        assert!(!segment.is_expired(now, expiry));
+    }
+
+    #[test]
+    fn never_expire_and_server_default_never_expire() {
+        let segment = sealed_segment(1);
+        assert!(!segment.is_expired(IggyTimestamp::now(), IggyExpiry::NeverExpire));
+        assert!(!segment.is_expired(IggyTimestamp::now(), IggyExpiry::ServerDefault));
     }
 }

@@ -16,9 +16,9 @@
 // under the License.
 
 use crate::MuxStateMachine;
-use crate::stm::consumer_group::ConsumerGroups;
+use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
-use crate::stm::stream::Streams;
+use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
@@ -26,19 +26,21 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
+    build_reply_message_with, drain_committable_prefix, emit_sim_event,
+    fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
-    replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
+    Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::IggyError;
 use iggy_common::UserId;
@@ -63,21 +65,15 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
-    #[must_use]
-    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
-impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
     fn users(&self) -> &Users {
         &self.inner().0
     }
 
     fn streams(&self) -> &Streams {
         &self.inner().1.0
-    }
-
-    fn consumer_groups(&self) -> &ConsumerGroups {
-        &self.inner().1.1.0
     }
 }
 
@@ -447,7 +443,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -511,13 +507,20 @@ where
         let prepare = match self.prepare_request(message) {
             Ok(prepare) => prepare,
             Err(error) => {
+                // Structurally-invalid request (not client-allowed, undecodable
+                // body, or partition-id overflow). Evict instead of dropping: a
+                // silent drop leaves the client unable to tell rejection from
+                // loss, retrying forever.
+                let reason = eviction_reason_for_invalid(operation);
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     error = %error,
-                    "failed to transform metadata request into prepare"
+                    ?reason,
+                    "rejecting invalid metadata request with eviction"
                 );
+                send_eviction_to_client(consensus, client_id, reason).await;
                 return;
             }
         };
@@ -783,10 +786,19 @@ where
                     self.client_table
                         .borrow_mut()
                         .remove_client(prepare_header.client);
+                    // Drop the disconnected client from every consumer group it
+                    // joined and rebalance. Deterministic side-effect of the
+                    // Logout commit, applied identically on every replica.
+                    self.mux_stm.streams().remove_consumer_group_member(
+                        prepare_header.client,
+                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                    );
                     reply
                 } else {
-                    // Normal op: apply SM, commit_reply.
-                    let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                    // only; a business rejection commits as a deterministic no-op
+                    // whose `code` rides the reply body, replayed on retry.
+                    let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                         panic!(
                             "on_ack: committed metadata op={} failed to apply: {err}",
                             prepare_header.op
@@ -796,7 +808,10 @@ where
                     // wake-up). Filtering by operation is the
                     // recipient's responsibility.
                     self.fire_commit_notifier(prepare_header.operation);
-                    let reply = build_reply_message(&prepare_header, &response);
+                    let reply =
+                        build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
+                            apply.write_reply_body(dst);
+                        });
                     // Cache only if session exists. Client evicted between
                     // prepare and commit: skip cache (`commit_reply` no-ops),
                     // wire reply still ships.
@@ -896,7 +911,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -1079,6 +1094,94 @@ where
         }
     }
 
+    /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
+    /// metadata consensus group (shard 0). The partition reconciler calls this
+    /// to complete a cooperative revocation once the source has drained the
+    /// partition (or it timed out).
+    ///
+    /// Unlike a client op there is no session: a reserved internal client id
+    /// (never coordinator-minted) carries it, `request_preflight` is skipped
+    /// (server-originated), and the normal-op commit path skips reply-caching
+    /// when the client has no session. The op is internal (not client-allowed),
+    /// so it bypasses `prepare_request` and projects directly.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot accept the prepare,
+    /// `InProgress` / `PipelineFull` on pipeline pressure (the reconciler
+    /// retries next tick; completion is idempotent), `Canceled` if the pending
+    /// prepare was canceled before commit.
+    ///
+    /// # Panics
+    /// On a shard without consensus (only shard 0 owns the metadata consensus
+    /// group); callers must route here only on shard 0.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_complete_revocation_in_process(
+        &self,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+    ) -> Result<u64, MetadataSubmitError> {
+        const INTERNAL_REQUEST_ID: u64 = u64::MAX;
+        // Reserved internal client id, distinct per (group, partition) target.
+        // The high 64 bits are all-ones -- never coordinator-minted (those carry
+        // a small home-shard number in the top bits) -- and the low 64 bits pack
+        // (group_id, partition_id). Distinct ids matter: the pipeline dedups by
+        // client id, so a shared id would cap internal completions at one
+        // in-flight cluster-wide and drain a wide rebalance one per consensus
+        // round-trip. Per-target ids let completions for different partitions
+        // pipeline concurrently while still deduping a retry of the same target.
+        let internal_client_id: u128 =
+            (u128::from(u64::MAX) << 64) | (u128::from(group_id) << 32) | u128::from(partition_id);
+
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
+
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(internal_client_id)
+        {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline().borrow().is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        let request = CompleteConsumerGroupRevocationRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id,
+            source_client_id,
+            partition_id,
+        };
+        let body = request.to_bytes();
+        let message = build_complete_revocation_request_message(
+            consensus,
+            internal_client_id,
+            INTERNAL_REQUEST_ID,
+            &body,
+        );
+        let prepare = message.project(consensus);
+
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
     /// `true` when this node is the caught-up primary of the metadata
     /// consensus group. Gates leader-only maintenance (the PAT cleaner)
     /// off backups and lagging primaries.
@@ -1237,9 +1340,14 @@ where
             return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let prepare = self
-            .prepare_request(message)
-            .map_err(|_| MetadataSubmitError::Canceled)?;
+        let Ok(prepare) = self.prepare_request(message) else {
+            // Structurally-invalid request. Return an eviction frame (relayed to
+            // the socket by the home shard) rather than `Canceled`, which leaves
+            // the shard silent and the SDK retrying forever.
+            let reason = eviction_reason_for_invalid(request_header.operation);
+            let ctx = EvictionContext::from_consensus(consensus);
+            return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+        };
 
         self.dispatch_prepare_and_await(consensus, prepare)
             .await
@@ -1334,13 +1442,20 @@ where
             let prepare = match self.prepare_request(req.message) {
                 Ok(prepare) => prepare,
                 Err(error) => {
+                    // Same invariant as `on_request`: a structurally-invalid
+                    // request evicts, never a silent drop, or the SDK retries
+                    // forever. Reachable here because requests are queued
+                    // unvalidated (prepare queue full at arrival), projected now.
+                    let reason = eviction_reason_for_invalid(operation);
                     warn!(
                         target: "iggy.metadata.diag",
                         plane = "metadata",
                         replica_id = consensus.replica(),
                         error = %error,
-                        "drain_request_queue: failed to project queued request into prepare"
+                        ?reason,
+                        "drain_request_queue: rejecting invalid queued request with eviction"
                     );
+                    send_eviction_to_client(consensus, client_id, reason).await;
                     continue;
                 }
             };
@@ -1361,7 +1476,7 @@ where
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
-            Output = bytes::Bytes,
+            Output = crate::stm::result::ApplyReply,
             Error = iggy_common::IggyError,
         >,
 {
@@ -1411,7 +1526,15 @@ where
     ) -> Result<Message<PrepareHeader>, iggy_common::IggyError> {
         let consensus = self.consensus.as_ref().unwrap();
         let header = *message.header();
-        if !header.operation.is_client_allowed() {
+        // `TruncatePartition` is server-originated (the owning shard resolves a
+        // client `DeleteSegments` count to a concrete offset) but replicated AS
+        // the client's own request, so the commit records the client's request
+        // sequence in the `ClientTable`. It is internal -- no wire command code
+        // maps to it, so a client cannot construct one directly -- hence the
+        // `is_client_allowed` gate excludes it; admit it explicitly. The default
+        // match arm below projects it through unchanged.
+        if !header.operation.is_client_allowed() && header.operation != Operation::TruncatePartition
+        {
             return Err(IggyError::InvalidCommand);
         }
         let body = &message.as_slice()[size_of::<RequestHeader>()..header.size as usize];
@@ -1448,10 +1571,11 @@ where
             Operation::CreatePartitions => {
                 let request = WireCreatePartitionsRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                self.mux_stm
-                    .streams()
-                    .current_partition_count(&request.stream_id, &request.topic_id)
-                    .ok_or(IggyError::InvalidCommand)?;
+                // Parent-existence is validated at apply, returning
+                // `CreatePartitionsResult::{Stream,Topic}NotFound`. A preflight
+                // read here would decide against possibly-uncommitted state and
+                // drop without a reply (TOCTOU + wedge). See the metadata
+                // validation design doc.
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1567,9 +1691,17 @@ where
                     .commit_register(header.client, reply, in_flight);
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
+                // Mirror the on_ack path: drop the disconnected client from
+                // every consumer group it joined and rebalance.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    header.client,
+                    iggy_common::IggyTimestamp::from(header.timestamp),
+                );
             } else {
-                // Normal op: apply SM, commit_reply.
-                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                // only; a business rejection commits as a deterministic no-op
+                // whose `code` rides the reply body, replayed on retry.
+                let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
                 // Post-commit notifier (e.g. partition reconciler
@@ -1577,7 +1709,9 @@ where
                 // converge after replicated commits, not only quorum-acked
                 // ones reached via `on_ack` on the primary.
                 self.fire_commit_notifier(header.operation);
-                let reply = build_reply_message(&header, &response);
+                let reply = build_reply_message_with(&header, apply.reply_body_len(), |dst| {
+                    apply.write_reply_body(dst);
+                });
                 // Cache only if session still exists. WAL replay may carry a
                 // reply for a later-evicted client; `commit_reply` no-ops.
                 let session = self.client_table.borrow().get_session(header.client);
@@ -1716,6 +1850,103 @@ where
     msg
 }
 
+fn build_complete_revocation_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    request: u64,
+    body: &[u8],
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::CompleteConsumerGroupRevocation,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: consensus.cluster(),
+            view: consensus.view(),
+            release: 0,
+            client: client_id,
+            // `validate()` requires session/request > 0 for non-register ops;
+            // there is no real session (the commit path skips reply-caching).
+            session: 1,
+            request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
+    msg
+}
+
+/// Build a `TruncatePartition` request attributed to the originating client.
+///
+/// Replicated through the standard client-request path so the commit records
+/// `(client, session, request)` in the `ClientTable`. The client numbers
+/// `DeleteSegments` in the same monotonic request sequence as every other
+/// metadata op, so attributing the truncate to an internal id (or skipping the
+/// commit) leaves a hole that fails the next op's `request == committed + 1`
+/// preflight.
+///
+/// `template` is the client's own `DeleteSegments` header: it supplies the wire
+/// `cluster` / `view` / `release` and the client's `request` number.
+/// `client_id` / `session` are the bound VSR identity.
+///
+/// # Panics
+/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
+/// a few fixed-width fields, so this cannot happen in practice.
+#[must_use]
+pub fn build_truncate_partition_client_message(
+    template: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: u32,
+    topic_id: u32,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RequestHeader> {
+    let body = TruncatePartitionRequest {
+        stream_id: WireIdentifier::numeric(stream_id),
+        topic_id: WireIdentifier::numeric(topic_id),
+        partition_id,
+        up_to_offset,
+    }
+    .to_bytes();
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(&body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::TruncatePartition,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: template.cluster,
+            view: template.view,
+            release: template.release,
+            client: client_id,
+            session,
+            request: template.request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
+    msg
+}
+
 fn build_prepare_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     request: &RequestHeader,
@@ -1768,17 +1999,41 @@ where
     prepare
 }
 
+/// Eviction reason for a request `prepare_request` rejected as structurally
+/// invalid.
+const fn eviction_reason_for_invalid(operation: Operation) -> EvictionReason {
+    if operation.is_client_allowed() {
+        EvictionReason::InvalidRequestBody
+    } else {
+        EvictionReason::InvalidRequestOperation
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::consumer_group::ConsumerGroups;
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
     use iggy_common::variadic;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    type TestMux = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+    #[test]
+    fn eviction_reason_splits_client_and_internal_ops() {
+        // Client-allowed op with a bad body evicts InvalidRequestBody; an internal
+        // / unknown op (here `CreateTopicWithAssignments`) evicts
+        // InvalidRequestOperation.
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateStream),
+            EvictionReason::InvalidRequestBody,
+        );
+        assert_eq!(
+            eviction_reason_for_invalid(Operation::CreateTopicWithAssignments),
+            EvictionReason::InvalidRequestOperation,
+        );
+    }
+
+    type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
 
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
     /// `journal`, and `snapshot` all `None`. Enough to test the

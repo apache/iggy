@@ -29,8 +29,13 @@ use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::Bytes;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE,
+};
+use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::requests::consumer_groups::{
+    GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -42,7 +47,9 @@ use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsReques
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
+use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
@@ -55,12 +62,13 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireIdentifier, WireName, WirePartitioning,
+    Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
+    RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
@@ -72,15 +80,16 @@ use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Build the `get_me` reply for the requesting connection, sourced
-/// entirely from the per-shard [`SessionManager`] (`user_id`, transport
-/// kind, peer address) -- no message-bus lookup. `consumer_groups` is
-/// empty (see [`client_record_to_response`]).
+/// Build the `get_me` reply for the requesting connection. Identity
+/// (`user_id`, transport kind, peer address) comes from the per-shard
+/// [`SessionManager`]; the `consumer_groups` list is read from the
+/// (replicated) consumer-group STM by the connection's bound VSR client id.
 pub(crate) fn build_get_me_response(
+    shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
 ) -> ClientDetailsResponse {
-    let client = sessions
+    let mut client = sessions
         .borrow()
         .client_record(transport_client_id)
         .map_or_else(
@@ -98,11 +107,41 @@ pub(crate) fn build_get_me_response(
                     consumer_groups_count: 0,
                 }
             },
-            |record| connected_client_to_response(&record),
+            |record| connected_client_to_response(shard, &record),
         );
+
+    // The wire `consumer_groups` list keys off the connection's bound VSR
+    // client id (the same id recorded as a group member by the replicated
+    // Join op), not the transport id.
+    let consumer_groups = sessions
+        .borrow()
+        .get_session(transport_client_id)
+        .map(|(vsr_client_id, _)| {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_group_memberships(vsr_client_id)
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(
+            |(stream_id, topic_id, group_id)| ConsumerGroupInfoResponse {
+                stream_id,
+                topic_id,
+                group_id,
+            },
+        )
+        .collect::<Vec<_>>();
+
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        client.consumer_groups_count = consumer_groups.len() as u32;
+    }
     ClientDetailsResponse {
         client,
-        consumer_groups: Vec::new(),
+        consumer_groups,
     }
 }
 
@@ -110,12 +149,24 @@ pub(crate) fn build_get_me_response(
 /// `SessionManager` or a `get_clients` gather) into the wire
 /// [`ClientResponse`]. Shared by `get_me`, `get_clients`, and `get_client`.
 ///
-/// TODO(consumer-group-membership): `consumer_groups_count` is always 0
-/// -- server-ng does not yet track which consumer groups a connection
-/// joined. Populate once the partition-reconciliation / consumer-group
-/// rebalancing work lands; until then `get_me` / `get_clients` report no
-/// memberships.
-pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> ClientResponse {
+/// `consumer_groups_count` is resolved from the connection's bound VSR client
+/// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
+/// transport id). Connections that never bound (pre-register) count 0.
+pub(crate) fn connected_client_to_response(
+    shard: &Rc<ServerNgShard>,
+    info: &ConnectedClientInfo,
+) -> ClientResponse {
+    let consumer_groups_count = info.vsr_client_id.map_or(0, |vsr_client_id| {
+        #[allow(clippy::cast_possible_truncation)]
+        let count = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_memberships(vsr_client_id)
+            .len() as u32;
+        count
+    });
     // The transport client id is a u128 `(shard << 112) | seq`; the wire
     // `client_id` is the u32 seq tail.
     #[allow(clippy::cast_possible_truncation)]
@@ -124,14 +175,75 @@ pub(crate) fn connected_client_to_response(info: &ConnectedClientInfo) -> Client
         user_id: info.user_id.unwrap_or(u32::MAX),
         transport: transport_kind_to_wire(info.transport),
         address: info.address.to_string(),
-        consumer_groups_count: 0,
+        consumer_groups_count,
     }
+}
+
+/// Fence a consumer-group offset commit/delete: a group consumer may only
+/// touch the offset of a partition it currently owns. `Ok` for individual
+/// consumers (no fence) and for owned group partitions; `Err` otherwise so a
+/// stale client re-syncs instead of corrupting the shared group offset.
+fn fence_group_offset(
+    shard: &Rc<ServerNgShard>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<(), IggyError> {
+    if consumer.kind != KIND_CONSUMER_GROUP {
+        return Ok(());
+    }
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    #[allow(clippy::cast_possible_truncation)]
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        // Commit fence: allow a pending-revoked partition (the source commits it
+        // to drain the cooperative handoff), so `require_pollable = false`.
+        .consumer_group_fence(
+            stream_id,
+            topic_id,
+            &consumer.id,
+            client_id,
+            partition_id,
+            false,
+        )
+        .map(|_| ())
+        .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
+            client_id as u32,
+            partition_id,
+        ))
+}
+
+/// Fence a consumer-group offset op then resolve its target partition
+/// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
+fn fence_and_resolve_offset_namespace(
+    shard: &Rc<ServerNgShard>,
+    consumer: &WireConsumer,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+    client_id: u128,
+) -> Result<IggyNamespace, IggyError> {
+    fence_group_offset(
+        shard,
+        consumer,
+        stream_id,
+        topic_id,
+        partition_id,
+        client_id,
+    )?;
+    resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
 pub(crate) fn resolve_partition_request_namespace(
     shard: &Rc<ServerNgShard>,
     operation: Operation,
     body: &[u8],
+    client_id: u128,
 ) -> Result<u64, IggyError> {
     let namespace = match operation {
         Operation::SendMessages => {
@@ -153,41 +265,49 @@ pub(crate) fn resolve_partition_request_namespace(
         Operation::StoreConsumerOffset => {
             let request = StoreConsumerOffsetRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteConsumerOffset => {
             let request = DeleteConsumerOffsetRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::StoreConsumerOffset2 => {
             let request = StoreConsumerOffset2Request::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteConsumerOffset2 => {
             let request = DeleteConsumerOffset2Request::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
-            resolve_partition_namespace(
+            fence_and_resolve_offset_namespace(
                 shard,
+                &request.consumer,
                 &request.stream_id,
                 &request.topic_id,
                 request.partition_id,
+                client_id,
             )?
         }
         Operation::DeleteSegments => {
@@ -209,8 +329,22 @@ fn resolve_send_messages_namespace(
     shard: &Rc<ServerNgShard>,
     header: &SendMessagesHeader,
 ) -> Result<IggyNamespace, IggyError> {
-    let WirePartitioning::PartitionId(partition_id) = header.partitioning else {
-        return Err(IggyError::FeatureUnavailable);
+    let partition_id = match &header.partitioning {
+        WirePartitioning::PartitionId(partition_id) => *partition_id,
+        WirePartitioning::Balanced => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .next_balanced_partition(&header.stream_id, &header.topic_id)
+            .ok_or(IggyError::InvalidIdentifier)?,
+        WirePartitioning::MessagesKey(key) => shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+            .ok_or(IggyError::InvalidIdentifier)?,
     };
     resolve_partition_namespace(
         shard,
@@ -291,6 +425,32 @@ pub(crate) fn build_non_replicated_response(
                 })
             })
         }
+        GET_CONSUMER_GROUP_CODE => {
+            let request = GetConsumerGroupRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let response = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
+            Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
+                NonReplicatedResponse::Bytes(response.to_bytes())
+            }))
+        }
+        GET_CONSUMER_GROUPS_CODE => {
+            let request = GetConsumerGroupsRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            let groups = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_group_list(&request.stream_id, &request.topic_id);
+            Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
+                NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
+            }))
+        }
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
             Some(meta) if !meta.is_replicated() => Ok(NonReplicatedResponse::Empty),
             Some(_) => Err(IggyError::FeatureUnavailable),
@@ -346,12 +506,14 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
                     messages_count,
                 ))
             })?;
-    let consumer_groups_count = shard
-        .plane
-        .metadata()
-        .mux_stm
-        .consumer_groups()
-        .read(|groups| usize_to_u32(groups.items.len()))?;
+    let consumer_groups_count = usize_to_u32(
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_count(),
+    )?;
 
     Ok(StatsResponse {
         process_id: std::process::id(),
@@ -616,6 +778,9 @@ pub(crate) fn build_empty_reply(
     build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
 }
 
+/// Server build version advertised in the login-register response.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub(crate) fn build_login_register_reply(
     request_header: &RequestHeader,
     client_id: u128,
@@ -623,10 +788,14 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    build_reply_with_body(request_header, client_id, session, commit, 12, |body| {
-        body[..4].copy_from_slice(&user_id.to_le_bytes());
-        body[4..12].copy_from_slice(&session.to_le_bytes());
-    })
+    let body = LoginRegisterResponse {
+        user_id,
+        session,
+        server_protocol_version: IGGY_PROTOCOL_VERSION,
+        server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
+    }
+    .to_bytes();
+    build_reply_from_bytes(request_header, client_id, session, commit, &body)
 }
 
 pub(crate) fn build_reply_from_bytes(

@@ -2100,6 +2100,7 @@ where
 {
     type Consensus = VsrConsensus<B, P>;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
@@ -2116,7 +2117,9 @@ where
                 timestamp: old.timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
-                // PrepareOks are only header no body
+                // PrepareOk is header-only; the frame is exactly the header, so
+                // `size` is the header size.
+                size: std::mem::size_of::<PrepareOkHeader>() as u32,
                 ..Default::default()
             };
         })
