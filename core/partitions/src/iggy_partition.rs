@@ -2673,7 +2673,7 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
 
 /// Success reply body for a committed partition op. `DeleteConsumerOffset`
 /// (v1/v2) is result-framed on the SDK side so a `ConsumerOffsetNotFound`
-/// rejection surfaces as a terminal error rather than a mis-decoded `Ok`; its
+/// rejection surfaces as a terminal error rather than decoding as `Ok`; its
 /// success reply must therefore carry an explicit empty result section
 /// (`[count = 0]`) instead of an empty body. Every other partition op carries no
 /// result section and replies with an empty body.

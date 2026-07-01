@@ -249,7 +249,7 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     // section) and is passed through to fail the typed `LoginRegisterResponse`
     // decode. `DeleteConsumerOffset` is the one partition-plane op that carries a
     // result section: it can be rejected with `ConsumerOffsetNotFound`, which
-    // must reach the client as a terminal error rather than a mis-decoded `Ok`
+    // must reach the client as a terminal error rather than decoding as `Ok`
     // (its success reply ships `[count = 0]` to match). Other reads, data-plane
     // ops, and Logout carry no result section and pass through untouched.
     let result_framed = operation.is_metadata()
