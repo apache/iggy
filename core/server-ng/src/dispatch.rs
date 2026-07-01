@@ -548,90 +548,17 @@ async fn handle_client_request(
         return;
     }
 
-    // Partition data-plane op (SendMessages / consumer-offset writes): the
-    // op belongs to the partition's own consensus group, not the metadata
-    // group. Route it through the shard mesh by namespace; the owning
-    // shard's partitions plane runs at-least-once consensus and replies
-    // directly via `send_to_client`. `header.client` therefore stays the
-    // TRANSPORT id (home-shard routing bits), not the VSR session id --
-    // partition ops are sessionless ("session lifecycle is metadata-only").
     if header.operation.is_partition() {
-        // The consumer-group offset fence keys on the bound VSR client id (the
-        // member id), not the transport id stamped into the partition-op
-        // header. `bound` is Some here (unbound transports returned above).
-        let vsr_client_id = bound.map_or(0, |(client_id, _)| client_id);
-        let namespace = match resolve_partition_request_namespace(
+        // `bound` is Some here (unbound transports returned above).
+        let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+        dispatch_partition_request(
             shard,
-            header.operation,
-            request_body(&request),
+            request,
             vsr_client_id,
-        ) {
-            Ok(namespace) => namespace,
-            Err(error) => {
-                // A partition op against a stream/topic that no longer
-                // resolves (e.g. a consumer's trailing auto-commit racing a
-                // `delete_stream`). A silent drop wedges the SDK connection
-                // forever; reply empty so the client fails fast instead.
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "partition request with unresolved namespace; replying empty"
-                );
-                send_empty_partition_reply(shard, transport_client_id, &header).await;
-                return;
-            }
-        };
-        // Convergence wait: a CreateTopic commit returns to the client
-        // before the per-shard reconcilers seed routing rows and
-        // materialise the partition (next wake/periodic tick). The SDK
-        // does not replay sends, so an immediately-following partition op
-        // would be dropped as unroutable. Absorb that window here with a
-        // bounded wait; steady-state sends (row present, partition probed
-        // once) skip it entirely.
-        if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
-            warn!(
-                transport_client_id,
-                namespace,
-                operation = ?header.operation,
-                "partition request not routable within budget; replying empty"
-            );
-            send_empty_partition_reply(shard, transport_client_id, &header).await;
-            return;
-        }
-        // A group consumer-offset op carries the group NAME on the wire; the
-        // partition plane keys the offset by the group's monotonic id (the same
-        // key the poll path auto-commits under and the read path resolves), so
-        // rewrite the consumer id before replication -- the apply layer has no
-        // metadata access to resolve it.
-        let request = match maybe_rewrite_consumer_offset_request(shard, request) {
-            Ok(rewritten) => rewritten,
-            Err(error) => {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "failed to rewrite consumer-offset request; replying empty"
-                );
-                send_empty_partition_reply(shard, transport_client_id, &header).await;
-                return;
-            }
-        };
-        let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
-            *new_header = header;
-            new_header.namespace = namespace;
-            new_header.client = transport_client_id;
-            // Header validation requires `session > 0 && request > 0` for
-            // non-register ops. The partition plane itself is sessionless
-            // (at-least-once, no `ClientTable` dedup), so the bound VSR
-            // session merely satisfies validation, and a zero request id
-            // (the SDK does not number data-plane ops) is normalized.
-            if let Some((_, bound_session)) = bound {
-                new_header.session = bound_session;
-            }
-            new_header.request = new_header.request.max(1);
-        });
-        shard.dispatch(request.into_generic());
+            bound_session,
+            transport_client_id,
+        )
+        .await;
         return;
     }
 
@@ -730,6 +657,102 @@ async fn handle_client_request(
             );
         }
     }
+}
+
+/// Route a partition data-plane op (`SendMessages` / consumer-offset writes)
+/// through the shard mesh by namespace: the op belongs to the partition's
+/// own consensus group, not the metadata group. The owning shard's
+/// partitions plane runs at-least-once consensus and replies directly via
+/// `send_to_client`. `header.client` therefore stays the TRANSPORT id
+/// (home-shard routing bits), not the VSR session id -- partition ops are
+/// sessionless ("session lifecycle is metadata-only").
+///
+/// Callers must have authenticated the transport already: `vsr_client_id` /
+/// `bound_session` come from its bound VSR session. Every failure before
+/// dispatch replies empty so the client fails fast instead of wedging on a
+/// silent drop.
+///
+/// `vsr_client_id` keys the consumer-group offset fence (the member id),
+/// not the transport id stamped into the partition-op header.
+#[allow(clippy::future_not_send)]
+pub(crate) async fn dispatch_partition_request(
+    shard: &Rc<ServerNgShard>,
+    request: Message<RequestHeader>,
+    vsr_client_id: u128,
+    bound_session: u64,
+    transport_client_id: u128,
+) {
+    let header = *request.header();
+    let namespace = match resolve_partition_request_namespace(
+        shard,
+        header.operation,
+        request_body(&request),
+        vsr_client_id,
+    ) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            // A partition op against a stream/topic that no longer
+            // resolves (e.g. a consumer's trailing auto-commit racing a
+            // `delete_stream`). A silent drop wedges the SDK connection
+            // forever; reply empty so the client fails fast instead.
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "partition request with unresolved namespace; replying empty"
+            );
+            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            return;
+        }
+    };
+    // Convergence wait: a CreateTopic commit returns to the client
+    // before the per-shard reconcilers seed routing rows and
+    // materialise the partition (next wake/periodic tick). The SDK
+    // does not replay sends, so an immediately-following partition op
+    // would be dropped as unroutable. Absorb that window here with a
+    // bounded wait; steady-state sends (row present, partition probed
+    // once) skip it entirely.
+    if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
+        warn!(
+            transport_client_id,
+            namespace,
+            operation = ?header.operation,
+            "partition request not routable within budget; replying empty"
+        );
+        send_empty_partition_reply(shard, transport_client_id, &header).await;
+        return;
+    }
+    // A group consumer-offset op carries the group NAME on the wire; the
+    // partition plane keys the offset by the group's monotonic id (the same
+    // key the poll path auto-commits under and the read path resolves), so
+    // rewrite the consumer id before replication -- the apply layer has no
+    // metadata access to resolve it.
+    let request = match maybe_rewrite_consumer_offset_request(shard, request) {
+        Ok(rewritten) => rewritten,
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "failed to rewrite consumer-offset request; replying empty"
+            );
+            send_empty_partition_reply(shard, transport_client_id, &header).await;
+            return;
+        }
+    };
+    let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+        *new_header = header;
+        new_header.namespace = namespace;
+        new_header.client = transport_client_id;
+        // Header validation requires `session > 0 && request > 0` for
+        // non-register ops. The partition plane itself is sessionless
+        // (at-least-once, no `ClientTable` dedup), so the bound VSR
+        // session merely satisfies validation, and a zero request id
+        // (the SDK does not number data-plane ops) is normalized.
+        new_header.session = bound_session;
+        new_header.request = new_header.request.max(1);
+    });
+    shard.dispatch(request.into_generic());
 }
 
 #[allow(clippy::future_not_send)]

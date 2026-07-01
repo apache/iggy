@@ -1762,7 +1762,7 @@ where
         let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
         let mut messages_committed = false;
 
-        for mut entry in drained {
+        for entry in drained {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
@@ -1813,14 +1813,6 @@ where
             // offsets. Only primary delivers replies; backups just advance
             // commit. Session lifecycle is metadata-only.
             let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-
-            // TODO: no production caller yet. Partition has no in-process
-            // subscriber (only metadata uses pipeline_message_with_subscriber);
-            // wired for forward-compat. Fired AFTER local commit (slot-first
-            // ordering analog). Dropped receiver ignored.
-            if let Some(sender) = entry.take_reply_sender() {
-                let _ = sender.send(reply.clone());
-            }
 
             if send_client_replies {
                 let reply_buffers = reply.into_generic().into_frozen();

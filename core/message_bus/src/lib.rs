@@ -95,7 +95,8 @@ pub use installer::conn_info::{
 };
 pub use lifecycle::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, FusedShutdown,
-    ReplicaRegistry, ReplyRoute, Shutdown, ShutdownToken,
+    InstanceToken, ReplicaRegistry, ReplyRoute, ReplySlotError, ReplySlotGuard, Shutdown,
+    ShutdownToken,
 };
 pub use transports::tls::TlsServerCredentials;
 
@@ -1390,6 +1391,56 @@ mod tests {
         let client_id = (3u128 << 112) | 1;
         let err = bus
             .send_to_client(client_id, dummy_message().into_frozen())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::ClientNotFound(_)));
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn reply_message(request: u64) -> Message<ReplyHeader> {
+        Message::<ReplyHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut ReplyHeader| {
+            h.command = Command2::Reply;
+            h.size = HEADER_SIZE as u32;
+            h.request = request;
+        })
+    }
+
+    /// Full in-process seam: entry + slot installed, `send_to_client`
+    /// resolves the request id from the reply header and fires the oneshot.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_in_process_fires_matching_reply_slot() {
+        let bus = IggyMessageBus::new(0);
+        let client_id = 1u128;
+        bus.clients()
+            .insert_in_process(client_id)
+            .expect("fresh key");
+        let (_guard, reply_rx) = bus
+            .clients()
+            .install_reply_slot(client_id, 42)
+            .expect("slot installs");
+
+        bus.send_to_client(client_id, reply_message(42).into_generic().into_frozen())
+            .await
+            .expect("in-process delivery");
+
+        let received = reply_rx.await.expect("reply delivered");
+        assert_eq!(reply_request_id(&received), 42);
+    }
+
+    /// Reply whose request id has no waiter (timed-out caller already
+    /// removed its slot): shed as `ClientNotFound`, nothing panics.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_in_process_sheds_reply_without_waiter() {
+        let bus = IggyMessageBus::new(0);
+        let client_id = 1u128;
+        bus.clients()
+            .insert_in_process(client_id)
+            .expect("fresh key");
+
+        let err = bus
+            .send_to_client(client_id, reply_message(42).into_generic().into_frozen())
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::ClientNotFound(_)));
