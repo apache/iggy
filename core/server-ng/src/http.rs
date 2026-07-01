@@ -27,37 +27,54 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
 use configs::http::HttpJwtConfig;
+use consensus::{MetadataHandle, VsrConsensus};
+use iggy_binary_protocol::codes::{
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+};
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
-    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
+    GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
+    PurgeStreamRequest, UpdateStreamRequest,
 };
+use iggy_binary_protocol::requests::system::GetStatsRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
+    UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::{
-    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
-    UpdateUserRequest,
+    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
+    UpdatePermissionsRequest, UpdateUserRequest,
 };
+use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
+use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
+use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
+use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
     GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
@@ -75,14 +92,20 @@ use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
-use iggy_common::wire_conversions::{identifier_to_wire, permissions_to_wire};
+use iggy_common::wire_conversions::{
+    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, permissions_to_wire,
+    streams_from_wire, topics_from_wire, users_from_wire,
+};
 use iggy_common::{
-    ConsumerGroupDetails, Identifier, IdentityInfo, IggyError, IggyTimestamp,
-    RawPersonalAccessToken, StreamDetails, TokenInfo, TopicDetails, UserInfoDetails, Validatable,
+    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, Identifier, IdentityInfo,
+    IggyError, IggyTimestamp, RawPersonalAccessToken, Stats, Stream, StreamDetails, TokenInfo,
+    Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
 };
 use message_bus::client_listener;
+use metadata::impls::metadata::StreamsFrontend;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
+use serde::Deserialize;
 use server::http::error::{CustomError, ErrorResponse};
 use server_common::Message;
 use tokio::sync::Mutex;
@@ -91,11 +114,14 @@ use tracing::{error, info, warn};
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::bootstrap::ServerNgShard;
 use crate::dispatch::{submit_client_request_on_owner, submit_register_on_owner};
-use crate::http::extractor::Authenticated;
+use crate::http::extractor::{Authenticated, Identity};
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
 use crate::pat::rewrite_pat_request_for_user;
-use crate::responses::build_raw_pat_reply;
+use crate::responses::{
+    NonReplicatedResponse, build_non_replicated_response, build_raw_pat_reply,
+    connected_client_to_response,
+};
 use crate::server_error::ServerNgError;
 use crate::users::maybe_rewrite_user_password_request;
 
@@ -205,6 +231,75 @@ fn service_unavailable() -> Response {
         .into_response()
 }
 
+/// Read consistency selected by the `?consistency=` query param.
+///
+/// `serializable` (the default) serves from this node's local metadata STM:
+/// correct and consensus-free, but may trail the primary by the replication
+/// delay. `linearizable` demands the freshest committed state and is honored
+/// only on the primary; a follower answers 503 (see [`read_local`]).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Consistency {
+    #[default]
+    Serializable,
+    Linearizable,
+}
+
+/// `?consistency=` query wrapper. An absent param defaults to
+/// [`Consistency::Serializable`]; an unrecognized value is a 400 (axum `Query`).
+#[derive(Default, Deserialize)]
+struct ConsistencyQuery {
+    #[serde(default)]
+    consistency: Consistency,
+}
+
+/// Rejection for an authenticated read route (`GET /streams`,
+/// `GET /streams/{id}`, and the reads that follow). Three classes, three
+/// renderings, mirroring [`WriteError`]'s split so error bodies stay
+/// SDK-identical:
+enum ReadError {
+    /// Caller-side or STM rejection (bad identifier, unsupported op, or the
+    /// interim non-root authz denial) graded through the legacy
+    /// `IggyError -> status` map so SDK error bodies stay byte-identical.
+    Rejected(IggyError),
+    /// Requested entity is absent -> 404 with the legacy not-found body.
+    NotFound,
+    /// A linearizable read reached a follower. Transient from the caller's view
+    /// -> 503, retryable; becomes a 307-to-leader once the roster + redirect
+    /// land (see [`not_primary_response`]).
+    NotPrimary,
+}
+
+impl IntoResponse for ReadError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Rejected(error) => CustomError::from(error).into_response(),
+            // Reuse the legacy 404 body so a missing stream renders exactly as
+            // the legacy server's `CustomError::ResourceNotFound` does.
+            Self::NotFound => CustomError::ResourceNotFound.into_response(),
+            Self::NotPrimary => not_primary_response(),
+        }
+    }
+}
+
+/// The 503 body for a linearizable read that reached a follower. No node roster
+/// exists at the HTTP layer yet (F7), so this node cannot 307-redirect to the
+/// primary nor emit a `Location` (F3); the caller must retry, ideally against
+/// the leader. Once both land this branch becomes a 307. Rendered as an
+/// `ErrorResponse` so the body shape matches every other HTTP error.
+fn not_primary_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            id: StatusCode::SERVICE_UNAVAILABLE.as_u16().into(),
+            code: "not_primary".to_owned(),
+            reason: "linearizable read requires the primary; retry against the leader".to_owned(),
+            field: None,
+        }),
+    )
+        .into_response()
+}
+
 /// Shared shard-0 HTTP state.
 ///
 /// Groups the shard handle, the JWT issuer/verifier, and the per-credential VSR
@@ -221,6 +316,21 @@ struct HttpInner {
 }
 
 impl HttpInner {
+    /// True when this shard-0 node is the current VSR metadata primary, i.e.
+    /// `primary_index(current_view) == own_replica_id` - the check consensus
+    /// `is_primary` already encapsulates over the live view and this replica's
+    /// id. Absent consensus (never on shard 0 under VSR, only a no-replica
+    /// build) is treated as not-primary so a linearizable read fails closed
+    /// rather than serving possibly-stale local state as authoritative.
+    fn is_metadata_primary(&self) -> bool {
+        self.shard
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .is_some_and(VsrConsensus::is_primary)
+    }
+
     /// Resolve the VSR session for `key`, minting and Registering one on first
     /// use. Every later request bearing the same credential reuses it.
     ///
@@ -375,20 +485,26 @@ fn router(state: HttpState) -> Router {
             post(login_with_personal_access_token),
         )
         .route("/users/me", get(get_me))
-        .route("/users", post(create_user))
-        .route("/users/{user_id}", put(update_user).delete(delete_user))
+        .route("/users", get(get_users).post(create_user))
+        .route(
+            "/users/{user_id}",
+            get(get_user).put(update_user).delete(delete_user),
+        )
         .route("/users/{user_id}/password", put(change_password))
         .route("/users/{user_id}/permissions", put(update_permissions))
-        .route("/streams", post(create_stream))
+        .route("/streams", get(get_streams).post(create_stream))
         .route(
             "/streams/{stream_id}",
-            put(update_stream).delete(delete_stream),
+            get(get_stream).put(update_stream).delete(delete_stream),
         )
         .route("/streams/{stream_id}/purge", delete(purge_stream))
-        .route("/streams/{stream_id}/topics", post(create_topic))
+        .route(
+            "/streams/{stream_id}/topics",
+            get(get_topics).post(create_topic),
+        )
         .route(
             "/streams/{stream_id}/topics/{topic_id}",
-            put(update_topic).delete(delete_topic),
+            get(get_topic).put(update_topic).delete(delete_topic),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/purge",
@@ -396,14 +512,19 @@ fn router(state: HttpState) -> Router {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
-            post(create_cg),
+            get(get_cgs).post(create_cg),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
-            delete(delete_cg),
+            get(get_cg).delete(delete_cg),
         )
+        // TODO(hubcio): GET /personal-access-tokens (list) deferred - needs a server-ng STM
+        // list accessor (PATs sit behind the "Never iterate" apply invariant; TCP-ng lacks it too).
         .route("/personal-access-tokens", post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
+        .route("/stats", get(get_stats))
+        .route("/clients", get(get_clients))
+        .route("/clients/{client_id}", get(get_client))
         .with_state(state)
 }
 
@@ -445,6 +566,316 @@ async fn get_me(identity: Authenticated) -> Json<IdentityInfo> {
         user_id: identity.user_id,
         access_token: None,
     })
+}
+
+/// `GET /streams`: list every stream as the same `Vec<Stream>` JSON the legacy
+/// server returns. A consensus-free local STM read via [`read_local`].
+async fn get_streams(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<Stream>>, ReadError> {
+    let body = GetStreamsRequest.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_STREAMS_CODE,
+        &body,
+    )?;
+    let response = GetStreamsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(streams_from_wire(response)))
+}
+
+/// `GET /streams/{stream_id}`: fetch one stream by numeric id or name as the
+/// same `StreamDetails` JSON the legacy server returns; 404 when absent. A
+/// consensus-free local STM read via [`read_local`].
+async fn get_stream(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path(stream_id): Path<String>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<StreamDetails>, ReadError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let request = GetStreamRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_STREAM_CODE,
+        &body,
+    )?;
+    let response = GetStreamResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        StreamDetails::try_from(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
+/// `GET /streams/{stream_id}/topics`: list a stream's topics as the same
+/// `Vec<Topic>` JSON the legacy server returns. A consensus-free local STM read
+/// via [`read_local`].
+async fn get_topics(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path(stream_id): Path<String>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<Topic>>, ReadError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let request = GetTopicsRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_TOPICS_CODE,
+        &body,
+    )?;
+    let response = GetTopicsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        topics_from_wire(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
+/// `GET /streams/{stream_id}/topics/{topic_id}`: fetch one topic by numeric id
+/// or name as the same `TopicDetails` JSON the legacy server returns; 404 when
+/// absent. A consensus-free local STM read via [`read_local`].
+async fn get_topic(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<TopicDetails>, ReadError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let request = GetTopicRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_TOPIC_CODE,
+        &body,
+    )?;
+    let response = GetTopicResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        TopicDetails::try_from(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
+/// `GET /users`: list every user as the same `Vec<UserInfo>` JSON the legacy
+/// server returns. A consensus-free local STM read via [`read_local`].
+async fn get_users(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<UserInfo>>, ReadError> {
+    let body = GetUsersRequest.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_USERS_CODE,
+        &body,
+    )?;
+    let response = GetUsersResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        users_from_wire(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
+/// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
+/// `UserInfoDetails` JSON the legacy server returns; 404 when absent. A
+/// consensus-free local STM read via [`read_local`].
+async fn get_user(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path(user_id): Path<String>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<UserInfoDetails>, ReadError> {
+    let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
+    let request = GetUserRequest {
+        user_id: identifier_to_wire(&user_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_USER_CODE,
+        &body,
+    )?;
+    let response = UserDetailsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(
+        UserInfoDetails::try_from(response).map_err(ReadError::Rejected)?,
+    ))
+}
+
+/// `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups`: list a topic's
+/// consumer groups as the same `Vec<ConsumerGroup>` JSON the legacy server
+/// returns. A consensus-free local STM read via [`read_local`].
+async fn get_cgs(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<ConsumerGroup>>, ReadError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let request = GetConsumerGroupsRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_CONSUMER_GROUPS_CODE,
+        &body,
+    )?;
+    let response = GetConsumerGroupsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(consumer_groups_from_wire(response)))
+}
+
+/// `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}`:
+/// fetch one consumer group by numeric id or name as the same
+/// `ConsumerGroupDetails` JSON the legacy server returns; 404 when absent. The
+/// wire-to-domain conversion is infallible.
+async fn get_cg(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id, group_id)): Path<(String, String, String)>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<ConsumerGroupDetails>, ReadError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let group_id = Identifier::from_str_value(&group_id).map_err(ReadError::Rejected)?;
+    let request = GetConsumerGroupRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+        group_id: identifier_to_wire(&group_id).map_err(ReadError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_CONSUMER_GROUP_CODE,
+        &body,
+    )?;
+    let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(ConsumerGroupDetails::from(response)))
+}
+
+/// `GET /stats`: server + storage counters as the same `Stats` JSON the legacy
+/// server returns. `GET_STATS` is served by `build_non_replicated_response` like
+/// the entity reads, so it flows through [`read_local`] unchanged rather than a
+/// dedicated builder. No entity can be missing, so no 404 branch.
+async fn get_stats(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Stats>, ReadError> {
+    let body = GetStatsRequest.to_bytes();
+    let bytes = read_local(
+        &state,
+        identity.user_id,
+        query.consistency,
+        GET_STATS_CODE,
+        &body,
+    )?;
+    let response = StatsResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(Stats::from(response)))
+}
+
+/// `GET /clients`: list every connected client across all shards as the same
+/// `Vec<ClientInfo>` JSON the legacy server returns.
+///
+/// Unlike the entity reads, connections live in each shard's session manager,
+/// not the metadata STM, so this scatter-gathers over the shard mesh
+/// (`list_all_clients`) instead of going through [`read_local`]. It still runs
+/// the identical root-only + consistency gate via [`authorize_read`], so its
+/// authorization matches every metadata read. The gather future is `!Send`,
+/// bridged onto shard 0's thread by `SendWrapper` exactly as the write path
+/// bridges its submit.
+async fn get_clients(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<ClientInfo>>, ReadError> {
+    authorize_read(&state, identity.user_id, query.consistency)?;
+    let infos = SendWrapper::new(state.shard.list_all_clients()).await;
+    let response = GetClientsResponse {
+        clients: infos
+            .iter()
+            .map(|info| connected_client_to_response(&state.shard, info))
+            .collect(),
+    };
+    Ok(Json(clients_from_wire(response)))
+}
+
+/// `GET /clients/{client_id}`: fetch one connected client as the same
+/// `ClientInfoDetails` JSON the legacy server returns; 404 when absent.
+///
+/// The path id is the `u32` wire client id (the seq tail of the u128 transport
+/// id), matching the legacy route's `Path<u32>`. There is no reverse map from
+/// that id to a home shard, so this gathers every shard's clients and filters -
+/// the same fan-out-and-filter as [`get_clients`] and the TCP `get_client`
+/// dispatch. The wire-to-domain conversion is infallible.
+async fn get_client(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path(client_id): Path<u32>,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<ClientInfoDetails>, ReadError> {
+    authorize_read(&state, identity.user_id, query.consistency)?;
+    let infos = SendWrapper::new(state.shard.list_all_clients()).await;
+    // The wire client id is the u32 seq tail of the u128 transport id.
+    #[allow(clippy::cast_possible_truncation)]
+    let info = infos
+        .iter()
+        .find(|info| info.client_id as u32 == client_id)
+        .ok_or(ReadError::NotFound)?;
+    let consumer_groups = info.vsr_client_id.map_or_else(Vec::new, |vsr_client_id| {
+        state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_group_memberships(vsr_client_id)
+            .into_iter()
+            .map(
+                |(stream_id, topic_id, group_id)| ConsumerGroupInfoResponse {
+                    stream_id,
+                    topic_id,
+                    group_id,
+                },
+            )
+            .collect()
+    });
+    let response = ClientDetailsResponse {
+        client: connected_client_to_response(&state.shard, info),
+        consumer_groups,
+    };
+    Ok(Json(ClientInfoDetails::from(response)))
 }
 
 /// `POST /streams`: create a stream and render the committed reply as the same
@@ -952,6 +1383,17 @@ async fn submit_committed(
     if session.user_id != DEFAULT_ROOT_USER_ID {
         return Err(WriteError::Rejected(IggyError::Unauthorized));
     }
+    // Per-session gate: serialize this session's request ids across the commit
+    // await, advancing the id only after an observed Reply so a transient
+    // failure leaves it free to retry.
+    //
+    // TODO(hubcio): cancellation-unsafe. If the client disconnects while parked
+    // on the await below, this handler is dropped without advancing the id, yet
+    // the prepare still commits pump-driven. The next write on this session then
+    // reuses the id, gets the prior op's cached reply (Duplicate), silently loses
+    // its own write, and returns a foreign success. Fix by moving the submit into
+    // a detached shard-0 task that owns the id advance and signals the handler
+    // via a oneshot, so the commit is recorded regardless of client liveness.
     let mut next_request_id = session.gate.lock().await;
     let message = build_request_message(
         operation,
@@ -993,6 +1435,59 @@ async fn submit_write(
     let (_request_header, reply, _raw_token) =
         submit_committed(state, session, operation, body).await?;
     Ok(Bytes::copy_from_slice(committed_payload(&reply)?))
+}
+
+/// The two cross-cutting gates every authenticated read enforces before it
+/// touches state. Factored out of [`read_local`] so the cross-shard client
+/// reads (`get_clients` / `get_client`) - which serve from the shard session
+/// managers, not the local STM, and so cannot use [`read_local`] - still pass
+/// the identical gate. Keeping it in one place is what guarantees no read route
+/// can silently skip authz or answer a linearizable request on a follower.
+///
+/// Root-only: until server-ng has an RBAC permissioner, every read is root-only,
+/// mirroring the write gate in [`submit_committed`]. A non-root credential is
+/// authenticated but unprivileged -> 403. Linearizable reads must come from the
+/// primary; on a follower we cannot yet 307-redirect (no roster: F7) nor emit
+/// the Location (F3), so 503 and let the client retry. This becomes a
+/// 307-to-leader once both land.
+fn authorize_read(
+    state: &HttpInner,
+    user_id: u32,
+    consistency: Consistency,
+) -> Result<(), ReadError> {
+    if user_id != DEFAULT_ROOT_USER_ID {
+        return Err(ReadError::Rejected(IggyError::Unauthorized));
+    }
+    if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
+        return Err(ReadError::NotPrimary);
+    }
+    Ok(())
+}
+
+/// Serve one authenticated read from the local metadata STM and hand back the
+/// wire response body. Shared chokepoint for every read route whose data lives
+/// in the metadata STM: it runs the shared [`authorize_read`] gate, then
+/// delegates to [`build_non_replicated_response`], the SAME local-read entry the
+/// TCP dispatch spine uses (`handle_default_non_replicated`), so an HTTP read and
+/// a TCP read of the same entity return byte-identical bodies.
+///
+/// Reads never touch consensus or a VSR session: `build_non_replicated_response`
+/// is a pure STM read. It is synchronous, so this helper is too - no submit
+/// await, no gate, no `SendWrapper`. An absent entity surfaces as
+/// [`NonReplicatedResponse::Empty`], mapped to 404 here because every REST read
+/// whose entity can be missing shares that not-found shape.
+fn read_local(
+    state: &HttpInner,
+    user_id: u32,
+    consistency: Consistency,
+    code: u32,
+    body: &[u8],
+) -> Result<Bytes, ReadError> {
+    authorize_read(state, user_id, consistency)?;
+    match build_non_replicated_response(&state.shard, code, body).map_err(ReadError::Rejected)? {
+        NonReplicatedResponse::Empty => Err(ReadError::NotFound),
+        NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
+    }
 }
 
 /// Classify a committed reply's leading result section and return the typed

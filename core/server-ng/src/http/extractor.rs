@@ -79,6 +79,43 @@ impl FromRequestParts<HttpState> for Authenticated {
     }
 }
 
+/// Read-only caller identity for a protected read route: the authenticated
+/// user id and nothing else.
+///
+/// Unlike [`Authenticated`], it verifies the bearer WITHOUT minting or
+/// Registering a VSR session. Reads are served from the local metadata STM and
+/// never enter consensus, so a session (and the `Register` commit round-trip it
+/// costs) would be dead weight. Same 401 rejection surface as [`Authenticated`]
+/// (missing/invalid/expired credential), and the verify runs through the same
+/// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
+pub struct Identity {
+    pub user_id: u32,
+}
+
+impl FromRequestParts<HttpState> for Identity {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &HttpState,
+    ) -> Result<Self, Self::Rejection> {
+        let bearer = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix(BEARER))
+            .ok_or(IggyError::AccessTokenMissing)?;
+
+        // Verify only. The session key and expiry `resolve_credential` also
+        // returns feed the write path's session table; a read discards them.
+        // No `.await` and no session borrow here, so the extractor future needs
+        // no `SendWrapper` bridge (contrast [`Authenticated`], which awaits the
+        // `!Send` `resolve_session`).
+        let (_key, user_id, _expiry) = resolve_credential(state, bearer)?;
+        Ok(Self { user_id })
+    }
+}
+
 /// Map a bearer credential to its `(session key, user id, expiry secs)`.
 ///
 /// A JWT is the primary credential, keyed by its `jti`. A raw PAT presented as
