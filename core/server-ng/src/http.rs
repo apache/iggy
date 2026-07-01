@@ -52,7 +52,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
     GetConsumerGroupsRequest,
 };
-use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffset2Request, GetConsumerOffsetRequest, StoreConsumerOffset2Request,
+};
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
@@ -87,7 +89,8 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
-    GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
+    AckLevel, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
+    WireName,
 };
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -96,25 +99,28 @@ use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{
-    clients_from_wire, consumer_groups_from_wire, identifier_to_wire, partitioning_to_wire,
-    permissions_to_wire, streams_from_wire, topics_from_wire, users_from_wire,
+    clients_from_wire, consumer_groups_from_wire, consumer_to_wire, identifier_to_wire,
+    partitioning_to_wire, permissions_to_wire, streams_from_wire, topics_from_wire,
+    users_from_wire,
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
-    ClusterNodeStatus, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo, Identifier,
-    IdentityInfo, IggyError, IggyMessageView, IggyTimestamp, PollMessages, PolledMessages,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, RawPersonalAccessToken, SendMessages, Stats, Stream,
-    StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints, UserInfo, UserInfoDetails,
-    Validatable,
+    ClusterNodeStatus, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo,
+    Identifier, IdentityInfo, IggyError, IggyMessageView, IggyTimestamp, PollMessages,
+    PolledMessages, RESYNC_REQUIRED_PARTITION_SENTINEL, RawPersonalAccessToken, SendMessages,
+    Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints, UserInfo,
+    UserInfoDetails, Validatable,
 };
 use message_bus::{BusMessage, InstanceToken, client_listener};
 use metadata::impls::metadata::StreamsFrontend;
@@ -158,13 +164,14 @@ const MAX_HTTP_SESSIONS: usize = 100_000;
 /// are 1-based and strictly increasing within a session.
 const FIRST_REQUEST_ID: u64 = 1;
 
-/// Bound on a produce's wait for its committed partition reply. Long enough to
-/// ride out a view change (plus the dispatch gates' own routable-wait budget),
-/// short enough not to pin HTTP connections behind a dead consensus group. On
-/// expiry the caller gets 504 and must treat the outcome as unknown: the
-/// partition plane is at-least-once and the prepare may still commit after the
-/// wait gave up, so the server never retries on the caller's behalf.
-const PRODUCE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on a partition write's (produce / consumer-offset write) wait for its
+/// committed reply. Long enough to ride out a view change (plus the dispatch
+/// gates' own routable-wait budget), short enough not to pin HTTP connections
+/// behind a dead consensus group. On expiry the caller gets 504 and must treat
+/// the outcome as unknown: the partition plane is at-least-once and the prepare
+/// may still commit after the wait gave up, so the server never retries on the
+/// caller's behalf.
+const PARTITION_WRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
 /// HTTP reads never Register a VSR client, and shard-0 client ids are minted
@@ -223,8 +230,9 @@ struct HttpSession {
     /// monotonically and never reused, which the slot-guard contract requires.
     data_request: Cell<u64>,
     /// Registry token of this session's lazily-installed in-process reply
-    /// target (`None` until the first awaited produce). Stored so session
-    /// eviction can tear the registry entry down fenced by the same token.
+    /// target (`None` until the first awaited partition write). Stored so
+    /// session eviction can tear the registry entry down fenced by the same
+    /// token.
     registry_token: Cell<Option<InstanceToken>>,
 }
 
@@ -293,56 +301,67 @@ impl IntoResponse for WriteError {
     }
 }
 
-/// Rejection for a data-plane produce (`POST .../messages`).
+/// Rejection for a data-plane partition write (`POST .../messages` produce and
+/// the `PUT`/`DELETE .../consumer-offsets` writes).
 ///
 /// Split differently from [`WriteError`] because the partition plane replies
 /// carry no committed error code: a pre-dispatch gate failure is an empty
 /// reply distinguishable only by header (see [`classify_partition_reply`]),
-/// and an unanswered produce is a distinct outcome the caller must treat as
+/// and an unanswered write is a distinct outcome the caller must treat as
 /// unknown rather than failed.
-enum ProduceError {
+enum PartitionWriteError {
     /// Caller-side rejection (bad identifier, oversized batch, the interim
     /// non-root denial) or a malformed reply frame, rendered through the
     /// legacy `IggyError -> status` map for SDK-identical bodies.
     Rejected(IggyError),
-    /// The dispatch gates could not route the produce: the stream, topic, or
+    /// The dispatch gates could not route the write: the stream, topic, or
     /// partition does not resolve (or never materialised within the routable
     /// budget). Rendered as the legacy 404 body.
     NotFound,
     /// The in-process reply slot could not be installed. Transient server
     /// condition -> the shared 503, retryable.
     Unavailable,
-    /// No committed reply within [`PRODUCE_REPLY_TIMEOUT`], or the session's
-    /// reply target was torn down mid-wait. 504: the commit may still land
-    /// (at-least-once), so this is a hard "outcome unknown", not a failure
-    /// the server may transparently retry.
-    Timeout,
+    /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], or the
+    /// session's reply target was torn down mid-wait. 504: the commit may
+    /// still land (at-least-once), so this is a hard "outcome unknown", not a
+    /// failure the server may transparently retry. Carries the write's
+    /// operation so the 504 body names which write kind timed out.
+    Timeout(Operation),
 }
 
-impl IntoResponse for ProduceError {
+impl IntoResponse for PartitionWriteError {
     fn into_response(self) -> Response {
         match self {
             Self::Rejected(error) => CustomError::from(error).into_response(),
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::Unavailable => service_unavailable(),
-            Self::Timeout => produce_timeout_response(),
+            Self::Timeout(operation) => partition_write_timeout_response(operation),
         }
     }
 }
 
-/// 504 body for a produce whose commit outcome is unknown. Shaped like every
-/// other HTTP error (`ErrorResponse`) so clients parse one error schema.
-fn produce_timeout_response() -> Response {
-    gateway_timeout_response(
-        "produce_timeout",
-        "produce was not acknowledged in time; the write may still commit",
-    )
+/// 504 body for a partition write whose commit outcome is unknown, coded per
+/// write kind so a caller can tell a produce timeout from an offset-write
+/// timeout. Shaped like every other HTTP error (`ErrorResponse`) so clients
+/// parse one error schema.
+fn partition_write_timeout_response(operation: Operation) -> Response {
+    let (code, reason) = match operation {
+        Operation::SendMessages => (
+            "produce_timeout",
+            "produce was not acknowledged in time; the write may still commit",
+        ),
+        _ => (
+            "offset_write_timeout",
+            "consumer-offset write was not acknowledged in time; the write may still commit",
+        ),
+    };
+    gateway_timeout_response(code, reason)
 }
 
 /// Shared 504 rendering for an in-band request the partition plane did not
 /// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
-/// clients parse one error schema. Consumed by the produce reply wait and the
-/// partition reads ([`ReadError::Timeout`]).
+/// clients parse one error schema. Consumed by the partition-write reply wait
+/// and the partition reads ([`ReadError::Timeout`]).
 fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
@@ -614,7 +633,7 @@ impl HttpInner {
                 return true;
             }
             // Evicting the session also tears down its in-process reply
-            // target (if a produce ever installed one), cancelling any
+            // target (if a partition write ever installed one), cancelling any
             // still-parked reply waiters. Token-fenced so a stale sweep can
             // never remove a later occupant of the key.
             if let Some(token) = session.registry_token.get() {
@@ -792,7 +811,11 @@ fn router(state: HttpState) -> Router {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            get(get_consumer_offset),
+            get(get_consumer_offset).put(store_consumer_offset),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
+            delete(delete_consumer_offset),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
@@ -1478,21 +1501,28 @@ async fn send_messages(
     Path((stream_id, topic_id)): Path<(String, String)>,
     Query(query): Query<ProduceQuery>,
     Json(command): Json<SendMessages>,
-) -> Result<Response, ProduceError> {
+) -> Result<Response, PartitionWriteError> {
     // Interim authorization: root-only until server-ng has an RBAC
     // permissioner, mirroring the control-plane gate in `submit_committed`.
     if identity.session.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(ProduceError::Rejected(IggyError::Unauthorized));
+        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
     }
-    let stream_id = Identifier::from_str_value(&stream_id).map_err(ProduceError::Rejected)?;
-    let topic_id = Identifier::from_str_value(&topic_id).map_err(ProduceError::Rejected)?;
+    let stream_id =
+        Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
-    command.validate().map_err(ProduceError::Rejected)?;
-    let body =
-        encode_send_messages(&stream_id, &topic_id, &command).map_err(ProduceError::Rejected)?;
+    command.validate().map_err(PartitionWriteError::Rejected)?;
+    let body = encode_send_messages(&stream_id, &topic_id, &command)
+        .map_err(PartitionWriteError::Rejected)?;
     match query.ack {
         ProduceAck::Replicated => {
-            SendWrapper::new(produce_replicated(&state, &identity.session, &body)).await?;
+            SendWrapper::new(partition_write_replicated(
+                &state,
+                &identity.session,
+                Operation::SendMessages,
+                &body,
+            ))
+            .await?;
             Ok((
                 StatusCode::CREATED,
                 [(
@@ -1511,6 +1541,82 @@ async fn send_messages(
                 .into_response())
         }
     }
+}
+
+/// `PUT /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: store a
+/// consumer's offset. The JSON body is the same `StoreConsumerOffset` shape the
+/// legacy server accepts (flattened `consumer_id`, optional `partition_id`,
+/// `offset`); stream and topic come from the path. Returns 204 on commit,
+/// matching the legacy server.
+///
+/// Data plane like a produce: the offset write is a replicated op on the
+/// partition group's own consensus, awaited through the session's in-process
+/// reply slot ([`partition_write_replicated`]). The v2 wire op is pinned to
+/// `ack = Quorum` - `?ack=none` is a produce-only surface. The consumer
+/// identifier passes through on the wire; the dispatch resolvers hash named
+/// consumers and rewrite group ids server-side, identically to TCP.
+async fn store_consumer_offset(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Json(command): Json<StoreConsumerOffset>,
+) -> Result<StatusCode, PartitionWriteError> {
+    // Interim authorization: root-only until server-ng has an RBAC
+    // permissioner, mirroring the control-plane gate in `submit_committed`.
+    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
+        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
+    }
+    let stream_id =
+        Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
+    let request = store_offset_wire_request(&stream_id, &topic_id, &command)
+        .map_err(PartitionWriteError::Rejected)?;
+    let body = request.to_bytes();
+    SendWrapper::new(partition_write_replicated(
+        &state,
+        &identity.session,
+        Operation::StoreConsumerOffset2,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}`:
+/// delete a consumer's stored offset. The consumer comes from the path and the
+/// optional `partition_id` from the query, the same `DeleteConsumerOffset`
+/// shape the legacy server accepts. Returns 204 on commit, matching the legacy
+/// server. Same replicated partition write as [`store_consumer_offset`].
+async fn delete_consumer_offset(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
+    Query(query): Query<DeleteConsumerOffset>,
+) -> Result<StatusCode, PartitionWriteError> {
+    // Interim authorization: root-only until server-ng has an RBAC
+    // permissioner, mirroring the control-plane gate in `submit_committed`.
+    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
+        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
+    }
+    let stream_id =
+        Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
+    // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
+    // handler does; HTTP cannot express a group-kind offset op.
+    let consumer = Consumer::new(
+        Identifier::from_str_value(&consumer_id).map_err(PartitionWriteError::Rejected)?,
+    );
+    let request = delete_offset_wire_request(&stream_id, &topic_id, &consumer, query.partition_id)
+        .map_err(PartitionWriteError::Rejected)?;
+    let body = request.to_bytes();
+    SendWrapper::new(partition_write_replicated(
+        &state,
+        &identity.session,
+        Operation::DeleteConsumerOffset2,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups`: create a
@@ -1952,6 +2058,45 @@ fn consumer_offset_wire_request(
     })
 }
 
+/// Map a validated HTTP store-offset body onto the v2 wire request
+/// (`StoreConsumerOffset2Request`), `ack` pinned to `Quorum` so the route can
+/// await the committed reply. The body's consumer kind is structurally always
+/// `Consumer` (`Consumer::kind` is `#[serde(skip)]`), matching the legacy HTTP
+/// server; `partition_id` passes through as the wire `Option` (flag byte +
+/// u32) for the server-side resolvers to ground.
+fn store_offset_wire_request(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    command: &StoreConsumerOffset,
+) -> Result<StoreConsumerOffset2Request, IggyError> {
+    Ok(StoreConsumerOffset2Request {
+        consumer: consumer_to_wire(&command.consumer)?,
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        partition_id: command.partition_id,
+        offset: command.offset,
+        ack: AckLevel::Quorum,
+    })
+}
+
+/// Map a validated HTTP delete-offset request onto the v2 wire request
+/// (`DeleteConsumerOffset2Request`), `ack` pinned to `Quorum` like
+/// [`store_offset_wire_request`].
+fn delete_offset_wire_request(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    consumer: &Consumer,
+    partition_id: Option<u32>,
+) -> Result<DeleteConsumerOffset2Request, IggyError> {
+    Ok(DeleteConsumerOffset2Request {
+        consumer: consumer_to_wire(consumer)?,
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        partition_id,
+        ack: AckLevel::Quorum,
+    })
+}
+
 /// The empty `PolledMessages` a fenced consumer-group poll answers, carrying
 /// the re-sync sentinel in `partition_id` exactly as the TCP dispatch replies
 /// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
@@ -1964,23 +2109,25 @@ const fn resync_required_polled_messages() -> PolledMessages {
     }
 }
 
-/// Run one awaited produce end to end: install the reply slot, dispatch into
-/// the partition plane, and wait (bounded) for the committed reply.
+/// Run one awaited partition write (produce / consumer-offset write) end to
+/// end: install the reply slot, dispatch into the partition plane, and wait
+/// (bounded) for the committed reply.
 ///
 /// Slot-before-dispatch is load-bearing: every pre-dispatch gate failure
 /// inside [`dispatch_partition_request`] replies through `send_to_client`,
 /// which fires an installed slot, so one slot catches every exit. The slot
 /// guard borrows the registry, which is why this whole future runs inside
 /// the caller's `SendWrapper` on shard 0.
-async fn produce_replicated(
+async fn partition_write_replicated(
     state: &HttpInner,
     session: &HttpSession,
+    operation: Operation,
     body: &[u8],
-) -> Result<(), ProduceError> {
+) -> Result<(), PartitionWriteError> {
     ensure_in_process_reply_target(state, session);
     let request_id = session.next_data_request_id();
     let message = build_request_message(
-        Operation::SendMessages,
+        operation,
         session.client_id,
         session.session,
         request_id,
@@ -1992,8 +2139,12 @@ async fn produce_replicated(
         .clients()
         .install_reply_slot(session.client_id, request_id)
         .map_err(|error| {
-            warn!(?error, "server-ng HTTP: produce reply slot install failed");
-            ProduceError::Unavailable
+            warn!(
+                ?error,
+                ?operation,
+                "server-ng HTTP: partition write reply slot install failed"
+            );
+            PartitionWriteError::Unavailable
         })?;
     dispatch_partition_request(
         &state.shard,
@@ -2003,7 +2154,7 @@ async fn produce_replicated(
         session.client_id,
     )
     .await;
-    let outcome = compio::time::timeout(PRODUCE_REPLY_TIMEOUT, receiver).await;
+    let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
     // Removes the slot unless the reply already fired, so a late commit
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
@@ -2011,7 +2162,7 @@ async fn produce_replicated(
         Ok(Ok(reply)) => classify_partition_reply(&reply),
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
-        Ok(Err(_)) | Err(_) => Err(ProduceError::Timeout),
+        Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),
     }
 }
 
@@ -2059,24 +2210,24 @@ fn ensure_in_process_reply_target(state: &HttpInner, session: &HttpSession) {
     }
 }
 
-/// Discriminate a produce reply. Partition replies carry no result section
-/// and no error code - success and gate failure are both empty-bodied - so
-/// the only wire discriminator is the reply's `op`: a committed reply is
+/// Discriminate a partition write reply. Partition replies carry no result
+/// section and no error code (success and gate failure are both empty-bodied),
+/// so the only wire discriminator is the reply's `op`: a committed reply is
 /// built from its prepare header, whose op (the partition group's commit
 /// number) is always >= 1, while the pre-dispatch gate failures reply through
 /// `build_empty_reply` with 0 in that field. The gate reply cannot name which
 /// entity was missing, hence the generic legacy 404 body.
-fn classify_partition_reply(reply: &BusMessage) -> Result<(), ProduceError> {
+fn classify_partition_reply(reply: &BusMessage) -> Result<(), PartitionWriteError> {
     let header = reply
         .as_slice()
         .get(..HEADER_SIZE)
         .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
-        .ok_or(ProduceError::Rejected(IggyError::InvalidCommand))?;
+        .ok_or(PartitionWriteError::Rejected(IggyError::InvalidCommand))?;
     if header.command != Command2::Reply {
-        return Err(ProduceError::Rejected(IggyError::InvalidCommand));
+        return Err(PartitionWriteError::Rejected(IggyError::InvalidCommand));
     }
     if header.op == 0 {
-        return Err(ProduceError::NotFound);
+        return Err(PartitionWriteError::NotFound);
     }
     Ok(())
 }
@@ -2620,6 +2771,83 @@ mod tests {
         assert_eq!(wire.consumer.kind, 1);
     }
 
+    // -- consumer-offset write wire mapping --
+
+    #[test]
+    fn store_offset_wire_request_round_trips_with_quorum_ack() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::named("orders").expect("valid topic id");
+        let command = StoreConsumerOffset {
+            consumer: Consumer::new(Identifier::named("c1").expect("valid id")),
+            partition_id: Some(1),
+            offset: 42,
+        };
+        let request = store_offset_wire_request(&stream_id, &topic_id, &command).expect("maps");
+        let bytes = request.to_bytes();
+        assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
+        let (decoded, consumed) =
+            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, request);
+        assert_eq!(decoded.consumer.kind, 1);
+        assert_eq!(decoded.partition_id, Some(1));
+        assert_eq!(decoded.offset, 42);
+        assert_eq!(decoded.ack, AckLevel::Quorum);
+    }
+
+    #[test]
+    fn store_offset_wire_request_passes_omitted_partition_through() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::numeric(2).expect("valid topic id");
+        let command = StoreConsumerOffset {
+            consumer: Consumer::new(Identifier::numeric(7).expect("valid id")),
+            partition_id: None,
+            offset: u64::MAX,
+        };
+        let request = store_offset_wire_request(&stream_id, &topic_id, &command).expect("maps");
+        let bytes = request.to_bytes();
+        let (decoded, consumed) =
+            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.partition_id, None);
+        assert_eq!(decoded.offset, u64::MAX);
+        assert_eq!(decoded.ack, AckLevel::Quorum);
+    }
+
+    #[test]
+    fn delete_offset_wire_request_round_trips_partition_variants() {
+        let stream_id = Identifier::named("stream-1").expect("valid stream id");
+        let topic_id = Identifier::numeric(2).expect("valid topic id");
+        for partition_id in [Some(1), None] {
+            let request = delete_offset_wire_request(
+                &stream_id,
+                &topic_id,
+                &Consumer::new(Identifier::named("c1").expect("valid id")),
+                partition_id,
+            )
+            .expect("maps");
+            let bytes = request.to_bytes();
+            assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
+            let (decoded, consumed) =
+                DeleteConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded, request);
+            assert_eq!(decoded.consumer.kind, 1);
+            assert_eq!(decoded.partition_id, partition_id);
+            assert_eq!(decoded.ack, AckLevel::Quorum);
+        }
+    }
+
+    #[test]
+    fn delete_offset_query_parses_optional_partition_id() {
+        let uri: Uri = "/x?partition_id=3".parse().expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.partition_id, Some(3));
+        let bare: Uri = "/x".parse().expect("valid uri");
+        let Query(query) = Query::<DeleteConsumerOffset>::try_from_uri(&bare).expect("parses");
+        assert_eq!(query.partition_id, None);
+    }
+
     // -- polled messages body decode --
 
     /// Wrap one stored `SendMessages2` batch (`[256B header][blob]`) as the
@@ -2720,13 +2948,29 @@ mod tests {
         assert!(classify_partition_reply(&reply).is_ok());
     }
 
+    /// The 204 path of the offset write routes: a committed
+    /// `StoreConsumerOffset2` reply (op >= 1) classifies as success.
+    #[test]
+    fn committed_offset_write_reply_classifies_as_success() {
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::StoreConsumerOffset2,
+            client: 42,
+            op: 3,
+            request: 2,
+            ..Default::default()
+        };
+        let reply = frozen(consensus::build_reply_message(&prepare, &Bytes::new()));
+        assert!(classify_partition_reply(&reply).is_ok());
+    }
+
     #[test]
     fn gate_failure_empty_reply_classifies_as_not_found() {
         let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
         let reply = frozen(build_empty_reply(request.header(), 42, 0, 9));
         assert!(matches!(
             classify_partition_reply(&reply),
-            Err(ProduceError::NotFound)
+            Err(PartitionWriteError::NotFound)
         ));
     }
 
@@ -2735,7 +2979,7 @@ mod tests {
         let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
         assert!(matches!(
             classify_partition_reply(&request.into_generic().into_frozen()),
-            Err(ProduceError::Rejected(IggyError::InvalidCommand))
+            Err(PartitionWriteError::Rejected(IggyError::InvalidCommand))
         ));
     }
 }
