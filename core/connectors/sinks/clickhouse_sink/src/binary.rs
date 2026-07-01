@@ -451,7 +451,10 @@ fn write_zero_or_null(ch_type: &ChType, buf: &mut Vec<u8>, col_name: &str) -> Re
 fn coerce_i64(value: &OwnedValue) -> Result<i64, Error> {
     match value {
         OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(*n),
-        OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(*n as i64),
+        OwnedValue::Static(simd_json::StaticNode::U64(n)) => i64::try_from(*n).map_err(|_| {
+            error!("Cannot coerce unsigned integer {n} to signed integer");
+            Error::InvalidRecord
+        }),
         OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
             let n = *f as i64;
             if n as f64 != *f {
@@ -628,7 +631,10 @@ fn coerce_to_string(value: &OwnedValue) -> Result<Cow<'_, str>, Error> {
 fn coerce_to_days(value: &OwnedValue) -> Result<i64, Error> {
     match value {
         OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(*n),
-        OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(*n as i64),
+        OwnedValue::Static(simd_json::StaticNode::U64(n)) => i64::try_from(*n).map_err(|_| {
+            error!("Cannot coerce unsigned integer {n} to signed integer");
+            Error::InvalidRecord
+        }),
         OwnedValue::String(s) => {
             // Parse "YYYY-MM-DD" manually
             let mut it = s.splitn(3, '-');
@@ -883,6 +889,29 @@ mod tests {
         let mut buf = vec![];
         assert!(serialize_value(&json_i64(65536), &ChType::UInt16, &mut buf).is_err());
         assert!(serialize_value(&json_i64(-1), &ChType::UInt16, &mut buf).is_err());
+    }
+
+    #[test]
+    fn serialize_int64_rejects_u64_above_i64_max() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_u64(u64::MAX), &ChType::Int64, &mut buf).is_err());
+        assert!(
+            serialize_value(&json_u64(i64::MAX as u64 + 1), &ChType::Int64, &mut buf).is_err()
+        );
+    }
+
+    #[test]
+    fn serialize_int64_accepts_u64_at_i64_max() {
+        let mut buf = vec![];
+        serialize_value(&json_u64(i64::MAX as u64), &ChType::Int64, &mut buf).unwrap();
+        assert_eq!(buf, i64::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_int8_rejects_u64_above_i64_max() {
+        // Regression: the u64->i64 wrap must not turn u64::MAX into -1 and slip past the i8 range check.
+        let mut buf = vec![];
+        assert!(serialize_value(&json_u64(u64::MAX), &ChType::Int8, &mut buf).is_err());
     }
 
     #[test]
@@ -1186,6 +1215,12 @@ mod tests {
         let mut buf = vec![];
         serialize_value(&json_u64(19000), &ChType::Date, &mut buf).unwrap();
         assert_eq!(buf, 19000u16.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_date_rejects_u64_above_i64_max() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_u64(u64::MAX), &ChType::Date, &mut buf).is_err());
     }
 
     #[test]
