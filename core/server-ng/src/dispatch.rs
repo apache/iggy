@@ -1305,15 +1305,27 @@ fn empty_polled_messages_body(partition_id: u32) -> Bytes {
     Bytes::from(body)
 }
 
-type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
+pub(crate) type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
 
-#[allow(clippy::cast_possible_truncation)]
 fn decode_poll_request(
     shard: &Rc<ServerNgShard>,
     request: &Message<RequestHeader>,
 ) -> Result<DecodedPollRequest, IggyError> {
     let wire = PollMessagesRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
+    resolve_poll_request(shard, &wire, request.header().client)
+}
+
+/// Resolve a decoded poll request into its owning-shard read: namespace,
+/// partition, polling consumer, and args. Shared by the TCP dispatch (client
+/// id = the connection's bound VSR client) and the HTTP route (client id 0,
+/// which fences group polls closed).
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn resolve_poll_request(
+    shard: &Rc<ServerNgShard>,
+    wire: &PollMessagesRequest,
+    client_id: u128,
+) -> Result<DecodedPollRequest, IggyError> {
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
 
@@ -1325,7 +1337,6 @@ fn decode_poll_request(
     // both use, so `next()` reads back the offset it just committed.
     if wire.consumer.kind == KIND_CONSUMER_GROUP {
         let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
-        let client_id = request.header().client;
         let group_id = shard
             .plane
             .metadata()
@@ -1369,6 +1380,17 @@ fn decode_consumer_offset_request(
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
     let wire = GetConsumerOffsetRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
+    resolve_consumer_offset_request(shard, &wire)
+}
+
+/// Resolve a decoded consumer-offset read into its owning-shard read:
+/// namespace, partition, and polling consumer. Shared by the TCP dispatch and
+/// the HTTP route; needs no client id because offset reads are not fenced
+/// (any client may read a group's offset, member or not).
+pub(crate) fn resolve_consumer_offset_request(
+    shard: &Rc<ServerNgShard>,
+    wire: &GetConsumerOffsetRequest,
+) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
     let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;

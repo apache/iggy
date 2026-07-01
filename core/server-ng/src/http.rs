@@ -46,11 +46,16 @@ use iggy_binary_protocol::codes::{
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
 };
+use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
     GetConsumerGroupsRequest,
 };
-use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
+use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
+use iggy_binary_protocol::requests::messages::{
+    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+};
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
@@ -91,8 +96,10 @@ use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
+use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
@@ -103,8 +110,9 @@ use iggy_common::wire_conversions::{
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
-    ClusterNodeStatus, ConsumerGroup, ConsumerGroupDetails, Identifier, IdentityInfo, IggyError,
-    IggyMessageView, IggyTimestamp, RawPersonalAccessToken, SendMessages, Stats, Stream,
+    ClusterNodeStatus, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo, Identifier,
+    IdentityInfo, IggyError, IggyMessageView, IggyTimestamp, PollMessages, PolledMessages,
+    RESYNC_REQUIRED_PARTITION_SENTINEL, RawPersonalAccessToken, SendMessages, Stats, Stream,
     StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints, UserInfo, UserInfoDetails,
     Validatable,
 };
@@ -115,21 +123,23 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use server::http::error::{CustomError, ErrorResponse};
 use server_common::Message;
+use shard::{PartitionRead, PartitionReadReply};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::auth::{verify_login_credentials, verify_pat_credentials};
 use crate::bootstrap::ServerNgShard;
 use crate::dispatch::{
-    dispatch_partition_request, submit_client_request_on_owner, submit_register_on_owner,
+    dispatch_partition_request, resolve_consumer_offset_request, resolve_poll_request,
+    submit_client_request_on_owner, submit_register_on_owner,
 };
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
 use crate::pat::rewrite_pat_request_for_user;
 use crate::responses::{
-    NonReplicatedResponse, build_non_replicated_response, build_raw_pat_reply,
-    connected_client_to_response,
+    NonReplicatedResponse, build_non_replicated_response, build_polled_messages_body,
+    build_raw_pat_reply, connected_client_to_response,
 };
 use crate::server_error::ServerNgError;
 use crate::users::maybe_rewrite_user_password_request;
@@ -155,6 +165,15 @@ const FIRST_REQUEST_ID: u64 = 1;
 /// partition plane is at-least-once and the prepare may still commit after the
 /// wait gave up, so the server never retries on the caller's behalf.
 const PRODUCE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// VSR client id stamped on HTTP data-plane reads (poll / consumer-offset).
+/// HTTP reads never Register a VSR client, and shard-0 client ids are minted
+/// from 1, so 0 can never name a live consumer-group member: a group-kind
+/// poll fences closed with `ConsumerGroupPartitionNotOwned` and answers the
+/// re-sync sentinel empty poll - the same failure a stale TCP member sees.
+/// Legacy HTTP polls with client id 0 for the same reason (no persistent
+/// sessions, so no group membership).
+const HTTP_READ_CLIENT_ID: u128 = 0;
 
 /// Response header attesting what durability a produce response proves:
 /// [`DURABILITY_REPLICATED_MEMORY`] after an awaited quorum commit,
@@ -314,12 +333,23 @@ impl IntoResponse for ProduceError {
 /// 504 body for a produce whose commit outcome is unknown. Shaped like every
 /// other HTTP error (`ErrorResponse`) so clients parse one error schema.
 fn produce_timeout_response() -> Response {
+    gateway_timeout_response(
+        "produce_timeout",
+        "produce was not acknowledged in time; the write may still commit",
+    )
+}
+
+/// Shared 504 rendering for an in-band request the partition plane did not
+/// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
+/// clients parse one error schema. Consumed by the produce reply wait and the
+/// partition reads ([`ReadError::Timeout`]).
+fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     (
         StatusCode::GATEWAY_TIMEOUT,
         Json(ErrorResponse {
             id: StatusCode::GATEWAY_TIMEOUT.as_u16().into(),
-            code: "produce_timeout".to_owned(),
-            reason: "produce was not acknowledged in time; the write may still commit".to_owned(),
+            code: code.to_owned(),
+            reason: reason.to_owned(),
             field: None,
         }),
     )
@@ -404,6 +434,10 @@ enum ReadError {
     /// query, so the caller re-issues the read against the leader (see
     /// [`primary_redirect_response`]).
     RedirectToPrimary(String),
+    /// A partition read (poll / consumer-offset) got no reply from the owning
+    /// shard within the mesh budget. 504 like a produce timeout: the outcome is
+    /// unknown (the abandoned read may still be running), so the caller retries.
+    Timeout,
 }
 
 impl IntoResponse for ReadError {
@@ -415,6 +449,10 @@ impl IntoResponse for ReadError {
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
+            Self::Timeout => gateway_timeout_response(
+                "partition_read_timeout",
+                "the partition owner did not answer the read in time; retry",
+            ),
         }
     }
 }
@@ -750,7 +788,11 @@ fn router(state: HttpState) -> Router {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
-            post(send_messages),
+            get(poll_messages).post(send_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
+            get(get_consumer_offset),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
@@ -1312,6 +1354,112 @@ async fn purge_topic(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /streams/{stream_id}/topics/{topic_id}/messages`: poll a batch of
+/// messages as the same `PolledMessages` JSON the legacy server returns. The
+/// query is the same flattened `PollMessages` shape the legacy server accepts
+/// (`consumer_id`, `partition_id`, strategy `kind`+`value`, `count`,
+/// `auto_commit`); stream and topic come from the path.
+///
+/// A non-replicated read served in band: the same resolution the TCP dispatch
+/// runs ([`resolve_poll_request`]), then a mesh read on the owning shard and a
+/// re-encode of the stored batches into the legacy wire body, decoded here by
+/// the SDK's own [`PolledMessages::from_bytes`] so the JSON is field-identical
+/// to a TCP poll. `auto_commit` rides [`resolve_poll_request`]'s args and is
+/// honored by the owning shard's poll plan; no extra HTTP work.
+async fn poll_messages(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(consistency): Query<ConsistencyQuery>,
+) -> Result<Json<PolledMessages>, ReadError> {
+    authorize_read(&state, &identity, consistency.consistency)?;
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let wire = poll_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
+    let (namespace, partition_id, consumer, args) =
+        match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
+            Ok(decoded) => decoded,
+            // TCP parity: a fenced group poll answers 200 with the re-sync
+            // sentinel partition, not an error (see [`HTTP_READ_CLIENT_ID`]).
+            Err(IggyError::ConsumerGroupPartitionNotOwned(..)) => {
+                return Ok(Json(resync_required_polled_messages()));
+            }
+            // The remaining resolver failures are STM lookups that came up
+            // empty (unknown stream, topic, partition, or consumer group), so
+            // they render as the legacy 404 body.
+            Err(_) => return Err(ReadError::NotFound),
+        };
+    let reply = SendWrapper::new(
+        state
+            .shard
+            .partition_read(namespace, PartitionRead::Poll { consumer, args }),
+    )
+    .await;
+    match reply {
+        Some(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        }) => {
+            let body = build_polled_messages_body(partition_id, current_offset, fragments)
+                .map_err(ReadError::Rejected)?;
+            Ok(Json(
+                PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?,
+            ))
+        }
+        Some(PartitionReadReply::NotFound) => Err(ReadError::NotFound),
+        Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
+        None => Err(ReadError::Timeout),
+    }
+}
+
+/// `GET /streams/{stream_id}/topics/{topic_id}/consumer-offsets`: fetch a
+/// consumer's stored offset as the same `ConsumerOffsetInfo` JSON the legacy
+/// server returns. The query is the same flattened `GetConsumerOffset` shape
+/// the legacy server accepts (`consumer_id`, optional `partition_id`).
+///
+/// A non-replicated read served in band, mirroring [`poll_messages`]. A
+/// missing offset (never stored, or the partition unknown to its owner) is
+/// the legacy 404: the TCP path replies an empty body the SDK decodes as
+/// `None`, and the legacy HTTP server renders that `None` as
+/// `CustomError::ResourceNotFound`.
+async fn get_consumer_offset(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<GetConsumerOffset>,
+    Query(consistency): Query<ConsistencyQuery>,
+) -> Result<Json<ConsumerOffsetInfo>, ReadError> {
+    authorize_read(&state, &identity, consistency.consistency)?;
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let wire =
+        consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
+    let (namespace, partition_id, consumer) =
+        resolve_consumer_offset_request(&state.shard, &wire).map_err(|_| ReadError::NotFound)?;
+    let reply = SendWrapper::new(
+        state
+            .shard
+            .partition_read(namespace, PartitionRead::ConsumerOffset { consumer }),
+    )
+    .await;
+    match reply {
+        Some(PartitionReadReply::ConsumerOffset {
+            stored: Some(stored_offset),
+            current_offset,
+        }) => Ok(Json(ConsumerOffsetInfo {
+            partition_id,
+            current_offset,
+            stored_offset,
+        })),
+        Some(
+            PartitionReadReply::ConsumerOffset { stored: None, .. } | PartitionReadReply::NotFound,
+        ) => Err(ReadError::NotFound),
+        Some(_) => Err(ReadError::Rejected(IggyError::InvalidCommand)),
+        None => Err(ReadError::Timeout),
+    }
+}
+
 /// `POST /streams/{stream_id}/topics/{topic_id}/messages`: produce a batch of
 /// messages to a topic. The JSON body is the same `SendMessages` shape the
 /// legacy server accepts (partitioning + base64 messages); stream and topic
@@ -1757,6 +1905,65 @@ fn encode_send_messages(
     Ok(buf.freeze())
 }
 
+/// Map a validated HTTP poll query onto the wire `PollMessagesRequest` the
+/// shared TCP resolver consumes, so both transports resolve one request shape.
+/// The query's consumer kind is structurally always `Consumer`
+/// (`Consumer::kind` is `#[serde(skip)]` - the flattened `kind` param names
+/// the polling strategy), matching the legacy HTTP server.
+fn poll_wire_request(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    query: &PollMessages,
+) -> Result<PollMessagesRequest, IggyError> {
+    Ok(PollMessagesRequest {
+        consumer: WireConsumer {
+            kind: query.consumer.kind.as_code(),
+            id: identifier_to_wire(&query.consumer.id)?,
+        },
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        partition_id: query.partition_id,
+        strategy: WirePollingStrategy {
+            kind: query.strategy.kind.as_code(),
+            value: query.strategy.value,
+        },
+        count: query.count,
+        auto_commit: query.auto_commit,
+    })
+}
+
+/// Map a validated HTTP consumer-offset query onto the wire
+/// `GetConsumerOffsetRequest` the shared TCP resolver consumes. An omitted
+/// `partition_id` defaults to partition 0, matching the legacy server's
+/// `resolve_consumer_with_partition_id` (`partition_id.unwrap_or(0)`).
+fn consumer_offset_wire_request(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    query: &GetConsumerOffset,
+) -> Result<GetConsumerOffsetRequest, IggyError> {
+    Ok(GetConsumerOffsetRequest {
+        consumer: WireConsumer {
+            kind: query.consumer.kind.as_code(),
+            id: identifier_to_wire(&query.consumer.id)?,
+        },
+        stream_id: identifier_to_wire(stream_id)?,
+        topic_id: identifier_to_wire(topic_id)?,
+        partition_id: Some(query.partition_id.unwrap_or(DEFAULT_PARTITION_ID)),
+    })
+}
+
+/// The empty `PolledMessages` a fenced consumer-group poll answers, carrying
+/// the re-sync sentinel in `partition_id` exactly as the TCP dispatch replies
+/// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
+const fn resync_required_polled_messages() -> PolledMessages {
+    PolledMessages {
+        partition_id: RESYNC_REQUIRED_PARTITION_SENTINEL,
+        current_offset: 0,
+        count: 0,
+        messages: Vec::new(),
+    }
+}
+
 /// Run one awaited produce end to end: install the reply slot, dispatch into
 /// the partition plane, and wait (bounded) for the committed reply.
 ///
@@ -2166,9 +2373,20 @@ const fn login_error_to_iggy(error: &LoginRegisterError) -> IggyError {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::Uri;
     use configs::cluster::TransportPorts;
     use iggy_binary_protocol::PrepareHeader;
-    use iggy_common::{IggyMessage, IggyMessagesBatch, Partitioning, PartitioningKind};
+    use iggy_common::{
+        Consumer, ConsumerKind, IggyMessage, IggyMessagesBatch, Partitioning, PartitioningKind,
+        PollingKind, PollingStrategy,
+    };
+    use partitions::{Fragment, PollFragments};
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Owned;
+    use server_common::send_messages2::{
+        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Header,
+        SendMessages2Owned,
+    };
 
     use super::*;
     use crate::responses::build_empty_reply;
@@ -2317,6 +2535,169 @@ mod tests {
             value: vec![0u8; 256],
         });
         assert!(command.validate().is_err());
+    }
+
+    // -- poll / consumer-offset query parsing and wire mapping --
+
+    #[test]
+    fn poll_query_parses_with_documented_defaults() {
+        let uri: Uri = "/streams/1/topics/1/messages?consumer_id=42"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<PollMessages>::try_from_uri(&uri).expect("parses");
+        assert_eq!(query.consumer.kind, ConsumerKind::Consumer);
+        assert_eq!(
+            query.consumer.id,
+            Identifier::numeric(42).expect("valid id")
+        );
+        assert_eq!(query.partition_id, Some(0));
+        assert_eq!(query.strategy, PollingStrategy::offset(0));
+        assert_eq!(query.count, 10);
+        assert!(!query.auto_commit);
+    }
+
+    #[test]
+    fn poll_query_parses_explicit_strategy_count_and_tolerates_consistency_param() {
+        let uri: Uri = "/x?consumer_id=app&partition_id=3&kind=timestamp&value=42&count=5&auto_commit=true&consistency=linearizable"
+            .parse()
+            .expect("valid uri");
+        let Query(query) = Query::<PollMessages>::try_from_uri(&uri).expect("parses");
+        assert_eq!(
+            query.consumer.id,
+            Identifier::named("app").expect("valid id")
+        );
+        assert_eq!(query.partition_id, Some(3));
+        assert_eq!(
+            query.strategy,
+            PollingStrategy::timestamp(IggyTimestamp::from(42))
+        );
+        assert_eq!(query.count, 5);
+        assert!(query.auto_commit);
+        let Query(consistency) = Query::<ConsistencyQuery>::try_from_uri(&uri).expect("parses");
+        assert!(consistency.consistency == Consistency::Linearizable);
+    }
+
+    #[test]
+    fn poll_wire_request_maps_query_onto_tcp_request_shape() {
+        let stream_id = Identifier::from_str_value("orders").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("1").expect("valid topic id");
+        let query = PollMessages {
+            consumer: Consumer {
+                kind: ConsumerKind::Consumer,
+                id: Identifier::numeric(9).expect("valid id"),
+            },
+            partition_id: Some(4),
+            strategy: PollingStrategy::next(),
+            count: 25,
+            auto_commit: true,
+            ..Default::default()
+        };
+        let wire = poll_wire_request(&stream_id, &topic_id, &query).expect("maps");
+        assert_eq!(wire.consumer.kind, 1);
+        assert_eq!(
+            wire.consumer.id,
+            identifier_to_wire(&query.consumer.id).unwrap()
+        );
+        assert_eq!(wire.stream_id, identifier_to_wire(&stream_id).unwrap());
+        assert_eq!(wire.topic_id, identifier_to_wire(&topic_id).unwrap());
+        assert_eq!(wire.partition_id, Some(4));
+        assert_eq!(wire.strategy.kind, PollingKind::Next.as_code());
+        assert_eq!(wire.strategy.value, 0);
+        assert_eq!(wire.count, 25);
+        assert!(wire.auto_commit);
+    }
+
+    #[test]
+    fn consumer_offset_wire_request_defaults_omitted_partition_to_zero() {
+        let stream_id = Identifier::numeric(1).expect("valid stream id");
+        let topic_id = Identifier::numeric(1).expect("valid topic id");
+        let query = GetConsumerOffset {
+            consumer: Consumer::new(Identifier::numeric(7).expect("valid id")),
+            partition_id: None,
+        };
+        let wire = consumer_offset_wire_request(&stream_id, &topic_id, &query).expect("maps");
+        assert_eq!(wire.partition_id, Some(DEFAULT_PARTITION_ID));
+        assert_eq!(wire.consumer.kind, 1);
+    }
+
+    // -- polled messages body decode --
+
+    /// Wrap one stored `SendMessages2` batch (`[256B header][blob]`) as the
+    /// poll fragment the owning shard replies, the shape
+    /// `build_polled_messages_body` consumes.
+    fn fragment_from_stored_batch(header: &SendMessages2Header, blob: &[u8]) -> PollFragments {
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(COMMAND_HEADER_SIZE + blob.len());
+        header.encode_into(buffer.as_mut_slice());
+        buffer.as_mut_slice()[COMMAND_HEADER_SIZE..].copy_from_slice(blob);
+        let mut fragments = PollFragments::new();
+        fragments.push(Fragment::whole(buffer.into()));
+        fragments
+    }
+
+    /// Round-trip the poll route's encode/decode seam: the store's own batch
+    /// writer (`SendMessages2Owned::from_messages`) is the encoder oracle,
+    /// `build_polled_messages_body` re-encodes to the legacy wire body, and
+    /// the SDK's `PolledMessages::from_bytes` must read back every field.
+    #[test]
+    fn polled_messages_body_decodes_into_common_polled_messages() {
+        let mut messages = IggyMessages2::with_capacity(2);
+        messages.push(IggyMessage2 {
+            header: IggyMessage2Header {
+                id: 7,
+                origin_timestamp: 1_000,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"first"),
+            user_headers: None,
+        });
+        messages.push(IggyMessage2 {
+            header: IggyMessage2Header {
+                id: 8,
+                origin_timestamp: 1_050,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"second"),
+            user_headers: Some(Bytes::from_static(b"raw-header-bytes")),
+        });
+        let namespace = server_common::sharding::IggyNamespace::new(0, 0, 3);
+        let stored =
+            SendMessages2Owned::from_messages(namespace, &messages).expect("encodes stored batch");
+        // The store stamps these on append; `from_messages` leaves them zero.
+        let mut header = stored.header;
+        header.base_offset = 41;
+        header.base_timestamp = 999_999;
+
+        let body =
+            build_polled_messages_body(3, 42, fragment_from_stored_batch(&header, &stored.blob))
+                .expect("re-encodes wire body");
+        let polled = PolledMessages::from_bytes(body).expect("decodes as the SDK does");
+
+        assert_eq!(polled.partition_id, 3);
+        assert_eq!(polled.current_offset, 42);
+        assert_eq!(polled.count, 2);
+        assert_eq!(polled.messages.len(), 2);
+        assert_eq!(polled.messages[0].header.id, 7);
+        assert_eq!(polled.messages[0].header.offset, 41);
+        assert_eq!(polled.messages[0].header.timestamp, 999_999);
+        assert_eq!(polled.messages[0].header.origin_timestamp, 1_000);
+        assert_eq!(polled.messages[0].payload.as_ref(), b"first");
+        assert!(polled.messages[0].user_headers.is_none());
+        assert_eq!(polled.messages[1].header.id, 8);
+        assert_eq!(polled.messages[1].header.offset, 42);
+        assert_eq!(polled.messages[1].header.origin_timestamp, 1_050);
+        assert_eq!(polled.messages[1].payload.as_ref(), b"second");
+        assert_eq!(
+            polled.messages[1].user_headers.as_deref(),
+            Some(b"raw-header-bytes".as_ref())
+        );
+    }
+
+    #[test]
+    fn resync_required_polled_messages_carries_sentinel_partition() {
+        let polled = resync_required_polled_messages();
+        assert_eq!(polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL);
+        assert_eq!(polled.count, 0);
+        assert!(polled.messages.is_empty());
     }
 
     // -- classify_partition_reply --
