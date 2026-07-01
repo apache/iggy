@@ -247,10 +247,17 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     // login decodes to `TransientNotCommitted` and the SDK replays it. The one
     // exception is a terminal failure, which ships an empty body (no result
     // section) and is passed through to fail the typed `LoginRegisterResponse`
-    // decode. Reads, the partition data plane, and Logout carry no result
-    // section and pass through untouched.
-    let result_framed =
-        operation.is_metadata() || (operation == Operation::Register && !body.is_empty());
+    // decode. `DeleteConsumerOffset` is the one partition-plane op that carries a
+    // result section: it can be rejected with `ConsumerOffsetNotFound`, which
+    // must reach the client as a terminal error rather than a mis-decoded `Ok`
+    // (its success reply ships `[count = 0]` to match). Other reads, data-plane
+    // ops, and Logout carry no result section and pass through untouched.
+    let result_framed = operation.is_metadata()
+        || (operation == Operation::Register && !body.is_empty())
+        || matches!(
+            operation,
+            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
+        );
     if !result_framed {
         return Ok(body);
     }

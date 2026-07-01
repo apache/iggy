@@ -329,6 +329,73 @@ impl Stream {
     }
 }
 
+/// Cross-buffer shared aggregate stats.
+///
+/// The metadata STM is left-right double-buffered; `create_stream` /
+/// `create_topic` / snapshot restore run on BOTH buffers (Absorb
+/// re-dispatches each op), which would mint a distinct `Arc<StreamStats>` /
+/// `Arc<TopicStats>` per buffer. Aggregate message/size counters are
+/// `AtomicU64`s the partition plane increments DIRECTLY (outside the consensus
+/// op-log), so per-buffer Arcs silently drop those increments on a buffer swap
+/// (a read lands on the other, un-incremented buffer -- hence the
+/// `messages_count_inconsistent` naming). This registry hands both buffers the
+/// SAME `Arc` (get-or-create by id), so a direct increment is visible on every
+/// read.
+///
+/// Shared across buffers and reader shards via `Arc` (a `StreamsInner` clone
+/// shares it). Only shard 0's writer mutates the maps, under the
+/// single-threaded Absorb; the `Mutex` is for `Sync` (uncontended), not
+/// concurrency. Ids are deterministic across replicas (same op order), so both
+/// buffers resolve the same key.
+#[derive(Debug, Default)]
+pub struct StatsRegistry {
+    streams: std::sync::Mutex<AHashMap<usize, Arc<StreamStats>>>,
+    topics: std::sync::Mutex<AHashMap<(usize, usize), Arc<TopicStats>>>,
+}
+
+impl StatsRegistry {
+    fn stream(&self, id: usize) -> Arc<StreamStats> {
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry(id)
+            .or_insert_with(|| Arc::new(StreamStats::default()))
+            .clone()
+    }
+
+    fn topic(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        parent: Arc<StreamStats>,
+    ) -> Arc<TopicStats> {
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry((stream_id, topic_id))
+            .or_insert_with(|| Arc::new(TopicStats::new(parent)))
+            .clone()
+    }
+
+    fn remove_stream(&self, id: usize) {
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .remove(&id);
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(stream_id, _), _| *stream_id != id);
+    }
+
+    fn remove_topic(&self, stream_id: usize, topic_id: usize) {
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .remove(&(stream_id, topic_id));
+    }
+}
+
 define_state! {
     Streams {
         index: AHashMap<Arc<str>, usize>,
@@ -345,6 +412,10 @@ define_state! {
         // decide whether to wake the reconciler. Deterministic (same ops, same
         // recompute on every replica).
         pending_revocations_count: u64,
+        // Shared aggregate stats, one `Arc` per stream/topic across both
+        // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
+        // as streams/topics restore.
+        stats_registry: Arc<StatsRegistry>,
     }
 }
 
@@ -1046,19 +1117,21 @@ impl StateHandler for CreateStreamRequest {
             return ApplyReply::err(CreateStreamResult::NameAlreadyExists);
         }
 
+        // Share one `Arc<StreamStats>` across both left-right buffers via the
+        // registry (see `StatsRegistry`). The id the next insert will use is
+        // deterministic, so both buffers resolve the same registry key.
+        let id = state.items.vacant_key();
+        let stream_stats = state.stats_registry.stream(id);
         let stream = Stream {
-            id: 0,
+            id,
             name: name_arc.clone(),
             created_at: timestamp,
-            stats: Arc::new(StreamStats::default()),
+            stats: stream_stats,
             topics: Slab::new(),
             topic_index: AHashMap::default(),
         };
-
-        let id = state.items.insert(stream);
-        if let Some(stream) = state.items.get_mut(id) {
-            stream.id = id;
-        }
+        let inserted = state.items.insert(stream);
+        debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
         state.index.insert(name_arc, id);
 
         // Reply body: a freshly created stream has no topics. The SDK
@@ -1118,6 +1191,8 @@ impl StateHandler for DeleteStreamRequest {
         let name = stream.name.clone();
         state.items.remove(stream_id);
         state.index.remove(&name);
+        // Evict registry entries so a reused slab id starts with fresh stats.
+        state.stats_registry.remove_stream(stream_id);
         state.revision = state.revision.wrapping_add(1);
         // The dropped stream may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -1167,6 +1242,21 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
 
+        // Share one `Arc<TopicStats>` across both left-right buffers via the
+        // registry, parented to the stream's shared `Arc<StreamStats>`. The id
+        // the next insert will use is deterministic across buffers. Fetched
+        // under an immutable borrow that ends before the `&mut stream` below,
+        // so the registry access (a sibling field) does not alias.
+        let (topic_id, parent_stats) = {
+            let Some(stream) = state.items.get(stream_id) else {
+                return ApplyReply::err(CreateTopicResult::StreamNotFound);
+            };
+            (stream.topics.vacant_key(), stream.stats.clone())
+        };
+        let topic_stats = state
+            .stats_registry
+            .topic(stream_id, topic_id, parent_stats);
+
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
@@ -1178,7 +1268,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         };
 
         let topic = Topic {
-            id: 0,
+            id: topic_id,
             name: name_arc.clone(),
             created_at: timestamp,
             replication_factor,
@@ -1188,7 +1278,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             )
             .unwrap_or_default(),
             max_topic_size: MaxTopicSize::from(self.request.max_topic_size),
-            stats: Arc::new(TopicStats::new(stream.stats.clone())),
+            stats: topic_stats,
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
@@ -1196,10 +1286,9 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             next_consumer_group_id: 1,
         };
 
-        let topic_id = stream.topics.insert(topic);
-        if let Some(topic) = stream.topics.get_mut(topic_id) {
-            topic.id = topic_id;
-
+        let inserted = stream.topics.insert(topic);
+        debug_assert_eq!(inserted, topic_id, "vacant_key must match the insert slot");
+        if let Some(topic) = stream.topics.get_mut(inserted) {
             for partition in &self.partitions {
                 let partition = Partition {
                     id: partition.partition_id as usize,
@@ -1339,6 +1428,8 @@ impl StateHandler for DeleteTopicRequest {
         let name = topic.name.clone();
         stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
+        // Evict registry entry so a reused slab id starts with fresh stats.
+        state.stats_registry.remove_topic(stream_id, topic_id);
         state.revision = state.revision.wrapping_add(1);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -1581,9 +1672,13 @@ impl Snapshotable for Streams {
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
         let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
+        // Register restored stats in the shared registry so both left-right
+        // buffers (and any post-restore op) reference one `Arc` per
+        // stream/topic (see `StatsRegistry`).
+        let stats_registry = Arc::new(StatsRegistry::default());
 
         for (slab_key, stream_snap) in snapshot.items {
-            let stream_stats = Arc::new(StreamStats::default());
+            let stream_stats = stats_registry.stream(slab_key);
             stream_stats.store_from_snapshot(
                 stream_snap.stats.size_bytes,
                 stream_snap.stats.messages_count,
@@ -1594,7 +1689,8 @@ impl Snapshotable for Streams {
             let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
 
             for (topic_slab_key, topic_snap) in stream_snap.topics {
-                let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
+                let topic_stats =
+                    stats_registry.topic(slab_key, topic_slab_key, stream_stats.clone());
                 topic_stats.store_from_snapshot(
                     topic_snap.stats.size_bytes,
                     topic_snap.stats.messages_count,
@@ -1674,6 +1770,7 @@ impl Snapshotable for Streams {
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
             last_result: None,
+            stats_registry,
         };
         inner.recompute_pending_revocations_count();
         Ok(inner.into())

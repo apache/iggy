@@ -52,6 +52,9 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::{
+    GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
+};
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -85,6 +88,36 @@ use std::rc::Rc;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
+pub(crate) fn build_get_personal_access_tokens_response(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) -> GetPersonalAccessTokensResponse {
+    // PATs are per-user; list the requesting connection's own tokens, resolved
+    // from this shard's `SessionManager` (like `get_me`) then read out of the
+    // replicated Users STM.
+    let Some(user_id) = sessions.borrow().get_user_id(transport_client_id) else {
+        return GetPersonalAccessTokensResponse { tokens: Vec::new() };
+    };
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        let tokens = users
+            .personal_access_tokens
+            .get(&user_id)
+            .map(|pats| {
+                pats.values()
+                    .filter_map(|pat| {
+                        Some(PersonalAccessTokenResponse {
+                            name: WireName::new(pat.name.as_ref()).ok()?,
+                            expiry_at: pat.expiry_at.map_or(0, |expiry| expiry.as_micros()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        GetPersonalAccessTokensResponse { tokens }
+    })
+}
+
 pub(crate) fn build_get_me_response(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
