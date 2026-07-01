@@ -37,6 +37,9 @@ use configs::http::HttpJwtConfig;
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
 };
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
@@ -50,6 +53,7 @@ use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     UpdateUserRequest,
 };
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
@@ -59,6 +63,7 @@ use iggy_binary_protocol::{
     GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::change_password::ChangePassword;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
@@ -72,8 +77,8 @@ use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{identifier_to_wire, permissions_to_wire};
 use iggy_common::{
-    Identifier, IdentityInfo, IggyError, IggyTimestamp, RawPersonalAccessToken, StreamDetails,
-    TokenInfo, TopicDetails, UserInfoDetails, Validatable,
+    ConsumerGroupDetails, Identifier, IdentityInfo, IggyError, IggyTimestamp,
+    RawPersonalAccessToken, StreamDetails, TokenInfo, TopicDetails, UserInfoDetails, Validatable,
 };
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
@@ -389,6 +394,14 @@ fn router(state: HttpState) -> Router {
             "/streams/{stream_id}/topics/{topic_id}/purge",
             delete(purge_topic),
         )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
+            post(create_cg),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
+            delete(delete_cg),
+        )
         .route("/personal-access-tokens", post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
         .with_state(state)
@@ -637,6 +650,65 @@ async fn purge_topic(
         &state,
         &identity.session,
         Operation::PurgeTopic,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups`: create a
+/// consumer group under a topic and render the committed reply as the same
+/// `ConsumerGroupDetails` JSON the legacy server returns.
+///
+/// The stream and topic come from the path; the JSON body is name-only
+/// (`{"name": ...}`), matching the legacy request. The submitted op is a plain
+/// `CreateConsumerGroup`; the metadata owner assigns the group id, so this
+/// handler never allocates one itself.
+async fn create_cg(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Json(command): Json<CreateConsumerGroup>,
+) -> Result<Json<ConsumerGroupDetails>, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
+    let request = CreateConsumerGroupRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+        name: WireName::new(command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidConsumerGroupName))?,
+    };
+    let body = request.to_bytes();
+    let payload = SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::CreateConsumerGroup,
+        &body,
+    ))
+    .await?;
+    Ok(Json(decode_consumer_group_details(&payload)?))
+}
+
+/// `DELETE /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}`:
+/// delete a consumer group. Returns 204 on commit.
+async fn delete_cg(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path((stream_id, topic_id, group_id)): Path<(String, String, String)>,
+) -> Result<StatusCode, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
+    let group_id = Identifier::from_str_value(&group_id).map_err(WriteError::Rejected)?;
+    let request = DeleteConsumerGroupRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
+        group_id: identifier_to_wire(&group_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::DeleteConsumerGroup,
         &body,
     ))
     .await?;
@@ -999,6 +1071,16 @@ fn decode_user_details(payload: &[u8]) -> Result<UserInfoDetails, WriteError> {
     let response = UserDetailsResponse::decode_from(payload)
         .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
     UserInfoDetails::try_from(response).map_err(WriteError::Rejected)
+}
+
+/// Decode the `ConsumerGroupDetailsResponse` payload of a committed
+/// create-consumer-group reply into `ConsumerGroupDetails`. `payload` is the
+/// slice past the result section that [`submit_write`] already validated as a
+/// success. The wire-to-domain conversion is infallible.
+fn decode_consumer_group_details(payload: &[u8]) -> Result<ConsumerGroupDetails, WriteError> {
+    let response = ConsumerGroupDetailsResponse::decode_from(payload)
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    Ok(ConsumerGroupDetails::from(response))
 }
 
 /// Extract the raw one-time token from a [`build_raw_pat_reply`] output. That
