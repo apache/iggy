@@ -15,16 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    cxx_build::bridge("src/lib.rs")
-        .std("c++17")
-        .compile("iggy-cpp-bridge");
+use iggy::prelude::IggyConsumer as RustIggyConsumer;
 
-    println!("cargo:rerun-if-changed=src/client.rs");
-    println!("cargo:rerun-if-changed=src/consumer.rs");
-    println!("cargo:rerun-if-changed=src/identifier.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/messages.rs");
-    println!("cargo:rerun-if-changed=src/producer.rs");
-    println!("cargo:rerun-if-changed=src/type_conversion.rs");
+#[allow(dead_code)]
+pub struct Consumer {
+    pub inner: RustIggyConsumer,
 }

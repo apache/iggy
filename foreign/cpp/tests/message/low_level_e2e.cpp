@@ -17,7 +17,6 @@
  * under the License.
  */
 
-#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
