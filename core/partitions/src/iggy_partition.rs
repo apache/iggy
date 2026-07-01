@@ -16,21 +16,20 @@
 // under the License.
 
 use crate::iggy_index_writer::IggyIndexWriter;
-use crate::journal::{
-    MessageLookup, PartitionJournal, PartitionJournalMemStorage, QueryableJournal,
-    select_batch_slice,
-};
+use crate::journal::{MessageLookup, PartitionJournal, PartitionJournalMemStorage};
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{delete_persisted_offset, persist_offset};
-use crate::segment::Segment;
-use crate::types::Fragment;
-use crate::{
-    AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer,
+use crate::poll_plan::{
+    AutoCommitCtx, AutoCommitTarget, DiskReadPlan, DiskSegment, LastPolledCtx, PollPlan, PollTier,
+    ResidentTailSnapshot,
 };
-use compio::io::AsyncReadAtExt;
+use crate::segment::Segment;
+use crate::{
+    AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
+    PollingConsumer,
+};
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
@@ -47,16 +46,15 @@ use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader, WireDecode, WireI
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
+    IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
 };
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus};
 use server_common::{
     Message, SegmentStorage,
-    iobuf::{Frozen, Owned},
+    iobuf::Frozen,
     send_messages2::{
-        COMMAND_HEADER_SIZE, convert_request_message, decode_batch_slice, decode_prepare_slice,
-        stamp_prepare_for_persistence,
+        convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -108,6 +106,11 @@ where
     consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     observed_view: u32,
+    /// Highest `PurgeTopic` generation this replica has locally applied (reset
+    /// the partition to empty). The reconciler compares the committed metadata
+    /// generation against this and resets only when it advances, so a redundant
+    /// reconcile pass never re-wipes a partition already at this generation.
+    applied_purge_generation: u64,
 }
 
 /// Post-preflight dispatch in `on_request`: replicate via VSR or take the
@@ -196,7 +199,13 @@ where
             consumer_offset_enforce_fsync: false,
             pending_consumer_offset_commits: HashMap::new(),
             observed_view,
+            applied_purge_generation: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn applied_purge_generation(&self) -> u64 {
+        self.applied_purge_generation
     }
 
     #[must_use]
@@ -330,32 +339,24 @@ where
                 if pending.kind == ConsumerKind::Consumer =>
             {
                 let id = pending.consumer_id;
-                let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                if let Some(existing) = guard.get(&key) {
-                    existing.offset.store(offset, Ordering::Relaxed);
-                } else {
-                    let created = self.consumer_offsets_path.as_deref().map_or_else(
+                crate::poll_plan::upsert_offset(&self.consumer_offsets, key, offset, || {
+                    self.consumer_offsets_path.as_deref().map_or_else(
                         || ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
                         |path| ConsumerOffset::default_for_consumer(id, path),
-                    );
-                    created.offset.store(offset, Ordering::Relaxed);
-                    guard.insert(key, created);
-                }
+                    )
+                });
                 Ok(())
             }
             PendingConsumerOffsetMutation::Upsert(offset)
                 if pending.kind == ConsumerKind::ConsumerGroup =>
             {
                 let group_id = pending.consumer_id;
-                let guard = self.consumer_group_offsets.pin();
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                if let Some(existing) = guard.get(&key) {
-                    existing.offset.store(offset, Ordering::Relaxed);
-                } else {
-                    let created = self.consumer_group_offsets_path.as_deref().map_or_else(
+                crate::poll_plan::upsert_offset(&self.consumer_group_offsets, key, offset, || {
+                    self.consumer_group_offsets_path.as_deref().map_or_else(
                         || {
                             ConsumerOffset::new(
                                 ConsumerKind::ConsumerGroup,
@@ -365,10 +366,8 @@ where
                             )
                         },
                         |path| ConsumerOffset::default_for_consumer_group(key, path),
-                    );
-                    created.offset.store(offset, Ordering::Relaxed);
-                    guard.insert(key, created);
-                }
+                    )
+                });
                 Ok(())
             }
             PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
@@ -409,32 +408,57 @@ where
             .collect()
     }
 
-    /// Reclaim a deleted consumer group's offset on this partition (in-memory
-    /// entry + persisted file). A no-op if the group has no stored offset here.
+    /// Reclaim every stored consumer-group offset whose group id is no longer
+    /// `is_live`, returning the owned persisted-file paths the caller must unlink.
     ///
-    /// # Errors
-    /// Returns an I/O error if deleting the persisted offset file fails.
+    /// Fully synchronous (no `.await`): the in-memory papaya remove happens here,
+    /// the disk unlink is deferred to the caller on owned `String` data so no
+    /// borrow of `self` survives across the await. This is the only safe shape
+    /// for the reconciler, which runs on a sibling task to the pump that may
+    /// realloc the partitions vec during that await. The remove-then-unlink
+    /// ordering matches the crash-safe GC invariant (monotonic, never-reused
+    /// group ids mean a recreated group never reads a dead group's offset).
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn delete_consumer_group_offset(&self, group_id: u64) -> Result<(), IggyError> {
-        self.consumer_group_offsets
-            .pin()
-            .remove(&ConsumerGroupId(group_id as usize));
-        if let Some(path) = self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
-        {
-            delete_persisted_offset(&path).await?;
+    pub fn reclaim_dead_group_offsets(&self, is_live: impl Fn(u64) -> bool) -> Vec<String> {
+        let pinned = self.consumer_group_offsets.pin();
+        let dead: Vec<u64> = pinned
+            .keys()
+            .map(|key| key.0 as u64)
+            .filter(|group_id| !is_live(*group_id))
+            .collect();
+        let mut paths = Vec::with_capacity(dead.len());
+        for group_id in dead {
+            pinned.remove(&ConsumerGroupId(group_id as usize));
+            if let Some(path) =
+                self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
+            {
+                paths.push(path);
+            }
         }
-        Ok(())
+        paths
     }
 
-    async fn store_consumer_offset_and_persist(
-        &self,
-        consumer: PollingConsumer,
-        offset: u64,
-    ) -> Result<(), IggyError> {
-        let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
-        self.persist_consumer_offset_commit(pending).await?;
-        self.apply_consumer_offset_commit(pending)?;
-        Ok(())
+    /// Cooperative-rebalance classification: a group's `(last_polled, committed)`
+    /// offsets on this partition, so the join enrichment can tell an in-flight
+    /// partition (committed < last-polled) from a never-polled/drained one.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn group_offset_state(&self, group_id: u64) -> (Option<u64>, Option<u64>) {
+        let key = ConsumerGroupId(group_id as usize);
+        let load = |offset: &ConsumerOffset| offset.offset.load(Ordering::Relaxed);
+        let last_polled = self.last_polled_offsets.pin().get(&key).map(load);
+        let committed = self.consumer_group_offsets.pin().get(&key).map(load);
+        (last_polled, committed)
+    }
+
+    /// Drop a group's ephemeral `last_polled` mark on this partition (residue of
+    /// a since-removed member that a later join would misread as a live hold).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn clear_group_last_polled(&self, group_id: u64) {
+        self.last_polled_offsets
+            .pin()
+            .remove(&ConsumerGroupId(group_id as usize));
     }
 
     /// `AckLevel::NoAck` fast path: persist, apply, send reply, no
@@ -543,6 +567,196 @@ where
         self.pending_consumer_offset_commits.clear();
         self.observed_view = current_view;
     }
+
+    /// Build an owned [`PollPlan`] synchronously (no `.await`), so the caller
+    /// can run the disk read + offset persist off the partition borrow. The
+    /// in-memory journal tier is read here directly (mem reads never yield);
+    /// the disk tier is captured as owned descriptors in [`DiskReadPlan`].
+    pub(crate) fn build_poll_plan(
+        &self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+    ) -> PollPlan {
+        // Reads the durable commit frontier (`self.offset`, stored only on
+        // commit). Also used below as the poll's high-water bound: this function
+        // is fully synchronous, so the single load cannot drift mid-plan.
+        let commit_offset = self.offsets().commit_offset;
+        if !self.should_increment_offset || args.count == 0 {
+            return PollPlan {
+                commit_offset,
+                auto_commit: None,
+                last_polled: None,
+                tier: PollTier::Empty,
+            };
+        }
+
+        let query = match args.strategy.kind {
+            PollingKind::Timestamp => MessageLookup::Timestamp {
+                timestamp: args.strategy.value,
+                count: args.count,
+                ceiling: commit_offset,
+            },
+            kind => {
+                let start_offset = match kind {
+                    PollingKind::Offset => args.strategy.value,
+                    PollingKind::First => 0,
+                    PollingKind::Last => commit_offset.saturating_sub(u64::from(args.count) - 1),
+                    PollingKind::Next => self
+                        .get_consumer_offset(consumer)
+                        .map_or(0, |offset| offset + 1),
+                    PollingKind::Timestamp => unreachable!(),
+                };
+                if start_offset > commit_offset {
+                    return PollPlan {
+                        commit_offset,
+                        auto_commit: None,
+                        last_polled: None,
+                        tier: PollTier::Empty,
+                    };
+                }
+                MessageLookup::Offset {
+                    offset: start_offset,
+                    count: args.count,
+                    ceiling: commit_offset,
+                }
+            }
+        };
+
+        // Past the empty-return guards: only now build the auto-commit context,
+        // whose offset-path `format!()` is wasted on the early returns above.
+        let auto_commit = self.auto_commit_ctx(consumer, args.auto_commit);
+        // Cooperative-rebalance: record the highest offset served to a group so
+        // the drain reconciler can tell committed >= last-polled. Captured here
+        // as an owned `Arc` and applied off the borrow in `PollPlan::execute`,
+        // since the served offset is unknown until the poll completes.
+        let last_polled = match consumer {
+            PollingConsumer::ConsumerGroup(group_id, _) => Some(LastPolledCtx {
+                offsets: self.last_polled_offsets.clone(),
+                group_id,
+            }),
+            PollingConsumer::Consumer(..) => None,
+        };
+
+        let serve_journal_first = match query {
+            MessageLookup::Offset { offset, .. } => self
+                .log
+                .journal()
+                .inner
+                .oldest_resident_offset()
+                .is_some_and(|oldest| offset >= oldest),
+            MessageLookup::Timestamp { .. } => !self.has_persisted_segment_bytes(),
+        };
+
+        if serve_journal_first {
+            let tier = match self.journal_get_sync(&query) {
+                Some((fragments, last_matching_offset)) => PollTier::Resident {
+                    fragments,
+                    last_matching_offset,
+                },
+                None => PollTier::Empty,
+            };
+            return PollPlan {
+                commit_offset,
+                auto_commit,
+                last_polled,
+                tier,
+            };
+        }
+
+        let (start_segment, start_position) = self.disk_poll_start(&query);
+        // Snapshot only the segments the disk walk visits (`start_segment..`),
+        // so `start_position` applies to the first snapshotted segment.
+        let segments = self.log.segments()[start_segment..]
+            .iter()
+            .map(|segment| DiskSegment {
+                start_offset: segment.start_offset,
+                persisted: segment.size.as_bytes_u64(),
+            })
+            .collect();
+        let disk = DiskReadPlan {
+            partition_dir: self.partition_dir(),
+            segments,
+            start_position,
+            namespace_raw: self.namespace().inner(),
+        };
+        // Snapshot the resident journal tail now (on the pump, under the
+        // borrow) so the straddle splice runs off-task on owned data with no
+        // partition reference. Point-in-time, so immune to a concurrent commit
+        // evicting the run just past the disk match.
+        let resident_tail = self.resident_tail_snapshot();
+        PollPlan {
+            commit_offset,
+            auto_commit,
+            last_polled,
+            tier: PollTier::Disk {
+                disk,
+                query,
+                resident_tail,
+            },
+        }
+    }
+
+    /// Capture the owned inputs for an auto-commit, if requested. The committed
+    /// offset is unknown until the poll completes, so the persist path + fsync
+    /// flag (for the disk write) and the lock-free offset-map `Arc` (for the
+    /// in-memory apply) are captured here, so both run off the partition borrow.
+    fn auto_commit_ctx(
+        &self,
+        consumer: PollingConsumer,
+        auto_commit: bool,
+    ) -> Option<AutoCommitCtx> {
+        if !auto_commit {
+            return None;
+        }
+        let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, 0).ok()?;
+        let offset_path = self.persisted_offset_path(pending.kind, pending.consumer_id);
+        let target = match pending.kind {
+            ConsumerKind::Consumer => AutoCommitTarget::Consumer {
+                offsets: self.consumer_offsets.clone(),
+                consumer_id: pending.consumer_id,
+                create_path: self.consumer_offsets_path.clone(),
+            },
+            ConsumerKind::ConsumerGroup => AutoCommitTarget::ConsumerGroup {
+                offsets: self.consumer_group_offsets.clone(),
+                group_id: pending.consumer_id,
+                create_path: self.consumer_group_offsets_path.clone(),
+            },
+        };
+        Some(AutoCommitCtx {
+            offset_path,
+            enforce_fsync: self.consumer_offset_enforce_fsync,
+            target,
+        })
+    }
+
+    /// Synchronous in-memory journal poll, for the resident tier. Never awaits
+    /// (see [`PartitionJournal::get_sync`]), so it is safe under a partition
+    /// borrow.
+    pub(crate) fn journal_get_sync(&self, query: &MessageLookup) -> Option<PollQueryResult<4096>> {
+        self.log.journal().inner.get_sync(query)
+    }
+
+    /// Snapshot the resident journal tail (oldest resident offset + op-ascending
+    /// entry clones) for the disk-tier straddle continuation. Taken
+    /// synchronously under the partition borrow so the splice runs off-task on
+    /// owned data; see [`ResidentTailSnapshot`].
+    fn resident_tail_snapshot(&self) -> ResidentTailSnapshot {
+        let journal = &self.log.journal().inner;
+        let oldest_resident = journal.oldest_resident_offset();
+        // Only clone the entries (a Vec + per-entry `Frozen` refcount bumps)
+        // when a resident tail actually exists. A fully drained journal yields
+        // `None`, and an empty `entries` makes `select_resident` return `None`
+        // (empty poll) on both the straddle and retention-recovery paths.
+        let entries = if oldest_resident.is_some() {
+            journal.resident_entries()
+        } else {
+            Vec::new()
+        };
+        ResidentTailSnapshot {
+            oldest_resident,
+            entries,
+        }
+    }
 }
 
 impl<B> Partition for IggyPartition<B>
@@ -617,93 +831,6 @@ where
         ))
     }
 
-    async fn poll_messages(
-        &self,
-        consumer: PollingConsumer,
-        args: PollingArgs,
-    ) -> Result<PollQueryResult<4096>, IggyError> {
-        if !self.should_increment_offset || args.count == 0 {
-            return Ok((PollFragments::new(), None));
-        }
-
-        let write_offset = self.offset.load(Ordering::Acquire);
-
-        let result = match args.strategy.kind {
-            PollingKind::Timestamp => {
-                self.lookup_messages(MessageLookup::Timestamp {
-                    timestamp: args.strategy.value,
-                    count: args.count,
-                })
-                .await
-            }
-            kind => {
-                let start_offset = match kind {
-                    PollingKind::Offset => args.strategy.value,
-                    PollingKind::First => 0,
-                    PollingKind::Last => write_offset.saturating_sub(u64::from(args.count) - 1),
-                    PollingKind::Next => self
-                        .get_consumer_offset(consumer)
-                        .map_or(0, |offset| offset + 1),
-                    PollingKind::Timestamp => unreachable!(),
-                };
-
-                if start_offset > write_offset {
-                    return Ok((PollFragments::new(), None));
-                }
-
-                self.lookup_messages(MessageLookup::Offset {
-                    offset: start_offset,
-                    count: args.count,
-                })
-                .await
-            }
-        };
-
-        let (fragments, last_matching_offset) =
-            result.unwrap_or_else(|| (PollFragments::new(), None));
-
-        // Record the highest offset served to a consumer group, so the
-        // cooperative-rebalance reconciler knows when a pending-revoked
-        // partition has been fully drained (committed >= last polled).
-        if let (PollingConsumer::ConsumerGroup(group_id, _), Some(last_offset)) =
-            (consumer, last_matching_offset)
-        {
-            let guard = self.last_polled_offsets.pin();
-            let key = ConsumerGroupId(group_id);
-            if let Some(existing) = guard.get(&key) {
-                existing.offset.fetch_max(last_offset, Ordering::Relaxed);
-            } else {
-                let created = ConsumerOffset::new(
-                    ConsumerKind::ConsumerGroup,
-                    u32::try_from(group_id).unwrap_or(u32::MAX),
-                    last_offset,
-                    String::new(),
-                );
-                guard.insert(key, created);
-            }
-        }
-
-        if args.auto_commit && !fragments.is_empty() {
-            let last_offset =
-                last_matching_offset.expect("non-empty poll result must have a last offset");
-            if let Err(err) = self
-                .store_consumer_offset_and_persist(consumer, last_offset)
-                .await
-            {
-                // warning for now.
-                warn!(
-                    target: "iggy.partitions.diag",
-                    consumer = ?consumer,
-                    last_offset,
-                    %err,
-                    "poll_messages: failed to store consumer offset"
-                );
-            }
-        }
-
-        Ok((fragments, last_matching_offset))
-    }
-
     #[allow(clippy::cast_possible_truncation)]
     fn store_consumer_offset(
         &self,
@@ -747,60 +874,6 @@ where
         IggyNamespace::from_raw(self.consensus.namespace())
     }
 
-    /// Resolve a poll query against the in-memory journal, falling back to
-    /// the on-disk segments for ranges the journal no longer holds (the
-    /// persist threshold drains committed batches to segment files).
-    ///
-    /// A query is served from exactly one tier per call: a poll that starts
-    /// below the journal's oldest resident offset reads from disk only, and
-    /// the client's next poll (advancing past what was returned) eventually
-    /// crosses back into the resident range. Timestamp queries try disk
-    /// first whenever segments hold persisted bytes -- older matches always
-    /// live there -- and fall back to the journal when the disk has none.
-    async fn lookup_messages(&self, query: MessageLookup) -> Option<PollQueryResult<4096>> {
-        let serve_journal_first = match query {
-            MessageLookup::Offset { offset, .. } => self
-                .log
-                .journal()
-                .inner
-                .oldest_resident_offset()
-                .is_some_and(|oldest| offset >= oldest),
-            MessageLookup::Timestamp { .. } => !self.has_persisted_segment_bytes(),
-        };
-
-        if serve_journal_first {
-            return self.log.journal().inner.get(&query).await;
-        }
-        match self.poll_from_disk(query).await {
-            Some((mut fragments, last_matching_offset, matched)) => {
-                // A poll can straddle the tiers: older messages already
-                // drained to segments, the tail still journal-resident.
-                // Continue past the last disk match by offset (timestamp
-                // matches are contiguous from the first hit, so an offset
-                // continuation is equivalent).
-                let remaining = query.count().saturating_sub(matched);
-                if remaining > 0
-                    && let Some(last_offset) = last_matching_offset
-                {
-                    let continuation = MessageLookup::Offset {
-                        offset: last_offset + 1,
-                        count: remaining,
-                    };
-                    if let Some((journal_fragments, journal_last)) =
-                        self.log.journal().inner.get(&continuation).await
-                    {
-                        fragments.extend(journal_fragments);
-                        return Some((fragments, journal_last.or(last_matching_offset)));
-                    }
-                }
-                Some((fragments, last_matching_offset))
-            }
-            // Nothing matched on disk (e.g. a timestamp newer than every
-            // persisted batch): the match, if any, is journal-resident.
-            None => self.log.journal().inner.get(&query).await,
-        }
-    }
-
     fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
@@ -826,155 +899,6 @@ where
             .segments()
             .iter()
             .any(|segment| segment.size.as_bytes_u64() > 0)
-    }
-
-    /// Serve a poll from the on-disk segment files.
-    ///
-    /// Picks the starting segment + byte position via the sparse index
-    /// (one entry per persist flush; a miss falls back to the segment
-    /// start), then walks stamped `[256B SendMessages2Header][blob]`
-    /// batches in chunked reads, slicing fragments with the same selector
-    /// the journal path uses. Batches split across a chunk boundary are
-    /// re-read from their start in the next chunk.
-    #[allow(clippy::cast_possible_truncation)]
-    async fn poll_from_disk(
-        &self,
-        query: MessageLookup,
-    ) -> Option<(PollFragments<4096>, Option<u64>, u32)> {
-        const DISK_POLL_CHUNK: u64 = 1 << 20;
-
-        let count = query.count();
-        if count == 0 || !self.log.has_segments() {
-            return None;
-        }
-
-        let (start_segment, mut position) = self.disk_poll_start(&query);
-
-        let mut fragments = PollFragments::new();
-        let mut last_matching_offset = None;
-        let mut matched: u32 = 0;
-
-        for segment_index in start_segment..self.log.segments().len() {
-            if matched >= count {
-                break;
-            }
-            let persisted = self.log.segments()[segment_index].size.as_bytes_u64();
-            if persisted == 0 || position >= persisted {
-                position = 0;
-                continue;
-            }
-            // Sealed segments drop their writer at rotation, so resolve the
-            // file from the partition directory (taken from any live writer)
-            // plus the segment's start offset, mirroring the writer naming.
-            let Some(partition_dir) = self.partition_dir() else {
-                // Simulated in-memory persistence: no files to read. A live
-                // partition hitting this means no writer was resolvable
-                // (e.g. mid-rotation), which silently hides the disk tier.
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    namespace_raw = self.namespace().inner(),
-                    segment_count = self.log.segments().len(),
-                    "disk poll: no live writer to resolve partition dir; disk tier unreadable"
-                );
-                return None;
-            };
-            let start_offset = self.log.segments()[segment_index].start_offset;
-            let path = format!("{partition_dir}/{start_offset:0>20}.log");
-            let Some(file) = self.open_segment_with_retry(&path).await else {
-                position = 0;
-                continue;
-            };
-
-            let mut chunk_len = DISK_POLL_CHUNK;
-            while matched < count && position < persisted {
-                let len = (persisted - position).min(chunk_len) as usize;
-                let Some(chunk) = self.read_chunk_with_retry(&file, position, len).await else {
-                    break;
-                };
-                let consumed = walk_disk_chunk(
-                    &chunk,
-                    query,
-                    count,
-                    &mut matched,
-                    &mut fragments,
-                    &mut last_matching_offset,
-                );
-                if consumed == 0 {
-                    if (len as u64) >= persisted - position {
-                        // The whole remainder fit and still no complete
-                        // batch decoded: corrupt tail; stop.
-                        break;
-                    }
-                    // A single batch larger than the chunk: grow and
-                    // re-read instead of spinning.
-                    chunk_len = chunk_len.saturating_mul(4);
-                    continue;
-                }
-                chunk_len = DISK_POLL_CHUNK;
-                position += consumed as u64;
-            }
-            position = 0;
-        }
-
-        if fragments.is_empty() {
-            None
-        } else {
-            Some((fragments, last_matching_offset, matched))
-        }
-    }
-
-    /// Open a segment file for a disk poll, retrying transient IO failures
-    /// (fd pressure under heavy parallel load) so one failed syscall does
-    /// not silently collapse the poll into an empty result.
-    async fn open_segment_with_retry(&self, path: &str) -> Option<compio::fs::File> {
-        for attempt in 0..3u8 {
-            match compio::fs::File::open(path).await {
-                Ok(file) => return Some(file),
-                Err(error) => {
-                    warn!(
-                        target: "iggy.partitions.diag",
-                        plane = "partitions",
-                        namespace_raw = self.namespace().inner(),
-                        path,
-                        attempt,
-                        %error,
-                        "disk poll: failed to open segment file"
-                    );
-                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            }
-        }
-        None
-    }
-
-    /// Read one chunk for a disk poll, retrying transient IO failures.
-    async fn read_chunk_with_retry(
-        &self,
-        file: &compio::fs::File,
-        position: u64,
-        len: usize,
-    ) -> Option<Frozen<4096>> {
-        for attempt in 0..3u8 {
-            let buffer = Owned::<4096>::zeroed(len);
-            let compio::BufResult(read, buffer) = file.read_exact_at(buffer, position).await;
-            match read {
-                Ok(()) => return Some(Frozen::from(buffer)),
-                Err(error) => {
-                    warn!(
-                        target: "iggy.partitions.diag",
-                        plane = "partitions",
-                        namespace_raw = self.namespace().inner(),
-                        position,
-                        attempt,
-                        %error,
-                        "disk poll: segment read failed"
-                    );
-                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            }
-        }
-        None
     }
 
     /// Starting `(segment index, byte position)` for a disk poll, resolved
@@ -2344,6 +2268,348 @@ where
         Ok(())
     }
 
+    /// Minimum committed offset across all consumers and consumer groups, with
+    /// the holder's identity. `None` when nothing has been committed, in which
+    /// case there is no deletion barrier.
+    fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
+        let consumer_guard = self.consumer_offsets.pin();
+        let group_guard = self.consumer_group_offsets.pin();
+        let consumers = consumer_guard.iter().map(|(_, offset)| {
+            (
+                offset.offset.load(Ordering::Relaxed),
+                offset.kind,
+                offset.consumer_id,
+            )
+        });
+        let groups = group_guard.iter().map(|(_, offset)| {
+            (
+                offset.offset.load(Ordering::Relaxed),
+                offset.kind,
+                offset.consumer_id,
+            )
+        });
+        consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
+    }
+
+    /// Time-expiry plus size-retention in one pass: remove the leading sealed
+    /// segments that have expired or that push the partition past `max_bytes`.
+    /// Returns the `(segments, messages)` removed.
+    pub async fn clean_expired_segments(
+        &mut self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> (u64, u64) {
+        let expired = leading_expired_end(self.log.segments(), now, message_expiry);
+        let oversized =
+            max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
+        let Some(up_to) = expired.into_iter().chain(oversized).max() else {
+            return (0, 0);
+        };
+        self.remove_sealed_segments_up_to(up_to).await
+    }
+
+    /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
+    /// never the active segment and never past the consumer barrier (the
+    /// minimum committed consumer/group offset). Unlinks the messages and
+    /// index files and decrements partition stats. Idempotent: an offset below
+    /// the oldest sealed segment removes nothing. Returns the
+    /// `(segments, messages)` removed.
+    ///
+    /// Holds `write_lock` to serialize against the commit/rotate path, which
+    /// runs on the separate consensus-tick loop.
+    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> (u64, u64) {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let barrier = self.min_committed_offset();
+        let namespace = self.namespace();
+        let removable = {
+            let segments = self.log.segments();
+            let last_idx = segments.len().saturating_sub(1);
+            let mut removable = 0usize;
+            for (idx, segment) in segments.iter().enumerate() {
+                if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
+                    break;
+                }
+                if let Some((barrier_offset, kind, consumer_id)) = barrier
+                    && segment.end_offset > barrier_offset
+                {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = namespace.inner(),
+                        start_offset = segment.start_offset,
+                        end_offset = segment.end_offset,
+                        barrier = barrier_offset,
+                        %kind,
+                        consumer_id,
+                        "segment retained: blocked by committed consumer offset"
+                    );
+                    break;
+                }
+                removable += 1;
+            }
+            removable
+        };
+
+        let mut deleted_segments = 0u64;
+        let mut deleted_messages = 0u64;
+        for _ in 0..removable {
+            // The removable run is always a prefix (oldest first), so the next
+            // victim is index 0 once the previous one is gone.
+            let segment = self.log.segments_mut().remove(0);
+            let mut storage = self.log.storages_mut().remove(0);
+            self.log.indexes_mut().remove(0);
+            self.log.messages_writers_mut().remove(0);
+            self.log.index_writers_mut().remove(0);
+
+            let (messages_path, index_path) = storage.segment_and_index_paths();
+            let _ = storage.shutdown();
+            drop(storage);
+
+            for path in messages_path.into_iter().chain(index_path) {
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            namespace_raw = namespace.inner(),
+                            path = %path,
+                            %error,
+                            "failed to unlink segment file during cleanup"
+                        );
+                    }
+                }
+            }
+
+            let segment_size = segment.size.as_bytes_u64();
+            // The removal loop above only reaches sealed segments, which always
+            // hold at least one message, so the count is inclusive end..=start.
+            // A one-message sealed segment has `start_offset == end_offset`, so
+            // the `+ 1` is required (a `start == end -> 0` special case would
+            // undercount it).
+            let messages_in_segment = segment.end_offset - segment.start_offset + 1;
+            self.stats.decrement_size_bytes(segment_size);
+            self.stats.decrement_segments_count(1);
+            self.stats.decrement_messages_count(messages_in_segment);
+
+            deleted_segments += 1;
+            deleted_messages += messages_in_segment;
+
+            debug!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                start_offset = segment.start_offset,
+                end_offset = segment.end_offset,
+                "deleted sealed segment during cleanup"
+            );
+        }
+
+        (deleted_segments, deleted_messages)
+    }
+
+    /// Build and install a fresh empty segment starting at `start_offset` with
+    /// real on-disk writers. Paths are derived from the partition directory
+    /// (see `rotate_segment`); falls back to the config-derived path for
+    /// in-memory partitions with no directory.
+    ///
+    /// # Errors
+    /// If the segment's log / index file cannot be created.
+    async fn install_empty_segment(
+        &mut self,
+        config: &PartitionsConfig,
+        start_offset: u64,
+    ) -> Result<(), IggyError> {
+        let namespace = self.namespace();
+        let (messages_path, index_path) = self.partition_dir().map_or_else(
+            || {
+                (
+                    config.get_messages_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                    config.get_index_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                )
+            },
+            |dir| {
+                (
+                    format!("{dir}/{start_offset:0>20}.log"),
+                    format!("{dir}/{start_offset:0>20}.index"),
+                )
+            },
+        );
+        let segment = Segment::new(start_offset, config.segment_size);
+        let storage = SegmentStorage::new(
+            &messages_path,
+            &index_path,
+            0,
+            0,
+            config.enforce_fsync,
+            config.enforce_fsync,
+            false,
+        )
+        .await
+        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let messages_size_bytes = storage
+            .messages_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
+            .size_counter();
+        let messages_writer = Rc::new(
+            MessagesWriter::new(
+                &messages_path,
+                messages_size_bytes,
+                config.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
+        );
+        let index_writer = Rc::new(
+            IggyIndexWriter::new(
+                &index_path,
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                config.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+        );
+        self.log
+            .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
+        Ok(())
+    }
+
+    /// Reset the partition to a single empty segment at offset 0 and clear all
+    /// consumer / consumer-group offsets (memory + disk). This is the local
+    /// effect of a committed `PurgeTopic`: it wipes message data and offsets but
+    /// preserves the partition and its consumer-group membership. Mirrors the
+    /// legacy server's `purge_all_segments` + offset-file deletion.
+    ///
+    /// Records `generation` as the applied purge generation so the reconciler
+    /// does not re-wipe a partition already purged at this generation (a later
+    /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
+    ///
+    /// # Errors
+    /// If the replacement segment's log / index file cannot be created.
+    pub async fn purge(
+        &mut self,
+        config: &PartitionsConfig,
+        generation: u64,
+    ) -> Result<(), IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let namespace = self.namespace();
+
+        // Drain every segment (including the active one) and unlink its files.
+        let segment_count = self.log.segments().len();
+        for _ in 0..segment_count {
+            self.log.segments_mut().remove(0);
+            let mut storage = self.log.storages_mut().remove(0);
+            self.log.indexes_mut().remove(0);
+            self.log.messages_writers_mut().remove(0);
+            self.log.index_writers_mut().remove(0);
+
+            let (messages_path, index_path) = storage.segment_and_index_paths();
+            let _ = storage.shutdown();
+            drop(storage);
+
+            for path in messages_path.into_iter().chain(index_path) {
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            namespace_raw = namespace.inner(),
+                            path = %path,
+                            %error,
+                            "failed to unlink segment file during purge"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Recreate a fresh empty segment at offset 0 with real writers.
+        let start_offset = 0u64;
+        self.install_empty_segment(config, start_offset).await?;
+
+        // Reset the offset counters so new messages start at offset 0.
+        self.offset.store(start_offset, Ordering::Release);
+        self.dirty_offset.store(start_offset, Ordering::Relaxed);
+        self.should_increment_offset = false;
+
+        // Clear consumer + consumer-group offsets (memory + disk). Collect the
+        // file paths before deleting so the map guard is not held across an
+        // await.
+        let consumer_paths: Vec<String> = {
+            let guard = self.consumer_offsets.pin();
+            let paths = guard
+                .iter()
+                .filter_map(|(key, _)| {
+                    u32::try_from(*key)
+                        .ok()
+                        .and_then(|id| self.persisted_offset_path(ConsumerKind::Consumer, id))
+                })
+                .collect();
+            guard.clear();
+            paths
+        };
+        let group_paths: Vec<String> = {
+            let guard = self.consumer_group_offsets.pin();
+            let paths = guard
+                .iter()
+                .filter_map(|(key, _)| {
+                    u32::try_from(key.0)
+                        .ok()
+                        .and_then(|id| self.persisted_offset_path(ConsumerKind::ConsumerGroup, id))
+                })
+                .collect();
+            guard.clear();
+            paths
+        };
+        for path in consumer_paths.into_iter().chain(group_paths) {
+            let _ = delete_persisted_offset(&path).await;
+        }
+
+        // Clear the ephemeral cooperative-rebalance tracking too: after the
+        // reset to offset 0 a stale `last_polled` (a high pre-purge offset)
+        // would make the reconciler's completion check `committed >= last_polled`
+        // unsatisfiable, stalling a pending revocation until its timeout.
+        self.last_polled_offsets.pin().clear();
+
+        // Reset stats to a single empty segment.
+        self.stats.zero_out_all();
+        self.stats.increment_segments_count(1);
+
+        self.applied_purge_generation = generation;
+        Ok(())
+    }
+
+    /// `end_offset` of the `count`-th oldest sealed (non-active) segment, used
+    /// to resolve a client `DeleteSegments` count into a concrete truncation
+    /// offset on the owning shard. `None` when there are no deletable sealed
+    /// segments; clamps to the last sealed segment when fewer than `count`
+    /// exist.
+    #[must_use]
+    pub fn nth_oldest_sealed_end_offset(&self, count: u32) -> Option<u64> {
+        nth_oldest_sealed_end(self.log.segments(), count)
+    }
+
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
         // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
         // Both `SendMessages` (via `append_send_messages_to_journal`) and
@@ -2389,58 +2655,437 @@ fn accumulate_committed_info(
     info.max_timestamp = info.max_timestamp.max(base_timestamp);
 }
 
-/// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
-/// chunk, pushing matching fragments. Returns bytes consumed: the start
-/// of the first batch that did not fully fit in the chunk (the caller
-/// re-reads from there), or the chunk end when everything decoded.
-fn walk_disk_chunk(
-    chunk: &Frozen<4096>,
-    query: MessageLookup,
-    count: u32,
-    matched: &mut u32,
-    fragments: &mut PollFragments<4096>,
-    last_matching_offset: &mut Option<u64>,
-) -> usize {
-    let bytes: &[u8] = chunk;
-    let mut cursor = 0usize;
-
-    while *matched < count && cursor + COMMAND_HEADER_SIZE <= bytes.len() {
-        let Ok(batch) = decode_batch_slice(&bytes[cursor..]) else {
-            // Incomplete tail batch (or corrupt data): hand the position
-            // back so the caller can re-read or bail.
+/// Highest `end_offset` among the leading run of expired sealed segments, or
+/// `None` when none are expired. The last element is the active segment and is
+/// never considered. `expiry` must be resolved; a `ServerDefault` expires
+/// nothing (see [`Segment::is_expired`]).
+fn leading_expired_end(
+    segments: &[Segment],
+    now: IggyTimestamp,
+    expiry: IggyExpiry,
+) -> Option<u64> {
+    let last_idx = segments.len().saturating_sub(1);
+    let mut up_to = None;
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == last_idx || !segment.is_expired(now, expiry) {
             break;
-        };
-        let total_size = batch.header.total_size();
-
-        if let Some(selection) = select_batch_slice(&batch, query, *matched) {
-            let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
-            if full_body_selected {
-                fragments.push(Fragment::slice(chunk.clone(), cursor, cursor + total_size));
-            } else {
-                let mut rewritten = batch.header;
-                rewritten.batch_length =
-                    u64::try_from(COMMAND_HEADER_SIZE + (selection.end - selection.start))
-                        .expect("sliced batch length exceeds u64::MAX");
-                rewritten.message_count = selection.matched_messages;
-                rewritten.batch_checksum = rewritten.checksum_for_blob(
-                    batch
-                        .blob()
-                        .get(selection.start..selection.end)
-                        .expect("selected batch slice must stay within blob bounds"),
-                );
-                fragments.push(Fragment::whole(rewritten.into_frozen()));
-                fragments.push(Fragment::slice(
-                    chunk.clone(),
-                    cursor + COMMAND_HEADER_SIZE + selection.start,
-                    cursor + COMMAND_HEADER_SIZE + selection.end,
-                ));
-            }
-            *last_matching_offset = Some(selection.last_matching_offset);
-            *matched += selection.matched_messages;
         }
+        up_to = Some(segment.end_offset);
+    }
+    up_to
+}
 
-        cursor += total_size;
+/// Highest `end_offset` to drop so the resident size falls to `max_bytes`, or
+/// `None` when already under budget. The active segment (last element) is
+/// never dropped. The budget is per-partition: the cluster has no single owner
+/// of a topic-wide total, so each replica trims its own log.
+fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
+    let last_idx = segments.len().saturating_sub(1);
+    let mut resident: u64 = segments
+        .iter()
+        .map(|segment| segment.size.as_bytes_u64())
+        .sum();
+    let mut up_to = None;
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == last_idx || !segment.sealed || resident <= max_bytes {
+            break;
+        }
+        resident -= segment.size.as_bytes_u64();
+        up_to = Some(segment.end_offset);
+    }
+    up_to
+}
+
+/// `end_offset` of the `count`-th oldest sealed (non-active) segment of
+/// `segments`, or `None` when there is no deletable sealed segment. Clamps to
+/// the last sealed segment when fewer than `count` exist.
+fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    // Exclude the active (last) segment, take the leading sealed run, then the
+    // `count`-th of those (or the last available when fewer exist).
+    let last_idx = segments.len().saturating_sub(1);
+    segments
+        .iter()
+        .take(last_idx)
+        .take_while(|segment| segment.sealed)
+        .take(count as usize)
+        .map(|segment| segment.end_offset)
+        .last()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::poll_plan::DiskReadOutcome;
+    use bytes::Bytes;
+    use compio::io::AsyncWriteAtExt;
+    use consensus::LocalPipeline;
+    use server_common::send_messages2::{
+        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+    };
+
+    const TEST_CLUSTER: u128 = 1;
+
+    fn test_partition() -> IggyPartition<IggyMessageBus> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        )
     }
 
-    cursor.min(bytes.len())
+    /// `reclaim_dead_group_offsets` must drop exactly the not-`is_live` groups
+    /// from the in-memory map and hand back their owned persisted-file paths,
+    /// leaving live groups untouched. The returned `Vec<String>` is what the
+    /// reconciler unlinks off-borrow, so it carries no partition reference.
+    ///
+    /// TODO: a true cross-task interleave (pump reallocs the partitions vec
+    /// while the reconciler awaits the unlink) needs a two-future sim oracle
+    /// that does not exist yet; this covers the synchronous removal contract
+    /// the off-borrow split relies on.
+    #[compio::test]
+    async fn reclaim_dead_group_offsets_drops_dead_keeps_live() {
+        let mut partition = test_partition();
+        let group_offsets_path = "/iggy-test-cg-offsets".to_owned();
+        partition.consumer_group_offsets_path = Some(group_offsets_path.clone());
+
+        let dead: u32 = 1;
+        let live: u32 = 2;
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(dead as usize),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, dead, 7, String::new()),
+        );
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(live as usize),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, live, 9, String::new()),
+        );
+
+        let paths = partition.reclaim_dead_group_offsets(|group_id| group_id == u64::from(live));
+
+        assert_eq!(
+            paths,
+            vec![format!("{group_offsets_path}/{dead}")],
+            "only the dead group's persisted path is returned for unlink"
+        );
+        let mut remaining = partition.consumer_group_offset_ids();
+        remaining.sort_unstable();
+        assert_eq!(
+            remaining,
+            vec![u64::from(live)],
+            "dead group removed in-memory; live group retained"
+        );
+    }
+
+    /// One-message segment record in on-disk layout `[256B command header][blob]`
+    /// stamped at `base_offset`, with a valid batch checksum so it decodes
+    /// through `decode_batch_slice` and matches an `Offset` poll.
+    fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
+        let mut batch = IggyMessages2::with_capacity(1);
+        batch.push(IggyMessage2 {
+            header: IggyMessage2Header {
+                payload_length: 8,
+                ..Default::default()
+            },
+            payload: Bytes::from_static(b"abcdefgh"),
+            user_headers: None,
+        });
+        let mut owned = SendMessages2Owned::from_messages(namespace, &batch)
+            .expect("build send_messages batch");
+        owned.header.base_offset = base_offset;
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+
+        let mut record = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
+        owned.header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
+        record[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
+        record
+    }
+
+    /// Fail-closed disk read: an unreadable EARLIER segment must stop the walk
+    /// (return `Faulted`) rather than skip forward and serve a LATER segment's
+    /// messages, which would punch a silent gap into the poll. The second
+    /// segment holds a real, matchable batch at a higher offset; before the
+    /// fix, a missing first segment did `continue` and the walk served that
+    /// batch (offset 5 in response to an offset-0 poll) - the exact skip.
+    #[compio::test]
+    async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        // Unique temp dir; the first segment file is deliberately never created.
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-faulted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        // Second segment starts at offset 5 and holds a valid batch there.
+        let later_record = build_segment_record(namespace, 5);
+        let later_path = format!("{partition_dir}/{:0>20}.log", 5u64);
+        let later_len = later_record.len() as u64;
+        {
+            let mut file = compio::fs::File::create(&later_path)
+                .await
+                .expect("create later segment file");
+            let (written, _) = file.write_all_at(later_record, 0).await.into();
+            written.expect("write later segment record");
+            file.sync_all().await.expect("flush later segment file");
+        }
+
+        // First segment claims persisted bytes but its file is absent, so the
+        // open exhausts retries -> the walk must fault-close before segment two.
+        let plan = DiskReadPlan {
+            partition_dir: Some(partition_dir),
+            segments: vec![
+                DiskSegment {
+                    start_offset: 0,
+                    persisted: 512,
+                },
+                DiskSegment {
+                    start_offset: 5,
+                    persisted: later_len,
+                },
+            ],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, DiskReadOutcome::Faulted),
+            "unreadable first segment must fault-close, not skip forward to the later segment",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed disk read on a CORRUPT (present-but-undecodable) batch in an
+    /// EARLIER segment: like a missing/unreadable segment, the walk must stop
+    /// (`Faulted`) rather than skip past the garbage and serve a LATER
+    /// segment's valid batch at a higher offset, which would punch a silent gap
+    /// into the poll. The first segment's file exists and claims persisted bytes
+    /// but holds non-decodable data; the second segment holds a real batch at
+    /// offset 5.
+    #[compio::test]
+    async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-read-disk-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp partition dir");
+        let partition_dir = dir.to_string_lossy().into_owned();
+
+        // First segment (start_offset 0): garbage bytes that never decode into a
+        // complete batch.
+        let corrupt_record = vec![0xABu8; 512];
+        let corrupt_len = corrupt_record.len() as u64;
+        let corrupt_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+        {
+            let mut file = compio::fs::File::create(&corrupt_path)
+                .await
+                .expect("create corrupt segment file");
+            let (written, _) = file.write_all_at(corrupt_record, 0).await.into();
+            written.expect("write corrupt segment record");
+            file.sync_all().await.expect("flush corrupt segment file");
+        }
+
+        // Second segment (start_offset 5): a valid, matchable batch.
+        let later_record = build_segment_record(namespace, 5);
+        let later_path = format!("{partition_dir}/{:0>20}.log", 5u64);
+        let later_len = later_record.len() as u64;
+        {
+            let mut file = compio::fs::File::create(&later_path)
+                .await
+                .expect("create later segment file");
+            let (written, _) = file.write_all_at(later_record, 0).await.into();
+            written.expect("write later segment record");
+            file.sync_all().await.expect("flush later segment file");
+        }
+
+        let plan = DiskReadPlan {
+            partition_dir: Some(partition_dir),
+            segments: vec![
+                DiskSegment {
+                    start_offset: 0,
+                    persisted: corrupt_len,
+                },
+                DiskSegment {
+                    start_offset: 5,
+                    persisted: later_len,
+                },
+            ],
+            start_position: 0,
+            namespace_raw: namespace.inner(),
+        };
+
+        let outcome = plan
+            .read_disk(MessageLookup::Offset {
+                offset: 0,
+                count: 10,
+                ceiling: u64::MAX,
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, DiskReadOutcome::Faulted),
+            "corrupt earlier segment must fault-close, not skip forward to the later segment",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use iggy_common::IggyDuration;
+    use std::time::Duration;
+
+    fn segment(end_offset: u64, max_timestamp: u64, size: u64, sealed: bool) -> Segment {
+        let mut segment = Segment::new(0, IggyByteSize::from(0u64));
+        segment.end_offset = end_offset;
+        segment.max_timestamp = max_timestamp;
+        segment.size = IggyByteSize::from(size);
+        segment.sealed = sealed;
+        segment
+    }
+
+    fn one_second() -> IggyExpiry {
+        IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)))
+    }
+
+    #[test]
+    fn leading_expired_end_skips_active_and_returns_last_expired() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false), // active: never considered
+        ];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), one_second()),
+            Some(29)
+        );
+    }
+
+    #[test]
+    fn leading_expired_end_stops_at_first_unexpired() {
+        let now = IggyTimestamp::now();
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_hours(1)));
+        let segments = vec![
+            segment(9, 1, 100, true),                // expired
+            segment(19, now.as_micros(), 100, true), // recent: not expired, stops run
+            segment(29, 1, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(leading_expired_end(&segments, now, expiry), Some(9));
+    }
+
+    #[test]
+    fn leading_expired_end_none_for_never_expire() {
+        let segments = vec![segment(9, 1, 100, true), segment(19, 0, 100, false)];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), IggyExpiry::NeverExpire),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_expired_end_none_for_lone_active_segment() {
+        let segments = vec![segment(9, 1, 100, false)];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), one_second()),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_oversized_end_trims_oldest_until_under_budget() {
+        // 4 x 100 = 400 resident, active excluded. Budget 250: drop seg0 (300
+        // left) then seg1 (200 <= 250, stop). up_to = seg1.end_offset.
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(leading_oversized_end(&segments, 250), Some(19));
+    }
+
+    #[test]
+    fn leading_oversized_end_none_when_under_budget() {
+        let segments = vec![segment(9, 1, 100, true), segment(19, 0, 100, false)];
+        assert_eq!(leading_oversized_end(&segments, 10_000), None);
+    }
+
+    #[test]
+    fn leading_oversized_end_never_drops_active_segment() {
+        let segments = vec![segment(9, 1, 1_000, false)];
+        assert_eq!(leading_oversized_end(&segments, 10), None);
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_resolves_count_to_offset() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false), // active: excluded
+        ];
+        assert_eq!(nth_oldest_sealed_end(&segments, 1), Some(9));
+        assert_eq!(nth_oldest_sealed_end(&segments, 2), Some(19));
+        // More than available sealed: clamps to the last sealed segment.
+        assert_eq!(nth_oldest_sealed_end(&segments, 10), Some(29));
+        assert_eq!(nth_oldest_sealed_end(&segments, 0), None);
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_stops_at_first_unsealed() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, false), // unsealed mid-run stops the count
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(nth_oldest_sealed_end(&segments, 5), Some(9));
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_none_for_lone_active_segment() {
+        let segments = vec![segment(9, 1, 100, false)];
+        assert_eq!(nth_oldest_sealed_end(&segments, 1), None);
+    }
 }

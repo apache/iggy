@@ -28,8 +28,7 @@
 # fully endorsed by the ASF.
 
 ARG RUST_VERSION=1.96
-
-FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build
 RUN apt-get update && apt-get install -y \
@@ -46,7 +45,7 @@ RUN npm --prefix web ci && npm --prefix web run build:static
 RUN cargo build --bin iggy --release
 RUN cargo build --bin iggy-server --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     liblzma5 \

@@ -29,7 +29,6 @@
 
 ARG RUST_VERSION=1.96
 ARG ALPINE_VERSION=3.23
-
 # ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef
 WORKDIR /app

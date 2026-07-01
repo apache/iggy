@@ -47,14 +47,12 @@ pub mod invalid_consumer_offset_scenario;
 // file), so volume-based rotation rules cannot trigger.
 #[cfg(not(feature = "vsr"))]
 pub mod log_rotation_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod permissions_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 #[cfg(not(feature = "vsr"))]
@@ -69,6 +67,8 @@ pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod stream_size_validation_scenario;
+#[cfg(feature = "vsr")]
+pub mod stress_produce_consume_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod system_scenario;
 #[cfg(not(feature = "vsr"))]
