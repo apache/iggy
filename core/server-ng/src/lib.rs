@@ -22,6 +22,7 @@ pub mod bootstrap;
 pub mod config_writer;
 pub mod consumer_group;
 pub mod dispatch;
+pub(crate) mod http;
 pub mod login_register;
 pub mod partition_helpers;
 pub mod partition_reconciler;

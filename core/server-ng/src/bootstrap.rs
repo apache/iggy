@@ -21,6 +21,7 @@ use crate::dispatch::{
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
     make_partition_read_handler,
 };
+use crate::http;
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
@@ -1919,7 +1920,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(
+        start_via_replica_io(
             shard,
             config,
             topology,
@@ -1927,18 +1928,28 @@ async fn start_tcp_runtime(
             dialed_replica,
             accepted_clients,
         )
-        .await;
+        .await?;
+    } else {
+        start_manual_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await?;
     }
 
-    start_manual_runtime(
-        shard,
-        config,
-        topology,
-        accepted_replica,
-        dialed_replica,
-        accepted_clients,
-    )
-    .await
+    // HTTP is served over TCP but sits outside the replica_io / manual client
+    // reactor, so it binds independently. Shard-0 gating comes from the sole
+    // caller of this function.
+    if config.http.enabled {
+        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+        http::start(shard, http_addr, &config.http.jwt).await?;
+    }
+
+    Ok(())
 }
 
 async fn start_via_replica_io(

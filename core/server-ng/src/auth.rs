@@ -74,6 +74,17 @@ pub(crate) fn verify_pat_credentials(
     shard: &Rc<ServerNgShard>,
     token: &str,
 ) -> Result<u32, LoginRegisterError> {
+    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
+}
+
+/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (unix
+/// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
+/// per-token VSR session table on this expiry for lazy eviction; the wire and
+/// login paths only need the user id and go through [`verify_pat_credentials`].
+pub(crate) fn verify_pat_credentials_with_expiry(
+    shard: &Rc<ServerNgShard>,
+    token: &str,
+) -> Result<(u32, u64), LoginRegisterError> {
     let token_hash = PersonalAccessToken::hash_token(token);
     let now = IggyTimestamp::now();
     shard.plane.metadata().mux_stm.users().read(|users| {
@@ -98,7 +109,12 @@ pub(crate) fn verify_pat_credentials(
         if user.status != UserStatus::Active {
             return Err(LoginRegisterError::UserInactive);
         }
-        Ok(user.id)
+        // `expiry_at == None` is a never-expiring PAT; map it to `u64::MAX` so
+        // the HTTP session table never expiry-evicts its entry.
+        let expiry = pat
+            .expiry_at
+            .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
+        Ok((user.id, expiry))
     })
 }
 
