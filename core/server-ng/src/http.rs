@@ -41,21 +41,24 @@ use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::topics::{
-    DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
     GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
 };
 use iggy_common::create_stream::CreateStream;
+use iggy_common::create_topic::CreateTopic;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{
-    Identifier, IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo, Validatable,
+    Identifier, IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo, TopicDetails,
+    Validatable,
 };
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
@@ -356,6 +359,7 @@ fn router(state: HttpState) -> Router {
             put(update_stream).delete(delete_stream),
         )
         .route("/streams/{stream_id}/purge", delete(purge_stream))
+        .route("/streams/{stream_id}/topics", post(create_topic))
         .route(
             "/streams/{stream_id}/topics/{topic_id}",
             put(update_topic).delete(delete_topic),
@@ -498,6 +502,43 @@ async fn purge_stream(
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /streams/{stream_id}/topics`: create a topic under a stream and render
+/// the committed reply as the same `TopicDetails` JSON the legacy server returns.
+///
+/// The stream comes from the path; the JSON body carries the remaining fields.
+/// The submitted op is a plain `CreateTopic`; the metadata owner allocates the
+/// consensus group ids and rewrites it to `CreateTopicWithAssignments` before
+/// replication, so this handler stays a pure submit-and-decode.
+async fn create_topic(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(stream_id): Path<String>,
+    Json(command): Json<CreateTopic>,
+) -> Result<Json<TopicDetails>, WriteError> {
+    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
+    // Rejects empty/oversized name, partitions_count > MAX, replication_factor == Some(0).
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = CreateTopicRequest {
+        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
+        partitions_count: command.partitions_count,
+        compression_algorithm: command.compression_algorithm.as_code(),
+        message_expiry: command.message_expiry.into(),
+        max_topic_size: command.max_topic_size.into(),
+        replication_factor: command.replication_factor.unwrap_or(0),
+        name: WireName::new(command.name)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidTopicName))?,
+    };
+    let body = request.to_bytes();
+    let payload = SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::CreateTopic,
+        &body,
+    ))
+    .await?;
+    Ok(Json(decode_topic_details(&payload)?))
 }
 
 /// `PUT /streams/{stream_id}/topics/{topic_id}`: update a topic. Returns 204.
@@ -674,6 +715,15 @@ fn decode_stream_details(payload: &[u8]) -> Result<StreamDetails, WriteError> {
     let response = GetStreamResponse::decode_from(payload)
         .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
     StreamDetails::try_from(response).map_err(WriteError::Rejected)
+}
+
+/// Decode the `GetTopicResponse` payload of a committed create-topic reply into
+/// `TopicDetails`. `payload` is the slice past the result section that
+/// [`submit_write`] already validated as a success.
+fn decode_topic_details(payload: &[u8]) -> Result<TopicDetails, WriteError> {
+    let response = GetTopicResponse::decode_from(payload)
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    TopicDetails::try_from(response).map_err(WriteError::Rejected)
 }
 
 /// Map an eviction frame to the same typed [`IggyError`] the SDK's
