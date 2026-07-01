@@ -31,7 +31,7 @@ use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
-use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
+use partitions::{Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -309,18 +309,23 @@ impl Simulator {
         replica_idx: usize,
         namespace: IggyNamespace,
         consumer: PollingConsumer,
-        args: PollingArgs,
-    ) -> Result<PollQueryResult<4096>, IggyError> {
+        args: &PollingArgs,
+    ) -> Result<PollFragments<4096>, IggyError> {
         let replica = &self.replicas[replica_idx];
-        let partition =
-            replica
-                .plane
-                .partitions()
-                .get_by_ns(&namespace)
-                .ok_or(IggyError::ResourceNotFound(format!(
-                    "partition not found for namespace {namespace:?} on replica {replica_idx}"
-                )))?;
-        futures::executor::block_on(partition.poll_messages(consumer, args))
+        // Build the owned poll plan synchronously, then execute off the borrow.
+        // The sim's partitions are in-memory (no `partition_dir`), so the plan
+        // serves only the resident journal tier; `execute` performs no disk IO.
+        let Some(plan) = replica
+            .plane
+            .partitions()
+            .build_poll_snapshot(&namespace, consumer, args)
+        else {
+            return Err(IggyError::ResourceNotFound(format!(
+                "partition not found for namespace {namespace:?} on replica {replica_idx}"
+            )));
+        };
+        let (fragments, _commit_offset) = futures::executor::block_on(plan.execute());
+        Ok(fragments)
     }
 
     /// Partition offsets from a replica.

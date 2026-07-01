@@ -28,7 +28,7 @@
 # fully endorsed by the ASF.
 
 ARG RUST_VERSION=1.96
-FROM rust:${RUST_VERSION}
+FROM rust:${RUST_VERSION}-slim-trixie
 
 WORKDIR /app
 

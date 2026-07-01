@@ -48,4 +48,5 @@ mod backend {
 pub(crate) use backend::ensure_keyring_store;
 
 #[cfg(not(all(feature = "login-session", secret_service_keyring)))]
+#[allow(dead_code)]
 pub(crate) fn ensure_keyring_store() {}

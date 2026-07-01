@@ -118,8 +118,8 @@ fn main() {
     // 4. Poll messages and check offsets on the leader
     let consumer = PollingConsumer::Consumer(1, 0);
     let args = PollingArgs::new(PollingStrategy::first(), 10, false);
-    match sim.poll_messages(leader as usize, test_namespace, consumer, args) {
-        Ok((fragments, _last_matching_offset)) => {
+    match sim.poll_messages(leader as usize, test_namespace, consumer, &args) {
+        Ok(fragments) => {
             println!(
                 "[sim] Poll returned {} fragments (expected 4)",
                 fragments.len()

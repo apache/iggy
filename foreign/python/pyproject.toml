@@ -112,14 +112,14 @@ testing-docker = ["testcontainers>=3.7.0,<5.0"]
 # Development tools
 dev = [
     "maturin>=1.2,<2.0",
-    "pyrefly>=1.0.0",
+    "pyrefly>=1.1.1",
     "ruff>=0.1.0,<1.0",
 ]
 
 # All dependencies for full development setup
 all = [
     "maturin>=1.2,<2.0",
-    "pyrefly>=1.0.0",
+    "pyrefly>=1.1.1",
     "pytest>=9.0.3,<10.0",
     "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<8.0",

@@ -55,6 +55,13 @@ pub enum Operation {
     /// consensus by the partition reconciler; no client wire code.
     CompleteConsumerGroupRevocation = 67,
 
+    /// Server-originated: set a partition's delete watermark (the offset below
+    /// which sealed segments are removed). The dispatch handler resolves a
+    /// client `DeleteSegments` count to a concrete offset on the owning shard
+    /// and submits this through metadata consensus, so every replica applies
+    /// the same offset deterministically. No client wire code.
+    TruncatePartition = 68,
+
     // Metadata operations (shard 0)
     CreateStream = 128,
     UpdateStream = 129,
@@ -66,9 +73,10 @@ pub enum Operation {
     PurgeTopic = 135,
     CreatePartitions = 136,
     DeletePartitions = 137,
-    // TODO: DeleteSegments is a partition operation (is_partition() == true) but its
-    // discriminant sits in the metadata range (128-147). Should be moved to 163 once
-    // iggy_common's Operation enum is removed and wire compat is no longer a concern.
+    // Client op handled specially: the dispatch layer resolves the requested
+    // segment count to an offset on the owning shard and replicates a
+    // `TruncatePartition` through metadata, so `DeleteSegments` itself is
+    // neither a metadata nor a partition consensus op (see `is_partition`).
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
@@ -86,7 +94,6 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    // 163 is reserved for the planned DeleteSegments move (see TODO above).
     StoreConsumerOffset2 = 164,
     DeleteConsumerOffset2 = 165,
 }
@@ -152,7 +159,7 @@ impl Operation {
     #[must_use]
     #[inline]
     pub const fn is_partition(&self) -> bool {
-        matches!(self, Self::DeleteSegments) || (*self as u8) >= Self::PARTITION_START
+        (*self as u8) >= Self::PARTITION_START
     }
 
     /// Operations clients are allowed to send directly.
@@ -175,7 +182,8 @@ impl Operation {
             | Self::CreateTopicWithAssignments
             | Self::CreatePartitionsWithAssignments
             | Self::RemoveConsumerGroupMember
-            | Self::CompleteConsumerGroupRevocation => None,
+            | Self::CompleteConsumerGroupRevocation
+            | Self::TruncatePartition => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -315,7 +323,11 @@ mod tests {
         assert!(Operation::CreateStream.is_client_allowed());
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
-        assert!(Operation::DeleteSegments.is_partition());
+        assert!(!Operation::DeleteSegments.is_partition());
+        assert!(!Operation::DeleteSegments.is_metadata());
+        assert!(Operation::TruncatePartition.is_internal());
+        assert!(Operation::TruncatePartition.is_metadata());
+        assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::DeleteConsumerOffset.is_partition());
         assert!(Operation::StoreConsumerOffset2.is_partition());
         assert!(Operation::DeleteConsumerOffset2.is_partition());
