@@ -18,16 +18,15 @@
 use aligned_vec::{AVec, ConstAlign};
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
-use once_cell::sync::OnceCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::{info, trace, warn};
 
 pub const ALIGNMENT: usize = 4096;
 pub type AlignedBuffer = AVec<u8, ConstAlign<4096>>;
 
 /// Global memory pool instance. Use `memory_pool()` to access it.
-pub static MEMORY_POOL: OnceCell<MemoryPool> = OnceCell::new();
+pub static MEMORY_POOL: OnceLock<MemoryPool> = OnceLock::new();
 
 /// Total number of distinct bucket sizes.
 const NUM_BUCKETS: usize = 28;

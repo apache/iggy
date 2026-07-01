@@ -42,6 +42,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
@@ -66,7 +67,10 @@ members = [
     "gateways/kafka/tools/kafka-tool",
 ]
 exclude = ["foreign/cpp", "foreign/php", "foreign/python"]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+rust-version = "1.95"
 
 [workspace.dependencies]
 actix-cors = "0.7.1"
@@ -213,7 +217,6 @@ nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.53.1"
-once_cell = "1.21.4"
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [

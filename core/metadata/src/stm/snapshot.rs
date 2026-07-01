@@ -18,7 +18,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
-use crate::stm::consumer_group::ConsumerGroupsSnapshot;
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
@@ -115,10 +114,9 @@ pub struct MetadataSnapshot {
     pub sequence_number: u64,
     /// Users state machine snapshot data.
     pub users: Option<UsersSnapshot>,
-    /// Streams state machine snapshot data.
+    /// Streams state machine snapshot data (consumer groups are nested inside
+    /// each topic).
     pub streams: Option<StreamsSnapshot>,
-    /// Consumer groups state machine snapshot data.
-    pub consumer_groups: Option<ConsumerGroupsSnapshot>,
 }
 
 impl Default for MetadataSnapshot {
@@ -137,7 +135,6 @@ impl MetadataSnapshot {
             sequence_number,
             users: None,
             streams: None,
-            consumer_groups: None,
         }
     }
 
@@ -309,7 +306,6 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
-        assert!(decoded.consumer_groups.is_none());
     }
 
     #[test]
@@ -350,8 +346,11 @@ mod tests {
                                 consensus_group_id: 33,
                                 created_at: ts,
                                 created_revision: 0,
+                                deleted_up_to_offset: 0,
+                                purge_generation: 0,
                             }],
-                            round_robin_counter: 0,
+                            consumer_groups: Vec::new(),
+                            next_consumer_group_id: 1,
                         },
                     )],
                 },
@@ -363,7 +362,6 @@ mod tests {
 
         assert_eq!(decoded.sequence_number, 100);
         assert!(decoded.users.is_none());
-        assert!(decoded.consumer_groups.is_none());
 
         let streams = decoded.streams.as_ref().unwrap();
         assert_eq!(streams.items.len(), 1);

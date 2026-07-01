@@ -60,7 +60,6 @@ use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
@@ -98,13 +97,13 @@ use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
 
-type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
 /// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
 /// state. Shard 0 mints one after `recover()` and broadcasts a clone to
 /// every peer shard; each peer rebuilds a reader-mode
 /// [`ServerNgMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerNgMetadataBundle = <variadic!(Users, Streams, ConsumerGroups) as WithFactory>::Bundle;
+type ServerNgMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 
 pub(crate) type ServerNgMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,
@@ -326,9 +325,10 @@ impl Drop for ShutdownOnDrop {
 /// `ReadHandleFactory`s) and pushes one clone per peer onto `bundle_tx`.
 /// Every other shard receives the bundle and rebuilds a reader-mode
 /// `MuxStateMachine` on its own runtime - no WAL access, no replay, no
-/// `RecoverySync` two-phase fence. Phase 2 of the old handshake was
-/// only there to keep peer scans away from shard 0's torn-tail repair;
-/// with no peer scan that race is structurally gone.
+/// `RecoverySync` two-phase fence. The old phase-2 WAL fence is gone
+/// because peers no longer scan the WAL. They do still scan live shared
+/// metadata to load their on-disk partitions, so a separate listener
+/// fence is still required - see [`BootstrapBarrier`].
 ///
 /// The channel is bounded to the peer count so shard 0's `send` never
 /// blocks beyond a peer drain. A peer that dies before recv drops its
@@ -341,6 +341,33 @@ enum MetadataHandoff {
     },
     Waiter {
         bundle_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<ServerNgMetadataBundle>>,
+    },
+}
+
+/// Reverse handshake to [`MetadataHandoff`]: gates shard 0's client
+/// listeners until every peer has loaded its on-disk partitions.
+///
+/// Peers build their owned-partition set from live shared metadata and
+/// load each segment from disk in `build_shard_for_thread`. If shard 0
+/// opened listeners the instant `broadcast_metadata_bundle` returned
+/// (peers have only *received* the bundle, not *loaded* partitions), a
+/// client could create a partition before a peer's load scan finished.
+/// That freshly committed partition would surface in the peer's scan
+/// with no segment dir on disk yet, and `load_partition`'s `walk_dir`
+/// would fail with `CannotReadPartitions`, aborting the whole node. A
+/// partition created after boot must take the runtime reconciler path
+/// (which creates its dir), never the bootstrap load path.
+///
+/// Shard 0 (`Owner`) drains one signal per peer before binding
+/// listeners; each peer (`Waiter`) sends one once its load completes.
+/// The cross-thread shutdown flag drives both sides out of their poll
+/// loop if any shard dies mid-boot.
+enum BootstrapBarrier {
+    Owner {
+        ready_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    },
+    Waiter {
+        ready_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
     },
 }
 
@@ -528,6 +555,12 @@ pub fn bootstrap(
     let (metadata_bundle_tx, metadata_bundle_rx) =
         crossfire::mpmc::bounded_async::<ServerNgMetadataBundle>(metadata_peers);
 
+    // Reverse barrier (see `BootstrapBarrier`): every peer sends one
+    // signal once it finishes loading its on-disk partitions; shard 0
+    // drains them all before binding listeners. Bounded to the peer
+    // count so a sender never blocks (each peer sends exactly once).
+    let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(metadata_peers);
+
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)> =
         Vec::with_capacity(shards_count);
     for (idx, assignment) in assignments.into_iter().enumerate() {
@@ -549,6 +582,15 @@ pub fn bootstrap(
                 bundle_rx: metadata_bundle_rx.clone(),
             }
         };
+        let barrier_for_shard = if shard_id == 0 {
+            BootstrapBarrier::Owner {
+                ready_rx: ready_rx.clone(),
+            }
+        } else {
+            BootstrapBarrier::Waiter {
+                ready_tx: ready_tx.clone(),
+            }
+        };
 
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -563,6 +605,7 @@ pub fn bootstrap(
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
+                    barrier_for_shard,
                     owner_table_for_shard,
                 )
             }) {
@@ -578,6 +621,8 @@ pub fn bootstrap(
                 // would hang until the shutdown watchdog kicks the bus.
                 drop(metadata_bundle_tx);
                 drop(metadata_bundle_rx);
+                drop(ready_tx);
+                drop(ready_rx);
                 join_partial_shard_survivors(shard_threads);
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
@@ -591,6 +636,8 @@ pub fn bootstrap(
     // disconnects.
     drop(metadata_bundle_tx);
     drop(metadata_bundle_rx);
+    drop(ready_tx);
+    drop(ready_rx);
 
     info!(
         shards_count,
@@ -616,6 +663,7 @@ fn run_shard_thread(
     config: Arc<ServerNgConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
 ) -> Result<(), ServerNgError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -651,6 +699,7 @@ fn run_shard_thread(
             &config,
             shutdown_flag,
             metadata_handoff,
+            barrier,
             owner_table,
         ))
         .await
@@ -676,6 +725,7 @@ async fn shard_main(
     config: &ServerNgConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
 ) -> Result<(), ServerNgError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -845,6 +895,9 @@ async fn shard_main(
         drop(metrics_for_notifier);
     }
 
+    // The pump task also drives the consensus timer tick (heartbeats, prepare
+    // retransmit, view-change timeouts) as a select! arm, serialized with frame
+    // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
     let pump_handle = compio::runtime::spawn(async move {
@@ -879,27 +932,23 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Consensus timer driver: heartbeats, prepare retransmit, and
-    // view-change timeouts only advance when `VsrConsensus::tick` runs
-    // ("call this periodically, e.g. every 10ms"). The simulator steps it
-    // explicitly; production drives it here. Without this, a prepare lost
-    // to a transient replica-link blip is never retransmitted and its
-    // client request hangs until the SDK read timeout.
-    let (consensus_tick_stop_tx, consensus_tick_stop_rx) = channel::<()>(1);
-    let tick_shard = Rc::clone(&shard);
-    let consensus_tick_handle = compio::runtime::spawn(async move {
-        const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        loop {
-            if consensus_tick_stop_rx.try_recv().is_ok() {
-                break;
-            }
-            tick_shard.tick_metadata().await;
-            tick_shard.tick_partitions().await;
-            compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
-        }
-    });
-    bus.track_background(consensus_tick_handle);
-
+    // Per-shard heartbeat verifier: evicts connections that stop pinging,
+    // releasing their consumer-group membership. Gated on config so a
+    // deployment without heartbeats never reaps live sessions.
+    let heartbeat_stop_tx = if config.heartbeat.enabled {
+        let (hb_stop_tx, hb_stop_rx) = channel::<()>(1);
+        let hb_shard = Rc::clone(&shard);
+        let hb_sessions = Rc::clone(&sessions);
+        let hb_interval = config.heartbeat.interval.get_duration();
+        let hb_handle = compio::runtime::spawn(async move {
+            crate::dispatch::run_heartbeat_verifier(hb_shard, hb_sessions, hb_interval, hb_stop_rx)
+                .await;
+        });
+        bus.track_background(hb_handle);
+        Some(hb_stop_tx)
+    } else {
+        None
+    };
     // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
     // group) and only when enabled. Each pass no-ops unless this node is
     // the caught-up metadata primary, so the delete is proposed once and
@@ -922,17 +971,58 @@ async fn shard_main(
         None
     };
 
+    // Segment cleaner: runs on every shard (each replica trims its own log,
+    // primary and backup alike). Local and unreplicated; gated by the shared
+    // data-maintenance config.
+    let segment_cleaner_stop = if config.data_maintenance.messages.cleaner_enabled {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.data_maintenance.messages.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::segment_cleaner::run_segment_cleaner(cleaner_shard, stop_rx, interval).await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(stop_tx)
+    } else {
+        None
+    };
+
+    // Listener fence (see `BootstrapBarrier`). Peers still scan live
+    // shared metadata and load their on-disk partitions in
+    // `build_shard_for_thread`; the factory-bundle handoff only proves
+    // they *received* the bundle, not that they finished loading. Shard
+    // 0 must not accept client traffic until every peer's load scan is
+    // done, otherwise a partition created by the first client surfaces
+    // in a still-running scan with no segment dir on disk and aborts the
+    // node with `CannotReadPartitions`. By this point every shard has
+    // also spawned its pump + reconciler, so a partition created after
+    // the fence takes the runtime reconciler path on its owning shard.
+    match barrier {
+        BootstrapBarrier::Owner { ready_rx } => {
+            await_bootstrap_complete(
+                &ready_rx,
+                usize::from(total_shards.saturating_sub(1)),
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+        BootstrapBarrier::Waiter { ready_tx } => {
+            signal_bootstrap_complete(
+                shard_id,
+                &ready_tx,
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+    }
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
     // locally on shard 0 (their per-connection state is non-portable -
     // see `LifecycleFrame::ClientWsConnectionSetup` rustdoc).
-    //
-    // No phase-2 listener fence is needed: peer shards no longer scan
-    // the WAL, so a shard-0 append accepted mid-boot cannot race a
-    // peer's `truncate_or_fail`. The factory-bundle handoff has already
-    // installed reader-mode `MuxStateMachine`s on every peer by the
-    // time shard 0 returns from `broadcast_metadata_bundle`.
     if shard_id == 0 {
         let coord = shard
             .coordinator()
@@ -954,9 +1044,14 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
-            let _ = consensus_tick_stop_tx.try_send(());
+            if let Some(tx) = &heartbeat_stop_tx {
+                let _ = tx.try_send(());
+            }
             if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
                 let _ = cleaner_stop_tx.try_send(());
+            }
+            if let Some(tx) = &segment_cleaner_stop {
+                let _ = tx.try_send(());
             }
             return Err(error);
         }
@@ -965,9 +1060,14 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
-    let _ = consensus_tick_stop_tx.try_send(());
+    if let Some(tx) = &heartbeat_stop_tx {
+        let _ = tx.try_send(());
+    }
     if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
         let _ = cleaner_stop_tx.try_send(());
+    }
+    if let Some(tx) = &segment_cleaner_stop {
+        let _ = tx.try_send(());
     }
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
@@ -1051,6 +1151,70 @@ async fn broadcast_metadata_bundle(
                     pending = returned;
                     compio::time::sleep(poll_interval).await;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Peer side of [`BootstrapBarrier`]: tell shard 0 this shard finished
+/// loading its on-disk partitions. Mirrors [`broadcast_metadata_bundle`]'s
+/// `try_send`-or-shutdown poll loop so a sibling failure (which flips the
+/// shutdown flag) drives this out instead of stranding it on a full
+/// channel. The channel is sized to the peer count and each peer sends
+/// exactly once, so `Full` is not expected; the branch only keeps the
+/// loop interruptible.
+async fn signal_bootstrap_complete(
+    shard_id: u16,
+    ready_tx: &crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut pending = shard_id;
+    loop {
+        match ready_tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(crossfire::TrySendError::Disconnected(_)) => {
+                // Shard 0 dropped its `ready_rx` before draining (it
+                // aborted before binding listeners). Propagate so this
+                // shard short-circuits; the shutdown flag flips via the
+                // normal teardown path.
+                return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+            }
+            Err(crossfire::TrySendError::Full(returned)) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+                }
+                pending = returned;
+                compio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+/// Owner side of [`BootstrapBarrier`]: drain one ready signal per peer
+/// before shard 0 binds listeners. Polls the shutdown flag so a peer that
+/// dies mid-load (flipping the flag) aborts the wait instead of hanging on
+/// a signal that will never arrive. A single shard (`peers == 0`) returns
+/// immediately.
+async fn await_bootstrap_complete(
+    ready_rx: &crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    peers: usize,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut remaining = peers;
+    while remaining > 0 {
+        match ready_rx.try_recv() {
+            Ok(_shard_id) => remaining -= 1,
+            Err(crossfire::TryRecvError::Disconnected) => {
+                return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+            }
+            Err(crossfire::TryRecvError::Empty) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+                }
+                compio::time::sleep(poll_interval).await;
             }
         }
     }
@@ -2611,6 +2775,84 @@ mod tests {
         assert!(
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 1 }),
             "expected MetadataHandoffAborted on shutdown, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_returns_immediately_for_single_shard() {
+        // A single-shard server has no peers to wait on; the owner barrier
+        // must not block when `peers == 0`.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        await_bootstrap_complete(&ready_rx, 0, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("single-shard server must not block on the barrier");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_drains_every_peer_signal() {
+        // Two peers report load-complete; shard 0 drains both, then proceeds
+        // to bind listeners.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(2);
+        let flag = Arc::new(AtomicBool::new(false));
+        signal_bootstrap_complete(1, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 1 must signal load-complete");
+        signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 2 must signal load-complete");
+        await_bootstrap_complete(&ready_rx, 2, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("owner must drain both peer signals");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_aborts_on_shutdown_flag() {
+        use compio::runtime::ResumeUnwind;
+
+        // `_ready_tx` is held so the channel is not disconnected: the owner
+        // must exit via the shutdown flag, not a dropped sender.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let owner = compio::runtime::spawn({
+            let flag = Arc::clone(&flag);
+            async move { await_bootstrap_complete(&ready_rx, 1, &flag, TEST_POLL_INTERVAL).await }
+        });
+
+        // The peer never signals, but a sibling failure flips the flag; the
+        // owner must abort instead of hanging before listeners.
+        compio::time::sleep(TEST_POLL_INTERVAL / 2).await;
+        flag.store(true, Ordering::Relaxed);
+
+        let err = owner
+            .await
+            .resume_unwind()
+            .expect("owner task was cancelled")
+            .expect_err("shutdown flag must abort the barrier wait");
+        assert!(
+            matches!(
+                err,
+                ServerNgError::ShardBootstrapBarrierAborted { remaining: 1 }
+            ),
+            "expected ShardBootstrapBarrierAborted, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn signal_bootstrap_complete_aborts_when_owner_drops_rx() {
+        // Shard 0 aborted before draining and dropped its receiver; a peer's
+        // signal must surface the disconnect instead of stranding.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(ready_rx);
+
+        let err = signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect_err("dropped rx must surface as an abort");
+        assert!(
+            matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 2 }),
+            "expected MetadataHandoffAborted, got {err:?}"
         );
     }
 }

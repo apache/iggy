@@ -18,7 +18,8 @@
 use crate::ffi;
 use iggy::prelude::ConsumerGroupDetails as RustConsumerGroupDetails;
 use iggy_common::{
-    ConsumerGroupInfo as RustConsumerGroupInfo, ConsumerGroupMember as RustConsumerGroupMember,
+    ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
+    ConsumerGroupMember as RustConsumerGroupMember,
 };
 
 impl From<RustConsumerGroupInfo> for ffi::ConsumerGroupInfo {
@@ -37,6 +38,17 @@ impl From<RustConsumerGroupMember> for ffi::ConsumerGroupMember {
             id: member.id,
             partitions_count: member.partitions_count,
             partitions: member.partitions,
+        }
+    }
+}
+
+impl From<RustConsumerGroup> for ffi::ConsumerGroup {
+    fn from(group: RustConsumerGroup) -> Self {
+        ffi::ConsumerGroup {
+            id: group.id,
+            name: group.name,
+            partitions_count: group.partitions_count,
+            members_count: group.members_count,
         }
     }
 }

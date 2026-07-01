@@ -30,7 +30,7 @@ readme = "../../README.md"
 publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+ignored = ["dashmap"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -41,7 +41,6 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 deltalake = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "vsr")]
+pub mod consumer_group_client_state;
 mod error;
 pub mod http;
 mod macros;
@@ -28,6 +30,17 @@ pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(feature = "vsr")]
+pub use consumer_group_client_state::ConsumerGroupClientState;
+
+/// Sentinel `partition_id` in an otherwise-empty poll reply that tells the
+/// client its cached consumer-group assignment is stale (a generation fence
+/// rejected the partition it polled) and it must re-sync before retrying. The
+/// VSR reply header carries no status field yet, so this rides the empty-poll
+/// body -- an application payload, not a wire-format header. Never a real
+/// partition id (those are small, dense, zero-based), so it can't collide with
+/// a genuine end-of-partition empty poll, which echoes the real partition id.
+pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;

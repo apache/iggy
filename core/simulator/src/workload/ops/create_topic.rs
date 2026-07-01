@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CreateTopic` op. Parent stream from shadow, fresh topic name.
+//! `CreateTopic` op. Targets `Ok` (fresh topic under a live stream),
+//! `StreamNotFound` (a fabricated parent stream), or `NameAlreadyExists` (an
+//! existing topic name under its live stream).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -27,6 +29,8 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::CreateTopicResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub stream: String,
@@ -34,12 +38,11 @@ pub struct Input {
     pub partitions_count: u32,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[
+    Outcome::Ok,
+    Outcome::StreamNotFound,
+    Outcome::NameAlreadyExists,
+];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -48,9 +51,28 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => {
+        Outcome::Ok => {
             let stream = shadow.pick_stream_name(prng)?;
             let name = shadow.fresh_name("topic");
+            let partitions_count = 1 + prng.random_range(0..4u32);
+            Some(Input {
+                stream,
+                name,
+                partitions_count,
+            })
+        }
+        Outcome::StreamNotFound => {
+            let stream = shadow.fabricate_absent_name("stream");
+            let name = shadow.fresh_name("topic");
+            let partitions_count = 1 + prng.random_range(0..4u32);
+            Some(Input {
+                stream,
+                name,
+                partitions_count,
+            })
+        }
+        Outcome::NameAlreadyExists => {
+            let (stream, name) = shadow.pick_topic_pair(prng)?;
             let partitions_count = 1 + prng.random_range(0..4u32);
             Some(Input {
                 stream,
@@ -66,18 +88,23 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.create_topic(&input.stream, &input.name, input.partitions_count)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::AddTopic {
+        Outcome::Ok => Effect::AddTopic {
             stream: input.stream.clone(),
             name: input.name.clone(),
             partitions: input.partitions_count,
         },
+        _ => Effect::None,
     }
 }

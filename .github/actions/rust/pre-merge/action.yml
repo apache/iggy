@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -36,6 +36,11 @@ runs:
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
+        # check-msrv stays on `dev`: only `dev` is ever saved (by
+        # coverage-baseline), so a dedicated key would be cold every run. It
+        # reads only (pre-merge save-cache=false), so it cannot churn `dev`;
+        # the warm `~/.cargo` restore is a free win, and its 1.95 target
+        # artifacts rebuild regardless since the rustc hash differs.
         shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
         # fmt/sort/machete never build into target/, so the multi-GB cache
         # restore is pure overhead. Compiling legs (check/clippy/doctest/test-*)
@@ -44,7 +49,7 @@ runs:
         # Light legs fit in the runner's ~89 GiB default headroom; skip the
         # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
         # images on test-*, cross-builds, miri, verify-publish) keep it.
-        free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -130,6 +135,21 @@ runs:
     - name: Cargo check
       if: inputs.task == 'check'
       run: cargo check --all --all-features
+      shell: bash
+
+    # MSRV gate: compile-check the published crates against the declared
+    # workspace `rust-version`. The MSRV is read from Cargo.toml so this stays
+    # in sync with the single source of truth. The `+<msrv>` override beats the
+    # rust-toolchain.toml pin. check-only: downstream consumers compile our
+    # libs (not our tests), so dev-deps needing newer Rust are out of scope.
+    - name: Cargo check on MSRV
+      if: inputs.task == 'check-msrv'
+      run: |
+        MSRV=$(grep -oP -m1 '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+        echo "::notice::Checking published crates against MSRV ${MSRV}"
+        rustup toolchain install "$MSRV" --profile minimal --no-self-update
+        cargo "+$MSRV" check --locked --all-features \
+          -p iggy -p iggy_common -p iggy_binary_protocol -p iggy-cli
       shell: bash
 
     - name: Cargo fmt

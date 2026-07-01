@@ -211,13 +211,14 @@ impl Client {
         })
     }
 
-    pub fn create_stream(&self, stream_name: String) -> Result<(), String> {
+    pub fn create_stream(&self, stream_name: String) -> Result<ffi::StreamDetails, String> {
         RUNTIME.block_on(async {
-            self.inner
+            let stream_details = self
+                .inner
                 .create_stream(&stream_name)
                 .await
                 .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
-            Ok(())
+            Ok(ffi::StreamDetails::from(stream_details))
         })
     }
 
@@ -407,7 +408,7 @@ impl Client {
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
-    ) -> Result<(), String> {
+    ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
         let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
@@ -418,10 +419,7 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = match replication_factor {
-            0 => None,
-            value => Some(value),
-        };
+        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -444,7 +442,8 @@ impl Client {
         };
 
         RUNTIME.block_on(async {
-            self.inner
+            let topic_details = self
+                .inner
                 .create_topic(
                     &rust_stream_id,
                     &topic_name,
@@ -458,6 +457,143 @@ impl Client {
                 .map_err(|error| {
                     format!(
                         "Could not create topic '{topic_name}' on stream '{rust_stream_id}': {error}"
+                    )
+                })?;
+            Ok(ffi::TopicDetails::from(topic_details))
+        })
+    }
+
+    pub fn get_topic(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+    ) -> Result<ffi::TopicDetails, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not get topic: invalid stream identifier: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not get topic: invalid topic identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let topic_details = self
+                .inner
+                .get_topic(&rust_stream_id, &rust_topic_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not get topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+                    )
+                })?;
+            let topic_details = topic_details.ok_or_else(|| {
+                format!(
+                    "Topic '{rust_topic_id}' was not found on stream '{rust_stream_id}'"
+                )
+            })?;
+            Ok(ffi::TopicDetails::from(topic_details))
+        })
+    }
+
+    pub fn get_topics(&self, stream_id: ffi::Identifier) -> Result<Vec<ffi::Topic>, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not get topics: invalid stream identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let topics = self
+                .inner
+                .get_topics(&rust_stream_id)
+                .await
+                .map_err(|error| {
+                    format!("Could not get topics on stream '{rust_stream_id}': {error}")
+                })?;
+            Ok(topics.into_iter().map(ffi::Topic::from).collect())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_topic(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        topic_name: String,
+        compression_algorithm: String,
+        replication_factor: u8,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        max_topic_size: String,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
+        let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
+            "" | "none" => RustCompressionAlgorithm::None,
+            _ => RustCompressionAlgorithm::from_str(&compression_algorithm).map_err(|error| {
+                format!(
+                    "Could not update topic '{topic_name}': invalid compression algorithm '{compression_algorithm}': {error}"
+                )
+            })?,
+        };
+        let rust_replication_factor = Some(replication_factor.max(1));
+        let rust_message_expiry = match message_expiry_kind.as_str() {
+            "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
+            "never_expire" => RustIggyExpiry::NeverExpire,
+            "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
+                message_expiry_value,
+            )),
+            _ => {
+                return Err(format!(
+                    "Could not update topic '{topic_name}': invalid message expiry kind '{message_expiry_kind}'"
+                ));
+            }
+        };
+        let rust_max_topic_size = match max_topic_size.as_str() {
+            "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
+            _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
+                format!(
+                    "Could not update topic '{topic_name}': invalid max topic size '{max_topic_size}': {error}"
+                )
+            })?,
+        };
+
+        RUNTIME.block_on(async {
+            self.inner
+                .update_topic(
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    &topic_name,
+                    rust_compression_algorithm,
+                    rust_replication_factor,
+                    rust_message_expiry,
+                    rust_max_topic_size,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not update topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_topic(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not delete topic: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not delete topic: invalid topic identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_topic(&rust_stream_id, &rust_topic_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not delete topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
                     )
                 })?;
             Ok(())
@@ -599,6 +735,32 @@ impl Client {
                 )
             })?;
             Ok(ffi::ConsumerGroupDetails::from(group))
+        })
+    }
+
+    pub fn get_consumer_groups(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+    ) -> Result<Vec<ffi::ConsumerGroup>, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not get consumer groups: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not get consumer groups: invalid topic identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            let groups = self
+                .inner
+                .get_consumer_groups(&rust_stream_id, &rust_topic_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not get consumer groups for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
+                    )
+                })?;
+            Ok(groups.into_iter().map(ffi::ConsumerGroup::from).collect())
         })
     }
 

@@ -1290,6 +1290,10 @@ impl Metadata {
         self.perm_get_server_info(user_id)
     }
 
+    pub fn perm_get_snapshot(&self, user_id: u32) -> Result<(), IggyError> {
+        self.perm_get_server_info(user_id)
+    }
+
     fn perm_get_server_info(&self, user_id: u32) -> Result<(), IggyError> {
         let metadata = self.load();
 
