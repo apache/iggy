@@ -28,11 +28,13 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::Bytes;
+use configs::cluster::{ClusterConfig, ClusterNodeConfig};
 use configs::http::HttpJwtConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
@@ -97,9 +99,10 @@ use iggy_common::wire_conversions::{
     streams_from_wire, topics_from_wire, users_from_wire,
 };
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, Identifier, IdentityInfo,
-    IggyError, IggyTimestamp, RawPersonalAccessToken, Stats, Stream, StreamDetails, TokenInfo,
-    Topic, TopicDetails, UserInfo, UserInfoDetails, Validatable,
+    ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
+    ClusterNodeStatus, ConsumerGroup, ConsumerGroupDetails, Identifier, IdentityInfo, IggyError,
+    IggyTimestamp, RawPersonalAccessToken, Stats, Stream, StreamDetails, TokenInfo, Topic,
+    TopicDetails, TransportEndpoints, UserInfo, UserInfoDetails, Validatable,
 };
 use message_bus::client_listener;
 use metadata::impls::metadata::StreamsFrontend;
@@ -138,6 +141,18 @@ const MAX_HTTP_SESSIONS: usize = 100_000;
 /// First per-session request id the write path hands out. VSR request numbers
 /// are 1-based and strictly increasing within a session.
 const FIRST_REQUEST_ID: u64 = 1;
+
+/// Node name reported for the synthesized single self-node, matching the legacy
+/// server's single-node synthesis.
+const SELF_NODE_NAME: &str = "iggy-node";
+
+/// Cluster name reported when no roster is configured, matching the legacy
+/// server's single-node synthesis.
+const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
+
+/// Response header carrying the current VSR view number, set on every response
+/// while this shard-0 node has live consensus.
+const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
 
 /// One VSR session established for a single login credential (a JWT `jti` or a
 /// PAT). Shared via `Rc` by every concurrent request bearing that credential,
@@ -300,6 +315,20 @@ fn not_primary_response() -> Response {
         .into_response()
 }
 
+/// Owned snapshot of the cluster topology `GET /cluster/metadata` reports.
+///
+/// The roster lives only in `ServerNgConfig` and is not reachable from
+/// [`ServerNgShard`], so [`start`] copies the minimal pieces here at listener
+/// start. Owned so the handler stays synchronous and never borrows config.
+struct ClusterRoster {
+    enabled: bool,
+    name: String,
+    nodes: Vec<ClusterNodeConfig>,
+    /// This node's bound HTTP address, used to synthesize the sole self-node
+    /// when no roster is configured (the only transport port known here).
+    http_addr: SocketAddr,
+}
+
 /// Shared shard-0 HTTP state.
 ///
 /// Groups the shard handle, the JWT issuer/verifier, and the per-credential VSR
@@ -313,6 +342,7 @@ struct HttpInner {
     /// bridge tolerates the `!Sync` interior - but the guard must never be held
     /// across an `.await` (see [`HttpInner::resolve_session`]).
     sessions: RefCell<HashMap<String, Rc<HttpSession>>>,
+    roster: ClusterRoster,
 }
 
 impl HttpInner {
@@ -448,6 +478,7 @@ pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
     jwt_config: &HttpJwtConfig,
+    cluster: &ClusterConfig,
 ) -> Result<(), ServerNgError> {
     let jwt = JwtManager::build(jwt_config)?;
     let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
@@ -457,6 +488,12 @@ pub async fn start(
         shard: Rc::clone(shard),
         jwt,
         sessions: RefCell::new(HashMap::new()),
+        roster: ClusterRoster {
+            enabled: cluster.enabled,
+            name: cluster.name.clone(),
+            nodes: cluster.nodes.clone(),
+            http_addr: bound_addr,
+        },
     }));
     let router = router(state);
 
@@ -477,6 +514,9 @@ pub async fn start(
 /// Assemble the shard-0 router: unauthenticated health + login routes, plus
 /// one authenticated probe that exercises the [`Authenticated`] extractor.
 fn router(state: HttpState) -> Router {
+    // Cloned for the response layer so `X-Iggy-View` reads the live view per
+    // response; the original `state` is moved into `with_state` below.
+    let view_source = state.clone();
     Router::new()
         .route("/ping", get(ping))
         .route("/users/login", post(login_user))
@@ -523,9 +563,14 @@ fn router(state: HttpState) -> Router {
         .route("/personal-access-tokens", post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
         .route("/stats", get(get_stats))
+        .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client))
         .with_state(state)
+        .layer(map_response(move |response: Response| {
+            let view_source = view_source.clone();
+            async move { insert_view_header(&view_source, response) }
+        }))
 }
 
 /// Extracting the state here proves at compile time that the `!Send` state
@@ -803,6 +848,20 @@ async fn get_stats(
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
+}
+
+/// `GET /cluster/metadata`: report the live cluster topology as the same
+/// `ClusterMetadata` JSON the legacy server returns.
+///
+/// Auth-only: any valid token serves. Unlike the entity reads it bypasses both
+/// the root gate and the consistency gate, and serves from the roster captured
+/// at listener start plus the sync consensus getters, so it never touches the
+/// metadata STM, consensus, or a VSR session and stays fully synchronous.
+async fn get_cluster_metadata(
+    State(state): State<HttpState>,
+    _identity: Identity,
+) -> Json<ClusterMetadata> {
+    Json(build_cluster_metadata(&state))
 }
 
 /// `GET /clients`: list every connected client across all shards as the same
@@ -1488,6 +1547,75 @@ fn read_local(
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
     }
+}
+
+/// Build the live [`ClusterMetadata`] for `GET /cluster/metadata`.
+///
+/// Mirrors the legacy `get_cluster_metadata`: with a configured, non-empty
+/// roster and live consensus, emit one node per roster entry and derive each
+/// role from the current VSR view - the node at `primary_index(view)` leads, the
+/// rest follow. Otherwise (cluster disabled, empty roster, or absent consensus)
+/// fail closed to a synthesized self-node as the sole leader.
+fn build_cluster_metadata(state: &HttpInner) -> ClusterMetadata {
+    let roster = &state.roster;
+    match state.shard.plane.metadata().consensus.as_ref() {
+        Some(consensus) if roster.enabled && !roster.nodes.is_empty() => {
+            let primary = consensus.primary_index(consensus.view());
+            let nodes = roster
+                .nodes
+                .iter()
+                .map(|node| ClusterNode {
+                    name: node.name.clone(),
+                    ip: node.ip.clone(),
+                    endpoints: TransportEndpoints::new(
+                        node.ports.tcp.unwrap_or(0),
+                        node.ports.quic.unwrap_or(0),
+                        node.ports.http.unwrap_or(0),
+                        node.ports.websocket.unwrap_or(0),
+                    ),
+                    role: if node.replica_id == primary {
+                        ClusterNodeRole::Leader
+                    } else {
+                        ClusterNodeRole::Follower
+                    },
+                    status: ClusterNodeStatus::Healthy,
+                })
+                .collect();
+            ClusterMetadata {
+                name: roster.name.clone(),
+                nodes,
+            }
+        }
+        _ => self_node_metadata(roster),
+    }
+}
+
+/// Synthesize a single self-node [`ClusterMetadata`], mirroring the legacy
+/// single-node path. Only this node's bound HTTP port is known at the HTTP layer
+/// (the roster is not threaded onto the shard), so the other transports report 0.
+fn self_node_metadata(roster: &ClusterRoster) -> ClusterMetadata {
+    ClusterMetadata {
+        name: SINGLE_NODE_CLUSTER_NAME.to_owned(),
+        nodes: vec![ClusterNode {
+            name: SELF_NODE_NAME.to_owned(),
+            ip: roster.http_addr.ip().to_string(),
+            endpoints: TransportEndpoints::new(0, 0, roster.http_addr.port(), 0),
+            role: ClusterNodeRole::Leader,
+            status: ClusterNodeStatus::Healthy,
+        }],
+    }
+}
+
+/// Set the [`VIEW_HEADER`] to the current VSR view on `response`. Omits the
+/// header when this node has no live consensus: a missing header is
+/// unambiguous, whereas a fabricated view number would mislead.
+fn insert_view_header(state: &HttpInner, mut response: Response) -> Response {
+    if let Some(consensus) = state.shard.plane.metadata().consensus.as_ref() {
+        response
+            .headers_mut()
+            .insert(VIEW_HEADER, HeaderValue::from(consensus.view()));
+    }
+    response
 }
 
 /// Classify a committed reply's leading result section and return the typed

@@ -1946,7 +1946,7 @@ async fn start_tcp_runtime(
     // caller of this function.
     if config.http.enabled {
         let http_addr = parse_socket_addr("http.address", &config.http.address)?;
-        http::start(shard, http_addr, &config.http.jwt).await?;
+        http::start(shard, http_addr, &config.http.jwt, &config.cluster).await?;
     }
 
     Ok(())
