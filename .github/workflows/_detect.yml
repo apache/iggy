@@ -73,7 +73,7 @@ jobs:
       examples_matrix: ${{ steps.mk.outputs.examples_matrix }}
       other_matrix: ${{ steps.mk.outputs.other_matrix }}
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
 
