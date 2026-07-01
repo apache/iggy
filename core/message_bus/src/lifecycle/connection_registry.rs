@@ -33,6 +33,7 @@
 //! [`ShutdownToken`]: crate::lifecycle::ShutdownToken
 
 use compio::runtime::JoinHandle;
+use futures::channel::oneshot;
 use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -128,9 +129,50 @@ pub struct DrainOutcome {
     pub background_force: usize,
 }
 
+/// Where a client reply is delivered.
+///
+/// `Socket` is the wire path taken by every TCP / WS / QUIC client: the
+/// reply is pushed into the per-peer queue exactly as before. `InProcess`
+/// reifies an in-process reply target keyed by request id so a caller
+/// holding the matching [`oneshot::Receiver`] can await its reply without a
+/// socket. Both ends are shard-0-local, hence a single-threaded oneshot.
+#[derive(Debug)]
+enum ReplyTarget {
+    Socket(BusSender),
+    #[allow(dead_code)] // wired in P2 (HTTP data plane)
+    InProcess {
+        by_request: HashMap<u64, oneshot::Sender<BusMessage>>,
+    },
+}
+
+impl ReplyTarget {
+    /// Wire sender for socket targets; `None` for in-process targets.
+    const fn as_socket(&self) -> Option<&BusSender> {
+        match self {
+            Self::Socket(sender) => Some(sender),
+            Self::InProcess { .. } => None,
+        }
+    }
+}
+
+/// Outcome of routing a client reply through an [`Entry`]'s reply target.
+///
+/// `Delivered` is the socket fast path: `try_send` was attempted and its
+/// result is carried through unchanged. `InProcess` hands the message back
+/// so the caller can decode the request id and fire the matching oneshot
+/// via [`ConnectionRegistry::fire_in_process`], keeping that decode off the
+/// socket path. `NoSlot` means no entry exists for the key.
+#[derive(Debug)]
+#[must_use]
+pub enum ReplyRoute {
+    Delivered(Result<(), async_channel::TrySendError<BusMessage>>),
+    InProcess(BusMessage),
+    NoSlot(BusMessage),
+}
+
 #[derive(Debug)]
 struct Entry {
-    sender: BusSender,
+    reply: ReplyTarget,
     writer_handle: Option<JoinHandle<()>>,
     reader_handle: Option<JoinHandle<()>>,
     /// Generation token minted by the registry on insert. Entries that
@@ -215,39 +257,58 @@ where
     /// `close_peer`.
     pub fn with_sender<R>(&self, key: K, f: impl FnOnce(&BusSender) -> R) -> Option<R> {
         let entries = self.entries.borrow();
-        entries.get(&key).map(|entry| f(&entry.sender))
+        entries
+            .get(&key)
+            .and_then(|entry| entry.reply.as_socket())
+            .map(f)
     }
 
-    /// Try to send `msg` to the per-peer queue, returning the message back
-    /// when no slot exists.
+    /// Route `msg` to the entry's reply target, handing it back when no
+    /// live target accepts it.
     ///
-    /// Lets `send_to_*` skip the unconditional `Frozen::clone()` the
-    /// `with_sender` shape forced (closure consumes a clone, outer caller
-    /// retains the original for the slow path the borrow checker cannot
-    /// prove unreachable). The consuming variant moves `msg` into
-    /// `try_send` on the fast path; on no-slot the message is handed back
-    /// so the caller can route it via the slow path or drop it.
+    /// Lets `send_to_client` skip the unconditional `Frozen::clone()` the
+    /// `with_sender` shape forced. Socket targets move `msg` straight into
+    /// `try_send`; in-process targets hand it back via
+    /// [`ReplyRoute::InProcess`] so the caller can resolve the request id
+    /// and fire the oneshot without decoding on the socket path.
     ///
     /// Returns:
-    /// - `Ok(Ok(()))`: slot exists and the queue accepted `msg`.
-    /// - `Ok(Err(TrySendError))`: slot exists but `try_send` failed
-    ///   (`Full` or `Closed`); the inner error carries `msg` back per
-    ///   `async_channel`'s contract.
-    /// - `Err(msg)`: no slot for `key`; `msg` returned to the caller.
+    /// - [`ReplyRoute::Delivered`]: socket target; carries the `try_send`
+    ///   result (`Full` / `Closed` errors carry `msg` back per
+    ///   `async_channel`'s contract).
+    /// - [`ReplyRoute::InProcess`]: in-process target; `msg` handed back.
+    /// - [`ReplyRoute::NoSlot`]: no entry for `key`; `msg` handed back.
+    pub fn try_send_or_return(&self, key: K, msg: BusMessage) -> ReplyRoute {
+        let entries = self.entries.borrow();
+        let Some(entry) = entries.get(&key) else {
+            return ReplyRoute::NoSlot(msg);
+        };
+        match &entry.reply {
+            ReplyTarget::Socket(sender) => ReplyRoute::Delivered(sender.try_send(msg)),
+            ReplyTarget::InProcess { .. } => ReplyRoute::InProcess(msg),
+        }
+    }
+
+    /// Fire the in-process reply registered under `request` for `key`.
+    ///
+    /// Companion to [`ReplyRoute::InProcess`]; the socket path never reaches
+    /// here. Removes the matching oneshot and delivers `msg` on it.
     ///
     /// # Errors
     ///
-    /// The outer `Err(msg)` reports that no entry exists for `key`. The
-    /// inner `Err(TrySendError)` reports that the entry's queue is full
-    /// or closed.
-    pub fn try_send_or_return(
-        &self,
-        key: K,
-        msg: BusMessage,
-    ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
-        let entries = self.entries.borrow();
-        match entries.get(&key) {
-            Some(entry) => Ok(entry.sender.try_send(msg)),
+    /// Hands `msg` back when `key` has no in-process target or no waiter is
+    /// registered for `request`, so the caller surfaces the same not-found
+    /// outcome as a missing socket.
+    pub fn fire_in_process(&self, key: K, request: u64, msg: BusMessage) -> Result<(), BusMessage> {
+        let mut entries = self.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(&key) else {
+            return Err(msg);
+        };
+        let ReplyTarget::InProcess { by_request } = &mut entry.reply else {
+            return Err(msg);
+        };
+        match by_request.remove(&request) {
+            Some(reply_tx) => reply_tx.send(msg),
             None => Err(msg),
         }
     }
@@ -294,7 +355,7 @@ where
         entries.insert(
             key,
             Entry {
-                sender,
+                reply: ReplyTarget::Socket(sender),
                 writer_handle: Some(writer_handle),
                 reader_handle: Some(reader_handle),
                 token,
@@ -360,7 +421,9 @@ where
         let Some(mut entry) = self.entries.borrow_mut().remove(&key) else {
             return;
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -389,7 +452,9 @@ where
             }
             slot.remove()
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -447,7 +512,9 @@ where
             // the shutdown token has not been triggered. Writer is
             // awaited before the reader handle is dropped so a
             // mid-writev cancellation cannot truncate a frame.
-            entry.sender.close();
+            if let Some(sender) = entry.reply.as_socket() {
+                sender.close();
+            }
             // Writer gets the full shared deadline so a legitimately-
             // flushing `write_vectored_all` never loses budget to any
             // other entry in the same drain batch.
@@ -581,7 +648,8 @@ impl ReplicaRegistry {
         let slots = self.slots.borrow();
         slots[usize::from(key)]
             .as_ref()
-            .map(|entry| f(&entry.sender))
+            .and_then(|entry| entry.reply.as_socket())
+            .map(f)
     }
 
     /// See [`ConnectionRegistry::try_send_or_return`].
@@ -595,8 +663,11 @@ impl ReplicaRegistry {
         msg: BusMessage,
     ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
         let slots = self.slots.borrow();
-        match slots[usize::from(key)].as_ref() {
-            Some(entry) => Ok(entry.sender.try_send(msg)),
+        match slots[usize::from(key)]
+            .as_ref()
+            .and_then(|entry| entry.reply.as_socket())
+        {
+            Some(sender) => Ok(sender.try_send(msg)),
             None => Err(msg),
         }
     }
@@ -627,7 +698,7 @@ impl ReplicaRegistry {
         }
         let token = self.mint_token();
         *slot = Some(Entry {
-            sender,
+            reply: ReplyTarget::Socket(sender),
             writer_handle: Some(writer_handle),
             reader_handle: Some(reader_handle),
             token,
@@ -672,7 +743,9 @@ impl ReplicaRegistry {
             self.len.set(self.len.get() - 1);
             entry
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -697,7 +770,9 @@ impl ReplicaRegistry {
             self.len.set(self.len.get() - 1);
             removed_entry
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -1065,7 +1140,7 @@ mod tests {
             .expect("insert ok");
 
         let outer = reg.try_send_or_return(1u8, make_bus_msg());
-        assert!(matches!(outer, Ok(Ok(()))));
+        assert!(matches!(outer, ReplyRoute::Delivered(Ok(()))));
         // Receiver drains the message; closing the writer's rx end via
         // close_peer is not necessary for this assertion.
         let received = rx.recv().await.expect("queue had message");
@@ -1081,7 +1156,9 @@ mod tests {
         let original_len = msg.len();
 
         let outcome = reg.try_send_or_return(99u8, msg);
-        let returned = outcome.expect_err("missing slot should return msg");
+        let ReplyRoute::NoSlot(returned) = outcome else {
+            panic!("missing slot should return msg");
+        };
         assert_eq!(returned.len(), original_len);
     }
 
@@ -1104,14 +1181,16 @@ mod tests {
             .expect("insert ok");
 
         // Saturate the queue.
-        reg.try_send_or_return(1u8, make_bus_msg())
-            .expect("slot present")
-            .expect("first send accepted");
+        assert!(matches!(
+            reg.try_send_or_return(1u8, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
         // Second send: slot present, queue full.
-        let outcome = reg
-            .try_send_or_return(1u8, make_bus_msg())
-            .expect("slot still present");
-        assert!(matches!(outcome, Err(async_channel::TrySendError::Full(_))));
+        let outcome = reg.try_send_or_return(1u8, make_bus_msg());
+        assert!(matches!(
+            outcome,
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
+        ));
     }
 
     /// Mirror of `try_send_or_return_returns_msg_when_slot_missing` for the

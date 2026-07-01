@@ -95,13 +95,13 @@ pub use installer::conn_info::{
 };
 pub use lifecycle::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, FusedShutdown,
-    ReplicaRegistry, Shutdown, ShutdownToken,
+    ReplicaRegistry, ReplyRoute, Shutdown, ShutdownToken,
 };
 pub use transports::tls::TlsServerCredentials;
 
 pub use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
-use iggy_binary_protocol::GenericHeader;
+use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::array;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -1225,13 +1225,21 @@ impl MessageBus for IggyMessageBus {
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
-            // Fast path: move `message` straight into `try_send`. On no-slot
-            // the registry hands it back; we drop it and surface
-            // ClientNotFound (matches prior behaviour: SendError did not
-            // preserve payload either).
+            // Route by the entry's reply target. Socket is the unchanged
+            // fast path and never decodes. InProcess resolves the waiting
+            // request id from the reply header and fires its oneshot; that
+            // decode stays off the socket path. No slot surfaces
+            // ClientNotFound (prior behaviour: SendError did not preserve
+            // the payload either).
             return match self.clients.try_send_or_return(client_id, message) {
-                Ok(send_result) => send_result.map_err(map_try_send_err),
-                Err(_msg) => Err(SendError::ClientNotFound(client_id)),
+                ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
+                ReplyRoute::InProcess(message) => {
+                    let request = reply_request_id(&message);
+                    self.clients
+                        .fire_in_process(client_id, request, message)
+                        .map_err(|_| SendError::ClientNotFound(client_id))
+                }
+                ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
             };
         }
         let forward = self
@@ -1323,6 +1331,18 @@ fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> Se
         async_channel::TrySendError::Full(_) => SendError::Backpressure,
         async_channel::TrySendError::Closed(_) => SendError::ConnectionClosed,
     }
+}
+
+/// Peek `ReplyHeader.request` (the originating request id) from a reply
+/// buffer at its fixed header offset. Only the in-process reply path calls
+/// this; the socket path never decodes.
+fn reply_request_id(reply: &Frozen<MESSAGE_ALIGN>) -> u64 {
+    const OFFSET: usize = std::mem::offset_of!(ReplyHeader, request);
+    reply
+        .as_slice()
+        .get(OFFSET..OFFSET + std::mem::size_of::<u64>())
+        .and_then(|bytes| bytes.try_into().ok())
+        .map_or(0, u64::from_ne_bytes)
 }
 
 #[cfg(test)]
