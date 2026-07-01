@@ -43,23 +43,32 @@ use iggy_binary_protocol::requests::streams::{
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
+    UpdateUserRequest,
+};
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
+use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
     GenericHeader, Operation, RequestHeader, WireDecode, WireEncode, WireName,
 };
+use iggy_common::change_password::ChangePassword;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
+use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::update_user::UpdateUser;
+use iggy_common::wire_conversions::{identifier_to_wire, permissions_to_wire};
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, IggyTimestamp, StreamDetails, TokenInfo, TopicDetails,
-    Validatable,
+    UserInfoDetails, Validatable,
 };
 use message_bus::client_listener;
 use secrecy::ExposeSecret;
@@ -76,6 +85,7 @@ use crate::http::extractor::Authenticated;
 use crate::http::jwt::JwtManager;
 use crate::login_register::LoginRegisterError;
 use crate::server_error::ServerNgError;
+use crate::users::maybe_rewrite_user_password_request;
 
 /// `GET /ping` response body, matching the legacy HTTP server's health probe.
 const PONG: &str = "pong";
@@ -353,6 +363,10 @@ fn router(state: HttpState) -> Router {
             post(login_with_personal_access_token),
         )
         .route("/users/me", get(get_me))
+        .route("/users", post(create_user))
+        .route("/users/{user_id}", put(update_user).delete(delete_user))
+        .route("/users/{user_id}/password", put(change_password))
+        .route("/users/{user_id}/permissions", put(update_permissions))
         .route("/streams", post(create_stream))
         .route(
             "/streams/{stream_id}",
@@ -620,6 +634,142 @@ async fn purge_topic(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /users`: create a user and render the committed reply as the same
+/// `UserInfoDetails` JSON the legacy server returns.
+///
+/// The plaintext password rides the JSON body; [`submit_write`] hashes it on
+/// shard 0 before the request enters consensus (see
+/// [`maybe_rewrite_user_password_request`]), so no plaintext is ever replicated.
+async fn create_user(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Json(command): Json<CreateUser>,
+) -> Result<Json<UserInfoDetails>, WriteError> {
+    // Rejects empty/oversized username or password before any consensus work.
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = CreateUserRequest {
+        username: WireName::new(&command.username)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidUsername))?,
+        password: command.password.expose_secret().to_string(),
+        status: command.status.as_code(),
+        permissions: command.permissions.as_ref().map(permissions_to_wire),
+    };
+    let body = request.to_bytes();
+    let payload = SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::CreateUser,
+        &body,
+    ))
+    .await?;
+    Ok(Json(decode_user_details(&payload)?))
+}
+
+/// `PUT /users/{user_id}`: update a user's username and/or status. Returns 204.
+async fn update_user(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(user_id): Path<String>,
+    Json(command): Json<UpdateUser>,
+) -> Result<StatusCode, WriteError> {
+    let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
+    // Rejects an oversized replacement username; a no-op when username is absent.
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = UpdateUserRequest {
+        user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
+        username: command
+            .username
+            .as_deref()
+            .map(WireName::new)
+            .transpose()
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidUsername))?,
+        status: command.status.map(|status| status.as_code()),
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::UpdateUser,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /users/{user_id}`: delete a user. Returns 204.
+async fn delete_user(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, WriteError> {
+    let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
+    let request = DeleteUserRequest {
+        user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::DeleteUser,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /users/{user_id}/password`: change a user's password. Returns 204.
+///
+/// Like [`create_user`], the new password rides the JSON body in plaintext and
+/// is hashed by [`submit_write`] on shard 0 before replication.
+async fn change_password(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(user_id): Path<String>,
+    Json(command): Json<ChangePassword>,
+) -> Result<StatusCode, WriteError> {
+    let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
+    // Rejects empty/oversized current or new password before any consensus work.
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = ChangePasswordRequest {
+        user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
+        current_password: command.current_password.expose_secret().to_string(),
+        new_password: command.new_password.expose_secret().to_string(),
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::ChangePassword,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /users/{user_id}/permissions`: replace a user's permissions. Returns 204.
+async fn update_permissions(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(user_id): Path<String>,
+    Json(command): Json<UpdatePermissions>,
+) -> Result<StatusCode, WriteError> {
+    let user_id = Identifier::from_str_value(&user_id).map_err(WriteError::Rejected)?;
+    command.validate().map_err(WriteError::Rejected)?;
+    let request = UpdatePermissionsRequest {
+        user_id: identifier_to_wire(&user_id).map_err(WriteError::Rejected)?,
+        permissions: command.permissions.as_ref().map(permissions_to_wire),
+    };
+    let body = request.to_bytes();
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::UpdatePermissions,
+        &body,
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Run one authenticated control-plane write end to end and return the committed
 /// reply's typed payload. Shared by every write route: `create_stream` decodes
 /// the payload into an entity, the update/delete/purge routes ignore it (it is
@@ -658,6 +808,11 @@ async fn submit_write(
         *next_request_id,
         body,
     );
+    // Hash raw passwords on shard 0 before replication (CreateUser /
+    // ChangePassword); a no-op for every other operation. Mirrors the TCP
+    // dispatch path so plaintext never enters consensus. On decode failure the
+    // gate is released without advancing, leaving the request id free to retry.
+    let message = maybe_rewrite_user_password_request(message).map_err(WriteError::Rejected)?;
     let reply = submit_client_request_on_owner(&state.shard, message).await;
     let Some(reply) = reply else {
         return Err(WriteError::Unavailable);
@@ -730,6 +885,15 @@ fn decode_topic_details(payload: &[u8]) -> Result<TopicDetails, WriteError> {
     let response = GetTopicResponse::decode_from(payload)
         .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
     TopicDetails::try_from(response).map_err(WriteError::Rejected)
+}
+
+/// Decode the `UserDetailsResponse` payload of a committed create-user reply into
+/// `UserInfoDetails`. `payload` is the slice past the result section that
+/// [`submit_write`] already validated as a success.
+fn decode_user_details(payload: &[u8]) -> Result<UserInfoDetails, WriteError> {
+    let response = UserDetailsResponse::decode_from(payload)
+        .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
+    UserInfoDetails::try_from(response).map_err(WriteError::Rejected)
 }
 
 /// Map an eviction frame to the same typed [`IggyError`] the SDK's
