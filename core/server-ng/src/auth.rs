@@ -50,6 +50,12 @@ use tracing::warn;
 static DUMMY_PASSWORD_HASH: LazyLock<String> =
     LazyLock::new(|| crypto::hash_password("http-login-timing-guard"));
 
+/// Pay the one-time Argon2 cost of [`DUMMY_PASSWORD_HASH`] at boot instead of
+/// inside the first unknown-username login request.
+pub(crate) fn warm_dummy_password_hash() {
+    LazyLock::force(&DUMMY_PASSWORD_HASH);
+}
+
 pub(crate) fn verify_login_credentials(
     shard: &Rc<ServerNgShard>,
     username: &str,

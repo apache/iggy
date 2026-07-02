@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::auth::warm_dummy_password_hash;
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
@@ -513,6 +514,7 @@ pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
+    warm_dummy_password_hash();
     let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
         .map_err(ServerNgError::ShardAllocator)?;
     let assignments = allocator
