@@ -19,6 +19,7 @@ use crate::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
 };
 use async_trait::async_trait;
+use std::time::Duration;
 
 /// This trait defines the methods to interact with the messaging module.
 #[async_trait]
@@ -37,6 +38,37 @@ pub trait MessageClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError>;
+
+    /// Polls messages and waits up to the timeout when no messages are immediately available.
+    /// A zero timeout preserves immediate polling behavior.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_with_timeout(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        wait_timeout: Duration,
+    ) -> Result<PolledMessages, IggyError> {
+        if wait_timeout.is_zero() {
+            return self
+                .poll_messages(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy,
+                    count,
+                    auto_commit,
+                )
+                .await;
+        }
+
+        Err(IggyError::FeatureUnavailable)
+    }
 
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
