@@ -86,8 +86,6 @@ pub(crate) fn validate_state_storage_config(config: &StateConfig) -> Result<(), 
 }
 
 pub(crate) fn create_state_storage(config: &StateConfig) -> Result<Arc<dyn StateStorage>, Error> {
-    validate_state_storage_config(config)?;
-
     let base_path = config
         .storage_config
         .as_ref()
