@@ -40,7 +40,7 @@ timestamp_field = "@timestamp"
 # password = "replace_with_secret"
 # verbose_logging = false
 
-# HTTP resilience (defaults shown; see docs/RESILIENCE.md).
+# HTTP resilience (defaults shown;).
 # max_retries = 3
 # retry_delay = "1s"
 # retry_max_delay = "30s"

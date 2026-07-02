@@ -56,7 +56,7 @@ query = { match_all = {} }
 
 | Field | Type | Default | Description |
 | ----- | ---- | ------- | ----------- |
-| `polling_interval` | `String` | `"10s"` | Delay after each completed poll cycle (humantime format). First poll runs immediately. |
+| `polling_interval` | `String` | `"10s"` | Wait at the start of each poll cycle before fetching (humantime format). First poll waits one interval. |
 | `batch_size` | `usize` | `100` | Documents per search request (minimum `1`) |
 | `query` | JSON object | `{"match_all": {}}` | OpenSearch query DSL; applied on every poll |
 | `username` / `password` | `String` | none | HTTP basic authentication |
@@ -90,11 +90,11 @@ Only `storage_type = "file"` is implemented. See [State and persistence](#state-
 
 Each call to `poll()`:
 
-1. Issues `POST /{index}/_search` with the query below.
-2. Maps each hit's `_source` to a JSON `ProducedMessage`.
-3. Updates the `search_after` cursor to the sort tuple of the last hit with a valid sort tuple.
-4. Returns `ProducedMessages` containing the messages and a serialized `ConnectorState`.
-5. Sleeps `polling_interval` before returning.
+1. Sleeps `polling_interval` (paces fetch cadence; first poll waits one interval).
+2. Issues `POST /{index}/_search` with the query below.
+3. Maps each hit's `_source` to a JSON `ProducedMessage`.
+4. Updates the `search_after` cursor to the sort tuple of the last hit with a valid sort tuple.
+5. Returns `ProducedMessages` containing the messages and a serialized `ConnectorState`.
 
 The runtime persists `ConnectorState` (msgpack) after each successful `poll()` return.
 

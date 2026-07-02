@@ -653,7 +653,6 @@ impl OpenSearchSource {
             "{CONNECTOR_NAME} connector ID: {} poll failed: {error}",
             self.id
         );
-        sleep(self.polling_interval).await;
         Err(error)
     }
 }
@@ -797,6 +796,8 @@ impl Source for OpenSearchSource {
             });
         }
 
+        sleep(self.polling_interval).await;
+
         let start_time = std::time::Instant::now();
 
         let client = self
@@ -810,7 +811,6 @@ impl Source for OpenSearchSource {
                 let processing_time = start_time.elapsed().as_millis() as f64;
                 let (messages, persisted_state) =
                     self.finalize_poll(outcome, processing_time).await;
-                sleep(self.polling_interval).await;
                 Ok(ProducedMessages {
                     schema: Schema::Json,
                     messages,
