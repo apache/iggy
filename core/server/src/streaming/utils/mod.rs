@@ -16,7 +16,7 @@
 // under the License.
 
 pub mod address;
-pub mod crypto;
 pub mod file;
 pub mod ptr;
 pub use iggy_common::random_id;
+pub use server_common::crypto;

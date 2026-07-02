@@ -18,7 +18,7 @@
 use crate::MuxStateMachine;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
-use crate::stm::stream::Streams;
+use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
@@ -1526,7 +1526,15 @@ where
     ) -> Result<Message<PrepareHeader>, iggy_common::IggyError> {
         let consensus = self.consensus.as_ref().unwrap();
         let header = *message.header();
-        if !header.operation.is_client_allowed() {
+        // `TruncatePartition` is server-originated (the owning shard resolves a
+        // client `DeleteSegments` count to a concrete offset) but replicated AS
+        // the client's own request, so the commit records the client's request
+        // sequence in the `ClientTable`. It is internal -- no wire command code
+        // maps to it, so a client cannot construct one directly -- hence the
+        // `is_client_allowed` gate excludes it; admit it explicitly. The default
+        // match arm below projects it through unchanged.
+        if !header.operation.is_client_allowed() && header.operation != Operation::TruncatePartition
+        {
             return Err(IggyError::InvalidCommand);
         }
         let body = &message.as_slice()[size_of::<RequestHeader>()..header.size as usize];
@@ -1873,6 +1881,65 @@ where
             // there is no real session (the commit path skips reply-caching).
             session: 1,
             request,
+            namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            ..RequestHeader::default()
+        };
+    }
+    msg
+}
+
+/// Build a `TruncatePartition` request attributed to the originating client.
+///
+/// Replicated through the standard client-request path so the commit records
+/// `(client, session, request)` in the `ClientTable`. The client numbers
+/// `DeleteSegments` in the same monotonic request sequence as every other
+/// metadata op, so attributing the truncate to an internal id (or skipping the
+/// commit) leaves a hole that fails the next op's `request == committed + 1`
+/// preflight.
+///
+/// `template` is the client's own `DeleteSegments` header: it supplies the wire
+/// `cluster` / `view` / `release` and the client's `request` number.
+/// `client_id` / `session` are the bound VSR identity.
+///
+/// # Panics
+/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
+/// a few fixed-width fields, so this cannot happen in practice.
+#[must_use]
+pub fn build_truncate_partition_client_message(
+    template: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: u32,
+    topic_id: u32,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RequestHeader> {
+    let body = TruncatePartitionRequest {
+        stream_id: WireIdentifier::numeric(stream_id),
+        topic_id: WireIdentifier::numeric(topic_id),
+        partition_id,
+        up_to_offset,
+    }
+    .to_bytes();
+    let header_size = size_of::<RequestHeader>();
+    let total = header_size + body.len();
+    let mut msg = Message::<RequestHeader>::new(total);
+    {
+        let slice = msg.as_mut_slice();
+        slice[header_size..total].copy_from_slice(&body);
+        let header =
+            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut slice[..header_size])
+                .expect("zeroed bytes are a valid RequestHeader");
+        *header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::TruncatePartition,
+            size: u32::try_from(total).expect("request size fits u32"),
+            cluster: template.cluster,
+            view: template.view,
+            release: template.release,
+            client: client_id,
+            session,
+            request: template.request,
             namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
             ..RequestHeader::default()
         };

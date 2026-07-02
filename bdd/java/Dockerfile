@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-FROM gradle:9.6.0-jdk17
+FROM gradle:9.6.1-jdk17
 
 WORKDIR /workspace
 COPY . .

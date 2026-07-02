@@ -55,6 +55,7 @@ use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
@@ -69,7 +70,9 @@ use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
+use metadata::impls::metadata::{
+    MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
+};
 use partitions::{PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -198,6 +201,15 @@ pub(crate) fn make_partition_read_handler(
                     Some(()) => PartitionReadReply::Ack,
                     None => PartitionReadReply::NotFound,
                 };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ResolveSegmentDeleteOffset { count } => {
+                let result = partitions
+                    .nth_oldest_sealed_end_offset(&namespace, count)
+                    .map_or_else(
+                        || PartitionReadReply::NotFound,
+                        |up_to_offset| PartitionReadReply::SegmentDeleteOffset { up_to_offset },
+                    );
                 let _ = reply.try_send(result);
             }
         }
@@ -523,6 +535,16 @@ async fn handle_client_request(
                 "dropping replicated request from unbound transport; replied empty"
             );
         }
+        return;
+    }
+
+    // DeleteSegments is neither a partition nor a metadata consensus op: the
+    // owning shard resolves the requested count to a concrete offset, then a
+    // `TruncatePartition` is replicated through metadata (Option A). Each
+    // replica's reconciler trims to the committed watermark. Handle it here,
+    // ahead of the partition/metadata routing below.
+    if header.operation == Operation::DeleteSegments {
+        handle_delete_segments_request(shard, transport_client_id, bound, &request).await;
         return;
     }
 
@@ -1444,6 +1466,117 @@ async fn submit_logout_on_owner(
     match rx.recv().await {
         Ok(Some(commit)) => Ok(commit),
         _ => Err(MetadataSubmitError::Canceled),
+    }
+}
+
+/// Handle a client `DeleteSegments`: resolve the requested count to an offset
+/// on the owning shard, replicate a `TruncatePartition` through metadata so
+/// every replica trims to the same watermark, then ack the client. The local
+/// deletion happens later, when each replica's reconciler observes the commit.
+///
+/// Best-effort space management: any failure (bad request, unknown namespace,
+/// nothing sealed to delete, transient submit error) is logged and still acks,
+/// so the client never blocks on it.
+#[allow(clippy::future_not_send)]
+async fn handle_delete_segments_request(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    bound: Option<(u128, u64)>,
+    request: &Message<RequestHeader>,
+) {
+    let header = *request.header();
+    let body = request_body(request);
+
+    // An unbound transport cannot be attributed a VSR request sequence; the
+    // outer handler already short-circuits these, so this is defensive.
+    let Some((vsr_client_id, session)) = bound else {
+        return;
+    };
+
+    // The client numbers DeleteSegments in the same monotonic request sequence
+    // as every other metadata op. So resolve the requested count to a concrete
+    // offset on the owning shard, then replicate a `TruncatePartition(offset)`
+    // AS the client's own request through the standard owner path: the commit
+    // records (client, session, request) in the `ClientTable` on every replica,
+    // keeping the sequence contiguous. Skipping the commit (or attributing it
+    // to an internal id) leaves a hole that fails the next metadata op's
+    // `request == committed + 1` preflight -> RequestGap -> silent drop -> the
+    // SDK blocks until timeout. A no-op delete still commits `up_to_offset = 0`
+    // (monotonic apply) for the same reason.
+    #[allow(clippy::cast_possible_truncation)]
+    let truncate = match DeleteSegmentsRequest::decode_from(body) {
+        Ok(parsed) => match resolve_partition_request_namespace(
+            shard,
+            Operation::DeleteSegments,
+            body,
+            transport_client_id,
+        ) {
+            Ok(namespace_raw) => {
+                let namespace = IggyNamespace::from_raw(namespace_raw);
+                let up_to_offset = match shard
+                    .partition_read(
+                        namespace,
+                        PartitionRead::ResolveSegmentDeleteOffset {
+                            count: parsed.segments_count,
+                        },
+                    )
+                    .await
+                {
+                    Some(PartitionReadReply::SegmentDeleteOffset {
+                        up_to_offset: Some(offset),
+                    }) => offset,
+                    _ => 0,
+                };
+                Some(build_truncate_partition_client_message(
+                    &header,
+                    vsr_client_id,
+                    session,
+                    namespace.stream_id() as u32,
+                    namespace.topic_id() as u32,
+                    namespace.partition_id() as u32,
+                    up_to_offset,
+                ))
+            }
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "delete_segments: unresolved namespace"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    if let Some(truncate) = truncate
+        && submit_client_request_on_owner(shard, truncate)
+            .await
+            .is_none()
+    {
+        // Transient submit failure (not primary / view change). Stay silent;
+        // the SDK read-timeout replays the same request id, which re-resolves
+        // and commits. Acking here would advance the client past an unrecorded
+        // request and gap the next metadata op.
+        warn!(
+            transport_client_id,
+            "delete_segments: transient submit; client will replay"
+        );
+        return;
+    }
+
+    let commit = current_metadata_commit(shard);
+    let reply = build_empty_reply(&header, transport_client_id, session, commit);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "delete_segments: failed to send reply"
+        );
     }
 }
 

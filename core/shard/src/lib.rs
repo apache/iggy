@@ -37,6 +37,7 @@ use iggy_binary_protocol::{
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
+use iggy_common::{IggyExpiry, IggyTimestamp};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -247,6 +248,12 @@ pub enum PartitionRead {
     ClearGroupLastPolled {
         group_id: u64,
     },
+    /// Resolve a client `DeleteSegments` count into a concrete truncation
+    /// offset: the `end_offset` of the `count`-th oldest sealed segment. Run on
+    /// the owning shard, which alone holds the partition's segment state.
+    ResolveSegmentDeleteOffset {
+        count: u32,
+    },
 }
 
 /// Reply to a [`PartitionRead`].
@@ -268,6 +275,10 @@ pub enum PartitionReadReply {
     },
     /// Acknowledges a [`PartitionRead::ClearGroupLastPolled`].
     Ack,
+    /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
+    /// truncation offset, or `None` when the partition has no sealed segments
+    /// to delete.
+    SegmentDeleteOffset { up_to_offset: Option<u64> },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
@@ -531,6 +542,34 @@ pub enum LifecycleFrame {
     /// shard's `reconcile_queue` on receipt; tail drain on every frame
     /// catches dropped markers.
     ReconcileApply,
+    /// Per-shard segment-cleaner request: delete expired / over-budget sealed
+    /// segments of `namespace` on the pump, serialized with reads. The timer
+    /// task resolves `message_expiry` / `max_bytes` from metadata and stamps
+    /// `now`; the pump only mutates. Local and unreplicated — each replica
+    /// trims its own log (divergence is invisible: reads hit the primary).
+    CleanPartition {
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+    /// Reconciler-staged enforcement of a committed `TruncatePartition`
+    /// watermark: delete sealed segments up to `up_to_offset` on the pump,
+    /// serialized with reads. Each replica applies the committed offset
+    /// locally and idempotently.
+    TruncatePartition {
+        namespace: IggyNamespace,
+        up_to_offset: u64,
+    },
+    /// Reconciler-staged enforcement of a committed `PurgeTopic`: reset the
+    /// partition to a single empty segment at offset 0 and clear consumer
+    /// offsets on the pump, serialized with reads. `generation` is the
+    /// committed purge generation; the pump no-ops if the partition already
+    /// applied it, so a redundant reconcile pass never re-wipes live data.
+    PurgePartition {
+        namespace: IggyNamespace,
+        generation: u64,
+    },
 }
 
 /// Reconciler-staged partition mutation.
@@ -1039,6 +1078,55 @@ where
             return;
         };
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply));
+    }
+
+    /// Stage a segment-cleaner pass for `namespace` on this shard's pump. The
+    /// timer task resolves retention config off-pump and stamps `now`; the pump
+    /// is the single writer of partition state, so the deletion runs there,
+    /// serialized with reads.
+    pub fn request_clean_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
+            namespace,
+            now,
+            message_expiry,
+            max_bytes,
+        }));
+    }
+
+    /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
+    /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
+    /// this after observing a committed delete watermark for an owned partition.
+    pub fn request_truncate_partition(&self, namespace: IggyNamespace, up_to_offset: u64) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TruncatePartition {
+            namespace,
+            up_to_offset,
+        }));
+    }
+
+    /// Stage a `PurgePartition` enforcement for `namespace` on this shard's
+    /// pump: reset the partition to empty at offset 0 and clear consumer
+    /// offsets. The reconciler calls this after observing a committed purge
+    /// generation newer than the partition's locally applied one.
+    pub fn request_purge_partition(&self, namespace: IggyNamespace, generation: u64) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PurgePartition {
+            namespace,
+            generation,
+        }));
     }
 
     /// Drain and apply staged [`ReconcileOp`]s on the pump task.

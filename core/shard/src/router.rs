@@ -20,7 +20,7 @@ use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
@@ -541,6 +541,81 @@ where
             }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
+            }
+            LifecycleFrame::CleanPartition {
+                namespace,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                // Pump-side: the single writer of partition state. The timer
+                // task already resolved the retention decision off-pump, so
+                // this only mutates, serialized with reads on the same loop.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    let (segments, messages) = partition
+                        .clean_expired_segments(now, message_expiry, max_bytes)
+                        .await;
+                    if segments > 0 {
+                        tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            segments,
+                            messages,
+                            "segment cleaner removed sealed segments"
+                        );
+                    }
+                }
+            }
+            LifecycleFrame::TruncatePartition {
+                namespace,
+                up_to_offset,
+            } => {
+                // Pump-side enforcement of a committed delete watermark. The
+                // committed offset is identical on every replica, so the local
+                // deletion converges; idempotent if already trimmed past it.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    let (segments, messages) =
+                        partition.remove_sealed_segments_up_to(up_to_offset).await;
+                    if segments > 0 {
+                        tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            segments,
+                            messages,
+                            up_to_offset,
+                            "truncate-partition removed sealed segments"
+                        );
+                    }
+                }
+            }
+            LifecycleFrame::PurgePartition {
+                namespace,
+                generation,
+            } => {
+                // Pump-side enforcement of a committed `PurgeTopic`: reset the
+                // partition to empty at offset 0 and clear consumer offsets.
+                // Idempotent per generation -- skip if already applied so a
+                // redundant reconcile pass does not wipe messages sent since.
+                let config = self.plane.partitions().config().clone();
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace)
+                    && partition.applied_purge_generation() < generation
+                {
+                    match partition.purge(&config, generation).await {
+                        Ok(()) => tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            generation,
+                            "purge-partition reset partition to empty"
+                        ),
+                        Err(error) => tracing::error!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            generation,
+                            %error,
+                            "purge-partition failed to reset partition"
+                        ),
+                    }
+                }
             }
         }
     }

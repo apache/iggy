@@ -416,6 +416,20 @@ where
             partition.clear_group_last_polled(group_id);
         })
     }
+
+    /// Resolve a `DeleteSegments` count to the `end_offset` of the `count`-th
+    /// oldest sealed segment on the partition for `namespace`. The outer `None`
+    /// is a missing/tombstoned namespace; the inner `None` is a partition with
+    /// no deletable sealed segment.
+    pub fn nth_oldest_sealed_end_offset(
+        &self,
+        namespace: &IggyNamespace,
+        count: u32,
+    ) -> Option<Option<u64>> {
+        self.with_partition(namespace, |partition| {
+            partition.nth_oldest_sealed_end_offset(count)
+        })
+    }
 }
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>

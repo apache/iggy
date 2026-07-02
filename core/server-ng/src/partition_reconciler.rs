@@ -294,6 +294,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
+    reconcile_segment_truncations(ctx);
+    reconcile_partition_purges(ctx);
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -756,6 +758,48 @@ fn fetch_topic_stats(
 
 fn shards_table_contains(ctx: &ReconcilerCtx, ns: IggyNamespace) -> bool {
     ctx.shard.shards_table().shard_for(ns).is_some()
+}
+
+/// Enforce committed `TruncatePartition` watermarks: for each owned partition
+/// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
+/// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
+/// so a redundant pass triggered by an unrelated revision bump is harmless.
+fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
+    let namespaces: Vec<_> = ctx.shard.plane.partitions().namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let watermark = streams.partition_delete_watermark(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        if watermark > 0 {
+            ctx.shard.request_truncate_partition(namespace, watermark);
+        }
+    }
+}
+
+/// Stage a `PurgePartition` reset for every owned partition whose committed
+/// `PurgeTopic` generation is newer than the one the local partition last
+/// applied. The pump re-checks the generation before wiping, so a redundant
+/// pass (e.g. from an unrelated revision bump) is a no-op.
+fn reconcile_partition_purges(ctx: &ReconcilerCtx) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let committed = streams.partition_purge_generation(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let applied = partitions
+            .get_by_ns(&namespace)
+            .map_or(0, partitions::IggyPartition::applied_purge_generation);
+        if committed > applied {
+            ctx.shard.request_purge_partition(namespace, committed);
+        }
+    }
 }
 
 pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {

@@ -11670,7 +11670,6 @@ version = "0.8.1-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
- "argon2",
  "async-channel",
  "async_zip",
  "axum",
@@ -11707,7 +11706,6 @@ dependencies = [
  "opentelemetry_sdk",
  "papaya",
  "prometheus-client",
- "rand 0.10.1",
  "ringbuffer",
  "rmp-serde",
  "rolling-file",
@@ -11825,6 +11823,7 @@ name = "server_common"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
+ "argon2",
  "bytemuck",
  "bytes",
  "compio",
@@ -11837,6 +11836,7 @@ dependencies = [
  "lending-iterator",
  "moka",
  "nix",
+ "rand 0.10.1",
  "rcgen",
  "rustls",
  "serial_test",
@@ -12048,6 +12048,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "bytes",
+ "clap",
  "consensus",
  "enumset",
  "futures",

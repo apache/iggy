@@ -30,6 +30,7 @@ use server::bootstrap::{
     load_metadata, resolve_persister, update_system_info,
 };
 use server::diagnostics::{
+    ASYNCIFY_POOL_DISABLED_PANIC_MSG, print_incomplete_io_uring_ops_info,
     print_invalid_io_uring_args_info, print_io_uring_permission_info,
     print_locked_memory_limit_info,
 };
@@ -63,6 +64,11 @@ const SHARDS_TABLE_CAPACITY: usize = 16384;
 static SHUTDOWN_START_TIME: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
 static SHARD_EXECUTOR_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
+// Separate latch from SHARD_EXECUTOR_DIAGNOSTIC: a shard that fails ring setup
+// (e.g. partial ENOMEM under a tight RLIMIT_MEMLOCK) must not consume the latch
+// and suppress the unsupported-opcode diagnostic from a sibling shard that did
+// start. Setup vs runtime io_uring failures can co-occur across shards.
+static SHARD_RUNTIME_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
 
 enum ShardExitStatus {
     Success,
@@ -506,6 +512,10 @@ fn main() -> Result<(), ServerError> {
                         }
                         ShardExitStatus::Panic(msg) => {
                             error!("Shard {shard_id} panicked: {msg}");
+                            if msg.contains(ASYNCIFY_POOL_DISABLED_PANIC_MSG) {
+                                SHARD_RUNTIME_DIAGNOSTIC
+                                    .call_once(print_incomplete_io_uring_ops_info);
+                            }
                             if failure_message.is_none() {
                                 failure_message =
                                     Some(format!("Shard {shard_id} panicked: {msg}"));

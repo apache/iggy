@@ -46,7 +46,7 @@ use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader, WireDecode, WireI
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
+    IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
 };
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus};
@@ -106,6 +106,11 @@ where
     consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     observed_view: u32,
+    /// Highest `PurgeTopic` generation this replica has locally applied (reset
+    /// the partition to empty). The reconciler compares the committed metadata
+    /// generation against this and resets only when it advances, so a redundant
+    /// reconcile pass never re-wipes a partition already at this generation.
+    applied_purge_generation: u64,
 }
 
 /// Post-preflight dispatch in `on_request`: replicate via VSR or take the
@@ -194,7 +199,13 @@ where
             consumer_offset_enforce_fsync: false,
             pending_consumer_offset_commits: HashMap::new(),
             observed_view,
+            applied_purge_generation: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn applied_purge_generation(&self) -> u64 {
+        self.applied_purge_generation
     }
 
     #[must_use]
@@ -2257,6 +2268,348 @@ where
         Ok(())
     }
 
+    /// Minimum committed offset across all consumers and consumer groups, with
+    /// the holder's identity. `None` when nothing has been committed, in which
+    /// case there is no deletion barrier.
+    fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
+        let consumer_guard = self.consumer_offsets.pin();
+        let group_guard = self.consumer_group_offsets.pin();
+        let consumers = consumer_guard.iter().map(|(_, offset)| {
+            (
+                offset.offset.load(Ordering::Relaxed),
+                offset.kind,
+                offset.consumer_id,
+            )
+        });
+        let groups = group_guard.iter().map(|(_, offset)| {
+            (
+                offset.offset.load(Ordering::Relaxed),
+                offset.kind,
+                offset.consumer_id,
+            )
+        });
+        consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
+    }
+
+    /// Time-expiry plus size-retention in one pass: remove the leading sealed
+    /// segments that have expired or that push the partition past `max_bytes`.
+    /// Returns the `(segments, messages)` removed.
+    pub async fn clean_expired_segments(
+        &mut self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> (u64, u64) {
+        let expired = leading_expired_end(self.log.segments(), now, message_expiry);
+        let oversized =
+            max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
+        let Some(up_to) = expired.into_iter().chain(oversized).max() else {
+            return (0, 0);
+        };
+        self.remove_sealed_segments_up_to(up_to).await
+    }
+
+    /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
+    /// never the active segment and never past the consumer barrier (the
+    /// minimum committed consumer/group offset). Unlinks the messages and
+    /// index files and decrements partition stats. Idempotent: an offset below
+    /// the oldest sealed segment removes nothing. Returns the
+    /// `(segments, messages)` removed.
+    ///
+    /// Holds `write_lock` to serialize against the commit/rotate path, which
+    /// runs on the separate consensus-tick loop.
+    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> (u64, u64) {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let barrier = self.min_committed_offset();
+        let namespace = self.namespace();
+        let removable = {
+            let segments = self.log.segments();
+            let last_idx = segments.len().saturating_sub(1);
+            let mut removable = 0usize;
+            for (idx, segment) in segments.iter().enumerate() {
+                if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
+                    break;
+                }
+                if let Some((barrier_offset, kind, consumer_id)) = barrier
+                    && segment.end_offset > barrier_offset
+                {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = namespace.inner(),
+                        start_offset = segment.start_offset,
+                        end_offset = segment.end_offset,
+                        barrier = barrier_offset,
+                        %kind,
+                        consumer_id,
+                        "segment retained: blocked by committed consumer offset"
+                    );
+                    break;
+                }
+                removable += 1;
+            }
+            removable
+        };
+
+        let mut deleted_segments = 0u64;
+        let mut deleted_messages = 0u64;
+        for _ in 0..removable {
+            // The removable run is always a prefix (oldest first), so the next
+            // victim is index 0 once the previous one is gone.
+            let segment = self.log.segments_mut().remove(0);
+            let mut storage = self.log.storages_mut().remove(0);
+            self.log.indexes_mut().remove(0);
+            self.log.messages_writers_mut().remove(0);
+            self.log.index_writers_mut().remove(0);
+
+            let (messages_path, index_path) = storage.segment_and_index_paths();
+            let _ = storage.shutdown();
+            drop(storage);
+
+            for path in messages_path.into_iter().chain(index_path) {
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            namespace_raw = namespace.inner(),
+                            path = %path,
+                            %error,
+                            "failed to unlink segment file during cleanup"
+                        );
+                    }
+                }
+            }
+
+            let segment_size = segment.size.as_bytes_u64();
+            // The removal loop above only reaches sealed segments, which always
+            // hold at least one message, so the count is inclusive end..=start.
+            // A one-message sealed segment has `start_offset == end_offset`, so
+            // the `+ 1` is required (a `start == end -> 0` special case would
+            // undercount it).
+            let messages_in_segment = segment.end_offset - segment.start_offset + 1;
+            self.stats.decrement_size_bytes(segment_size);
+            self.stats.decrement_segments_count(1);
+            self.stats.decrement_messages_count(messages_in_segment);
+
+            deleted_segments += 1;
+            deleted_messages += messages_in_segment;
+
+            debug!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                start_offset = segment.start_offset,
+                end_offset = segment.end_offset,
+                "deleted sealed segment during cleanup"
+            );
+        }
+
+        (deleted_segments, deleted_messages)
+    }
+
+    /// Build and install a fresh empty segment starting at `start_offset` with
+    /// real on-disk writers. Paths are derived from the partition directory
+    /// (see `rotate_segment`); falls back to the config-derived path for
+    /// in-memory partitions with no directory.
+    ///
+    /// # Errors
+    /// If the segment's log / index file cannot be created.
+    async fn install_empty_segment(
+        &mut self,
+        config: &PartitionsConfig,
+        start_offset: u64,
+    ) -> Result<(), IggyError> {
+        let namespace = self.namespace();
+        let (messages_path, index_path) = self.partition_dir().map_or_else(
+            || {
+                (
+                    config.get_messages_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                    config.get_index_path(
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                        namespace.partition_id(),
+                        start_offset,
+                    ),
+                )
+            },
+            |dir| {
+                (
+                    format!("{dir}/{start_offset:0>20}.log"),
+                    format!("{dir}/{start_offset:0>20}.index"),
+                )
+            },
+        );
+        let segment = Segment::new(start_offset, config.segment_size);
+        let storage = SegmentStorage::new(
+            &messages_path,
+            &index_path,
+            0,
+            0,
+            config.enforce_fsync,
+            config.enforce_fsync,
+            false,
+        )
+        .await
+        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let messages_size_bytes = storage
+            .messages_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
+            .size_counter();
+        let messages_writer = Rc::new(
+            MessagesWriter::new(
+                &messages_path,
+                messages_size_bytes,
+                config.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
+        );
+        let index_writer = Rc::new(
+            IggyIndexWriter::new(
+                &index_path,
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                config.enforce_fsync,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+        );
+        self.log
+            .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
+        Ok(())
+    }
+
+    /// Reset the partition to a single empty segment at offset 0 and clear all
+    /// consumer / consumer-group offsets (memory + disk). This is the local
+    /// effect of a committed `PurgeTopic`: it wipes message data and offsets but
+    /// preserves the partition and its consumer-group membership. Mirrors the
+    /// legacy server's `purge_all_segments` + offset-file deletion.
+    ///
+    /// Records `generation` as the applied purge generation so the reconciler
+    /// does not re-wipe a partition already purged at this generation (a later
+    /// `PurgeTopic` advances the committed generation and triggers a fresh pass).
+    ///
+    /// # Errors
+    /// If the replacement segment's log / index file cannot be created.
+    pub async fn purge(
+        &mut self,
+        config: &PartitionsConfig,
+        generation: u64,
+    ) -> Result<(), IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let namespace = self.namespace();
+
+        // Drain every segment (including the active one) and unlink its files.
+        let segment_count = self.log.segments().len();
+        for _ in 0..segment_count {
+            self.log.segments_mut().remove(0);
+            let mut storage = self.log.storages_mut().remove(0);
+            self.log.indexes_mut().remove(0);
+            self.log.messages_writers_mut().remove(0);
+            self.log.index_writers_mut().remove(0);
+
+            let (messages_path, index_path) = storage.segment_and_index_paths();
+            let _ = storage.shutdown();
+            drop(storage);
+
+            for path in messages_path.into_iter().chain(index_path) {
+                match compio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            namespace_raw = namespace.inner(),
+                            path = %path,
+                            %error,
+                            "failed to unlink segment file during purge"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Recreate a fresh empty segment at offset 0 with real writers.
+        let start_offset = 0u64;
+        self.install_empty_segment(config, start_offset).await?;
+
+        // Reset the offset counters so new messages start at offset 0.
+        self.offset.store(start_offset, Ordering::Release);
+        self.dirty_offset.store(start_offset, Ordering::Relaxed);
+        self.should_increment_offset = false;
+
+        // Clear consumer + consumer-group offsets (memory + disk). Collect the
+        // file paths before deleting so the map guard is not held across an
+        // await.
+        let consumer_paths: Vec<String> = {
+            let guard = self.consumer_offsets.pin();
+            let paths = guard
+                .iter()
+                .filter_map(|(key, _)| {
+                    u32::try_from(*key)
+                        .ok()
+                        .and_then(|id| self.persisted_offset_path(ConsumerKind::Consumer, id))
+                })
+                .collect();
+            guard.clear();
+            paths
+        };
+        let group_paths: Vec<String> = {
+            let guard = self.consumer_group_offsets.pin();
+            let paths = guard
+                .iter()
+                .filter_map(|(key, _)| {
+                    u32::try_from(key.0)
+                        .ok()
+                        .and_then(|id| self.persisted_offset_path(ConsumerKind::ConsumerGroup, id))
+                })
+                .collect();
+            guard.clear();
+            paths
+        };
+        for path in consumer_paths.into_iter().chain(group_paths) {
+            let _ = delete_persisted_offset(&path).await;
+        }
+
+        // Clear the ephemeral cooperative-rebalance tracking too: after the
+        // reset to offset 0 a stale `last_polled` (a high pre-purge offset)
+        // would make the reconciler's completion check `committed >= last_polled`
+        // unsatisfiable, stalling a pending revocation until its timeout.
+        self.last_polled_offsets.pin().clear();
+
+        // Reset stats to a single empty segment.
+        self.stats.zero_out_all();
+        self.stats.increment_segments_count(1);
+
+        self.applied_purge_generation = generation;
+        Ok(())
+    }
+
+    /// `end_offset` of the `count`-th oldest sealed (non-active) segment, used
+    /// to resolve a client `DeleteSegments` count into a concrete truncation
+    /// offset on the owning shard. `None` when there are no deletable sealed
+    /// segments; clamps to the last sealed segment when fewer than `count`
+    /// exist.
+    #[must_use]
+    pub fn nth_oldest_sealed_end_offset(&self, count: u32) -> Option<u64> {
+        nth_oldest_sealed_end(self.log.segments(), count)
+    }
+
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
         // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
         // Both `SendMessages` (via `append_send_messages_to_journal`) and
@@ -2300,6 +2653,66 @@ fn accumulate_committed_info(
     }
     info.end_timestamp = base_timestamp;
     info.max_timestamp = info.max_timestamp.max(base_timestamp);
+}
+
+/// Highest `end_offset` among the leading run of expired sealed segments, or
+/// `None` when none are expired. The last element is the active segment and is
+/// never considered. `expiry` must be resolved; a `ServerDefault` expires
+/// nothing (see [`Segment::is_expired`]).
+fn leading_expired_end(
+    segments: &[Segment],
+    now: IggyTimestamp,
+    expiry: IggyExpiry,
+) -> Option<u64> {
+    let last_idx = segments.len().saturating_sub(1);
+    let mut up_to = None;
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == last_idx || !segment.is_expired(now, expiry) {
+            break;
+        }
+        up_to = Some(segment.end_offset);
+    }
+    up_to
+}
+
+/// Highest `end_offset` to drop so the resident size falls to `max_bytes`, or
+/// `None` when already under budget. The active segment (last element) is
+/// never dropped. The budget is per-partition: the cluster has no single owner
+/// of a topic-wide total, so each replica trims its own log.
+fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
+    let last_idx = segments.len().saturating_sub(1);
+    let mut resident: u64 = segments
+        .iter()
+        .map(|segment| segment.size.as_bytes_u64())
+        .sum();
+    let mut up_to = None;
+    for (idx, segment) in segments.iter().enumerate() {
+        if idx == last_idx || !segment.sealed || resident <= max_bytes {
+            break;
+        }
+        resident -= segment.size.as_bytes_u64();
+        up_to = Some(segment.end_offset);
+    }
+    up_to
+}
+
+/// `end_offset` of the `count`-th oldest sealed (non-active) segment of
+/// `segments`, or `None` when there is no deletable sealed segment. Clamps to
+/// the last sealed segment when fewer than `count` exist.
+fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
+    if count == 0 {
+        return None;
+    }
+    // Exclude the active (last) segment, take the leading sealed run, then the
+    // `count`-th of those (or the last available when fewer exist).
+    let last_idx = segments.len().saturating_sub(1);
+    segments
+        .iter()
+        .take(last_idx)
+        .take_while(|segment| segment.sealed)
+        .take(count as usize)
+        .map(|segment| segment.end_offset)
+        .last()
 }
 
 #[cfg(test)]
@@ -2552,5 +2965,127 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use iggy_common::IggyDuration;
+    use std::time::Duration;
+
+    fn segment(end_offset: u64, max_timestamp: u64, size: u64, sealed: bool) -> Segment {
+        let mut segment = Segment::new(0, IggyByteSize::from(0u64));
+        segment.end_offset = end_offset;
+        segment.max_timestamp = max_timestamp;
+        segment.size = IggyByteSize::from(size);
+        segment.sealed = sealed;
+        segment
+    }
+
+    fn one_second() -> IggyExpiry {
+        IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)))
+    }
+
+    #[test]
+    fn leading_expired_end_skips_active_and_returns_last_expired() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false), // active: never considered
+        ];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), one_second()),
+            Some(29)
+        );
+    }
+
+    #[test]
+    fn leading_expired_end_stops_at_first_unexpired() {
+        let now = IggyTimestamp::now();
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_hours(1)));
+        let segments = vec![
+            segment(9, 1, 100, true),                // expired
+            segment(19, now.as_micros(), 100, true), // recent: not expired, stops run
+            segment(29, 1, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(leading_expired_end(&segments, now, expiry), Some(9));
+    }
+
+    #[test]
+    fn leading_expired_end_none_for_never_expire() {
+        let segments = vec![segment(9, 1, 100, true), segment(19, 0, 100, false)];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), IggyExpiry::NeverExpire),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_expired_end_none_for_lone_active_segment() {
+        let segments = vec![segment(9, 1, 100, false)];
+        assert_eq!(
+            leading_expired_end(&segments, IggyTimestamp::now(), one_second()),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_oversized_end_trims_oldest_until_under_budget() {
+        // 4 x 100 = 400 resident, active excluded. Budget 250: drop seg0 (300
+        // left) then seg1 (200 <= 250, stop). up_to = seg1.end_offset.
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(leading_oversized_end(&segments, 250), Some(19));
+    }
+
+    #[test]
+    fn leading_oversized_end_none_when_under_budget() {
+        let segments = vec![segment(9, 1, 100, true), segment(19, 0, 100, false)];
+        assert_eq!(leading_oversized_end(&segments, 10_000), None);
+    }
+
+    #[test]
+    fn leading_oversized_end_never_drops_active_segment() {
+        let segments = vec![segment(9, 1, 1_000, false)];
+        assert_eq!(leading_oversized_end(&segments, 10), None);
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_resolves_count_to_offset() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, true),
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false), // active: excluded
+        ];
+        assert_eq!(nth_oldest_sealed_end(&segments, 1), Some(9));
+        assert_eq!(nth_oldest_sealed_end(&segments, 2), Some(19));
+        // More than available sealed: clamps to the last sealed segment.
+        assert_eq!(nth_oldest_sealed_end(&segments, 10), Some(29));
+        assert_eq!(nth_oldest_sealed_end(&segments, 0), None);
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_stops_at_first_unsealed() {
+        let segments = vec![
+            segment(9, 1, 100, true),
+            segment(19, 2, 100, false), // unsealed mid-run stops the count
+            segment(29, 3, 100, true),
+            segment(39, 0, 100, false),
+        ];
+        assert_eq!(nth_oldest_sealed_end(&segments, 5), Some(9));
+    }
+
+    #[test]
+    fn nth_oldest_sealed_end_none_for_lone_active_segment() {
+        let segments = vec![segment(9, 1, 100, false)];
+        assert_eq!(nth_oldest_sealed_end(&segments, 1), None);
     }
 }
