@@ -326,8 +326,6 @@ read_current_version() {
             grep '^version = ' "$abs_file" | head -1 | sed 's/version = "\(.*\)"/\1/' ;;
         php-cargo)
             grep '^version = ' "$abs_file" | head -1 | sed 's/version = "\(.*\)"/\1/' ;;
-        composer)
-            grep '"version"' "$abs_file" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' ;;
         json)
             grep '"version"' "$abs_file" | head -1 | sed 's/.*"version": *"\([^"]*\)".*/\1/' ;;
         csproj)
@@ -374,8 +372,6 @@ write_version() {
             sedi '/^\[project\]/,/^\[/{s/^version = ".*"/version = "'"${translated}"'"/;}' "$abs_file" ;;
         php-cargo)
             sedi "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
-        composer)
-            sedi "1,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/;}" "$abs_file" ;;
         json)
             sedi "1,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/;}" "$abs_file" ;;
         csproj)

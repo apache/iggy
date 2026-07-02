@@ -19,6 +19,7 @@
 name = "iggy-php"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96.0"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
 description = "PHP extension bindings for Apache Iggy."

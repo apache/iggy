@@ -16,7 +16,7 @@
 # under the License.
 
 name: php-post-merge
-description: PHP post-merge GitHub release publishing with pre-built PIE extension archives
+description: PHP post-merge GitHub release publishing with source-only PHP SDK archives
 
 inputs:
   version:
@@ -33,9 +33,9 @@ inputs:
     required: false
     default: "false"
   packages_artifact:
-    description: "Name of the artifact containing PHP extension archives"
+    description: "Name of the artifact containing PHP source release files"
     required: false
-    default: "php-extensions-all"
+    default: "php-release-all"
   packages_path:
     description: "Path where PHP packages should be downloaded"
     required: false
@@ -57,13 +57,13 @@ runs:
         echo "Version format valid: $VERSION"
       shell: bash
 
-    - name: Download pre-built PHP packages
+    - name: Download PHP source package
       uses: actions/download-artifact@v8
       with:
         name: ${{ inputs.packages_artifact }}
         path: ${{ inputs.packages_path }}
 
-    - name: Validate downloaded PHP packages
+    - name: Validate downloaded PHP source package
       run: |
         set -euo pipefail
 
@@ -76,19 +76,8 @@ runs:
         fi
 
         expected=(
-          "php_iggy_php-${VERSION}_php8.3-x86_64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-x86_64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-arm64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-arm64-linux-glibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-x86_64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-x86_64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-arm64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-arm64-linux-musl-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-x86_64-darwin-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-x86_64-darwin-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.3-arm64-darwin-bsdlibc-nts.zip"
-          "php_iggy_php-${VERSION}_php8.4-arm64-darwin-bsdlibc-nts.zip"
           "apache-iggy-php-${VERSION}-source.tar.gz"
+          "apache-iggy-php-${VERSION}-LICENSE-binary.txt"
         )
 
         missing=0
@@ -102,21 +91,24 @@ runs:
           exit 1
         fi
 
-        echo "Validating PHP extension archive contents:"
-        for archive in "$PACKAGES_PATH"/*.zip; do
-          filename="$(basename "$archive")"
-          echo "  - $filename"
-          members="$(unzip -Z1 "$archive")"
-          for member in iggy_php.so LICENSE NOTICE LICENSE-binary; do
-            if ! grep -qx "$member" <<< "$members"; then
-              echo "Archive $filename is missing $member"
-              exit 1
-            fi
-          done
+        source_archive="$PACKAGES_PATH/apache-iggy-php-${VERSION}-source.tar.gz"
+        echo "Validating PHP source archive contents:"
+        members="$(tar -tzf "$source_archive")"
+        for member in Cargo.toml composer.json LICENSE NOTICE src/lib.rs rust-toolchain.toml; do
+          if ! grep -qx "apache-iggy-php-${VERSION}/${member}" <<< "$members"; then
+            echo "Source archive is missing $member"
+            exit 1
+          fi
         done
 
+        license_manifest="$PACKAGES_PATH/apache-iggy-php-${VERSION}-LICENSE-binary.txt"
+        if [ ! -s "$license_manifest" ]; then
+          echo "License manifest is empty: $(basename "$license_manifest")"
+          exit 1
+        fi
+
         echo ""
-        echo "Packages ready for publishing:"
+        echo "PHP release files ready for publishing:"
         find "$PACKAGES_PATH" -maxdepth 1 -type f -print | sort | while IFS= read -r file; do
           size="$(du -h "$file" | cut -f1)"
           echo "  - $(basename "$file") ($size)"
@@ -130,7 +122,7 @@ runs:
         VERSION="${{ inputs.version }}"
         TAG="${{ inputs.tag }}"
 
-        echo "DRY RUN - Would publish PHP SDK:"
+        echo "DRY RUN - Would publish PHP SDK source package:"
         echo ""
         echo "Package: apache/iggy-php"
         echo "Version: $VERSION"
@@ -168,7 +160,7 @@ runs:
         {
           echo "Apache Iggy PHP SDK ${VERSION}"
           echo ""
-          echo "This GitHub release contains downstream convenience binaries for the PHP extension."
+          echo "This GitHub release contains the PHP SDK source package and generated license manifest."
           echo "The canonical Apache source release remains the ASF release artifact."
         } > "$release_notes"
 

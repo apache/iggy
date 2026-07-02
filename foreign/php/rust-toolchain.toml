@@ -15,11 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
-
-[target.'cfg(target_env = "musl")']
-rustflags = ["-C", "target-feature=-crt-static"]
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "default"

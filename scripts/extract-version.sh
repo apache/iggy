@@ -426,7 +426,7 @@ fi
 #   .devN       (Python SDK PEP 440 development markers)
 #   rcN$        (legacy bare rcN, retained for compatibility)
 if [[ "$RETURN_IS_PRE_RELEASE" == "true" ]]; then
-    if [[ "$VERSION" =~ -[0-9A-Za-z] ]] \
+    if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z] ]] \
        || [[ "$VERSION" =~ \.dev[0-9]+$ ]] \
        || [[ "$VERSION" =~ rc[0-9]+$ ]]; then
         echo "true"

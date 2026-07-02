@@ -80,6 +80,13 @@ if [ -n "$COMPOSER_VERSION_LINE" ]; then
     COMPOSER_VERSION=$(printf '%s\n' "$COMPOSER_VERSION_LINE" | sed 's/.*"version": *"\([^"]*\)".*/\1/')
 fi
 
+validate_composer_json() {
+    if ! python3 -c 'import json, sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$COMPOSER_JSON"; then
+        echo -e "${RED}Error: Invalid JSON in $COMPOSER_JSON${NC}"
+        exit 1
+    fi
+}
+
 if [ -z "$PHP_CARGO_VERSION" ]; then
     echo -e "${RED}Error: Could not extract version from $PHP_CARGO_TOML${NC}"
     exit 1
@@ -89,6 +96,7 @@ if [ -z "$RUST_SDK_VERSION" ]; then
     echo -e "${RED}Error: Could not extract version from $RUST_SDK_CARGO_TOML${NC}"
     exit 1
 fi
+validate_composer_json
 
 echo "PHP SDK version check:"
 echo "  PHP Cargo.toml:       $PHP_CARGO_VERSION"
@@ -158,6 +166,7 @@ if grep -q '"version"' "$COMPOSER_JSON"; then
     echo -e "${RED}Error: Failed to remove version field from $COMPOSER_JSON${NC}"
     exit 1
 fi
+validate_composer_json
 
 PHP_IGGY_DEP_LINE=$(grep '^iggy = ' "$PHP_CARGO_TOML" | head -1 || true)
 PHP_IGGY_DEP_VERSION=""

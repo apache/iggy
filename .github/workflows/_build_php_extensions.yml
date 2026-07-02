@@ -36,10 +36,10 @@ on:
         type: string
         required: false
         default: ""
-        description: "Specific commit to checkout for building PHP extensions"
+        description: "Specific commit to checkout for building PHP extension source"
     outputs:
       artifact_name:
-        description: "Name of the uploaded artifact containing PHP extension archives"
+        description: "Name of the uploaded artifact containing PHP source release files"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
 permissions:
@@ -47,7 +47,7 @@ permissions:
 
 jobs:
   license-manifest:
-    name: Generate PHP binary license manifest
+    name: Generate PHP license manifest
     runs-on: ubuntu-latest
     steps:
       - name: Download latest copy script from master
@@ -84,298 +84,9 @@ jobs:
           path: foreign/php/LICENSE-binary
           retention-days: 7
 
-  linux:
-    name: PHP ${{ matrix.php }} ${{ matrix.arch }} linux-${{ matrix.libc }}
-    needs: license-manifest
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - php: "8.3"
-            arch: x86_64
-            libc: glibc
-            runner: ubuntu-latest
-            image: php:8.3-cli-bookworm
-          - php: "8.4"
-            arch: x86_64
-            libc: glibc
-            runner: ubuntu-latest
-            image: php:8.4-cli-bookworm
-          - php: "8.3"
-            arch: arm64
-            libc: glibc
-            runner: ubuntu-24.04-arm
-            image: php:8.3-cli-bookworm
-          - php: "8.4"
-            arch: arm64
-            libc: glibc
-            runner: ubuntu-24.04-arm
-            image: php:8.4-cli-bookworm
-          - php: "8.3"
-            arch: x86_64
-            libc: musl
-            runner: ubuntu-latest
-            image: php:8.3-cli-alpine
-          - php: "8.4"
-            arch: x86_64
-            libc: musl
-            runner: ubuntu-latest
-            image: php:8.4-cli-alpine
-          - php: "8.3"
-            arch: arm64
-            libc: musl
-            runner: ubuntu-24.04-arm
-            image: php:8.3-cli-alpine
-          - php: "8.4"
-            arch: arm64
-            libc: musl
-            runner: ubuntu-24.04-arm
-            image: php:8.4-cli-alpine
-    steps:
-      - name: Download latest copy script from master
-        if: inputs.use_latest_ci
-        run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
-            -o /tmp/copy-latest-from-master.sh
-          chmod +x /tmp/copy-latest-from-master.sh
-
-      - uses: actions/checkout@v6.0.2
-        with:
-          ref: ${{ inputs.commit }}
-
-      - name: Save and apply latest CI from master
-        if: inputs.use_latest_ci
-        run: |
-          /tmp/copy-latest-from-master.sh save .github scripts
-          /tmp/copy-latest-from-master.sh apply
-
-      - name: Download license manifest
-        uses: actions/download-artifact@v8
-        with:
-          name: php-license-binary
-          path: foreign/php
-
-      - name: Setup PHP release tools
-        id: release
-        uses: ./.github/actions/php/setup-release-tools
-        with:
-          version: ${{ inputs.version }}
-
-      - name: Cache Linux PHP cargo state
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/php-cargo-home/registry
-            target/php-cargo-home/git
-            target/php-rustup-home
-          key: php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-php${{ matrix.php }}-${{ hashFiles('Cargo.lock', 'foreign/php/Cargo.toml') }}
-          restore-keys: |
-            php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-php${{ matrix.php }}-
-            php-release-linux-${{ matrix.arch }}-${{ matrix.libc }}-
-            php-release-linux-${{ matrix.arch }}-
-
-      - name: Build and package PHP extension
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-          PHP_VERSION: ${{ matrix.php }}
-          PHP_ARCH: ${{ matrix.arch }}
-          PHP_LIBC: ${{ matrix.libc }}
-          PHP_IMAGE: ${{ matrix.image }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p foreign/php/dist
-
-          docker run --rm \
-            -e CARGO_TERM_COLOR=always \
-            -e CARGO_HOME=/workspace/target/php-cargo-home \
-            -e RUSTUP_HOME=/workspace/target/php-rustup-home \
-            -e "CARGO_TARGET_DIR=/workspace/target/php-release-${PHP_VERSION}-${PHP_ARCH}-${PHP_LIBC}" \
-            -e VERSION="${VERSION}" \
-            -e PHP_VERSION="${PHP_VERSION}" \
-            -e PHP_ARCH="${PHP_ARCH}" \
-            -e PHP_LIBC="${PHP_LIBC}" \
-            -v "$PWD:/workspace" \
-            -w /workspace \
-            "${PHP_IMAGE}" \
-            sh -lc '
-              set -eu
-
-              if command -v apt-get >/dev/null 2>&1; then
-                apt-get update
-                apt-get install -y --no-install-recommends \
-                  build-essential \
-                  ca-certificates \
-                  clang \
-                  curl \
-                  git \
-                  libclang-dev \
-                  libhwloc-dev \
-                  libssl-dev \
-                  libudev-dev \
-                  pkg-config \
-                  zip
-                rm -rf /var/lib/apt/lists/*
-              else
-                apk add --no-cache \
-                  build-base \
-                  ca-certificates \
-                  clang \
-                  clang-dev \
-                  curl \
-                  eudev-dev \
-                  git \
-                  hwloc-dev \
-                  linux-headers \
-                  openssl-dev \
-                  pkgconf \
-                  zip
-              fi
-
-              mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
-              if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-                curl -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-                sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none
-              fi
-              . "$CARGO_HOME/env"
-              rustup show
-
-              php --version
-              php-config --version
-              cargo build --release --manifest-path foreign/php/Cargo.toml
-
-              extension="$(find "${CARGO_TARGET_DIR}/release" -maxdepth 1 -name "libiggy_php.so" -print -quit)"
-              if [ -z "$extension" ]; then
-                echo "PHP extension was not produced"
-                exit 1
-              fi
-
-              package_dir="$(mktemp -d)"
-              cp "$extension" "$package_dir/iggy_php.so"
-              cp foreign/php/LICENSE "$package_dir/LICENSE"
-              cp foreign/php/NOTICE "$package_dir/NOTICE"
-              cp foreign/php/LICENSE-binary "$package_dir/LICENSE-binary"
-
-              archive="php_iggy_php-${VERSION}_php${PHP_VERSION}-${PHP_ARCH}-linux-${PHP_LIBC}-nts.zip"
-              (cd "$package_dir" && zip -9 "/workspace/foreign/php/dist/${archive}" iggy_php.so LICENSE NOTICE LICENSE-binary)
-              rm -rf "$package_dir"
-            '
-
-          ls -lh foreign/php/dist
-
-      - name: Upload PHP extension archive
-        if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: php-package-linux-${{ matrix.arch }}-${{ matrix.libc }}-php${{ matrix.php }}
-          path: foreign/php/dist/*.zip
-          retention-days: 7
-
-  macos:
-    name: PHP ${{ matrix.php }} ${{ matrix.arch }} macos
-    needs: license-manifest
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - php: "8.3"
-            arch: x86_64
-            runner: macos-15-intel
-          - php: "8.4"
-            arch: x86_64
-            runner: macos-15-intel
-          - php: "8.3"
-            arch: arm64
-            runner: macos-15
-          - php: "8.4"
-            arch: arm64
-            runner: macos-15
-    steps:
-      - name: Download latest copy script from master
-        if: inputs.use_latest_ci
-        run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
-            -o /tmp/copy-latest-from-master.sh
-          chmod +x /tmp/copy-latest-from-master.sh
-
-      - uses: actions/checkout@v6.0.2
-        with:
-          ref: ${{ inputs.commit }}
-
-      - name: Save and apply latest CI from master
-        if: inputs.use_latest_ci
-        run: |
-          /tmp/copy-latest-from-master.sh save .github scripts
-          /tmp/copy-latest-from-master.sh apply
-
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
-          tools: none
-
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          shared-key: php-release
-          save-cache: "false"
-
-      - name: Download license manifest
-        uses: actions/download-artifact@v8
-        with:
-          name: php-license-binary
-          path: foreign/php
-
-      - name: Setup PHP release tools
-        id: release
-        uses: ./.github/actions/php/setup-release-tools
-        with:
-          version: ${{ inputs.version }}
-
-      - name: Build and package PHP extension
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-          PHP_VERSION: ${{ matrix.php }}
-          PHP_ARCH: ${{ matrix.arch }}
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target/php-release-${{ matrix.php }}-${{ matrix.arch }}-macos
-        run: |
-          set -euo pipefail
-
-          php --version
-          php-config --version
-          cargo build --release --manifest-path foreign/php/Cargo.toml
-
-          extension="$(find "${CARGO_TARGET_DIR}/release" -maxdepth 1 \( -name 'libiggy_php.so' -o -name 'libiggy_php.dylib' \) -print -quit)"
-          if [ -z "$extension" ]; then
-            echo "PHP extension was not produced"
-            exit 1
-          fi
-
-          mkdir -p foreign/php/dist
-          package_dir="$(mktemp -d)"
-          cp "$extension" "$package_dir/iggy_php.so"
-          cp foreign/php/LICENSE "$package_dir/LICENSE"
-          cp foreign/php/NOTICE "$package_dir/NOTICE"
-          cp foreign/php/LICENSE-binary "$package_dir/LICENSE-binary"
-
-          archive="php_iggy_php-${VERSION}_php${PHP_VERSION}-${PHP_ARCH}-darwin-bsdlibc-nts.zip"
-          (cd "$package_dir" && zip -9 "${{ github.workspace }}/foreign/php/dist/${archive}" iggy_php.so LICENSE NOTICE LICENSE-binary)
-          rm -rf "$package_dir"
-
-          ls -lh foreign/php/dist
-
-      - name: Upload PHP extension archive
-        if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: php-package-macos-${{ matrix.arch }}-php${{ matrix.php }}
-          path: foreign/php/dist/*.zip
-          retention-days: 7
-
   source:
-    name: Build PHP source archive
+    name: Build PHP source package
+    needs: license-manifest
     runs-on: ubuntu-latest
     steps:
       - name: Download latest copy script from master
@@ -401,7 +112,13 @@ jobs:
         with:
           version: ${{ inputs.version }}
 
-      - name: Build source archive
+      - name: Download license manifest
+        uses: actions/download-artifact@v8
+        with:
+          name: php-license-binary
+          path: foreign/php
+
+      - name: Build source package
         run: |
           set -euo pipefail
 
@@ -412,58 +129,60 @@ jobs:
             --prefix="apache-iggy-php-${version}/" \
             --output="foreign/php/dist/apache-iggy-php-${version}-source.tar.gz" \
             HEAD:foreign/php
+          cp foreign/php/LICENSE-binary "foreign/php/dist/apache-iggy-php-${version}-LICENSE-binary.txt"
 
           ls -lh foreign/php/dist
 
-      - name: Upload PHP source archive
+      - name: Upload PHP source package
         if: inputs.upload_artifacts
         uses: actions/upload-artifact@v7
         with:
           name: php-package-source
-          path: foreign/php/dist/*.tar.gz
+          path: foreign/php/dist/*
           retention-days: 7
 
   collect:
-    name: Collect PHP packages
-    needs: [linux, macos, source]
-    if: ${{ !cancelled() }}
+    name: Collect PHP source package
+    needs: source
     runs-on: ubuntu-latest
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:
-      - name: Download PHP packages
+      - name: Download PHP source package
         uses: actions/download-artifact@v8
         with:
           pattern: php-package-*
           merge-multiple: true
           path: dist
 
-      - name: List PHP packages
+      - name: List PHP release files
         run: |
-          echo "## Built PHP packages" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Kind | File |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Built PHP release files"
+            echo ""
+            echo "| Kind | File |"
+            echo "|------|------|"
 
-          while IFS= read -r package; do
-            filename="$(basename "$package")"
-            case "$filename" in
-              *.zip) kind="PIE binary" ;;
-              *.tar.gz) kind="Source" ;;
-              *) kind="Other" ;;
-            esac
-            echo "| $kind | \`$filename\` |" >> $GITHUB_STEP_SUMMARY
-          done < <(find dist -type f | sort)
+            while IFS= read -r package; do
+              filename="$(basename "$package")"
+              case "$filename" in
+                *.tar.gz) kind="Source" ;;
+                *LICENSE-binary.txt) kind="License manifest" ;;
+                *) kind="Other" ;;
+              esac
+              echo "| $kind | \`$filename\` |"
+            done < <(find dist -type f | sort)
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Total packages built:** $(find dist -type f | wc -l)" >> $GITHUB_STEP_SUMMARY
+            echo ""
+            echo "**Total files built:** $(find dist -type f | wc -l)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v7
         with:
-          name: php-extensions-all
+          name: php-release-all
           path: dist
           retention-days: 30
 
       - id: output
-        run: echo "artifact_name=php-extensions-all" >> "$GITHUB_OUTPUT"
+        run: echo "artifact_name=php-release-all" >> "$GITHUB_OUTPUT"

@@ -38,7 +38,6 @@
         "support-nts": true,
         "configure-options": [],
         "download-url-method": [
-            "pre-packaged-binary",
             "composer-default"
         ]
     },

@@ -402,7 +402,7 @@ jobs:
             core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
             // Output non-Docker, non-Rust, non-PHP targets. PHP needs its
-            // pre-built binary artifact, so it has a separate publish job.
+            // generated source release artifact, so it has a separate publish job.
             core.setOutput('non_docker_targets', JSON.stringify(otherSdkTargets.length ? { include: otherSdkTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
             core.setOutput('php_targets', JSON.stringify(phpTargets.length ? { include: phpTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
 
@@ -726,7 +726,7 @@ jobs:
       commit: ${{ needs.validate.outputs.commit }}
 
   build-php-extensions:
-    name: Build PHP extensions
+    name: Build PHP source package
     needs: [validate, plan, check-tags]
     if: |
       needs.validate.outputs.has_targets == 'true' &&
@@ -1014,7 +1014,7 @@ jobs:
               $(printf "${IMAGE}@sha256:%s " *)
             echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
 
-            if [ "$(scripts/extract-version.sh "${{ matrix.key }}" --is-pre-release)" != "true" ]; then
+            if [ "$(scripts/extract-version.sh "${{ matrix.key }}" --is-pre-release 2>/dev/null || echo true)" != "true" ]; then
               echo "Creating 'latest' manifest"
               docker buildx imagetools create \
                 -t "${IMAGE}:latest" \
@@ -1343,7 +1343,6 @@ jobs:
         if: |
           success() &&
           inputs.dry_run == false &&
-          matrix.type != 'php' &&
           inputs.skip_tag_creation == false &&
           steps.ver.outputs.should_tag == 'true'
         uses: ./.github/actions/utils/create-git-tag
@@ -1367,11 +1366,9 @@ jobs:
     name: PHP SDK
     needs: [validate, plan, check-tags, build-php-extensions]
     if: |
-      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_php == 'true' &&
-      fromJson(needs.plan.outputs.php_targets).include[0].key != 'noop' &&
-      (needs.build-php-extensions.result == 'success' || needs.build-php-extensions.result == 'skipped')
+      fromJson(needs.plan.outputs.php_targets).include[0].key != 'noop'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1468,7 +1465,7 @@ jobs:
           tag: ${{ steps.ver.outputs.tag }}
           commit: ${{ needs.validate.outputs.commit }}
           dry_run: ${{ inputs.dry_run }}
-          packages_artifact: php-extensions-all
+          packages_artifact: php-release-all
           packages_path: dist
 
       - name: Skip PHP SDK publishing without tag
@@ -1631,13 +1628,13 @@ jobs:
               echo
             fi
 
-            # PHP extension building status
+            # PHP source package status
             if [ "${{ needs.plan.outputs.has_php }}" = "true" ]; then
-              echo "### PHP Extension Building"
+              echo "### PHP Source Package"
               case "${{ needs.build-php-extensions.result }}" in
-                success)   echo "✅ **PHP extension packages built successfully for all platforms**" ;;
-                failure)   echo "❌ **PHP extension package building failed**" ;;
-                skipped)   echo "⏭️ **PHP extension package building was skipped**" ;;
+                success)   echo "✅ **PHP source package built successfully**" ;;
+                failure)   echo "❌ **PHP source package build failed**" ;;
+                skipped)   echo "⏭️ **PHP source package build was skipped**" ;;
               esac
               echo
             fi
