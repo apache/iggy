@@ -46,6 +46,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/mysql_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -304,7 +305,7 @@ tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "mysql", "http_wait"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-rustls = "0.26.4"

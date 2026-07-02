@@ -7012,6 +7012,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_mysql_source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "iggy_connector_postgres_sink"
 version = "0.4.1-edge.1"
 dependencies = [
