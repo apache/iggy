@@ -28,6 +28,9 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "ConsumerGroup",
+    "ConsumerGroupDetails",
+    "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
     "PollingStrategy",
@@ -231,6 +234,39 @@ class AutoCommitWhen:
     ...
 
 @typing.final
+class ConsumerGroup:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+
+@typing.final
+class ConsumerGroupDetails:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def members_count(self) -> builtins.int: ...
+    @property
+    def members(self) -> builtins.list[ConsumerGroupMember]: ...
+
+@typing.final
+class ConsumerGroupMember:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
+    @property
+    def partitions(self) -> builtins.list[builtins.int]: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -301,6 +337,67 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns Option of topic details or a PyRuntimeError on failure.
+        """
+    def create_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Create a consumer group for a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: Consumer group name as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the consumer group is created.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def get_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
+        r"""
+        Get a consumer group in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupDetails | None`.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def get_consumer_groups(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
+        r"""
+        Get all consumer groups in a stream topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[ConsumerGroup]`.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def send_messages(
         self,

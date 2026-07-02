@@ -22,9 +22,13 @@ use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, *,
+    AutoCommitWhen as RustAutoCommitWhen, IggyConsumer as RustIggyConsumer, IggyDuration,
+    IggyError, ReceivedMessage,
 };
-use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
+use iggy_common::{
+    ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerGroupMember as RustConsumerGroupMember,
+};
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
@@ -213,6 +217,124 @@ impl IggyConsumer {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
         })
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct ConsumerGroup {
+    pub(crate) inner: RustConsumerGroup,
+}
+
+impl From<RustConsumerGroup> for ConsumerGroup {
+    fn from(group: RustConsumerGroup) -> Self {
+        Self { inner: group }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ConsumerGroup {
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[getter]
+    pub fn name(&self) -> String {
+        self.inner.name.to_string()
+    }
+
+    #[getter]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+
+    #[getter]
+    pub fn members_count(&self) -> u32 {
+        self.inner.members_count
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct ConsumerGroupDetails {
+    pub(crate) inner: RustConsumerGroupDetails,
+}
+
+impl From<RustConsumerGroupDetails> for ConsumerGroupDetails {
+    fn from(group: RustConsumerGroupDetails) -> Self {
+        Self { inner: group }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ConsumerGroupDetails {
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[getter]
+    pub fn name(&self) -> String {
+        self.inner.name.to_string()
+    }
+
+    #[getter]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+
+    #[getter]
+    pub fn members_count(&self) -> u32 {
+        self.inner.members_count
+    }
+
+    #[getter]
+    pub fn members(&self) -> Vec<ConsumerGroupMember> {
+        self.inner
+            .members
+            .iter()
+            .map(ConsumerGroupMember::from)
+            .collect()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct ConsumerGroupMember {
+    pub(crate) inner: RustConsumerGroupMember,
+}
+
+impl From<&RustConsumerGroupMember> for ConsumerGroupMember {
+    fn from(member: &RustConsumerGroupMember) -> Self {
+        Self {
+            inner: RustConsumerGroupMember {
+                id: member.id,
+                partitions_count: member.partitions_count,
+                partitions: member.partitions.clone(),
+            },
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl ConsumerGroupMember {
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[getter]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+
+    #[getter]
+    pub fn partitions(&self) -> Vec<u32> {
+        self.inner.partitions.clone()
     }
 }
 
