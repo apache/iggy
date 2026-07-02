@@ -605,25 +605,55 @@ class StreamDetails:
 @typing.final
 class Topic:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        The unique name of the topic.
+        """
     @property
-    def messages_count(self) -> builtins.int: ...
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages in the topic.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions in the topic.
+        """
 
 @typing.final
 class TopicDetails:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        The unique name of the topic.
+        """
     @property
-    def messages_count(self) -> builtins.int: ...
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages in the topic.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions in the topic.
+        """
     @property
-    def compression_algorithm(self) -> builtins.str: ...
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
     @property
-    def replication_factor(self) -> builtins.int: ...
+    def replication_factor(self) -> builtins.int:
+        r"""
+        Replication factor for the topic.
+        """
