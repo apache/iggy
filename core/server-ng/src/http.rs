@@ -2876,10 +2876,16 @@ fn self_node_metadata(roster: &ClusterRoster) -> ClusterMetadata {
     }
 }
 
-/// Set the [`VIEW_HEADER`] to the current VSR view on `response`. Omits the
-/// header when this node has no live consensus: a missing header is
-/// unambiguous, whereas a fabricated view number would mislead.
+/// Set the [`VIEW_HEADER`] to the current VSR view on a successful or redirect
+/// `response`. Omits the header on error responses and when this node has no
+/// live consensus: a missing header is unambiguous, whereas a fabricated view
+/// number would mislead.
 fn insert_view_header(state: &HttpInner, mut response: Response) -> Response {
+    // The view is cluster-internal; error responses (notably pre-auth 401s)
+    // must not leak it. Success and the 307 primary-redirect still carry it.
+    if !(response.status().is_success() || response.status().is_redirection()) {
+        return response;
+    }
     if let Some(consensus) = state.shard.plane.metadata().consensus.as_ref() {
         response
             .headers_mut()
