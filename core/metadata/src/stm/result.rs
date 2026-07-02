@@ -210,7 +210,11 @@ result_enum!(CreatePersonalAccessTokenResult {
 result_enum!(DeletePersonalAccessTokenResult { NotFound = 20 });
 
 // Consumer groups.
-result_enum!(CreateConsumerGroupResult { NameAlreadyExists = 5004 });
+result_enum!(CreateConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    NameAlreadyExists = 5004,
+});
 result_enum!(DeleteConsumerGroupResult { NotFound = 5000 });
 
 /// `IggyError::Unauthorized`. Any control-plane op can commit as an in-apply
@@ -408,6 +412,10 @@ mod tests {
             u32::from(DeletePartitionsResult::StreamNotFound),
             stream_not_found
         );
+        assert_eq!(
+            u32::from(CreateConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
 
         // StreamNameAlreadyExists (1012).
         let stream_name_exists = IggyError::StreamNameAlreadyExists(String::new()).as_code();
@@ -431,6 +439,10 @@ mod tests {
         );
         assert_eq!(
             u32::from(DeletePartitionsResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(CreateConsumerGroupResult::TopicNotFound),
             topic_not_found
         );
 
