@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteConsumerGroup` op. Live (stream, topic, group) picked from shadow.
+//! `DeleteConsumerGroup` op. Targets `Ok` (a live group) or `NotFound` (a live
+//! stream/topic with a fabricated group name).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -26,6 +27,8 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::DeleteConsumerGroupResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub stream: String,
@@ -33,12 +36,7 @@ pub struct Input {
     pub group: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::NotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -47,14 +45,20 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => {
-            shadow
-                .pick_consumer_group_triple(prng)
-                .map(|(stream, topic, group)| Input {
-                    stream,
-                    topic,
-                    group,
-                })
+        Outcome::Ok => shadow
+            .pick_consumer_group_triple(prng)
+            .map(|(stream, topic, group)| Input {
+                stream,
+                topic,
+                group,
+            }),
+        Outcome::NotFound => {
+            let (stream, topic) = shadow.pick_topic_pair(prng)?;
+            Some(Input {
+                stream,
+                topic,
+                group: shadow.fabricate_absent_name("cg"),
+            })
         }
     }
 }
@@ -64,18 +68,23 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.delete_consumer_group(&input.stream, &input.topic, &input.group)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::RemoveConsumerGroup {
+        Outcome::Ok => Effect::RemoveConsumerGroup {
             stream: input.stream.clone(),
             topic: input.topic.clone(),
             name: input.group.clone(),
         },
+        Outcome::NotFound => Effect::None,
     }
 }

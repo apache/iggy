@@ -262,7 +262,7 @@ func TestNewIggyTcpClient_StoresProvidedLogger(t *testing.T) {
 
 	c := NewIggyTcpClient(logger)
 
-	c.logger.Info("transport probe", "source", "tcp")
+	c.logger.Info("transport probe", slog.String("source", "tcp"))
 
 	output := buf.String()
 	if !strings.Contains(output, "transport probe") {

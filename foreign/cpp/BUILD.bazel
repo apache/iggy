@@ -29,11 +29,17 @@ genrule(
         "cxxbridge/rust/cxx.h",
         "cxxbridge/sources/lib.rs.cc",
     ],
+    tools = [
+        "@rs_host_tools//:cargo",
+        "@rs_host_tools//:rustc",
+        "@rs_host_tools//:rust_toolchain",
+    ],
     cmd = """
         set -euo pipefail
 
-        CARGO="$$(command -v cargo)"
         EXECROOT="$$(pwd)"
+        CARGO="$$EXECROOT/$(execpath @rs_host_tools//:cargo)"
+        RUSTC="$$EXECROOT/$(execpath @rs_host_tools//:rustc)"
         CARGO_TARGET_DIR="$$EXECROOT/$(@D)/cargo_target"
         OUT_LIB="$$EXECROOT/$(location libiggy_cpp.a)"
         OUT_RS="$$EXECROOT/$(location include/lib.rs.h)"
@@ -51,7 +57,10 @@ genrule(
         fi
 
         mkdir -p "$$CARGO_TARGET_DIR"
-        env -u PWD CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" "$$CARGO" build $$FLAGS
+        env -u PWD \
+            CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" \
+            RUSTC="$$RUSTC" \
+            "$$CARGO" build $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 

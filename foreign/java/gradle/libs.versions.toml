@@ -17,7 +17,7 @@
 
 [versions]
 # Flink
-flink = "2.2.1"
+flink = "2.3.0"
 
 # Pinot
 pinot = "1.5.0"
@@ -34,7 +34,7 @@ httpclient5 = "5.6.1"
 
 # Logging
 slf4j = "2.0.18"
-logback = "1.5.34"
+logback = "1.5.35"
 
 # Testing
 junit = "6.1.0"
@@ -45,14 +45,14 @@ testcontainers = "2.0.5"
 netty = "4.2.15.Final"
 
 # Spotbugs
-spotbugs = "4.10.1"
+spotbugs = "4.10.2"
 
 # Config
 typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.6.0"
+spotless = "8.7.0"
 shadow = "9.4.2"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"

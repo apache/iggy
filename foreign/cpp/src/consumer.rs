@@ -15,22 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::ffi;
-use iggy::prelude::Topic as RustTopic;
+use iggy::prelude::IggyConsumer as RustIggyConsumer;
 
-impl From<RustTopic> for ffi::Topic {
-    fn from(topic: RustTopic) -> Self {
-        ffi::Topic {
-            id: topic.id,
-            created_at: topic.created_at.as_micros(),
-            name: topic.name,
-            size_bytes: topic.size.as_bytes_u64(),
-            message_expiry: u64::from(topic.message_expiry),
-            compression_algorithm: topic.compression_algorithm.to_string(),
-            max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
-            messages_count: topic.messages_count,
-            partitions_count: topic.partitions_count,
-        }
-    }
+#[allow(dead_code)]
+pub struct Consumer {
+    pub inner: RustIggyConsumer,
 }

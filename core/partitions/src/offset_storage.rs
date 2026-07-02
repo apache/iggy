@@ -53,6 +53,10 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
     Ok(())
 }
 
+/// Unlink a persisted consumer-offset file. A no-op if the file is absent.
+///
+/// # Errors
+/// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if the unlink fails.
 pub async fn delete_persisted_offset(path: &str) -> Result<(), IggyError> {
     if !Path::new(path).exists() {
         return Ok(());

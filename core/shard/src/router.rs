@@ -20,6 +20,7 @@ use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
+use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
@@ -29,6 +30,11 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use server_common::{Message, MessageBag};
+
+/// How often the shard pump drives `VsrConsensus::tick`: heartbeats, prepare
+/// retransmit, and view-change timeouts only advance when the tick runs
+/// ("call this periodically, e.g. every 10ms").
+const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Decompose a [`MessageBag`] into the routing-relevant tuple
 /// `(operation, namespace, generic_message)`.
@@ -251,7 +257,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -259,9 +265,45 @@ where
         // first-drain reallocation.
         let mut loopback_buf = Vec::with_capacity(64);
         let mut namespace_scratch: Vec<IggyNamespace> = Vec::with_capacity(64);
+        // Consensus timer driver, folded into the pump: running the tick as a
+        // select! arm (not a sibling task) serializes it with frame processing,
+        // so `tick_partitions` can no longer hold a partition reference across
+        // an `.await` while `apply_reconcile_ops` reallocates the partitions
+        // vec on this same task. The timer is created once and pinned, then
+        // re-armed only after it fires, so a busy inbox cannot drop-and-reset
+        // it (which would stall heartbeats / prepare retransmit).
+        // Single source for the timer, so the re-arm below cannot drift from the
+        // initial interval.
+        let rearm_tick = || compio::time::sleep(CONSENSUS_TICK_INTERVAL).fuse();
+        let mut consensus_tick = std::pin::pin!(rearm_tick());
         loop {
             futures::select! {
                 _ = stop.recv().fuse() => break,
+                () = consensus_tick.as_mut() => {
+                    // Sharing the pump task is what keeps `tick_partitions`
+                    // borrow-safe, but it bounds the tick's worst-case delay to
+                    // one frame body's longest `.await` (replication append +
+                    // commit_journal fsync/rotate + reply).
+                    // TODO(hubcio): if a load test shows tick starvation,
+                    // make `tick_partitions` borrow-free so the tick can be
+                    // decoupled from the pump again without reintroducing the
+                    // partition-ref-across-`.await` UB this fold closed.
+                    self.tick_metadata().await;
+                    self.tick_partitions().await;
+                    // While a cooperative revocation is pending, wake the
+                    // reconciler each tick so the handoff completes within ~one
+                    // tick of the partition draining, not the periodic pass.
+                    if self
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .streams()
+                        .has_pending_revocations()
+                    {
+                        self.dispatch_metadata_commit_tick();
+                    }
+                    consensus_tick.set(rearm_tick());
+                }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {
@@ -334,7 +376,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -499,6 +541,81 @@ where
             }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
+            }
+            LifecycleFrame::CleanPartition {
+                namespace,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                // Pump-side: the single writer of partition state. The timer
+                // task already resolved the retention decision off-pump, so
+                // this only mutates, serialized with reads on the same loop.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    let (segments, messages) = partition
+                        .clean_expired_segments(now, message_expiry, max_bytes)
+                        .await;
+                    if segments > 0 {
+                        tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            segments,
+                            messages,
+                            "segment cleaner removed sealed segments"
+                        );
+                    }
+                }
+            }
+            LifecycleFrame::TruncatePartition {
+                namespace,
+                up_to_offset,
+            } => {
+                // Pump-side enforcement of a committed delete watermark. The
+                // committed offset is identical on every replica, so the local
+                // deletion converges; idempotent if already trimmed past it.
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
+                    let (segments, messages) =
+                        partition.remove_sealed_segments_up_to(up_to_offset).await;
+                    if segments > 0 {
+                        tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            segments,
+                            messages,
+                            up_to_offset,
+                            "truncate-partition removed sealed segments"
+                        );
+                    }
+                }
+            }
+            LifecycleFrame::PurgePartition {
+                namespace,
+                generation,
+            } => {
+                // Pump-side enforcement of a committed `PurgeTopic`: reset the
+                // partition to empty at offset 0 and clear consumer offsets.
+                // Idempotent per generation -- skip if already applied so a
+                // redundant reconcile pass does not wipe messages sent since.
+                let config = self.plane.partitions().config().clone();
+                if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace)
+                    && partition.applied_purge_generation() < generation
+                {
+                    match partition.purge(&config, generation).await {
+                        Ok(()) => tracing::debug!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            generation,
+                            "purge-partition reset partition to empty"
+                        ),
+                        Err(error) => tracing::error!(
+                            shard = self.id,
+                            namespace_raw = namespace.inner(),
+                            generation,
+                            %error,
+                            "purge-partition failed to reset partition"
+                        ),
+                    }
+                }
             }
         }
     }
