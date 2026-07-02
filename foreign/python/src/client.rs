@@ -33,7 +33,7 @@ use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
-use crate::topic::TopicDetails;
+use crate::topic::{Topic, TopicDetails};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
@@ -240,6 +240,170 @@ impl IggyClient {
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(topic.map(TopicDetails::from))
+        })
+    }
+
+    /// Get all topics in a stream.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[Topic]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Topic]]", imports=("collections.abc")))]
+    fn get_topics<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let topics = inner
+                .get_topics(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(topics.into_iter().map(Topic::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Update an existing topic.
+    ///
+    /// This is a full replacement: any optional parameter left unset is reset to
+    /// its server default rather than preserved.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     name: New topic name as `str`.
+    ///     compression_algorithm: Compression algorithm as `str | None`.
+    ///     replication_factor: Replication factor as `int | None`.
+    ///     message_expiry: Message expiry as `datetime.timedelta | None`.
+    ///     max_topic_size: Maximum topic size in bytes as `int | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is updated.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    #[pyo3(
+        signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+    )]
+    #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        name: String,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
+            u8,
+        >,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        message_expiry: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let compression_algorithm = match compression_algorithm {
+            Some(algo) => CompressionAlgorithm::from_str(&algo)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+            None => CompressionAlgorithm::default(),
+        };
+
+        let expiry = match message_expiry {
+            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
+            None => IggyExpiry::ServerDefault,
+        };
+
+        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_topic(
+                    &stream_id,
+                    &topic_id,
+                    &name,
+                    compression_algorithm,
+                    replication_factor,
+                    expiry,
+                    max_size,
+                )
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Delete a topic from a stream.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is deleted.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_topic(&stream_id, &topic_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Purge all messages from a topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is purged.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn purge_topic<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .purge_topic(&stream_id, &topic_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
         })
     }
 
