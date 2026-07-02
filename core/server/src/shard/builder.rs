@@ -17,7 +17,7 @@
 
 use super::{
     IggyShard, TaskRegistry, transmission::connector::ShardConnector,
-    transmission::frame::ShardFrame,
+    transmission::frame::ShardFrame, waiters::PollWaiterRegistry,
 };
 use crate::metadata::{Metadata, MetadataWriter};
 use crate::streaming::partitions::local_partitions::LocalPartitions;
@@ -174,6 +174,7 @@ impl IggyShardBuilder {
             metadata_writer: self.metadata_writer.map(RefCell::new),
             local_partitions,
             pending_partition_inits: RefCell::new(AHashSet::new()),
+            poll_waiters: RefCell::new(PollWaiterRegistry::default()),
             encryptor,
             config,
             _version: version,
