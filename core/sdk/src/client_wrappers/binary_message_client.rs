@@ -21,6 +21,7 @@ use iggy_common::MessageClient;
 use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
 };
+use std::time::Duration;
 
 #[async_trait]
 impl MessageClient for ClientWrapper {
@@ -34,10 +35,34 @@ impl MessageClient for ClientWrapper {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_timeout(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            count,
+            auto_commit,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_timeout(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        wait_timeout: Duration,
+    ) -> Result<PolledMessages, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_timeout(
                         stream_id,
                         topic_id,
                         partition_id,
@@ -45,12 +70,13 @@ impl MessageClient for ClientWrapper {
                         strategy,
                         count,
                         auto_commit,
+                        wait_timeout,
                     )
                     .await
             }
             ClientWrapper::Http(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_timeout(
                         stream_id,
                         topic_id,
                         partition_id,
@@ -58,12 +84,13 @@ impl MessageClient for ClientWrapper {
                         strategy,
                         count,
                         auto_commit,
+                        wait_timeout,
                     )
                     .await
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_timeout(
                         stream_id,
                         topic_id,
                         partition_id,
@@ -71,12 +98,13 @@ impl MessageClient for ClientWrapper {
                         strategy,
                         count,
                         auto_commit,
+                        wait_timeout,
                     )
                     .await
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_timeout(
                         stream_id,
                         topic_id,
                         partition_id,
@@ -84,12 +112,13 @@ impl MessageClient for ClientWrapper {
                         strategy,
                         count,
                         auto_commit,
+                        wait_timeout,
                     )
                     .await
             }
             ClientWrapper::WebSocket(client) => {
                 client
-                    .poll_messages(
+                    .poll_messages_with_timeout(
                         stream_id,
                         topic_id,
                         partition_id,
@@ -97,6 +126,7 @@ impl MessageClient for ClientWrapper {
                         strategy,
                         count,
                         auto_commit,
+                        wait_timeout,
                     )
                     .await
             }
