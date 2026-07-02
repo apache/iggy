@@ -26,14 +26,14 @@
 use crate::bootstrap::ServerNgShard;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE,
     GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
     GET_USERS_CODE,
 };
-use iggy_binary_protocol::consensus::result_code;
+use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -917,13 +917,20 @@ pub(crate) fn build_raw_pat_reply(
         return Ok(committed);
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
-    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let response = RawPersonalAccessTokenResponse { token };
+    // The SDK strips a leading result section from every metadata reply
+    // (`split_metadata_result`), so the spliced body must carry the success
+    // section like any committed metadata reply; a bare token body would be
+    // read as a garbage result code.
+    let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
+    body.put_u32_le(0);
+    response.encode(&mut body);
     let reply = build_reply_from_bytes(
         request_header,
         request_header.client,
         request_header.session,
         commit,
-        &body,
+        &body.freeze(),
     );
     Ok(reply.into_generic())
 }
@@ -1134,8 +1141,11 @@ mod tests {
                 .expect("splice succeeds");
         let header_len = std::mem::size_of::<ReplyHeader>();
         let body = &reply.as_slice()[header_len..reply.header().size as usize];
-        let response =
-            RawPersonalAccessTokenResponse::decode_from(body).expect("token body decodes");
+        // Framed like every committed metadata reply: the SDK reads the result
+        // section first, then decodes the token payload past it.
+        assert_eq!(result_code(body), Some(0));
+        let response = RawPersonalAccessTokenResponse::decode_from(&body[RESULT_COUNT_LEN..])
+            .expect("token body decodes");
         assert_eq!(response.token.as_str(), "raw-token");
     }
 

@@ -3000,14 +3000,13 @@ fn decode_consumer_group_details(payload: &[u8]) -> Result<ConsumerGroupDetails,
     Ok(ConsumerGroupDetails::from(response))
 }
 
-/// Extract the raw one-time token from a [`build_raw_pat_reply`] output. That
-/// reply's body is a bare `RawPersonalAccessTokenResponse` (no leading result
-/// section, unlike a committed metadata reply), so decode it straight past the
-/// header.
+/// Extract the raw one-time token from a [`build_raw_pat_reply`] output. The
+/// spliced reply is framed like any committed metadata reply (a success result
+/// section, then the `RawPersonalAccessTokenResponse`) so the SDK's
+/// `split_metadata_result` can decode it; strip the section the same way here.
 fn decode_raw_pat_token(reply: &Message<GenericHeader>) -> Result<String, WriteError> {
-    let size = reply.header().size as usize;
-    let body = reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default();
-    let response = RawPersonalAccessTokenResponse::decode_from(body)
+    let payload = committed_payload(reply)?;
+    let response = RawPersonalAccessTokenResponse::decode_from(payload)
         .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
     Ok(response.token.as_str().to_string())
 }
