@@ -421,7 +421,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the consumer group is created.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_consumer_group<'a>(
         &self,
@@ -454,7 +455,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `ConsumerGroupDetails | None`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails | None]", imports=("collections.abc")))]
     fn get_consumer_group<'a>(
         &self,
@@ -487,7 +489,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[ConsumerGroup]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ConsumerGroup]]", imports=("collections.abc")))]
     fn get_consumer_groups<'a>(
         &self,

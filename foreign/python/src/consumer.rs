@@ -307,12 +307,6 @@ pub struct ConsumerGroupMember {
     pub(crate) inner: RustConsumerGroupMember,
 }
 
-impl From<RustConsumerGroupMember> for ConsumerGroupMember {
-    fn from(member: RustConsumerGroupMember) -> Self {
-        Self { inner: member }
-    }
-}
-
 impl From<&RustConsumerGroupMember> for ConsumerGroupMember {
     fn from(member: &RustConsumerGroupMember) -> Self {
         Self {
