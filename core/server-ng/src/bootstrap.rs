@@ -1948,7 +1948,16 @@ async fn start_tcp_runtime(
     // caller of this function.
     if config.http.enabled {
         let http_addr = parse_socket_addr("http.address", &config.http.address)?;
-        http::start(shard, http_addr, &config.http, &config.cluster).await?;
+        let self_ports = configs::cluster::TransportPorts {
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            ..Default::default()
+        };
+        http::start(shard, http_addr, &config.http, &config.cluster, self_ports).await?;
     }
 
     Ok(())

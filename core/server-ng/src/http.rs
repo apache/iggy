@@ -37,7 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
-use configs::cluster::{ClusterConfig, ClusterNodeConfig};
+use configs::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
 use configs::http::HttpConfig;
 use consensus::{CLIENTS_TABLE_MAX, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
@@ -640,8 +640,11 @@ struct ClusterRoster {
     name: String,
     nodes: Vec<ClusterNodeConfig>,
     /// This node's bound HTTP address, used to synthesize the sole self-node
-    /// when no roster is configured (the only transport port known here).
+    /// when no roster is configured.
     http_addr: SocketAddr,
+    /// This node's other client listener ports for the same self-node
+    /// synthesis (`None` = transport disabled; HTTP comes from `http_addr`).
+    self_ports: TransportPorts,
 }
 
 /// Serializes first-use VSR registration per credential key so a herd of
@@ -971,6 +974,7 @@ pub async fn start(
     addr: SocketAddr,
     http_config: &HttpConfig,
     cluster: &ClusterConfig,
+    self_ports: TransportPorts,
 ) -> Result<(), ServerNgError> {
     let jwt = JwtManager::build(&http_config.jwt)?;
     let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
@@ -986,6 +990,7 @@ pub async fn start(
             name: cluster.name.clone(),
             nodes: cluster.nodes.clone(),
             http_addr: bound_addr,
+            self_ports,
         },
         in_flight_writes: Cell::new(0),
     }));
@@ -2861,15 +2866,20 @@ fn build_cluster_metadata(state: &HttpInner) -> ClusterMetadata {
 }
 
 /// Synthesize a single self-node [`ClusterMetadata`], mirroring the legacy
-/// single-node path. Only this node's bound HTTP port is known at the HTTP layer
-/// (the roster is not threaded onto the shard), so the other transports report 0.
+/// single-node path: this node's own listener ports, with the HTTP port taken
+/// from the live bound address and disabled transports reporting 0.
 fn self_node_metadata(roster: &ClusterRoster) -> ClusterMetadata {
     ClusterMetadata {
         name: SINGLE_NODE_CLUSTER_NAME.to_owned(),
         nodes: vec![ClusterNode {
             name: SELF_NODE_NAME.to_owned(),
             ip: roster.http_addr.ip().to_string(),
-            endpoints: TransportEndpoints::new(0, 0, roster.http_addr.port(), 0),
+            endpoints: TransportEndpoints::new(
+                roster.self_ports.tcp.unwrap_or(0),
+                roster.self_ports.quic.unwrap_or(0),
+                roster.http_addr.port(),
+                roster.self_ports.websocket.unwrap_or(0),
+            ),
             role: ClusterNodeRole::Leader,
             status: ClusterNodeStatus::Healthy,
         }],
@@ -3191,6 +3201,7 @@ mod tests {
             name: "test-cluster".to_owned(),
             nodes,
             http_addr: "127.0.0.1:3000".parse().expect("valid socket addr"),
+            self_ports: TransportPorts::default(),
         }
     }
 
