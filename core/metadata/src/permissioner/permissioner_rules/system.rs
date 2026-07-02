@@ -32,6 +32,10 @@ impl Permissioner {
         self.get_server_info(user_id)
     }
 
+    pub fn get_snapshot(&self, user_id: u32) -> Result<(), IggyError> {
+        self.get_server_info(user_id)
+    }
+
     fn get_server_info(&self, user_id: u32) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.manage_servers || global_permissions.read_servers)

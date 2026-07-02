@@ -360,6 +360,16 @@ impl StateHandler for CreateUserRequest {
             .personal_access_tokens
             .insert(id as UserId, AHashMap::default());
 
+        // The permissioner is a denormalized index of `User.permissions`;
+        // derive it from the just-stored user so the two never drift.
+        let user_permissions = state
+            .items
+            .get(id)
+            .and_then(|user| user.permissions.as_deref().cloned());
+        state
+            .permissioner
+            .init_permissions_for_user(id as UserId, user_permissions);
+
         // Reply body: the SDK `create_user` decodes a `UserDetailsResponse`.
         // Serialization local to this state machine.
         ApplyReply::ok(
@@ -435,6 +445,9 @@ impl StateHandler for DeleteUserRequest {
                     }
                 }
             }
+            state
+                .permissioner
+                .delete_permissions_for_user(user_id as UserId);
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -456,6 +469,7 @@ impl StateHandler for ChangePasswordRequest {
 
 impl StateHandler for UpdatePermissionsRequest {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return ApplyReply::err(UpdatePermissionsResult::UserNotFound);
@@ -467,6 +481,13 @@ impl StateHandler for UpdatePermissionsRequest {
                 .as_ref()
                 .map(|p| Arc::new(Permissions::from(p.clone())));
         }
+        let user_permissions = state
+            .items
+            .get(user_id)
+            .and_then(|user| user.permissions.as_deref().cloned());
+        state
+            .permissioner
+            .update_permissions_for_user(user_id as UserId, user_permissions);
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -650,43 +671,18 @@ impl Snapshotable for Users {
                     })
                     .collect();
 
+            // The permissioner is a denormalized index of `User.permissions`.
+            // Its `AHashMap`/`AHashSet` fields iterate in a per-replica-random
+            // order, so serializing them would make the snapshot bytes differ
+            // across replicas. Persist empty vecs (kept only for the positional
+            // msgpack layout) and rebuild the index from the users on restore.
             let permissioner = PermissionerSnapshot {
-                users_permissions: inner
-                    .permissioner
-                    .users_permissions
-                    .iter()
-                    .map(|(&k, v)| (k, v.clone()))
-                    .collect(),
-                users_streams_permissions: inner
-                    .permissioner
-                    .users_streams_permissions
-                    .iter()
-                    .map(|(&k, v)| (k, v.clone()))
-                    .collect(),
-                users_that_can_poll_messages_from_all_streams: inner
-                    .permissioner
-                    .users_that_can_poll_messages_from_all_streams
-                    .iter()
-                    .copied()
-                    .collect(),
-                users_that_can_send_messages_to_all_streams: inner
-                    .permissioner
-                    .users_that_can_send_messages_to_all_streams
-                    .iter()
-                    .copied()
-                    .collect(),
-                users_that_can_poll_messages_from_specific_streams: inner
-                    .permissioner
-                    .users_that_can_poll_messages_from_specific_streams
-                    .iter()
-                    .copied()
-                    .collect(),
-                users_that_can_send_messages_to_specific_streams: inner
-                    .permissioner
-                    .users_that_can_send_messages_to_specific_streams
-                    .iter()
-                    .copied()
-                    .collect(),
+                users_permissions: Vec::new(),
+                users_streams_permissions: Vec::new(),
+                users_that_can_poll_messages_from_all_streams: Vec::new(),
+                users_that_can_send_messages_to_all_streams: Vec::new(),
+                users_that_can_poll_messages_from_specific_streams: Vec::new(),
+                users_that_can_send_messages_to_specific_streams: Vec::new(),
             };
 
             UsersSnapshot {
@@ -751,38 +747,14 @@ impl Snapshotable for Users {
             personal_access_tokens.insert(user_id, token_map);
         }
 
-        let permissioner = Permissioner {
-            users_permissions: snapshot
-                .permissioner
-                .users_permissions
-                .into_iter()
-                .collect(),
-            users_streams_permissions: snapshot
-                .permissioner
-                .users_streams_permissions
-                .into_iter()
-                .collect(),
-            users_that_can_poll_messages_from_all_streams: snapshot
-                .permissioner
-                .users_that_can_poll_messages_from_all_streams
-                .into_iter()
-                .collect(),
-            users_that_can_send_messages_to_all_streams: snapshot
-                .permissioner
-                .users_that_can_send_messages_to_all_streams
-                .into_iter()
-                .collect(),
-            users_that_can_poll_messages_from_specific_streams: snapshot
-                .permissioner
-                .users_that_can_poll_messages_from_specific_streams
-                .into_iter()
-                .collect(),
-            users_that_can_send_messages_to_specific_streams: snapshot
-                .permissioner
-                .users_that_can_send_messages_to_specific_streams
-                .into_iter()
-                .collect(),
-        };
+        // Rebuild the permissioner from the restored users rather than the
+        // snapshot vecs, which are intentionally empty (see `to_snapshot`).
+        // Slab iteration is ascending by key, so the build is deterministic.
+        let mut permissioner = Permissioner::new();
+        for (user_id, user) in &items {
+            permissioner
+                .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
+        }
 
         let inner = UsersInner {
             index,
@@ -802,6 +774,8 @@ impl_fill_restore!(Users, users);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::primitives::permissions::WireStreamPermissions;
+    use iggy_common::IggyError;
 
     #[test]
     fn create_pat_request_roundtrip_preserves_user_id() {
@@ -988,5 +962,244 @@ mod tests {
         };
         let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
         assert_eq!(apply.code, u32::from(DeleteUserResult::UserNotFound));
+    }
+
+    fn empty_global() -> WireGlobalPermissions {
+        WireGlobalPermissions {
+            manage_servers: false,
+            read_servers: false,
+            manage_users: false,
+            read_users: false,
+            manage_streams: false,
+            read_streams: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: false,
+            send_messages: false,
+        }
+    }
+
+    fn create_user_with(
+        users: &mut UsersInner,
+        username: &str,
+        permissions: Option<WirePermissions>,
+    ) -> UserId {
+        let request = CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions,
+        };
+        let reply = StateHandler::apply(&request, users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0);
+        *users.index.get(username).expect("user created")
+    }
+
+    #[test]
+    fn given_global_poll_grant_when_apply_create_user_should_allow_poll_from_any_stream() {
+        let mut users = UsersInner::new();
+        let mut global = empty_global();
+        global.poll_messages = true;
+        let uid = create_user_with(
+            &mut users,
+            "poller",
+            Some(WirePermissions {
+                global,
+                streams: Vec::new(),
+            }),
+        );
+
+        // The global poll bit denormalizes into the can-poll-all set, so the
+        // user may poll any stream/topic without a stream-specific grant.
+        assert!(users.permissioner.poll_messages(uid, 7, 3).is_ok());
+        assert!(
+            users
+                .permissioner
+                .users_that_can_poll_messages_from_all_streams
+                .contains(&uid)
+        );
+    }
+
+    #[test]
+    fn given_poll_grant_when_apply_update_permissions_removes_it_should_return_unauthorized() {
+        let mut users = UsersInner::new();
+        let mut global = empty_global();
+        global.poll_messages = true;
+        let uid = create_user_with(
+            &mut users,
+            "poller",
+            Some(WirePermissions {
+                global,
+                streams: Vec::new(),
+            }),
+        );
+        assert!(users.permissioner.poll_messages(uid, 1, 1).is_ok());
+
+        let update = UpdatePermissionsRequest {
+            user_id: WireIdentifier::numeric(uid),
+            permissions: None,
+        };
+        let reply = StateHandler::apply(&update, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0);
+
+        assert!(matches!(
+            users.permissioner.poll_messages(uid, 1, 1),
+            Err(IggyError::Unauthorized)
+        ));
+        assert!(
+            !users
+                .permissioner
+                .users_that_can_poll_messages_from_all_streams
+                .contains(&uid)
+        );
+    }
+
+    #[test]
+    fn given_permissioned_user_when_apply_delete_user_should_clear_all_indexes() {
+        let mut users = UsersInner::new();
+        let mut global = empty_global();
+        global.poll_messages = true;
+        global.send_messages = true;
+        let stream = WireStreamPermissions {
+            stream_id: 4,
+            manage_stream: false,
+            read_stream: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: true,
+            send_messages: true,
+            topics: Vec::new(),
+        };
+        let uid = create_user_with(
+            &mut users,
+            "victim",
+            Some(WirePermissions {
+                global,
+                streams: vec![stream],
+            }),
+        );
+        assert!(!users.permissioner.users_permissions.is_empty());
+
+        let delete = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(uid),
+        };
+        let reply = StateHandler::apply(&delete, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0);
+
+        let permissioner = &users.permissioner;
+        assert!(permissioner.users_permissions.is_empty());
+        assert!(permissioner.users_streams_permissions.is_empty());
+        assert!(
+            permissioner
+                .users_that_can_poll_messages_from_all_streams
+                .is_empty()
+        );
+        assert!(
+            permissioner
+                .users_that_can_send_messages_to_all_streams
+                .is_empty()
+        );
+        assert!(
+            permissioner
+                .users_that_can_poll_messages_from_specific_streams
+                .is_empty()
+        );
+        assert!(
+            permissioner
+                .users_that_can_send_messages_to_specific_streams
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn given_populated_permissions_when_snapshot_round_trip_should_rebuild_index_and_persist_empty_vecs()
+     {
+        let mut inner = UsersInner::new();
+        let mut global = empty_global();
+        global.poll_messages = true;
+        global.send_messages = true;
+        let stream = WireStreamPermissions {
+            stream_id: 2,
+            manage_stream: false,
+            read_stream: false,
+            manage_topics: false,
+            read_topics: false,
+            poll_messages: true,
+            send_messages: true,
+            topics: Vec::new(),
+        };
+        let uid = create_user_with(
+            &mut inner,
+            "alice",
+            Some(WirePermissions {
+                global,
+                streams: vec![stream],
+            }),
+        );
+        let pre_poll = inner.permissioner.poll_messages(uid, 9, 9).is_ok();
+        let pre_send = inner.permissioner.append_messages(uid, 2, 0).is_ok();
+
+        let users: Users = inner.into();
+        let snapshot = users.to_snapshot();
+
+        // The derived index is not serialized: every permissioner vec is empty.
+        let snap = &snapshot.permissioner;
+        assert!(snap.users_permissions.is_empty());
+        assert!(snap.users_streams_permissions.is_empty());
+        assert!(
+            snap.users_that_can_poll_messages_from_all_streams
+                .is_empty()
+        );
+        assert!(snap.users_that_can_send_messages_to_all_streams.is_empty());
+        assert!(
+            snap.users_that_can_poll_messages_from_specific_streams
+                .is_empty()
+        );
+        assert!(
+            snap.users_that_can_send_messages_to_specific_streams
+                .is_empty()
+        );
+
+        let restored = Users::from_snapshot(snapshot).expect("snapshot restore");
+        let (poll_ok, send_ok, in_poll_all, in_send_specific) = restored.read(|inner| {
+            let permissioner = &inner.permissioner;
+            (
+                permissioner.poll_messages(uid, 9, 9).is_ok(),
+                permissioner.append_messages(uid, 2, 0).is_ok(),
+                permissioner
+                    .users_that_can_poll_messages_from_all_streams
+                    .contains(&uid),
+                permissioner
+                    .users_that_can_send_messages_to_specific_streams
+                    .contains(&(uid, 2)),
+            )
+        });
+
+        // Rule results survive the round-trip...
+        assert_eq!(poll_ok, pre_poll);
+        assert_eq!(send_ok, pre_send);
+        // ...because the index was rebuilt from the restored user: the global
+        // poll bit repopulated the can-poll-all set and the stream send bit
+        // repopulated the specific set.
+        assert!(in_poll_all);
+        assert!(in_send_specific);
+    }
+
+    #[test]
+    fn given_root_user_when_ensure_root_after_bootstrap_should_have_root_grants() {
+        let users = Users::default();
+        users.ensure_root_user("iggy", "hash");
+        // Root carries `Permissions::root()`: full grants across every rule.
+        let (can_create_stream, can_get_stats, can_poll) = users.read(|inner| {
+            let root = *inner.index.get("iggy").expect("root user created");
+            (
+                inner.permissioner.create_stream(root).is_ok(),
+                inner.permissioner.get_stats(root).is_ok(),
+                inner.permissioner.poll_messages(root, 1, 1).is_ok(),
+            )
+        });
+        assert!(can_create_stream);
+        assert!(can_get_stats);
+        assert!(can_poll);
     }
 }
