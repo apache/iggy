@@ -25,6 +25,7 @@ use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_common::IggyError;
 use server_common::PooledBuffer;
+use server_common::sharding::IggyNamespace;
 use std::{rc::Rc, time::Duration};
 use tracing::{debug, trace};
 
@@ -48,14 +49,59 @@ pub async fn handle_poll_messages(
     );
     shard.ensure_authenticated(session)?;
 
-    let args = PollingArgs::with_wait_timeout(strategy, count, auto_commit, wait_timeout);
-
     let user_id = session.get_user_id();
     let client_id = session.client_id;
     let topic = shard.resolve_topic_for_poll(user_id, &stream_id, &topic_id)?;
-    let (metadata, mut batch) = shard
-        .poll_messages(client_id, topic, consumer, partition_id, args)
+    let (mut metadata, mut batch) = shard
+        .poll_messages(
+            client_id,
+            topic,
+            consumer.clone(),
+            partition_id,
+            PollingArgs::with_wait_timeout(strategy.clone(), count, auto_commit, wait_timeout),
+        )
         .await?;
+
+    if !wait_timeout.is_zero() && batch.is_empty() {
+        let namespace = IggyNamespace::new(
+            topic.stream_id,
+            topic.topic_id,
+            metadata.partition_id as usize,
+        );
+
+        if let Some(waiter) = shard.register_poll_waiter(namespace, wait_timeout) {
+            let immediate_args = || PollingArgs::new(strategy.clone(), count, auto_commit);
+            (metadata, batch) = shard
+                .poll_messages(
+                    client_id,
+                    topic,
+                    consumer.clone(),
+                    partition_id,
+                    immediate_args(),
+                )
+                .await?;
+
+            if batch.is_empty() {
+                let woke = matches!(
+                    compio::time::timeout(wait_timeout, waiter.wait()).await,
+                    Ok(true)
+                );
+                drop(waiter);
+
+                if woke {
+                    (metadata, batch) = shard
+                        .poll_messages(
+                            client_id,
+                            topic,
+                            consumer,
+                            partition_id,
+                            immediate_args(),
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
 
     let response_length = 4 + 8 + 4 + batch.size();
     let response_length_bytes = response_length.to_le_bytes();
