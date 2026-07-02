@@ -49,7 +49,6 @@ iggy = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 mimalloc = { workspace = true }
-once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 opentelemetry-otlp = { workspace = true }

@@ -67,13 +67,14 @@ pub mod namespace;
 pub mod primitives;
 pub mod requests;
 pub mod responses;
+pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
     EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
     RESERVED_COMMAND_LEN, ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
-    StartViewHeader, read_size_field,
+    StartViewHeader, read_size_field, result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
@@ -82,7 +83,7 @@ pub use message_view::{
     WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
 };
 pub use primitives::ack_level::AckLevel;
-pub use primitives::consumer::WireConsumer;
+pub use primitives::consumer::{KIND_CONSUMER_GROUP, WireConsumer};
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
 pub use primitives::partition_assignment::CreatedPartitionAssignment;
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
@@ -93,6 +94,10 @@ pub use primitives::polling_strategy::WirePollingStrategy;
 pub use primitives::user_headers::{
     WireHeaderKind, WireUserHeaderEntry, WireUserHeaderIterator, WireUserHeaders,
     encode_user_headers, user_headers_encoded_size, validate_user_headers,
+};
+pub use version::{
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, ProtocolVersion,
+    is_protocol_compatible,
 };
 
 /// Maximum number of partitions allowed in a single create/delete request.

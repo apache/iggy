@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteUser` op. Live username picked from shadow.
+//! `DeleteUser` op. Targets `Ok` (a live user) or `UserNotFound` (a fabricated
+//! username).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -26,17 +27,14 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::DeleteUserResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub user: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -45,7 +43,10 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => shadow.pick_user_name(prng).map(|user| Input { user }),
+        Outcome::Ok => shadow.pick_user_name(prng).map(|user| Input { user }),
+        Outcome::UserNotFound => Some(Input {
+            user: shadow.fabricate_absent_name("user"),
+        }),
     }
 }
 
@@ -54,16 +55,21 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.delete_user(&input.user)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::RemoveUser {
+        Outcome::Ok => Effect::RemoveUser {
             name: input.user.clone(),
         },
+        Outcome::UserNotFound => Effect::None,
     }
 }

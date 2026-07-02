@@ -27,7 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 # Multi-stage build for Python SDK testing
-FROM python:3.10-slim AS base
+FROM python:3.10-slim-trixie AS base
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

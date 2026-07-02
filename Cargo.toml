@@ -42,6 +42,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
@@ -65,14 +66,19 @@ members = [
     "examples/rust",
     "gateways/kafka",
     "gateways/kafka/tools/kafka-tool",
+    "gateways/kafka",
+    "gateways/kafka/tools/kafka-tool",
 ]
 exclude = ["foreign/cpp", "foreign/php", "foreign/python"]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+rust-version = "1.95"
 
 [workspace.dependencies]
 actix-cors = "0.7.1"
 actix-files = "0.6.10"
-actix-web = "4.13.0"
+actix-web = "4.14.0"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
 aligned-vec = "0.6.4"
@@ -100,13 +106,13 @@ bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bit-set = "0.10.0"
 blake3 = "1.8.5"
-bon = "3.9.1"
-byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
+bon = "3.9.3"
+byte-unit = { version = "5.2.3", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
-bytes = "1.11.1"
+bytes = "1.12.0"
 cfg_aliases = "0.2.1"
 charming = "0.6.0"
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
 clap_complete = "4.6.5"
 clock = { path = "core/clock" }
@@ -125,8 +131,8 @@ compio = { version = "=0.19.1", features = [
     "ws",
     "fs",
 ] }
-compio-buf = "0.8.2"
-compio-driver = "0.12.1"
+compio-buf = "0.8.3"
+compio-driver = "0.12.3"
 compio-quic = "=0.8.0"
 compio-ws = "=0.4.0"
 configs = { path = "core/configs", version = "0.1.0" }
@@ -136,14 +142,14 @@ console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
 crossfire = "3.1.16"
 csv = "1.4.0"
-ctor = "1.0.6"
+ctor = "1.0.7"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.9.0", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.9.0" }
 darling = "0.23"
 dashmap = "6.2.1"
-deltalake = { version = "0.32.3", features = ["azure", "gcs", "s3"] }
+deltalake = { version = "0.32.4", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
@@ -151,15 +157,15 @@ dircpy = "0.3.20"
 dirs = "6.0.0"
 dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
-dtor = "1.0.3"
+dtor = "1.0.5"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enumset = "1.1"
 env_logger = "0.11.10"
-err_trail = { version = "0.11.0", features = ["tracing"] }
+err_trail = { version = "0.11.1", features = ["tracing"] }
 error_set = "0.9.1"
 figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-file-operation = "0.8.21"
+file-operation = "0.8.25"
 flatbuffers = "25.12.19"
 flume = "0.12.0"
 fs2 = "0.4.3"
@@ -179,7 +185,7 @@ governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hostname = "0.4.2"
-http = "1.4.0"
+http = "1.4.2"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.12"
@@ -201,7 +207,7 @@ lazy_static = "1.5.0"
 left-right = "0.11"
 lending-iterator = "0.1.7"
 libc = "0.2.186"
-log = "0.4.30"
+log = "0.4.33"
 lz4_flex = "0.13.1"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
@@ -213,9 +219,7 @@ mongodb = { version = "3.7.0", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.51.0"
-once_cell = "1.21.4"
-opensearch = { version = "2.4.0", features = ["rustls-tls"], default-features = false }
+octocrab = "0.53.1"
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [
@@ -242,18 +246,18 @@ paste = "1.0"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.4"
 proc-macro2 = "1"
-prometheus-client = "0.24.1"
-prost = "0.14.3"
-prost-types = "0.14.3"
+prometheus-client = "0.25.0"
+prost = "0.14.4"
+prost-types = "0.14.4"
 protox = "0.9.1"
 protox-parse = "0.9.0"
-quinn = "0.11.9"
+quinn = "0.11.11"
 quote = "1"
 rand = "0.10.1"
 rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.8"
-regex = "1.12.3"
+regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
@@ -265,7 +269,7 @@ rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.11.0"
 rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls", "tags"] }
-rustls = { version = "0.23.40", features = ["ring"] }
+rustls = { version = "0.23.41", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
 sd-notify = "0.5"
@@ -273,9 +277,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.150"
-serde_with = { version = "3.20.0", features = ["base64", "macros"] }
+serde_with = { version = "3.21.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
-serial_test = "3.4.0"
+serial_test = "3.5.0"
 server = { path = "core/server" }
 server-ng = { path = "core/server-ng" }
 server_common = { path = "core/server_common" }
@@ -283,7 +287,7 @@ shard = { path = "core/shard" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"
 smallvec = "1.15"
-socket2 = "0.6.3"
+socket2 = "0.6.4"
 sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "tls-rustls",
@@ -300,7 +304,7 @@ static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 syn = { version = "2", features = ["full", "extra-traits"] }
-sysinfo = "0.39.2"
+sysinfo = "0.39.5"
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
@@ -312,7 +316,7 @@ tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 toml = "1.1.2"
-tower-http = { version = "0.6.11", features = ["add-extension", "cors", "trace"] }
+tower-http = { version = "0.7.0", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-opentelemetry = "0.33.0"
@@ -327,8 +331,8 @@ twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
 ureq = "3.3"
 url = "2.5.8"
-uuid = { version = "1.23.1", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
-vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
+uuid = { version = "1.23.3", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
+vergen-git2 = { version = "10.0.0", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = [
@@ -340,13 +344,13 @@ web-sys = { version = "0.3", features = [
     "ResizeObserver",
     "ResizeObserverEntry",
 ] }
-webpki-roots = "1.0.7"
+webpki-roots = "1.0.8"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }
-zeroize = "1"
+zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]

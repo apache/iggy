@@ -26,10 +26,10 @@ use encoders::{
     proto::ProtoStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder,
 };
 use iggy::prelude::{HeaderKey, HeaderValue};
-use once_cell::sync::OnceCell;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 use strum_macros::{Display, IntoStaticStr};
 use thiserror::Error;
 use tokio::runtime::Runtime;
@@ -52,10 +52,9 @@ pub use transforms::Transform;
 #[doc(hidden)]
 pub mod connector_macro_support {
     pub use dashmap::DashMap;
-    pub use once_cell::sync::Lazy;
 }
 
-static RUNTIME: OnceCell<Runtime> = OnceCell::new();
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))

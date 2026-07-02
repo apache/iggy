@@ -27,11 +27,10 @@ use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
     source::HandleCallback, transforms::Transform,
 };
-use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, LazyLock, atomic::Ordering},
     time::Instant,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -58,7 +57,8 @@ pub(crate) struct SourceSenderEntry {
     pub(crate) error_counter: Counter,
 }
 
-pub(crate) static SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>> = Lazy::new(DashMap::new);
+pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
+    LazyLock::new(DashMap::new);
 
 pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);

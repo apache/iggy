@@ -16,14 +16,16 @@
 // under the License.
 
 mod client;
-mod consumer_group;
+mod consumer;
 mod identifier;
 mod messages;
-mod stream;
-mod topic;
+mod producer;
+mod type_conversion;
 
-use client::{Client, delete_connection, new_connection};
+use client::{Client, delete_connection as delete_client, new_connection};
+use consumer::Consumer;
 use messages::make_message;
+use producer::Producer;
 use std::sync::LazyLock;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -52,6 +54,29 @@ mod ffi {
         replication_factor: u8,
         messages_count: u64,
         partitions_count: u32,
+    }
+
+    struct Partition {
+        id: u32,
+        created_at: u64,
+        segments_count: u32,
+        current_offset: u64,
+        size_bytes: u64,
+        messages_count: u64,
+    }
+
+    struct TopicDetails {
+        id: u32,
+        created_at: u64,
+        name: String,
+        size_bytes: u64,
+        message_expiry: u64,
+        compression_algorithm: String,
+        max_topic_size: u64,
+        replication_factor: u8,
+        messages_count: u64,
+        partitions_count: u32,
+        partitions: Vec<Partition>,
     }
 
     struct Stream {
@@ -115,10 +140,23 @@ mod ffi {
         members: Vec<ConsumerGroupMember>,
     }
 
+    struct ConsumerGroup {
+        id: u32,
+        name: String,
+        partitions_count: u32,
+        members_count: u32,
+    }
+
     struct ConsumerGroupInfo {
         stream_id: u32,
         topic_id: u32,
         group_id: u32,
+    }
+
+    struct ConsumerOffsetInfo {
+        partition_id: u32,
+        current_offset: u64,
+        stored_offset: u64,
     }
 
     struct ClientInfo {
@@ -186,12 +224,16 @@ mod ffi {
 
     extern "Rust" {
         type Client;
+        type Consumer;
+        type Producer;
 
         // Client functions
         fn new_connection(connection_string: String) -> Result<*mut Client>;
         fn login_user(self: &Client, username: String, password: String) -> Result<()>;
+        fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
-        fn create_stream(self: &Client, stream_name: String) -> Result<()>;
+        fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
+        fn update_stream(self: &Client, stream_id: Identifier, stream_name: String) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
@@ -207,7 +249,26 @@ mod ffi {
             message_expiry_kind: String,
             message_expiry_value: u64,
             max_topic_size: String,
+        ) -> Result<TopicDetails>;
+        fn get_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<TopicDetails>;
+        fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
+        #[allow(clippy::too_many_arguments)]
+        fn update_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            topic_name: String,
+            compression_algorithm: String,
+            replication_factor: u8,
+            message_expiry_kind: String,
+            message_expiry_value: u64,
+            max_topic_size: String,
         ) -> Result<()>;
+        fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
@@ -233,6 +294,11 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<ConsumerGroupDetails>;
+        fn get_consumer_groups(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+        ) -> Result<Vec<ConsumerGroup>>;
         fn delete_consumer_group(
             self: &Client,
             stream_id: Identifier,
@@ -250,6 +316,31 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+        ) -> Result<()>;
+        fn store_consumer_offset(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            offset: u64,
+        ) -> Result<()>;
+        fn get_consumer_offset(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+        ) -> Result<ConsumerOffsetInfo>;
+        fn delete_consumer_offset(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
         ) -> Result<()>;
 
         #[allow(clippy::too_many_arguments)]
@@ -277,6 +368,13 @@ mod ffi {
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
         ) -> Result<()>;
+        fn flush_unsaved_buffer(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            fsync: bool,
+        ) -> Result<()>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
@@ -289,10 +387,52 @@ mod ffi {
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
 
-        unsafe fn delete_connection(client: *mut Client) -> Result<()>;
+        // Future functions
+        // fn disconnect(self: &Client) -> Result<()>;
+        // fn shutdown(self: &Client) -> Result<()>;
+        // fn subscribe_events(self: &Client) -> Result<()>;
+        // fn delete_segments(self: &Client, stream_id: Identifier, topic_id: Identifier, partition_id: u32, segments_count: u32) -> Result<()>;
+        // fn get_user(self: &Client, user_id: Identifier) -> Result<()>;
+        // fn get_users(self: &Client) -> Result<()>;
+        // fn create_user(self: &Client, username: String, password: String, status: u8) -> Result<()>;
+        // fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
+        // fn update_user(self: &Client, user_id: Identifier, username: String, status: u8) -> Result<()>;
+        // fn update_permissions(self: &Client, user_id: Identifier, permissions: Vec<u8>) -> Result<()>;
+        // fn change_password(self: &Client, user_id: Identifier, current_password: String, new_password: String) -> Result<()>;
+        // fn get_cluster_metadata(self: &Client) -> Result<()>;
+        // fn get_personal_access_tokens(self: &Client) -> Result<()>;
+        // fn create_personal_access_token(self: &Client, name: String, expiry: u64) -> Result<()>;
+        // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        // fn login_with_personal_access_token(self: &Client, token: String) -> Result<()>;
+
+        unsafe fn delete_client(client: *mut Client) -> Result<()>;
 
         // Identifier functions
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;
         fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
+
+        // Consumer methods
+        // fn name(self: &Consumer) -> Result<String>;
+        // fn topic(self: &Consumer) -> Result<Identifier>;
+        // fn stream(self: &Consumer) -> Result<Identifier>;
+        // fn partition_id(self: &Consumer) -> u32;
+        // fn store_offset(self: &Consumer, offset: u64, partition_id: u32) -> Result<()>;
+        // fn delete_offset(self: &Consumer, partition_id: u32) -> Result<()>;
+        // fn get_last_consumed_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
+        // fn get_last_stored_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
+        // fn init(self: &mut Consumer) -> Result<()>;
+        // fn shutdown(self: &mut Consumer) -> Result<()>;
+        // unsafe fn delete_consumer(consumer: *mut Consumer) -> Result<()>;
+
+        // Producer methods
+        // fn stream(self: &Producer) -> Result<Identifier>;
+        // fn topic(self: &Producer) -> Result<Identifier>;
+        // fn init(self: &Producer) -> Result<()>;
+        // fn send(self: &Producer, messages: Vec<IggyMessageToSend>) -> Result<()>;
+        // fn send_one(self: &Producer, message: IggyMessageToSend) -> Result<()>;
+        // fn send_with_partitioning(self: &Producer, partitioning_kind: String, partitioning_value: Vec<u8>, messages: Vec<IggyMessageToSend>) -> Result<()>;
+        // fn send_to(self: &Producer, stream_id: Identifier, topic_id: Identifier, partitioning_kind: String, partitioning_value: Vec<u8>, messages: Vec<IggyMessageToSend>) -> Result<()>;
+        // fn shutdown(self: &mut Producer) -> Result<()>;
+        // unsafe fn delete_producer(producer: *mut Producer) -> Result<()>;
     }
 }

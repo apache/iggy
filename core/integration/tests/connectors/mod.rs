@@ -31,6 +31,7 @@ mod quickwit;
 mod random;
 mod random_source_liveness;
 mod runtime;
+mod s3;
 mod stdout;
 
 use iggy_common::IggyTimestamp;

@@ -27,8 +27,8 @@ pub use config::CoordinatorConfig;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer, VsrAction,
-    VsrConsensus,
+    Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer,
+    VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -37,6 +37,7 @@ use iggy_binary_protocol::{
 #[cfg(any(test, feature = "simulator"))]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
+use iggy_common::{IggyExpiry, IggyTimestamp};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -160,6 +161,19 @@ pub enum MetadataSubmit {
         request: Message<GenericHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
     },
+    /// A shard's partition reconciler asks shard 0 to complete a cooperative
+    /// consumer-group revocation (the source drained the partition or it timed
+    /// out). Server-originated: shard 0 proposes it through metadata consensus
+    /// with no client session. Fire-and-forget + idempotent -- `reply` carries
+    /// the commit op (or `None` on a transient submit failure) for logging only.
+    CompleteRevocation {
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u64,
+        source_client_id: u128,
+        partition_id: u32,
+        reply: Sender<Option<u64>>,
+    },
 }
 
 /// Handler shard 0 runs for an inbound [`MetadataSubmit`].
@@ -180,9 +194,20 @@ pub struct ConnectedClientInfo {
     /// Transport (coordinator-minted) client id; top 16 bits are the home
     /// shard. The wire `client_id` is the `u32` seq tail.
     pub client_id: u128,
+    /// Bound VSR client id, if the connection completed register. Keys the
+    /// connection to its consumer-group memberships (stored by VSR id, not
+    /// transport id).
+    pub vsr_client_id: Option<u128>,
     pub user_id: Option<u32>,
     pub transport: ClientTransportKind,
     pub address: std::net::SocketAddr,
+    /// SDK identity from the login version prefix; `None` pre-login.
+    /// In-memory only: the `get_clients` wire response is shared with the
+    /// legacy server, so exposing these on the wire is a follow-up.
+    pub sdk_name: Option<String>,
+    pub sdk_version: Option<String>,
+    /// Packed protocol version, see `iggy_binary_protocol::ProtocolVersion`.
+    pub protocol_version: Option<u32>,
 }
 
 /// Handler each shard runs for an inbound [`LifecycleFrame::ListClients`].
@@ -207,6 +232,28 @@ pub enum PartitionRead {
     ConsumerOffset {
         consumer: PollingConsumer,
     },
+    /// Cooperative-rebalance classification: the group's last-polled and
+    /// committed offsets on this partition, so the join enrichment can tell an
+    /// in-flight partition (committed < last-polled) from a never-polled/drained
+    /// one. `group_id` is the monotonic consumer-group id (offset key).
+    GroupOffsetState {
+        group_id: u64,
+    },
+    /// Drop the group's ephemeral `last_polled` mark on this partition. The
+    /// join-time gather issues this when it finds an uncommitted `last_polled`
+    /// for a partition no live member owns: the residue of a since-removed
+    /// member (reconnect). Clearing it stops a later join in the same restart
+    /// from misreading the dead mark as a live in-flight hold. `group_id` is the
+    /// monotonic consumer-group id (offset key).
+    ClearGroupLastPolled {
+        group_id: u64,
+    },
+    /// Resolve a client `DeleteSegments` count into a concrete truncation
+    /// offset: the `end_offset` of the `count`-th oldest sealed segment. Run on
+    /// the owning shard, which alone holds the partition's segment state.
+    ResolveSegmentDeleteOffset {
+        count: u32,
+    },
 }
 
 /// Reply to a [`PartitionRead`].
@@ -220,6 +267,18 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
+    /// committed offsets on this partition (each `None` if absent).
+    GroupOffsetState {
+        last_polled: Option<u64>,
+        committed: Option<u64>,
+    },
+    /// Acknowledges a [`PartitionRead::ClearGroupLastPolled`].
+    Ack,
+    /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
+    /// truncation offset, or `None` when the partition has no sealed segments
+    /// to delete.
+    SegmentDeleteOffset { up_to_offset: Option<u64> },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
@@ -483,6 +542,34 @@ pub enum LifecycleFrame {
     /// shard's `reconcile_queue` on receipt; tail drain on every frame
     /// catches dropped markers.
     ReconcileApply,
+    /// Per-shard segment-cleaner request: delete expired / over-budget sealed
+    /// segments of `namespace` on the pump, serialized with reads. The timer
+    /// task resolves `message_expiry` / `max_bytes` from metadata and stamps
+    /// `now`; the pump only mutates. Local and unreplicated — each replica
+    /// trims its own log (divergence is invisible: reads hit the primary).
+    CleanPartition {
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+    /// Reconciler-staged enforcement of a committed `TruncatePartition`
+    /// watermark: delete sealed segments up to `up_to_offset` on the pump,
+    /// serialized with reads. Each replica applies the committed offset
+    /// locally and idempotently.
+    TruncatePartition {
+        namespace: IggyNamespace,
+        up_to_offset: u64,
+    },
+    /// Reconciler-staged enforcement of a committed `PurgeTopic`: reset the
+    /// partition to a single empty segment at offset 0 and clear consumer
+    /// offsets on the pump, serialized with reads. `generation` is the
+    /// committed purge generation; the pump no-ops if the partition already
+    /// applied it, so a redundant reconcile pass never re-wipes live data.
+    PurgePartition {
+        namespace: IggyNamespace,
+        generation: u64,
+    },
 }
 
 /// Reconciler-staged partition mutation.
@@ -993,6 +1080,55 @@ where
         let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::ReconcileApply));
     }
 
+    /// Stage a segment-cleaner pass for `namespace` on this shard's pump. The
+    /// timer task resolves retention config off-pump and stamps `now`; the pump
+    /// is the single writer of partition state, so the deletion runs there,
+    /// serialized with reads.
+    pub fn request_clean_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
+            namespace,
+            now,
+            message_expiry,
+            max_bytes,
+        }));
+    }
+
+    /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
+    /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
+    /// this after observing a committed delete watermark for an owned partition.
+    pub fn request_truncate_partition(&self, namespace: IggyNamespace, up_to_offset: u64) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::TruncatePartition {
+            namespace,
+            up_to_offset,
+        }));
+    }
+
+    /// Stage a `PurgePartition` enforcement for `namespace` on this shard's
+    /// pump: reset the partition to empty at offset 0 and clear consumer
+    /// offsets. The reconciler calls this after observing a committed purge
+    /// generation newer than the partition's locally applied one.
+    pub fn request_purge_partition(&self, namespace: IggyNamespace, generation: u64) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::PurgePartition {
+            namespace,
+            generation,
+        }));
+    }
+
     /// Drain and apply staged [`ReconcileOp`]s on the pump task.
     /// Synchronous: every arm is in-memory only. `ConfirmRemove`'s fsync +
     /// blocking close is offloaded to a detached task so the pump doesn't
@@ -1153,7 +1289,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1168,6 +1304,23 @@ where
                 let routing = (prepare.header().operation, prepare.header().namespace);
                 if let Some(prepare) = self.park_if_unmaterialised(prepare, routing.0, routing.1) {
                     self.on_replicate(prepare).await;
+                    // A follower learns the cluster commit point from the
+                    // commit_max piggybacked on each prepare; the Commit
+                    // heartbeat carries commit_min and stops advancing
+                    // commit_max once the piggyback has raced ahead, so
+                    // on_commit alone never drains a follower's journal. Drive
+                    // it here off the prepare, as the metadata plane does inside
+                    // its own on_replicate.
+                    if routing.0.is_partition() {
+                        let planes = self.plane.inner();
+                        let config = planes.1.0.config();
+                        let namespace = IggyNamespace::from_raw(routing.1);
+                        if let Some(partition) = planes.1.0.get_mut_by_ns(&namespace)
+                            && partition.consensus().is_follower()
+                        {
+                            partition.commit_journal(config).await;
+                        }
+                    }
                 }
             }
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
@@ -1260,7 +1413,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1279,7 +1432,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1298,7 +1451,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1332,7 +1485,7 @@ where
             >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
@@ -1417,25 +1570,46 @@ where
         partitions.insert(namespace, partition);
     }
 
-    /// Handle incoming view-change/control message. Metadata use metadata
-    /// consensus. Partitions loop all partitions, use partition consensus.
-    ///
-    // TODO(hubcio): every VSR callback below
-    // (`on_start_view_change`, `on_do_view_change`, `on_start_view`,
-    // `on_commit`, `tick_partitions`) materialises
-    // `planes.1.0.namespaces().copied().collect::<Vec<_>>()` per call to
-    // avoid borrowing the partitions plane across the partition-consensus
-    // `.await` inside the loop. Allocs scale with VSR traffic, not with
-    // useful work: a quiet cluster still pays one Vec per heartbeat tick.
-    // Convert to the `namespace_scratch: RefCell<Vec<IggyNamespace>>`
-    // pattern already used by `process_loopback` (see :646-684) so the
-    // scratch is reused across calls. Asserts on entry/exit keep the
-    // "empty on entry, drained on exit" invariant explicit.
-    //
-    // Reproducible in `core/simulator`: sim drives these callbacks via
-    // `tick()` against `IggyShard`, so an allocation-counting variant of
-    // `MemStorage`/test harness can pin the per-VSR-cb alloc count and
-    // fail on regression after the scratch refactor lands.
+    /// Resolve the single partition a VSR control frame addresses, keyed by
+    /// `header.namespace`. Warns and returns `None` when the namespace matches
+    /// neither metadata nor a live partition consensus. Returns `&mut` because
+    /// `on_do_view_change` / `on_commit` need it for `commit_journal`; the read-
+    /// only callers reborrow `&`. Pump-only (sole mutator), so the `&mut` formed
+    /// here via interior mutability cannot alias a concurrent reconcile.
+    #[allow(clippy::mut_from_ref)]
+    fn resolve_partition_target<'a>(
+        &self,
+        partitions: &'a IggyPartitions<B>,
+        namespace: u64,
+        view: u32,
+        replica: u8,
+        frame: &'static str,
+    ) -> Option<&'a mut IggyPartition<B>>
+    where
+        B: MessageBus,
+    {
+        let Some(partition) = partitions.get_mut_by_ns(&IggyNamespace::from_raw(namespace)) else {
+            tracing::warn!(
+                shard = self.id,
+                namespace,
+                view,
+                replica,
+                frame,
+                "dropping VSR control frame: namespace matches neither metadata nor partition consensus"
+            );
+            return None;
+        };
+        debug_assert_eq!(
+            partition.consensus().namespace(),
+            namespace,
+            "keyed partition lookup must match the frame namespace"
+        );
+        Some(partition)
+    }
+
+    /// Handle an incoming VSR control frame. A metadata frame uses the metadata
+    /// consensus; a partition frame addresses exactly one partition, resolved by
+    /// [`Self::resolve_partition_target`].
     #[allow(clippy::future_not_send)]
     async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
     where
@@ -1458,29 +1632,19 @@ where
             return;
         }
 
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "StartViewChange",
+        ) else {
             return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartViewChange: namespace matches neither metadata nor partition consensus"
-        );
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -1496,7 +1660,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1517,36 +1681,26 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
-            if actions
-                .iter()
-                .any(|action| matches!(action, VsrAction::CommitJournal))
-            {
-                partition.commit_journal(&config).await;
-            }
+        let config = planes.1.0.config();
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "DoViewChange",
+        ) else {
             return;
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if actions
+            .iter()
+            .any(|action| matches!(action, VsrAction::CommitJournal))
+        {
+            partition.commit_journal(config).await;
         }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping DoViewChange: namespace matches neither metadata nor partition consensus"
-        );
     }
 
     #[allow(clippy::future_not_send)]
@@ -1571,29 +1725,19 @@ where
             return;
         }
 
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
-            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "StartView",
+        ) else {
             return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartView: namespace matches neither metadata nor partition consensus"
-        );
+        };
+        let consensus = partition.consensus();
+        let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
+        dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+        dispatch_partition_journal_actions(consensus, partition, &actions).await;
     }
 
     #[allow(clippy::future_not_send)]
@@ -1609,7 +1753,7 @@ where
         M: StreamsFrontend
             + StateMachine<
                 Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
+                Output = metadata::stm::result::ApplyReply,
                 Error = iggy_common::IggyError,
             >,
     {
@@ -1625,30 +1769,20 @@ where
             return;
         }
 
-        let config = planes.1.0.config().clone();
-        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
-        for namespace in namespaces {
-            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-                continue;
-            };
-            let consensus = partition.consensus();
-            if consensus.namespace() != header.namespace {
-                continue;
-            }
-
-            if consensus.handle_commit(&header) {
-                partition.commit_journal(&config).await;
-            }
+        let config = planes.1.0.config();
+        let Some(partition) = self.resolve_partition_target(
+            &planes.1.0,
+            header.namespace,
+            header.view,
+            header.replica,
+            "Commit",
+        ) else {
             return;
+        };
+        let consensus = partition.consensus();
+        if consensus.handle_commit(&header) {
+            partition.commit_journal(config).await;
         }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping Commit: namespace matches neither metadata nor partition consensus"
-        );
     }
 
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
@@ -1664,6 +1798,14 @@ where
             >,
     {
         let partitions = self.plane.partitions();
+        // Fan out over every group (each partition's heartbeat/retransmit timer
+        // must advance), so the keyed single-namespace lookup the control-frame
+        // handlers use does not apply here. The namespaces are snapshotted into
+        // an owned Vec so no partitions-plane borrow is held across the tick
+        // `.await`.
+        // TODO(hubcio): reuse the pump's `namespace_scratch` (as
+        // `process_loopback` does) to drop this per-tick alloc; a quiet cluster
+        // still pays one Vec per heartbeat.
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
 
         for namespace in namespaces {
@@ -1672,9 +1814,7 @@ where
             };
 
             let consensus = partition.consensus();
-            let current_op = consensus.sequencer().current_sequence();
-            let current_commit = consensus.commit_min();
-            let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+            let actions = consensus.tick(PlaneKind::Partitions);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             dispatch_partition_journal_actions(consensus, partition, &actions).await;
         }
@@ -1696,9 +1836,7 @@ where
             return;
         };
 
-        let current_op = consensus.sequencer().current_sequence();
-        let current_commit = consensus.commit_min();
-        let actions = consensus.tick(PlaneKind::Metadata, current_op, current_commit);
+        let actions = consensus.tick(PlaneKind::Metadata);
 
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
     }
