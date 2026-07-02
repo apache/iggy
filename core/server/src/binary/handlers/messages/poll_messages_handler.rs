@@ -25,7 +25,7 @@ use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_common::IggyError;
 use server_common::PooledBuffer;
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 use tracing::{debug, trace};
 
 pub async fn handle_poll_messages(
@@ -41,13 +41,14 @@ pub async fn handle_poll_messages(
     let partition_id = req.partition_id;
     let count = req.count;
     let auto_commit = req.auto_commit;
+    let wait_timeout = Duration::from_micros(req.wait_timeout_us);
 
     debug!(
         "session: {session}, command: poll_messages, stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id:?}"
     );
     shard.ensure_authenticated(session)?;
 
-    let args = PollingArgs::new(strategy, count, auto_commit);
+    let args = PollingArgs::with_wait_timeout(strategy, count, auto_commit, wait_timeout);
 
     let user_id = session.get_user_id();
     let client_id = session.client_id;
