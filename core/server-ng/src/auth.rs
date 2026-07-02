@@ -37,7 +37,18 @@ use metadata::impls::metadata::StreamsFrontend;
 use server::streaming::utils::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
 use tracing::warn;
+
+/// A well-formed Argon2 hash to verify against on the unknown-user login
+/// branch, so a missing username costs the same single `verify_password` a real
+/// user's wrong-password branch costs. Closes the username-existence timing
+/// oracle without changing the returned error. The password is a throwaway no
+/// account can present (login rejects out-of-range usernames before any hash
+/// check); computed once via the same hasher real users use, so the dummy
+/// verify runs an identical Argon2 KDF.
+static DUMMY_PASSWORD_HASH: LazyLock<String> =
+    LazyLock::new(|| crypto::hash_password("http-login-timing-guard"));
 
 pub(crate) fn verify_login_credentials(
     shard: &Rc<ServerNgShard>,
@@ -54,10 +65,16 @@ pub(crate) fn verify_login_credentials(
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some(user_id) = users.index.get(username).copied() else {
-            return Err(LoginRegisterError::InvalidCredentials);
-        };
-        let Some(user) = users.items.get(user_id as usize) else {
+        let user = users
+            .index
+            .get(username)
+            .copied()
+            .and_then(|user_id| users.items.get(user_id as usize));
+        let Some(user) = user else {
+            // Constant-cost path: verify against a dummy hash so a missing
+            // username is indistinguishable by response timing from a wrong
+            // password (both return InvalidCredentials).
+            let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
             return Err(LoginRegisterError::InvalidCredentials);
         };
         if user.status != UserStatus::Active {

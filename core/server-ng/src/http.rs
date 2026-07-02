@@ -24,6 +24,7 @@ mod jwt;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
@@ -38,7 +39,7 @@ use axum::{Json, Router};
 use bytes::{Bytes, BytesMut};
 use configs::cluster::{ClusterConfig, ClusterNodeConfig};
 use configs::http::HttpConfig;
-use consensus::{MetadataHandle, VsrConsensus};
+use consensus::{CLIENTS_TABLE_MAX, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::codes::{
     GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
@@ -161,7 +162,16 @@ const PONG: &str = "pong";
 /// (pathological at P1 volume). New sessions past the cap are refused with a
 /// transient 503 rather than evicting a live one; the client retries. Expired
 /// entries are dropped first, so the cap only bites on live oversubscription.
-const MAX_HTTP_SESSIONS: usize = 100_000;
+///
+/// Bounded by the shared VSR client table: HTTP sessions and the TCP/QUIC/WS
+/// virtual clients all Register into the one [`CLIENTS_TABLE_MAX`]-slot table,
+/// which LRU-evicts the oldest client when full. Capping HTTP at half that
+/// bound keeps this plane from crowding the others out and keeps the combined
+/// steady state under the shared bound, so a live idle HTTP session is not
+/// routinely evicted consensus-side. The residual eviction race (both planes
+/// busy) degrades gracefully: an evicted session's next control write is
+/// classified as an eviction and re-registers (see [`HttpInner::forget_session`]).
+const MAX_HTTP_SESSIONS: usize = CLIENTS_TABLE_MAX / 2;
 
 /// First per-session request id the write path hands out. VSR request numbers
 /// are 1-based and strictly increasing within a session.
@@ -227,6 +237,11 @@ const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
 /// PAT). Shared via `Rc` by every concurrent request bearing that credential,
 /// so the session granularity is per-login.
 struct HttpSession {
+    /// Session-table key this entry lives under (`jwt:{jti}` / `pat:{sha}`).
+    /// Held so an eviction observed on the write path can remove exactly this
+    /// entry (see [`HttpInner::forget_session`]) without threading the key
+    /// through the whole write chain.
+    key: String,
     /// Shard-0 client id minted for this credential; its top 16 bits are 0, so
     /// it shares the shard-0 id space with TCP virtual clients without
     /// colliding. Fills `RequestHeader.client` on every write.
@@ -315,13 +330,21 @@ impl IntoResponse for AuthError {
 /// business error or, worse, a 200 with a stale body.
 enum WriteError {
     Rejected(IggyError),
+    /// The VSR session was evicted (its client slot was reclaimed cluster-side,
+    /// e.g. LRU-evicted from the full client table). Renders identically to a
+    /// terminal `Rejected` (401 -> re-authenticate), but is a distinct variant
+    /// so the submit path can drop the dead session entry and let the caller's
+    /// next request re-register cleanly instead of 401-looping on it.
+    Evicted(IggyError),
     Unavailable,
 }
 
 impl IntoResponse for WriteError {
     fn into_response(self) -> Response {
         match self {
-            Self::Rejected(error) => CustomError::from(error).into_response(),
+            Self::Rejected(error) | Self::Evicted(error) => {
+                CustomError::from(error).into_response()
+            }
             Self::Unavailable => service_unavailable(),
         }
     }
@@ -621,6 +644,67 @@ struct ClusterRoster {
     http_addr: SocketAddr,
 }
 
+/// Serializes first-use VSR registration per credential key so a herd of
+/// concurrent first-requests for one token runs exactly one `Register` instead
+/// of N that each mint a client id and orphan N-1 slots last-writer-wins.
+///
+/// Shard 0 is single-threaded, so the whole check-or-claim is a synchronous
+/// `RefCell` critical section (no cross-thread machinery): the first caller for
+/// a key claims it and gets a [`RegistrationGuard`]; every later caller gets a
+/// waiter to park on until the registrant finishes. The guard clears the marker
+/// and wakes all waiters on drop - including a cancellation drop, so a
+/// disconnected registrant can never wedge its waiters.
+#[derive(Default)]
+struct RegistrationBarrier {
+    /// Key -> waiters parked on the in-flight registration. Dropping a waiter's
+    /// sender wakes its receiver; the guard drops the whole vec at once.
+    inflight: RefCell<HashMap<String, Vec<oneshot::Sender<()>>>>,
+}
+
+/// Outcome of [`RegistrationBarrier::enter`]: lead the registration or wait for
+/// the caller that is already leading it.
+enum BarrierEntry<'a> {
+    Lead(RegistrationGuard<'a>),
+    Wait(oneshot::Receiver<()>),
+}
+
+/// Held by the sole registrant for a key. On drop it removes the in-flight
+/// marker, which drops every parked waiter's sender and so wakes them to
+/// re-check the session table.
+struct RegistrationGuard<'a> {
+    barrier: &'a RegistrationBarrier,
+    key: String,
+}
+
+impl RegistrationBarrier {
+    /// Claim `key` for registration, or return a waiter if another caller
+    /// already holds it. Synchronous and borrow-free of any `.await`.
+    fn enter(&self, key: &str) -> BarrierEntry<'_> {
+        match self.inflight.borrow_mut().entry(key.to_owned()) {
+            Entry::Occupied(mut occupied) => {
+                let (sender, receiver) = oneshot::channel();
+                occupied.get_mut().push(sender);
+                BarrierEntry::Wait(receiver)
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(Vec::new());
+                BarrierEntry::Lead(RegistrationGuard {
+                    barrier: self,
+                    key: key.to_owned(),
+                })
+            }
+        }
+    }
+}
+
+impl Drop for RegistrationGuard<'_> {
+    fn drop(&mut self) {
+        // Dropping the vec of senders wakes every waiter (Canceled), which then
+        // re-checks the table for the session this registrant installed.
+        self.barrier.inflight.borrow_mut().remove(&self.key);
+    }
+}
+
 /// Shared shard-0 HTTP state.
 ///
 /// Groups the shard handle, the JWT issuer/verifier, and the per-credential VSR
@@ -634,6 +718,9 @@ struct HttpInner {
     /// bridge tolerates the `!Sync` interior - but the guard must never be held
     /// across an `.await` (see [`HttpInner::resolve_session`]).
     sessions: RefCell<HashMap<String, Rc<HttpSession>>>,
+    /// Per-key registration barrier: prevents a thundering herd of first
+    /// requests for one credential from each running its own `Register`.
+    registrations: RegistrationBarrier,
     roster: ClusterRoster,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
@@ -689,45 +776,48 @@ impl HttpInner {
         user_id: u32,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
-        let now = IggyTimestamp::now().to_secs();
-        if let Some(session) = self.live_session(&key, now) {
-            return Ok(session);
-        }
-
-        // Miss: mint + Register with no borrow held (an async VSR commit).
-        let fresh = self.register_session(user_id, expiry).await?;
-
-        let mut table = self.sessions.borrow_mut();
-        // A concurrent first request for the same key may have Registered and
-        // inserted while we were parked. Last-writer-wins: reuse the installed
-        // entry and drop `fresh`, whose client id is then orphaned on the peers
-        // until they evict it - an accepted rare cost at P1 volume.
-        if let Some(session) = live_entry(&table, &key, now) {
-            return Ok(session);
-        }
-        table.retain(|_, session| {
-            if session.expiry > now {
-                return true;
+        loop {
+            let now = IggyTimestamp::now().to_secs();
+            if let Some(session) = self.live_session(&key, now) {
+                return Ok(session);
             }
-            // Evicting the session also tears down its in-process reply
-            // target (if a partition write ever installed one), cancelling any
-            // still-parked reply waiters. Token-fenced so a stale sweep can
-            // never remove a later occupant of the key.
-            if let Some(token) = session.registry_token.get() {
-                self.shard
-                    .bus
-                    .clients()
-                    .remove_if_token_matches(session.client_id, token);
+
+            // Miss. Serialize registration per credential so a herd of
+            // concurrent first-requests runs one `Register`, not N.
+            match self.registrations.enter(&key) {
+                BarrierEntry::Wait(waiter) => {
+                    // Another first-request is registering this credential.
+                    // Park until it finishes (its guard wakes us on drop),
+                    // then loop to re-check the table for what it installed.
+                    let _ = waiter.await;
+                }
+                BarrierEntry::Lead(_guard) => {
+                    // Sole registrant for this key: mint + Register with no
+                    // borrow held (an async VSR commit). The guard wakes any
+                    // waiters when this scope ends, cancellation drop included.
+                    let fresh = self.register_session(key.clone(), user_id, expiry).await?;
+                    // Resample after the await: the pre-await stamp is stale for
+                    // the expiry sweep and cap check below.
+                    let now = IggyTimestamp::now().to_secs();
+                    let (admitted, torn) = {
+                        let mut table = self.sessions.borrow_mut();
+                        let torn = sweep_expired(&mut table, now);
+                        if table.len() >= MAX_HTTP_SESSIONS {
+                            // Still full after dropping expired entries: too many
+                            // genuinely live sessions. Refuse rather than evict a
+                            // live one (its `fresh` client id is orphaned on the
+                            // peers until they evict it - a rare at-cap cost).
+                            (None, torn)
+                        } else {
+                            table.insert(key.clone(), Rc::clone(&fresh));
+                            (Some(fresh), torn)
+                        }
+                    };
+                    self.teardown_reply_targets(torn);
+                    return admitted.ok_or(AuthError::SessionUnavailable);
+                }
             }
-            false
-        });
-        if table.len() >= MAX_HTTP_SESSIONS {
-            // Still full after dropping expired entries: too many genuinely live
-            // sessions. Refuse rather than evict a live one; the client retries.
-            return Err(AuthError::SessionUnavailable);
         }
-        table.insert(key, Rc::clone(&fresh));
-        Ok(fresh)
     }
 
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
@@ -737,9 +827,10 @@ impl HttpInner {
     }
 
     /// Mint a shard-0 client id and run the VSR `Register` for a fresh session.
-    /// Holds no table borrow; the caller inserts the result.
+    /// Holds no table borrow; the caller inserts the result under `key`.
     async fn register_session(
         &self,
+        key: String,
         user_id: u32,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
@@ -766,6 +857,7 @@ impl HttpInner {
                 AuthError::SessionUnavailable
             })?;
         Ok(Rc::new(HttpSession {
+            key,
             client_id,
             session,
             user_id,
@@ -775,6 +867,73 @@ impl HttpInner {
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))
+    }
+
+    /// Drop the session table entry for `session`, but only if it is still the
+    /// current occupant of its key (pointer-fenced, so a later re-registration
+    /// under the same key is never purged). Also tears down its in-process
+    /// reply target. Called when a control write comes back evicted: the VSR
+    /// slot is gone, so leaving the entry would 401-loop every retry on the
+    /// same credential until the token expires; removing it makes the next
+    /// request re-register cleanly through the barrier.
+    fn forget_session(&self, session: &Rc<HttpSession>) {
+        let torn = forget_if_same(&mut self.sessions.borrow_mut(), session);
+        self.teardown_reply_targets(torn.into_iter().collect());
+    }
+
+    /// Tear down the in-process reply targets of swept/forgotten sessions,
+    /// token-fenced so a stale teardown can never remove a later occupant's
+    /// registry entry. Runs outside the `sessions` borrow.
+    fn teardown_reply_targets(&self, torn: Vec<(u128, InstanceToken)>) {
+        for (client_id, token) in torn {
+            self.shard
+                .bus
+                .clients()
+                .remove_if_token_matches(client_id, token);
+        }
+    }
+}
+
+/// Drop every expired entry from the session table, returning the
+/// `(client_id, registry token)` of each dropped entry that had installed an
+/// in-process reply target so the caller can tear those down outside the
+/// borrow. A pure map operation (no shard), so the cap/expiry policy is
+/// unit-testable without a live consensus.
+fn sweep_expired(
+    table: &mut HashMap<String, Rc<HttpSession>>,
+    now_secs: u64,
+) -> Vec<(u128, InstanceToken)> {
+    let mut torn = Vec::new();
+    table.retain(|_, session| {
+        if session.expiry > now_secs {
+            return true;
+        }
+        if let Some(token) = session.registry_token.get() {
+            torn.push((session.client_id, token));
+        }
+        false
+    });
+    torn
+}
+
+/// Remove `session` from the table only if it is still the current occupant of
+/// its key (`Rc::ptr_eq`), returning its reply target to tear down. A stale
+/// handle whose key was re-registered to a newer session removes nothing. Pure
+/// (no shard) so the eviction-recovery fencing is unit-testable.
+fn forget_if_same(
+    table: &mut HashMap<String, Rc<HttpSession>>,
+    session: &Rc<HttpSession>,
+) -> Option<(u128, InstanceToken)> {
+    match table.get(&session.key) {
+        Some(current) if Rc::ptr_eq(current, session) => {
+            let torn = session
+                .registry_token
+                .get()
+                .map(|token| (session.client_id, token));
+            table.remove(&session.key);
+            torn
+        }
+        _ => None,
     }
 }
 
@@ -821,6 +980,7 @@ pub async fn start(
         shard: Rc::clone(shard),
         jwt,
         sessions: RefCell::new(HashMap::new()),
+        registrations: RegistrationBarrier::default(),
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
@@ -2117,12 +2277,12 @@ async fn submit_committed(
     // legacy parity.
     let (result_slot, committed) = oneshot::channel();
     let shard = Rc::clone(&state.shard);
-    let session = Rc::clone(session);
+    let task_session = Rc::clone(session);
     let body = body.to_vec();
     // Detached so a client disconnect cannot split a commit from its id
     // advance; both happen inside the task regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result = submit_gated(&shard, &session, operation, &body).await;
+        let result = submit_gated(&shard, &task_session, operation, &body).await;
         // A failed send means the handler died mid-await. The id advance
         // already happened above, which is the invariant that matters.
         let _ = result_slot.send(result);
@@ -2130,7 +2290,13 @@ async fn submit_committed(
     .detach();
     // `Canceled` = the task was dropped before sending (runtime teardown), a
     // transient server condition like an unanswered submit.
-    committed.await.map_err(|_| WriteError::Unavailable)?
+    let outcome = committed.await.map_err(|_| WriteError::Unavailable)?;
+    // An eviction means this session's VSR slot is gone: forget the entry so
+    // the caller's next request re-registers instead of 401-looping on it.
+    if matches!(&outcome, Err(WriteError::Evicted(_))) {
+        state.forget_session(session);
+    }
+    outcome
 }
 
 /// Gate-locked core of [`submit_committed`], run on a task the HTTP client
@@ -2140,7 +2306,8 @@ async fn submit_committed(
 /// eviction leaves the id free for the caller's retry, which the depth-1
 /// dedup requires (the next accepted request must be `committed + 1`, so a
 /// consumed-but-uncommitted id would wedge the session on `RequestGap`). An
-/// eviction means the session is dead, mapped to 401.
+/// eviction means the session is dead: mapped to 401, and [`submit_committed`]
+/// then forgets the entry so the caller's retry re-registers cleanly.
 ///
 /// Both shard-0 request rewrites run here before consensus, mirroring the TCP
 /// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
@@ -2177,7 +2344,7 @@ async fn submit_gated(
             drop(next_request_id);
             Ok((request_header, reply, raw_token))
         }
-        Command2::Eviction => Err(WriteError::Rejected(eviction_error(&reply))),
+        Command2::Eviction => Err(WriteError::Evicted(eviction_error(&reply))),
         _ => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
 }
@@ -3537,6 +3704,7 @@ mod tests {
     #[compio::test]
     async fn detached_task_advances_gate_and_ignores_dead_receiver() {
         let session = Rc::new(HttpSession {
+            key: "jwt:test".to_owned(),
             client_id: 7,
             session: 1,
             user_id: DEFAULT_ROOT_USER_ID,
@@ -3561,5 +3729,127 @@ mod tests {
         .detach();
         done.await.expect("detached task must run to completion");
         assert_eq!(*session.gate.lock().await, FIRST_REQUEST_ID + 1);
+    }
+
+    // -- session table + registration barrier --
+
+    /// `InstanceToken` has no public constructor, so fixtures carry no reply
+    /// target; the token-teardown branch of the sweep/forget helpers is
+    /// exercised via their `Option` path, not fabricated here.
+    fn fake_session(key: &str, client_id: u128, expiry: u64) -> Rc<HttpSession> {
+        Rc::new(HttpSession {
+            key: key.to_owned(),
+            client_id,
+            session: 1,
+            user_id: DEFAULT_ROOT_USER_ID,
+            expiry,
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_request: Cell::new(FIRST_REQUEST_ID),
+            registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
+        })
+    }
+
+    // The barrier is what makes a herd of concurrent first-requests for one
+    // credential run a single `Register`: only the leader reaches
+    // `register_session`; every other caller waits and reuses what it installs.
+    // A different credential leads independently, and the key frees on drop.
+    #[compio::test]
+    async fn registration_barrier_leads_one_caller_and_parks_the_rest() {
+        let barrier = RegistrationBarrier::default();
+
+        let BarrierEntry::Lead(leader) = barrier.enter("jwt:a") else {
+            panic!("first caller for a key must lead");
+        };
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            match barrier.enter("jwt:a") {
+                BarrierEntry::Wait(waiter) => waiters.push(waiter),
+                BarrierEntry::Lead(_) => panic!("a concurrent caller must not lead the same key"),
+            }
+        }
+        assert!(
+            matches!(barrier.enter("jwt:b"), BarrierEntry::Lead(_)),
+            "a different credential leads independently"
+        );
+
+        // Leader finishing wakes every waiter and frees the key.
+        drop(leader);
+        for waiter in waiters {
+            let _ = waiter.await;
+        }
+        assert!(
+            matches!(barrier.enter("jwt:a"), BarrierEntry::Lead(_)),
+            "the freed key leads a fresh registration"
+        );
+    }
+
+    #[test]
+    fn sweep_expired_drops_only_expired_entries() {
+        let mut table = HashMap::new();
+        let live = fake_session("jwt:live", 1, 1_000);
+        let stale = fake_session("jwt:stale", 2, 10);
+        table.insert(live.key.clone(), Rc::clone(&live));
+        table.insert(stale.key.clone(), Rc::clone(&stale));
+
+        // now = 100: live.expiry(1000) > now stays, stale.expiry(10) <= now goes.
+        let torn = sweep_expired(&mut table, 100);
+
+        assert!(torn.is_empty(), "fixtures install no reply target");
+        assert!(table.contains_key("jwt:live"), "live session retained");
+        assert!(!table.contains_key("jwt:stale"), "expired session swept");
+    }
+
+    // At the cap the sweep only reclaims expired entries, never a live one, so
+    // an all-live table stays full and `resolve_session` refuses (503) rather
+    // than evicting a live session.
+    #[test]
+    fn sweep_never_evicts_live_sessions_so_a_full_table_stays_full() {
+        let mut table = HashMap::new();
+        for client_id in 0..8u128 {
+            let session = fake_session(&format!("jwt:{client_id}"), client_id, 1_000);
+            table.insert(session.key.clone(), session);
+        }
+        let torn = sweep_expired(&mut table, 100);
+        assert!(torn.is_empty());
+        assert_eq!(table.len(), 8, "no live session is evicted to make room");
+    }
+
+    #[test]
+    fn http_session_cap_leaves_headroom_below_the_shared_client_table_bound() {
+        const {
+            assert!(
+                MAX_HTTP_SESSIONS < CLIENTS_TABLE_MAX,
+                "HTTP must not claim the whole shared VSR client table"
+            );
+        }
+        assert_eq!(MAX_HTTP_SESSIONS, CLIENTS_TABLE_MAX / 2);
+    }
+
+    // Eviction recovery: forgetting the evicted session drops exactly its
+    // entry, and a stale handle never purges a session that re-registered under
+    // the same key in the meantime (the `Rc::ptr_eq` fence).
+    #[test]
+    fn forget_removes_the_evicted_session_but_spares_a_re_registration() {
+        let mut table = HashMap::new();
+        let evicted = fake_session("jwt:a", 1, u64::MAX);
+        table.insert(evicted.key.clone(), Rc::clone(&evicted));
+
+        assert!(forget_if_same(&mut table, &evicted).is_none());
+        assert!(!table.contains_key("jwt:a"), "evicted session removed");
+
+        let replacement = fake_session("jwt:a", 2, u64::MAX);
+        table.insert(replacement.key.clone(), Rc::clone(&replacement));
+        assert!(
+            forget_if_same(&mut table, &evicted).is_none(),
+            "a stale handle removes nothing"
+        );
+        assert!(
+            Rc::ptr_eq(
+                table.get("jwt:a").expect("replacement present"),
+                &replacement
+            ),
+            "the pointer fence spares the re-registered session"
+        );
     }
 }

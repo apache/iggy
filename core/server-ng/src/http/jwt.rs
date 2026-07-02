@@ -71,6 +71,11 @@ impl JwtManager {
         validation.set_issuer(&config.valid_issuers);
         validation.set_audience(&config.valid_audiences);
         validation.leeway = u64::from(config.clock_skew.as_secs());
+        // The issuer always stamps `nbf`, so enforce it: a token presented
+        // before its not-before instant (beyond `leeway`) is rejected.
+        // `jsonwebtoken` leaves `validate_nbf` off by default, so this is
+        // explicit; the claim is always present, so it only ever tightens.
+        validation.validate_nbf = true;
         Ok(Self {
             algorithm,
             issuer: config.issuer,
@@ -172,4 +177,42 @@ fn normalize_secrets(mut config: HttpJwtConfig) -> HttpJwtConfig {
         }
     }
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A default config (HS256, matching issuer/audience, empty secrets ->
+    /// one ephemeral secret shared by encode and decode) with the two
+    /// timing knobs overridden.
+    fn config(not_before: &str, clock_skew: &str) -> HttpJwtConfig {
+        HttpJwtConfig {
+            not_before: not_before.parse().expect("valid duration"),
+            clock_skew: clock_skew.parse().expect("valid duration"),
+            ..HttpJwtConfig::default()
+        }
+    }
+
+    #[test]
+    fn token_presented_before_its_nbf_is_rejected() {
+        // not_before well past the leeway window, so the freshly issued token
+        // is not yet valid and decode must reject it.
+        let manager = JwtManager::build(&config("3600 s", "5 s")).expect("builds");
+        let token = manager.generate(7).expect("issues");
+        assert!(
+            manager.decode(&token.access_token).is_err(),
+            "a token presented before its nbf must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_at_its_nbf_is_accepted() {
+        // Default not_before (0s) => nbf == iat, so the token is valid now and
+        // enabling nbf validation does not reject a normally issued token.
+        let manager = JwtManager::build(&config("0 s", "5 s")).expect("builds");
+        let token = manager.generate(7).expect("issues");
+        let claims = manager.decode(&token.access_token).expect("valid now");
+        assert_eq!(claims.sub, "7");
+    }
 }
