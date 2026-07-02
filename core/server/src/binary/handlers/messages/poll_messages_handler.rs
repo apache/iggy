@@ -90,13 +90,7 @@ pub async fn handle_poll_messages(
 
                 if woke {
                     (metadata, batch) = shard
-                        .poll_messages(
-                            client_id,
-                            topic,
-                            consumer,
-                            partition_id,
-                            immediate_args(),
-                        )
+                        .poll_messages(client_id, topic, consumer, partition_id, immediate_args())
                         .await?;
                 }
             }
