@@ -15,26 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-module(
-    name = "iggy_cpp",
-    version = "0.1.0",
-)
+common --enable_bzlmod
 
-bazel_dep(name = "rules_cc", version = "0.2.20")
-bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
-bazel_dep(name = "rules_rust", version = "0.70.0")
-
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-rust.toolchain(
-    edition = "2024",
-    versions = ["1.96.0"],
-)
-use_repo(rust, "rust_toolchains")
-
-rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
-rust_host_tools.host_tools(
-    name = "rs_host_tools",
-    version = "1.96.0",
-)
-use_repo(rust_host_tools, "rs_host_tools")
+# CI configuration, mirroring foreign/cpp: bazel 9 defaults to lockfile_mode=update, which
+# silently rewrites a stale MODULE.bazel.lock; error mode makes drift fail the build instead.
+common:ci --color=no
+common:ci --curses=no
+common:ci --announce_rc
+build:ci --lockfile_mode=error
