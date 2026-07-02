@@ -19,6 +19,7 @@ pub mod bootstrap;
 mod buffer;
 mod certificates;
 mod consensus_message;
+pub mod crypto;
 mod deduplication;
 pub mod diagnostics;
 pub mod executor;

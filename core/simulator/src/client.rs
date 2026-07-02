@@ -50,10 +50,24 @@ use server_common::{
 };
 use std::cell::Cell;
 
+/// Partition-plane request ids are offset into the top half of the `u64` space
+/// so they never collide with the small, contiguous metadata ids in the
+/// auditor's `(client, request)` map. The metadata sequence would have to reach
+/// `2^63` to overlap, which no run approaches.
+const PARTITION_ID_BASE: u64 = 1 << 63;
+
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
     client_id: u128,
+    /// Contiguous `1, 2, 3, …` request ids for metadata/replicated ops, the
+    /// sequence the server's `ClientTable` dedups and requires gap-free.
     request_counter: Cell<u64>,
+    /// Separate id sequence for partition-plane ops, offset into a disjoint
+    /// range ([`PARTITION_ID_BASE`]). The partition plane has no client-table
+    /// dedup and treats the id as an opaque echo, so a partition id never
+    /// collides with a metadata id, even under reply duplication. See
+    /// [`SimClient::request_id_for`].
+    partition_counter: Cell<u64>,
     session: Cell<u64>,
 }
 
@@ -63,6 +77,7 @@ impl SimClient {
         Self {
             client_id,
             request_counter: Cell::new(0),
+            partition_counter: Cell::new(0),
             session: Cell::new(0),
         }
     }
@@ -81,10 +96,29 @@ impl SimClient {
         self.session.set(session);
     }
 
-    fn next_request_number(&self) -> u64 {
-        let next = self.request_counter.get() + 1;
-        self.request_counter.set(next);
-        next
+    /// Assign the wire request id for `operation`, keyed by plane.
+    ///
+    /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter: the
+    /// `ClientTable` dedups them and rejects anything but `committed + 1`, so a
+    /// gap opens a permanent `RequestGap` and wedges the client's metadata
+    /// plane. Partition ops are at-least-once with no dedup and the server
+    /// treats their id as an opaque echo, so they draw from a separate counter
+    /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
+    /// therefore never equal a metadata id, so a delayed or duplicated partition
+    /// reply is never misattributed to a metadata entry in the auditor's
+    /// `(client, request)` map (which would trip the namespace guard and drop a
+    /// live metadata op). This holds regardless of reply duplication, not only
+    /// while clients are one-in-flight.
+    fn request_id_for(&self, operation: Operation) -> u64 {
+        if operation.is_partition() {
+            let next = self.partition_counter.get() + 1;
+            self.partition_counter.set(next);
+            PARTITION_ID_BASE + next
+        } else {
+            let next = self.request_counter.get() + 1;
+            self.request_counter.set(next);
+            next
+        }
     }
 
     fn session_id(&self) -> u64 {
@@ -429,7 +463,7 @@ impl SimClient {
         let batch = SendMessages2Owned::from_messages(namespace, &batch)
             .expect("simulator must build a valid send_messages2 batch");
         let total_size = std::mem::size_of::<RequestHeader>() + batch.header.total_size();
-        let request_header = self.request_header(Operation::SendMessages, namespace, total_size);
+        let request_header = self.header(Operation::SendMessages, namespace.inner(), total_size);
         batch
             .encode_request(request_header)
             .expect("simulator must build a valid send_messages2 request")
@@ -534,7 +568,6 @@ impl SimClient {
         )
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,
         operation: Operation,
@@ -544,7 +577,22 @@ impl SimClient {
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = self.request_header(operation, namespace, total_size);
+        let header = self.header(operation, namespace.inner(), total_size);
+
+        let header_bytes = bytemuck::bytes_of(&header);
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(header_bytes);
+        buffer.extend_from_slice(payload);
+
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("request buffer must contain a valid request message")
+    }
+
+    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total_size = header_size + payload.len();
+
+        let header = self.header(operation, 0, total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -556,11 +604,8 @@ impl SimClient {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
-        let total_size = header_size + payload.len();
-
-        let header = RequestHeader {
+    fn header(&self, operation: Operation, namespace: u64, total_size: usize) -> RequestHeader {
+        RequestHeader {
             command: iggy_binary_protocol::Command2::Request,
             operation,
             size: total_size as u32,
@@ -575,43 +620,8 @@ impl SimClient {
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
             session: self.session_id(),
-            request: self.next_request_number(),
-            ..Default::default()
-        };
-
-        let header_bytes = bytemuck::bytes_of(&header);
-        let mut buffer = Vec::with_capacity(total_size);
-        buffer.extend_from_slice(header_bytes);
-        buffer.extend_from_slice(payload);
-
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
-            .expect("request buffer must contain a valid request message")
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn request_header(
-        &self,
-        operation: Operation,
-        namespace: IggyNamespace,
-        total_size: usize,
-    ) -> RequestHeader {
-        RequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
-            operation,
-            size: total_size as u32,
-            cluster: 0,
-            checksum: 0,
-            checksum_body: 0,
-            view: 0,
-            release: 0,
-            replica: 0,
-            reserved_frame: [0; 66],
-            client: self.client_id,
-            request_checksum: 0,
-            timestamp: 0,
-            session: self.session_id(),
-            request: self.next_request_number(),
-            namespace: namespace.inner(),
+            request: self.request_id_for(operation),
+            namespace,
             ..Default::default()
         }
     }
@@ -638,4 +648,35 @@ fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u
         WireIdentifier::Numeric(to_u32(ns.topic_id())),
         Some(to_u32(ns.partition_id())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A partition send between two metadata ops must not consume a metadata
+    // request number: the server's `ClientTable` requires the metadata sequence
+    // gap-free (`committed + 1`), else a gap permanently wedges the client's
+    // metadata plane. Partition ops draw from a separate counter in a disjoint
+    // range (`PARTITION_ID_BASE`), so the metadata sequence stays `1, 2, 3`
+    // regardless of interleaved sends and a partition id never collides with a
+    // metadata id.
+    #[test]
+    fn partition_ops_do_not_gap_the_metadata_request_sequence() {
+        let client = SimClient::new(7);
+
+        // Metadata ops advance (1, 2, 3); interleaved sends draw their own
+        // disjoint sequence and leave the metadata counter untouched.
+        assert_eq!(client.request_id_for(Operation::CreateStream), 1);
+        assert_eq!(
+            client.request_id_for(Operation::SendMessages),
+            PARTITION_ID_BASE + 1
+        );
+        assert_eq!(client.request_id_for(Operation::CreateStream), 2);
+        assert_eq!(
+            client.request_id_for(Operation::SendMessages),
+            PARTITION_ID_BASE + 2
+        );
+        assert_eq!(client.request_id_for(Operation::CreateStream), 3);
+    }
 }
