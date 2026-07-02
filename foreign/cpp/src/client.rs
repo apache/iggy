@@ -17,11 +17,12 @@
 
 use crate::{RUNTIME, ffi};
 use iggy::prelude::{
-    Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
-    ConsumerGroupClient, ConsumerOffsetClient, Identifier as RustIdentifier,
-    IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder,
-    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
-    MessageClient, PartitionClient, Partitioning, PollingStrategy,
+    Client as IggyConnectionClient, ClusterClient,
+    CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
+    ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
+    IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
+    IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
+    Permissions as RustPermissions, PollingStrategy, SegmentClient,
     SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
 };
@@ -121,6 +122,26 @@ impl Client {
                 .connect()
                 .await
                 .map_err(|error| format!("Could not connect: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn disconnect(&self) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .disconnect()
+                .await
+                .map_err(|error| format!("Could not disconnect: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn shutdown(&self) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .shutdown()
+                .await
+                .map_err(|error| format!("Could not shutdown client: {error}"))?;
             Ok(())
         })
     }
@@ -633,6 +654,33 @@ impl Client {
         })
     }
 
+    pub fn delete_segments(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not delete segments: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not delete segments: invalid topic identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_segments(&rust_stream_id, &rust_topic_id, partition_id, segments_count)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not delete {segments_count} segments for topic '{rust_topic_id}' on stream '{rust_stream_id}', partition '{partition_id}': {error}"
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
     pub fn create_consumer_group(
         &self,
         stream_id: ffi::Identifier,
@@ -1022,6 +1070,59 @@ impl Client {
                 .map_err(|error| format!("Could not capture snapshot: {error}"))?;
             let iggy_common::Snapshot(bytes) = snapshot;
             Ok(bytes)
+        })
+    }
+
+    pub fn get_cluster_metadata(&self) -> Result<ffi::ClusterMetadata, String> {
+        RUNTIME.block_on(async {
+            let metadata = self
+                .inner
+                .get_cluster_metadata()
+                .await
+                .map_err(|error| format!("Could not get cluster metadata: {error}"))?;
+            Ok(ffi::ClusterMetadata::from(metadata))
+        })
+    }
+
+    pub fn update_permissions(
+        &self,
+        user_id: ffi::Identifier,
+        permissions: ffi::Permissions,
+    ) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id).map_err(|error| {
+            format!("Could not update permissions: invalid user identifier: {error}")
+        })?;
+        let rust_permissions = Some(RustPermissions::from(permissions));
+
+        RUNTIME.block_on(async {
+            self.inner
+                .update_permissions(&rust_user_id, rust_permissions)
+                .await
+                .map_err(|error| {
+                    format!("Could not update permissions for user '{rust_user_id}': {error}")
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn change_password(
+        &self,
+        user_id: ffi::Identifier,
+        current_password: String,
+        new_password: String,
+    ) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id).map_err(|error| {
+            format!("Could not change password: invalid user identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .change_password(&rust_user_id, &current_password, &new_password)
+                .await
+                .map_err(|error| {
+                    format!("Could not change password for user '{rust_user_id}': {error}")
+                })?;
+            Ok(())
         })
     }
 }

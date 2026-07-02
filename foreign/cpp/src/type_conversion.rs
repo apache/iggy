@@ -26,10 +26,14 @@ use iggy::prelude::{
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
+    ClusterMetadata as RustClusterMetadata, ClusterNode as RustClusterNode,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
-    Stats as RustStats,
+    GlobalPermissions as RustGlobalPermissions, Permissions as RustPermissions, Stats as RustStats,
+    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
+    TransportEndpoints as RustTransportEndpoints,
 };
+use std::collections::BTreeMap;
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -184,6 +188,119 @@ impl From<RustStats> for ffi::Stats {
             threads_count: stats.threads_count,
             free_disk_space: stats.free_disk_space.as_bytes_u64(),
             total_disk_space: stats.total_disk_space.as_bytes_u64(),
+        }
+    }
+}
+
+impl From<RustTransportEndpoints> for ffi::TransportEndpoints {
+    fn from(endpoints: RustTransportEndpoints) -> Self {
+        ffi::TransportEndpoints {
+            tcp: endpoints.tcp,
+            quic: endpoints.quic,
+            http: endpoints.http,
+            websocket: endpoints.websocket,
+        }
+    }
+}
+
+impl From<RustClusterNode> for ffi::ClusterNode {
+    fn from(node: RustClusterNode) -> Self {
+        ffi::ClusterNode {
+            name: node.name,
+            ip: node.ip,
+            endpoints: ffi::TransportEndpoints::from(node.endpoints),
+            role: node.role.to_string(),
+            status: node.status.to_string(),
+        }
+    }
+}
+
+impl From<RustClusterMetadata> for ffi::ClusterMetadata {
+    fn from(metadata: RustClusterMetadata) -> Self {
+        ffi::ClusterMetadata {
+            name: metadata.name,
+            nodes: metadata
+                .nodes
+                .into_iter()
+                .map(ffi::ClusterNode::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<ffi::GlobalPermissions> for RustGlobalPermissions {
+    fn from(permissions: ffi::GlobalPermissions) -> Self {
+        RustGlobalPermissions {
+            manage_servers: permissions.manage_servers,
+            read_servers: permissions.read_servers,
+            manage_users: permissions.manage_users,
+            read_users: permissions.read_users,
+            manage_streams: permissions.manage_streams,
+            read_streams: permissions.read_streams,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<ffi::TopicPermissions> for RustTopicPermissions {
+    fn from(permissions: ffi::TopicPermissions) -> Self {
+        RustTopicPermissions {
+            manage_topic: permissions.manage_topic,
+            read_topic: permissions.read_topic,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<ffi::StreamPermissions> for RustStreamPermissions {
+    fn from(permissions: ffi::StreamPermissions) -> Self {
+        let topics = if permissions.topics.is_empty() {
+            None
+        } else {
+            Some(BTreeMap::from_iter(permissions.topics.into_iter().map(
+                |entry| {
+                    (
+                        entry.topic_id as usize,
+                        RustTopicPermissions::from(entry.permissions),
+                    )
+                },
+            )))
+        };
+
+        RustStreamPermissions {
+            manage_stream: permissions.manage_stream,
+            read_stream: permissions.read_stream,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+            topics,
+        }
+    }
+}
+
+impl From<ffi::Permissions> for RustPermissions {
+    fn from(permissions: ffi::Permissions) -> Self {
+        let streams = if permissions.streams.is_empty() {
+            None
+        } else {
+            Some(BTreeMap::from_iter(permissions.streams.into_iter().map(
+                |entry| {
+                    (
+                        entry.stream_id as usize,
+                        RustStreamPermissions::from(entry.permissions),
+                    )
+                },
+            )))
+        };
+
+        RustPermissions {
+            global: RustGlobalPermissions::from(permissions.global),
+            streams,
         }
     }
 }
