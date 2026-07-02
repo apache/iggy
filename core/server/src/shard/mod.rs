@@ -20,7 +20,10 @@ use crate::{
     bootstrap::load_segments,
     configs::server::ServerConfig,
     metadata::{Metadata, MetadataWriter},
-    shard::{task_registry::TaskRegistry, transmission::frame::ShardFrame},
+    shard::{
+        task_registry::TaskRegistry, transmission::frame::ShardFrame,
+        waiters::PollWaiterRegistry,
+    },
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager,
@@ -56,6 +59,7 @@ pub mod system;
 pub mod task_registry;
 pub mod tasks;
 pub mod transmission;
+pub mod waiters;
 
 #[cfg(feature = "systemd")]
 pub mod systemd;
@@ -77,6 +81,7 @@ pub struct IggyShard {
     pub(crate) metadata_writer: Option<RefCell<MetadataWriter>>,
     pub(crate) local_partitions: RefCell<LocalPartitions>,
     pub(crate) pending_partition_inits: RefCell<AHashSet<IggyNamespace>>,
+    pub(crate) poll_waiters: RefCell<PollWaiterRegistry>,
 
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,
@@ -258,225 +263,3 @@ impl IggyShard {
                     self.config
                         .system
                         .get_consumer_offsets_path(stream_id, topic_id, partition_id);
-                let consumer_group_offsets_path = self
-                    .config
-                    .system
-                    .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-
-                // Reuse metadata's Arcs so both metadata and local_partitions
-                // reference the same allocation — writes via store_consumer_offset
-                // (metadata path) are visible to delete_oldest_segments (local path).
-                let consumer_offsets = init_info.consumer_offsets;
-                let consumer_group_offsets = init_info.consumer_group_offsets;
-
-                {
-                    let guard = consumer_offsets.pin();
-                    for co in load_consumer_offsets(&consumer_offset_path).unwrap_or_default() {
-                        guard.insert(co.consumer_id as usize, co);
-                    }
-                }
-
-                {
-                    let guard = consumer_group_offsets.pin();
-                    for (cg_id, co) in load_consumer_group_offsets(&consumer_group_offsets_path)
-                        .unwrap_or_default()
-                    {
-                        guard.insert(cg_id, co);
-                    }
-                }
-
-                let message_deduplicator =
-                    create_message_deduplicator(&self.config.system).map(Arc::new);
-
-                match load_segments(
-                    &self.config.system,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    partition_path,
-                    stats.clone(),
-                )
-                .await
-                {
-                    Ok(mut loaded_log) => {
-                        if !loaded_log.has_segments() {
-                            info!(
-                                "No segments found on disk for partition ID: {} for topic ID: {} for stream ID: {}, creating initial segment",
-                                partition_id, topic_id, stream_id
-                            );
-                            let segment = crate::streaming::segments::Segment::new(
-                                0,
-                                self.config.system.segment.size,
-                            );
-                            let storage =
-                                crate::streaming::segments::storage::create_segment_storage(
-                                    &self.config.system,
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    0,
-                                    0,
-                                    0,
-                                )
-                                .await?;
-                            loaded_log.add_persisted_segment(segment, storage);
-                            stats.increment_segments_count(1);
-                        }
-
-                        // Use the max end_offset across segments that have data,
-                        // not just the active segment. Handles the edge case where
-                        // the active segment is empty (rotated right before shutdown).
-                        let current_offset = loaded_log
-                            .segments()
-                            .iter()
-                            .filter(|s| s.size > IggyByteSize::default())
-                            .map(|s| s.end_offset)
-                            .max()
-                            .unwrap_or(0);
-                        stats.set_current_offset(current_offset);
-
-                        // Check if ANY segment has data. Cannot use current_offset > 0
-                        // because a single message at offset 0 yields current_offset = 0
-                        // yet must still increment on the next append.
-                        let should_increment_offset = loaded_log
-                            .segments()
-                            .iter()
-                            .any(|s| s.size > IggyByteSize::default());
-
-                        // After a crash (OOM, SIGKILL), auto_commit may have persisted
-                        // a consumer offset beyond what was flushed to disk. Clamp to
-                        // the partition's actual offset to prevent permanent empty polls.
-                        {
-                            let guard = consumer_offsets.pin();
-                            for entry in guard.iter() {
-                                let stored = entry.1.offset.load(Ordering::Relaxed);
-                                if stored > current_offset {
-                                    warn!(
-                                        "Consumer {} offset {} ahead of partition offset {} \
-                                         for stream {}, topic {}, partition {} - clamping \
-                                         (crash recovery)",
-                                        entry.0,
-                                        stored,
-                                        current_offset,
-                                        stream_id,
-                                        topic_id,
-                                        partition_id
-                                    );
-                                    entry.1.offset.store(current_offset, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        {
-                            let guard = consumer_group_offsets.pin();
-                            for entry in guard.iter() {
-                                let stored = entry.1.offset.load(Ordering::Relaxed);
-                                if stored > current_offset {
-                                    warn!(
-                                        "Consumer group {:?} offset {} ahead of partition \
-                                         offset {} for stream {}, topic {}, partition {} - \
-                                         clamping (crash recovery)",
-                                        entry.0,
-                                        stored,
-                                        current_offset,
-                                        stream_id,
-                                        topic_id,
-                                        partition_id
-                                    );
-                                    entry.1.offset.store(current_offset, Ordering::Relaxed);
-                                }
-                            }
-                        }
-
-                        // Initialize journal base_offset so the three-tier
-                        // routing in ops.rs computes correct in_memory_floor.
-                        // Without this, journal defaults to base_offset=0 which
-                        // causes disk reads to be skipped after restart.
-                        if should_increment_offset {
-                            use crate::streaming::partitions::journal::{Inner, Journal};
-                            loaded_log.journal_mut().init(Inner {
-                                base_offset: current_offset + 1,
-                                ..Default::default()
-                            });
-                        }
-
-                        let revision_id = init_info.revision_id;
-
-                        let partition = LocalPartition::with_log(
-                            loaded_log,
-                            stats,
-                            Arc::new(AtomicU64::new(current_offset)),
-                            consumer_offsets,
-                            consumer_group_offsets,
-                            message_deduplicator,
-                            created_at,
-                            revision_id,
-                            should_increment_offset,
-                        );
-
-                        self.local_partitions
-                            .borrow_mut()
-                            .insert(*namespace, partition);
-
-                        info!(
-                            "Successfully loaded segments for stream: {}, topic: {}, partition: {}",
-                            stream_id, topic_id, partition_id
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to load segments for stream: {}, topic: {}, partition: {}: {}",
-                            stream_id, topic_id, partition_id, e
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn load_users(&self) -> Result<(), IggyError> {
-        let users_count = self.metadata.users_count();
-        self.metrics.increment_users(users_count as u32);
-        info!("Initialized {} user(s).", users_count);
-        Ok(())
-    }
-
-    pub fn assert_init(&self) -> Result<(), IggyError> {
-        Ok(())
-    }
-
-    pub fn is_shutting_down(&self) -> bool {
-        self.is_shutting_down.load(Ordering::Relaxed)
-    }
-
-    pub fn get_stop_receiver(&self) -> StopReceiver {
-        self.stop_receiver.clone()
-    }
-
-    #[instrument(skip_all, name = "trace_shutdown")]
-    pub async fn trigger_shutdown(&self) -> bool {
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-        debug!("Shard {} shutdown state set", self.id);
-        self.task_registry.graceful_shutdown(SHUTDOWN_TIMEOUT).await
-    }
-
-    pub fn get_available_shards_count(&self) -> u32 {
-        self.shards.len() as u32
-    }
-
-    pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {
-        if !session.is_active() {
-            error!("{COMPONENT} - session is inactive, session: {session}");
-            return Err(IggyError::StaleClient);
-        }
-
-        if session.is_authenticated() {
-            Ok(())
-        } else {
-            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
-            Err(IggyError::Unauthenticated)
-        }
-    }
-}
