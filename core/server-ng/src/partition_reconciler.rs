@@ -58,6 +58,7 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
@@ -293,6 +294,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
+    reconcile_segment_truncations(ctx);
+    reconcile_partition_purges(ctx);
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -589,24 +592,24 @@ async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut Pa
     let partitions = ctx.shard.plane.partitions();
     let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
     for ns in owned {
-        let Some(partition) = partitions.get_by_ns(&ns) else {
+        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
+        // Take the in-memory removes + owned unlink paths under a closure-scoped
+        // borrow that cannot escape into the await below. Holding a raw
+        // `&IggyPartition` across `delete_persisted_offset().await` would let the
+        // pump task realloc the partitions vec underneath us (a UAF).
+        let paths = partitions.with_partition(&ns, |partition| {
+            partition.reclaim_dead_group_offsets(|group_id| {
+                live.is_some_and(|set| set.contains(&group_id))
+            })
+        });
+        let Some(paths) = paths else {
             continue;
         };
-        let stored = partition.consumer_group_offset_ids();
-        if stored.is_empty() {
-            continue;
-        }
-        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
-        for group_id in stored {
-            let still_live = live.is_some_and(|set| set.contains(&group_id));
-            if still_live {
-                continue;
-            }
-            if let Err(err) = partition.delete_consumer_group_offset(group_id).await {
+        for path in paths {
+            if let Err(err) = delete_persisted_offset(&path).await {
                 warn!(
                     shard = ctx.shard.id,
                     ns_raw = ns.inner(),
-                    group_id,
                     error = %err,
                     "reconciler failed to reclaim deleted consumer-group offset"
                 );
@@ -755,6 +758,48 @@ fn fetch_topic_stats(
 
 fn shards_table_contains(ctx: &ReconcilerCtx, ns: IggyNamespace) -> bool {
     ctx.shard.shards_table().shard_for(ns).is_some()
+}
+
+/// Enforce committed `TruncatePartition` watermarks: for each owned partition
+/// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
+/// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
+/// so a redundant pass triggered by an unrelated revision bump is harmless.
+fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
+    let namespaces: Vec<_> = ctx.shard.plane.partitions().namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let watermark = streams.partition_delete_watermark(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        if watermark > 0 {
+            ctx.shard.request_truncate_partition(namespace, watermark);
+        }
+    }
+}
+
+/// Stage a `PurgePartition` reset for every owned partition whose committed
+/// `PurgeTopic` generation is newer than the one the local partition last
+/// applied. The pump re-checks the generation before wiping, so a redundant
+/// pass (e.g. from an unrelated revision bump) is a no-op.
+fn reconcile_partition_purges(ctx: &ReconcilerCtx) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let committed = streams.partition_purge_generation(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let applied = partitions
+            .get_by_ns(&namespace)
+            .map_or(0, partitions::IggyPartition::applied_purge_generation);
+        if committed > applied {
+            ctx.shard.request_purge_partition(namespace, committed);
+        }
+    }
 }
 
 pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {

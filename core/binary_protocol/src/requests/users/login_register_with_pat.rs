@@ -17,50 +17,51 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
+use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretString};
 
 /// Combined login-with-PAT + register request for server-ng.
 ///
-/// The server verifies the token locally, then submits `Operation::Register`
-/// through consensus. The response carries `user_id` + `session` (commit op
-/// number). The `client_id` is carried in the VSR `RequestHeader.client` field
-/// (populated by the SDK at encode time); the body no longer duplicates it.
+/// Shares the `ClientVersionInfo` prefix with `LoginRegisterRequest` so the
+/// server gates on the protocol version once before attempting either body
+/// shape. The server verifies the token locally, then submits
+/// `Operation::Register` through consensus. The `client_id` is carried in
+/// the VSR `RequestHeader.client` field (populated by the SDK at encode
+/// time); the body no longer duplicates it.
 ///
 /// Wire format:
 /// ```text
+/// [ClientVersionInfo]
 /// [token_len:u8][token:N]
-/// [version_len:u32_le][version:N?][context_len:u32_le][context:N?]
+/// [context_len:u32_le][context:N?]
 /// ```
 #[derive(Debug, Clone)]
 pub struct LoginRegisterWithPatRequest {
+    pub version_info: ClientVersionInfo,
     pub token: SecretString,
-    pub version: Option<String>,
     pub client_context: Option<String>,
 }
 
 impl WireEncode for LoginRegisterWithPatRequest {
     fn encoded_size(&self) -> usize {
-        1 + self.token.expose_secret().len()
-            + 4
-            + self.version.as_ref().map_or(0, String::len)
+        self.version_info.encoded_size()
+            + 1
+            + self.token.expose_secret().len()
             + 4
             + self.client_context.as_ref().map_or(0, String::len)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
+        self.version_info.encode(buf);
         let token = self.token.expose_secret();
+        debug_assert!(
+            u8::try_from(token.len()).is_ok(),
+            "token exceeds u8 length prefix; callers must validate before encoding"
+        );
         #[allow(clippy::cast_possible_truncation)]
         buf.put_u8(token.len() as u8);
         buf.put_slice(token.as_bytes());
-        match &self.version {
-            Some(v) => {
-                #[allow(clippy::cast_possible_truncation)]
-                buf.put_u32_le(v.len() as u32);
-                buf.put_slice(v.as_bytes());
-            }
-            None => buf.put_u32_le(0),
-        }
         match &self.client_context {
             Some(c) => {
                 #[allow(clippy::cast_possible_truncation)]
@@ -72,27 +73,27 @@ impl WireEncode for LoginRegisterWithPatRequest {
     }
 }
 
-impl WireDecode for LoginRegisterWithPatRequest {
-    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let token_len = read_u8(buf, 0)? as usize;
+impl LoginRegisterWithPatRequest {
+    /// Decode the body after the [`ClientVersionInfo`] prefix has already
+    /// been consumed; the server-side login gate decodes the prefix once
+    /// for both login-register shapes. Returns the bytes consumed from
+    /// `tail`.
+    ///
+    /// # Errors
+    /// [`WireError`] when `tail` is truncated or a field is malformed.
+    pub fn decode_after_prefix(
+        version_info: ClientVersionInfo,
+        tail: &[u8],
+    ) -> Result<(Self, usize), WireError> {
+        let token_len = read_u8(tail, 0)? as usize;
         let mut pos = 1;
-        let token = SecretString::from(read_str(buf, pos, token_len)?);
+        let token = SecretString::from(read_str(tail, pos, token_len)?);
         pos += token_len;
 
-        let version_len = read_u32_le(buf, pos)? as usize;
-        pos += 4;
-        let version = if version_len > 0 {
-            let v = read_str(buf, pos, version_len)?;
-            pos += version_len;
-            Some(v)
-        } else {
-            None
-        };
-
-        let client_context_len = read_u32_le(buf, pos)? as usize;
+        let client_context_len = read_u32_le(tail, pos)? as usize;
         pos += 4;
         let client_context = if client_context_len > 0 {
-            let c = read_str(buf, pos, client_context_len)?;
+            let c = read_str(tail, pos, client_context_len)?;
             pos += client_context_len;
             Some(c)
         } else {
@@ -101,8 +102,8 @@ impl WireDecode for LoginRegisterWithPatRequest {
 
         Ok((
             Self {
+                version_info,
                 token,
-                version,
                 client_context,
             },
             pos,
@@ -110,21 +111,38 @@ impl WireDecode for LoginRegisterWithPatRequest {
     }
 }
 
+impl WireDecode for LoginRegisterWithPatRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let (version_info, prefix_len) = ClientVersionInfo::decode(buf)?;
+        let (request, body_len) = Self::decode_after_prefix(version_info, &buf[prefix_len..])?;
+        Ok((request, prefix_len + body_len))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::identifier::WireName;
+
+    fn version_info() -> ClientVersionInfo {
+        ClientVersionInfo {
+            protocol_version: 1,
+            sdk_name: WireName::new("rust-sdk").unwrap(),
+            sdk_version: WireName::new("1.0.0").unwrap(),
+        }
+    }
 
     fn assert_req_eq(a: &LoginRegisterWithPatRequest, b: &LoginRegisterWithPatRequest) {
+        assert_eq!(a.version_info, b.version_info);
         assert_eq!(a.token.expose_secret(), b.token.expose_secret());
-        assert_eq!(a.version, b.version);
         assert_eq!(a.client_context, b.client_context);
     }
 
     #[test]
     fn roundtrip_full() {
         let req = LoginRegisterWithPatRequest {
+            version_info: version_info(),
             token: SecretString::from("pat-abc123def456"),
-            version: Some("1.0.0".to_string()),
             client_context: Some("rust-sdk".to_string()),
         };
         let bytes = req.to_bytes();
@@ -134,10 +152,10 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_no_optionals() {
+    fn roundtrip_no_context() {
         let req = LoginRegisterWithPatRequest {
+            version_info: version_info(),
             token: SecretString::from("tok"),
-            version: None,
             client_context: None,
         };
         let bytes = req.to_bytes();
@@ -149,8 +167,8 @@ mod tests {
     #[test]
     fn encoded_size_matches_output() {
         let req = LoginRegisterWithPatRequest {
+            version_info: version_info(),
             token: SecretString::from("t"),
-            version: Some("v1".to_string()),
             client_context: Some("ctx".to_string()),
         };
         assert_eq!(req.encoded_size(), req.to_bytes().len());
@@ -159,8 +177,8 @@ mod tests {
     #[test]
     fn truncated_returns_error() {
         let req = LoginRegisterWithPatRequest {
+            version_info: version_info(),
             token: SecretString::from("t"),
-            version: Some("v".to_string()),
             client_context: Some("c".to_string()),
         };
         let bytes = req.to_bytes();
@@ -173,15 +191,15 @@ mod tests {
     }
 
     #[test]
-    fn wire_layout_token_first() {
+    fn wire_layout_version_info_first() {
         let req = LoginRegisterWithPatRequest {
+            version_info: version_info(),
             token: SecretString::from("t"),
-            version: None,
             client_context: None,
         };
         let bytes = req.to_bytes();
-        // Token: [1, b't'], version: [0,0,0,0], client_context: [0,0,0,0]
-        assert_eq!(bytes[0], 1); // token len
-        assert_eq!(bytes[1], b't');
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 1);
+        assert_eq!(bytes[4], 8);
+        assert_eq!(&bytes[5..13], b"rust-sdk");
     }
 }

@@ -57,6 +57,15 @@ pub enum ConnectionState {
     },
 }
 
+/// SDK identity reported in the login-register version prefix.
+#[derive(Debug, Clone)]
+pub struct ClientSdkInfo {
+    pub sdk_name: String,
+    pub sdk_version: String,
+    /// Packed protocol version, see `iggy_binary_protocol::ProtocolVersion`.
+    pub protocol_version: u32,
+}
+
 /// Per-connection metadata tracked by the session manager.
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -66,6 +75,8 @@ pub struct Connection {
     /// Last time the client proved liveness (a `ping`). The heartbeat
     /// verifier evicts connections stale past the configured threshold.
     pub last_heartbeat: Instant,
+    /// Recorded at login; `None` until the connection authenticates.
+    pub sdk: Option<ClientSdkInfo>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -110,6 +121,7 @@ impl SessionManager {
                 transport,
                 state: ConnectionState::Connected,
                 last_heartbeat: Instant::now(),
+                sdk: None,
             });
     }
 
@@ -143,6 +155,15 @@ impl SessionManager {
         match self.connections.get(&connection_id)?.state {
             ConnectionState::Bound { client_id, .. } => Some(client_id),
             ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+        }
+    }
+
+    /// Record (or refresh on re-login) the SDK identity for a connection.
+    /// No state-machine constraint: the gate already validated the version
+    /// and a missing connection just drops the record.
+    pub fn record_sdk_info(&mut self, connection_id: u128, info: ClientSdkInfo) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.sdk = Some(info);
         }
     }
 
@@ -320,7 +341,7 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 /// Flatten a connection + its id into a [`ConnectedClientInfo`].
-const fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
+fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
     let user_id = match conn.state {
         ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
             Some(user_id)
@@ -337,6 +358,9 @@ const fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientI
         user_id,
         transport: conn.transport,
         address: conn.address,
+        sdk_name: conn.sdk.as_ref().map(|sdk| sdk.sdk_name.clone()),
+        sdk_version: conn.sdk.as_ref().map(|sdk| sdk.sdk_version.clone()),
+        protocol_version: conn.sdk.as_ref().map(|sdk| sdk.protocol_version),
     }
 }
 
@@ -355,6 +379,52 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[test]
+    fn record_sdk_info_exposed_via_iter_clients() {
+        let mut mgr = SessionManager::new();
+        mgr.ensure_connection(1, addr(5000), ClientTransportKind::Tcp);
+
+        // Pre-login: no SDK identity.
+        let info = mgr.iter_clients().next().unwrap();
+        assert!(info.sdk_name.is_none());
+
+        mgr.record_sdk_info(
+            1,
+            ClientSdkInfo {
+                sdk_name: "rust-sdk".to_string(),
+                sdk_version: "1.0.0".to_string(),
+                protocol_version: 42,
+            },
+        );
+        let info = mgr.iter_clients().next().unwrap();
+        assert_eq!(info.sdk_name.as_deref(), Some("rust-sdk"));
+        assert_eq!(info.sdk_version.as_deref(), Some("1.0.0"));
+        assert_eq!(info.protocol_version, Some(42));
+
+        // Re-login overwrites (client may reconnect after an upgrade).
+        mgr.record_sdk_info(
+            1,
+            ClientSdkInfo {
+                sdk_name: "rust-sdk".to_string(),
+                sdk_version: "2.0.0".to_string(),
+                protocol_version: 43,
+            },
+        );
+        let info = mgr.iter_clients().next().unwrap();
+        assert_eq!(info.sdk_version.as_deref(), Some("2.0.0"));
+
+        // Unknown connection: record is dropped, no panic.
+        mgr.record_sdk_info(
+            999,
+            ClientSdkInfo {
+                sdk_name: "go-sdk".to_string(),
+                sdk_version: "0.1.0".to_string(),
+                protocol_version: 1,
+            },
+        );
+        assert_eq!(mgr.iter_clients().count(), 1);
     }
 
     #[test]
