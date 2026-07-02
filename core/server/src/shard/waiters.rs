@@ -19,8 +19,7 @@ use crate::shard::IggyShard;
 use ahash::AHashMap;
 use async_channel::{Receiver, Sender};
 use server_common::sharding::IggyNamespace;
-use std::{cell::RefCell, time::Instant};
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration, time::Instant};
 
 const MAX_WAITERS_PER_NAMESPACE: usize = 1024;
 
@@ -62,11 +61,14 @@ impl PollWaiterRegistry {
     }
 
     fn remove(&mut self, namespace: &IggyNamespace, id: u64) {
-        let Some(waiters) = self.waiters.get_mut(namespace) else {
-            return;
+        let should_remove = if let Some(waiters) = self.waiters.get_mut(namespace) {
+            waiters.retain(|waiter| waiter.id != id);
+            waiters.is_empty()
+        } else {
+            false
         };
-        waiters.retain(|waiter| waiter.id != id);
-        if waiters.is_empty() {
+
+        if should_remove {
             self.waiters.remove(namespace);
         }
     }
@@ -108,14 +110,17 @@ impl PollWaiterRegistry {
 
     fn prune_namespace(&mut self, namespace: &IggyNamespace) {
         let now = Instant::now();
-        let Some(waiters) = self.waiters.get_mut(namespace) else {
-            return;
+        let should_remove = if let Some(waiters) = self.waiters.get_mut(namespace) {
+            waiters.retain(|waiter| {
+                !waiter.wake_sender.is_closed()
+                    && waiter.deadline.is_none_or(|deadline| deadline > now)
+            });
+            waiters.is_empty()
+        } else {
+            false
         };
-        waiters.retain(|waiter| {
-            !waiter.wake_sender.is_closed()
-                && waiter.deadline.is_none_or(|deadline| deadline > now)
-        });
-        if waiters.is_empty() {
+
+        if should_remove {
             self.waiters.remove(namespace);
         }
     }
