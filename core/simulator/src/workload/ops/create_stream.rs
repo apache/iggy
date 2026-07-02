@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CreateStream` op. Samples only `Success`. Error outcomes
-//! (`DuplicateName`, `InvalidName`) land once `ReplyHeader.context`
-//! carries an error discriminant.
+//! `CreateStream` op. Targets `Ok` with a fresh name, or `NameAlreadyExists`
+//! by reusing a live stream name from the shadow.
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -28,27 +27,27 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::CreateStreamResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub name: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::NameAlreadyExists];
 
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    _prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256Plus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => Some(Input {
+        Outcome::Ok => Some(Input {
             name: shadow.fresh_stream_name(),
+        }),
+        Outcome::NameAlreadyExists => Some(Input {
+            name: shadow.pick_stream_name(prng)?,
         }),
     }
 }
@@ -58,18 +57,21 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.create_stream(&input.name)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    // Server-ng sets context = 0 always; classify as Success until error
-    // discriminants are wired.
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::AddStream {
+        Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
+        Outcome::NameAlreadyExists => Effect::None,
     }
 }

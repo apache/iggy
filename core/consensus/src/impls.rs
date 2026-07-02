@@ -1069,7 +1069,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
-    pub fn tick(&self, plane: PlaneKind, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
+    pub fn tick(&self, plane: PlaneKind) -> Vec<VsrAction> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
@@ -1091,11 +1091,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         if timeouts.fired(TimeoutKind::DoViewChangeMessage) {
             drop(timeouts);
-            actions.extend(self.handle_do_view_change_message_timeout(
-                plane,
-                current_op,
-                current_commit,
-            ));
+            actions.extend(self.handle_do_view_change_message_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
         }
 
@@ -1202,12 +1198,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Resend DVC message if we've sent one.
-    fn handle_do_view_change_message_timeout(
-        &self,
-        plane: PlaneKind,
-        current_op: u64,
-        current_commit: u64,
-    ) -> Vec<VsrAction> {
+    fn handle_do_view_change_message_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if self.status.get() != Status::ViewChange {
             return Vec::new();
         }
@@ -1225,12 +1216,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::DoViewChangeMessage);
 
+        let current_op = self.sequencer.current_sequence();
         let action = VsrAction::SendDoViewChange {
             view: self.view.get(),
             target: self.primary_index(self.view.get()),
             log_view: self.log_view.get(),
             op: current_op,
-            commit: current_commit,
+            // commit_max clamped to op: see `handle_start_view_change`.
+            commit: self.commit_max.get().min(current_op),
             namespace: self.namespace,
         };
         emit_sim_event(
@@ -1471,8 +1464,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
             let primary_candidate = self.primary_index(self.view.get());
             let current_op = self.sequencer.current_sequence();
-            // DVC uses commit_min: the replica's actual execution progress.
-            let current_commit = self.commit_min.get();
+            // DVC carries commit_max (highest known-committed), not commit_min
+            // (locally applied). The new primary floors its pipeline rebuild at
+            // max(commit) across the quorum; only commit_max bounds that range
+            // to pipeline depth (every replica holds op - commit_max <= depth).
+            // commit_min can lag far behind and overflow the rebuild. The
+            // committed-but-unapplied tail (commit_min..commit_max] is replayed
+            // by the new primary's CommitJournal, not the pipeline.
+            //
+            // Clamp to op: a backup learns commit_max from a heartbeat before
+            // receiving the prepares, so commit_max can exceed its op. The wire
+            // contract `DoViewChangeHeader::validate` rejects commit > op and
+            // drops such a DVC (view-change liveness stall). The clamp is
+            // lossless for the rebuild floor: quorum intersection guarantees
+            // some sender whose op covers the true commit point carries it, so
+            // max(commit) across the quorum is unchanged.
+            let commit = self.commit_max.get().min(current_op);
 
             // Start DVC timeout
             self.timeouts
@@ -1484,7 +1491,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 target: primary_candidate,
                 log_view: self.log_view.get(),
                 op: current_op,
-                commit: current_commit,
+                commit,
                 namespace: self.namespace,
             };
             emit_sim_event(
@@ -1502,7 +1509,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     replica: self.replica,
                     log_view: self.log_view.get(),
                     op: current_op,
-                    commit: current_commit,
+                    commit,
                 };
                 dvc_record(
                     &mut self.do_view_change_from_all_replicas.borrow_mut(),
@@ -1605,8 +1612,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         let current_op = self.sequencer.current_sequence();
-        // Use commit_min: the replica's actual execution progress.
-        let current_commit = self.commit_min.get();
+        // commit_max clamped to op: see `handle_start_view_change`.
+        let commit = self.commit_max.get().min(current_op);
 
         // If we haven't sent our own DVC yet, record it
         if !self.sent_own_do_view_change.get() {
@@ -1616,7 +1623,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 replica: self.replica,
                 log_view: self.log_view.get(),
                 op: current_op,
-                commit: current_commit,
+                commit,
             };
             dvc_record(
                 &mut self.do_view_change_from_all_replicas.borrow_mut(),
@@ -2093,6 +2100,7 @@ where
 {
     type Consensus = VsrConsensus<B, P>;
 
+    #[allow(clippy::cast_possible_truncation)]
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
@@ -2109,7 +2117,9 @@ where
                 timestamp: old.timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
-                // PrepareOks are only header no body
+                // PrepareOk is header-only; the frame is exactly the header, so
+                // `size` is the header size.
+                size: std::mem::size_of::<PrepareOkHeader>() as u32,
                 ..Default::default()
             };
         })

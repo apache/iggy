@@ -87,6 +87,11 @@ impl<B: BinaryClient> SystemClient for B {
         self.get_heartbeat_interval()
     }
 
+    #[cfg(feature = "vsr")]
+    async fn refresh_consumer_group_assignments(&self) {
+        super::messages::refresh_group_assignments(self).await;
+    }
+
     async fn snapshot(
         &self,
         compression: SnapshotCompression,

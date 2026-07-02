@@ -21,7 +21,6 @@ use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use metadata::IggyMetadata;
-use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use partitions::{IggyPartitions, PartitionsConfig};
@@ -49,8 +48,7 @@ pub type Replica = shard::IggyShard<
 pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
     let streams: Streams = StreamsInner::new().into();
-    let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
-    let mux = SimMuxStateMachine::new(variadic!(users, streams, consumer_groups));
+    let mux = SimMuxStateMachine::new(variadic!(users, streams));
 
     // Metadata uses namespace=0 (not partition-scoped)
     let metadata_consensus = VsrConsensus::new(

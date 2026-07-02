@@ -294,7 +294,11 @@ impl PrepareJournal {
             // Until a producer computes them, verification here would be
             // trivially-passing noise. Without it, a body bit-flip that
             // leaves the header valid is replayed silently as corrupt
-            // state.
+            // state. Committed bytes are meant to be byte-identical across
+            // replicas (deterministic apply, timestamp replicated not
+            // re-projected), so once the producer computes the integrity fields
+            // they should agree on every node and this check can be turned on
+            // without per-replica false positives.
 
             // Check if the full entry fits
             if pos + entry_size > file_len {

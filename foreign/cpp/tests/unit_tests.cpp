@@ -85,7 +85,7 @@ TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
 TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto server_default = iggy::Expiry::server_default();
     EXPECT_EQ(server_default.expiry_kind(), "server_default");
-    EXPECT_EQ(server_default.expiry_value(), 0);
+    EXPECT_EQ(server_default.expiry_value(), static_cast<std::uint64_t>(0));
 
     const auto never_expire = iggy::Expiry::never_expire();
     EXPECT_EQ(never_expire.expiry_kind(), "never_expire");
@@ -93,7 +93,7 @@ TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
 
     const auto duration = iggy::Expiry::duration(15);
     EXPECT_EQ(duration.expiry_kind(), "duration");
-    EXPECT_EQ(duration.expiry_value(), 15);
+    EXPECT_EQ(duration.expiry_value(), static_cast<std::uint64_t>(15));
 }
 
 TEST(IggyExceptionTest, StoresMessage) {

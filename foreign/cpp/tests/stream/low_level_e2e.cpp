@@ -17,12 +17,8 @@
  * under the License.
  */
 
-#include <chrono>
 #include <cstdint>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -91,6 +87,283 @@ TEST_F(LowLevelE2E_Stream, CreateStreamWithEmojiName) {
         EXPECT_EQ(stream_details.topics_count, 0u);
         EXPECT_EQ(stream_details.topics.size(), 0u);
     });
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamWorksCorrectly) {
+    RecordProperty("description", "Updates an existing stream name while preserving the stream identity.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    iggy::ffi::StreamDetails original_stream_details{};
+    ASSERT_NO_THROW({ original_stream_details = client->get_stream(make_string_identifier(stream_name)); });
+    const std::uint32_t stream_id = original_stream_details.id;
+    ForgetTrackedStream(stream_name);
+    TrackStream(stream_id);
+
+    ASSERT_NO_THROW(client->update_stream(make_string_identifier(stream_name), updated_stream_name));
+
+    ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
+
+    iggy::ffi::StreamDetails updated_stream_details{};
+    ASSERT_NO_THROW({ updated_stream_details = client->get_stream(make_numeric_identifier(stream_id)); });
+
+    EXPECT_EQ(updated_stream_details.id, original_stream_details.id);
+    EXPECT_EQ(updated_stream_details.created_at, original_stream_details.created_at);
+    EXPECT_EQ(updated_stream_details.name, updated_stream_name);
+    EXPECT_EQ(updated_stream_details.size_bytes, original_stream_details.size_bytes);
+    EXPECT_EQ(updated_stream_details.messages_count, original_stream_details.messages_count);
+    EXPECT_EQ(updated_stream_details.topics_count, original_stream_details.topics_count);
+    EXPECT_EQ(updated_stream_details.topics.size(), original_stream_details.topics.size());
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamWithSameNameIsIdempotent) {
+    RecordProperty("description",
+                   "Calling update_stream with the current name succeeds without changing stream details.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    iggy::ffi::StreamDetails first_read{};
+    iggy::ffi::StreamDetails second_read{};
+    ASSERT_NO_THROW({ first_read = client->get_stream(make_string_identifier(stream_name)); });
+    ASSERT_NO_THROW(client->update_stream(make_numeric_identifier(first_read.id), stream_name));
+    ASSERT_NO_THROW({ second_read = client->get_stream(make_numeric_identifier(first_read.id)); });
+
+    EXPECT_EQ(second_read.id, first_read.id);
+    EXPECT_EQ(second_read.created_at, first_read.created_at);
+    EXPECT_EQ(second_read.name, first_read.name);
+    EXPECT_EQ(second_read.size_bytes, first_read.size_bytes);
+    EXPECT_EQ(second_read.messages_count, first_read.messages_count);
+    EXPECT_EQ(second_read.topics_count, first_read.topics_count);
+    EXPECT_EQ(second_read.topics.size(), first_read.topics.size());
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamBeforeLoginThrows) {
+    RecordProperty("description", "Rejects update_stream before connect, and after connect but before login.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+
+    ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamWithVariousUtf8Characters) {
+    RecordProperty("description", "Updates a stream name with various UTF-8 values.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    std::uint32_t stream_id = 0;
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        stream_id                 = stream_details.id;
+    });
+    ForgetTrackedStream(stream_name);
+    TrackStream(stream_id);
+
+    const std::vector<std::string> updated_stream_names = {
+        "こんにちは世界", "안녕하세요세계", "你好世界", "مرحبا بالعالم", "नमस्ते दुनिया", "🚀🍕✨🎯🔥",
+    };
+
+    for (const auto &updated_stream_name : updated_stream_names) {
+        SCOPED_TRACE(updated_stream_name);
+        ASSERT_NO_THROW(client->update_stream(make_numeric_identifier(stream_id), updated_stream_name));
+        ASSERT_NO_THROW({
+            const auto stream_details = client->get_stream(make_numeric_identifier(stream_id));
+            EXPECT_EQ(stream_details.name, updated_stream_name);
+        });
+    }
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when updating a stream that does not exist.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_THROW(client->update_stream(make_string_identifier(stream_name), updated_stream_name), std::exception);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamWithDuplicateNameThrows) {
+    RecordProperty("description", "Rejects renaming a stream to another stream's existing name.");
+    const std::string first_stream_name  = GetRandomName();
+    const std::string second_stream_name = GetRandomName();
+    iggy::ffi::Client *client            = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(first_stream_name));
+    TrackStream(first_stream_name);
+    ASSERT_NO_THROW(client->create_stream(second_stream_name));
+    TrackStream(second_stream_name);
+
+    ASSERT_THROW(client->update_stream(make_string_identifier(first_stream_name), second_stream_name), std::exception);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateDeletedStreamThrows) {
+    RecordProperty("description", "Throws when updating a stream after it has been deleted.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
+
+    ASSERT_THROW(client->update_stream(make_string_identifier(stream_name), updated_stream_name), std::exception);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamFailedValidationDoesNotMutateStream) {
+    RecordProperty("description", "Keeps the stream unchanged when update_stream fails wrapper validation.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    iggy::ffi::StreamDetails stream_before_failed_update{};
+    ASSERT_NO_THROW({ stream_before_failed_update = client->get_stream(make_string_identifier(stream_name)); });
+
+    iggy::ffi::Identifier invalid_numeric_id;
+    invalid_numeric_id.kind   = "numeric";
+    invalid_numeric_id.length = 1;
+    invalid_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->update_stream(std::move(invalid_numeric_id), updated_stream_name), std::exception);
+
+    iggy::ffi::StreamDetails stream_after_failed_update{};
+    ASSERT_NO_THROW({ stream_after_failed_update = client->get_stream(make_string_identifier(stream_name)); });
+
+    EXPECT_EQ(stream_after_failed_update.id, stream_before_failed_update.id);
+    EXPECT_EQ(stream_after_failed_update.created_at, stream_before_failed_update.created_at);
+    EXPECT_EQ(stream_after_failed_update.name, stream_before_failed_update.name);
+    EXPECT_EQ(stream_after_failed_update.size_bytes, stream_before_failed_update.size_bytes);
+    EXPECT_EQ(stream_after_failed_update.messages_count, stream_before_failed_update.messages_count);
+    EXPECT_EQ(stream_after_failed_update.topics_count, stream_before_failed_update.topics_count);
+    EXPECT_EQ(stream_after_failed_update.topics.size(), stream_before_failed_update.topics.size());
+
+    ASSERT_THROW(client->get_stream(make_string_identifier(updated_stream_name)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamOnlyChangesName) {
+    RecordProperty(
+        "description",
+        "Changes only the stream name and leaves stream, topic, message, partition, and segment data intact.");
+    const std::string stream_name         = GetRandomName();
+    const std::string updated_stream_name = GetRandomName();
+    const std::string topic_name          = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    std::uint32_t stream_id = 0;
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        stream_id                 = stream_details.id;
+    });
+    ForgetTrackedStream(stream_name);
+    TrackStream(stream_id);
+
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream_id), topic_name, 2, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        auto message = iggy::ffi::make_message(to_payload("stream-update-preserve-" + std::to_string(i)));
+        messages.push_back(std::move(message));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    iggy::ffi::StreamDetails stream_before_update{};
+    iggy::ffi::StreamDetails stream_after_update{};
+    iggy::ffi::Stats stats_before_update{};
+    iggy::ffi::Stats stats_after_update{};
+    ASSERT_NO_THROW({
+        stream_before_update = client->get_stream(make_numeric_identifier(stream_id));
+        stats_before_update  = client->get_stats();
+    });
+
+    ASSERT_NO_THROW(client->update_stream(make_numeric_identifier(stream_id), updated_stream_name));
+
+    ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW({
+        stream_after_update = client->get_stream(make_numeric_identifier(stream_id));
+        stats_after_update  = client->get_stats();
+    });
+
+    EXPECT_EQ(stream_after_update.id, stream_before_update.id);
+    EXPECT_EQ(stream_after_update.created_at, stream_before_update.created_at);
+    EXPECT_EQ(stream_after_update.name, updated_stream_name);
+    EXPECT_EQ(stream_after_update.size_bytes, stream_before_update.size_bytes);
+    EXPECT_EQ(stream_after_update.messages_count, stream_before_update.messages_count);
+    EXPECT_EQ(stream_after_update.topics_count, stream_before_update.topics_count);
+    ASSERT_EQ(stream_before_update.topics.size(), 1u);
+    ASSERT_EQ(stream_after_update.topics.size(), 1u);
+
+    const auto &before_topic = stream_before_update.topics[0];
+    const auto &after_topic  = stream_after_update.topics[0];
+    EXPECT_EQ(after_topic.id, before_topic.id);
+    EXPECT_EQ(after_topic.created_at, before_topic.created_at);
+    EXPECT_EQ(after_topic.name, before_topic.name);
+    EXPECT_EQ(after_topic.size_bytes, before_topic.size_bytes);
+    EXPECT_EQ(after_topic.message_expiry, before_topic.message_expiry);
+    EXPECT_EQ(after_topic.compression_algorithm, before_topic.compression_algorithm);
+    EXPECT_EQ(after_topic.max_topic_size, before_topic.max_topic_size);
+    EXPECT_EQ(after_topic.replication_factor, before_topic.replication_factor);
+    EXPECT_EQ(after_topic.messages_count, before_topic.messages_count);
+    EXPECT_EQ(after_topic.partitions_count, before_topic.partitions_count);
+
+    EXPECT_EQ(stats_after_update.streams_count, stats_before_update.streams_count);
+    EXPECT_EQ(stats_after_update.topics_count, stats_before_update.topics_count);
+    EXPECT_EQ(stats_after_update.partitions_count, stats_before_update.partitions_count);
+    EXPECT_EQ(stats_after_update.segments_count, stats_before_update.segments_count);
+    EXPECT_EQ(stats_after_update.messages_count, stats_before_update.messages_count);
+}
+
+TEST_F(LowLevelE2E_Stream, UpdateStreamValidatesNameBounds) {
+    RecordProperty("description",
+                   "Rejects invalid stream name lengths during update and accepts the maximum allowed name length.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+
+    std::uint32_t stream_id = 0;
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        stream_id                 = stream_details.id;
+    });
+    ForgetTrackedStream(stream_name);
+    TrackStream(stream_id);
+
+    const std::vector<std::string> invalid_stream_names = {
+        "",
+        std::string(256, 'b'),
+    };
+    for (const auto &invalid_stream_name : invalid_stream_names) {
+        SCOPED_TRACE("invalid_stream_name_length=" + std::to_string(invalid_stream_name.size()));
+        ASSERT_THROW(client->update_stream(make_numeric_identifier(stream_id), invalid_stream_name), std::exception);
+    }
 }
 
 TEST_F(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
@@ -249,7 +522,7 @@ TEST_F(LowLevelE2E_Stream, GetStreamsReturnsEmptyAfterCleanup) {
     }
 
     streams = client->get_streams();
-    ASSERT_EQ(streams.size(), 0);
+    ASSERT_EQ(streams.size(), 0u);
 }
 
 TEST_F(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
@@ -260,7 +533,7 @@ TEST_F(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
     client->create_stream(stream_name);
     TrackStream(stream_name);
     auto streams = client->get_streams();
-    ASSERT_GE(streams.size(), 1);
+    ASSERT_GE(streams.size(), 1u);
 
     bool found = false;
     for (const auto &s : streams) {

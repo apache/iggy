@@ -171,6 +171,35 @@ if ! git diff --quiet HEAD -- Cargo.toml; then
 fi
 
 # ---------------------------------------------------------------------------
+# 0b. MSRV contract: the four crates we publish must advertise an MSRV on
+#     crates.io. The rust-msrv CI gate compile-checks against the floor, but
+#     it pins the toolchain regardless of the manifest, so it cannot notice
+#     the `rust-version` field silently disappearing. Assert it here, at the
+#     publish boundary, plus that every crate agrees on the value.
+# ---------------------------------------------------------------------------
+if ! command -v jq >/dev/null 2>&1; then
+    err "jq is required for the MSRV check but is not on PATH"
+    exit 1
+fi
+metadata="$(cargo metadata --format-version 1 --no-deps)"
+msrv=""
+for crate in "${CRATES[@]}"; do
+    crate_msrv="$(jq -r --arg c "$crate" \
+        '.packages[] | select(.name == $c) | .rust_version // ""' <<< "$metadata")"
+    if [[ -z "$crate_msrv" ]]; then
+        err "${crate} declares no rust-version; published MSRV would be unset"
+        exit 1
+    fi
+    if [[ -z "$msrv" ]]; then
+        msrv="$crate_msrv"
+    elif [[ "$crate_msrv" != "$msrv" ]]; then
+        err "MSRV mismatch: ${crate} pins ${crate_msrv}, expected ${msrv}"
+        exit 1
+    fi
+done
+log "Published crates declare MSRV ${msrv}"
+
+# ---------------------------------------------------------------------------
 # 1. Start the local registry
 # ---------------------------------------------------------------------------
 log "Starting cargo-http-registry at 127.0.0.1:${REGISTRY_PORT}"

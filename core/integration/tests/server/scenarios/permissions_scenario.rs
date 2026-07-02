@@ -213,6 +213,18 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
             .await,
         "poll_messages",
     );
+    // Snapshot returns a real archive, never Ok(None), so a denied caller must
+    // get an explicit Unauthorized rather than the enumeration-safe Ok of reads.
+    let snapshot_result = client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await;
+    assert!(
+        matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
+        "snapshot must be rejected as unauthorized without read_servers, got {snapshot_result:?}"
+    );
 
     delete_test_user(root_client, USER).await;
 }
@@ -246,6 +258,13 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("read_servers: get_clients should work");
+    client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await
+        .expect("read_servers: snapshot should work");
 
     // But cannot read users or streams
     assert_unauthorized(client.get_users().await, "read_servers: get_users");
@@ -277,6 +296,13 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("manage_servers: get_clients should work");
+    client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await
+        .expect("manage_servers: snapshot should work");
 
     delete_test_user(root_client, MANAGE_USER).await;
 }

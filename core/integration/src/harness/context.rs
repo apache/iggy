@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::harness::error::TestBinaryError;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::RwLock;
 use std::thread;
 use uuid::Uuid;
@@ -27,8 +27,8 @@ use uuid::Uuid;
 const TEST_CLEANUP_DISABLED_ENV_VAR: &str = "IGGY_TEST_CLEANUP_DISABLED";
 
 /// Global registry mapping test names to their log directories.
-static TEST_DIRECTORIES: Lazy<RwLock<HashMap<String, PathBuf>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static TEST_DIRECTORIES: LazyLock<RwLock<HashMap<String, PathBuf>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Get the log directory for a test by name.
 pub fn get_test_directory(test_name: &str) -> Option<PathBuf> {
@@ -50,7 +50,7 @@ fn is_cleanup_disabled_by_env() -> bool {
         .unwrap_or(false)
 }
 
-static TEST_LOGS_DIR: Lazy<PathBuf> = Lazy::new(|| {
+static TEST_LOGS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())

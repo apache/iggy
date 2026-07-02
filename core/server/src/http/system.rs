@@ -127,9 +127,14 @@ async fn get_clients(
 #[debug_handler]
 async fn get_snapshot(
     State(state): State<Arc<AppState>>,
-    Extension(_identity): Extension<Identity>,
+    Extension(identity): Extension<Identity>,
     Json(command): Json<GetSnapshot>,
 ) -> Result<impl IntoResponse, CustomError> {
+    state
+        .shard
+        .shard()
+        .metadata
+        .perm_get_snapshot(identity.user_id)?;
     if command.snapshot_types.contains(&SystemSnapshotType::All) && command.snapshot_types.len() > 1
     {
         error!("When using 'All' snapshot type, no other types can be specified");
