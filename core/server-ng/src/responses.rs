@@ -870,8 +870,9 @@ pub(crate) fn build_empty_reply(
 /// Build an empty reply that denies a dispatch-time authorization check: the
 /// same request echo as [`build_empty_reply`] but with `ReplyHeader.status`
 /// set to the rule's error code -- the request-level failure channel the SDK
-/// peeks before any body decode. The single writer of a nonzero status, so
-/// every deny path stamps it one way.
+/// peeks before any body decode. Every deny frame shares this shape (empty
+/// body, nonzero status, op 0); the partition primary's pre-pipeline deny
+/// stamps it through `consensus::build_deny_reply_from_request`.
 pub(crate) fn build_deny_reply(
     request_header: &RequestHeader,
     client_id: u128,

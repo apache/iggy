@@ -388,6 +388,37 @@ where
         .expect("reply buffer must contain a valid reply message")
 }
 
+/// Reply that denies a request on the primary before it enters the VSR
+/// pipeline.
+///
+/// The request's frame with an empty body and a nonzero `ReplyHeader.status`
+/// (the request-level error channel the SDK peeks before body decode).
+/// Nothing is prepared or replicated, so backups never see the denied
+/// request; `op` stays 0, the shape reply consumers already read as "nothing
+/// committed".
+///
+/// # Panics
+/// If the constructed message buffer is not valid.
+pub fn build_deny_reply_from_request<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    request_header: &RequestHeader,
+    status: u32,
+) -> Message<ReplyHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let mut reply = build_reply_from_request(consensus, request_header, bytes::Bytes::new());
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+        &mut reply.as_mut_slice()[..header_size],
+    )
+    .expect("freshly built reply header is valid");
+    header.status = status;
+    header.op = 0;
+    reply
+}
+
 /// Verify hash chain would not break if we add this header.
 ///
 /// # Panics
@@ -475,7 +506,7 @@ pub async fn send_prepare_ok<B, P>(
 mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline, VsrAction};
-    use iggy_binary_protocol::StartViewChangeHeader;
+    use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use message_bus::SendError;
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
@@ -919,5 +950,43 @@ mod tests {
                 .map(|entry| entry.header.op),
             Some(7)
         );
+    }
+
+    // A deny echoes the request frame with an empty body, carries the error
+    // code in `status`, and keeps `op` at 0 even when the group has committed
+    // ops -- reply consumers read `op == 0` as "nothing committed", and the
+    // deny must never be mistaken for a committed reply.
+    #[test]
+    fn deny_reply_from_request_stamps_status_and_commits_nothing() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.advance_commit_max(4);
+
+        let request = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::DeleteConsumerOffset2,
+            client: 42,
+            request: 7,
+            namespace: 9,
+            ..Default::default()
+        };
+        let status = 3021;
+        let reply = build_deny_reply_from_request(&consensus, &request, status);
+
+        let header = reply.header();
+        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.status, status);
+        assert_eq!(header.op, 0, "a deny commits nothing");
+        assert_eq!(header.commit, 4);
+        assert_eq!(header.client, 42);
+        assert_eq!(header.request, 7);
+        assert_eq!(header.namespace, 9);
+        assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
+        assert_eq!(
+            header.size as usize,
+            std::mem::size_of::<ReplyHeader>(),
+            "deny reply body must be empty"
+        );
+        assert!(header.validate().is_ok());
     }
 }

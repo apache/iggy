@@ -280,10 +280,10 @@ pub struct ReplyHeader {
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     /// Request-level status: 0 = ok; nonzero = the `IggyError` code for a
-    /// failure decided at dispatch time (authorization denial today; other
-    /// pre-commit gate failures may adopt it later).
+    /// failure decided before commit (a dispatch-time authorization denial, or
+    /// the partition primary rejecting a delete of a missing consumer offset).
     ///
-    /// Contract: this is nonzero ONLY on a dispatch-time denial, and a deny
+    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
     /// reply always carries an EMPTY body. So this header channel and the
     /// committed per-sub-op results in the metadata result section are mutually
     /// exclusive by construction: a reply either commits (status 0, result

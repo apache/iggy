@@ -371,8 +371,9 @@ impl IntoResponse for WriteError {
 #[derive(Debug)]
 enum PartitionWriteError {
     /// Caller-side rejection (bad identifier, oversized batch, an authorization
-    /// denial) or a malformed reply frame, rendered through the legacy
-    /// `IggyError -> status` map for SDK-identical bodies.
+    /// denial), a typed pre-commit deny from the partition plane
+    /// (`ReplyHeader.status`), or a malformed reply frame, rendered through the
+    /// legacy `IggyError -> status` map for SDK-identical bodies.
     Rejected(IggyError),
     /// The dispatch gates could not route the write: the stream, topic, or
     /// partition does not resolve (or never materialised within the routable
@@ -1960,7 +1961,9 @@ async fn store_consumer_offset(
 /// delete a consumer's stored offset. The consumer comes from the path and the
 /// optional `partition_id` from the query, the same `DeleteConsumerOffset`
 /// shape the legacy server accepts. Returns 204 on commit, matching the legacy
-/// server. Same replicated partition write as [`store_consumer_offset`].
+/// server; a delete of a never-stored offset is denied by the partition
+/// primary (`ReplyHeader.status`) and renders the legacy typed 404. Same
+/// replicated partition write as [`store_consumer_offset`].
 async fn delete_consumer_offset(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -2699,12 +2702,16 @@ fn ensure_in_process_reply_target(state: &HttpInner, session: &HttpSession) {
 }
 
 /// Discriminate a partition write reply. Partition replies carry no result
-/// section and no error code (success and gate failure are both empty-bodied),
-/// so the only wire discriminator is the reply's `op`: a committed reply is
-/// built from its prepare header, whose op (the partition group's commit
-/// number) is always >= 1, while the pre-dispatch gate failures reply through
-/// `build_empty_reply` with 0 in that field. The gate reply cannot name which
-/// entity was missing, hence the generic legacy 404 body.
+/// section (success and denial are both empty-bodied), so the discriminators
+/// live in the header. `status` is read first: a nonzero value is the typed
+/// pre-commit denial (the partition primary's delete-of-missing-offset
+/// rejection, or a dispatch-time authorization denial) and renders through
+/// the legacy `IggyError -> status` map. With status 0, the reply's `op`
+/// splits the rest: a committed reply is built from its prepare header, whose
+/// op (the partition group's commit number) is always >= 1, while the
+/// pre-dispatch gate failures reply through `build_empty_reply` with 0 in
+/// that field. The gate reply cannot name which entity was missing, hence the
+/// generic legacy 404 body.
 fn classify_partition_reply(reply: &BusMessage) -> Result<(), PartitionWriteError> {
     let header = reply
         .as_slice()
@@ -2713,6 +2720,11 @@ fn classify_partition_reply(reply: &BusMessage) -> Result<(), PartitionWriteErro
         .ok_or(PartitionWriteError::Rejected(IggyError::InvalidCommand))?;
     if header.command != Command2::Reply {
         return Err(PartitionWriteError::Rejected(IggyError::InvalidCommand));
+    }
+    if header.status != 0 {
+        return Err(PartitionWriteError::Rejected(IggyError::from_code(
+            header.status,
+        )));
     }
     if header.op == 0 {
         return Err(PartitionWriteError::NotFound);
@@ -3157,10 +3169,12 @@ mod tests {
         assert_eq!(reply.header().operation, request.header().operation);
     }
 
-    // Enforces the status contract: every reply builder EXCEPT build_deny_reply
-    // leaves status 0, so a future builder that leaks a nonzero reserved tail
-    // (or sets status by mistake) trips here rather than silently shipping a
-    // fake denial. build_deny_reply is the sole nonzero-status writer.
+    // Enforces the status contract: every ok-path reply builder leaves status
+    // 0, so a future builder that leaks a nonzero reserved tail (or sets
+    // status by mistake) trips here rather than silently shipping a fake
+    // denial. The deny builders (build_deny_reply here, the partition
+    // primary's consensus::build_deny_reply_from_request) are the only
+    // nonzero-status writers.
     #[test]
     fn only_the_deny_builder_emits_a_nonzero_status() {
         let request = build_request_message(Operation::CreateStream, 42, 7, 3, &[]);
@@ -3205,13 +3219,13 @@ mod tests {
             "committed replies carry status 0"
         );
 
-        // The one intentional writer stamps nonzero.
+        // The intentional deny writer stamps nonzero.
         assert_ne!(
             build_deny_reply(header, 42, 7, commit, IggyError::Unauthorized.as_code())
                 .header()
                 .status,
             0,
-            "the deny builder is the sole nonzero-status writer"
+            "the deny builder must stamp a nonzero status"
         );
     }
 
@@ -3652,6 +3666,26 @@ mod tests {
         assert!(matches!(
             classify_partition_reply(&request.into_generic().into_frozen()),
             Err(PartitionWriteError::Rejected(IggyError::InvalidCommand))
+        ));
+    }
+
+    /// The partition primary's typed pre-commit deny (delete of a missing
+    /// consumer offset) rides `ReplyHeader.status` and must classify as the
+    /// mapped `IggyError`, not as the generic op-0 not-found.
+    #[test]
+    fn status_bearing_deny_reply_classifies_as_typed_rejection() {
+        let request = build_request_message(Operation::DeleteConsumerOffset2, 42, 7, 1, &[]);
+        let mut deny = build_empty_reply(request.header(), 42, 0, 9);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut deny.as_mut_slice()[..HEADER_SIZE],
+        )
+        .expect("empty reply header is valid");
+        header.status = IggyError::ConsumerOffsetNotFound(0).as_code();
+        assert!(matches!(
+            classify_partition_reply(&frozen(deny)),
+            Err(PartitionWriteError::Rejected(
+                IggyError::ConsumerOffsetNotFound(_)
+            ))
         ));
     }
 

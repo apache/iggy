@@ -520,6 +520,90 @@ async fn given_consumer_offset_when_stored_and_deleted_should_round_trip(harness
     );
 }
 
+/// A DELETE of a never-stored consumer offset is denied by the partition
+/// primary before consensus (`ReplyHeader.status`), so the route must answer
+/// a typed 404 immediately - not wait out the 10s partition-write reply
+/// timeout into a 504 - and the deny gate must not break a store-then-delete
+/// of an offset that does exist.
+#[iggy_harness]
+async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harness: &TestHarness) {
+    /// Well under the partition-write reply timeout: a deny is a single
+    /// round trip, a silent drop only answers at the full 10s.
+    const DENY_LATENCY_BUDGET: Duration = Duration::from_secs(5);
+
+    let http = HttpSession::login_root(harness).await;
+    http.create_stream_and_topic("http-missing-offset", "offsets", 1)
+        .await;
+
+    let offsets_path = "/streams/http-missing-offset/topics/offsets/consumer-offsets";
+    let delete_path = format!("{offsets_path}/{CONSUMER_ID}?partition_id={PARTITION_ID}");
+    let started = Instant::now();
+    let response = http
+        .client
+        .delete(http.url(&delete_path))
+        .bearer_auth(&http.token)
+        .send()
+        .await
+        .expect("delete missing offset request");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "missing offset delete must reject 404"
+    );
+    assert!(
+        elapsed < DENY_LATENCY_BUDGET,
+        "deny must answer fast, not ride the reply timeout (took {elapsed:?})"
+    );
+    // The typed deny body, not the generic pre-dispatch not-found shape.
+    let body: serde_json::Value = response.json().await.expect("decode error body");
+    assert_eq!(
+        body["code"], "consumer_offset_not_found",
+        "deny must carry the typed error code, got {body}"
+    );
+
+    // The deny gate must not reject offsets that exist: store, then delete.
+    let messages = vec![text_message(1, "offset-fodder".to_string())];
+    let response = http
+        .produce("http-missing-offset", "offsets", PARTITION_ID, messages)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+    let store = StoreConsumerOffset {
+        consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
+        partition_id: Some(PARTITION_ID),
+        offset: 0,
+    };
+    let response = http
+        .client
+        .put(http.url(offsets_path))
+        .bearer_auth(&http.token)
+        .json(&store)
+        .send()
+        .await
+        .expect("store offset request");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "store must commit"
+    );
+    let response = http
+        .client
+        .delete(http.url(&delete_path))
+        .bearer_auth(&http.token)
+        .send()
+        .await
+        .expect("delete stored offset request");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "existing offset delete must commit"
+    );
+}
+
 #[iggy_harness]
 async fn given_oversized_body_when_producing_should_reject_413(harness: &TestHarness) {
     let http = HttpSession::login_root(harness).await;
