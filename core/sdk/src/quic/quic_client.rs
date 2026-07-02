@@ -209,6 +209,10 @@ impl iggy_common::VsrSessionControl for QuicClient {
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
     }
+
+    fn sdk_version(&self) -> &'static str {
+        crate::SDK_VERSION
+    }
 }
 
 impl BinaryClient for QuicClient {}

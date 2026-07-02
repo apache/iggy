@@ -346,6 +346,8 @@ mod tests {
                                 consensus_group_id: 33,
                                 created_at: ts,
                                 created_revision: 0,
+                                deleted_up_to_offset: 0,
+                                purge_generation: 0,
                             }],
                             consumer_groups: Vec::new(),
                             next_consumer_group_id: 1,

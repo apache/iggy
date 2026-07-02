@@ -26,10 +26,12 @@ use std::{
     cell::UnsafeCell,
     collections::{BTreeMap, HashMap},
 };
+use tracing::warn;
 
 use crate::{Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
+const PREPARE_HEADER_SIZE: usize = std::mem::size_of::<PrepareHeader>();
 type JournalBuffer = Frozen<4096>;
 
 /// Decoded `SendMessages` header fields surfaced from a journal (re-)append so a
@@ -46,18 +48,37 @@ pub struct RetainedBatchMeta {
 }
 
 /// Lookup key for querying messages from the journal.
+///
+/// `ceiling` is the inclusive commit-frontier bound: the resident journal holds
+/// replicated-but-uncommitted prepares (a pipeline ahead of the commit
+/// frontier), so a poll must never return a message past `ceiling` or it leaks
+/// a dirty read of view-change-rollbackable data.
 #[derive(Debug, Clone, Copy)]
 pub enum MessageLookup {
-    #[allow(dead_code)]
-    Offset { offset: u64, count: u32 },
-    #[allow(dead_code)]
-    Timestamp { timestamp: u64, count: u32 },
+    Offset {
+        offset: u64,
+        count: u32,
+        ceiling: u64,
+    },
+    Timestamp {
+        timestamp: u64,
+        count: u32,
+        ceiling: u64,
+    },
 }
 
 impl MessageLookup {
     pub const fn count(self) -> u32 {
         match self {
             Self::Offset { count, .. } | Self::Timestamp { count, .. } => count,
+        }
+    }
+
+    /// Inclusive commit-frontier upper bound: no message with a greater offset
+    /// may be served (uncommitted, rollbackable on a view change).
+    pub const fn ceiling(self) -> u64 {
+        match self {
+            Self::Offset { ceiling, .. } | Self::Timestamp { ceiling, .. } => ceiling,
         }
     }
 }
@@ -68,16 +89,6 @@ pub struct SelectedBatchSlice {
     pub end: usize,
     pub matched_messages: u32,
     pub last_matching_offset: u64,
-}
-
-#[allow(dead_code)]
-pub trait QueryableJournal<S>: Journal<S>
-where
-    S: Storage,
-{
-    type Query;
-
-    fn get(&self, query: &Self::Query) -> impl Future<Output = Option<PollQueryResult<4096>>>;
 }
 
 /// In-memory only partition journal storage. Non-durable.
@@ -194,6 +205,22 @@ where
 }
 
 impl PartitionJournalMemStorage {
+    /// Synchronous mirror of [`Storage::read_at`] for the poll path. Mem
+    /// storage never hits the reactor (it copies from an in-memory `Vec`), so
+    /// the read can run under a partition borrow without crossing an `.await`
+    /// - the property that keeps poll-read sound.
+    fn read_at_sync(&self, offset: usize) -> JournalBuffer {
+        let offset_to_index = unsafe { &*self.offset_to_index.get() };
+        let Some(&index) = offset_to_index.get(&offset) else {
+            return Owned::<4096>::zeroed(0).into();
+        };
+        let entries = unsafe { &*self.entries.get() };
+        entries
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| Owned::<4096>::zeroed(0).into())
+    }
+
     fn entries(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &*self.entries.get() };
         entries.clone()
@@ -222,6 +249,58 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
+    /// Synchronous resident-range poll read. Never awaits (mem storage reads
+    /// are pure memory copies), so a partition borrow held across it cannot span
+    /// a scheduler yield. The poll path uses this; the disk tier, which does
+    /// await file IO, runs off the borrow on owned descriptors.
+    pub fn get_sync(&self, query: &MessageLookup) -> Option<PollQueryResult<4096>> {
+        let query = *query;
+        let start_op = self.candidate_start_op(&query)?;
+        let result = self.load_polled_batches_from_storage_sync(start_op, query);
+        (!result.0.is_empty()).then_some(result)
+    }
+
+    fn load_polled_batches_from_storage_sync(
+        &self,
+        start_op: u64,
+        query: MessageLookup,
+    ) -> PollQueryResult<4096> {
+        let count = query.count();
+        if count == 0 {
+            return (PollFragments::new(), None);
+        }
+
+        // Disjoint `UnsafeCell`s: this borrows `op_to_storage_offset` while the
+        // loop borrows `inner.storage` (via `read_at_sync`); the loop mutates
+        // neither, so iterating the range in place avoids a per-poll Vec copy.
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+
+        let mut fragments = PollFragments::new();
+        let mut last_matching_offset = None;
+        let mut matched_messages = 0u32;
+
+        for (_, &storage_offset) in op_to_storage_offset.range(start_op..) {
+            if matched_messages >= count {
+                break;
+            }
+
+            let bytes = {
+                let inner = unsafe { &*self.inner.get() };
+                inner.storage.read_at_sync(storage_offset)
+            };
+
+            try_push_resident_entry(
+                &bytes,
+                query,
+                &mut fragments,
+                &mut last_matching_offset,
+                &mut matched_messages,
+            );
+        }
+
+        (fragments, last_matching_offset)
+    }
+
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
     pub fn commit(&self) -> Vec<JournalBuffer> {
         let entries = {
@@ -328,8 +407,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         &self,
         entry: JournalBuffer,
     ) -> io::Result<Option<RetainedBatchMeta>> {
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let header_bytes = &entry[..header_size];
+        let header_bytes = &entry[..PREPARE_HEADER_SIZE];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
         let op = header.op;
@@ -389,6 +467,15 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         let inner = unsafe { &*self.inner.get() };
         inner.storage.is_empty()
     }
+
+    /// Owned, op-ascending clones of every resident journal entry. Each clone
+    /// is a `Frozen` refcount bump, not a deep copy. Used to snapshot the
+    /// resident tail at poll-plan time so a disk-tier straddle can be spliced
+    /// off the partition borrow on owned data ([`crate::iggy_partition`]).
+    pub fn resident_entries(&self) -> Vec<JournalBuffer> {
+        let inner = unsafe { &*self.inner.get() };
+        inner.storage.entries()
+    }
 }
 
 impl<S> PartitionJournal<S>
@@ -441,7 +528,6 @@ where
         offset_to_op.keys().next().copied()
     }
 
-    #[allow(dead_code)]
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
         match query {
             MessageLookup::Offset { offset, .. } => {
@@ -495,78 +581,6 @@ where
 
         Some(bytes)
     }
-
-    #[allow(dead_code)]
-    async fn load_polled_batches_from_storage(
-        &self,
-        start_op: u64,
-        query: MessageLookup,
-    ) -> PollQueryResult<4096> {
-        let count = query.count();
-
-        if count == 0 {
-            return (PollFragments::new(), None);
-        }
-
-        // Get (op, storage_offset) pairs directly from the mapping
-        // BTreeMap is already sorted by op
-        let op_offsets: Vec<(u64, usize)> = {
-            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-            op_to_storage_offset
-                .range(start_op..)
-                .map(|(op, offset)| (*op, *offset))
-                .collect()
-        };
-
-        let mut fragments = PollFragments::new();
-        let mut last_matching_offset = None;
-        let mut matched_messages = 0u32;
-
-        for (_, storage_offset) in op_offsets {
-            if matched_messages >= count {
-                break;
-            }
-
-            let bytes = {
-                let inner = unsafe { &*self.inner.get() };
-                inner
-                    .storage
-                    .read_at(storage_offset, Owned::<4096>::zeroed(ZERO_LEN).into())
-                    .await
-                    .unwrap_or_else(|_| Owned::<4096>::zeroed(ZERO_LEN).into())
-            };
-
-            if bytes.is_empty() {
-                continue;
-            }
-
-            let header_size = std::mem::size_of::<PrepareHeader>();
-            let header_bytes = &bytes[..header_size];
-            let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
-                .expect("partition journal storage must contain a valid prepare header");
-            if header.operation != Operation::SendMessages {
-                continue;
-            }
-            let Ok(batch) = decode_prepare_slice(bytes.as_slice()) else {
-                continue;
-            };
-
-            let Some(selection) = select_batch_slice(&batch, query, matched_messages) else {
-                continue;
-            };
-            push_selected_batch_fragments(
-                &mut fragments,
-                &mut last_matching_offset,
-                &mut matched_messages,
-                &bytes,
-                &header,
-                &batch,
-                selection,
-            );
-        }
-
-        (fragments, last_matching_offset)
-    }
 }
 
 impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
@@ -599,22 +613,6 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
     }
 }
 
-impl QueryableJournal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
-    type Query = MessageLookup;
-
-    async fn get(&self, query: &Self::Query) -> Option<PollQueryResult<4096>> {
-        let query = *query;
-        let start_op = self.candidate_start_op(&query)?;
-        let result = self.load_polled_batches_from_storage(start_op, query).await;
-
-        if result.0.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-}
-
 pub fn select_batch_slice(
     batch: &SendMessages2Ref<'_>,
     query: MessageLookup,
@@ -631,8 +629,16 @@ pub fn select_batch_slice(
     let mut matched = 0u32;
     let mut last_matching_offset = None;
 
+    let ceiling = query.ceiling();
     for record in batch.iter_with_offsets() {
         let offset = batch.header.base_offset + u64::from(record.message.header.offset_delta);
+
+        // Offsets within a batch ascend with the record index, so once we pass
+        // the commit frontier every later record is uncommitted too: stop here
+        // rather than skipping, which would punch a hole into the byte slice.
+        if offset > ceiling {
+            break;
+        }
 
         let selected = match query {
             MessageLookup::Offset {
@@ -666,24 +672,30 @@ pub fn select_batch_slice(
     })
 }
 
-fn push_selected_batch_fragments(
+/// Push the fragments for one selected batch, shared by the resident-journal
+/// walk and the disk-chunk walk. `source` holds a stamped
+/// `[256B SendMessages2Header][blob]` batch starting at byte `batch_base`
+/// (the disk walk passes the chunk cursor; the resident walk passes
+/// `size_of::<PrepareHeader>()`, the batch's offset past the prepare header).
+/// A full-body selection forwards the original batch bytes by reference; a
+/// partial selection emits a rewritten header (clamped length/count/checksum)
+/// plus a body slice.
+pub fn push_selected_batch_fragments(
     fragments: &mut PollFragments<4096>,
     last_matching_offset: &mut Option<u64>,
     matched_messages: &mut u32,
-    prepare: &Frozen<4096>,
-    prepare_header: &PrepareHeader,
+    source: &Frozen<4096>,
+    batch_base: usize,
     batch: &SendMessages2Ref<'_>,
     selection: SelectedBatchSlice,
 ) {
-    let prepare_header_size = std::mem::size_of::<PrepareHeader>();
-    let prepare_size = prepare_header.size as usize;
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
 
     if full_body_selected {
         fragments.push(Fragment::slice(
-            prepare.clone(),
-            prepare_header_size,
-            prepare_size,
+            source.clone(),
+            batch_base,
+            batch_base + batch.header.total_size(),
         ));
     } else {
         let mut rewritten = batch.header;
@@ -699,14 +711,101 @@ fn push_selected_batch_fragments(
         );
         fragments.push(Fragment::whole(rewritten.into_frozen()));
         fragments.push(Fragment::slice(
-            prepare.clone(),
-            prepare_header_size + COMMAND_HEADER_SIZE + selection.start,
-            prepare_header_size + COMMAND_HEADER_SIZE + selection.end,
+            source.clone(),
+            batch_base + COMMAND_HEADER_SIZE + selection.start,
+            batch_base + COMMAND_HEADER_SIZE + selection.end,
         ));
     }
 
     *last_matching_offset = Some(selection.last_matching_offset);
     *matched_messages += selection.matched_messages;
+}
+
+/// Decode one resident `Frozen` entry and push its matching fragments. Shared by
+/// the live storage walk and the owned-snapshot walk so the corrupt-header skip
+/// and `SendMessages` filter live in one place. Skips (never panics) on a short
+/// or undecodable entry: a poll must not crash the shard on bad storage.
+fn try_push_resident_entry(
+    prepare: &Frozen<4096>,
+    query: MessageLookup,
+    fragments: &mut PollFragments<4096>,
+    last_matching_offset: &mut Option<u64>,
+    matched_messages: &mut u32,
+) {
+    let Some(header_bytes) = prepare.as_slice().get(..PREPARE_HEADER_SIZE) else {
+        return;
+    };
+    let Ok(header) = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes) else {
+        warn!(
+            target: "iggy.partitions.diag",
+            "partition journal poll: skipping entry with undecodable prepare header"
+        );
+        return;
+    };
+    if header.operation != Operation::SendMessages {
+        return;
+    }
+    let Ok(batch) = decode_prepare_slice(prepare.as_slice()) else {
+        return;
+    };
+    let Some(selection) = select_batch_slice(&batch, query, *matched_messages) else {
+        return;
+    };
+    // The batch's 256B header sits right after the prepare header in a resident
+    // entry (see `decode_prepare_slice`), so the batch base is `PREPARE_HEADER_SIZE`.
+    push_selected_batch_fragments(
+        fragments,
+        last_matching_offset,
+        matched_messages,
+        prepare,
+        PREPARE_HEADER_SIZE,
+        &batch,
+        selection,
+    );
+}
+
+/// Poll an owned, point-in-time snapshot of the resident journal tail.
+/// `entries` are op-ascending `Frozen` clones captured while the partition
+/// borrow was held; this runs off the borrow on owned data, so no concurrent
+/// commit/eviction can interleave. Mirrors [`PartitionJournal::get_sync`] but
+/// over owned entries: a single forward walk where `select_batch_slice` filters
+/// by `query`, which is equivalent to the live `candidate_start_op` seek (a
+/// batch entirely before the query bound contributes no records).
+///
+/// Used both for retention-recovery (disk walked clean, serve the journal with
+/// the original query) and, after a contiguity check by the caller, for the
+/// disk-tier straddle continuation. Returns `None` when nothing matched.
+//
+// Plain `pub` (not `pub(crate)`): the `journal` module is private, so this is
+// not externally reachable, and `pub(crate)` here trips `redundant_pub_crate`.
+// Matches `select_batch_slice` above.
+pub fn select_resident(
+    entries: &[Frozen<4096>],
+    query: MessageLookup,
+) -> Option<PollQueryResult<4096>> {
+    let count = query.count();
+    if count == 0 {
+        return None;
+    }
+
+    let mut fragments = PollFragments::new();
+    let mut last_matching_offset = None;
+    let mut matched_messages = 0u32;
+
+    for prepare in entries {
+        if matched_messages >= count {
+            break;
+        }
+        try_push_resident_entry(
+            prepare,
+            query,
+            &mut fragments,
+            &mut last_matching_offset,
+            &mut matched_messages,
+        );
+    }
+
+    (!fragments.is_empty()).then_some((fragments, last_matching_offset))
 }
 
 #[cfg(test)]
