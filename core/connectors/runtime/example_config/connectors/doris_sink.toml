@@ -44,6 +44,13 @@ timeout = "30s"
 # TCP connect timeout (default "5s"). Independent of timeout; raise it for
 # cross-region or cold-start FEs that are slow to accept the connection.
 # connect_timeout = "5s"
+# In-request retry for transient Stream Load failures (5xx/408/429, transport
+# error, Doris "Publish Timeout"). Retries re-PUT under the same label, which
+# Doris dedupes. max_retries is the total attempt count (1 disables retries);
+# keep max_retries * max_retry_delay inside Doris's label_keep_max_second.
+# max_retries = 3
+# retry_delay = "200ms"
+# max_retry_delay = "5s"
 # Stream Load redirect security. Doris's FE redirects (307) to a BE on another
 # host; credentials are re-attached across that hop. By default a redirect that
 # downgrades https -> http is refused (it would leak credentials in cleartext).
