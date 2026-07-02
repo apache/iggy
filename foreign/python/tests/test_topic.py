@@ -600,9 +600,12 @@ class TestGetTopics:
     async def test_get_topics_returns_all_created_topics(
         self, iggy_client: IggyClient, unique_name, topic_count: int
     ):
-        """Test get_topics returns every topic created in the stream."""
+        """Test get_topics returns every created topic, ordered by id ascending."""
         stream_name = unique_name()
-        topic_names = {unique_name() for _ in range(topic_count)}
+        # Reverse-alphabetical names so that id-ascending (creation) order
+        # and name order disagree, proving the list isn't accidentally
+        # name-sorted.
+        topic_names = [f"{unique_name()}-{i}" for i in range(topic_count, 0, -1)]
 
         await iggy_client.create_stream(stream_name)
         for name in topic_names:
@@ -612,7 +615,8 @@ class TestGetTopics:
 
         topics = await iggy_client.get_topics(stream_name)
         assert len(topics) == len(topic_names)
-        assert {topic.name for topic in topics} == topic_names
+        assert [topic.name for topic in topics] == topic_names
+        assert [topic.id for topic in topics] == sorted(topic.id for topic in topics)
         # Only assert fields supplied at creation or deterministically set by
         # the server: each topic keeps its partition count and a fresh topic
         # holds no messages. The numeric id is server-assigned and not checked.
@@ -623,9 +627,9 @@ class TestGetTopics:
     async def test_get_topics_returns_same_result_when_called_repeatedly(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test repeated get_topics calls return a stable view of the stream."""
+        """Test repeated get_topics calls return an identically ordered view."""
         stream_name = unique_name()
-        topic_names = {unique_name() for _ in range(3)}
+        topic_names = [unique_name() for _ in range(3)]
 
         await iggy_client.create_stream(stream_name)
         for name in topic_names:
@@ -635,9 +639,9 @@ class TestGetTopics:
 
         first = await iggy_client.get_topics(stream_name)
         second = await iggy_client.get_topics(stream_name)
-        assert {topic.name for topic in first} == topic_names
-        assert {topic.name for topic in second} == topic_names
-        assert {topic.id for topic in first} == {topic.id for topic in second}
+        assert [topic.name for topic in first] == topic_names
+        assert [topic.id for topic in first] == [topic.id for topic in second]
+        assert [topic.name for topic in first] == [topic.name for topic in second]
 
     @pytest.mark.asyncio
     async def test_get_topics_accepts_numeric_stream_id(
