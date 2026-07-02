@@ -33,6 +33,7 @@ use iggy_binary_protocol::codes::{
     GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
     GET_USERS_CODE,
 };
+use iggy_binary_protocol::consensus::result_code;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -837,11 +838,12 @@ pub(crate) fn build_reply_from_bytes(
     )
 }
 
-/// If a raw PAT token was minted (`CreatePersonalAccessToken`), replace the
-/// committed reply -- whose body is empty because the raw token never entered
-/// consensus -- with a `RawPersonalAccessTokenResponse`, reusing the confirmed
-/// commit position from the committed reply. Otherwise the committed reply
-/// passes through unchanged.
+/// If a raw PAT token was minted (`CreatePersonalAccessToken`) and the commit
+/// succeeded, replace the committed reply -- whose body is empty because the
+/// raw token never entered consensus -- with a `RawPersonalAccessTokenResponse`,
+/// reusing the confirmed commit position from the committed reply. Otherwise
+/// (no token, a committed business rejection, or an eviction frame) the
+/// committed reply passes through unchanged.
 pub(crate) fn build_raw_pat_reply(
     request_header: &RequestHeader,
     committed: Message<GenericHeader>,
@@ -865,6 +867,20 @@ pub(crate) fn build_raw_pat_reply(
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
+    let size = committed_header.size as usize;
+    // A committed create can still be a business rejection (duplicate name,
+    // invalid expiry) whose reply body carries a nonzero result code. Splice
+    // the secret only into a genuine success; pass everything else through
+    // untouched so the client decodes the committed error instead of a
+    // success-shaped token reply (the minted raw secret is simply dropped).
+    // Mirrors the HTTP handler's `committed_payload` gate.
+    let reply_body = committed
+        .as_slice()
+        .get(header_len..size)
+        .unwrap_or_default();
+    if result_code(reply_body) != Some(0) {
+        return Ok(committed);
+    }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let body = RawPersonalAccessTokenResponse { token }.to_bytes();
     let reply = build_reply_from_bytes(
@@ -1043,4 +1059,81 @@ pub(crate) fn build_consumer_offset_body(
     body.extend_from_slice(&current_offset.to_le_bytes());
     body.extend_from_slice(&stored_offset.to_le_bytes());
     Bytes::from(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pat_request_header() -> RequestHeader {
+        let zeroed = [0u8; std::mem::size_of::<RequestHeader>()];
+        let mut header = *bytemuck::checked::try_from_bytes::<RequestHeader>(&zeroed)
+            .expect("zeroed bytes form a valid RequestHeader");
+        header.command = Command2::Request;
+        header.operation = Operation::CreatePersonalAccessToken;
+        header.client = 42;
+        header.session = 7;
+        header.request = 3;
+        header
+    }
+
+    /// A committed metadata reply whose body is the given result section
+    /// (`[count][{index, result}]*`), as the commit path emits it.
+    fn committed_reply(result_body: &[u8]) -> Message<GenericHeader> {
+        let request_header = pat_request_header();
+        build_reply_from_bytes(
+            &request_header,
+            42,
+            7,
+            9,
+            &Bytes::copy_from_slice(result_body),
+        )
+        .into_generic()
+    }
+
+    #[test]
+    fn raw_pat_reply_splices_token_into_a_committed_success() {
+        let success = committed_reply(&0u32.to_le_bytes());
+        let reply =
+            build_raw_pat_reply(&pat_request_header(), success, Some("raw-token".to_owned()))
+                .expect("splice succeeds");
+        let header_len = std::mem::size_of::<ReplyHeader>();
+        let body = &reply.as_slice()[header_len..reply.header().size as usize];
+        let response =
+            RawPersonalAccessTokenResponse::decode_from(body).expect("token body decodes");
+        assert_eq!(response.token.as_str(), "raw-token");
+    }
+
+    #[test]
+    fn raw_pat_reply_passes_a_committed_rejection_through_untouched() {
+        let rejection_code =
+            IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code();
+        let mut result_body = Vec::new();
+        result_body.extend_from_slice(&1u32.to_le_bytes());
+        result_body.extend_from_slice(&0u32.to_le_bytes());
+        result_body.extend_from_slice(&rejection_code.to_le_bytes());
+        let rejection = committed_reply(&result_body);
+        let original = rejection.as_slice().to_vec();
+
+        let reply = build_raw_pat_reply(
+            &pat_request_header(),
+            rejection,
+            Some("raw-token".to_owned()),
+        )
+        .expect("pass-through succeeds");
+        assert_eq!(
+            reply.as_slice(),
+            original.as_slice(),
+            "a committed rejection must not be rewritten into a token reply"
+        );
+    }
+
+    #[test]
+    fn raw_pat_reply_without_a_token_passes_through() {
+        let success = committed_reply(&0u32.to_le_bytes());
+        let original = success.as_slice().to_vec();
+        let reply =
+            build_raw_pat_reply(&pat_request_header(), success, None).expect("pass-through");
+        assert_eq!(reply.as_slice(), original.as_slice());
+    }
 }
