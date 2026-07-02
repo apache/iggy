@@ -203,11 +203,12 @@ impl OpenSearchSource {
         self.config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE)
     }
 
-    fn timestamp_field(&self) -> &str {
+    fn timestamp_field(&self) -> Result<&str, Error> {
         self.config
             .timestamp_field
             .as_deref()
-            .expect("timestamp_field validated at open()")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::InvalidConfigValue("timestamp_field is required".to_string()))
     }
 
     fn get_state_id(&self) -> String {
@@ -233,7 +234,6 @@ impl OpenSearchSource {
                 "connector_type": "opensearch_source",
                 "connector_id": self.id,
                 "index": self.config.index,
-                "url": self.config.url,
             })),
         })
     }
@@ -452,7 +452,7 @@ impl OpenSearchSource {
         let search_after = state.search_after.clone();
         drop(state);
 
-        let timestamp_field = self.timestamp_field();
+        let timestamp_field = self.timestamp_field()?;
 
         let mut search_body = self
             .search_body_base
@@ -733,17 +733,6 @@ impl Source for OpenSearchSource {
 
         validate_open_config(&self.config)?;
 
-        let timestamp_field = self.timestamp_field();
-        let batch_size = self.batch_size();
-        self.search_body_base = Some(json!({
-            "query": self.config.query.clone().unwrap_or_else(|| json!({ "match_all": {} })),
-            "size": batch_size,
-            "sort": [
-                { timestamp_field: { "order": "asc" } },
-                { "_id": { "order": "asc" } }
-            ]
-        }));
-
         info!(
             "Opening OpenSearch source connector with ID: {} for URL: {}, index: {}",
             self.id, self.config.url, self.config.index
@@ -753,6 +742,16 @@ impl Source for OpenSearchSource {
 
         self.check_index_exists_with_retry(&client).await?;
 
+        let timestamp_field = self.timestamp_field()?;
+        let batch_size = self.batch_size();
+        self.search_body_base = Some(json!({
+            "query": self.config.query.clone().unwrap_or_else(|| json!({ "match_all": {} })),
+            "size": batch_size,
+            "sort": [
+                { timestamp_field: { "order": "asc" } },
+                { "_id": { "order": "asc" } }
+            ]
+        }));
         self.client = Some(client);
 
         if self
