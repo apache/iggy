@@ -27,19 +27,27 @@ use iggy_gateway_kafka::{KafkaServer, ServerConfig};
 
 /// Bind an ephemeral port, start `KafkaServer`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-
-    let config = ServerConfig {
-        bind_addr: addr.to_string(),
+    spawn_test_server_with_config(ServerConfig {
+        bind_addr: String::new(),
         advertised_host: None,
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
         read_timeout: Duration::from_secs(5),
         write_timeout: Duration::from_secs(5),
-    };
+    })
+    .await
+}
+
+/// Start `KafkaServer` with explicit config (`bind_addr` overwritten with ephemeral port).
+pub async fn spawn_test_server_with_config(
+    mut config: ServerConfig,
+) -> (SocketAddr, broadcast::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    config.bind_addr = addr.to_string();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let server = KafkaServer::new(config);
     tokio::spawn(async move {
