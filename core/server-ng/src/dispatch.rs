@@ -598,17 +598,35 @@ async fn handle_client_request(
                 return;
             }
         };
-    // Hash raw passwords on the primary before replication (CreateUser /
-    // ChangePassword); see `crate::users`. Replicas store the hash directly.
-    let request = match maybe_rewrite_user_password_request(request) {
+    // Hash raw passwords and verify ChangePassword's current password on the
+    // primary before replication (CreateUser / ChangePassword); see
+    // `crate::users`. Replicas store the hash directly.
+    let request = match maybe_rewrite_user_password_request(shard, request) {
         Ok(rewritten) => rewritten,
         Err(error) => {
+            // Deny fast with the typed code (InvalidCredentials on a failed
+            // current-password check, InvalidCommand on a malformed body): a
+            // silent drop would wedge every later request on the connection
+            // until the socket read timeout.
             warn!(
                 transport_client_id,
                 error = %error,
                 operation = ?header.operation,
-                "dropping user request with invalid password payload"
+                "denying user password request"
             );
+            let commit = current_metadata_commit(shard);
+            let reply = build_deny_reply(&header, transport_client_id, 0, commit, error.as_code());
+            if let Err(send_error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %send_error,
+                    "failed to send password-deny reply"
+                );
+            }
             return;
         }
     };

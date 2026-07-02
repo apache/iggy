@@ -2126,8 +2126,11 @@ async fn delete_user(
 
 /// `PUT /users/{user_id}/password`: change a user's password. Returns 204.
 ///
-/// Like [`create_user`], the new password rides the JSON body in plaintext and
-/// is hashed by [`submit_write`] on shard 0 before replication.
+/// Both passwords ride the JSON body in plaintext. On shard 0, before the op
+/// enters consensus, [`maybe_rewrite_user_password_request`] hashes the new
+/// password and strips the current one (so neither plaintext is ever
+/// replicated), and verifies `current_password` against the target's stored
+/// hash -- a wrong one rejects as 400 `InvalidCredentials`.
 async fn change_password(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -2311,10 +2314,13 @@ async fn submit_committed(
 ///
 /// Both shard-0 request rewrites run here before consensus, mirroring the TCP
 /// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
-/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes plaintext
-/// (`CreateUser` / `ChangePassword`). Both are no-ops for every other operation,
-/// so plaintext secrets never enter consensus on any write. On either rewrite's
-/// decode failure the gate is released without advancing, leaving the id free.
+/// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
+/// password and, for `ChangePassword`, strips the current one and verifies it
+/// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
+/// for every other operation, so plaintext secrets never enter consensus on any
+/// write. On either rewrite's rejection (a malformed body, or a failed
+/// current-password check) the gate is released without advancing, leaving the
+/// id free.
 async fn submit_gated(
     shard: &Rc<ServerNgShard>,
     session: &HttpSession,
@@ -2331,7 +2337,8 @@ async fn submit_gated(
     );
     let (message, raw_token) =
         rewrite_pat_request_for_user(session.user_id, message).map_err(WriteError::Rejected)?;
-    let message = maybe_rewrite_user_password_request(message).map_err(WriteError::Rejected)?;
+    let message =
+        maybe_rewrite_user_password_request(shard, message).map_err(WriteError::Rejected)?;
     let request_header = *message.header();
     let reply = submit_client_request_on_owner(shard, message).await;
     let Some(reply) = reply else {

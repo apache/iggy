@@ -55,12 +55,17 @@ const CONSUMER_ID: u32 = 1;
 
 // `IggyError` discriminants (== the numeric `id` in the JSON error body).
 const UNAUTHORIZED_ID: u64 = 41;
+const INVALID_CREDENTIALS_ID: u64 = 42;
 const CANNOT_DELETE_USER_ID: u64 = 48;
 const CANNOT_CHANGE_PERMISSIONS_ID: u64 = 49;
+// The apply's `ChangePasswordResult::UserNotFound` maps to `ResourceNotFound`.
+const RESOURCE_NOT_FOUND_ID: u64 = 20;
 // Snake-case `IggyError` names (== the `code` string in the JSON error body).
 const UNAUTHORIZED_CODE: &str = "unauthorized";
+const INVALID_CREDENTIALS_CODE: &str = "invalid_credentials";
 const CANNOT_DELETE_USER_CODE: &str = "cannot_delete_user";
 const CANNOT_CHANGE_PERMISSIONS_CODE: &str = "cannot_change_permissions";
+const RESOURCE_NOT_FOUND_CODE: &str = "resource_not_found";
 
 /// Root is the first user (slab id 0) and is undeletable / permission-locked.
 const ROOT_USER_PATH: &str = "0";
@@ -268,6 +273,26 @@ impl Client {
             }),
         )
         .await
+    }
+
+    /// Change a user's password via `PUT /users/{user_id}/password`.
+    async fn change_password(&self, user_id: &str, current: &str, new: &str) -> Response {
+        self.put_json(
+            &format!("/users/{user_id}/password"),
+            &json!({ "current_password": current, "new_password": new }),
+        )
+        .await
+    }
+
+    /// Anonymous login attempt returning the raw response, for exercising a
+    /// rejected login (the asserting [`Client::login`] cannot express failure).
+    async fn login_attempt(&self, username: &str, password: &str) -> Response {
+        self.http
+            .post(self.url("/users/login"))
+            .json(&json!({ "username": username, "password": password }))
+            .send()
+            .await
+            .expect("login request")
     }
 
     async fn produce(
@@ -913,4 +938,105 @@ async fn given_non_root_tcp_session_when_polling_denied_should_surface_typed_una
         matches!(&result, Err(error) if error.as_code() == IggyError::Unauthorized.as_code()),
         "non-root TCP poll must surface Err(Unauthorized) via the reply status peek, got {result:?}"
     );
+}
+
+/// The current-password check gates a self-service rotation: a wrong current
+/// password is rejected pre-consensus as 400 `InvalidCredentials` (never
+/// reaching the replicated apply), and only the correct one rotates the
+/// credential so the old password stops working and the new one starts.
+#[iggy_harness]
+async fn given_own_password_when_current_wrong_should_reject_and_correct_should_rotate(
+    harness: &TestHarness,
+) {
+    let root = Client::login_root(harness).await;
+    root.create_user("carol", "carol-pass-1", no_permissions())
+        .await;
+    let carol = root.login("carol", "carol-pass-1").await;
+
+    let wrong = carol
+        .change_password("carol", "not-my-password", "carol-pass-2")
+        .await;
+    assert_eq!(
+        wrong.status(),
+        StatusCode::BAD_REQUEST,
+        "wrong current password must be 400"
+    );
+    assert_error_body(
+        wrong,
+        INVALID_CREDENTIALS_ID,
+        INVALID_CREDENTIALS_CODE,
+        "carol change-password wrong current",
+    )
+    .await;
+
+    let correct = carol
+        .change_password("carol", "carol-pass-1", "carol-pass-2")
+        .await;
+    assert_eq!(
+        correct.status(),
+        StatusCode::NO_CONTENT,
+        "correct current password must be 204"
+    );
+
+    assert!(
+        !carol
+            .login_attempt("carol", "carol-pass-1")
+            .await
+            .status()
+            .is_success(),
+        "old password must stop working after a successful rotation"
+    );
+    assert!(
+        carol
+            .login_attempt("carol", "carol-pass-2")
+            .await
+            .status()
+            .is_success(),
+        "new password must work after a successful rotation"
+    );
+}
+
+/// Admin-initiated change (target != caller): the current password is checked
+/// against the TARGET's stored hash, so a wrong one is 400 `InvalidCredentials`;
+/// a target that does not resolve is left to the replicated apply, which
+/// answers 404 `UserNotFound` (the plaintext is still stripped + hashed first).
+#[iggy_harness]
+async fn given_admin_change_password_when_target_current_wrong_or_missing_should_reject(
+    harness: &TestHarness,
+) {
+    let root = Client::login_root(harness).await;
+    root.create_user("dave", "dave-pass", no_permissions())
+        .await;
+
+    let wrong = root
+        .change_password("dave", "not-daves-password", "new-dave-pass")
+        .await;
+    assert_eq!(
+        wrong.status(),
+        StatusCode::BAD_REQUEST,
+        "admin change with the wrong target current password must be 400"
+    );
+    assert_error_body(
+        wrong,
+        INVALID_CREDENTIALS_ID,
+        INVALID_CREDENTIALS_CODE,
+        "admin change dave wrong current",
+    )
+    .await;
+
+    let missing = root
+        .change_password("ghost-does-not-exist", "whatever", "whatever-else")
+        .await;
+    assert_eq!(
+        missing.status(),
+        StatusCode::NOT_FOUND,
+        "change for an unknown target must be 404 from the apply"
+    );
+    assert_error_body(
+        missing,
+        RESOURCE_NOT_FOUND_ID,
+        RESOURCE_NOT_FOUND_CODE,
+        "admin change missing target",
+    )
+    .await;
 }
