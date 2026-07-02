@@ -241,12 +241,13 @@ mod tests {
             + STRATEGY_SIZE
             + COUNT_SIZE
             + AUTO_COMMIT_SIZE;
+        let wait_timeout_bytes = req.wait_timeout_us.to_le_bytes();
 
         assert_eq!(req.encoded_size(), legacy_size + WAIT_TIMEOUT_SIZE);
         assert_eq!(bytes.len(), req.encoded_size());
         assert_eq!(
             &bytes[legacy_size..legacy_size + WAIT_TIMEOUT_SIZE],
-            &req.wait_timeout_us.to_le_bytes()
+            wait_timeout_bytes.as_slice()
         );
     }
 
