@@ -1,0 +1,87 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Example JDBC Source Connector Configuration for Oracle Database
+
+type = "source"
+key = "jdbc_oracle_example"
+enabled = true
+version = 0
+name = "JDBC Oracle Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
+
+[plugin_config]
+# JDBC connection URL
+# Option 1: Separate credentials
+jdbc_url = "jdbc:oracle:thin:@localhost:1521:XE"
+
+# Option 2: Embedded credentials in URL (Oracle uses / separator)
+# jdbc_url = "jdbc:oracle:thin:system/oracle@localhost:1521:XE"
+
+# JDBC driver class name
+driver_class = "oracle.jdbc.OracleDriver"
+
+# Path to JDBC driver JAR file
+# Download from: https://www.oracle.com/database/technologies/appdev/jdbc-downloads.html
+driver_jar_path = "/opt/jdbc-drivers/ojdbc11.jar"
+
+# Database credentials (optional if included in jdbc_url)
+username = "system"
+password = "oracle"
+
+# SQL query to execute
+# Oracle example with ROWNUM or use a numeric/timestamp column
+query = "SELECT * FROM CUSTOMERS WHERE ID > {last_offset} ORDER BY ID"
+
+# How often to poll the database
+poll_interval = "1m"
+
+# Maximum number of rows to fetch per poll
+batch_size = 500
+
+# Column to track for incremental reads (must be in query result)
+tracking_column = "ID"
+
+# Initial offset value for the first poll
+initial_offset = "0"
+
+# Source mode: "incremental" or "bulk"
+# Works with ALL JDBC databases universally
+mode = "incremental"
+
+# Convert column names to snake_case (e.g., OrderDate -> order_date)
+snake_case_columns = true
+
+# Include metadata wrapper in output messages
+include_metadata = true
+
+# Connection pooling (optional, requires HikariCP JAR in classpath)
+enable_connection_pool = false
+# max_pool_size = 10
+# min_idle = 2
+# connection_timeout_ms = 30000
+
+# Custom JVM options (optional)
+jvm_options = ["-Xmx512m", "-Xms256m"]
+
+# Target Iggy stream and topic
+[[streams]]
+stream = "crm"
+topic = "customers"
+partition_id = 1
+schema = "json"
