@@ -223,7 +223,7 @@ Requirements for correct operation:
 
 | Category | Conditions |
 | -------- | ---------- |
-| Transient (retry) | Network errors; HTTP `429`; HTTP `5xx`; honors `Retry-After` header on `429` |
+| Transient (retry) | Network errors; HTTP `429`; HTTP `5xx`; honors `Retry-After` header on `429` and `5xx` |
 | Permanent (no retry) | `400`, `401`, `403`, `404`; malformed responses; search DSL errors |
 
 ### Circuit breaker
@@ -232,7 +232,9 @@ When open, `poll()` skips the search, logs a warning, sleeps `polling_interval`,
 
 ### Delivery semantics
 
-**At-least-once toward Iggy.** The in-memory cursor advances in `finalize_poll()` before the runtime persists `ConnectorState`. A crash after cursor advance but before the runtime save re-emits the last batch on restart.
+**At-least-once on crash.** The in-memory cursor advances in `finalize_poll()` before the runtime persists `ConnectorState`. A crash after cursor advance but before the runtime save re-emits the last batch on restart.
+
+**At-most-once on in-process send failure.** If the runtime's `send()` to Iggy fails, the runtime logs the error and continues polling without persisting state — but the in-memory cursor already advanced in `finalize_poll()`. That batch is skipped until the next restart. The runtime only persists `ConnectorState` on successful delivery.
 
 Consumer guidance: dedup on OpenSearch `_id` plus index name (for index patterns), or a business key in `_source`.
 
