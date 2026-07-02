@@ -13,8 +13,8 @@ source = { directory = "../../foreign/python" }
 
 [package.metadata]
 requires-dist = [
-    { name = "maturin", marker = "extra == 'all'", specifier = ">=1.2,<2.0" },
-    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.2,<2.0" },
+    { name = "maturin", marker = "extra == 'all'", specifier = ">=1.14.1,<2.0" },
+    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.14.1,<2.0" },
     { name = "pyrefly", marker = "extra == 'all'", specifier = ">=1.1.1" },
     { name = "pyrefly", marker = "extra == 'dev'", specifier = ">=1.1.1" },
     { name = "pytest", marker = "extra == 'all'", specifier = ">=9.0.3,<10.0" },

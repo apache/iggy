@@ -34,7 +34,7 @@ use iggy_common::defaults::{
 use iggy_common::{IggyTimestamp, PersonalAccessToken, UserStatus};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use server::streaming::utils::crypto;
+use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tracing::warn;
