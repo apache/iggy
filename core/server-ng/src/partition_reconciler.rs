@@ -420,18 +420,18 @@ async fn reconcile_additions(
             continue;
         }
 
-        // Clone the parent `Arc<TopicStats>` only for namespaces actually
+        // Resolve the shared stats `Arc` only for namespaces actually
         // built, not once per committed partition every pass. A topic that
         // vanished between the target snapshot and this read defers to the
         // next pass.
-        let Some(topic_stats) = fetch_topic_stats(ctx, ns) else {
+        let Some(partition_stats) = fetch_partition_stats(ctx, ns) else {
             continue;
         };
 
         match build_partition_fresh(
             ctx.config.as_ref(),
             ns,
-            topic_stats,
+            partition_stats,
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
@@ -712,7 +712,7 @@ fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), A
 /// Committed `(namespace, created_revision)` pairs. The epoch lets the
 /// additions pass detect a stale local incarnation after slab-key reuse
 /// without an `Arc<TopicStats>` clone per partition; stats are fetched
-/// lazily in [`fetch_topic_stats`] only for namespaces actually built.
+/// lazily in [`fetch_partition_stats`] only for namespaces actually built.
 fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         // TODO(krishna): O(committed partitions) per non-skipped pass (here +
@@ -745,14 +745,21 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
 
 /// Clone the parent topic's `Arc<TopicStats>` for a single namespace.
 /// `None` if the topic vanished between the target snapshot and this read.
-fn fetch_topic_stats(
+fn fetch_partition_stats(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
-) -> Option<Arc<iggy_common::TopicStats>> {
+) -> Option<Arc<iggy_common::PartitionStats>> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
-        Some(topic.stats.clone())
+        // Get-or-create in the shared registry so the owning shard's counters
+        // are the same `Arc` every shard's `get_topic` reply reads.
+        Some(inner.stats_registry.partition(
+            ns.stream_id(),
+            ns.topic_id(),
+            ns.partition_id(),
+            topic.stats.clone(),
+        ))
     })
 }
 

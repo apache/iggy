@@ -1830,6 +1830,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = metadata::stm::result::ApplyReply,
+                Error = iggy_common::IggyError,
+            > + StreamsFrontend,
     {
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
@@ -1839,6 +1844,13 @@ where
         let actions = consensus.tick(PlaneKind::Metadata);
 
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+
+        // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
+        // no-op, so the timer-driven retransmit above cannot recover the
+        // primary's own missing vote. Without this the commit prefix can pin
+        // forever (commit_min stuck below commit_max). See
+        // `IggyMetadata::repair_primary_self_acks`.
+        metadata.repair_primary_self_acks().await;
     }
 }
 

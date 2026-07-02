@@ -34,7 +34,6 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod cli;
 #[cfg(not(feature = "vsr"))]
 mod cluster;
-#[cfg(not(feature = "vsr"))]
 mod config_provider;
 #[cfg(not(feature = "vsr"))]
 mod connectors;
@@ -63,6 +62,12 @@ mod connectors;
 // revocation. server-ng's rebalance is also covered by `server::cg_vsr` +
 // `stale_client_consumer_group_scenario` (both green).
 mod data_integrity;
+// TODO(vsr): un-gate once the metadata `messages_count` aggregation gap is
+// fixed (partition-plane counts aren't shared into the metadata topic/stream
+// stats under vsr -- root-caused: per-buffer left-right `Arc<TopicStats>`;
+// see `sdk::metadata_counts`) and the `delete_consumer_offset` hang is
+// addressed. Enablement scaffolding is done: the `iggy-mcp` crate has a `vsr`
+// feature and the harness `mcp()` accessor works for clusters.
 #[cfg(not(feature = "vsr"))]
 mod mcp;
 mod sdk;

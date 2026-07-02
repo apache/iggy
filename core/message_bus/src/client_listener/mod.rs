@@ -102,8 +102,10 @@ pub mod wss;
 ///
 /// compio 0.19 replaced `TcpListener::bind_with_options(addr, SocketOpts)`
 /// with the `TcpSocket` builder; this preserves the prior `nodelay(true)`
-/// bind. `SO_REUSEPORT` is intentionally not set: only shard 0 binds the
-/// client listeners (see each caller).
+/// bind. `SO_REUSEADDR` is set so a restarted server can rebind the port
+/// while a previous client connection lingers in `TIME_WAIT` (matching the
+/// replica and QUIC listeners); `SO_REUSEPORT` is intentionally not set:
+/// only shard 0 binds the client listeners (see each caller).
 ///
 /// # Errors
 ///
@@ -119,6 +121,9 @@ pub async fn bind_nodelay_listener(
     .map_err(|e| IggyError::IoError(e.to_string()))?;
     socket
         .set_nodelay(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    socket
+        .set_reuseaddr(true)
         .map_err(|e| IggyError::IoError(e.to_string()))?;
     socket
         .bind(addr)
