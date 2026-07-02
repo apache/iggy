@@ -36,13 +36,12 @@ const BEARER: &str = "Bearer ";
 const JWT_KEY_PREFIX: &str = "jwt:";
 const PAT_KEY_PREFIX: &str = "pat:";
 
-/// Resolved caller identity for a protected route: the numeric user id plus the
-/// shared VSR session established once per presenting credential.
+/// Resolved caller identity for a protected write route: the shared VSR
+/// session established once per presenting credential (it carries the
+/// authenticated user id).
 pub struct Authenticated {
-    pub user_id: u32,
     /// Per-credential VSR session. The write path reads its client id and
-    /// session number and serializes writes through its gate; `get_me` and
-    /// other read-only probes ignore it.
+    /// session number and serializes writes through its gate.
     ///
     /// Wrapped because axum requires every handler argument to be `Send` and
     /// `Rc` is not; this mirrors the `HttpState` bridge. Sound for the same
@@ -73,7 +72,6 @@ impl FromRequestParts<HttpState> for Authenticated {
         // that ever touches the session table (mirrors legacy `HttpSafeShard`).
         let session = SendWrapper::new(state.resolve_session(key, user_id, expiry)).await?;
         Ok(Self {
-            user_id,
             session: SendWrapper::new(session),
         })
     }

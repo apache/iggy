@@ -543,10 +543,16 @@ async fn given_ungranted_user_when_touching_any_surface_should_deny_except_self_
         StatusCode::NO_CONTENT,
         "alice delete own PAT must be 204"
     );
+    let me = alice.get("/users/me").await;
     assert_eq!(
-        alice.get("/users/me").await.status(),
+        me.status(),
         StatusCode::OK,
         "alice GET /users/me must be 200"
+    );
+    let me_body: Value = me.json().await.expect("users/me body must be JSON");
+    assert_eq!(
+        me_body["username"], "alice",
+        "the me alias must resolve to the caller's own user"
     );
 
     // Auth-only cluster metadata (no rule) and the public ping.

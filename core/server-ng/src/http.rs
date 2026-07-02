@@ -229,6 +229,12 @@ const SELF_NODE_NAME: &str = "iggy-node";
 /// server's single-node synthesis.
 const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
 
+/// `{user_id}` segment alias resolving to the caller in `GET /users/{user_id}`.
+/// Handled inside the handler rather than as a static `/users/me` route so it
+/// cannot shadow `{user_id}` matching (a user literally named "me" stays
+/// reachable by numeric id).
+const CURRENT_USER_ALIAS: &str = "me";
+
 /// Response header carrying the current VSR view number, set on every response
 /// while this shard-0 node has live consensus.
 const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
@@ -1014,8 +1020,8 @@ pub async fn start(
     Ok(())
 }
 
-/// Assemble the shard-0 router: unauthenticated health + login routes, plus
-/// one authenticated probe that exercises the [`Authenticated`] extractor.
+/// Assemble the shard-0 router: unauthenticated health + login routes plus the
+/// authenticated REST surface.
 ///
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
@@ -1032,7 +1038,6 @@ fn router(state: HttpState, max_request_size: usize) -> Router {
             "/personal-access-tokens/login",
             post(login_with_personal_access_token),
         )
-        .route("/users/me", get(get_me))
         .route("/users", get(get_users).post(create_user))
         .route(
             "/users/{user_id}",
@@ -1121,17 +1126,6 @@ async fn login_with_personal_access_token(
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
-}
-
-/// Interim authenticated probe: echoes the caller's resolved `user_id` so the
-/// [`Authenticated`] extractor is covered end to end. Iggy exposes no "current
-/// identity" route to reuse. This path also shadows a future
-/// `GET /users/{user_id}` and must be reconciled when that route is added.
-async fn get_me(identity: Authenticated) -> Json<IdentityInfo> {
-    Json(IdentityInfo {
-        user_id: identity.user_id,
-        access_token: None,
-    })
 }
 
 /// `GET /streams`: list every stream as the same `Vec<Stream>` JSON the legacy
@@ -1286,16 +1280,24 @@ async fn get_users(
 
 /// `GET /users/{user_id}`: fetch one user by numeric id or name as the same
 /// `UserInfoDetails` JSON the legacy server returns; 404 when absent. A
-/// consensus-free local STM read via [`read_local`].
+/// consensus-free local STM read via [`read_local`]. [`CURRENT_USER_ALIAS`]
+/// resolves to the caller and skips the `read_users` gate, mirroring the
+/// legacy self-read bypass.
 async fn get_user(
     State(state): State<HttpState>,
     identity: Identity,
     Path(user_id): Path<String>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<UserInfoDetails>, ReadError> {
-    let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
+    let is_self = user_id == CURRENT_USER_ALIAS;
+    let wire_user_id = if is_self {
+        WireIdentifier::numeric(identity.user_id)
+    } else {
+        let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
+        identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
+    };
     let request = GetUserRequest {
-        user_id: identifier_to_wire(&user_id).map_err(ReadError::Rejected)?,
+        user_id: wire_user_id,
     };
     let body = request.to_bytes();
     let bytes = read_local(
@@ -1304,7 +1306,13 @@ async fn get_user(
         query.consistency,
         GET_USER_CODE,
         &body,
-        Permissioner::get_user,
+        |permissioner, uid| {
+            if is_self {
+                Ok(())
+            } else {
+                permissioner.get_user(uid)
+            }
+        },
     )?;
     let response = UserDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
