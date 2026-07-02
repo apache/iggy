@@ -1,3 +1,4 @@
+#!/bin/bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,26 +16,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-module(
-    name = "iggy_cpp",
-    version = "0.1.0",
-)
+# Copy the mounted shared feature files, start the cucumber-cpp wire server, then run the
+# Ruby Cucumber driver against it.
+set -euo pipefail
 
-bazel_dep(name = "rules_cc", version = "0.2.19")
-bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
-bazel_dep(name = "rules_rust", version = "0.70.0")
+if [ -d /app/features ]; then
+    cp -f /app/features/*.feature /workspace/bdd/cpp/features/ 2>/dev/null || true
+fi
 
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-rust.toolchain(
-    edition = "2024",
-    versions = ["1.96.0"],
-)
-use_repo(rust, "rust_toolchains")
+bdd_wire_server &
+server_pid=$!
+sleep 2
 
-rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
-rust_host_tools.host_tools(
-    name = "rs_host_tools",
-    version = "1.96.0",
-)
-use_repo(rust_host_tools, "rs_host_tools")
+cd /workspace/bdd/cpp || exit 1
+
+set +e
+bundle exec cucumber
+status=$?
+set -e
+
+kill "$server_pid" 2>/dev/null || true
+exit "$status"
