@@ -42,8 +42,9 @@ use configs::http::HttpConfig;
 use consensus::{CLIENTS_TABLE_MAX, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::codes::{
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+    GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::consensus::{
     Command2, EvictionHeader, EvictionReason, HEADER_SIZE, result_code, result_section_len,
@@ -62,6 +63,7 @@ use iggy_binary_protocol::requests::messages::{
 };
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
+    GetPersonalAccessTokensRequest,
 };
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
@@ -81,7 +83,9 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
-use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::{
+    GetPersonalAccessTokensResponse, RawPersonalAccessTokenResponse,
+};
 use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
 use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
@@ -114,16 +118,16 @@ use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::wire_conversions::{
     clients_from_wire, consumer_groups_from_wire, consumer_to_wire, identifier_to_wire,
-    partitioning_to_wire, permissions_to_wire, streams_from_wire, topics_from_wire,
-    users_from_wire,
+    partitioning_to_wire, permissions_to_wire, personal_access_tokens_from_wire, streams_from_wire,
+    topics_from_wire, users_from_wire,
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
     ClusterNodeStatus, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo,
-    Identifier, IdentityInfo, IggyError, IggyMessageView, IggyTimestamp, PollMessages,
-    PolledMessages, RESYNC_REQUIRED_PARTITION_SENTINEL, RawPersonalAccessToken, SendMessages,
-    Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints, UserInfo,
-    UserInfoDetails, Validatable,
+    Identifier, IdentityInfo, IggyError, IggyMessageView, IggyTimestamp, PersonalAccessTokenInfo,
+    PollMessages, PolledMessages, RESYNC_REQUIRED_PARTITION_SENTINEL, RawPersonalAccessToken,
+    SendMessages, Stats, Stream, StreamDetails, TokenInfo, Topic, TopicDetails, TransportEndpoints,
+    UserInfo, UserInfoDetails, Validatable,
 };
 use message_bus::{BusMessage, InstanceToken, client_listener};
 use metadata::impls::metadata::StreamsFrontend;
@@ -1083,9 +1087,7 @@ fn router(state: HttpState, max_request_size: usize) -> Router {
             "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
             get(get_cg).delete(delete_cg),
         )
-        // TODO(hubcio): GET /personal-access-tokens (list) deferred - needs a server-ng STM
-        // list accessor (PATs sit behind the "Never iterate" apply invariant; TCP-ng lacks it too).
-        .route("/personal-access-tokens", post(create_pat))
+        .route("/personal-access-tokens", get(get_pats).post(create_pat))
         .route("/personal-access-tokens/{name}", delete(delete_pat))
         .route("/stats", get(get_stats))
         .route("/cluster/metadata", get(get_cluster_metadata))
@@ -2193,6 +2195,30 @@ async fn update_permissions(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /personal-access-tokens`: list the caller's own tokens (name +
+/// expiry, never the secrets) as the same `Vec<PersonalAccessTokenInfo>` JSON
+/// the legacy server returns. Self-scoped, so authentication is the whole
+/// rule - no permissioner check, matching legacy parity. A consensus-free
+/// local STM read via [`read_local`].
+async fn get_pats(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Query(query): Query<ConsistencyQuery>,
+) -> Result<Json<Vec<PersonalAccessTokenInfo>>, ReadError> {
+    let body = GetPersonalAccessTokensRequest.to_bytes();
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_PERSONAL_ACCESS_TOKENS_CODE,
+        &body,
+        |_, _| Ok(()),
+    )?;
+    let response = GetPersonalAccessTokensResponse::decode_from(&bytes)
+        .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
+    Ok(Json(personal_access_tokens_from_wire(response)))
+}
+
 /// `POST /personal-access-tokens`: mint a personal access token for the caller
 /// and return its one-time raw secret as the same `{"token": ...}` JSON the
 /// legacy server returns, with HTTP 200.
@@ -2749,7 +2775,9 @@ fn read_local(
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
     authorize_read(state, identity, consistency, rule)?;
-    match build_non_replicated_response(&state.shard, code, body).map_err(ReadError::Rejected)? {
+    match build_non_replicated_response(&state.shard, code, body, Some(identity.user_id))
+        .map_err(ReadError::Rejected)?
+    {
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
     }

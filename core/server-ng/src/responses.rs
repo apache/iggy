@@ -18,8 +18,8 @@
 //! Wire-response builders for the non-replicated read path.
 //!
 //! Assemble `get_me` / `get_clients` / `get_stream(s)` / `get_topic(s)` /
-//! `get_user(s)` / stats / cluster-metadata responses from per-shard
-//! session state and the metadata state machine, plus the
+//! `get_user(s)` / `get_personal_access_tokens` / stats / cluster-metadata
+//! responses from per-shard session state and the metadata state machine, plus the
 //! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
 //! resolvers.
 
@@ -29,9 +29,9 @@ use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::{BufMut, Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE,
-    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
-    GET_USERS_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
@@ -43,6 +43,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
+use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
@@ -51,7 +52,9 @@ use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
-use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::{
+    GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
+};
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -71,7 +74,7 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server::binary::dispatch::wire_id_to_identifier;
@@ -81,6 +84,7 @@ use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -372,10 +376,14 @@ pub(crate) fn resolve_partition_namespace(
         .ok_or(IggyError::InvalidIdentifier)
 }
 
+/// `user_id` is the authenticated caller, used only by the identity-scoped
+/// reads (currently the PAT list); every other arm ignores it. Authorization
+/// stays with the per-transport gates that run before this builder.
 pub(crate) fn build_non_replicated_response(
     shard: &Rc<ServerNgShard>,
     code: u32,
     body: &[u8],
+    user_id: Option<u32>,
 ) -> Result<NonReplicatedResponse, IggyError> {
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
@@ -426,6 +434,17 @@ pub(crate) fn build_non_replicated_response(
                     NonReplicatedResponse::Bytes(response.to_bytes())
                 })
             })
+        }
+        GET_PERSONAL_ACCESS_TOKENS_CODE => {
+            let _ = GetPersonalAccessTokensRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            // Caller-scoped: both transport gates reject unauthenticated
+            // callers before this builder runs, so a missing id is a gate
+            // bug; fail closed rather than serve another scope.
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            Ok(NonReplicatedResponse::Bytes(
+                build_get_personal_access_tokens_response(shard, user_id)?.to_bytes(),
+            ))
         }
         GET_CONSUMER_GROUP_CODE => {
             let request = GetConsumerGroupRequest::decode_from(body)
@@ -630,6 +649,39 @@ fn build_get_user_response(
                 .map(|p| iggy_common::wire_conversions::permissions_to_wire(p)),
         }))
     })
+}
+
+/// The caller's own tokens, never another user's - the one identity-scoped
+/// read in this module, which is why [`build_non_replicated_response`]
+/// carries a `user_id`.
+fn build_get_personal_access_tokens_response(
+    shard: &Rc<ServerNgShard>,
+    user_id: u32,
+) -> Result<GetPersonalAccessTokensResponse, IggyError> {
+    let tokens = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users.personal_access_tokens_of(user_id));
+    personal_access_tokens_response(tokens)
+}
+
+fn personal_access_tokens_response(
+    tokens: Vec<(Arc<str>, Option<IggyTimestamp>)>,
+) -> Result<GetPersonalAccessTokensResponse, IggyError> {
+    let tokens = tokens
+        .into_iter()
+        .map(|(name, expiry_at)| {
+            Ok(PersonalAccessTokenResponse {
+                name: WireName::new(name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+                // 0 is the wire encoding for a never-expiring token, matching
+                // the legacy handler and the SDK-side decode.
+                expiry_at: expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
+            })
+        })
+        .collect::<Result<Vec<_>, IggyError>>()?;
+    Ok(GetPersonalAccessTokensResponse { tokens })
 }
 
 fn build_get_topic_response(
@@ -1181,5 +1233,30 @@ mod tests {
         let reply =
             build_raw_pat_reply(&pat_request_header(), success, None).expect("pass-through");
         assert_eq!(reply.as_slice(), original.as_slice());
+    }
+
+    #[test]
+    fn personal_access_tokens_response_preserves_order_and_encodes_never_as_zero() {
+        let expiry = IggyTimestamp::from(123_456u64);
+        let tokens: Vec<(Arc<str>, Option<IggyTimestamp>)> = vec![
+            (Arc::from("alpha"), Some(expiry)),
+            (Arc::from("zeta"), None),
+        ];
+
+        let response = personal_access_tokens_response(tokens).expect("mapping succeeds");
+
+        assert_eq!(response.tokens.len(), 2);
+        assert_eq!(response.tokens[0].name.as_str(), "alpha");
+        assert_eq!(response.tokens[0].expiry_at, expiry.as_micros());
+        assert_eq!(response.tokens[1].name.as_str(), "zeta");
+        assert_eq!(response.tokens[1].expiry_at, 0);
+    }
+
+    #[test]
+    fn personal_access_tokens_response_encodes_empty_list_as_empty_body() {
+        let response = personal_access_tokens_response(Vec::new()).expect("mapping succeeds");
+        // An empty body is the wire shape the SDK decodes as "no tokens"; it
+        // must stay `Bytes` (not the not-found `Empty` variant) end to end.
+        assert!(response.to_bytes().is_empty());
     }
 }

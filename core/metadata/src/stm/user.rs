@@ -165,6 +165,34 @@ impl UsersInner {
             .map(|(_, user_id, name)| (*user_id, Arc::clone(name)))
             .collect()
     }
+
+    /// Collect `(name, expiry_at)` for every live personal access token of
+    /// one user, sorted by name.
+    ///
+    /// Read-only accessor for the non-replicated list path (the caller lists
+    /// its own tokens). The backing per-user map is an `AHashMap`, whose
+    /// iteration order is seeded per process, so the collected list is
+    /// sorted before it is returned. Never lift this iteration into an apply
+    /// handler: apply must stay deterministic across replicas (see the
+    /// invariant on `personal_access_token_index`).
+    #[must_use]
+    pub fn personal_access_tokens_of(
+        &self,
+        user_id: UserId,
+    ) -> Vec<(Arc<str>, Option<IggyTimestamp>)> {
+        let mut tokens: Vec<_> = self
+            .personal_access_tokens
+            .get(&user_id)
+            .map(|user_tokens| {
+                user_tokens
+                    .values()
+                    .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
+        tokens
+    }
 }
 
 impl Users {
@@ -968,6 +996,42 @@ mod tests {
         assert_eq!(
             expired,
             vec![(5, Arc::from("expired")), (9, Arc::from("stale"))]
+        );
+    }
+
+    #[test]
+    fn personal_access_tokens_of_lists_only_callers_sorted_by_name() {
+        let mut users = UsersInner::new();
+        // Insertion order deliberately not name order; a token for user 9
+        // proves the listing is caller-scoped.
+        for (user_id, name, expiry, fill) in [
+            (5u32, "zeta", 0u64, b'a'),
+            (5u32, "alpha", 1, b'b'),
+            (9u32, "other", 0, b'c'),
+        ] {
+            CreatePersonalAccessTokenRequest {
+                user_id,
+                name: WireName::new(name).unwrap(),
+                expiry,
+                token_hash: [fill; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, IggyTimestamp::zero());
+        }
+
+        let tokens = users.personal_access_tokens_of(5);
+        let names: Vec<&str> = tokens.iter().map(|(name, _)| name.as_ref()).collect();
+        assert_eq!(names, ["alpha", "zeta"], "own tokens only, sorted by name");
+        assert!(
+            tokens[0].1.is_some(),
+            "expiring token must carry its expiry_at"
+        );
+        assert!(
+            tokens[1].1.is_none(),
+            "never-expiring token must carry no expiry_at"
+        );
+        assert!(
+            users.personal_access_tokens_of(42).is_empty(),
+            "a user without tokens lists empty"
         );
     }
 

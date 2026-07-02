@@ -49,9 +49,10 @@ use consensus::{
 };
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_STATS_CODE,
-    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
-    GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -971,7 +972,7 @@ async fn handle_default_non_replicated(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    match build_non_replicated_response(shard, code, request_body(request)) {
+    match build_non_replicated_response(shard, code, request_body(request), user_id) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
             let reply = response.into_reply(
@@ -1519,7 +1520,8 @@ fn authorize_partition_read(
 /// miss, which falls through to the builder's own not-found reply so the legacy
 /// notfound-before-permission ordering holds. `Err` denies with that code.
 /// Unscoped rules gate directly; identifier-scoped rules resolve (stream[,
-/// topic]) against committed state first. `GET_CLUSTER_METADATA` is auth-only
+/// topic]) against committed state first. The PAT list is self-scoped, so
+/// authentication is its whole rule. `GET_CLUSTER_METADATA` is auth-only
 /// (bootstrap / leader discovery) and every other code the builder serves is
 /// ungated here.
 fn authorize_default_read(
@@ -1532,6 +1534,9 @@ fn authorize_default_read(
         GET_STATS_CODE => authorize_uid(shard, user_id, Permissioner::get_stats),
         GET_USERS_CODE => authorize_uid(shard, user_id, Permissioner::get_users),
         GET_USER_CODE => authorize_uid(shard, user_id, Permissioner::get_user),
+        // Self-scoped: lists only the caller's own tokens, so there is no
+        // permissioner rule to run (legacy runs none either).
+        GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
         GET_STREAM_CODE => {
             let Ok(request) = GetStreamRequest::decode_from(body) else {

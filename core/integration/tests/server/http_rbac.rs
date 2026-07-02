@@ -946,6 +946,98 @@ async fn given_non_root_tcp_session_when_polling_denied_should_surface_typed_una
     );
 }
 
+// === Case family 9: PAT list is caller-scoped ================================
+
+/// Listing is self-scoped like the other PAT ops: any authenticated user sees
+/// exactly their own tokens (name + expiry, name-sorted), never another
+/// user's. Asserted over HTTP and via the SDK on TCP, which share the read
+/// builder.
+#[iggy_harness]
+async fn given_two_users_with_tokens_when_listing_should_return_only_callers(
+    harness: &TestHarness,
+) {
+    let root = Client::login_root(harness).await;
+    root.create_user("alice", "alice-pass", no_permissions())
+        .await;
+    root.create_user("bob", "bob-pass", no_permissions()).await;
+    let alice = root.login("alice", "alice-pass").await;
+    let bob = root.login("bob", "bob-pass").await;
+
+    // Created in reverse name order to prove the listing sorts by name.
+    for name in ["alice-zeta", "alice-alpha"] {
+        let created = alice
+            .post_json(
+                "/personal-access-tokens",
+                &json!({ "name": name, "expiry": 0 }),
+            )
+            .await;
+        assert_eq!(
+            created.status(),
+            StatusCode::OK,
+            "alice create PAT {name} must be 200"
+        );
+    }
+    let created = bob
+        .post_json(
+            "/personal-access-tokens",
+            &json!({ "name": "bob-pat", "expiry": 0 }),
+        )
+        .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "bob create PAT must be 200"
+    );
+
+    assert_eq!(
+        pat_names(alice.get("/personal-access-tokens").await).await,
+        ["alice-alpha", "alice-zeta"],
+        "alice must list exactly her own tokens, name-sorted"
+    );
+    assert_eq!(
+        pat_names(bob.get("/personal-access-tokens").await).await,
+        ["bob-pat"],
+        "bob must never see alice's tokens"
+    );
+
+    // Same caller-scoped view over native TCP through the SDK.
+    let client = harness.tcp_new_client().await.expect("tcp client");
+    client
+        .login_user("alice", "alice-pass")
+        .await
+        .expect("alice tcp login");
+    let tokens = client
+        .get_personal_access_tokens()
+        .await
+        .expect("tcp PAT list");
+    let tcp_names: Vec<&str> = tokens.iter().map(|token| token.name.as_str()).collect();
+    assert_eq!(
+        tcp_names,
+        ["alice-alpha", "alice-zeta"],
+        "TCP list must match the HTTP caller-scoped view"
+    );
+}
+
+/// Decode a PAT-list response body into its token names, asserting 200 first.
+async fn pat_names(response: Response) -> Vec<String> {
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "PAT list must be 200 for an authenticated caller"
+    );
+    let body: Value = response.json().await.expect("PAT list body must be JSON");
+    body.as_array()
+        .expect("PAT list must be a JSON array")
+        .iter()
+        .map(|token| {
+            token["name"]
+                .as_str()
+                .expect("every token must carry a name")
+                .to_owned()
+        })
+        .collect()
+}
+
 /// The current-password check gates a self-service rotation: a wrong current
 /// password is rejected pre-consensus as 400 `InvalidCredentials` (never
 /// reaching the replicated apply), and only the correct one rotates the
