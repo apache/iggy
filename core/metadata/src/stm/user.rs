@@ -139,6 +139,15 @@ impl UsersInner {
         }
     }
 
+    /// Stored password hash of the user named by `identifier`, `None` when
+    /// the user does not resolve.
+    #[must_use]
+    pub fn password_hash_of(&self, identifier: &WireIdentifier) -> Option<Arc<str>> {
+        self.resolve_user_id(identifier)
+            .and_then(|user_id| self.items.get(user_id))
+            .map(|user| Arc::clone(&user.password_hash))
+    }
+
     /// Collect `(user_id, name)` for every expired personal access token.
     ///
     /// Walks the expiry-ordered `personal_access_token_expiry_index`,

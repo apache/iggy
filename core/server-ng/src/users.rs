@@ -38,13 +38,12 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
-use iggy_binary_protocol::{Operation, RequestHeader, WireIdentifier};
+use iggy_binary_protocol::{Operation, RequestHeader};
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
 use server::streaming::utils::crypto;
 use server_common::Message;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// Rewrite a raw wire password request before replication.
 ///
@@ -70,7 +69,12 @@ pub(crate) fn maybe_rewrite_user_password_request(
         Operation::ChangePassword => {
             let mut wire =
                 ChangePasswordRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            let stored_hash = resolve_password_hash(shard, &wire.user_id);
+            let stored_hash = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.password_hash_of(&wire.user_id));
             verify_and_rewrite_change_password(&mut wire, stored_hash.as_deref())?
         }
         _ => return Ok(request),
@@ -103,27 +107,10 @@ fn verify_and_rewrite_change_password(
     Ok(wire.to_bytes())
 }
 
-/// Stored Argon2 hash of the user named by `user_id`, read from the local
-/// metadata STM (the same replica login verifies against). `None` when the
-/// user does not resolve.
-fn resolve_password_hash(shard: &Rc<ServerNgShard>, user_id: &WireIdentifier) -> Option<Arc<str>> {
-    shard.plane.metadata().mux_stm.users().read(|users| {
-        let resolved = match user_id {
-            WireIdentifier::Numeric(id) => {
-                let id = *id as usize;
-                users.items.contains(id).then_some(id)
-            }
-            WireIdentifier::String(name) => users.index.get(name.as_str()).map(|&id| id as usize),
-        };
-        resolved
-            .and_then(|id| users.items.get(id))
-            .map(|user| Arc::clone(&user.password_hash))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::WireIdentifier;
 
     const CURRENT_PASSWORD: &str = "current-password";
     const NEW_PASSWORD: &str = "brand-new-password";
