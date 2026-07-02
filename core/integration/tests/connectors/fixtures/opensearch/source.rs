@@ -1,21 +1,19 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_INDEX,
@@ -36,8 +34,7 @@ const TEST_INDEX_PREFIX: &str = "test_documents";
 pub struct OpenSearchSourceFixture {
     container: OpenSearchContainer,
     http_client: HttpClient,
-    // Unique per fixture so tests sharing one container never collide on the
-    // same index. The connector reads from here via ENV_SOURCE_INDEX.
+    // Unique per fixture so parallel tests never collide on the same index.
     index: String,
 }
 
@@ -67,7 +64,10 @@ impl OpenSearchSourceFixture {
         name: &str,
         value: i32,
     ) -> Result<(), TestBinaryError> {
-        let timestamp = IggyTimestamp::now().to_rfc3339_string();
+        let timestamp = IggyTimestamp::from(
+            IggyTimestamp::now().as_micros() + u64::from(doc_id as u32) * 1_000,
+        )
+        .to_rfc3339_string();
         let document = serde_json::json!({
             "id": doc_id,
             "name": name,
@@ -93,6 +93,27 @@ impl OpenSearchSourceFixture {
 
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
         OpenSearchOps::refresh_index(self, &self.index).await
+    }
+
+    pub async fn insert_typed_sample_document(&self) -> Result<(), TestBinaryError> {
+        let timestamp = IggyTimestamp::now().to_rfc3339_string();
+        let document = serde_json::json!({
+            "id": 1,
+            "title": "OpenSearch typed field coverage",
+            "status": "active",
+            "count": 9_223_372_036_854_775_807_i64,
+            "score": 98.6_f32,
+            "ratio": 0.125_f64,
+            "active": true,
+            "timestamp": timestamp,
+            "client_ip": "192.168.1.42",
+            "location": { "lat": 40.12, "lon": -71.34 },
+            "tags": ["integration", "opensearch"],
+            "optional_note": null
+        });
+        self.index_document(&self.index, "typed-1", &document)
+            .await?;
+        self.refresh_index().await
     }
 }
 
@@ -139,6 +160,41 @@ impl TestFixture for OpenSearchSourceFixture {
     }
 }
 
+/// OpenSearch source fixture with typed-field index mapping.
+pub struct OpenSearchSourceTypedFieldsFixture {
+    inner: OpenSearchSourceFixture,
+}
+
+impl std::ops::Deref for OpenSearchSourceTypedFieldsFixture {
+    type Target = OpenSearchSourceFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl OpenSearchOps for OpenSearchSourceTypedFieldsFixture {
+    fn container(&self) -> &OpenSearchContainer {
+        &self.inner.container
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        &self.inner.http_client
+    }
+}
+
+#[async_trait]
+impl TestFixture for OpenSearchSourceTypedFieldsFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = OpenSearchSourceFixture::setup().await?;
+        inner.create_typed_fields_index(&inner.index).await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.inner.connectors_runtime_envs()
+    }
+}
+
 /// OpenSearch source fixture with pre-created index.
 pub struct OpenSearchSourcePreCreatedFixture {
     inner: OpenSearchSourceFixture,
@@ -173,6 +229,44 @@ impl TestFixture for OpenSearchSourcePreCreatedFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         self.inner.connectors_runtime_envs()
+    }
+}
+
+/// OpenSearch source fixture with pre-created index and a small `batch_size` for
+/// pagination integration tests.
+pub struct OpenSearchSourceSmallBatchFixture {
+    inner: OpenSearchSourceFixture,
+}
+
+impl std::ops::Deref for OpenSearchSourceSmallBatchFixture {
+    type Target = OpenSearchSourceFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl OpenSearchOps for OpenSearchSourceSmallBatchFixture {
+    fn container(&self) -> &OpenSearchContainer {
+        &self.inner.container
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        &self.inner.http_client
+    }
+}
+
+#[async_trait]
+impl TestFixture for OpenSearchSourceSmallBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = OpenSearchSourceFixture::setup().await?;
+        inner.setup_index().await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SOURCE_BATCH_SIZE.to_string(), "2".to_string());
+        envs
     }
 }
 

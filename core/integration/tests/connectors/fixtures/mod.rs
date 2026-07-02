@@ -68,7 +68,11 @@ pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
-pub use opensearch::{OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture};
+pub use opensearch::{
+    OpenSearchSourceCircuitBreakerFixture, OpenSearchSourceMissingIndexFixture,
+    OpenSearchSourcePreCreatedFixture, OpenSearchSourceSmallBatchFixture,
+    OpenSearchSourceTransientErrorFixture, OpenSearchSourceTypedFieldsFixture,
+};
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
     PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,

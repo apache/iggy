@@ -1,61 +1,37 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use crate::{OpenSearchSource, StateConfig};
 use async_trait::async_trait;
-use iggy_common::{ChronoDuration, DateTime, Utc};
+use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::Error;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::io::ErrorKind;
 use std::sync::Arc;
-use tokio::time::{Duration, interval};
-use tracing::{error, info, warn};
+use tracing::info;
+
+pub(crate) const SOURCE_STATE_VERSION: u32 = 1;
 
 impl OpenSearchSource {
-    async fn get_state(&self) -> Result<Option<SourceState>, Error> {
-        if self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
-            Ok(Some(self.internal_state_to_source_state().await?))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(super) async fn save_state(&self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
+        let Some(state_config) = self.config.state.as_ref().filter(|s| s.enabled) else {
             return Ok(());
-        }
-
-        let storage = self
-            .create_state_storage()
-            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
+        };
+        let storage = create_state_storage(state_config)?;
 
         let source_state = self.internal_state_to_source_state().await?;
         storage.save_source_state(&source_state).await?;
@@ -68,28 +44,26 @@ impl OpenSearchSource {
     }
 
     pub(super) async fn load_state(&mut self) -> Result<(), Error> {
-        if !self
-            .config
-            .state
-            .as_ref()
-            .map(|s| s.enabled)
-            .unwrap_or(false)
-        {
+        let Some(state_config) = self.config.state.as_ref().filter(|s| s.enabled) else {
             return Ok(());
-        }
-
-        let storage = self
-            .create_state_storage()
-            .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
+        };
+        let storage = create_state_storage(state_config)?;
 
         let state_id = self.get_state_id();
         if let Some(source_state) = storage.load_source_state(&state_id).await? {
             self.source_state_to_internal_state(source_state).await?;
 
-            let state = self.state.lock().await;
+            let (last_poll_timestamp, total_documents_published, poll_count) = {
+                let state = self.state.lock().await;
+                (
+                    state.last_poll_timestamp,
+                    state.total_documents_published,
+                    state.poll_count,
+                )
+            };
             info!(
                 "Loaded state for OpenSearch source connector with ID: {} - last poll: {:?}, total docs: {}, polls: {}",
-                self.id, state.last_poll_timestamp, state.total_documents_fetched, state.poll_count
+                self.id, last_poll_timestamp, total_documents_published, poll_count
             );
         } else {
             info!(
@@ -102,195 +76,50 @@ impl OpenSearchSource {
     }
 }
 
-/// State manager for OpenSearch source connector
-pub struct StateManager {
-    storage: Arc<dyn StateStorage>,
-    config: StateConfig,
-    auto_save_interval: Option<Duration>,
-}
-
-impl StateManager {
-    pub fn new(config: StateConfig) -> Result<Self, Error> {
-        let storage = Self::create_storage(&config)?;
-        let auto_save_interval = config
-            .auto_save_interval
-            .as_deref()
-            .and_then(|interval_str| {
-                humantime::Duration::from_str(interval_str)
-                    .ok()
-                    .map(|d| Duration::from_secs(d.as_secs()))
-            });
-
-        Ok(Self {
-            storage,
-            config,
-            auto_save_interval,
-        })
-    }
-
-    fn create_storage(config: &StateConfig) -> Result<Arc<dyn StateStorage>, Error> {
-        match config.storage_type.as_deref() {
-            Some("file") | None => {
-                let base_path = config
-                    .storage_config
-                    .as_ref()
-                    .and_then(|c| c.get("base_path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("./connector_states");
-
-                Ok(Arc::new(FileStateStorage::new(base_path)))
-            }
-            Some("opensearch") => {
-                // TODO: Implement OpenSearch-based state storage
-                warn!("OpenSearch state storage not yet implemented, falling back to file storage");
-                Ok(Arc::new(FileStateStorage::new("./connector_states")))
-            }
-            Some(storage_type) => {
-                warn!(
-                    "Unknown state storage type: {}, falling back to file storage",
-                    storage_type
-                );
-                Ok(Arc::new(FileStateStorage::new("./connector_states")))
-            }
-        }
-    }
-
-    /// Start auto-save background task
-    pub async fn start_auto_save(&self, connector: Arc<OpenSearchSource>) {
-        let interval_duration = self
-            .auto_save_interval
-            .unwrap_or_else(|| Duration::from_secs(60));
-        let storage = self.storage.clone();
-        let state_id = self.config.state_id.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(interval_duration);
-            loop {
-                interval.tick().await;
-                if let Ok(Some(state)) = connector.get_state().await {
-                    if let Err(e) = storage.save_source_state(&state).await {
-                        error!(
-                            "Failed to auto-save state for {}: {}",
-                            state_id.as_deref().unwrap_or("unknown"),
-                            e
-                        );
-                    } else {
-                        info!(
-                            "Auto-saved state for {}",
-                            state_id.as_deref().unwrap_or("unknown")
-                        );
-                    }
-                }
-            }
-        });
-    }
-
-    /// Get state statistics
-    pub async fn get_state_stats(&self) -> Result<StateStats, Error> {
-        let state_ids = self.storage.list_states().await?;
-        let mut stats = StateStats {
-            total_states: state_ids.len(),
-            states: Vec::new(),
-        };
-
-        for state_id in state_ids {
-            if let Some(state) = self.storage.load_source_state(&state_id).await? {
-                stats.states.push(StateInfo {
-                    id: state.id,
-                    last_updated: state.last_updated,
-                    version: state.version,
-                    connector_type: state
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("connector_type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                });
-            }
-        }
-
-        Ok(stats)
-    }
-
-    /// Clean up old states
-    pub async fn cleanup_old_states(&self, older_than_days: u32) -> Result<usize, Error> {
-        let state_ids = self.storage.list_states().await?;
-        let cutoff_time = Utc::now() - ChronoDuration::days(older_than_days as i64);
-        let mut deleted_count = 0;
-
-        for state_id in state_ids {
-            if let Some(state) = self.storage.load_source_state(&state_id).await?
-                && state.last_updated < cutoff_time
-            {
-                if let Err(e) = self.storage.delete_state(&state_id).await {
-                    warn!("Failed to delete old state {}: {}", state_id, e);
-                } else {
-                    deleted_count += 1;
-                    info!("Deleted old state: {}", state_id);
-                }
-            }
-        }
-
-        Ok(deleted_count)
-    }
-
-    pub fn auto_save_interval(&self) -> Option<Duration> {
-        self.auto_save_interval
+pub(crate) fn validate_state_storage_config(config: &StateConfig) -> Result<(), Error> {
+    match config.storage_type.as_deref() {
+        Some("file") | None => Ok(()),
+        Some(storage_type) => Err(Error::InvalidConfigValue(format!(
+            "state storage_type {storage_type:?} is not supported; only \"file\" is implemented"
+        ))),
     }
 }
 
-#[derive(Debug)]
-pub struct StateStats {
-    pub total_states: usize,
-    pub states: Vec<StateInfo>,
+pub(crate) fn create_state_storage(config: &StateConfig) -> Result<Arc<dyn StateStorage>, Error> {
+    let base_path = config
+        .storage_config
+        .as_ref()
+        .and_then(|c| c.get("base_path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("./connector_states");
+
+    Ok(Arc::new(FileStateStorage::new(base_path)))
 }
 
-#[derive(Debug)]
-pub struct StateInfo {
-    pub id: String,
-    pub last_updated: DateTime<Utc>,
-    pub version: u32,
-    pub connector_type: String,
-}
-
-/// State management for source connectors
+/// Optional file-backed mirror of connector state. Runtime `ConnectorState` msgpack is authoritative.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceState {
-    /// Unique identifier for this state
+pub(crate) struct SourceState {
     pub id: String,
-    /// Timestamp when this state was last updated
     pub last_updated: DateTime<Utc>,
-    /// Version of the state format
+    #[serde(default)]
     pub version: u32,
-    /// Generic state data as JSON
     pub data: serde_json::Value,
-    /// Optional metadata
     pub metadata: Option<serde_json::Value>,
 }
 
-/// State storage backend trait
 #[async_trait]
-pub trait StateStorage: Send + Sync {
-    /// Save source state to storage
+pub(crate) trait StateStorage: Send + Sync {
     async fn save_source_state(&self, state: &SourceState) -> Result<(), Error>;
 
-    /// Load source state from storage
     async fn load_source_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
-
-    /// Delete state from storage
-    async fn delete_state(&self, id: &str) -> Result<(), Error>;
-
-    /// List all state IDs
-    async fn list_states(&self) -> Result<Vec<String>, Error>;
 }
 
-/// File-based state storage implementation
-pub struct FileStateStorage {
+pub(crate) struct FileStateStorage {
     base_path: std::path::PathBuf,
 }
 
 impl FileStateStorage {
-    pub fn new<P: AsRef<std::path::Path>>(base_path: P) -> Self {
+    pub(crate) fn new<P: AsRef<std::path::Path>>(base_path: P) -> Self {
         Self {
             base_path: base_path.as_ref().to_path_buf(),
         }
@@ -304,22 +133,54 @@ impl FileStateStorage {
 #[async_trait]
 impl StateStorage for FileStateStorage {
     async fn save_source_state(&self, state: &SourceState) -> Result<(), Error> {
-        use tokio::fs;
+        use tokio::fs::{self, OpenOptions};
+        use tokio::io::AsyncWriteExt;
 
-        // Ensure directory exists
-        if let Some(parent) = self.base_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
-        }
+        fs::create_dir_all(&self.base_path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
 
         let path = self.get_state_path(&state.id);
-        let json = serde_json::to_string_pretty(state)
+        // PID in the suffix avoids races when two processes write the same state_id.
+        let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let json = serde_json::to_string(state)
             .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
 
-        fs::write(path, json)
+        let mut tmp_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to write state file: {e}")))?;
+            .map_err(|e| Error::Storage(format!("Failed to open state temp file: {e}")))?;
+        if let Err(e) = tmp_file.write_all(json.as_bytes()).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!(
+                "Failed to write state temp file: {e}"
+            )));
+        }
+        if let Err(e) = tmp_file.sync_all().await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!(
+                "Failed to sync state temp file: {e}"
+            )));
+        }
+        drop(tmp_file);
+
+        if let Err(e) = fs::rename(&tmp_path, &path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(Error::Storage(format!("Failed to rename state file: {e}")));
+        }
+
+        // Flush the parent directory entry so the rename is durable on crash.
+        if let Some(parent) = path.parent() {
+            let dir = tokio::fs::File::open(parent)
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to open state directory: {e}")))?;
+            dir.sync_all()
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to sync state directory: {e}")))?;
+        }
 
         Ok(())
     }
@@ -328,13 +189,15 @@ impl StateStorage for FileStateStorage {
         use tokio::fs;
 
         let path = self.get_state_path(id);
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(path)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to read state file: {e}")))?;
+        let content = match fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(Error::Storage(format!(
+                    "Failed to read state file: {error}"
+                )));
+            }
+        };
 
         let state: SourceState = serde_json::from_str(&content).map_err(|e| {
             Error::Serialization(format!("Failed to deserialize source state: {e}"))
@@ -342,47 +205,110 @@ impl StateStorage for FileStateStorage {
 
         Ok(Some(state))
     }
+}
 
-    async fn delete_state(&self, id: &str) -> Result<(), Error> {
-        use tokio::fs;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::Utc;
+    use serde_json::json;
+    use tempfile::TempDir;
 
-        let path = self.get_state_path(id);
-        if path.exists() {
-            fs::remove_file(path)
-                .await
-                .map_err(|e| Error::Storage(format!("Failed to delete state file: {e}")))?;
+    fn file_state_config(base_path: &str) -> StateConfig {
+        StateConfig {
+            enabled: true,
+            storage_type: Some("file".to_string()),
+            storage_config: Some(json!({ "base_path": base_path })),
+            state_id: Some("opensearch_unit_state".to_string()),
         }
-
-        Ok(())
     }
 
-    async fn list_states(&self) -> Result<Vec<String>, Error> {
-        use tokio::fs;
+    #[test]
+    fn given_unknown_storage_type_should_fail() {
+        let config = StateConfig {
+            enabled: true,
+            storage_type: Some("s3".to_string()),
+            storage_config: None,
+            state_id: None,
+        };
+        let error = validate_state_storage_config(&config);
+        assert!(matches!(error, Err(Error::InvalidConfigValue(_))));
+    }
 
-        let mut states = Vec::new();
+    #[test]
+    fn given_file_storage_should_save_and_load_source_state() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().expect("tempdir");
+            let config = file_state_config(&temp_dir.path().to_string_lossy());
+            let storage = create_state_storage(&config).expect("file storage");
 
-        if !self.base_path.exists() {
-            return Ok(states);
-        }
+            let source_state = SourceState {
+                id: "opensearch_unit_state".to_string(),
+                last_updated: Utc::now(),
+                version: SOURCE_STATE_VERSION,
+                data: json!({
+                    "total_documents_published": 7,
+                    "poll_count": 2,
+                    "search_after": ["2024-01-01T00:00:00Z", "doc-7"]
+                }),
+                metadata: None,
+            };
 
-        let mut entries = fs::read_dir(&self.base_path)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to read state directory: {e}")))?;
+            storage
+                .save_source_state(&source_state)
+                .await
+                .expect("save state");
+            let loaded = storage
+                .load_source_state("opensearch_unit_state")
+                .await
+                .expect("load state")
+                .expect("state file should exist");
+            assert_eq!(loaded.data["total_documents_published"], 7);
+            assert_eq!(loaded.data["poll_count"], 2);
+        });
+    }
 
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {e}")))?
-        {
-            if let Some(extension) = entry.path().extension()
-                && extension == "json"
-                && let Some(stem) = entry.path().file_stem()
-                && let Some(id) = stem.to_str()
-            {
-                states.push(id.to_string());
-            }
-        }
+    #[test]
+    fn given_missing_state_file_when_load_should_return_none() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let temp_dir = TempDir::new().expect("tempdir");
+            let config = file_state_config(&temp_dir.path().to_string_lossy());
+            let storage = create_state_storage(&config).expect("file storage");
+            let loaded = storage
+                .load_source_state("missing_state_id")
+                .await
+                .expect("load should not error");
+            assert!(loaded.is_none());
+        });
+    }
 
-        Ok(states)
+    #[test]
+    fn given_default_storage_type_should_use_file_backend() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let config = StateConfig {
+            enabled: true,
+            storage_type: None,
+            storage_config: Some(
+                json!({ "base_path": temp_dir.path().to_string_lossy().as_ref() }),
+            ),
+            state_id: None,
+        };
+        let storage = create_state_storage(&config).expect("default file storage");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let source_state = SourceState {
+                id: "opensearch_default".to_string(),
+                last_updated: Utc::now(),
+                version: SOURCE_STATE_VERSION,
+                data: json!({ "poll_count": 1 }),
+                metadata: None,
+            };
+            storage
+                .save_source_state(&source_state)
+                .await
+                .expect("save");
+        });
     }
 }

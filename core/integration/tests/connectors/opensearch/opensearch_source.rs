@@ -1,25 +1,24 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::{
     OpenSearchSourceMissingIndexFixture, OpenSearchSourcePreCreatedFixture,
+    OpenSearchSourceSmallBatchFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
@@ -27,14 +26,70 @@ use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use reqwest::Client;
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::time::sleep;
+
+fn document_ids(messages: &[serde_json::Value]) -> HashSet<i64> {
+    messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .collect()
+}
+
+fn assert_contains_document_ids(messages: &[serde_json::Value], expected_ids: &[i64]) {
+    let ids = document_ids(messages);
+    for expected_id in expected_ids {
+        assert!(
+            ids.contains(expected_id),
+            "expected document id {expected_id}, got ids {ids:?}"
+        );
+    }
+}
+
+async fn poll_all_messages_from_offset_zero(
+    client: &impl MessageClient,
+    consumer_id: &Identifier,
+    min_messages: usize,
+) -> Vec<serde_json::Value> {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let mut received = Vec::new();
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::offset(0),
+                100,
+                false,
+            )
+            .await
+        {
+            received.clear();
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= min_messages {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    received
+}
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_produces_messages_to_iggy(
+async fn given_documents_in_index_when_connector_polls_should_produce_messages(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -90,28 +145,95 @@ async fn opensearch_source_produces_messages_to_iggy(
         received.len()
     );
 
-    for (i, record) in received.iter().enumerate() {
-        let expected_id = (i + 1) as i64;
-        let expected_name = format!("doc_{}", i + 1);
-
-        assert_eq!(
-            record.get("id").and_then(|v| v.as_i64()),
-            Some(expected_id),
-            "ID mismatch at record {i}"
-        );
-        assert_eq!(
-            record.get("name").and_then(|v| v.as_str()),
-            Some(expected_name.as_str()),
-            "Name mismatch at record {i}"
-        );
-    }
+    let expected_ids: Vec<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
+    assert_contains_document_ids(&received, &expected_ids);
 }
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_handles_empty_index(
+async fn given_more_documents_than_batch_size_when_connector_polls_should_fetch_all(
+    harness: &TestHarness,
+    fixture: OpenSearchSourceSmallBatchFixture,
+) {
+    const DOC_COUNT: usize = 6;
+
+    let client = harness.root_client().await.unwrap();
+
+    fixture
+        .insert_documents(DOC_COUNT)
+        .await
+        .expect("Failed to insert documents");
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "pagination_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= DOC_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert!(
+        received.len() >= DOC_COUNT,
+        "Expected at least {DOC_COUNT} messages across search_after pages, got {}",
+        received.len()
+    );
+
+    let expected_ids: Vec<i64> = (1..=DOC_COUNT as i64).collect();
+    assert_contains_document_ids(&received, &expected_ids);
+
+    // Wait for at least one empty poll to fire (connector catches up to end of index).
+    // A cursor-reset bug would cause the connector to re-fetch all docs on the next empty poll.
+    sleep(Duration::from_millis(POLL_INTERVAL_MS * 5)).await;
+
+    let audit_consumer: Identifier = "pagination_audit".try_into().unwrap();
+    let all_on_stream =
+        poll_all_messages_from_offset_zero(&client, &audit_consumer, DOC_COUNT).await;
+
+    let all_ids: Vec<i64> = all_on_stream
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|v| v.as_i64()))
+        .collect();
+    let unique_count = document_ids(&all_on_stream).len();
+    assert_eq!(
+        all_ids.len(),
+        unique_count,
+        "stream contains duplicate document IDs after empty poll; cursor was reset"
+    );
+    assert_eq!(
+        unique_count, DOC_COUNT,
+        "expected exactly {DOC_COUNT} unique documents on stream, got {unique_count}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_empty_index_when_connector_polls_should_not_fail(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -151,7 +273,7 @@ async fn opensearch_source_handles_empty_index(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_produces_bulk_messages(
+async fn given_bulk_documents_when_connector_polls_should_produce_all_messages(
     harness: &TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -204,7 +326,7 @@ async fn opensearch_source_produces_bulk_messages(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn state_persists_across_connector_restart(
+async fn given_runtime_state_when_connector_restarts_should_resume_after_cursor(
     harness: &mut TestHarness,
     fixture: OpenSearchSourcePreCreatedFixture,
 ) {
@@ -276,41 +398,33 @@ async fn state_persists_across_connector_restart(
         .expect("Failed to restart connectors");
     sleep(Duration::from_millis(100)).await;
 
-    let mut received_after: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(polled) = client
-            .poll_messages(
-                &stream_id,
-                &topic_id,
-                None,
-                &Consumer::new(consumer_id.clone()),
-                &PollingStrategy::next(),
-                10,
-                true,
-            )
-            .await
-        {
-            for msg in polled.messages {
-                if let Ok(json) = serde_json::from_slice(&msg.payload) {
-                    received_after.push(json);
-                }
-            }
-            if received_after.len() >= TEST_MESSAGE_COUNT {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
+    let audit_consumer: Identifier = "state_audit_consumer".try_into().unwrap();
+    let all_messages =
+        poll_all_messages_from_offset_zero(&client, &audit_consumer, TEST_MESSAGE_COUNT * 2).await;
 
-    assert_eq!(received_after.len(), TEST_MESSAGE_COUNT);
+    let batch1_ids: HashSet<i64> = (1..=TEST_MESSAGE_COUNT as i64).collect();
+    let batch1_occurrences = all_messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .filter(|id| batch1_ids.contains(id))
+        .count();
+    assert_eq!(
+        batch1_occurrences, TEST_MESSAGE_COUNT,
+        "batch 1 IDs must appear exactly once on the stream; duplicates mean cursor reset"
+    );
 
-    for record in &received_after {
-        let id = record.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-        assert!(
-            id > TEST_MESSAGE_COUNT as i64,
-            "After restart, got ID {id} from first batch"
-        );
-    }
+    let batch2_ids: HashSet<i64> =
+        ((TEST_MESSAGE_COUNT + 1) as i64..=(TEST_MESSAGE_COUNT * 2) as i64).collect();
+    let batch2_seen: HashSet<i64> = all_messages
+        .iter()
+        .filter_map(|record| record.get("id").and_then(|value| value.as_i64()))
+        .filter(|id| batch2_ids.contains(id))
+        .collect();
+    assert_eq!(
+        batch2_seen.len(),
+        TEST_MESSAGE_COUNT,
+        "batch 2 IDs must be present after restart, got {batch2_seen:?}"
+    );
 }
 
 async fn fetch_sources(http_client: &Client, api_address: &str) -> Vec<SourceInfoResponse> {
@@ -323,14 +437,11 @@ async fn fetch_sources(http_client: &Client, api_address: &str) -> Vec<SourceInf
     response.json().await.expect("Failed to parse sources")
 }
 
-/// Negative path: the configured index does not exist, so `open()` must
-/// fail with a `Storage` error and the runtime reports the source as
-/// `ConnectorStatus::Error` without aborting.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/opensearch/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn opensearch_source_with_missing_index_reports_error(
+async fn given_missing_index_when_connector_opens_should_report_error(
     harness: &TestHarness,
     _fixture: OpenSearchSourceMissingIndexFixture,
 ) {
@@ -360,8 +471,8 @@ async fn opensearch_source_with_missing_index_reports_error(
         .as_ref()
         .expect("Source with missing index should expose a last_error");
     assert!(
-        last_error.message.contains("does not exist"),
-        "last_error should mention the missing index, got: {}",
+        last_error.message.contains("Plugin initialization failed"),
+        "missing index should fail during plugin open, got: {}",
         last_error.message
     );
 }

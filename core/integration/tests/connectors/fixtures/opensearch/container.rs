@@ -1,22 +1,21 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
@@ -25,20 +24,13 @@ use serde::Deserialize;
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{
-    ContainerAsync, GenericImage, ImageExt, ReuseDirective,
-};
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tracing::info;
 
 const OPENSEARCH_IMAGE: &str = "docker.io/opensearchproject/opensearch";
 const OPENSEARCH_TAG: &str = "2.19.1";
 const OPENSEARCH_PORT: u16 = 9200;
 const OPENSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
-// Fixed name + ReuseDirective::Always shares one container across nextest's
-// per-test processes: the first test creates it, every later test attaches by
-// name. Per-test isolation comes from a unique index per fixture, not a fresh
-// container.
-const OPENSEARCH_CONTAINER_NAME: &str = "iggy-test-opensearch";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -55,6 +47,20 @@ pub const ENV_SOURCE_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SOURCE_OPENSEARCH
 pub const ENV_SOURCE_STREAMS_0_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_OPENSEARCH_STREAMS_0_TOPIC";
 pub const ENV_SOURCE_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_OPENSEARCH_STREAMS_0_SCHEMA";
 pub const ENV_SOURCE_PATH: &str = "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PATH";
+pub const ENV_SOURCE_MAX_RETRIES: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_MAX_RETRIES";
+pub const ENV_SOURCE_RETRY_DELAY: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_RETRY_DELAY";
+pub const ENV_SOURCE_RETRY_MAX_DELAY: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_RETRY_MAX_DELAY";
+pub const ENV_SOURCE_MAX_OPEN_RETRIES: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_MAX_OPEN_RETRIES";
+pub const ENV_SOURCE_OPEN_RETRY_MAX_DELAY: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_OPEN_RETRY_MAX_DELAY";
+pub const ENV_SOURCE_CIRCUIT_BREAKER_THRESHOLD: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_CIRCUIT_BREAKER_THRESHOLD";
+pub const ENV_SOURCE_CIRCUIT_BREAKER_COOL_DOWN: &str =
+    "IGGY_CONNECTORS_SOURCE_OPENSEARCH_PLUGIN_CONFIG_CIRCUIT_BREAKER_COOL_DOWN";
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -83,8 +89,6 @@ pub struct OpenSearchHit {
 }
 
 pub struct OpenSearchContainer {
-    // Held so testcontainers' Drop runs on test exit; ReuseDirective::Always
-    // makes that Drop leave the container running for the next test to attach.
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub base_url: String,
@@ -102,10 +106,11 @@ impl OpenSearchContainer {
             .with_startup_timeout(std::time::Duration::from_secs(120))
             .with_env_var("discovery.type", "single-node")
             .with_env_var("plugins.security.disabled", "true")
+            .with_env_var("DISABLE_INSTALL_DEMO_CONFIG", "true")
+            .with_env_var("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "iggy-test-password1!")
             .with_env_var("OPENSEARCH_JAVA_OPTS", "-Xms512m -Xmx512m")
             .with_mapped_port(0, OPENSEARCH_PORT.tcp())
-            .with_container_name(OPENSEARCH_CONTAINER_NAME)
-            .with_reuse(ReuseDirective::Always)
+            .with_container_name(fixtures::unique_container_name("opensearch"))
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
@@ -192,6 +197,57 @@ pub trait OpenSearchOps: Sync {
             }
 
             info!("Created OpenSearch index: {index_name}");
+            Ok(())
+        }
+    }
+
+    fn create_typed_fields_index(
+        &self,
+        index_name: &str,
+    ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
+        async move {
+            let url = format!("{}/{}", self.container().base_url, index_name);
+            let mapping = serde_json::json!({
+                "mappings": {
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "title": { "type": "text" },
+                        "status": { "type": "keyword" },
+                        "count": { "type": "long" },
+                        "score": { "type": "float" },
+                        "ratio": { "type": "double" },
+                        "active": { "type": "boolean" },
+                        "timestamp": { "type": "date" },
+                        "client_ip": { "type": "ip" },
+                        "location": { "type": "geo_point" },
+                        "tags": { "type": "keyword" },
+                        "optional_note": { "type": "keyword" }
+                    }
+                }
+            });
+
+            let response = self
+                .http_client()
+                .put(&url)
+                .header("Content-Type", "application/json")
+                .json(&mapping)
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::FixtureSetup {
+                    fixture_type: "OpenSearchOps".to_string(),
+                    message: format!("Failed to create typed index: {e}"),
+                })?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(TestBinaryError::FixtureSetup {
+                    fixture_type: "OpenSearchOps".to_string(),
+                    message: format!("Failed to create typed index: status={status}, body={body}"),
+                });
+            }
+
+            info!("Created typed OpenSearch index: {index_name}");
             Ok(())
         }
     }
