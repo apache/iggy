@@ -25,6 +25,7 @@ mod http_config_provider;
 mod iceberg;
 mod influxdb;
 mod mongodb;
+mod opensearch;
 mod postgres;
 mod quickwit;
 mod random;

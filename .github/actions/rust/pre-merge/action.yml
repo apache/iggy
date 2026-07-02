@@ -269,6 +269,20 @@ runs:
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
+        # decode_validation_tests need gitignored wire fixtures. Generate when
+        # iggy-gateway-kafka is in the DAG test scope (rust-gateway job or parent
+        # rust job — both run gateway tests when gateways/** changes).
+        NEEDS_KAFKA_FIXTURES=false
+        if [[ -z "$NEXTEST_FILTER" ]]; then
+          NEEDS_KAFKA_FIXTURES=true
+        elif grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
+          NEEDS_KAFKA_FIXTURES=true
+        fi
+        if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
+          ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+          trap './gateways/kafka/scripts/ci-wire-fixtures.sh cleanup' EXIT
+        fi
+
         # Start D-Bus and unlock keyring right before test execution to avoid
         # gnome-keyring auto-locking the collection during the build phase.
         # Previously this ran before `cargo build`, leaving a 7+ minute idle
