@@ -33,10 +33,10 @@ use crate::{
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_from_request, build_reply_message, drain_committable_prefix,
-    emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
-    fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
-    send_prepare_ok as send_prepare_ok_common,
+    ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
+    build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -1027,6 +1027,27 @@ where
                     .with_operation(message.header().operation)
                     .with_error(error.to_string()),
                 );
+                // Deny on the primary before the op enters the pipeline:
+                // nothing replicates, so backups never see the rejected
+                // delete, and the client gets a typed failure instead of
+                // waiting out its reply timeout.
+                let reply =
+                    build_deny_reply_from_request(consensus, message.header(), error.as_code());
+                if let Err(send_error) = consensus
+                    .message_bus()
+                    .send_to_client(message.header().client, reply.into_generic().into_frozen())
+                    .await
+                {
+                    emit_partition_diag(
+                        tracing::Level::WARN,
+                        &PartitionDiagEvent::new(
+                            ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                            "delete_consumer_offset deny reply send failed",
+                        )
+                        .with_operation(message.header().operation)
+                        .with_error(send_error.to_string()),
+                    );
+                }
                 return;
             }
 
@@ -1762,7 +1783,7 @@ where
         let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
         let mut messages_committed = false;
 
-        for mut entry in drained {
+        for entry in drained {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
@@ -1813,14 +1834,6 @@ where
             // offsets. Only primary delivers replies; backups just advance
             // commit. Session lifecycle is metadata-only.
             let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-
-            // TODO: no production caller yet. Partition has no in-process
-            // subscriber (only metadata uses pipeline_message_with_subscriber);
-            // wired for forward-compat. Fired AFTER local commit (slot-first
-            // ordering analog). Dropped receiver ignored.
-            if let Some(sender) = entry.take_reply_sender() {
-                let _ = sender.send(reply.clone());
-            }
 
             if send_client_replies {
                 let reply_buffers = reply.into_generic().into_frozen();
@@ -2722,9 +2735,14 @@ mod tests {
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
+    use iggy_binary_protocol::{Command2, ReplyHeader, WireConsumer, WireEncode};
+    use message_bus::SendError;
+    use server_common::MESSAGE_ALIGN;
     use server_common::send_messages2::{
         COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
     };
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const TEST_CLUSTER: u128 = 1;
 
@@ -2745,6 +2763,151 @@ mod tests {
             IggyByteSize::from(1024 * 1024),
             false,
         )
+    }
+
+    /// Client-facing bus that records every `send_to_client` frame so tests
+    /// can assert on reply bytes without a connection registry (whose slot
+    /// guard would borrow the partition across `on_request(&mut self)`).
+    #[derive(Debug, Default)]
+    struct RecordingBus {
+        sent_to_clients: Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>,
+    }
+
+    impl MessageBus for RecordingBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
+        async fn send_to_client(
+            &self,
+            client_id: u128,
+            data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            self.sent_to_clients.borrow_mut().push((client_id, data));
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+    }
+
+    type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
+
+    fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let bus = RecordingBus::default();
+        let sent_to_clients = bus.sent_to_clients.clone();
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        );
+        (partition, sent_to_clients)
+    }
+
+    fn delete_offset_request(
+        client_id: u128,
+        request_id: u64,
+        consumer_id: u32,
+    ) -> Message<RequestHeader> {
+        let body = DeleteConsumerOffset2Request {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
+            stream_id: WireIdentifier::Numeric(1),
+            topic_id: WireIdentifier::Numeric(1),
+            partition_id: Some(0),
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&body);
+        message.transmute_header(|_, header: &mut RequestHeader| {
+            header.command = Command2::Request;
+            header.operation = Operation::DeleteConsumerOffset2;
+            header.client = client_id;
+            header.session = 1;
+            header.request = request_id;
+            header.namespace = IggyNamespace::new(1, 1, 0).inner();
+            header.size = u32::try_from(total).expect("request size fits u32");
+        })
+    }
+
+    /// Deleting a consumer offset that was never stored must answer with a
+    /// typed deny reply (empty body, `status` = `ConsumerOffsetNotFound`,
+    /// `op` 0) before consensus: nothing may enter the pipeline, and an
+    /// awaited client write must fail fast instead of waiting out its reply
+    /// timeout. Once the offset exists, the same request must pass the gate
+    /// into the pipeline without a deny.
+    #[compio::test]
+    async fn on_request_delete_of_missing_offset_replies_typed_deny() {
+        let (mut partition, sent_to_clients) = recording_partition();
+        let client_id: u128 = 42;
+        let consumer_id: u32 = 5;
+
+        partition
+            .on_request(delete_offset_request(client_id, 7, consumer_id))
+            .await;
+
+        {
+            let sent = sent_to_clients.borrow();
+            assert_eq!(sent.len(), 1, "exactly one deny reply");
+            let (reply_client, frame) = &sent[0];
+            assert_eq!(*reply_client, client_id);
+            let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+            )
+            .expect("deny frame starts with a valid reply header");
+            assert_eq!(header.command, Command2::Reply);
+            assert_eq!(
+                header.status,
+                IggyError::ConsumerOffsetNotFound(0).as_code()
+            );
+            assert_eq!(header.op, 0, "a deny commits nothing");
+            assert_eq!(header.request, 7);
+            assert_eq!(
+                header.size as usize,
+                std::mem::size_of::<ReplyHeader>(),
+                "deny reply body must be empty"
+            );
+        }
+        assert_eq!(
+            partition.consensus().pipeline().borrow().len(),
+            0,
+            "denied delete must not replicate"
+        );
+        assert!(partition.pending_consumer_offset_commits.is_empty());
+
+        // Existing offset: the gate passes and the delete enters the pipeline.
+        partition.consumer_offsets.pin().insert(
+            consumer_id as usize,
+            ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, 3, String::new()),
+        );
+        partition
+            .on_request(delete_offset_request(client_id, 8, consumer_id))
+            .await;
+        assert_eq!(
+            partition.consensus().pipeline().borrow().len(),
+            1,
+            "existing offset delete must replicate"
+        );
     }
 
     /// `reclaim_dead_group_offsets` must drop exactly the not-`is_live` groups

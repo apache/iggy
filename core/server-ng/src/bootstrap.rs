@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::auth::warm_dummy_password_hash;
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
     make_partition_read_handler,
 };
+use crate::http;
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
@@ -512,6 +514,7 @@ pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
+    warm_dummy_password_hash();
     let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
         .map_err(ServerNgError::ShardAllocator)?;
     let assignments = allocator
@@ -1919,7 +1922,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(
+        start_via_replica_io(
             shard,
             config,
             topology,
@@ -1927,18 +1930,37 @@ async fn start_tcp_runtime(
             dialed_replica,
             accepted_clients,
         )
-        .await;
+        .await?;
+    } else {
+        start_manual_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await?;
     }
 
-    start_manual_runtime(
-        shard,
-        config,
-        topology,
-        accepted_replica,
-        dialed_replica,
-        accepted_clients,
-    )
-    .await
+    // HTTP is served over TCP but sits outside the replica_io / manual client
+    // reactor, so it binds independently. Shard-0 gating comes from the sole
+    // caller of this function.
+    if config.http.enabled {
+        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+        let self_ports = configs::cluster::TransportPorts {
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            ..Default::default()
+        };
+        http::start(shard, http_addr, &config.http, &config.cluster, self_ports).await?;
+    }
+
+    Ok(())
 }
 
 async fn start_via_replica_io(

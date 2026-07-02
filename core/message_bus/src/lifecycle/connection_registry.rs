@@ -33,6 +33,7 @@
 //! [`ShutdownToken`]: crate::lifecycle::ShutdownToken
 
 use compio::runtime::JoinHandle;
+use futures::channel::oneshot;
 use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -40,6 +41,7 @@ use std::collections::hash_map::Entry as HmEntry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tracing::{debug, warn};
 
 /// Opaque per-insert generation token.
@@ -128,9 +130,111 @@ pub struct DrainOutcome {
     pub background_force: usize,
 }
 
+/// Where a client reply is delivered.
+///
+/// `Socket` is the wire path taken by every TCP / WS / QUIC client: the
+/// reply is pushed into the per-peer queue exactly as before. `InProcess`
+/// reifies an in-process reply target keyed by request id so a caller
+/// holding the matching [`oneshot::Receiver`] can await its reply without a
+/// socket. Both ends are shard-0-local, hence a single-threaded oneshot.
+#[derive(Debug)]
+enum ReplyTarget {
+    Socket(BusSender),
+    InProcess {
+        by_request: HashMap<u64, oneshot::Sender<BusMessage>>,
+    },
+}
+
+impl ReplyTarget {
+    /// Wire sender for socket targets; `None` for in-process targets.
+    const fn as_socket(&self) -> Option<&BusSender> {
+        match self {
+            Self::Socket(sender) => Some(sender),
+            Self::InProcess { .. } => None,
+        }
+    }
+}
+
+/// Outcome of routing a client reply through an [`Entry`]'s reply target.
+///
+/// `Delivered` is the socket fast path: `try_send` was attempted and its
+/// result is carried through unchanged. `InProcess` hands the message back
+/// so the caller can decode the request id and fire the matching oneshot
+/// via [`ConnectionRegistry::fire_in_process`], keeping that decode off the
+/// socket path. `NoSlot` means no entry exists for the key.
+#[derive(Debug)]
+#[must_use]
+pub enum ReplyRoute {
+    Delivered(Result<(), async_channel::TrySendError<BusMessage>>),
+    InProcess(BusMessage),
+    NoSlot(BusMessage),
+}
+
+/// Rejection reasons for [`ConnectionRegistry::install_reply_slot`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReplySlotError {
+    /// No registry entry exists for the key: the in-process entry was
+    /// never installed or has already been torn down.
+    #[error("no registry entry for this key")]
+    EntryNotFound,
+    /// The entry is a socket target. Socket replies go through the
+    /// per-peer queue; a reply slot on such an entry could never fire.
+    #[error("registry entry is a socket target")]
+    NotInProcess,
+    /// A waiter is already registered under this request id. Replacing it
+    /// would drop the first waiter's sender and could deliver its reply
+    /// to the wrong caller, so the second install is rejected instead.
+    #[error("a reply slot for this request id is already installed")]
+    DuplicateRequest,
+}
+
+/// Cancel-safety handle for an installed in-process reply slot.
+///
+/// Dropping the guard removes the slot unless the reply already fired
+/// ([`ConnectionRegistry::fire_in_process`] consumes the slot on delivery,
+/// making the drop a no-op) or the whole entry was replaced (fenced by the
+/// entry's [`InstanceToken`], mirroring `remove_if_token_matches`). A
+/// caller that times out or is cancelled therefore never leaks its oneshot
+/// sender.
+///
+/// Contract: a request id must not be reused under the same key while a
+/// previous guard for that id is still live; the stale guard's drop would
+/// remove the new slot. Callers mint monotonically increasing request ids,
+/// which rules this out.
+#[must_use = "dropping the guard removes the reply slot"]
+#[derive(Debug)]
+pub struct ReplySlotGuard<'a, K>
+where
+    K: Eq + Hash + Copy + Debug + 'static,
+{
+    registry: &'a ConnectionRegistry<K>,
+    key: K,
+    request: u64,
+    token: InstanceToken,
+}
+
+impl<K> Drop for ReplySlotGuard<'_, K>
+where
+    K: Eq + Hash + Copy + Debug + 'static,
+{
+    fn drop(&mut self) {
+        let mut entries = self.registry.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(&self.key) else {
+            return;
+        };
+        if entry.token != self.token {
+            return;
+        }
+        let ReplyTarget::InProcess { by_request } = &mut entry.reply else {
+            return;
+        };
+        by_request.remove(&self.request);
+    }
+}
+
 #[derive(Debug)]
 struct Entry {
-    sender: BusSender,
+    reply: ReplyTarget,
     writer_handle: Option<JoinHandle<()>>,
     reader_handle: Option<JoinHandle<()>>,
     /// Generation token minted by the registry on insert. Entries that
@@ -215,41 +319,103 @@ where
     /// `close_peer`.
     pub fn with_sender<R>(&self, key: K, f: impl FnOnce(&BusSender) -> R) -> Option<R> {
         let entries = self.entries.borrow();
-        entries.get(&key).map(|entry| f(&entry.sender))
+        entries
+            .get(&key)
+            .and_then(|entry| entry.reply.as_socket())
+            .map(f)
     }
 
-    /// Try to send `msg` to the per-peer queue, returning the message back
-    /// when no slot exists.
+    /// Route `msg` to the entry's reply target, handing it back when no
+    /// live target accepts it.
     ///
-    /// Lets `send_to_*` skip the unconditional `Frozen::clone()` the
-    /// `with_sender` shape forced (closure consumes a clone, outer caller
-    /// retains the original for the slow path the borrow checker cannot
-    /// prove unreachable). The consuming variant moves `msg` into
-    /// `try_send` on the fast path; on no-slot the message is handed back
-    /// so the caller can route it via the slow path or drop it.
+    /// Lets `send_to_client` skip the unconditional `Frozen::clone()` the
+    /// `with_sender` shape forced. Socket targets move `msg` straight into
+    /// `try_send`; in-process targets hand it back via
+    /// [`ReplyRoute::InProcess`] so the caller can resolve the request id
+    /// and fire the oneshot without decoding on the socket path.
     ///
     /// Returns:
-    /// - `Ok(Ok(()))`: slot exists and the queue accepted `msg`.
-    /// - `Ok(Err(TrySendError))`: slot exists but `try_send` failed
-    ///   (`Full` or `Closed`); the inner error carries `msg` back per
-    ///   `async_channel`'s contract.
-    /// - `Err(msg)`: no slot for `key`; `msg` returned to the caller.
+    /// - [`ReplyRoute::Delivered`]: socket target; carries the `try_send`
+    ///   result (`Full` / `Closed` errors carry `msg` back per
+    ///   `async_channel`'s contract).
+    /// - [`ReplyRoute::InProcess`]: in-process target; `msg` handed back.
+    /// - [`ReplyRoute::NoSlot`]: no entry for `key`; `msg` handed back.
+    pub fn try_send_or_return(&self, key: K, msg: BusMessage) -> ReplyRoute {
+        let entries = self.entries.borrow();
+        let Some(entry) = entries.get(&key) else {
+            return ReplyRoute::NoSlot(msg);
+        };
+        match &entry.reply {
+            ReplyTarget::Socket(sender) => ReplyRoute::Delivered(sender.try_send(msg)),
+            ReplyTarget::InProcess { .. } => ReplyRoute::InProcess(msg),
+        }
+    }
+
+    /// Fire the in-process reply registered under `request` for `key`.
+    ///
+    /// Companion to [`ReplyRoute::InProcess`]; the socket path never reaches
+    /// here. Removes the matching oneshot and delivers `msg` on it.
     ///
     /// # Errors
     ///
-    /// The outer `Err(msg)` reports that no entry exists for `key`. The
-    /// inner `Err(TrySendError)` reports that the entry's queue is full
-    /// or closed.
-    pub fn try_send_or_return(
-        &self,
-        key: K,
-        msg: BusMessage,
-    ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
-        let entries = self.entries.borrow();
-        match entries.get(&key) {
-            Some(entry) => Ok(entry.sender.try_send(msg)),
+    /// Hands `msg` back when `key` has no in-process target or no waiter is
+    /// registered for `request`, so the caller surfaces the same not-found
+    /// outcome as a missing socket.
+    pub fn fire_in_process(&self, key: K, request: u64, msg: BusMessage) -> Result<(), BusMessage> {
+        let mut entries = self.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(&key) else {
+            return Err(msg);
+        };
+        let ReplyTarget::InProcess { by_request } = &mut entry.reply else {
+            return Err(msg);
+        };
+        match by_request.remove(&request) {
+            Some(reply_tx) => reply_tx.send(msg),
             None => Err(msg),
         }
+    }
+
+    /// Register a oneshot waiter for the reply to `request` on `key`'s
+    /// in-process entry.
+    ///
+    /// The returned receiver resolves when `send_to_client` routes a reply
+    /// carrying this request id (via [`Self::fire_in_process`]), or with
+    /// `Canceled` when the entry is torn down first. The guard removes the
+    /// slot on drop; see [`ReplySlotGuard`] for the exact semantics.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplySlotError::EntryNotFound`] when `key` has no entry,
+    /// [`ReplySlotError::NotInProcess`] when the entry is a socket target,
+    /// [`ReplySlotError::DuplicateRequest`] when a waiter is already
+    /// registered under `request`.
+    pub fn install_reply_slot(
+        &self,
+        key: K,
+        request: u64,
+    ) -> Result<(ReplySlotGuard<'_, K>, oneshot::Receiver<BusMessage>), ReplySlotError> {
+        let mut entries = self.entries.borrow_mut();
+        let Some(entry) = entries.get_mut(&key) else {
+            return Err(ReplySlotError::EntryNotFound);
+        };
+        let token = entry.token;
+        let ReplyTarget::InProcess { by_request } = &mut entry.reply else {
+            return Err(ReplySlotError::NotInProcess);
+        };
+        let HmEntry::Vacant(slot) = by_request.entry(request) else {
+            return Err(ReplySlotError::DuplicateRequest);
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        slot.insert(reply_tx);
+        Ok((
+            ReplySlotGuard {
+                registry: self,
+                key,
+                request,
+                token,
+            },
+            reply_rx,
+        ))
     }
 
     /// Register a new connection. Stores the producer side of the per-peer
@@ -294,7 +460,7 @@ where
         entries.insert(
             key,
             Entry {
-                sender,
+                reply: ReplyTarget::Socket(sender),
                 writer_handle: Some(writer_handle),
                 reader_handle: Some(reader_handle),
                 token,
@@ -302,6 +468,38 @@ where
             },
         );
         Ok(token)
+    }
+
+    /// Register an in-process reply target for `key`.
+    ///
+    /// In-process peers have no socket and no reader / writer tasks:
+    /// replies routed to `key` resolve request-keyed oneshots installed
+    /// via [`Self::install_reply_slot`]. Teardown goes through
+    /// [`Self::remove`] / [`Self::remove_if_token_matches`]; dropping the
+    /// entry drops every pending sender, so all outstanding receivers
+    /// resolve `Canceled`.
+    ///
+    /// Returns `None` when `key` is already registered (socket or
+    /// in-process); the caller must tear the existing entry down first.
+    pub fn insert_in_process(&self, key: K) -> Option<InstanceToken> {
+        let mut entries = self.entries.borrow_mut();
+        let HmEntry::Vacant(slot) = entries.entry(key) else {
+            return None;
+        };
+        let token = self.mint_token();
+        // Nothing ever waits on this shutdown (no reader to wake); it
+        // exists only because every entry owns one.
+        let (conn_shutdown, _) = super::Shutdown::new();
+        slot.insert(Entry {
+            reply: ReplyTarget::InProcess {
+                by_request: HashMap::new(),
+            },
+            writer_handle: None,
+            reader_handle: None,
+            token,
+            _conn_shutdown: conn_shutdown,
+        });
+        Some(token)
     }
 
     /// Unregister a connection without awaiting its tasks.
@@ -360,7 +558,9 @@ where
         let Some(mut entry) = self.entries.borrow_mut().remove(&key) else {
             return;
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -389,7 +589,9 @@ where
             }
             slot.remove()
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -447,7 +649,9 @@ where
             // the shutdown token has not been triggered. Writer is
             // awaited before the reader handle is dropped so a
             // mid-writev cancellation cannot truncate a frame.
-            entry.sender.close();
+            if let Some(sender) = entry.reply.as_socket() {
+                sender.close();
+            }
             // Writer gets the full shared deadline so a legitimately-
             // flushing `write_vectored_all` never loses budget to any
             // other entry in the same drain batch.
@@ -581,7 +785,8 @@ impl ReplicaRegistry {
         let slots = self.slots.borrow();
         slots[usize::from(key)]
             .as_ref()
-            .map(|entry| f(&entry.sender))
+            .and_then(|entry| entry.reply.as_socket())
+            .map(f)
     }
 
     /// See [`ConnectionRegistry::try_send_or_return`].
@@ -595,8 +800,11 @@ impl ReplicaRegistry {
         msg: BusMessage,
     ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
         let slots = self.slots.borrow();
-        match slots[usize::from(key)].as_ref() {
-            Some(entry) => Ok(entry.sender.try_send(msg)),
+        match slots[usize::from(key)]
+            .as_ref()
+            .and_then(|entry| entry.reply.as_socket())
+        {
+            Some(sender) => Ok(sender.try_send(msg)),
             None => Err(msg),
         }
     }
@@ -627,7 +835,7 @@ impl ReplicaRegistry {
         }
         let token = self.mint_token();
         *slot = Some(Entry {
-            sender,
+            reply: ReplyTarget::Socket(sender),
             writer_handle: Some(writer_handle),
             reader_handle: Some(reader_handle),
             token,
@@ -672,7 +880,9 @@ impl ReplicaRegistry {
             self.len.set(self.len.get() - 1);
             entry
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -697,7 +907,9 @@ impl ReplicaRegistry {
             self.len.set(self.len.get() - 1);
             removed_entry
         };
-        entry.sender.close();
+        if let Some(sender) = entry.reply.as_socket() {
+            sender.close();
+        }
         if let Some(writer_handle) = entry.writer_handle.take() {
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
@@ -1065,7 +1277,7 @@ mod tests {
             .expect("insert ok");
 
         let outer = reg.try_send_or_return(1u8, make_bus_msg());
-        assert!(matches!(outer, Ok(Ok(()))));
+        assert!(matches!(outer, ReplyRoute::Delivered(Ok(()))));
         // Receiver drains the message; closing the writer's rx end via
         // close_peer is not necessary for this assertion.
         let received = rx.recv().await.expect("queue had message");
@@ -1081,7 +1293,9 @@ mod tests {
         let original_len = msg.len();
 
         let outcome = reg.try_send_or_return(99u8, msg);
-        let returned = outcome.expect_err("missing slot should return msg");
+        let ReplyRoute::NoSlot(returned) = outcome else {
+            panic!("missing slot should return msg");
+        };
         assert_eq!(returned.len(), original_len);
     }
 
@@ -1104,14 +1318,16 @@ mod tests {
             .expect("insert ok");
 
         // Saturate the queue.
-        reg.try_send_or_return(1u8, make_bus_msg())
-            .expect("slot present")
-            .expect("first send accepted");
+        assert!(matches!(
+            reg.try_send_or_return(1u8, make_bus_msg()),
+            ReplyRoute::Delivered(Ok(()))
+        ));
         // Second send: slot present, queue full.
-        let outcome = reg
-            .try_send_or_return(1u8, make_bus_msg())
-            .expect("slot still present");
-        assert!(matches!(outcome, Err(async_channel::TrySendError::Full(_))));
+        let outcome = reg.try_send_or_return(1u8, make_bus_msg());
+        assert!(matches!(
+            outcome,
+            ReplyRoute::Delivered(Err(async_channel::TrySendError::Full(_)))
+        ));
     }
 
     /// Mirror of `try_send_or_return_returns_msg_when_slot_missing` for the
@@ -1126,5 +1342,153 @@ mod tests {
         let outcome = reg.try_send_or_return(7u8, msg);
         let returned = outcome.expect_err("missing slot should return msg");
         assert_eq!(returned.len(), original_len);
+    }
+
+    /// End-to-end registry seam: install entry + slot, route, fire, await.
+    #[compio::test]
+    async fn in_process_slot_receives_fired_reply() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+
+        let (guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+        let msg = match reg.try_send_or_return(1u8, make_bus_msg()) {
+            ReplyRoute::InProcess(msg) => msg,
+            other => panic!("expected InProcess route, got {other:?}"),
+        };
+        reg.fire_in_process(1u8, 42, msg).expect("waiter present");
+
+        let received = reply_rx.await.expect("reply delivered");
+        assert_eq!(received.len(), HEADER_SIZE);
+        drop(guard);
+        assert!(reg.contains(1u8), "guard drop must not remove the entry");
+    }
+
+    #[compio::test]
+    async fn insert_in_process_duplicate_key_returns_none() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        assert!(reg.insert_in_process(1u8).is_some());
+        assert!(reg.insert_in_process(1u8).is_none());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[compio::test]
+    async fn install_reply_slot_rejects_missing_and_socket_entries() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        assert_eq!(
+            reg.install_reply_slot(1u8, 1).unwrap_err(),
+            ReplySlotError::EntryNotFound
+        );
+
+        let (_shutdown, token) = Shutdown::new();
+        let (tx, rx) = async_channel::bounded(8);
+        reg.insert(
+            1u8,
+            tx,
+            spawn_dummy_writer(rx),
+            spawn_dummy_reader(token),
+            dummy_conn_shutdown(),
+        )
+        .expect("socket insert ok");
+        assert_eq!(
+            reg.install_reply_slot(1u8, 1).unwrap_err(),
+            ReplySlotError::NotInProcess
+        );
+    }
+
+    /// Second install under a live request id must be rejected, and the
+    /// first waiter must stay wired (the reply still reaches it).
+    #[compio::test]
+    async fn install_reply_slot_rejects_duplicate_request() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+
+        let (_guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("first install");
+        assert_eq!(
+            reg.install_reply_slot(1u8, 42).unwrap_err(),
+            ReplySlotError::DuplicateRequest
+        );
+
+        reg.fire_in_process(1u8, 42, make_bus_msg())
+            .expect("first waiter still registered");
+        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+    }
+
+    /// Reply for a request id nobody waits on: handed back, no panic, and
+    /// the unrelated slot stays registered.
+    #[compio::test]
+    async fn fire_in_process_unknown_request_returns_msg() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+        let (_guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+
+        let msg = make_bus_msg();
+        let original_len = msg.len();
+        let returned = reg
+            .fire_in_process(1u8, 7, msg)
+            .expect_err("no waiter for request 7");
+        assert_eq!(returned.len(), original_len);
+
+        reg.fire_in_process(1u8, 42, make_bus_msg())
+            .expect("slot 42 untouched");
+        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+    }
+
+    /// Timeout / cancellation path: dropping the guard removes the slot,
+    /// cancels the receiver, and a later reply is shed as no-waiter.
+    #[compio::test]
+    async fn dropped_guard_removes_slot_and_cancels_receiver() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+
+        let (guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+        drop(guard);
+
+        assert!(reply_rx.await.is_err(), "sender dropped with the slot");
+        assert!(
+            reg.fire_in_process(1u8, 42, make_bus_msg()).is_err(),
+            "late reply must be handed back, not delivered"
+        );
+        let (_guard, _reply_rx) = reg
+            .install_reply_slot(1u8, 42)
+            .expect("request id reusable after guard drop");
+    }
+
+    /// After the reply fired the slot is gone; the guard's drop is a no-op
+    /// and the request id becomes reusable.
+    #[compio::test]
+    async fn guard_drop_is_noop_after_reply_fired() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+
+        let (guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+        reg.fire_in_process(1u8, 42, make_bus_msg())
+            .expect("waiter present");
+        drop(guard);
+
+        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
+        let (_guard, _reply_rx) = reg
+            .install_reply_slot(1u8, 42)
+            .expect("request id reusable after fire + drop");
+    }
+
+    /// Entry teardown with a pending waiter: the receiver resolves
+    /// `Canceled` instead of hanging, and the stale guard's later drop
+    /// must not disturb a reinstalled entry's slot (token fence).
+    #[compio::test]
+    async fn entry_teardown_cancels_pending_receiver_and_fences_stale_guard() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        reg.insert_in_process(1u8).expect("fresh key");
+        let (stale_guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+
+        assert!(reg.remove(1u8));
+        assert!(reply_rx.await.is_err(), "teardown cancels pending waiter");
+
+        reg.insert_in_process(1u8)
+            .expect("reinstall after teardown");
+        let (_guard, reply_rx) = reg.install_reply_slot(1u8, 42).expect("slot installs");
+        drop(stale_guard);
+        reg.fire_in_process(1u8, 42, make_bus_msg())
+            .expect("stale guard must not evict the new slot");
+        assert_eq!(reply_rx.await.expect("reply delivered").len(), HEADER_SIZE);
     }
 }

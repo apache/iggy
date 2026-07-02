@@ -114,7 +114,7 @@ pub(crate) fn encode_request_header(
         .checked_add(payload.len())
         .ok_or(IggyError::InvalidConfiguration)?;
     let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 56];
+    let mut reserved = [0; 52];
     if operation == Operation::NonReplicated {
         reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
     }
@@ -179,6 +179,9 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
             if response.len() < total_size {
                 return Err(IggyError::InvalidCommand);
             }
+            if let Some(error) = read_reply_status(header_bytes) {
+                return Err(error);
+            }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
         }
@@ -206,11 +209,29 @@ pub(crate) fn decode_response_split(
             if body.len() < expected_body {
                 return Err(IggyError::InvalidCommand);
             }
+            if let Some(error) = read_reply_status(header_bytes) {
+                return Err(error);
+            }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, body.slice(..expected_body))
         }
         _ => Err(IggyError::InvalidCommand),
     }
+}
+
+/// Peek `ReplyHeader.status`, the request-level error channel decided at
+/// dispatch time (authorization denial today). Read before any body decode:
+/// a nonzero status maps to its [`IggyError`] and fails the request, an empty
+/// or partial body notwithstanding. `None` (status 0) lets the reply flow to
+/// the body/result-section decode. Read by wire offset for the same
+/// misalignment reason as [`read_operation`]; metadata replies always stamp 0,
+/// so this is inert for them.
+fn read_reply_status(header_bytes: &[u8; HEADER_SIZE]) -> Option<IggyError> {
+    const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&header_bytes[STATUS_OFFSET..STATUS_OFFSET + 4]);
+    let status = u32::from_le_bytes(bytes);
+    (status != 0).then(|| IggyError::from_code(status))
 }
 
 /// Read the [`Operation`] discriminant from a reply header by wire offset.
@@ -521,6 +542,38 @@ mod tests {
                 "window [{server_min}, {server_max}] must not surface as typed error"
             );
         }
+    }
+
+    #[test]
+    fn reply_with_nonzero_status_surfaces_as_typed_error() {
+        // A dispatch-time authorization denial rides `ReplyHeader.status`; the
+        // decode funnel surfaces it as the typed error before any body decode,
+        // even though the deny body is empty.
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            size: HEADER_SIZE as u32,
+            status: IggyError::Unauthorized.as_code(),
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let result = decode_response_split(&buf, Bytes::new());
+        assert!(matches!(result, Err(IggyError::Unauthorized)));
+    }
+
+    #[test]
+    fn reply_with_zero_status_passes_body_through() {
+        // status 0 is the ok channel: a non-metadata reply returns its body.
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            operation: Operation::NonReplicated,
+            size: (HEADER_SIZE + 3) as u32,
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let out = decode_response_split(&buf, Bytes::from_static(b"abc")).unwrap();
+        assert_eq!(&out[..], b"abc");
     }
 
     #[test]

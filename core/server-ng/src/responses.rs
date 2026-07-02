@@ -18,21 +18,23 @@
 //! Wire-response builders for the non-replicated read path.
 //!
 //! Assemble `get_me` / `get_clients` / `get_stream(s)` / `get_topic(s)` /
-//! `get_user(s)` / stats / cluster-metadata responses from per-shard
-//! session state and the metadata state machine, plus the
+//! `get_user(s)` / `get_personal_access_tokens` / stats / cluster-metadata
+//! responses from per-shard session state and the metadata state machine, plus the
 //! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
 //! resolvers.
 
 use crate::bootstrap::ServerNgShard;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_STATS_CODE,
-    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
-    GET_USERS_CODE,
+    FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
+    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+    GET_USER_CODE, GET_USERS_CODE,
 };
+use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -42,6 +44,7 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
+use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
@@ -50,7 +53,9 @@ use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
-use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::{
+    GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
+};
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -70,15 +75,17 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
+use server::binary::dispatch::wire_id_to_identifier;
 use server_common::Message;
 use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -370,10 +377,14 @@ pub(crate) fn resolve_partition_namespace(
         .ok_or(IggyError::InvalidIdentifier)
 }
 
+/// `user_id` is the authenticated caller, used only by the identity-scoped
+/// reads (currently the PAT list); every other arm ignores it. Authorization
+/// stays with the per-transport gates that run before this builder.
 pub(crate) fn build_non_replicated_response(
     shard: &Rc<ServerNgShard>,
     code: u32,
     body: &[u8],
+    user_id: Option<u32>,
 ) -> Result<NonReplicatedResponse, IggyError> {
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
@@ -425,9 +436,21 @@ pub(crate) fn build_non_replicated_response(
                 })
             })
         }
+        GET_PERSONAL_ACCESS_TOKENS_CODE => {
+            let _ = GetPersonalAccessTokensRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            // Caller-scoped: both transport gates reject unauthenticated
+            // callers before this builder runs, so a missing id is a gate
+            // bug; fail closed rather than serve another scope.
+            let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+            Ok(NonReplicatedResponse::Bytes(
+                build_get_personal_access_tokens_response(shard, user_id)?.to_bytes(),
+            ))
+        }
         GET_CONSUMER_GROUP_CODE => {
             let request = GetConsumerGroupRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
+            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
             let response = shard
                 .plane
                 .metadata()
@@ -441,6 +464,7 @@ pub(crate) fn build_non_replicated_response(
         GET_CONSUMER_GROUPS_CODE => {
             let request = GetConsumerGroupsRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
+            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
             let groups = shard
                 .plane
                 .metadata()
@@ -451,6 +475,11 @@ pub(crate) fn build_non_replicated_response(
                 NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
             }))
         }
+        // server-ng has neither an on-demand flush nor a snapshot primitive, so
+        // both deny honestly. The non-replicated catch-all's empty-ok would
+        // otherwise attest a durability guarantee (flush) or a produced snapshot
+        // artifact the server never made.
+        FLUSH_UNSAVED_BUFFER_CODE | GET_SNAPSHOT_FILE_CODE => Err(IggyError::FeatureUnavailable),
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
             Some(meta) if !meta.is_replicated() => Ok(NonReplicatedResponse::Empty),
             Some(_) => Err(IggyError::FeatureUnavailable),
@@ -628,6 +657,39 @@ fn build_get_user_response(
     })
 }
 
+/// The caller's own tokens, never another user's - the one identity-scoped
+/// read in this module, which is why [`build_non_replicated_response`]
+/// carries a `user_id`.
+fn build_get_personal_access_tokens_response(
+    shard: &Rc<ServerNgShard>,
+    user_id: u32,
+) -> Result<GetPersonalAccessTokensResponse, IggyError> {
+    let tokens = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users.personal_access_tokens_of(user_id));
+    personal_access_tokens_response(tokens)
+}
+
+fn personal_access_tokens_response(
+    tokens: Vec<(Arc<str>, Option<IggyTimestamp>)>,
+) -> Result<GetPersonalAccessTokensResponse, IggyError> {
+    let tokens = tokens
+        .into_iter()
+        .map(|(name, expiry_at)| {
+            Ok(PersonalAccessTokenResponse {
+                name: WireName::new(name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+                // 0 is the wire encoding for a never-expiring token, matching
+                // the legacy handler and the SDK-side decode.
+                expiry_at: expiry_at.map_or(0, |expiry_at| expiry_at.as_micros()),
+            })
+        })
+        .collect::<Result<Vec<_>, IggyError>>()?;
+    Ok(GetPersonalAccessTokensResponse { tokens })
+}
+
 fn build_get_topic_response(
     shard: &Rc<ServerNgShard>,
     stream_id: &WireIdentifier,
@@ -664,12 +726,11 @@ fn build_get_topics_response(
     stream_id: &WireIdentifier,
 ) -> Result<GetTopicsResponse, IggyError> {
     shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
-            return Ok(GetTopicsResponse { topics: Vec::new() });
-        };
+        let resolved_stream =
+            resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
         let stream = streams
             .items
-            .get(stream_id)
+            .get(resolved_stream)
             .ok_or(IggyError::InvalidIdentifier)?;
         stream
             .topics
@@ -680,7 +741,41 @@ fn build_get_topics_response(
     })
 }
 
-fn resolve_stream_id(
+/// Reject a consumer-group read whose parent stream/topic is absent with the
+/// legacy typed error naming the level that missed; the group itself missing
+/// stays the shared not-found reply (empty over TCP, 404 over HTTP).
+fn ensure_topic_exists(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<(), IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let resolved_stream =
+            resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
+        resolve_topic_id(streams, resolved_stream, topic_id)
+            .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
+        Ok(())
+    })
+}
+
+/// Typed miss for a read's parent stream, matching the legacy servers' error
+/// shape. The identifier only feeds the error message; a wire form with no
+/// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
+/// falls back to the default identifier.
+fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
+    IggyError::StreamIdNotFound(wire_id_to_identifier(stream_id).unwrap_or_default())
+}
+
+/// Typed miss for a read's parent topic; see [`stream_not_found`]. The variant's
+/// display order is (topic, stream).
+fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> IggyError {
+    IggyError::TopicIdNotFound(
+        wire_id_to_identifier(topic_id).unwrap_or_default(),
+        wire_id_to_identifier(stream_id).unwrap_or_default(),
+    )
+}
+
+pub(crate) fn resolve_stream_id(
     streams: &metadata::stm::stream::StreamsInner,
     identifier: &WireIdentifier,
 ) -> Option<usize> {
@@ -693,7 +788,7 @@ fn resolve_stream_id(
     }
 }
 
-fn resolve_topic_id(
+pub(crate) fn resolve_topic_id(
     streams: &metadata::stm::stream::StreamsInner,
     stream_id: usize,
     identifier: &WireIdentifier,
@@ -778,6 +873,29 @@ pub(crate) fn build_empty_reply(
     build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
 }
 
+/// Build an empty reply that denies a dispatch-time authorization check: the
+/// same request echo as [`build_empty_reply`] but with `ReplyHeader.status`
+/// set to the rule's error code -- the request-level failure channel the SDK
+/// peeks before any body decode. Every deny frame shares this shape (empty
+/// body, nonzero status, op 0); the partition primary's pre-pipeline deny
+/// stamps it through `consensus::build_deny_reply_from_request`.
+pub(crate) fn build_deny_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    status: u32,
+) -> Message<ReplyHeader> {
+    let mut reply = build_empty_reply(request_header, client_id, session, commit);
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+        &mut reply.as_mut_slice()[..header_len],
+    )
+    .expect("empty reply header is a valid ReplyHeader");
+    header.status = status;
+    reply
+}
+
 /// Server build version advertised in the login-register response.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -815,11 +933,12 @@ pub(crate) fn build_reply_from_bytes(
     )
 }
 
-/// If a raw PAT token was minted (`CreatePersonalAccessToken`), replace the
-/// committed reply -- whose body is empty because the raw token never entered
-/// consensus -- with a `RawPersonalAccessTokenResponse`, reusing the confirmed
-/// commit position from the committed reply. Otherwise the committed reply
-/// passes through unchanged.
+/// If a raw PAT token was minted (`CreatePersonalAccessToken`) and the commit
+/// succeeded, replace the committed reply -- whose body is empty because the
+/// raw token never entered consensus -- with a `RawPersonalAccessTokenResponse`,
+/// reusing the confirmed commit position from the committed reply. Otherwise
+/// (no token, a committed business rejection, or an eviction frame) the
+/// committed reply passes through unchanged.
 pub(crate) fn build_raw_pat_reply(
     request_header: &RequestHeader,
     committed: Message<GenericHeader>,
@@ -843,14 +962,35 @@ pub(crate) fn build_raw_pat_reply(
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
+    let size = committed_header.size as usize;
+    // A committed create can still be a business rejection (duplicate name,
+    // invalid expiry) whose reply body carries a nonzero result code. Splice
+    // the secret only into a genuine success; pass everything else through
+    // untouched so the client decodes the committed error instead of a
+    // success-shaped token reply (the minted raw secret is simply dropped).
+    // Mirrors the HTTP handler's `committed_payload` gate.
+    let reply_body = committed
+        .as_slice()
+        .get(header_len..size)
+        .unwrap_or_default();
+    if result_code(reply_body) != Some(0) {
+        return Ok(committed);
+    }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
-    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let response = RawPersonalAccessTokenResponse { token };
+    // The SDK strips a leading result section from every metadata reply
+    // (`split_metadata_result`), so the spliced body must carry the success
+    // section like any committed metadata reply; a bare token body would be
+    // read as a garbage result code.
+    let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
+    body.put_u32_le(0);
+    response.encode(&mut body);
     let reply = build_reply_from_bytes(
         request_header,
         request_header.client,
         request_header.session,
         commit,
-        &body,
+        &body.freeze(),
     );
     Ok(reply.into_generic())
 }
@@ -1021,4 +1161,109 @@ pub(crate) fn build_consumer_offset_body(
     body.extend_from_slice(&current_offset.to_le_bytes());
     body.extend_from_slice(&stored_offset.to_le_bytes());
     Bytes::from(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pat_request_header() -> RequestHeader {
+        let zeroed = [0u8; std::mem::size_of::<RequestHeader>()];
+        let mut header = *bytemuck::checked::try_from_bytes::<RequestHeader>(&zeroed)
+            .expect("zeroed bytes form a valid RequestHeader");
+        header.command = Command2::Request;
+        header.operation = Operation::CreatePersonalAccessToken;
+        header.client = 42;
+        header.session = 7;
+        header.request = 3;
+        header
+    }
+
+    /// A committed metadata reply whose body is the given result section
+    /// (`[count][{index, result}]*`), as the commit path emits it.
+    fn committed_reply(result_body: &[u8]) -> Message<GenericHeader> {
+        let request_header = pat_request_header();
+        build_reply_from_bytes(
+            &request_header,
+            42,
+            7,
+            9,
+            &Bytes::copy_from_slice(result_body),
+        )
+        .into_generic()
+    }
+
+    #[test]
+    fn raw_pat_reply_splices_token_into_a_committed_success() {
+        let success = committed_reply(&0u32.to_le_bytes());
+        let reply =
+            build_raw_pat_reply(&pat_request_header(), success, Some("raw-token".to_owned()))
+                .expect("splice succeeds");
+        let header_len = std::mem::size_of::<ReplyHeader>();
+        let body = &reply.as_slice()[header_len..reply.header().size as usize];
+        // Framed like every committed metadata reply: the SDK reads the result
+        // section first, then decodes the token payload past it.
+        assert_eq!(result_code(body), Some(0));
+        let response = RawPersonalAccessTokenResponse::decode_from(&body[RESULT_COUNT_LEN..])
+            .expect("token body decodes");
+        assert_eq!(response.token.as_str(), "raw-token");
+    }
+
+    #[test]
+    fn raw_pat_reply_passes_a_committed_rejection_through_untouched() {
+        let rejection_code =
+            IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code();
+        let mut result_body = Vec::new();
+        result_body.extend_from_slice(&1u32.to_le_bytes());
+        result_body.extend_from_slice(&0u32.to_le_bytes());
+        result_body.extend_from_slice(&rejection_code.to_le_bytes());
+        let rejection = committed_reply(&result_body);
+        let original = rejection.as_slice().to_vec();
+
+        let reply = build_raw_pat_reply(
+            &pat_request_header(),
+            rejection,
+            Some("raw-token".to_owned()),
+        )
+        .expect("pass-through succeeds");
+        assert_eq!(
+            reply.as_slice(),
+            original.as_slice(),
+            "a committed rejection must not be rewritten into a token reply"
+        );
+    }
+
+    #[test]
+    fn raw_pat_reply_without_a_token_passes_through() {
+        let success = committed_reply(&0u32.to_le_bytes());
+        let original = success.as_slice().to_vec();
+        let reply =
+            build_raw_pat_reply(&pat_request_header(), success, None).expect("pass-through");
+        assert_eq!(reply.as_slice(), original.as_slice());
+    }
+
+    #[test]
+    fn personal_access_tokens_response_preserves_order_and_encodes_never_as_zero() {
+        let expiry = IggyTimestamp::from(123_456u64);
+        let tokens: Vec<(Arc<str>, Option<IggyTimestamp>)> = vec![
+            (Arc::from("alpha"), Some(expiry)),
+            (Arc::from("zeta"), None),
+        ];
+
+        let response = personal_access_tokens_response(tokens).expect("mapping succeeds");
+
+        assert_eq!(response.tokens.len(), 2);
+        assert_eq!(response.tokens[0].name.as_str(), "alpha");
+        assert_eq!(response.tokens[0].expiry_at, expiry.as_micros());
+        assert_eq!(response.tokens[1].name.as_str(), "zeta");
+        assert_eq!(response.tokens[1].expiry_at, 0);
+    }
+
+    #[test]
+    fn personal_access_tokens_response_encodes_empty_list_as_empty_body() {
+        let response = personal_access_tokens_response(Vec::new()).expect("mapping succeeds");
+        // An empty body is the wire shape the SDK decodes as "no tokens"; it
+        // must stay `Bytes` (not the not-found `Empty` variant) end to end.
+        assert!(response.to_bytes().is_empty());
+    }
 }

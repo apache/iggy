@@ -2087,6 +2087,10 @@ where
                 timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
+                // Copied verbatim: carries the stamped acting user for client
+                // ops (and the authenticated user on Register), so the in-apply
+                // RBAC gate resolves the same identity on every backup.
+                user_id: old.user_id,
                 ..Default::default()
             }
         })

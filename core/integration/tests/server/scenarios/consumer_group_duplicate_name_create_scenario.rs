@@ -30,7 +30,9 @@ use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
 use iggy::prelude::{ConsumerGroupClient, StreamClient, TopicClient};
-use integration::harness::{TestHarness, assert_clean_system, create_user, login_user};
+use integration::harness::{
+    TestHarness, assert_clean_system, create_user, delete_user, login_user,
+};
 
 pub async fn run(harness: &TestHarness) {
     let system_client = harness
@@ -99,7 +101,10 @@ pub async fn run(harness: &TestHarness) {
         "the surviving member must keep its partition assignment"
     );
 
-    cleanup(&system_client, true).await;
+    // Only USERNAME_1 exists here; the shared `cleanup(_, true)` deletes all
+    // three scenario users and dies on the absent ones.
+    delete_user(&system_client, USERNAME_1).await;
+    cleanup(&system_client, false).await;
     assert_clean_system(&system_client).await;
 }
 

@@ -37,7 +37,24 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
 use tracing::warn;
+
+/// A well-formed Argon2 hash to verify against on the unknown-user login
+/// branch, so a missing username costs the same single `verify_password` a real
+/// user's wrong-password branch costs. Closes the username-existence timing
+/// oracle without changing the returned error. The password is a throwaway no
+/// account can present (login rejects out-of-range usernames before any hash
+/// check); computed once via the same hasher real users use, so the dummy
+/// verify runs an identical Argon2 KDF.
+static DUMMY_PASSWORD_HASH: LazyLock<String> =
+    LazyLock::new(|| crypto::hash_password("http-login-timing-guard"));
+
+/// Pay the one-time Argon2 cost of [`DUMMY_PASSWORD_HASH`] at boot instead of
+/// inside the first unknown-username login request.
+pub(crate) fn warm_dummy_password_hash() {
+    LazyLock::force(&DUMMY_PASSWORD_HASH);
+}
 
 pub(crate) fn verify_login_credentials(
     shard: &Rc<ServerNgShard>,
@@ -54,16 +71,25 @@ pub(crate) fn verify_login_credentials(
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let Some(user_id) = users.index.get(username).copied() else {
+        let user = users
+            .index
+            .get(username)
+            .copied()
+            .and_then(|user_id| users.items.get(user_id as usize));
+        let Some(user) = user else {
+            // Constant-cost path: verify against a dummy hash so a missing
+            // username is indistinguishable by response timing from a wrong
+            // password (both return InvalidCredentials).
+            let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
             return Err(LoginRegisterError::InvalidCredentials);
         };
-        let Some(user) = users.items.get(user_id as usize) else {
-            return Err(LoginRegisterError::InvalidCredentials);
-        };
-        if user.status != UserStatus::Active {
-            return Err(LoginRegisterError::UserInactive);
-        }
-        if !crypto::verify_password(password, user.password_hash.as_ref()) {
+        // Verify before the status check and collapse inactive to
+        // InvalidCredentials: an inactive account must answer exactly like a
+        // wrong password (same error, same Argon2 cost), or login could probe
+        // which accounts exist but are disabled.
+        if !crypto::verify_password(password, user.password_hash.as_ref())
+            || user.status != UserStatus::Active
+        {
             return Err(LoginRegisterError::InvalidCredentials);
         }
         Ok(user.id)
@@ -74,6 +100,17 @@ pub(crate) fn verify_pat_credentials(
     shard: &Rc<ServerNgShard>,
     token: &str,
 ) -> Result<u32, LoginRegisterError> {
+    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
+}
+
+/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (unix
+/// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
+/// per-token VSR session table on this expiry for lazy eviction; the wire and
+/// login paths only need the user id and go through [`verify_pat_credentials`].
+pub(crate) fn verify_pat_credentials_with_expiry(
+    shard: &Rc<ServerNgShard>,
+    token: &str,
+) -> Result<(u32, u64), LoginRegisterError> {
     let token_hash = PersonalAccessToken::hash_token(token);
     let now = IggyTimestamp::now();
     shard.plane.metadata().mux_stm.users().read(|users| {
@@ -98,7 +135,12 @@ pub(crate) fn verify_pat_credentials(
         if user.status != UserStatus::Active {
             return Err(LoginRegisterError::UserInactive);
         }
-        Ok(user.id)
+        // `expiry_at == None` is a never-expiring PAT; map it to `u64::MAX` so
+        // the HTTP session table never expiry-evicts its entry.
+        let expiry = pat
+            .expiry_at
+            .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
+        Ok((user.id, expiry))
     })
 }
 
@@ -144,7 +186,7 @@ pub(crate) async fn complete_login_register(
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id).await {
+    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
         Ok(session) => session,
         Err(error) => {
             return Err(LoginRegisterError::Transient(error));
