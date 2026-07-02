@@ -215,8 +215,7 @@ mongodb = { version = "3.7.0", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.51.0"
-once_cell = "1.21.4"
+octocrab = "0.53.0"
 opensearch = { version = "2.4.0", features = ["rustls-tls"], default-features = false }
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
