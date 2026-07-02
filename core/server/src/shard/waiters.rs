@@ -151,7 +151,10 @@ impl IggyShard {
         namespace: IggyNamespace,
         timeout: Duration,
     ) -> Option<PollWaiterRegistration<'_>> {
-        let (id, receiver) = self.poll_waiters.borrow_mut().register(namespace, timeout)?;
+        let (id, receiver) = self
+            .poll_waiters
+            .borrow_mut()
+            .register(namespace, timeout)?;
         Some(PollWaiterRegistration {
             namespace,
             id,
@@ -165,7 +168,9 @@ impl IggyShard {
     }
 
     pub(crate) fn wake_topic_poll_waiters(&self, stream_id: usize, topic_id: usize) {
-        self.poll_waiters.borrow_mut().wake_topic(stream_id, topic_id);
+        self.poll_waiters
+            .borrow_mut()
+            .wake_topic(stream_id, topic_id);
     }
 
     pub(crate) fn wake_stream_poll_waiters(&self, stream_id: usize) {
