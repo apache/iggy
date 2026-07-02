@@ -300,6 +300,20 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_values_are_is_zero() {
+        for input in &["0", "0s", "unlimited", "disabled", "none"] {
+            let d: IggyDuration = input.parse().unwrap();
+            assert!(d.is_zero(), "\"{input}\" should be is_zero()");
+        }
+    }
+
+    #[test]
+    fn test_nonzero_value_is_not_zero() {
+        let d: IggyDuration = "30s".parse().unwrap();
+        assert!(!d.is_zero());
+    }
+
+    #[test]
     fn test_add_duration() {
         let iggy_duration1: IggyDuration = "6s".parse().unwrap();
         let iggy_duration2: IggyDuration = "1m".parse().unwrap();

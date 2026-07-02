@@ -31,6 +31,7 @@ pub struct QuicConnectionStringOptions {
     max_idle_timeout: u64,
     validate_certificate: bool,
     heartbeat_interval: IggyDuration,
+    request_timeout: IggyDuration,
 }
 
 impl QuicConnectionStringOptions {
@@ -73,6 +74,10 @@ impl QuicConnectionStringOptions {
     pub fn validate_certificate(&self) -> bool {
         self.validate_certificate
     }
+
+    pub fn request_timeout(&self) -> IggyDuration {
+        self.request_timeout
+    }
 }
 
 impl ConnectionStringOptions for QuicConnectionStringOptions {
@@ -96,6 +101,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
         let mut max_idle_timeout = 10000;
         let mut validate_certificate = false;
         let mut heartbeat_interval = "5s".to_owned();
+        let mut request_timeout = "30s".to_owned();
 
         // For reconnection config
         let mut reconnection_max_retries = "unlimited".to_owned();
@@ -178,6 +184,9 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                 "heartbeat_interval" => {
                     heartbeat_interval = option_parts[1].to_string();
                 }
+                "request_timeout" => {
+                    request_timeout = option_parts[1].to_string();
+                }
                 "reconnection_max_retries" => {
                     reconnection_max_retries = option_parts[1].to_string();
                 }
@@ -211,6 +220,8 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
 
         let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
+        let request_timeout = IggyDuration::from_str(request_timeout.as_str())
+            .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options = QuicConnectionStringOptions::new(
             reconnection,
@@ -224,6 +235,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
             max_idle_timeout,
             validate_certificate,
             heartbeat_interval,
+            request_timeout,
         );
 
         Ok(connection_string_options)
@@ -244,6 +256,7 @@ impl QuicConnectionStringOptions {
         max_idle_timeout: u64,
         validate_certificate: bool,
         heartbeat_interval: IggyDuration,
+        request_timeout: IggyDuration,
     ) -> Self {
         Self {
             reconnection,
@@ -257,6 +270,7 @@ impl QuicConnectionStringOptions {
             max_idle_timeout,
             validate_certificate,
             heartbeat_interval,
+            request_timeout,
         }
     }
 }
@@ -275,6 +289,7 @@ impl Default for QuicConnectionStringOptions {
             max_idle_timeout: 10000,
             validate_certificate: false,
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
         }
     }
 }

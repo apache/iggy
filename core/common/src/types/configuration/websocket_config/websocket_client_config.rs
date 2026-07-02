@@ -33,6 +33,8 @@ pub struct WebSocketClientConfig {
     pub reconnection: WebSocketClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
     pub heartbeat_interval: IggyDuration,
+    /// Per-request timeout for send/receive operations.
+    pub request_timeout: IggyDuration,
     /// WebSocket-specific configuration.
     pub ws_config: WebSocketConfig,
     /// Whether tls is enabled
@@ -70,6 +72,7 @@ impl Default for WebSocketClientConfig {
             auto_login: AutoLogin::Disabled,
             reconnection: WebSocketClientReconnectionConfig::default(),
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
             ws_config: WebSocketConfig::default(),
             tls_enabled: false,
             tls_domain: "localhost".to_string(),
@@ -156,6 +159,7 @@ impl From<ConnectionString<WebSocketConnectionStringOptions>> for WebSocketClien
             auto_login: connection_string.auto_login().to_owned(),
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
+            request_timeout: connection_string.options().request_timeout(),
             ws_config,
             tls_enabled: options.tls_enabled(),
             tls_domain: options.tls_domain().into(),

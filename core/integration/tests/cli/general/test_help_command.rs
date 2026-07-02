@@ -190,6 +190,11 @@ Options:
 {CLAP_INDENT}
           [default: "1s"]
 
+      --request-timeout <REQUEST_TIMEOUT>
+          The optional per-request timeout for send/receive operations. Use "0", "unlimited", "disabled", or "none" to disable (infinite wait).
+{CLAP_INDENT}
+          [default: "30s"]
+
   -q, --quiet
           Quiet mode (disabled stdout printing)
 

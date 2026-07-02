@@ -101,6 +101,12 @@ impl TcpClientConfigBuilder {
         self
     }
 
+    /// Sets the per-request timeout for send/receive operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config.request_timeout = request_timeout;
+        self
+    }
+
     /// Builds the TCP client configuration.
     pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
         self.config.server_address = self.config.server_address.trim().to_owned();
@@ -114,6 +120,7 @@ impl TcpClientConfigBuilder {
 mod tests {
     use super::*;
     use crate::IggyError;
+    use std::str::FromStr;
 
     fn builder_with_address(addr: &str) -> TcpClientConfigBuilder {
         let mut builder = TcpClientConfigBuilder::default();
@@ -186,5 +193,17 @@ mod tests {
     fn docker_compose_service_name_should_succeed() {
         let builder = builder_with_address("iggy-server:8090");
         assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn with_request_timeout_should_override_default() {
+        let config = TcpClientConfigBuilder::default()
+            .with_request_timeout(IggyDuration::from_str("60s").unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.request_timeout,
+            IggyDuration::from_str("60s").unwrap()
+        );
     }
 }

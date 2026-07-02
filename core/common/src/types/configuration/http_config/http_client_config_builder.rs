@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{HttpClientConfig, IggyError, utils::net::validate_api_url};
+use crate::{HttpClientConfig, IggyDuration, IggyError, utils::net::validate_api_url};
 
 /// The builder for the `HttpClientConfig` configuration.
 /// Allows configuring the HTTP client with custom settings or using defaults:
 /// - `api_url`: Default is "http://127.0.0.1:3000"
 /// - `retries`: Default is 3.
+/// - `request_timeout`: Default is 30s.
 #[derive(Debug, Default)]
 pub struct HttpClientConfigBuilder {
     config: HttpClientConfig,
@@ -47,6 +48,12 @@ impl HttpClientConfigBuilder {
     /// Sets the JWT for A2A authentication.
     pub fn with_jwt(mut self, token: String) -> Self {
         self.config.jwt = Some(token);
+        self
+    }
+
+    /// Sets the per-request timeout for HTTP operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config.request_timeout = request_timeout;
         self
     }
 

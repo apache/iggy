@@ -655,12 +655,18 @@ impl QuicClient {
 
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
+        let request_timeout = self.config.request_timeout;
         #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
-        // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
-        tokio::spawn(async move {
-            let connection = connection.lock().await;
-            if let Some(connection) = connection.as_ref() {
+        let result = tokio::spawn(async move {
+            let guard = connection.lock().await;
+
+            let result = {
+                let Some(conn) = guard.as_ref() else {
+                    error!("Cannot send data. Client is not connected.");
+                    return Err(IggyError::NotConnected);
+                };
+
                 #[cfg(feature = "vsr")]
                 let (request_header, request_size) = {
                     let mut consensus_session = consensus_session
@@ -668,71 +674,99 @@ impl QuicClient {
                         .expect("consensus session mutex poisoned");
                     crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
-                #[cfg(not(feature = "vsr"))]
-                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-                let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-                    error!("Failed to open a bidirectional stream: {error}");
-                    IggyError::QuicError
-                })?;
-                trace!("Sending a QUIC request with code: {code}");
-                #[cfg(feature = "vsr")]
-                trace!(
-                    "Sending a QUIC VSR request of size {} with code: {code}",
-                    request_size
-                );
-                #[cfg(feature = "vsr")]
-                send.write_all(bytemuck::bytes_of(&request_header))
-                    .await
-                    .map_err(|error| {
-                        error!("Failed to write VSR request header: {error}");
+
+                let io = async move {
+                    #[cfg(not(feature = "vsr"))]
+                    let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                    let (mut send, mut recv) = conn.open_bi().await.map_err(|error| {
+                        error!("Failed to open a bidirectional stream: {error}");
                         IggyError::QuicError
                     })?;
-                #[cfg(feature = "vsr")]
-                if !payload.is_empty() {
+                    trace!("Sending a QUIC request with code: {code}");
+                    #[cfg(feature = "vsr")]
+                    trace!(
+                        "Sending a QUIC VSR request of size {} with code: {code}",
+                        request_size
+                    );
+                    #[cfg(feature = "vsr")]
+                    send.write_all(bytemuck::bytes_of(&request_header))
+                        .await
+                        .map_err(|error| {
+                            error!("Failed to write VSR request header: {error}");
+                            IggyError::QuicError
+                        })?;
+                    #[cfg(feature = "vsr")]
+                    if !payload.is_empty() {
+                        send.write_all(&payload).await.map_err(|error| {
+                            error!("Failed to write VSR request payload: {error}");
+                            IggyError::QuicError
+                        })?;
+                    }
+                    #[cfg(feature = "vsr")]
+                    send.finish().map_err(|error| {
+                        error!("Failed to finish VSR request stream: {error}");
+                        IggyError::QuicError
+                    })?;
+                    #[cfg(not(feature = "vsr"))]
+                    send.write_all(&(payload_length as u32).to_le_bytes())
+                        .await
+                        .map_err(|error| {
+                            error!("Failed to write payload length: {error}");
+                            IggyError::QuicError
+                        })?;
+                    #[cfg(not(feature = "vsr"))]
+                    send.write_all(&code.to_le_bytes()).await.map_err(|error| {
+                        error!("Failed to write payload code: {error}");
+                        IggyError::QuicError
+                    })?;
+                    #[cfg(not(feature = "vsr"))]
                     send.write_all(&payload).await.map_err(|error| {
-                        error!("Failed to write VSR request payload: {error}");
+                        error!("Failed to write payload: {error}");
                         IggyError::QuicError
                     })?;
+                    #[cfg(not(feature = "vsr"))]
+                    send.finish().map_err(|error| {
+                        error!("Failed to finish sending data: {error}");
+                        IggyError::QuicError
+                    })?;
+                    trace!("Sent a QUIC request with code: {code}, waiting for a response...");
+                    QuicClient::handle_response(&mut recv, response_buffer_size as usize).await
+                };
+
+                if request_timeout.is_zero() {
+                    io.await
+                } else {
+                    match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                        Ok(result) => result,
+                        Err(_) => Err(IggyError::RequestTimeout(request_timeout)),
+                    }
                 }
+            };
+
+            if matches!(&result, Err(IggyError::RequestTimeout(_))) {
                 #[cfg(feature = "vsr")]
-                send.finish().map_err(|error| {
-                    error!("Failed to finish VSR request stream: {error}");
-                    IggyError::QuicError
-                })?;
-                #[cfg(not(feature = "vsr"))]
-                send.write_all(&(payload_length as u32).to_le_bytes())
-                    .await
-                    .map_err(|error| {
-                        error!("Failed to write payload length: {error}");
-                        IggyError::QuicError
-                    })?;
-                #[cfg(not(feature = "vsr"))]
-                send.write_all(&code.to_le_bytes()).await.map_err(|error| {
-                    error!("Failed to write payload code: {error}");
-                    IggyError::QuicError
-                })?;
-                #[cfg(not(feature = "vsr"))]
-                send.write_all(&payload).await.map_err(|error| {
-                    error!("Failed to write payload: {error}");
-                    IggyError::QuicError
-                })?;
-                #[cfg(not(feature = "vsr"))]
-                send.finish().map_err(|error| {
-                    error!("Failed to finish sending data: {error}");
-                    IggyError::QuicError
-                })?;
-                trace!("Sent a QUIC request with code: {code}, waiting for a response...");
-                return QuicClient::handle_response(&mut recv, response_buffer_size as usize).await;
+                {
+                    consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned")
+                        .reset();
+                }
             }
 
-            error!("Cannot send data. Client is not connected.");
-            Err(IggyError::NotConnected)
+            result
         })
         .await
         .map_err(|e| {
             error!("Task execution failed during QUIC request: {}", e);
             IggyError::QuicError
-        })?
+        })?;
+
+        if matches!(&result, Err(IggyError::RequestTimeout(_))) {
+            self.connection.lock().await.take();
+            self.set_state(ClientState::Disconnected).await;
+            self.publish_event(DiagnosticEvent::Disconnected).await;
+        }
+        result
     }
 }
 
@@ -981,6 +1015,10 @@ mod tests {
             quic_client_config.heartbeat_interval,
             IggyDuration::from_str("5s").unwrap()
         );
+        assert_eq!(
+            quic_client_config.request_timeout,
+            IggyDuration::from_str("30s").unwrap()
+        );
 
         assert!(quic_client_config.reconnection.enabled);
         assert!(quic_client_config.reconnection.max_retries.is_none());
@@ -1152,5 +1190,114 @@ mod tests {
 
         let client = QuicClient::create(config);
         assert!(client.is_err());
+    }
+
+    fn make_quic_server_endpoint(addr: std::net::SocketAddr) -> quinn::Endpoint {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        quinn::Endpoint::server(server_config, addr).unwrap()
+    }
+
+    async fn make_stalling_quic_server() -> std::net::SocketAddr {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = make_quic_server_endpoint("127.0.0.1:0".parse().unwrap());
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let _conn = incoming.await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    async fn make_quic_client(
+        server_addr: std::net::SocketAddr,
+        request_timeout: &str,
+    ) -> QuicClient {
+        let config = QuicClientConfig {
+            server_address: server_addr.to_string(),
+            request_timeout: IggyDuration::from_str(request_timeout).unwrap(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config)).unwrap();
+        Client::connect(&client).await.unwrap();
+        client
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_disconnect_and_null_connection_on_request_timeout() {
+        let addr = make_stalling_quic_server().await;
+        let client = make_quic_client(addr, "100ms").await;
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(client.connection.lock().await.is_none());
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_not_timeout_when_request_timeout_is_zero() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = make_quic_server_endpoint("127.0.0.1:0".parse().unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(64 * 1024).await.unwrap();
+            let response: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+            send.write_all(&response).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+        });
+
+        let client = make_quic_client(server_addr, "0").await;
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "vsr")]
+    #[tokio::test]
+    async fn should_reset_vsr_session_on_request_timeout() {
+        use iggy_binary_protocol::codes::CREATE_STREAM_CODE;
+
+        let addr = make_stalling_quic_server().await;
+        let client = make_quic_client(addr, "100ms").await;
+
+        let client_id = {
+            let mut session = client.consensus_session.lock().unwrap();
+            let _ = session.register_request_id();
+            session.bind(10);
+            let _ = session.next_request_id();
+            let _ = session.next_request_id();
+            assert!(session.is_bound());
+            assert_eq!(session.current_request_id(), 3);
+            session.client_id()
+        };
+
+        let result = client.send_raw(CREATE_STREAM_CODE, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        let session = client.consensus_session.lock().unwrap();
+        assert!(!session.is_bound());
+        assert_eq!(session.current_request_id(), 1);
+        assert_eq!(session.client_id(), client_id);
     }
 }

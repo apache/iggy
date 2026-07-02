@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::Identifier;
+use crate::IggyDuration;
 use crate::utils::topic_size::MaxTopicSize;
 use crate::{IggyMessage, utils::byte_size::IggyByteSize};
 use std::sync::Arc;
@@ -508,6 +509,8 @@ pub enum IggyError {
     CannotBindToSocket(String) = 12000,
     #[error("Task execution timeout")]
     TaskTimeout = 12001,
+    #[error("Request timeout after {0}")]
+    RequestTimeout(IggyDuration) = 12002,
 
     #[error("IO error: {0}")]
     IoError(String) = 13000,

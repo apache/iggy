@@ -218,6 +218,14 @@ pub struct ArgsOptional {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_reconnection_interval: Option<String>,
+
+    /// The optional per-request timeout for send/receive operations.
+    /// Use "0", "unlimited", "disabled", or "none" to disable (infinite wait).
+    ///
+    /// [default: "30s"]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<String>,
 }
 
 /// The arguments used by the `ClientProviderConfig` to create a client.
@@ -351,6 +359,9 @@ pub struct Args {
 
     /// The optional TLS validate certificate for the WebSocket transport
     pub websocket_tls_validate_certificate: bool,
+
+    /// The per-request timeout for send/receive operations
+    pub request_timeout: String,
 }
 
 const QUIC_TRANSPORT: &str = "quic";
@@ -416,6 +427,7 @@ impl Default for Args {
             websocket_tls_domain: "localhost".to_string(),
             websocket_tls_ca_file: None,
             websocket_tls_validate_certificate: false,
+            request_timeout: "30s".to_string(),
         }
     }
 }
@@ -516,6 +528,9 @@ impl From<Vec<ArgsOptional>> for Args {
                 optional_args.websocket_reconnection_interval
             {
                 args.websocket_reconnection_interval = websocket_reconnection_interval;
+            }
+            if let Some(request_timeout) = optional_args.request_timeout {
+                args.request_timeout = request_timeout;
             }
         }
 

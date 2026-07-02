@@ -54,6 +54,8 @@ pub struct QuicClientConfig {
     pub validate_certificate: bool,
     /// Interval of heartbeats sent by the client
     pub heartbeat_interval: IggyDuration,
+    /// Per-request timeout for send/receive operations.
+    pub request_timeout: IggyDuration,
 }
 
 impl Default for QuicClientConfig {
@@ -64,6 +66,7 @@ impl Default for QuicClientConfig {
             server_name: "localhost".to_string(),
             auto_login: AutoLogin::Disabled,
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
             reconnection: QuicClientReconnectionConfig::default(),
             response_buffer_size: 1000 * 1000 * 10,
             max_concurrent_bidi_streams: 10000,
@@ -96,6 +99,7 @@ impl From<ConnectionString<QuicConnectionStringOptions>> for QuicClientConfig {
             max_idle_timeout: connection_string.options().max_idle_timeout(),
             validate_certificate: connection_string.options().validate_certificate(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
+            request_timeout: connection_string.options().request_timeout(),
         }
     }
 }

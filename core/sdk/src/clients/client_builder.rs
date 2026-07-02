@@ -219,6 +219,12 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets the per-request timeout for send/receive operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config = self.config.with_request_timeout(request_timeout);
+        self
+    }
+
     /// Builds the parent `IggyClient` with TCP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = TcpClient::create(Arc::new(self.config.build()?))?;
@@ -277,6 +283,12 @@ impl QuicClientBuilder {
         self
     }
 
+    /// Sets the per-request timeout for send/receive operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config = self.config.with_request_timeout(request_timeout);
+        self
+    }
+
     /// Builds the parent `IggyClient` with QUIC configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = QuicClient::create(Arc::new(self.config.build()?))?;
@@ -310,6 +322,12 @@ impl HttpClientBuilder {
     /// Sets the JWT for A2A (Agent-to-Agent) authentication.
     pub fn with_jwt(mut self, token: String) -> Self {
         self.config = self.config.with_jwt(token);
+        self
+    }
+
+    /// Sets the per-request timeout for HTTP operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config = self.config.with_request_timeout(request_timeout);
         self
     }
 
@@ -387,6 +405,12 @@ impl WebSocketClientBuilder {
         self.config = self
             .config
             .with_tls_validate_certificate(tls_validate_certificate);
+        self
+    }
+
+    /// Sets the per-request timeout for send/receive operations.
+    pub fn with_request_timeout(mut self, request_timeout: IggyDuration) -> Self {
+        self.config = self.config.with_request_timeout(request_timeout);
         self
     }
 

@@ -148,6 +148,18 @@ impl ConsensusSession {
     pub fn current_request_id(&self) -> u64 {
         self.request_counter
     }
+
+    /// Reset session state while preserving the `client_id`.
+    ///
+    /// Used on request timeout where the server may have committed the
+    /// timed-out operation. A fresh `client_id` would bypass server-side
+    /// dedup on retry; keeping the same one lets the server detect the
+    /// duplicate.
+    pub fn reset(&mut self) {
+        self.session = None;
+        self.request_counter = 1;
+        self.register_consumed = false;
+    }
 }
 
 impl Default for ConsensusSession {
@@ -244,5 +256,21 @@ mod tests {
     fn with_client_id_deterministic() {
         let session = ConsensusSession::with_client_id(0xDEAD_BEEF);
         assert_eq!(session.client_id(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn reset_preserves_client_id() {
+        let mut session = ConsensusSession::with_client_id(42);
+        let _ = session.register_request_id();
+        session.bind(10);
+        let _ = session.next_request_id();
+        let _ = session.next_request_id();
+
+        let client_id = session.client_id();
+        session.reset();
+
+        assert_eq!(session.client_id(), client_id);
+        assert!(!session.is_bound());
+        assert_eq!(session.current_request_id(), 1);
     }
 }

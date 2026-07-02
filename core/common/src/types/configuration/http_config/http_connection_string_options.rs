@@ -21,6 +21,7 @@ use std::str::FromStr;
 #[derive(Debug)]
 pub struct HttpConnectionStringOptions {
     heartbeat_interval: IggyDuration,
+    request_timeout: IggyDuration,
     retries: u32,
 }
 
@@ -36,6 +37,7 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
     fn parse_options(options: &str) -> Result<HttpConnectionStringOptions, IggyError> {
         let options = options.split('&').collect::<Vec<&str>>();
         let mut heartbeat_interval = "5s".to_owned();
+        let mut request_timeout = "30s".to_owned();
         let mut retries = 3;
 
         for option in options {
@@ -46,6 +48,9 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
             match option_parts[0] {
                 "heartbeat_interval" => {
                     heartbeat_interval = option_parts[1].to_string();
+                }
+                "request_timeout" => {
+                    request_timeout = option_parts[1].to_string();
                 }
                 "retries" => {
                     retries = option_parts[1]
@@ -60,19 +65,30 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
 
         let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
+        let request_timeout = IggyDuration::from_str(request_timeout.as_str())
+            .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options =
-            HttpConnectionStringOptions::new(heartbeat_interval, retries);
+            HttpConnectionStringOptions::new(heartbeat_interval, request_timeout, retries);
         Ok(connection_string_options)
     }
 }
 
 impl HttpConnectionStringOptions {
-    pub fn new(heartbeat_interval: IggyDuration, retries: u32) -> Self {
+    pub fn new(
+        heartbeat_interval: IggyDuration,
+        request_timeout: IggyDuration,
+        retries: u32,
+    ) -> Self {
         Self {
             heartbeat_interval,
+            request_timeout,
             retries,
         }
+    }
+
+    pub fn request_timeout(&self) -> IggyDuration {
+        self.request_timeout
     }
 }
 
@@ -80,6 +96,7 @@ impl Default for HttpConnectionStringOptions {
     fn default() -> Self {
         Self {
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
             retries: 3,
         }
     }

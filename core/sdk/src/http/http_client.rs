@@ -294,10 +294,18 @@ impl HttpClient {
         validate_api_url(&config.api_url)?;
         let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
-        let client = ClientBuilder::new(reqwest::Client::new())
-            .with(TracingMiddleware::<SpanBackendWithUrl>::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
+        let mut reqwest_builder = reqwest::Client::builder();
+        if !config.request_timeout.is_zero() {
+            reqwest_builder = reqwest_builder.timeout(config.request_timeout.get_duration());
+        }
+        let client = ClientBuilder::new(
+            reqwest_builder
+                .build()
+                .map_err(|_| IggyError::InvalidConfiguration)?,
+        )
+        .with(TracingMiddleware::<SpanBackendWithUrl>::new())
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build();
 
         let access_token = config.jwt.clone().unwrap_or_default();
 
@@ -569,5 +577,52 @@ mod tests {
 
         let http_client = HttpClient::create(config);
         assert!(http_client.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_timeout_when_server_does_not_respond() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let config = Arc::new(HttpClientConfig {
+            api_url: format!("http://{addr}"),
+            request_timeout: IggyDuration::from_str("100ms").unwrap(),
+            retries: 0,
+            ..Default::default()
+        });
+        let client = HttpClient::create(config).unwrap();
+        let result = client.get("/ping").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_not_timeout_when_request_timeout_is_zero() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n";
+            stream.write_all(response).await.unwrap();
+        });
+
+        let config = Arc::new(HttpClientConfig {
+            api_url: format!("http://{addr}"),
+            request_timeout: IggyDuration::from_str("0").unwrap(),
+            retries: 0,
+            ..Default::default()
+        });
+        let client = HttpClient::create(config).unwrap();
+        let result = client.get("/ping").await;
+        assert!(result.is_ok());
     }
 }
