@@ -16,25 +16,23 @@
 # under the License.
 
 [package]
-name = "configs"
+name = "shard_allocator"
 version = "0.1.0"
+description = "CPU and NUMA shard allocation for the iggy server, backed by hwloc."
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
-configs_derive = { workspace = true }
 cpu_allocation = { workspace = true }
-derive_more = { workspace = true }
-err_trail = { workspace = true }
-figment = { workspace = true }
-iggy_common = { workspace = true }
-jsonwebtoken = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_with = { workspace = true }
-server_common = { workspace = true }
-static-toml = { workspace = true }
-strum = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }
+
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+hwlocality = { workspace = true }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+hwlocality = { workspace = true, features = ["vendored"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }

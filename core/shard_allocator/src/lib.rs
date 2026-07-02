@@ -15,7 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::sharding::{CpuAllocation, NumaConfig};
+//! `shard_allocator`: decide which CPU cores each shard lives on.
+//!
+//! The server makes many shards and wants each one to run on its own
+//! core so they do not fight over CPU time. This crate reads the
+//! operator's choice ([`CpuAllocation`] from the config), looks at the
+//! real machine with `hwloc`, and hands back one [`ShardInfo`] per
+//! shard. On Linux it also pins each shard's thread to its core and
+//! pins memory to the right NUMA node, so memory stays close and fast.
+
+use cpu_allocation::{CpuAllocation, NumaConfig};
 use hwlocality::Topology;
 use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
@@ -28,6 +37,9 @@ use std::sync::Arc;
 use std::thread::available_parallelism;
 use tracing::info;
 
+/// All the ways shard allocation can go wrong: machine has no NUMA,
+/// hwloc cannot read the topology, the operator asked for more cores
+/// than exist, or the OS refused to pin a thread or its memory.
 #[derive(Debug, thiserror::Error)]
 pub enum ShardingError {
     #[error("Failed to detect topology: {msg}")]
@@ -56,6 +68,10 @@ pub enum ShardingError {
     Other { msg: String },
 }
 
+/// A snapshot of the machine's NUMA layout, read once from `hwloc`.
+///
+/// Holds how many NUMA nodes there are and, for each node, how many
+/// real (physical) cores and how many threads (logical cores) it has.
 #[derive(Debug)]
 pub struct NumaTopology {
     topology: Topology,
@@ -65,6 +81,8 @@ pub struct NumaTopology {
 }
 
 impl NumaTopology {
+    /// Ask `hwloc` to read this machine's NUMA layout right now.
+    /// Errors if hwloc fails or the machine reports no NUMA nodes.
     pub fn detect() -> Result<NumaTopology, ShardingError> {
         let topology =
             Topology::new().map_err(|e| ShardingError::TopologyDetection { msg: e.to_string() })?;
@@ -110,10 +128,13 @@ impl NumaTopology {
         })
     }
 
+    /// How many real cores this node has. Returns `0` if no such node.
     pub fn physical_cores_for_node(&self, node: usize) -> usize {
         self.physical_cores_per_node.get(node).copied().unwrap_or(0)
     }
 
+    /// How many threads (logical cores) this node has, hyperthreads
+    /// included. Returns `0` if no such node.
     pub fn logical_cores_for_node(&self, node: usize) -> usize {
         self.logical_cores_per_node.get(node).copied().unwrap_or(0)
     }
@@ -161,6 +182,8 @@ impl NumaTopology {
     }
 }
 
+/// One shard's home: which CPU cores it may run on, and which NUMA
+/// node its memory should sit near (`None` means do not pin memory).
 #[derive(Debug, Clone)]
 pub struct ShardInfo {
     pub cpu_set: HashSet<usize>,
@@ -168,6 +191,8 @@ pub struct ShardInfo {
 }
 
 impl ShardInfo {
+    /// Pin the calling thread to this shard's cores. On non-Linux this
+    /// does nothing (no-op). Empty core set also does nothing.
     pub fn bind_cpu(&self) -> Result<(), ShardingError> {
         #[cfg(target_os = "linux")]
         {
@@ -196,6 +221,8 @@ impl ShardInfo {
         Ok(())
     }
 
+    /// Pin the calling thread's memory to this shard's NUMA node so
+    /// allocations stay local and fast. Does nothing if no node is set.
     pub fn bind_memory(&self) -> Result<(), ShardingError> {
         if let Some(node_id) = self.numa_node {
             let topology = Topology::new().map_err(|err| ShardingError::TopologyDetection {
@@ -230,12 +257,16 @@ impl ShardInfo {
     }
 }
 
+/// Turns the operator's [`CpuAllocation`] choice into a concrete plan
+/// of shards. Reads the NUMA topology only when the choice needs it.
 pub struct ShardAllocator {
     allocation: CpuAllocation,
     topology: Option<Arc<NumaTopology>>,
 }
 
 impl ShardAllocator {
+    /// Build an allocator for the given choice. Only `NumaAware` reads
+    /// the machine topology up front; the simpler modes do not.
     pub fn new(allocation: &CpuAllocation) -> Result<ShardAllocator, ShardingError> {
         let topology = if matches!(allocation, CpuAllocation::NumaAware(_)) {
             let numa_topology = NumaTopology::detect()?;
@@ -251,6 +282,8 @@ impl ShardAllocator {
         })
     }
 
+    /// Produce the final list of shards, one [`ShardInfo`] each, based
+    /// on the chosen [`CpuAllocation`]. This is the main entry point.
     pub fn to_shard_assignments(&self) -> Result<Vec<ShardInfo>, ShardingError> {
         match &self.allocation {
             CpuAllocation::All => {

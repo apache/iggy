@@ -90,6 +90,7 @@ send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 server_common = { workspace = true }
+shard_allocator = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
@@ -104,12 +105,6 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
-
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-hwlocality = { workspace = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 vergen-git2 = { workspace = true }

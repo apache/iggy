@@ -149,6 +149,7 @@ serde = { workspace = true }
 server = { workspace = true }
 server_common = { workspace = true }
 shard = { workspace = true }
+shard_allocator = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }

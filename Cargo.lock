@@ -3152,6 +3152,7 @@ name = "configs"
 version = "0.1.0"
 dependencies = [
  "configs_derive",
+ "cpu_allocation",
  "derive_more",
  "err_trail",
  "figment",
@@ -3343,6 +3344,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "cpu_allocation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -11683,7 +11692,6 @@ dependencies = [
  "futures",
  "hash32 1.0.0",
  "human-repr",
- "hwlocality",
  "iggy_binary_protocol",
  "iggy_common",
  "jsonwebtoken",
@@ -11710,6 +11718,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server_common",
+ "shard_allocator",
  "slab",
  "socket2 0.6.4",
  "strum 0.28.0",
@@ -11791,6 +11800,7 @@ dependencies = [
  "server",
  "server_common",
  "shard",
+ "shard_allocator",
  "slab",
  "socket2 0.6.4",
  "strum 0.28.0",
@@ -11910,6 +11920,17 @@ dependencies = [
  "partitions",
  "prometheus-client",
  "server_common",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "shard_allocator"
+version = "0.1.0"
+dependencies = [
+ "cpu_allocation",
+ "hwlocality",
+ "nix",
  "thiserror 2.0.18",
  "tracing",
 ]
