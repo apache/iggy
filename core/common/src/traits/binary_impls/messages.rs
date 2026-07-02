@@ -42,11 +42,19 @@ use iggy_binary_protocol::requests::messages::{
 };
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+use std::time::Duration;
 
 /// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
 /// coordinator rejects a stale assignment, then retry once.
 #[cfg(feature = "vsr")]
 const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
+
+fn duration_to_wait_timeout_us(wait_timeout: Duration) -> Result<u64, IggyError> {
+    wait_timeout
+        .as_micros()
+        .try_into()
+        .map_err(|_| IggyError::InvalidNumberValue)
+}
 
 #[cfg(feature = "vsr")]
 fn group_cache_key(stream_id: &Identifier, topic_id: &Identifier, group_id: &Identifier) -> String {
@@ -188,6 +196,7 @@ async fn poll_group_messages<B: BinaryClient>(
     strategy: &PollingStrategy,
     count: u32,
     auto_commit: bool,
+    wait_timeout_us: u64,
 ) -> Result<PolledMessages, IggyError> {
     let key = group_cache_key(stream_id, topic_id, &consumer.id);
     if !client.consumer_group_state().has_assignment(&key) {
@@ -206,6 +215,7 @@ async fn poll_group_messages<B: BinaryClient>(
             strategy: polling_strategy_to_wire(strategy),
             count,
             auto_commit,
+            wait_timeout_us,
         };
         match client
             .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
@@ -253,7 +263,32 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_timeout(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            count,
+            auto_commit,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_timeout(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        wait_timeout: Duration,
+    ) -> Result<PolledMessages, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wait_timeout_us = duration_to_wait_timeout_us(wait_timeout)?;
         // VSR: a consumer-group poll without an explicit partition is resolved
         // client-side from the member's cached assignment (the broker routes
         // explicit partitions only).
@@ -267,6 +302,7 @@ impl<B: BinaryClient> MessageClient for B {
                 strategy,
                 count,
                 auto_commit,
+                wait_timeout_us,
             )
             .await;
         }
@@ -278,6 +314,7 @@ impl<B: BinaryClient> MessageClient for B {
             strategy: polling_strategy_to_wire(strategy),
             count,
             auto_commit,
+            wait_timeout_us,
         };
         let response = self
             .send_raw_with_response(POLL_MESSAGES_CODE, req.to_bytes())
