@@ -31,7 +31,7 @@ use iggy_common::{
 };
 use server_common::PooledBuffer;
 use server_common::sharding::IggyNamespace;
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, time::Duration};
 use tracing::error;
 
 impl IggyShard {
@@ -682,14 +682,25 @@ pub struct PollingArgs {
     pub strategy: PollingStrategy,
     pub count: u32,
     pub auto_commit: bool,
+    pub wait_timeout: Duration,
 }
 
 impl PollingArgs {
     pub fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
+        Self::with_wait_timeout(strategy, count, auto_commit, Duration::ZERO)
+    }
+
+    pub fn with_wait_timeout(
+        strategy: PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        wait_timeout: Duration,
+    ) -> Self {
         Self {
             strategy,
             count,
             auto_commit,
+            wait_timeout,
         }
     }
 }
