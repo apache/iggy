@@ -708,11 +708,12 @@ fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
     IggyError::StreamIdNotFound(wire_id_to_identifier(stream_id).unwrap_or_default())
 }
 
-/// Typed miss for a read's parent topic; see [`stream_not_found`].
+/// Typed miss for a read's parent topic; see [`stream_not_found`]. The variant's
+/// display order is (topic, stream).
 fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> IggyError {
     IggyError::TopicIdNotFound(
-        wire_id_to_identifier(stream_id).unwrap_or_default(),
         wire_id_to_identifier(topic_id).unwrap_or_default(),
+        wire_id_to_identifier(stream_id).unwrap_or_default(),
     )
 }
 
