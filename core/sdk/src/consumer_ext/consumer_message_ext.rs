@@ -118,7 +118,8 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                 IggyError::InvalidServerAddress |
                                 IggyError::InvalidClientAddress |
                                 IggyError::NotConnected |
-                                IggyError::ClientShutdown => {
+                                IggyError::ClientShutdown |
+                                IggyError::RequestTimeout(_) => {
                                     error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
                                         name = self.name(), topic = self.topic(), stream = self.stream());
                                     return Err(err);

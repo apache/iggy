@@ -6595,6 +6595,7 @@ dependencies = [
  "iggy_common",
  "mockall",
  "quinn",
+ "rcgen",
  "reqwest 0.13.4",
  "reqwest-middleware",
  "reqwest-retry",

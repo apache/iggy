@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionString, ConnectionStringOptions, HttpConnectionStringOptions};
+use crate::{ConnectionString, ConnectionStringOptions, HttpConnectionStringOptions, IggyDuration};
+use std::str::FromStr;
 
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct HttpClientConfig {
     pub retries: u32,
     /// The JWT for A2A authentication.
     pub jwt: Option<String>,
+    /// The per-request timeout for HTTP operations.
+    pub request_timeout: IggyDuration,
 }
 
 impl Default for HttpClientConfig {
@@ -34,6 +37,7 @@ impl Default for HttpClientConfig {
             api_url: "http://127.0.0.1:3000".to_string(),
             retries: 3,
             jwt: None,
+            request_timeout: IggyDuration::from_str("30s").unwrap(),
         }
     }
 }
@@ -44,6 +48,7 @@ impl From<ConnectionString<HttpConnectionStringOptions>> for HttpClientConfig {
             api_url: format!("http://{}", connection_string.server_address()),
             retries: connection_string.options().retries().unwrap(),
             jwt: None,
+            request_timeout: connection_string.options().request_timeout(),
         }
     }
 }

@@ -62,3 +62,4 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
+rcgen = { workspace = true }

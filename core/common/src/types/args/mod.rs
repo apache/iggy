@@ -219,7 +219,8 @@ pub struct ArgsOptional {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_reconnection_interval: Option<String>,
 
-    /// The optional per-request timeout for send/receive operations
+    /// The optional per-request timeout for send/receive operations.
+    /// Use "0", "unlimited", "disabled", or "none" to disable (infinite wait).
     ///
     /// [default: "30s"]
     #[arg(long)]

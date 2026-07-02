@@ -131,6 +131,7 @@ impl ClientProviderConfig {
                     api_url: args.http_api_url,
                     retries: args.http_retries,
                     jwt: None,
+                    request_timeout: parse_duration(&args.request_timeout)?,
                 }));
             }
             TransportProtocol::Tcp => {

@@ -658,20 +658,27 @@ impl QuicClient {
         let request_timeout = self.config.request_timeout;
         #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
-        tokio::spawn(async move {
-            let io = async {
-                let connection = connection.lock().await;
-                if let Some(connection) = connection.as_ref() {
-                    #[cfg(feature = "vsr")]
-                    let (request_header, request_size) = {
-                        let mut consensus_session = consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned");
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
-                    };
+        let result = tokio::spawn(async move {
+            let guard = connection.lock().await;
+
+            let result = {
+                let Some(conn) = guard.as_ref() else {
+                    error!("Cannot send data. Client is not connected.");
+                    return Err(IggyError::NotConnected);
+                };
+
+                #[cfg(feature = "vsr")]
+                let (request_header, request_size) = {
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                };
+
+                let io = async move {
                     #[cfg(not(feature = "vsr"))]
                     let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-                    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
+                    let (mut send, mut recv) = conn.open_bi().await.map_err(|error| {
                         error!("Failed to open a bidirectional stream: {error}");
                         IggyError::QuicError
                     })?;
@@ -723,37 +730,43 @@ impl QuicClient {
                         IggyError::QuicError
                     })?;
                     trace!("Sent a QUIC request with code: {code}, waiting for a response...");
-                    return QuicClient::handle_response(&mut recv, response_buffer_size as usize)
-                        .await;
-                }
+                    QuicClient::handle_response(&mut recv, response_buffer_size as usize).await
+                };
 
-                error!("Cannot send data. Client is not connected.");
-                Err(IggyError::NotConnected)
-            };
-
-            if request_timeout.is_zero() {
-                io.await
-            } else {
-                match tokio::time::timeout(request_timeout.get_duration(), io).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        #[cfg(feature = "vsr")]
-                        {
-                            *consensus_session
-                                .lock()
-                                .expect("consensus session mutex poisoned") =
-                                ConsensusSession::new();
-                        }
-                        Err(IggyError::RequestTimeout(request_timeout))
+                if request_timeout.is_zero() {
+                    io.await
+                } else {
+                    match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                        Ok(result) => result,
+                        Err(_) => Err(IggyError::RequestTimeout(request_timeout)),
                     }
                 }
+            };
+
+            if matches!(&result, Err(IggyError::RequestTimeout(_))) {
+                #[cfg(feature = "vsr")]
+                {
+                    consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned")
+                        .reset();
+                }
             }
+
+            result
         })
         .await
         .map_err(|e| {
             error!("Task execution failed during QUIC request: {}", e);
             IggyError::QuicError
-        })?
+        })?;
+
+        if matches!(&result, Err(IggyError::RequestTimeout(_))) {
+            self.connection.lock().await.take();
+            self.set_state(ClientState::Disconnected).await;
+            self.publish_event(DiagnosticEvent::Disconnected).await;
+        }
+        result
     }
 }
 
@@ -1177,5 +1190,114 @@ mod tests {
 
         let client = QuicClient::create(config);
         assert!(client.is_err());
+    }
+
+    fn make_quic_server_endpoint(addr: std::net::SocketAddr) -> quinn::Endpoint {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
+
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        quinn::Endpoint::server(server_config, addr).unwrap()
+    }
+
+    async fn make_stalling_quic_server() -> std::net::SocketAddr {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = make_quic_server_endpoint("127.0.0.1:0".parse().unwrap());
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let _conn = incoming.await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    async fn make_quic_client(
+        server_addr: std::net::SocketAddr,
+        request_timeout: &str,
+    ) -> QuicClient {
+        let config = QuicClientConfig {
+            server_address: server_addr.to_string(),
+            request_timeout: IggyDuration::from_str(request_timeout).unwrap(),
+            ..Default::default()
+        };
+        let client = QuicClient::create(Arc::new(config)).unwrap();
+        Client::connect(&client).await.unwrap();
+        client
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_disconnect_and_null_connection_on_request_timeout() {
+        let addr = make_stalling_quic_server().await;
+        let client = make_quic_client(addr, "100ms").await;
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(client.connection.lock().await.is_none());
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_not_timeout_when_request_timeout_is_zero() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = make_quic_server_endpoint("127.0.0.1:0".parse().unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let incoming = server.accept().await.unwrap();
+            let conn = incoming.await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(64 * 1024).await.unwrap();
+            let response: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+            send.write_all(&response).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+        });
+
+        let client = make_quic_client(server_addr, "0").await;
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "vsr")]
+    #[tokio::test]
+    async fn should_reset_vsr_session_on_request_timeout() {
+        use iggy_binary_protocol::codes::CREATE_STREAM_CODE;
+
+        let addr = make_stalling_quic_server().await;
+        let client = make_quic_client(addr, "100ms").await;
+
+        let client_id = {
+            let mut session = client.consensus_session.lock().unwrap();
+            let _ = session.register_request_id();
+            session.bind(10);
+            let _ = session.next_request_id();
+            let _ = session.next_request_id();
+            assert!(session.is_bound());
+            assert_eq!(session.current_request_id(), 3);
+            session.client_id()
+        };
+
+        let result = client.send_raw(CREATE_STREAM_CODE, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        let session = client.consensus_session.lock().unwrap();
+        assert!(!session.is_bound());
+        assert_eq!(session.current_request_id(), 1);
+        assert_eq!(session.client_id(), client_id);
     }
 }

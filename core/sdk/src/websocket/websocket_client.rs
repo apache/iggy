@@ -664,8 +664,9 @@ impl WebSocketClient {
             ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {}
         }
 
-        let io = async {
-            let mut stream_guard = self.stream.lock().await;
+        let mut stream_guard = self.stream.lock().await;
+
+        let result = {
             let stream = stream_guard.as_mut().ok_or_else(|| {
                 trace!("Cannot send data. Client is not connected.");
                 IggyError::NotConnected
@@ -702,107 +703,115 @@ impl WebSocketClient {
                 request.len()
             );
 
-            stream.write(&request).await?;
-            stream.flush().await?;
+            let io = async move {
+                stream.write(&request).await?;
+                stream.flush().await?;
 
-            #[cfg(feature = "vsr")]
-            {
-                let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                stream.read(&mut response_header).await?;
+                #[cfg(feature = "vsr")]
+                {
+                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                    stream.read(&mut response_header).await?;
 
-                let response_size = crate::vsr::response_size(&response_header)?;
-                let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                let body = if body_size > 0 {
-                    let mut body = vec![0u8; body_size];
-                    stream.read(&mut body).await?;
-                    Bytes::from(body)
-                } else {
-                    Bytes::new()
-                };
-
-                crate::vsr::decode_response_split(&response_header, body)
-            }
-
-            #[cfg(not(feature = "vsr"))]
-            {
-                let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-                stream.read(&mut response_initial_buffer).await?;
-
-                let status = u32::from_le_bytes([
-                    response_initial_buffer[0],
-                    response_initial_buffer[1],
-                    response_initial_buffer[2],
-                    response_initial_buffer[3],
-                ]);
-
-                let length = u32::from_le_bytes([
-                    response_initial_buffer[4],
-                    response_initial_buffer[5],
-                    response_initial_buffer[6],
-                    response_initial_buffer[7],
-                ]) as usize;
-
-                trace!(
-                    "Received {NAME} response status: {}, length: {} bytes",
-                    status, length
-                );
-
-                if status != 0 {
-                    // TEMP: See https://github.com/apache/iggy/pull/604 for context.
-                    if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
-                        || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
-                        || status == IggyErrorDiscriminants::UserAlreadyExists as u32
-                        || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
-                        || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
-                    {
-                        debug!(
-                            "Received a server resource already exists response: {} ({})",
-                            status,
-                            IggyError::from_code_as_string(status)
-                        )
+                    let response_size = crate::vsr::response_size(&response_header)?;
+                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    let body = if body_size > 0 {
+                        let mut body = vec![0u8; body_size];
+                        stream.read(&mut body).await?;
+                        Bytes::from(body)
                     } else {
-                        error!(
-                            "Received an invalid response with status: {} ({}).",
-                            status,
-                            IggyError::from_code_as_string(status),
-                        );
+                        Bytes::new()
+                    };
+
+                    crate::vsr::decode_response_split(&response_header, body)
+                }
+
+                #[cfg(not(feature = "vsr"))]
+                {
+                    let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                    stream.read(&mut response_initial_buffer).await?;
+
+                    let status = u32::from_le_bytes([
+                        response_initial_buffer[0],
+                        response_initial_buffer[1],
+                        response_initial_buffer[2],
+                        response_initial_buffer[3],
+                    ]);
+
+                    let length = u32::from_le_bytes([
+                        response_initial_buffer[4],
+                        response_initial_buffer[5],
+                        response_initial_buffer[6],
+                        response_initial_buffer[7],
+                    ]) as usize;
+
+                    trace!(
+                        "Received {NAME} response status: {}, length: {} bytes",
+                        status, length
+                    );
+
+                    if status != 0 {
+                        // TEMP: See https://github.com/apache/iggy/pull/604 for context.
+                        if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
+                            || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
+                            || status == IggyErrorDiscriminants::UserAlreadyExists as u32
+                            || status
+                                == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
+                            || status
+                                == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
+                        {
+                            debug!(
+                                "Received a server resource already exists response: {} ({})",
+                                status,
+                                IggyError::from_code_as_string(status)
+                            )
+                        } else {
+                            error!(
+                                "Received an invalid response with status: {} ({}).",
+                                status,
+                                IggyError::from_code_as_string(status),
+                            );
+                        }
+
+                        return Err(IggyError::from_code(status));
                     }
 
-                    return Err(IggyError::from_code(status));
+                    if length == 0 {
+                        return Ok(Bytes::new());
+                    }
+
+                    let mut response_buffer = vec![0u8; length];
+                    stream.read(&mut response_buffer).await?;
+
+                    trace!("Received {NAME} response payload, size: {} bytes", length);
+                    Ok(Bytes::from(response_buffer))
                 }
+            };
 
-                if length == 0 {
-                    return Ok(Bytes::new());
+            if self.config.request_timeout.is_zero() {
+                io.await
+            } else {
+                match tokio::time::timeout(self.config.request_timeout.get_duration(), io).await {
+                    Ok(result) => result,
+                    Err(_) => Err(IggyError::RequestTimeout(self.config.request_timeout)),
                 }
-
-                let mut response_buffer = vec![0u8; length];
-                stream.read(&mut response_buffer).await?;
-
-                trace!("Received {NAME} response payload, size: {} bytes", length);
-                Ok(Bytes::from(response_buffer))
             }
         };
 
-        if self.config.request_timeout.is_zero() {
-            io.await
-        } else {
-            match tokio::time::timeout(self.config.request_timeout.get_duration(), io).await {
-                Ok(result) => result,
-                Err(_) => {
-                    // Reset to prevent response desync on the shared stream.
-                    *self.stream.lock().await = None;
-                    self.set_state(ClientState::Disconnected).await;
-                    #[cfg(feature = "vsr")]
-                    {
-                        *self
-                            .consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned") = ConsensusSession::new();
-                    }
-                    Err(IggyError::RequestTimeout(self.config.request_timeout))
-                }
+        if matches!(&result, Err(IggyError::RequestTimeout(_))) {
+            *stream_guard = None;
+            drop(stream_guard);
+            self.set_state(ClientState::Disconnected).await;
+            self.publish_event(DiagnosticEvent::Disconnected).await;
+            #[cfg(feature = "vsr")]
+            {
+                self.consensus_session
+                    .lock()
+                    .expect("consensus session mutex poisoned")
+                    .reset();
             }
         }
+
+        result
     }
 }
 
@@ -907,5 +916,108 @@ mod tests {
 
         let client = client.unwrap();
         assert_eq!(client.config.server_address, "localhost:8092");
+    }
+
+    async fn make_stalling_ws_server() -> std::net::SocketAddr {
+        use tokio_tungstenite::accept_async;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = accept_async(tcp).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    async fn make_ws_client(addr: std::net::SocketAddr, request_timeout: &str) -> WebSocketClient {
+        use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
+        use tokio_tungstenite::client_async;
+
+        let config = WebSocketClientConfig {
+            server_address: addr.to_string(),
+            request_timeout: IggyDuration::from_str(request_timeout).unwrap(),
+            ..Default::default()
+        };
+        let client = WebSocketClient::create(Arc::new(config)).unwrap();
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = tcp.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let (ws_stream, _) = client_async(url, tcp).await.unwrap();
+        let conn = WebSocketConnectionStream::new(client_addr, ws_stream);
+        *client.stream.lock().await = Some(WebSocketStreamKind::Plain(conn));
+        *client.state.lock().await = ClientState::Connected;
+        client
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_disconnect_and_null_stream_on_request_timeout() {
+        let addr = make_stalling_ws_server().await;
+        let client = make_ws_client(addr, "100ms").await;
+
+        let result = client.send_raw_with_response(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(client.stream.lock().await.is_none());
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_not_timeout_when_request_timeout_is_zero() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(tcp).await.unwrap();
+            // Read the request, respond with status=0, length=0
+            let _msg = futures_util::StreamExt::next(&mut ws).await;
+            let response: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+            ws.send(Message::Binary(response.to_vec().into()))
+                .await
+                .unwrap();
+        });
+
+        let client = make_ws_client(addr, "0").await;
+        let result = client.send_raw_with_response(1, Bytes::new()).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "vsr")]
+    #[tokio::test]
+    async fn should_reset_vsr_session_on_request_timeout() {
+        use iggy_binary_protocol::codes::CREATE_STREAM_CODE;
+
+        let addr = make_stalling_ws_server().await;
+        let client = make_ws_client(addr, "100ms").await;
+
+        let client_id = {
+            let mut session = client.consensus_session.lock().unwrap();
+            let _ = session.register_request_id();
+            session.bind(10);
+            let _ = session.next_request_id();
+            let _ = session.next_request_id();
+            assert!(session.is_bound());
+            assert_eq!(session.current_request_id(), 3);
+            session.client_id()
+        };
+
+        let result = client.send_raw(CREATE_STREAM_CODE, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        let session = client.consensus_session.lock().unwrap();
+        assert!(!session.is_bound());
+        assert_eq!(session.current_request_id(), 1);
+        assert_eq!(session.client_id(), client_id);
     }
 }

@@ -691,16 +691,23 @@ impl TcpClient {
         #[cfg(feature = "vsr")]
         let consensus_session = self.consensus_session.clone();
         let result = tokio::spawn(async move {
-            let io = async {
-                let mut stream = stream.lock().await;
-                if let Some(stream) = stream.as_mut() {
-                    #[cfg(feature = "vsr")]
-                    let (request_header, request_size) = {
-                        let mut consensus_session = consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned");
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
-                    };
+            let mut guard = stream.lock().await;
+
+            let result = {
+                let Some(s) = guard.as_mut() else {
+                    error!("Cannot send data. Client is not connected.");
+                    return Err(IggyError::NotConnected);
+                };
+
+                #[cfg(feature = "vsr")]
+                let (request_header, request_size) = {
+                    let mut consensus_session = consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned");
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                };
+
+                let io = async move {
                     #[cfg(not(feature = "vsr"))]
                     let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                     #[cfg(feature = "vsr")]
@@ -711,24 +718,23 @@ impl TcpClient {
                     #[cfg(not(feature = "vsr"))]
                     trace!("Sending a TCP request of size {payload_length} with code: {code}");
                     #[cfg(feature = "vsr")]
-                    stream.write(bytemuck::bytes_of(&request_header)).await?;
+                    s.write(bytemuck::bytes_of(&request_header)).await?;
                     #[cfg(feature = "vsr")]
                     if !payload.is_empty() {
-                        stream.write(&payload).await?;
+                        s.write(&payload).await?;
                     }
                     #[cfg(not(feature = "vsr"))]
-                    stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                    s.write(&(payload_length as u32).to_le_bytes()).await?;
                     #[cfg(not(feature = "vsr"))]
-                    stream.write(&code.to_le_bytes()).await?;
+                    s.write(&code.to_le_bytes()).await?;
                     #[cfg(not(feature = "vsr"))]
-                    stream.write(&payload).await?;
-                    stream.flush().await?;
+                    s.write(&payload).await?;
+                    s.flush().await?;
                     trace!("Sent a TCP request with code: {code}, waiting for a response...");
                     #[cfg(feature = "vsr")]
                     {
                         let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                        stream
-                            .read(&mut response_header)
+                        s.read(&mut response_header)
                             .await
                             .map_err(|error| {
                                 error!(
@@ -744,8 +750,7 @@ impl TcpClient {
                         let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
                         let body = if body_size > 0 {
                             let mut body = BytesMut::with_capacity(body_size);
-                            stream
-                                .read_buf(&mut body, body_size)
+                            s.read_buf(&mut body, body_size)
                                 .await
                                 .map_err(|error| {
                                     error!(
@@ -760,13 +765,13 @@ impl TcpClient {
                             Bytes::new()
                         };
 
-                        return crate::vsr::decode_response_split(&response_header, body);
+                        crate::vsr::decode_response_split(&response_header, body)
                     }
 
                     #[cfg(not(feature = "vsr"))]
                     {
                         let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-                        let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                        let read_bytes = s.read(&mut response_buffer).await.map_err(|error| {
                             error!(
                                 "Failed to read response for TCP request with code: {code}: {error}",
                                 code = code,
@@ -790,33 +795,31 @@ impl TcpClient {
                                 .try_into()
                                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
                         );
-                        return TcpClient::handle_response(status, length, stream).await;
+                        TcpClient::handle_response(status, length, s).await
+                    }
+                };
+
+                if request_timeout.is_zero() {
+                    io.await
+                } else {
+                    match tokio::time::timeout(request_timeout.get_duration(), io).await {
+                        Ok(result) => result,
+                        Err(_) => Err(IggyError::RequestTimeout(request_timeout)),
                     }
                 }
-
-                error!("Cannot send data. Client is not connected.");
-                Err(IggyError::NotConnected)
             };
 
-            if request_timeout.is_zero() {
-                io.await
-            } else {
-                match tokio::time::timeout(request_timeout.get_duration(), io).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        // Reset to prevent response desync on the shared stream.
-                        *stream.lock().await = None;
-                        #[cfg(feature = "vsr")]
-                        {
-                            *consensus_session
-                                .lock()
-                                .expect("consensus session mutex poisoned") =
-                                ConsensusSession::new();
-                        }
-                        Err(IggyError::RequestTimeout(request_timeout))
-                    }
+            if matches!(&result, Err(IggyError::RequestTimeout(_))) {
+                #[cfg(feature = "vsr")]
+                {
+                    consensus_session
+                        .lock()
+                        .expect("consensus session mutex poisoned")
+                        .reset();
                 }
             }
+
+            result
         })
         .await
         .map_err(|e| {
@@ -825,14 +828,12 @@ impl TcpClient {
         })?;
 
         if matches!(
-            result,
+            &result,
             Err(IggyError::Disconnected) | Err(IggyError::RequestTimeout(_))
         ) {
-            // Reply stream state is unknown (timed out or torn mid-frame);
-            // a late reply would desync framing for the next request, so
-            // drop the connection and let callers reconnect.
             self.stream.lock().await.take();
             self.set_state(ClientState::Disconnected).await;
+            self.publish_event(DiagnosticEvent::Disconnected).await;
         }
         result
     }
@@ -860,7 +861,6 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "vsr"))]
     use tokio::io::AsyncWriteExt;
-    #[cfg(not(feature = "vsr"))]
     use tokio::net::TcpListener;
 
     #[cfg(not(feature = "vsr"))]
@@ -877,6 +877,31 @@ mod tests {
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let client_addr = client.local_addr().unwrap();
         ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, client))
+    }
+
+    async fn make_stalling_tcp_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    async fn make_tcp_client(addr: std::net::SocketAddr, request_timeout: &str) -> TcpClient {
+        let config = TcpClientConfig {
+            server_address: addr.to_string(),
+            request_timeout: IggyDuration::from_str(request_timeout).unwrap(),
+            ..Default::default()
+        };
+        let client = TcpClient::create(Arc::new(config)).unwrap();
+        let tcp_stream = TcpStream::connect(addr).await.unwrap();
+        let client_addr = tcp_stream.local_addr().unwrap();
+        let stream = ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, tcp_stream));
+        *client.stream.lock().await = Some(stream);
+        *client.state.lock().await = ClientState::Connected;
+        client
     }
 
     #[test]
@@ -1193,29 +1218,64 @@ mod tests {
 
     #[cfg(not(feature = "vsr"))]
     #[tokio::test]
-    async fn should_return_request_timeout_when_server_does_not_respond() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn should_disconnect_and_null_stream_on_request_timeout() {
+        let addr = make_stalling_tcp_server().await;
+        let client = make_tcp_client(addr, "100ms").await;
 
-        tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-            std::future::pending::<()>().await;
-        });
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(client.stream.lock().await.is_none());
+
+        let result = client.send_raw(1, Bytes::new()).await;
+        assert!(matches!(result, Err(IggyError::NotConnected)));
+    }
+
+    #[cfg(not(feature = "vsr"))]
+    #[tokio::test]
+    async fn should_not_timeout_when_request_timeout_is_zero() {
+        // status=0 (OK), length=0 (empty body)
+        let response: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let stream = make_dummy_stream(&response).await;
 
         let config = TcpClientConfig {
-            server_address: addr.to_string(),
-            request_timeout: IggyDuration::from_str("100ms").unwrap(),
+            request_timeout: IggyDuration::from_str("0").unwrap(),
             ..Default::default()
         };
         let client = TcpClient::create(Arc::new(config)).unwrap();
-
-        let tcp_stream = TcpStream::connect(addr).await.unwrap();
-        let client_addr = tcp_stream.local_addr().unwrap();
-        let stream = ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, tcp_stream));
         *client.stream.lock().await = Some(stream);
         *client.state.lock().await = ClientState::Connected;
 
         let result = client.send_raw(1, Bytes::new()).await;
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "vsr")]
+    #[tokio::test]
+    async fn should_reset_vsr_session_on_request_timeout() {
+        use iggy_binary_protocol::codes::CREATE_STREAM_CODE;
+
+        let addr = make_stalling_tcp_server().await;
+        let client = make_tcp_client(addr, "100ms").await;
+
+        let client_id = {
+            let mut session = client.consensus_session.lock().unwrap();
+            let _ = session.register_request_id();
+            session.bind(10);
+            let _ = session.next_request_id();
+            let _ = session.next_request_id();
+            assert!(session.is_bound());
+            assert_eq!(session.current_request_id(), 3);
+            session.client_id()
+        };
+
+        let result = client.send_raw(CREATE_STREAM_CODE, Bytes::new()).await;
         assert!(matches!(result, Err(IggyError::RequestTimeout(_))));
+
+        let session = client.consensus_session.lock().unwrap();
+        assert!(!session.is_bound());
+        assert_eq!(session.current_request_id(), 1);
+        assert_eq!(session.client_id(), client_id);
     }
 }
