@@ -18,6 +18,7 @@
 #![allow(clippy::future_not_send)]
 
 mod iggy_index;
+mod iggy_index_reader;
 mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
@@ -31,6 +32,8 @@ mod types;
 
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
+pub use iggy_index::IggyIndex;
+pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;

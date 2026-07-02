@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(feature = "vsr")]
 use tokio::time::{sleep, timeout};
+#[cfg(feature = "vsr")]
 use tracing::warn;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -153,33 +154,42 @@ impl TestHarness {
             self.jwks_server = Some(mock_server);
         }
 
-        // Cluster startup can hit a transient replica-handshake blip that
+        // Legacy single-server harness: plain start, no cluster readiness.
+        #[cfg(not(feature = "vsr"))]
+        for server in &mut self.servers {
+            server.start()?;
+        }
+
+        // Cluster startup (vsr) can hit a transient replica-handshake blip that
         // leaves the mesh incomplete (a peer link drops mid-handshake, so a
         // node never reaches "all peers connected"). Rather than fail the whole
         // test on a startup blip, retry spawn + mesh-readiness a few times,
         // tearing down and respawning between attempts. `ServerHandle::start`
         // truncates the captured stdout (`File::create`), so the readiness
         // log-grep never matches a stale marker from a prior attempt.
-        const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
-        for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
-            for server in &mut self.servers {
-                server.start()?;
-            }
-            match self.wait_for_cluster_ready().await {
-                Ok(()) => break,
-                Err(error) if attempt < CLUSTER_STARTUP_ATTEMPTS => {
-                    warn!(
-                        attempt,
-                        max_attempts = CLUSTER_STARTUP_ATTEMPTS,
-                        error = %error,
-                        "cluster not ready; tearing down and respawning"
-                    );
-                    for server in &mut self.servers {
-                        let _ = server.stop();
-                    }
-                    sleep(Duration::from_millis(500)).await;
+        #[cfg(feature = "vsr")]
+        {
+            const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
+            for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
+                for server in &mut self.servers {
+                    server.start()?;
                 }
-                Err(error) => return Err(error),
+                match self.wait_for_cluster_ready().await {
+                    Ok(()) => break,
+                    Err(error) if attempt < CLUSTER_STARTUP_ATTEMPTS => {
+                        warn!(
+                            attempt,
+                            max_attempts = CLUSTER_STARTUP_ATTEMPTS,
+                            error = %error,
+                            "cluster not ready; tearing down and respawning"
+                        );
+                        for server in &mut self.servers {
+                            let _ = server.stop();
+                        }
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -197,13 +207,8 @@ impl TestHarness {
         Ok(())
     }
 
+    #[cfg(feature = "vsr")]
     async fn wait_for_cluster_ready(&self) -> Result<(), TestBinaryError> {
-        #[cfg(not(feature = "vsr"))]
-        {
-            Ok(())
-        }
-
-        #[cfg(feature = "vsr")]
         {
             if self.servers.len() <= 1 {
                 return Ok(());

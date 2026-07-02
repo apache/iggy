@@ -52,7 +52,8 @@ use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, To
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
-    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
+    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, StreamStats,
+    TopicStats,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -351,6 +352,7 @@ impl Stream {
 pub struct StatsRegistry {
     streams: std::sync::Mutex<AHashMap<usize, Arc<StreamStats>>>,
     topics: std::sync::Mutex<AHashMap<(usize, usize), Arc<TopicStats>>>,
+    partitions: std::sync::Mutex<AHashMap<(usize, usize, usize), Arc<PartitionStats>>>,
 }
 
 impl StatsRegistry {
@@ -377,6 +379,46 @@ impl StatsRegistry {
             .clone()
     }
 
+    /// Get-or-create the shared per-partition stats. The owning shard calls
+    /// this when it materializes the partition; any shard's `get_topic` reply
+    /// reads the same `Arc`, so partition-plane counters are visible
+    /// cross-shard without a gather.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    pub fn partition(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        parent: Arc<TopicStats>,
+    ) -> Arc<PartitionStats> {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry((stream_id, topic_id, partition_id))
+            .or_insert_with(|| Arc::new(PartitionStats::new(parent)))
+            .clone()
+    }
+
+    /// Read-only lookup for reply builders: `None` until the owning shard
+    /// materializes the partition.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    pub fn partition_get(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Option<Arc<PartitionStats>> {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .get(&(stream_id, topic_id, partition_id))
+            .cloned()
+    }
+
     fn remove_stream(&self, id: usize) {
         self.streams
             .lock()
@@ -386,6 +428,10 @@ impl StatsRegistry {
             .lock()
             .expect("stats registry mutex poisoned")
             .retain(|(stream_id, _), _| *stream_id != id);
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(stream_id, _, _), _| *stream_id != id);
     }
 
     fn remove_topic(&self, stream_id: usize, topic_id: usize) {
@@ -393,6 +439,19 @@ impl StatsRegistry {
             .lock()
             .expect("stats registry mutex poisoned")
             .remove(&(stream_id, topic_id));
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(sid, tid, _), _| !(*sid == stream_id && *tid == topic_id));
+    }
+
+    fn remove_partitions_from(&self, stream_id: usize, topic_id: usize, first_removed: usize) {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(sid, tid, pid), _| {
+                !(*sid == stream_id && *tid == topic_id && *pid >= first_removed)
+            });
     }
 }
 
@@ -1203,15 +1262,29 @@ impl StateHandler for DeleteStreamRequest {
 impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        // Message data lives in the partition plane, not metadata. A purge leaves
-        // the metadata shape (streams, topics, partition ids) intact, so apply
-        // only validates the parent and acks: no mutation, no `revision` bump
-        // (the reconciler keys off partition shape, which a purge preserves). The
-        // partition-journal segment drop is not yet wired off this committed op,
-        // so a committed purge is a metadata-plane no-op for now.
-        // TODO: partition-plane purge off the committed op.
-        if state.resolve_stream_id(&self.stream_id).is_none() {
-            return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+        // Stream purge = topic purge over every topic in the stream: advance
+        // each partition's monotonic purge generation; every replica's
+        // reconciler observes the committed generation and resets the
+        // partition to a single empty segment at offset 0 with cleared
+        // offsets (see `PurgeTopicRequest`). Metadata shape stays intact.
+        let advanced = {
+            let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+                return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+            };
+            let Some(stream) = state.items.get_mut(stream_id) else {
+                return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+            };
+            let mut advanced = false;
+            for (_, topic) in &mut stream.topics {
+                for partition in &mut topic.partitions {
+                    partition.purge_generation = partition.purge_generation.wrapping_add(1);
+                    advanced = true;
+                }
+            }
+            advanced
+        };
+        if advanced {
+            state.revision = state.revision.wrapping_add(1);
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -1567,11 +1640,15 @@ impl StateHandler for DeletePartitionsRequest {
         let count_to_delete = self.partitions_count as usize;
         let did_delete = count_to_delete > 0 && count_to_delete <= topic.partitions.len();
         if did_delete {
-            topic
-                .partitions
-                .truncate(topic.partitions.len() - count_to_delete);
+            let retained = topic.partitions.len() - count_to_delete;
+            topic.partitions.truncate(retained);
             // Members assigned the removed partitions must give them up.
             topic.rebalance_consumer_groups();
+            // Evict registry entries so re-created partition ids start with
+            // fresh stats.
+            state
+                .stats_registry
+                .remove_partitions_from(stream_id, topic_id, retained);
         }
         if did_delete {
             state.revision = state.revision.wrapping_add(1);

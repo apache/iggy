@@ -20,7 +20,6 @@ mod hello_world;
 mod mcp_parity;
 #[cfg(feature = "vsr")]
 mod messages;
-#[cfg(not(feature = "vsr"))]
 mod producer;
 #[cfg(feature = "vsr")]
 mod protocol_version;

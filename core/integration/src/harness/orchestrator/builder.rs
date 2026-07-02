@@ -393,7 +393,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
         assert!(!harness.started);
         assert_eq!(harness.client_configs.len(), 1);
     }
@@ -407,7 +407,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
         assert!(harness.mcp().is_some());
     }
 
@@ -452,6 +452,6 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
     }
 }

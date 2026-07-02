@@ -932,16 +932,24 @@ where
                 (segment_index, position)
             }
             MessageLookup::Timestamp { timestamp, .. } => {
-                for (segment_index, _) in segments.iter().enumerate() {
-                    if let Some(index) = self
-                        .log
-                        .segment_indexes(segment_index)
-                        .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
-                    {
-                        return (segment_index, index.position);
-                    }
-                }
-                (0, 0)
+                // Resolve the starting SEGMENT from segment metadata, not from
+                // the per-segment index caches: sealed segments drop their
+                // cache at rotation, and a cache miss must not read as "the
+                // timestamp is not in this segment" (skipping a sealed segment
+                // loses its messages). Timestamps are monotone across
+                // segments, so the first segment whose max timestamp reaches
+                // the query is the correct start; the walk filters precisely,
+                // so an early start is safe.
+                let segment_index = segments
+                    .iter()
+                    .position(|segment| segment.max_timestamp >= *timestamp)
+                    .unwrap_or_else(|| segments.len().saturating_sub(1));
+                let position = self
+                    .log
+                    .segment_indexes(segment_index)
+                    .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
+                    .map_or(0, |index| index.position);
+                (segment_index, position)
             }
         }
     }
@@ -1056,6 +1064,43 @@ where
                     .send_to_client(client_id, reply.into_generic().into_frozen())
                     .await;
                 return;
+            }
+
+            // Reject an out-of-range consumer-offset store at admission with a
+            // terminal `InvalidOffset` (result-framed like the delete rejection),
+            // mirroring the legacy `validate_partition_offset`: an empty partition
+            // accepts no offset, and a stored offset may not run ahead of the
+            // committed offset. Done here so the doomed op is never replicated.
+            if matches!(
+                message.header().operation,
+                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
+            ) && let Some((_, _, Some(requested_offset), _)) = consumer_offset
+            {
+                let current_offset = self.stats.current_offset();
+                let partition_empty =
+                    self.stats.messages_count_inconsistent() == 0 && current_offset == 0;
+                if partition_empty || requested_offset > current_offset {
+                    emit_partition_diag(
+                        tracing::Level::WARN,
+                        &PartitionDiagEvent::new(
+                            ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                            "rejecting store_consumer_offset for out-of-range offset",
+                        )
+                        .with_operation(message.header().operation)
+                        .with_error(IggyError::InvalidOffset(requested_offset).to_string()),
+                    );
+                    let reply = build_transient_reply(
+                        message.header(),
+                        self.consensus().commit_max(),
+                        IggyError::InvalidOffset(requested_offset).as_code(),
+                    );
+                    let _ = self
+                        .consensus()
+                        .message_bus()
+                        .send_to_client(client_id, reply.into_generic().into_frozen())
+                        .await;
+                    return;
+                }
             }
 
             assert!(!consensus.is_follower(), "on_request: primary only");
@@ -2292,6 +2337,12 @@ where
         let _ = old_storage.shutdown();
         self.log.messages_writers_mut()[old_segment_index] = None;
         self.log.index_writers_mut()[old_segment_index] = None;
+        // Drop the sealed segment's in-memory index cache: only the ACTIVE
+        // segment's cache is ever read (the `commit_messages` flush staging),
+        // so a sealed cache is dead weight -- and `ensure_indexes` preallocates
+        // a 16 MiB-capacity `Vec` per segment, which under small-segment
+        // workloads retains hundreds of MB across thousands of sealed segments.
+        self.log.indexes_mut()[old_segment_index] = None;
 
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -2671,17 +2722,18 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     .operation
 }
 
-/// Success reply body for a committed partition op. `DeleteConsumerOffset`
-/// (v1/v2) is result-framed on the SDK side so a `ConsumerOffsetNotFound`
-/// rejection surfaces as a terminal error rather than decoding as `Ok`; its
-/// success reply must therefore carry an explicit empty result section
-/// (`[count = 0]`) instead of an empty body. Every other partition op carries no
-/// result section and replies with an empty body.
+/// Success reply body for a committed partition op. The consumer-offset ops are
+/// result-framed on the SDK side so a rejection (`ConsumerOffsetNotFound` on
+/// delete, `InvalidOffset` on store) surfaces as a terminal error rather than
+/// decoding as `Ok`; their success reply must therefore carry an explicit empty
+/// result section (`[count = 0]`) instead of an empty body. Every other
+/// partition op carries no result section and replies with an empty body.
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     match operation {
-        Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
-            bytes::Bytes::from_static(&[0, 0, 0, 0])
-        }
+        Operation::StoreConsumerOffset
+        | Operation::StoreConsumerOffset2
+        | Operation::DeleteConsumerOffset
+        | Operation::DeleteConsumerOffset2 => bytes::Bytes::from_static(&[0, 0, 0, 0]),
         _ => bytes::Bytes::new(),
     }
 }

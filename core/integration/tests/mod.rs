@@ -34,7 +34,6 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod cli;
 #[cfg(not(feature = "vsr"))]
 mod cluster;
-#[cfg(not(feature = "vsr"))]
 mod config_provider;
 #[cfg(not(feature = "vsr"))]
 mod connectors;

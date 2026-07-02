@@ -18,15 +18,11 @@
 use crate::server::scenarios::{message_size_scenario, single_message_per_batch_scenario};
 #[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{reconnect_after_restart_scenario, restart_offset_skip_scenario};
-#[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{
     segment_rotation_race_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = TcpTlsGenerated,
     server(tls = generated)
@@ -36,9 +32,6 @@ async fn tcp_tls_scenario_should_be_valid(harness: &TestHarness) {
     tcp_tls_scenario::run(&client).await;
 }
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = TcpTlsSelfSigned,
     server(tls = self_signed)
@@ -48,9 +41,6 @@ async fn tcp_tls_self_signed_scenario_should_be_valid(harness: &TestHarness) {
     tcp_tls_scenario::run(&client).await;
 }
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = WebSocketTlsGenerated,
     server(websocket_tls = generated)
@@ -149,10 +139,8 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 /// Test configuration:
 /// - 8 producers total (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 /// - All producers write to the same partition for maximum lock contention
-// Concurrency race test over all four transports (vsr has no HTTP) and
-// trips the metadata-plane consensus races; skip with the other
-// concurrent tests until those races are fixed.
-#[cfg(not(feature = "vsr"))]
+// Concurrency race test: under vsr it runs over the three VSR transports
+// (TCP/QUIC/WebSocket -- HTTP/REST carries no VSR framing), legacy runs all four.
 #[iggy_harness(server(
     segment.size = "512B",
     message_saver.interval = "1s",

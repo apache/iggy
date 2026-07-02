@@ -18,10 +18,6 @@
 pub mod authentication_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod bench_scenario;
-// Concurrent produce+consume race regression: trips a metadata-plane
-// consensus race under vsr (`on_ack: committed prepare must be in journal`
-// panic on the primary); skip until the metadata races are fixed.
-#[cfg(not(feature = "vsr"))]
 pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
@@ -39,7 +35,6 @@ pub mod create_message_payload;
 pub mod cross_protocol_pat_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod encryption_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod invalid_consumer_offset_scenario;
 // Asserts server log-file rotation/archival policies; server-ng's file
 // logger only captures bootstrap output (shard-thread logs never reach the
@@ -58,24 +53,19 @@ pub mod read_during_persistence_scenario;
 pub mod reconnect_after_restart_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod restart_offset_skip_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod stream_size_validation_scenario;
 #[cfg(feature = "vsr")]
 pub mod stress_produce_consume_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod system_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod tcp_tls_scenario;
 pub mod timestamp_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod user_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod websocket_tls_scenario;
 
 use iggy::prelude::*;
@@ -93,7 +83,6 @@ const CONSUMER_GROUP_NAME: &str = "test-consumer-group";
 const USERNAME_1: &str = "user1";
 const USERNAME_2: &str = "user2";
 const USERNAME_3: &str = "user3";
-#[cfg(not(feature = "vsr"))]
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
 const MESSAGES_COUNT: u32 = 1337;
 
@@ -164,7 +153,6 @@ async fn join_consumer_group(client: &IggyClient) {
         .unwrap();
 }
 
-#[cfg(not(feature = "vsr"))]
 async fn leave_consumer_group(client: &IggyClient) {
     client
         .leave_consumer_group(

@@ -38,6 +38,7 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireC
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
+use iggy_binary_protocol::requests::topics::UpdateTopicRequest as WireUpdateTopicRequest;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, WireDecode, WireEncode, WireName,
@@ -48,7 +49,7 @@ use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use server_common::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
@@ -381,6 +382,13 @@ pub struct IggyMetadata<C, J, S, M> {
     /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
+    /// Resolved byte value for `MaxTopicSize::ServerDefault` (`0` on the
+    /// wire). Primary admission rewrites the sentinel to this value before
+    /// replication so the committed state carries a concrete size and every
+    /// replica resolves identically regardless of local config. Set from
+    /// server config at bootstrap ([`Self::set_default_max_topic_size`]);
+    /// defaults to unlimited, matching the shipped server config.
+    default_max_topic_size: Cell<u64>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -411,6 +419,7 @@ where
             coordinator,
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
+            default_max_topic_size: Cell::new(u64::MAX),
         }
     }
 }
@@ -421,6 +430,19 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// only; peer shards never commit metadata locally.
     pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
         *self.commit_notifier.borrow_mut() = notifier;
+    }
+
+    /// Install the resolved byte value used for `MaxTopicSize::ServerDefault`.
+    /// Server-ng bootstrap calls this with `system.topic.max_size` on every
+    /// shard (responses read it too); only shard 0's copy feeds admission.
+    pub fn set_default_max_topic_size(&self, max_topic_size_bytes: u64) {
+        self.default_max_topic_size.set(max_topic_size_bytes);
+    }
+
+    /// Resolved byte value for `MaxTopicSize::ServerDefault`.
+    #[must_use]
+    pub const fn default_max_topic_size(&self) -> u64 {
+        self.default_max_topic_size.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -1683,8 +1705,14 @@ where
 
         match header.operation {
             Operation::CreateTopic => {
-                let request = WireCreateTopicRequest::decode_from(body)
+                let mut request = WireCreateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
+                // Resolve the `ServerDefault` sentinel (0) against server config
+                // here, at primary admission, so the replicated payload carries a
+                // concrete size and every replica commits the same value.
+                if request.max_topic_size == 0 {
+                    request.max_topic_size = self.default_max_topic_size.get();
+                }
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1742,6 +1770,22 @@ where
                     Operation::CreatePartitionsWithAssignments,
                     &body,
                 ))
+            }
+            Operation::UpdateTopic => {
+                let mut request = WireUpdateTopicRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                if request.max_topic_size == 0 {
+                    // Same `ServerDefault` resolution as `CreateTopic` above.
+                    request.max_topic_size = self.default_max_topic_size.get();
+                    let body = request.to_bytes();
+                    return Ok(build_prepare_message(
+                        consensus,
+                        &header,
+                        Operation::UpdateTopic,
+                        &body,
+                    ));
+                }
+                Ok(message.project(consensus))
             }
             _ => Ok(message.project(consensus)),
         }

@@ -247,16 +247,20 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     // login decodes to `TransientNotCommitted` and the SDK replays it. The one
     // exception is a terminal failure, which ships an empty body (no result
     // section) and is passed through to fail the typed `LoginRegisterResponse`
-    // decode. `DeleteConsumerOffset` is the one partition-plane op that carries a
-    // result section: it can be rejected with `ConsumerOffsetNotFound`, which
-    // must reach the client as a terminal error rather than decoding as `Ok`
-    // (its success reply ships `[count = 0]` to match). Other reads, data-plane
-    // ops, and Logout carry no result section and pass through untouched.
+    // decode. The consumer-offset ops are the partition-plane ops that carry a
+    // result section: they can be rejected (`ConsumerOffsetNotFound` on delete,
+    // `InvalidOffset` on store), which must reach the client as a terminal error
+    // rather than decoding as `Ok` (their success reply ships `[count = 0]` to
+    // match). Other reads, data-plane ops, and Logout carry no result section and
+    // pass through untouched.
     let result_framed = operation.is_metadata()
         || (operation == Operation::Register && !body.is_empty())
         || matches!(
             operation,
-            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
+            Operation::StoreConsumerOffset
+                | Operation::StoreConsumerOffset2
+                | Operation::DeleteConsumerOffset
+                | Operation::DeleteConsumerOffset2
         );
     if !result_framed {
         return Ok(body);
@@ -694,6 +698,76 @@ mod tests {
         // Reads / partition-plane / Register-Logout replies carry no section.
         let body = Bytes::from_static(b"raw-non-metadata-body");
         let out = split_metadata_result(Operation::NonReplicated, body.clone()).unwrap();
+        assert_eq!(out, body);
+    }
+
+    /// `[count = 1][index = 0][result = code]` -- the single-entry rejection
+    /// shape (`ApplyReply::write_reply_body` / `build_transient_reply`).
+    fn rejection_body(code: u32) -> Bytes {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&code.to_le_bytes());
+        Bytes::from(body)
+    }
+
+    /// `[count = 0]` followed by the payload -- the result-framed success shape.
+    fn success_body(payload: &[u8]) -> Bytes {
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(payload);
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn delete_consumer_offset_rejection_decodes_to_terminal_error() {
+        let code = IggyError::ConsumerOffsetNotFound(0).as_code();
+        let result = split_metadata_result(Operation::DeleteConsumerOffset, rejection_body(code));
+        assert_eq!(
+            result.unwrap_err().as_code(),
+            code,
+            "delete rejection must surface as the typed error, not decode as Ok"
+        );
+    }
+
+    #[test]
+    fn store_consumer_offset_rejection_decodes_to_terminal_error() {
+        let code = IggyError::InvalidOffset(42).as_code();
+        let result = split_metadata_result(Operation::StoreConsumerOffset2, rejection_body(code));
+        assert_eq!(result.unwrap_err().as_code(), code);
+    }
+
+    #[test]
+    fn consumer_offset_success_strips_the_empty_result_section() {
+        let out = split_metadata_result(Operation::StoreConsumerOffset, success_body(b"")).unwrap();
+        assert!(out.is_empty());
+        let out =
+            split_metadata_result(Operation::DeleteConsumerOffset2, success_body(b"")).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn metadata_transient_code_decodes_to_transient_not_committed() {
+        let code = IggyError::TransientNotCommitted.as_code();
+        let result = split_metadata_result(Operation::CreateStream, rejection_body(code));
+        assert!(matches!(
+            result.unwrap_err(),
+            IggyError::TransientNotCommitted
+        ));
+    }
+
+    #[test]
+    fn metadata_success_returns_payload_after_result_section() {
+        let out = split_metadata_result(Operation::CreateStream, success_body(b"payload")).unwrap();
+        assert_eq!(out.as_ref(), b"payload");
+    }
+
+    #[test]
+    fn send_messages_body_is_never_interpreted_as_a_result_section() {
+        // A data-plane reply whose first bytes happen to look like a rejection
+        // must pass through untouched: `SendMessages` is not result-framed.
+        let body = rejection_body(IggyError::InvalidOffset(1).as_code());
+        let out = split_metadata_result(Operation::SendMessages, body.clone()).unwrap();
         assert_eq!(out, body);
     }
 }

@@ -24,6 +24,7 @@ use crate::dispatch::{
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
+use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
 use configs::server_ng::ServerNgConfig;
@@ -36,7 +37,7 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PartitionStats, TopicStats, variadic};
+use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
@@ -53,8 +54,8 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, DialedReplicaFn, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES,
-    ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus,
+    MAX_INFLIGHT_REPLICA_HANDSHAKES, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -65,7 +66,7 @@ use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
+    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
@@ -390,6 +391,7 @@ struct LocalClientAcceptFns {
     ws: AcceptedWsClientFn,
     quic: AcceptedQuicClientFn,
     tcp_tls: AcceptedTlsClientFn,
+    wss: AcceptedWssClientFn,
 }
 
 #[derive(Default)]
@@ -838,6 +840,9 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Shard 0's copy resolves the `MaxTopicSize::ServerDefault` sentinel at
+    // admission; every shard's copy backs the same resolution in responses.
+    metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1328,7 +1333,15 @@ async fn build_shard_for_thread(
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
                     if owning_shard == shard_id {
-                        owned.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
+                        // Shared per-partition stats from the registry: the
+                        // same `Arc` backs every shard's `get_topic` reply.
+                        let stats = inner.stats_registry.partition(
+                            stream.id,
+                            topic_id,
+                            partition.id,
+                            topic.stats.clone(),
+                        );
+                        owned.push((stream.id, topic_id, stats, partition.clone()));
                     } else {
                         shards_table.insert(
                             namespace,
@@ -1348,13 +1361,13 @@ async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, topic_stats, partition_metadata) in owned {
+    for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = load_partition(
             config,
             namespace,
-            topic_stats,
+            partition_stats,
             &partition_metadata,
             topology.cluster_id,
             topology.self_replica_id,
@@ -1473,7 +1486,7 @@ fn restore_metadata_consensus(
 async fn load_partition(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
-    topic_stats: Arc<TopicStats>,
+    stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
     cluster_id: u128,
     self_replica_id: u8,
@@ -1483,7 +1496,6 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
@@ -1494,29 +1506,19 @@ async fn load_partition(
     );
     consensus.init();
 
-    // TODO: decouple the loading logic from the `server` crate and load directly
-    // into the new `partitions` log/runtime types.
-    let loaded_log = server::bootstrap::load_segments(
-        &config.system,
-        stream_id,
-        topic_id,
-        partition_id,
-        config
-            .system
-            .get_partition_path(stream_id, topic_id, partition_id),
-        stats.clone(),
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to load partition log during server-ng bootstrap"
-        );
-        source
-    })?;
+    let recovered_segments =
+        load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    error = %source,
+                    "failed to load partition log during server-ng bootstrap"
+                );
+                source
+            })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_partition_dir(config.system.get_partition_path(
@@ -1530,7 +1532,7 @@ async fn load_partition(
         stream_id,
         topic_id,
         partition_id,
-        loaded_log,
+        recovered_segments,
     )
     .await?;
 
@@ -1566,43 +1568,12 @@ async fn hydrate_partition_log(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-    loaded_log: server::streaming::partitions::log::SegmentedLog<
-        server::streaming::partitions::journal::MemoryMessageJournal,
-    >,
+    recovered_segments: Vec<RecoveredSegment>,
 ) -> Result<(), ServerNgError> {
-    // TODO: decouple the loading logic from the `server` crate. This currently
-    // adapts the old server segmented log into the new `partitions` log.
-    for (segment_index, (segment, storage)) in loaded_log
-        .segments()
-        .iter()
-        .zip(loaded_log.storages().iter().cloned())
-        .enumerate()
-    {
-        validate_recovered_segment(
-            stream_id,
-            topic_id,
-            partition_id,
-            segment,
-            &storage,
-            loaded_log
-                .indexes()
-                .get(segment_index)
-                .and_then(|indexes| indexes.as_ref()),
-        )?;
-        let max_timestamp = match loaded_log
-            .indexes()
-            .get(segment_index)
-            .and_then(|indexes| indexes.as_ref())
-        {
-            Some(indexes) => indexes_max_timestamp(indexes),
-            None => load_segment_max_timestamp(&storage, stream_id, topic_id, partition_id).await?,
-        };
-        partition.log.add_persisted_segment(
-            convert_segment(segment, max_timestamp),
-            storage,
-            None,
-            None,
-        );
+    for RecoveredSegment { segment, storage } in recovered_segments {
+        partition
+            .log
+            .add_persisted_segment(segment, storage, None, None);
     }
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
@@ -1657,85 +1628,6 @@ async fn hydrate_partition_log(
     }
 
     Ok(())
-}
-
-fn validate_recovered_segment(
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-    segment: &iggy_common::Segment,
-    storage: &server_common::SegmentStorage,
-    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
-) -> Result<(), ServerNgError> {
-    let messages_size_bytes = storage
-        .messages_reader
-        .as_ref()
-        .map_or(0, |reader| u64::from(reader.file_size()));
-    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
-    if messages_size_bytes == indexed_size_bytes {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredSegmentSizeDivergence {
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        messages_size_bytes,
-        indexed_size_bytes,
-    })
-}
-
-fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
-    Segment {
-        sealed: segment.sealed,
-        start_timestamp: segment.start_timestamp,
-        end_timestamp: segment.end_timestamp,
-        max_timestamp,
-        current_position: u64::from(segment.current_position),
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        size: segment.size,
-        max_size: segment.max_size,
-    }
-}
-
-fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) -> u64 {
-    let mut max_timestamp = 0;
-    for index in 0..indexes.count() {
-        if let Some(index_view) = indexes.get(index) {
-            max_timestamp = max_timestamp.max(index_view.timestamp());
-        }
-    }
-
-    max_timestamp
-}
-
-async fn load_segment_max_timestamp(
-    storage: &server_common::SegmentStorage,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<u64, ServerNgError> {
-    let Some(index_reader) = storage.index_reader.as_ref() else {
-        return Ok(0);
-    };
-
-    let indexes = index_reader
-        .load_all_indexes_from_disk()
-        .await
-        .map_err(|source| {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                error = %source,
-                "failed to load segment indexes while recovering max timestamp"
-            );
-            source
-        })?;
-    Ok(indexes_max_timestamp(&indexes))
 }
 
 fn resolve_tcp_topology(
@@ -1930,6 +1822,9 @@ async fn start_tcp_runtime(
     .await
 }
 
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 async fn start_via_replica_io(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
@@ -1951,34 +1846,46 @@ async fn start_via_replica_io(
         .is_some()
         .then(|| load_tcp_tls_server_credentials(config))
         .transpose()?;
+    // `websocket.tls.enabled` upgrades the websocket address to a WSS
+    // listener; the plain-WS listener must NOT also bind it (one port, one
+    // handshake kind -- a plain upgrade parser fed a TLS ClientHello rejects
+    // every connection with an httparse error).
+    let wss_enabled = config.websocket.tls.enabled;
+    let ws_listen_addr = (!wss_enabled).then_some(topology.ws_listen_addr).flatten();
+    let wss_listen_addr = wss_enabled.then_some(topology.ws_listen_addr).flatten();
+    let wss_credentials = wss_listen_addr
+        .is_some()
+        .then(|| load_wss_server_credentials(config))
+        .transpose()?;
 
     let LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     } = accepted_clients;
 
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
         topology.client_listen_addr,
-        topology.ws_listen_addr,
+        ws_listen_addr,
         topology.quic_listen_addr,
         quic_credentials,
         topology.tcp_tls_listen_addr,
         tcp_tls_credentials,
-        None,
-        None,
+        wss_listen_addr,
+        wss_credentials,
         topology.self_replica_id,
         topology.peers.clone(),
         accepted_replica,
         dialed_replica,
         tcp,
-        topology.ws_listen_addr.map(|_| ws),
+        ws_listen_addr.map(|_| ws),
         topology.quic_listen_addr.map(|_| quic),
         topology.tcp_tls_listen_addr.map(|_| tcp_tls),
-        None,
+        wss_listen_addr.map(|_| wss),
         shard.bus.config().reconnect_period,
     )
     .await
@@ -2002,7 +1909,8 @@ async fn start_via_replica_io(
         config.cluster.enabled.then_some(bound.replica),
         bound.tcp_tls,
         bound.quic,
-        bound.ws,
+        // The WSS listener occupies the configured websocket address slot.
+        bound.wss.or(bound.ws),
     )
     .await?;
     if config.cluster.enabled {
@@ -2202,6 +2110,9 @@ fn make_replica_delegation_fns(
 /// locally on shard 0 because their per-connection state is not portable
 /// across shards (`compio_quic` endpoint binds one UDP socket; rustls TLS
 /// state ties to the post-handshake reactor).
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 fn make_shard_zero_client_accept_fns(
     coord: Rc<shard::coordinator::ShardZeroCoordinator>,
     bus: &Rc<IggyMessageBus>,
@@ -2209,7 +2120,9 @@ fn make_shard_zero_client_accept_fns(
 ) -> LocalClientAcceptFns {
     let quic_bus = Rc::clone(bus);
     let tcp_tls_bus = Rc::clone(bus);
+    let wss_bus = Rc::clone(bus);
     let quic_request = on_request.clone();
+    let wss_request = on_request.clone();
     let tcp_tls_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
@@ -2236,7 +2149,7 @@ fn make_shard_zero_client_accept_fns(
         installer::install_client_quic(&quic_bus, meta, accepted, quic_request.clone());
     });
 
-    let tcp_tls_coord = coord;
+    let tcp_tls_coord = Rc::clone(&coord);
     let tcp_tls = Rc::new(move |stream, tls_config| {
         let Some(meta) =
             client_meta_from_stream(&stream, &tcp_tls_coord, ClientTransportKind::TcpTls)
@@ -2252,11 +2165,24 @@ fn make_shard_zero_client_accept_fns(
         );
     });
 
+    // WSS terminates locally on shard 0 like TCP-TLS (rustls state is not
+    // serialisable across the delegate path), minting ids through the same
+    // coordinator counter.
+    let wss_coord = coord;
+    let wss = Rc::new(move |stream, tls_config| {
+        let Some(meta) = client_meta_from_stream(&stream, &wss_coord, ClientTransportKind::Wss)
+        else {
+            return;
+        };
+        installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
+    });
+
     LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     }
 }
 
@@ -2312,18 +2238,7 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
-        let token = shard.bus.token();
-        let accepted_ws = accepted_clients.ws.clone();
-        let ws_handle = compio::runtime::spawn(async move {
-            client_listener::ws::run(listener, token, accepted_ws).await;
-        });
-        shard.bus.track_background(ws_handle);
-        bound.ws = Some(bound_addr);
+        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -2511,6 +2426,62 @@ fn load_tcp_tls_server_credentials(
     load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
         ServerNgError::ListenerCredentials {
             transport: "tcp.tls",
+            source,
+        }
+    })
+}
+
+/// Bind the websocket client listener on `ws_addr`: WSS when
+/// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
+/// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
+/// connection with an httparse error), plain WS otherwise.
+async fn start_websocket_listener(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerNgConfig,
+    ws_addr: SocketAddr,
+    accepted_clients: &LocalClientAcceptFns,
+) -> Result<SocketAddr, ServerNgError> {
+    if config.websocket.tls.enabled {
+        let credentials = load_wss_server_credentials(config)?;
+        let (listener, tls_config, bound_addr) = client_listener::wss::bind(ws_addr, credentials)
+            .map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind WSS listener");
+            source
+        })?;
+        let token = shard.bus.token();
+        let accepted_wss = accepted_clients.wss.clone();
+        let wss_handle = compio::runtime::spawn(async move {
+            client_listener::wss::run(listener, tls_config, token, accepted_wss).await;
+        });
+        shard.bus.track_background(wss_handle);
+        Ok(bound_addr)
+    } else {
+        let (listener, bound_addr) =
+            client_listener::ws::bind(ws_addr).await.map_err(|source| {
+                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+                source
+            })?;
+        let token = shard.bus.token();
+        let accepted_ws = accepted_clients.ws.clone();
+        let ws_handle = compio::runtime::spawn(async move {
+            client_listener::ws::run(listener, token, accepted_ws).await;
+        });
+        shard.bus.track_background(ws_handle);
+        Ok(bound_addr)
+    }
+}
+
+fn load_wss_server_credentials(
+    config: &ServerNgConfig,
+) -> Result<TlsServerCredentials, ServerNgError> {
+    let tls = &config.websocket.tls;
+    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+        return Ok(self_signed_for_loopback());
+    }
+
+    load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
+        ServerNgError::ListenerCredentials {
+            transport: "websocket.tls",
             source,
         }
     })

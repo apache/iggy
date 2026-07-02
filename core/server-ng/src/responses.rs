@@ -510,36 +510,48 @@ fn build_cluster_metadata_response() -> ClusterMetadataResponse {
 }
 
 fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
-    let (streams_count, topics_count, partitions_count, messages_size_bytes, messages_count) =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                let mut topics_count = 0u32;
-                let mut partitions_count = 0u32;
-                let mut messages_size_bytes = 0u64;
-                let mut messages_count = 0u64;
-                for (_, stream) in &streams.items {
-                    topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-                    messages_size_bytes =
-                        messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-                    messages_count =
-                        messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                    for (_, topic) in &stream.topics {
-                        partitions_count =
-                            partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-                    }
+    let (
+        streams_count,
+        topics_count,
+        partitions_count,
+        segments_count,
+        messages_size_bytes,
+        messages_count,
+    ) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| -> Result<_, IggyError> {
+            let mut topics_count = 0u32;
+            let mut partitions_count = 0u32;
+            let mut segments_count = 0u32;
+            let mut messages_size_bytes = 0u64;
+            let mut messages_count = 0u64;
+            for (_, stream) in &streams.items {
+                topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
+                messages_size_bytes =
+                    messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
+                messages_count =
+                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+                // Segment counts roll up from the partition plane through
+                // the shared stats registry (partition -> topic -> stream).
+                segments_count =
+                    segments_count.saturating_add(stream.stats.segments_count_inconsistent());
+                for (_, topic) in &stream.topics {
+                    partitions_count =
+                        partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
                 }
-                Ok((
-                    usize_to_u32(streams.items.len())?,
-                    topics_count,
-                    partitions_count,
-                    messages_size_bytes,
-                    messages_count,
-                ))
-            })?;
+            }
+            Ok((
+                usize_to_u32(streams.items.len())?,
+                topics_count,
+                partitions_count,
+                segments_count,
+                messages_size_bytes,
+                messages_count,
+            ))
+        })?;
     let consumer_groups_count = usize_to_u32(
         shard
             .plane
@@ -564,7 +576,7 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
         streams_count,
         topics_count,
         partitions_count,
-        segments_count: 0,
+        segments_count,
         messages_count,
         clients_count: 0,
         consumer_groups_count,
@@ -687,7 +699,7 @@ fn build_get_topic_response(
             partitions: topic
                 .partitions
                 .iter()
-                .map(partition_response)
+                .map(|partition| partition_response(streams, stream_id, topic_id, partition))
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
@@ -769,15 +781,34 @@ fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeade
 }
 
 fn partition_response(
+    streams: &metadata::stm::stream::StreamsInner,
+    stream_id: usize,
+    topic_id: usize,
     partition: &metadata::stm::stream::Partition,
 ) -> Result<PartitionResponse, IggyError> {
+    // Per-partition counters live in the shared stats registry (one `Arc`
+    // across all shards and both left-right buffers), populated when the
+    // owning shard materializes the partition; `None` only in the window
+    // before that first materialization.
+    let stats = streams
+        .stats_registry
+        .partition_get(stream_id, topic_id, partition.id);
+    let (segments_count, current_offset, size_bytes, messages_count) =
+        stats.map_or((0, 0, 0, 0), |stats| {
+            (
+                stats.segments_count_inconsistent(),
+                stats.current_offset(),
+                stats.size_bytes_inconsistent(),
+                stats.messages_count_inconsistent(),
+            )
+        });
     Ok(PartitionResponse {
         id: usize_to_u32(partition.id)?,
         created_at: partition.created_at.as_micros(),
-        segments_count: 0,
-        current_offset: 0,
-        size_bytes: 0,
-        messages_count: 0,
+        segments_count,
+        current_offset,
+        size_bytes,
+        messages_count,
     })
 }
 
