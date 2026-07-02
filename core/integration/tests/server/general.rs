@@ -79,13 +79,12 @@ async fn user(harness: &TestHarness) {
     user_scenario::run(harness).await;
 }
 
-// Blocked under vsr: password hashing and the metadata journal-append
-// race are now fixed, so the scenario runs deep into its permission
-// matrix. Remaining blocker is per-operation authorization: server-ng
-// does not enforce the caller's permissions on metadata ops, so a
-// `read_streams`-only user calling `create_stream` gets `InvalidFormat`
-// instead of `Unauthorized`. Needs the permission-enforcement subsystem
-// wired on the metadata plane.
+// Blocked under vsr, but no longer for RBAC: server-ng now enforces the
+// caller's permissions on the metadata apply path, and that matrix is
+// covered by `server::http_rbac`. This scenario stays gated because it
+// drives get_stats/get_clients/snapshot across all four transports
+// (Tcp/Http/Quic/WebSocket), and QUIC/WebSocket control-plane parity is
+// not yet verified on server-ng.
 #[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
