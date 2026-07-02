@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod authz;
 pub mod consumer_group;
 pub mod mux;
 pub mod result;

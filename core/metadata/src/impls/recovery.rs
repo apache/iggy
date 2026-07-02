@@ -17,6 +17,7 @@
 
 use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
+use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use iggy_binary_protocol::consensus::PrepareHeader;
 use iggy_common::IggyError;
@@ -107,6 +108,7 @@ pub struct RecoveredMetadata<M> {
 pub async fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
+        + GatedApply
         + RestoreSnapshot<MetadataSnapshot>
         + Default,
 {
@@ -148,7 +150,9 @@ where
                 format!("failed to read journal entry for op={}", header.op),
             ))
         })?;
-        mux_stm.update(entry)?;
+        // WAL replay must recompute authorization denials identically to the
+        // primary/backup commit paths, so it goes through the same gate.
+        mux_stm.gated_update(entry)?;
         last_applied_op = Some(header.op);
     }
 

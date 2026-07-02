@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
+use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
@@ -341,8 +342,8 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
-/// Late-bound callback invoked after every successful
-/// `mux_stm.update(prepare)` on shard 0's metadata commit path.
+/// Late-bound callback invoked after every committed op on shard 0's metadata
+/// commit path (via `gated_apply`, including a gated no-op).
 ///
 /// Wired by server-ng bootstrap once the metadata bundle has broadcast;
 /// receives the committed [`Operation`] so the recipient can filter (the
@@ -799,7 +800,7 @@ where
                     // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                     // only; a business rejection commits as a deterministic no-op
                     // whose `code` rides the reply body, replayed on retry.
-                    let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
                         panic!(
                             "on_ack: committed metadata op={} failed to apply: {err}",
                             prepare_header.op
@@ -1293,7 +1294,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn submit_request_in_process(
         &self,
-        message: Message<RequestHeader>,
+        mut message: Message<RequestHeader>,
     ) -> Result<Message<GenericHeader>, MetadataSubmitError> {
         let request_header = *message.header();
         let client_id = request_header.client;
@@ -1340,6 +1341,33 @@ where
 
         if consensus.pipeline().borrow().is_full() {
             return Err(MetadataSubmitError::PipelineFull);
+        }
+
+        // Stamp the acting user id into the request header for the in-apply RBAC
+        // gate, overwriting any wire-supplied value (never trusted). The cluster
+        // resolves session -> user at Register (f1) and the gate must run
+        // identically on every replica, so identity rides the replicated prepare
+        // rather than a per-node session table. `request_preflight` above proved
+        // the session is live, so `get_user_id` is `Some`; the `unwrap_or(0)` is
+        // an unreachable guard, not a root grant (0 is only root's genuine id).
+        //
+        // Kept here rather than hoisted into the shared `prepare_request`:
+        // `Register` and `Logout` funnel through it too, and a mid-`Register`
+        // client has no committed session yet (`get_user_id` is `None`), so a
+        // blanket stamp there would zero `Register`'s f1 user id. The wire
+        // ingresses (`on_request`, `drain_request_queue_into_prepares`) are not
+        // client-reachable today; closing that latent gap needs an op-guarded
+        // stamp, tracked separately.
+        let acting_user_id = self
+            .client_table
+            .borrow()
+            .get_user_id(client_id)
+            .unwrap_or(0);
+        {
+            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+            );
+            header.user_id = acting_user_id;
         }
 
         let Ok(prepare) = self.prepare_request(message) else {
@@ -1706,7 +1734,7 @@ where
                 // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                 // only; a business rejection commits as a deterministic no-op
                 // whose `code` rides the reply body, replayed on retry.
-                let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
                 // Post-commit notifier (e.g. partition reconciler
@@ -2001,6 +2029,13 @@ where
         timestamp,
         operation,
         namespace: request.namespace,
+        // Carry the acting user id so the in-apply RBAC gate sees the same
+        // identity on every replica. The default projection copies it (see
+        // `Project::project`); this helper builds prepares for the ops it
+        // rewrites (CreateTopic/CreatePartitions assignment forms,
+        // TruncatePartition), which would otherwise reset it to 0 via
+        // `..Default::default()`.
+        user_id: request.user_id,
         ..Default::default()
     };
 

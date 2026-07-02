@@ -498,7 +498,7 @@ impl StreamsInner {
         self.pending_revocations_count = count;
     }
 
-    fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    pub(crate) fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -512,7 +512,11 @@ impl StreamsInner {
         }
     }
 
-    fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
+    pub(crate) fn resolve_topic_id(
+        &self,
+        stream_id: usize,
+        identifier: &WireIdentifier,
+    ) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
         match identifier {
             WireIdentifier::Numeric(id) => {

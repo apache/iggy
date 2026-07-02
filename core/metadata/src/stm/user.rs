@@ -35,6 +35,7 @@ use iggy_binary_protocol::requests::users::{
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{
     GlobalPermissions, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
     StreamPermissions, UserId, UserStatus,
@@ -124,7 +125,7 @@ collect_handlers! {
 }
 
 impl UsersInner {
-    fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    pub(crate) fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -429,6 +430,15 @@ impl StateHandler for DeleteUserRequest {
             return ApplyReply::err(DeleteUserResult::UserNotFound);
         };
 
+        // Root (slab id 0) is undeletable, matching legacy `CannotDeleteUser`.
+        // The rejection is deterministic, so every replica keeps slab id 0 as
+        // the root user and the in-apply RBAC gate's `user_id == 0` root
+        // short-circuit can never be inherited by a recreated user (the slab
+        // reuses freed keys, so a deleted root's slot would be reclaimed).
+        if user_id == DEFAULT_ROOT_USER_ID as usize {
+            return ApplyReply::err(DeleteUserResult::CannotDeleteUser);
+        }
+
         if let Some(user) = state.items.get(user_id) {
             let username = user.username.clone();
             state.items.remove(user_id);
@@ -474,6 +484,14 @@ impl StateHandler for UpdatePermissionsRequest {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return ApplyReply::err(UpdatePermissionsResult::UserNotFound);
         };
+
+        // Root (slab id 0) permissions are immutable, matching legacy
+        // `CannotChangePermissions`. Rejected before any mutation, so the op is a
+        // committed no-op: root keeps its full grants and the permissioner index
+        // is untouched.
+        if user_id == DEFAULT_ROOT_USER_ID as usize {
+            return ApplyReply::err(UpdatePermissionsResult::CannotChangePermissions);
+        }
 
         if let Some(user) = state.items.get_mut(user_id) {
             user.permissions = self
@@ -964,6 +982,98 @@ mod tests {
         assert_eq!(apply.code, u32::from(DeleteUserResult::UserNotFound));
     }
 
+    #[test]
+    fn given_root_user_when_apply_delete_user_should_reject_and_keep_root() {
+        // Production seeds root at slab id 0 (`ensure_root_user`), so the first
+        // slab slot is the root user. Deleting it must be rejected in-apply, or
+        // a later `CreateUser` would reclaim slot 0 and inherit the RBAC gate's
+        // `user_id == 0` root short-circuit.
+        let mut users = UsersInner::new();
+        let root_id = create_user_with(&mut users, "iggy", None);
+        assert_eq!(root_id, DEFAULT_ROOT_USER_ID, "root takes slab id 0");
+
+        let delete_root = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(root_id),
+        };
+        let reply = StateHandler::apply(&delete_root, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, u32::from(DeleteUserResult::CannotDeleteUser));
+        assert!(
+            users.items.contains(root_id as usize),
+            "root must survive a delete attempt"
+        );
+
+        // A non-root user (slab id 1) stays deletable: the guard is scoped to
+        // root, so there is no over-block regression.
+        let alice_id = create_user_with(&mut users, "alice", None);
+        assert_ne!(alice_id, DEFAULT_ROOT_USER_ID);
+        let delete_alice = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(alice_id),
+        };
+        let reply = StateHandler::apply(&delete_alice, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0, "non-root deletion still succeeds");
+        assert!(!users.items.contains(alice_id as usize));
+    }
+
+    #[test]
+    fn given_root_user_when_apply_update_permissions_should_reject_and_keep_grants() {
+        // Root occupies slab id 0 (production `ensure_root_user`). Its
+        // permissions must be immutable in-apply, or a delegated manage_users
+        // admin could tamper with root's grants.
+        let mut users = UsersInner::new();
+        let mut root_global = empty_global();
+        root_global.manage_servers = true;
+        root_global.poll_messages = true;
+        let root_id = create_user_with(
+            &mut users,
+            "iggy",
+            Some(WirePermissions {
+                global: root_global,
+                streams: Vec::new(),
+            }),
+        );
+        assert_eq!(root_id, DEFAULT_ROOT_USER_ID, "root takes slab id 0");
+        assert!(users.permissioner.poll_messages(root_id, 1, 1).is_ok());
+
+        // Attempt to strip root's grants: rejected, nothing mutates.
+        let strip = UpdatePermissionsRequest {
+            user_id: WireIdentifier::numeric(root_id),
+            permissions: None,
+        };
+        let reply = StateHandler::apply(&strip, &mut users, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(UpdatePermissionsResult::CannotChangePermissions)
+        );
+        assert!(
+            users
+                .items
+                .get(root_id as usize)
+                .and_then(|user| user.permissions.as_ref())
+                .is_some(),
+            "root permissions must survive"
+        );
+        assert!(
+            users.permissioner.poll_messages(root_id, 1, 1).is_ok(),
+            "root gate access unchanged"
+        );
+
+        // A non-root user's permissions can still be updated: no over-block.
+        let alice_id = create_user_with(&mut users, "alice", None);
+        assert_ne!(alice_id, DEFAULT_ROOT_USER_ID);
+        let mut alice_global = empty_global();
+        alice_global.poll_messages = true;
+        let grant = UpdatePermissionsRequest {
+            user_id: WireIdentifier::numeric(alice_id),
+            permissions: Some(WirePermissions {
+                global: alice_global,
+                streams: Vec::new(),
+            }),
+        };
+        let reply = StateHandler::apply(&grant, &mut users, IggyTimestamp::now());
+        assert_eq!(reply.code, 0, "non-root permission update still succeeds");
+        assert!(users.permissioner.poll_messages(alice_id, 1, 1).is_ok());
+    }
+
     fn empty_global() -> WireGlobalPermissions {
         WireGlobalPermissions {
             manage_servers: false,
@@ -1023,6 +1133,9 @@ mod tests {
     #[test]
     fn given_poll_grant_when_apply_update_permissions_removes_it_should_return_unauthorized() {
         let mut users = UsersInner::new();
+        // Occupy slab id 0 with the (immutable) root user so the poller under
+        // test is a non-root user; root permission changes are rejected in-apply.
+        create_user_with(&mut users, "iggy", None);
         let mut global = empty_global();
         global.poll_messages = true;
         let uid = create_user_with(
@@ -1057,6 +1170,9 @@ mod tests {
     #[test]
     fn given_permissioned_user_when_apply_delete_user_should_clear_all_indexes() {
         let mut users = UsersInner::new();
+        // Occupy slab id 0 with the (undeletable) root user so the victim under
+        // test is a non-root user; root deletion is rejected in-apply.
+        create_user_with(&mut users, "iggy", None);
         let mut global = empty_global();
         global.poll_messages = true;
         global.send_messages = true;

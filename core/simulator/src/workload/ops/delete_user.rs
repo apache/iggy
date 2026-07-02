@@ -47,6 +47,8 @@ pub fn sample(
         Outcome::UserNotFound => Some(Input {
             user: shadow.fabricate_absent_name("user"),
         }),
+        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
+        Outcome::CannotDeleteUser => None,
     }
 }
 
@@ -70,6 +72,9 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::RemoveUser {
             name: input.user.clone(),
         },
-        Outcome::UserNotFound => Effect::None,
+        // `CannotDeleteUser` is never targeted (the workload's users live at
+        // slab id 1+, never root), but effects dispatch on the committed
+        // outcome, so the arm is required: a rejected delete removes nothing.
+        Outcome::UserNotFound | Outcome::CannotDeleteUser => Effect::None,
     }
 }
