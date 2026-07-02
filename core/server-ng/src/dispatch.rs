@@ -994,12 +994,17 @@ async fn handle_default_non_replicated(
             }
         }
         Err(error) => {
+            // Surface the builder's typed error (unsupported op, undecodable
+            // body, or a not-found parity read) on the same deny channel the
+            // authz gate uses; a silent drop would wedge the client until its
+            // read timeout.
             warn!(
                 transport_client_id,
                 code,
                 error = %error,
-                "dropping unsupported non-replicated VSR request"
+                "denying non-replicated VSR request"
             );
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         }
     }
 }

@@ -74,6 +74,7 @@ use iggy_binary_protocol::{
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
+use server::binary::dispatch::wire_id_to_identifier;
 use server_common::Message;
 use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
@@ -429,6 +430,7 @@ pub(crate) fn build_non_replicated_response(
         GET_CONSUMER_GROUP_CODE => {
             let request = GetConsumerGroupRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
+            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
             let response = shard
                 .plane
                 .metadata()
@@ -442,6 +444,7 @@ pub(crate) fn build_non_replicated_response(
         GET_CONSUMER_GROUPS_CODE => {
             let request = GetConsumerGroupsRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
+            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
             let groups = shard
                 .plane
                 .metadata()
@@ -665,12 +668,11 @@ fn build_get_topics_response(
     stream_id: &WireIdentifier,
 ) -> Result<GetTopicsResponse, IggyError> {
     shard.plane.metadata().mux_stm.streams().read(|streams| {
-        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
-            return Ok(GetTopicsResponse { topics: Vec::new() });
-        };
+        let resolved_stream =
+            resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
         let stream = streams
             .items
-            .get(stream_id)
+            .get(resolved_stream)
             .ok_or(IggyError::InvalidIdentifier)?;
         stream
             .topics
@@ -679,6 +681,39 @@ fn build_get_topics_response(
             .collect::<Result<Vec<_>, _>>()
             .map(|topics| GetTopicsResponse { topics })
     })
+}
+
+/// Reject a consumer-group read whose parent stream/topic is absent with the
+/// legacy typed error naming the level that missed; the group itself missing
+/// stays the shared not-found reply (empty over TCP, 404 over HTTP).
+fn ensure_topic_exists(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<(), IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let resolved_stream =
+            resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
+        resolve_topic_id(streams, resolved_stream, topic_id)
+            .ok_or_else(|| topic_not_found(stream_id, topic_id))?;
+        Ok(())
+    })
+}
+
+/// Typed miss for a read's parent stream, matching the legacy servers' error
+/// shape. The identifier only feeds the error message; a wire form with no
+/// domain equivalent (numeric 0 is a live slab id here but not a legacy id)
+/// falls back to the default identifier.
+fn stream_not_found(stream_id: &WireIdentifier) -> IggyError {
+    IggyError::StreamIdNotFound(wire_id_to_identifier(stream_id).unwrap_or_default())
+}
+
+/// Typed miss for a read's parent topic; see [`stream_not_found`].
+fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> IggyError {
+    IggyError::TopicIdNotFound(
+        wire_id_to_identifier(stream_id).unwrap_or_default(),
+        wire_id_to_identifier(topic_id).unwrap_or_default(),
+    )
 }
 
 pub(crate) fn resolve_stream_id(
