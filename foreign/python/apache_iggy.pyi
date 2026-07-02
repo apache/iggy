@@ -356,7 +356,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is created.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def get_consumer_group(
         self,
@@ -376,7 +377,8 @@ class IggyClient:
             An awaitable that resolves to `ConsumerGroupDetails | None`.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def get_consumer_groups(
         self,
@@ -394,7 +396,8 @@ class IggyClient:
             An awaitable that resolves to `list[ConsumerGroup]`.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def send_messages(
         self,

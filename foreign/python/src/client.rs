@@ -29,8 +29,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::consumer::{
-    AutoCommit, IggyConsumer, py_delta_to_iggy_duration,
-    ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
+    AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
+    IggyConsumer, py_delta_to_iggy_duration,
 };
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
@@ -257,7 +257,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the consumer group is created.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_consumer_group<'a>(
         &self,
@@ -290,7 +291,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `ConsumerGroupDetails | None`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails | None]", imports=("collections.abc")))]
     fn get_consumer_group<'a>(
         &self,
@@ -323,7 +325,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[ConsumerGroup]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If an identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ConsumerGroup]]", imports=("collections.abc")))]
     fn get_consumer_groups<'a>(
         &self,
