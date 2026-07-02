@@ -28,28 +28,28 @@ pub mod actions;
 pub mod auditor;
 pub mod effect;
 pub mod ids;
+pub mod invariants;
 pub mod ops;
 pub mod options;
+pub mod oracle;
 pub mod shadow;
 
-use std::collections::HashMap;
-
+use crate::Simulator;
+use crate::client::SimClient;
+use crate::workload::ops::InFlight;
+use actions::Action;
+use auditor::{OnReply, ServerAuditor};
+use effect::SimCommand;
 use iggy_binary_protocol::{ReplyHeader, RequestHeader, result_code};
+use invariants::Invariants;
 use metadata::stm::result::result_code_recognized;
+use options::WorkloadOptions;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
-
-use crate::Simulator;
-use crate::client::SimClient;
-use actions::Action;
-use auditor::{OnReply, ServerAuditor};
-use effect::SimCommand;
-use options::WorkloadOptions;
 use shadow::Shadow;
-
-use crate::workload::ops::InFlight;
+use std::collections::{HashMap, HashSet};
 
 /// Max in-flight requests per client. Must stay under the consensus
 /// pipeline's queue limits.
@@ -104,6 +104,30 @@ impl Workload {
             .copied()
             .unwrap_or(0)
             < CLIENT_REQUEST_QUEUE_MAX
+    }
+
+    /// Total in-flight requests across all clients. Read by the
+    /// [`Invariants`]; draws no PRNG.
+    #[must_use]
+    pub(crate) fn total_in_flight(&self) -> usize {
+        self.in_flight_per_client.values().copied().sum()
+    }
+
+    /// Aggregate in-flight ceiling: one queue's worth per declared client.
+    /// Fixtures set `client_count` to the number of driven clients, the same
+    /// coupling `strict_outcome_oracle` relies on.
+    #[must_use]
+    pub(crate) fn in_flight_bound(&self) -> usize {
+        usize::from(self.options.client_count) * CLIENT_REQUEST_QUEUE_MAX
+    }
+
+    /// True when the run is fully serial (one client, one in-flight slot), the
+    /// regime where the shadow equals committed server state. Gates the
+    /// quiesce-time entity oracle the same way it gates the per-op equality
+    /// oracle.
+    #[must_use]
+    pub(crate) const fn strict_outcome_oracle(&self) -> bool {
+        self.strict_outcome_oracle
     }
 
     /// Build the next request for `client`. Returns the message and target
@@ -324,8 +348,18 @@ impl Workload {
     }
 }
 
+/// Salt mixed into the workload seed for the fault PRNG, so crash scheduling
+/// is reproducible from the seed yet independent of the traffic draw order
+/// (the determinism baseline stays valid with injection on).
+const FAULT_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0001;
+
 /// Drive the simulator until `tick_budget` elapses or `replies_target`
 /// replies are seen. Returns the number of replies seen.
+///
+/// The invariants are asserted after every tick, so a consensus or
+/// workload regression panics at the tick it occurs (the seed in the message
+/// replays it). When `crash_per_tick_ratio > 0` the driver also injects
+/// crash-only faults via [`maybe_inject_crash`].
 pub fn run(
     sim: &mut Simulator,
     workload: &mut Workload,
@@ -333,8 +367,13 @@ pub fn run(
     tick_budget: u64,
     replies_target: u64,
 ) -> u64 {
+    let mut invariants = Invariants::new();
+    let mut fault_prng = Xoshiro256Plus::seed_from_u64(workload.options.seed ^ FAULT_SEED_SALT);
     let mut replies_seen = 0u64;
     for _ in 0..tick_budget {
+        if workload.options.crash_per_tick_ratio > 0.0 {
+            maybe_inject_crash(sim, workload, &mut fault_prng);
+        }
         for client in clients {
             if let Some((target, msg)) = workload.build_request(client) {
                 sim.submit_request(client.client_id(), target, msg.into_generic());
@@ -345,11 +384,56 @@ pub fn run(
             apply_sim_commands(sim, &cmds);
             replies_seen += 1;
         }
+        invariants.check(sim, workload);
         if replies_seen >= replies_target {
             break;
         }
     }
     replies_seen
+}
+
+/// With probability `crash_per_tick_ratio`, crash one live non-primary replica,
+/// provided doing so leaves at least `min_survivors` live. Crash-only: a
+/// crashed replica is never restarted (that needs consensus durability).
+///
+/// "Non-primary" is partition-plane only: the exclusion set comes from
+/// `Simulator::primary_index`, which reads `partitions()`. The metadata-plane
+/// primary is not consulted; it is spared only by co-location, since every group
+/// starts at view 0 with `primary = view % replica_count` (so replica 0 leads
+/// both planes) and `min_survivors` keeps a commit quorum, so no view change
+/// moves it. Were the two planes' primaries to diverge, the metadata primary
+/// could be crashed.
+///
+/// Primaries are spared at all because the driver has no request-timeout/resend
+/// path: a request lost to a crashed primary would wedge the client's only
+/// in-flight slot. Forcing primary crashes (and the view change they trigger)
+/// while keeping traffic flowing is future work gated on that resend path.
+fn maybe_inject_crash(sim: &mut Simulator, workload: &Workload, prng: &mut Xoshiro256Plus) {
+    let live: Vec<u8> = (0..sim.replica_count)
+        .filter(|replica_idx| !sim.is_crashed(*replica_idx))
+        .collect();
+    if live.len() <= usize::from(workload.options.min_survivors) {
+        return;
+    }
+    let roll: f32 = prng.random();
+    if roll >= workload.options.crash_per_tick_ratio {
+        return;
+    }
+    let primaries: HashSet<u8> = workload
+        .options
+        .namespaces
+        .iter()
+        .filter_map(|ns| sim.primary_index(*ns))
+        .collect();
+    let eligible: Vec<u8> = live
+        .into_iter()
+        .filter(|replica_idx| !primaries.contains(replica_idx))
+        .collect();
+    if eligible.is_empty() {
+        return;
+    }
+    let victim = eligible[prng.random_range(0..eligible.len())];
+    sim.replica_crash(victim);
 }
 
 /// Apply `SimCommand`s returned by [`Workload::on_reply`].

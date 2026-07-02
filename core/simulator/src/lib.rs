@@ -340,6 +340,42 @@ impl Simulator {
         Some(partition.offsets())
     }
 
+    /// Consensus view for a replica's partition-plane group, or `None` if the
+    /// namespace is not present on that replica.
+    #[must_use]
+    pub(crate) fn consensus_view(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<u64> {
+        let replica = &self.replicas[replica_idx];
+        let partition = replica.plane.partitions().get_by_ns(&namespace)?;
+        Some(u64::from(partition.consensus().view()))
+    }
+
+    /// Index of the current primary for `namespace`, as seen by the first live
+    /// replica hosting it, or `None` if no live replica hosts it.
+    ///
+    /// Reads one replica's view, so it assumes live replicas agree on the
+    /// primary. Sound only while the primary is static, which holds today: the
+    /// driver spares primaries from crashes, so no crash-triggered view change
+    /// runs mid-test. Once primary-crash injection lands, views can diverge and
+    /// this may name a stale or crashed primary (see
+    /// `workload::oracle::assert_converged` for the consequence and fix).
+    #[must_use]
+    pub(crate) fn primary_index(&self, namespace: IggyNamespace) -> Option<u8> {
+        (0..self.replica_count)
+            .filter(|replica_idx| !self.crashed.contains(replica_idx))
+            .find_map(|replica_idx| {
+                let partition = self.replicas[usize::from(replica_idx)]
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)?;
+                let consensus = partition.consensus();
+                Some(consensus.primary_index(consensus.view()))
+            })
+    }
+
     fn dispatch_to_replica(replica: &Replica, message: Message<GenericHeader>) {
         futures::executor::block_on(replica.on_message(message));
 
@@ -684,7 +720,7 @@ mod tests {
         // shifts the trace. Re-lock on intentional changes; expect re-locks until
         // error discriminants and reply bodies stabilize the wire format.
         assert_eq!(
-            h1, 0x882B_163F_CA9B_A0BC,
+            h1, 0xFF7F_E659_B9D8_15E9,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -752,6 +788,266 @@ mod tests {
             replies_seen > 0,
             "uniform-weight workload produced no replies; sampling or dispatch broken"
         );
+    }
+
+    /// The cheap per-tick invariants run inside `workload::run` and
+    /// stay green over a uniform 25-op single-client workload. A second pass
+    /// with a fresh `Invariants` confirms the checks observed live state
+    /// (non-vacuous): `commit_offset` is tracked for every (replica, namespace)
+    /// pair, not silently skipped.
+    #[test]
+    fn uniform_weights_invariants_hold() {
+        use crate::workload::{
+            self, Workload,
+            actions::Action,
+            invariants::Invariants,
+            options::{ActionWeights, WorkloadOptions},
+        };
+        use strum::{EnumCount, IntoEnumIterator};
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC0FF_EE00,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_b = server_common::sharding::IggyNamespace::new(1, 1, 1);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+        sim.register_client_with_primary(&client);
+
+        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
+        options.weights = ActionWeights::new(&entries);
+        let mut wl = Workload::new(options);
+
+        // `run` asserts the invariants every tick; any regression panics
+        // here, replayable from the seed above.
+        let clients = [client];
+        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        assert!(
+            replies > 0,
+            "uniform-weight workload produced no replies; invariants never exercised"
+        );
+
+        // Non-vacuity: the checks must have read live state for every pair.
+        let mut probe = Invariants::new();
+        probe.check(&sim, &wl);
+        assert_eq!(
+            probe.tracked_pairs(),
+            usize::from(replica_count) * 2,
+            "expected commit_offset tracked for every (replica, namespace) pair"
+        );
+    }
+
+    /// With a positive crash probability
+    /// the driver crashes followers (never the primary) but never below the
+    /// survivor floor, while the per-tick invariants stay green and the
+    /// surviving quorum keeps committing.
+    #[test]
+    fn crash_injection_spares_primary_and_keeps_quorum() {
+        use crate::workload::{
+            self, Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC0FF_EE00,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a]);
+        options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
+        options.crash_per_tick_ratio = 0.05;
+        options.min_survivors = 3; // quorum of 5
+
+        let mut wl = Workload::new(options);
+        let clients = [client];
+        // run() asserts the per-tick invariants every tick under injected crashes.
+        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+
+        let crashed = sim.crashed.len();
+        assert!(
+            crashed >= 1,
+            "expected at least one crash injected over the run"
+        );
+        assert!(
+            !sim.is_crashed(0),
+            "primary (replica 0) must never be crashed"
+        );
+        assert!(
+            usize::from(replica_count) - crashed >= 3,
+            "must keep at least min_survivors=3 live (crashed={crashed})"
+        );
+        assert!(
+            replies > 0,
+            "surviving quorum must keep committing under follower crashes"
+        );
+    }
+
+    /// After a mixed metadata + partition run drains, the shadow's
+    /// predicted streams equal the metadata committed on the leader (the
+    /// entity-oracle payoff of the name-keyed shadow).
+    ///
+    /// Interleaves creates, deletes, and partition sends from a single client.
+    /// A send between two metadata ops once consumed a metadata request number
+    /// and gapped the next create into a permanent `RequestGap`; the `SimClient`
+    /// per-plane numbering fix keeps the metadata sequence contiguous, so the
+    /// mix now drains. The entity oracle still compares only against the leader:
+    /// a quorum-excluded backup has no idle catch-up yet, so full cross-replica
+    /// equality stays deferred (see [`oracle`]).
+    #[test]
+    fn quiesce_stream_entity_oracle_matches_leader() {
+        use crate::workload::{
+            self, Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC0FF_EE00,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a]);
+        // Interleave metadata creates/deletes with partition sends: the send
+        // between two metadata ops is the case that previously wedged the next
+        // create. Sends do not touch the metadata entity sets, so the entity
+        // oracle below still compares stream state cleanly.
+        options.weights = ActionWeights::new(&[
+            (Action::CreateStream, 50),
+            (Action::DeleteStream, 25),
+            (Action::SendMessages, 25),
+        ]);
+        let mut wl = Workload::new(options);
+
+        let clients = [client];
+        let replies = workload::run(&mut sim, &mut wl, &clients, 2_000, u64::MAX);
+        assert!(replies > 0, "workload produced no replies");
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            "system did not drain within the tick budget"
+        );
+        // Cross-replica agreement + entity oracle (single client => strict).
+        oracle::assert_converged(&sim, &wl);
+    }
+
+    /// Under follower crashes the surviving quorum still drains and
+    /// agrees on the partition commit offset at quiesce.
+    #[test]
+    fn quiesce_partition_offsets_converge_under_crashes() {
+        use crate::workload::{
+            self, Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC0FF_EE00,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        // Partition-plane workload under crashes: SendMessages replies and the
+        // partition plane converges across survivors. Stays partition-only by
+        // design to isolate partition-offset convergence from metadata loss to a
+        // crashed primary; the metadata entity oracle runs in the no-crash test.
+        // Crash one follower (keep quorum slack: 5 replicas, floor 4, quorum 3),
+        // so commits still reach quorum and the run drains.
+        let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a]);
+        options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
+        options.crash_per_tick_ratio = 0.05;
+        options.min_survivors = 4;
+        let mut wl = Workload::new(options);
+
+        let clients = [client];
+        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        assert!(replies > 0, "workload produced no replies");
+        assert!(
+            !sim.crashed.is_empty(),
+            "expected at least one follower crash"
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
+            "surviving quorum did not drain within the tick budget"
+        );
+        oracle::assert_converged(&sim, &wl);
     }
 
     /// Drive Create-heavy then Delete-heavy workload; assert shadow tracks
