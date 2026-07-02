@@ -948,6 +948,8 @@ class TestUpdateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
+        # TODO: assert topic.message_expiry once TopicDetails exposes that
+        # getter (tracked for a follow-up PR).
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("max_topic_size", [0, 2_000_000_000, 2**64 - 1])
@@ -973,6 +975,8 @@ class TestUpdateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
+        # TODO: assert topic.message_expiry and topic.max_topic_size once
+        # TopicDetails exposes those getters (tracked for a follow-up PR).
 
     @pytest.mark.asyncio
     async def test_update_topic_applies_repeated_updates(
