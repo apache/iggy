@@ -221,6 +221,69 @@ impl HttpSession {
         assert_eq!(response.status(), StatusCode::OK, "poll must answer 200");
         response.json().await.expect("decode PolledMessages")
     }
+
+    /// Log in as an already-created user, reusing this session's client and
+    /// base URL but swapping the bearer for the new credential. Single attempt:
+    /// the server is already warm once the root session exists.
+    async fn login(&self, username: &str, password: &str) -> Self {
+        let body = serde_json::json!({ "username": username, "password": password });
+        let response = self
+            .client
+            .post(self.url("/users/login"))
+            .json(&body)
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            response.status().is_success(),
+            "login for {username} failed: {}",
+            response.status()
+        );
+        let identity: IdentityInfo = response.json().await.expect("decode IdentityInfo");
+        let token = identity
+            .access_token
+            .expect("login must return an access token")
+            .token;
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            token,
+        }
+    }
+
+    /// Create an ungranted user (no permissions -> the permissioner holds no
+    /// entry, so every RBAC rule denies). Runs as this session's user.
+    async fn create_user(&self, username: &str, password: &str) {
+        let body = serde_json::json!({
+            "username": username,
+            "password": password,
+            "status": "active",
+            "permissions": null,
+        });
+        let response = self
+            .client
+            .post(self.url("/users"))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .expect("create user request");
+        assert!(
+            response.status().is_success(),
+            "create user failed: {}",
+            response.status()
+        );
+    }
+
+    /// GET `path` with this session's bearer.
+    async fn get(&self, path: &str) -> Response {
+        self.client
+            .get(self.url(path))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("get request")
+    }
 }
 
 fn durability(response: &Response) -> &str {
@@ -543,4 +606,66 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
         );
         sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
     }
+}
+
+/// End-to-end RBAC proof: an ungranted user is 403 on a metadata read and on a
+/// data-plane produce, root stays 200/201, and the auth-only cluster-metadata
+/// route is never gated. Exercises the HTTP per-op gates (read + partition
+/// write) and the in-apply control gate (user creation as root) in one path.
+#[iggy_harness]
+async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harness: &TestHarness) {
+    let root = HttpSession::login_root(harness).await;
+    root.create_stream_and_topic("rbac-stream", "rbac-topic", 1)
+        .await;
+    // Root provisions a user with no permissions, then we log in as them.
+    root.create_user("rbac-nobody", "rbac-nobody-pass").await;
+    let nobody = root.login("rbac-nobody", "rbac-nobody-pass").await;
+
+    // A metadata read: 403 for the ungranted user, 200 for root.
+    assert_eq!(
+        nobody.get("/streams").await.status(),
+        StatusCode::FORBIDDEN,
+        "ungranted read must be 403"
+    );
+    assert_eq!(
+        root.get("/streams").await.status(),
+        StatusCode::OK,
+        "root read must be 200"
+    );
+
+    // A data-plane produce: 403 for the ungranted user, 201 for root.
+    let denied = nobody
+        .produce(
+            "rbac-stream",
+            "rbac-topic",
+            PARTITION_ID,
+            vec![text_message(1, "denied".to_string())],
+        )
+        .await;
+    assert_eq!(
+        denied.status(),
+        StatusCode::FORBIDDEN,
+        "ungranted produce must be 403"
+    );
+    let allowed = root
+        .produce(
+            "rbac-stream",
+            "rbac-topic",
+            PARTITION_ID,
+            vec![text_message(2, "allowed".to_string())],
+        )
+        .await;
+    assert_eq!(
+        allowed.status(),
+        StatusCode::CREATED,
+        "root produce must commit"
+    );
+
+    // The auth-only cluster-metadata route carries no rule: any authenticated
+    // user reaches it, ungranted included.
+    assert_eq!(
+        nobody.get("/cluster/metadata").await.status(),
+        StatusCode::OK,
+        "cluster metadata is auth-only, never RBAC-gated"
+    );
 }

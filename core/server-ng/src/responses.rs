@@ -680,7 +680,7 @@ fn build_get_topics_response(
     })
 }
 
-fn resolve_stream_id(
+pub(crate) fn resolve_stream_id(
     streams: &metadata::stm::stream::StreamsInner,
     identifier: &WireIdentifier,
 ) -> Option<usize> {
@@ -693,7 +693,7 @@ fn resolve_stream_id(
     }
 }
 
-fn resolve_topic_id(
+pub(crate) fn resolve_topic_id(
     streams: &metadata::stm::stream::StreamsInner,
     stream_id: usize,
     identifier: &WireIdentifier,
@@ -776,6 +776,28 @@ pub(crate) fn build_empty_reply(
     commit: u64,
 ) -> Message<ReplyHeader> {
     build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
+}
+
+/// Build an empty reply that denies a dispatch-time authorization check: the
+/// same request echo as [`build_empty_reply`] but with `ReplyHeader.status`
+/// set to the rule's error code -- the request-level failure channel the SDK
+/// peeks before any body decode. The single writer of a nonzero status, so
+/// every deny path stamps it one way.
+pub(crate) fn build_deny_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    status: u32,
+) -> Message<ReplyHeader> {
+    let mut reply = build_empty_reply(request_header, client_id, session, commit);
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+        &mut reply.as_mut_slice()[..header_len],
+    )
+    .expect("empty reply header is a valid ReplyHeader");
+    header.status = status;
+    reply
 }
 
 /// Server build version advertised in the login-register response.

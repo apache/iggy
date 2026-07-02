@@ -91,7 +91,7 @@ use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{
     AckLevel, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
-    WireName,
+    WireIdentifier, WireName,
 };
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -99,9 +99,10 @@ use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
-use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
+// `DEFAULT_ROOT_USER_ID` is only referenced by the test module now that the
+// interim root-only gates are gone; its import lives there.
 use iggy_common::login_user::LoginUser;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
@@ -125,6 +126,7 @@ use iggy_common::{
 };
 use message_bus::{BusMessage, InstanceToken, client_listener};
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::permissioner::Permissioner;
 use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
@@ -146,7 +148,7 @@ use crate::login_register::LoginRegisterError;
 use crate::pat::rewrite_pat_request_for_user;
 use crate::responses::{
     NonReplicatedResponse, build_non_replicated_response, build_polled_messages_body,
-    build_raw_pat_reply, connected_client_to_response,
+    build_raw_pat_reply, connected_client_to_response, resolve_stream_id, resolve_topic_id,
 };
 use crate::server_error::ServerNgError;
 use crate::users::maybe_rewrite_user_password_request;
@@ -335,9 +337,9 @@ impl IntoResponse for WriteError {
 /// unknown rather than failed.
 #[derive(Debug)]
 enum PartitionWriteError {
-    /// Caller-side rejection (bad identifier, oversized batch, the interim
-    /// non-root denial) or a malformed reply frame, rendered through the
-    /// legacy `IggyError -> status` map for SDK-identical bodies.
+    /// Caller-side rejection (bad identifier, oversized batch, an authorization
+    /// denial) or a malformed reply frame, rendered through the legacy
+    /// `IggyError -> status` map for SDK-identical bodies.
     Rejected(IggyError),
     /// The dispatch gates could not route the write: the stream, topic, or
     /// partition does not resolve (or never materialised within the routable
@@ -509,9 +511,9 @@ struct ProduceQuery {
 /// renderings, mirroring [`WriteError`]'s split so error bodies stay
 /// SDK-identical:
 enum ReadError {
-    /// Caller-side or STM rejection (bad identifier, unsupported op, or the
-    /// interim non-root authz denial) graded through the legacy
-    /// `IggyError -> status` map so SDK error bodies stay byte-identical.
+    /// Caller-side or STM rejection (bad identifier, unsupported op, or an
+    /// authorization denial) graded through the legacy `IggyError -> status`
+    /// map so SDK error bodies stay byte-identical.
     Rejected(IggyError),
     /// Requested entity is absent -> 404 with the legacy not-found body.
     NotFound,
@@ -981,6 +983,7 @@ async fn get_streams(
         query.consistency,
         GET_STREAMS_CODE,
         &body,
+        Permissioner::get_streams,
     )?;
     let response = GetStreamsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
@@ -997,11 +1000,24 @@ async fn get_stream(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<StreamDetails>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    // Resolve for the gate; a miss leaves it a pass-through so the read renders
+    // the existing 404 rather than a 403.
+    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetStreamRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_STREAM_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_STREAM_CODE,
+        &body,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
+        },
+    )?;
     let response = GetStreamResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -1019,11 +1035,22 @@ async fn get_topics(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<Topic>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
+    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetTopicsRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
+        stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_TOPICS_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_TOPICS_CODE,
+        &body,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
+        },
+    )?;
     let response = GetTopicsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -1042,12 +1069,26 @@ async fn get_topic(
 ) -> Result<Json<TopicDetails>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetTopicRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+        stream_id: wire_stream_id,
+        topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_TOPIC_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_TOPIC_CODE,
+        &body,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |(stream_id, topic_id)| {
+                permissioner.get_topic(uid, stream_id, topic_id)
+            })
+        },
+    )?;
     let response = GetTopicResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -1063,7 +1104,14 @@ async fn get_users(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<UserInfo>>, ReadError> {
     let body = GetUsersRequest.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_USERS_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_USERS_CODE,
+        &body,
+        Permissioner::get_users,
+    )?;
     let response = GetUsersResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -1085,7 +1133,14 @@ async fn get_user(
         user_id: identifier_to_wire(&user_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_USER_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_USER_CODE,
+        &body,
+        Permissioner::get_user,
+    )?;
     let response = UserDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -1104,9 +1159,12 @@ async fn get_cgs(
 ) -> Result<Json<Vec<ConsumerGroup>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupsRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+        stream_id: wire_stream_id,
+        topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
     let bytes = read_local(
@@ -1115,6 +1173,11 @@ async fn get_cgs(
         query.consistency,
         GET_CONSUMER_GROUPS_CODE,
         &body,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |(stream_id, topic_id)| {
+                permissioner.get_consumer_groups(uid, stream_id, topic_id)
+            })
+        },
     )?;
     let response = GetConsumerGroupsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
@@ -1134,9 +1197,12 @@ async fn get_cg(
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let group_id = Identifier::from_str_value(&group_id).map_err(ReadError::Rejected)?;
+    let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
+    let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?,
+        stream_id: wire_stream_id,
+        topic_id: wire_topic_id,
         group_id: identifier_to_wire(&group_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
@@ -1146,6 +1212,11 @@ async fn get_cg(
         query.consistency,
         GET_CONSUMER_GROUP_CODE,
         &body,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |(stream_id, topic_id)| {
+                permissioner.get_consumer_group(uid, stream_id, topic_id)
+            })
+        },
     )?;
     let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
@@ -1162,7 +1233,14 @@ async fn get_stats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Stats>, ReadError> {
     let body = GetStatsRequest.to_bytes();
-    let bytes = read_local(&state, &identity, query.consistency, GET_STATS_CODE, &body)?;
+    let bytes = read_local(
+        &state,
+        &identity,
+        query.consistency,
+        GET_STATS_CODE,
+        &body,
+        Permissioner::get_stats,
+    )?;
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
@@ -1172,9 +1250,10 @@ async fn get_stats(
 /// `ClusterMetadata` JSON the legacy server returns.
 ///
 /// Auth-only: any valid token serves. Unlike the entity reads it bypasses both
-/// the root gate and the consistency gate, and serves from the roster captured
-/// at listener start plus the sync consensus getters, so it never touches the
-/// metadata STM, consensus, or a VSR session and stays fully synchronous.
+/// the per-op authorization gate and the consistency gate, and serves from the
+/// roster captured at listener start plus the sync consensus getters, so it
+/// never touches the metadata STM, consensus, or a VSR session and stays fully
+/// synchronous.
 async fn get_cluster_metadata(
     State(state): State<HttpState>,
     _identity: Identity,
@@ -1188,7 +1267,7 @@ async fn get_cluster_metadata(
 /// Unlike the entity reads, connections live in each shard's session manager,
 /// not the metadata STM, so this scatter-gathers over the shard mesh
 /// (`list_all_clients`) instead of going through [`read_local`]. It still runs
-/// the identical root-only + consistency gate via [`authorize_read`], so its
+/// the identical per-op + consistency gate via [`authorize_read`], so its
 /// authorization matches every metadata read. The gather future is `!Send`,
 /// bridged onto shard 0's thread by `SendWrapper` exactly as the write path
 /// bridges its submit.
@@ -1197,7 +1276,9 @@ async fn get_clients(
     identity: Identity,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<ClientInfo>>, ReadError> {
-    authorize_read(&state, &identity, query.consistency)?;
+    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
+        permissioner.get_clients(uid)
+    })?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     let response = GetClientsResponse {
         clients: infos
@@ -1222,7 +1303,9 @@ async fn get_client(
     Path(client_id): Path<u32>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<ClientInfoDetails>, ReadError> {
-    authorize_read(&state, &identity, query.consistency)?;
+    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
+        permissioner.get_client(uid)
+    })?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     // The wire client id is the u32 seq tail of the u128 transport id.
     #[allow(clippy::cast_possible_truncation)]
@@ -1483,9 +1566,19 @@ async fn poll_messages(
     Query(query): Query<PollMessages>,
     Query(consistency): Query<ConsistencyQuery>,
 ) -> Result<Json<PolledMessages>, ReadError> {
-    authorize_read(&state, &identity, consistency.consistency)?;
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_topic_ids(&state, &stream_id, &topic_id);
+    authorize_read(
+        &state,
+        &identity,
+        consistency.consistency,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |(stream_id, topic_id)| {
+                permissioner.poll_messages(uid, stream_id, topic_id)
+            })
+        },
+    )?;
     let wire = poll_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
     let (namespace, partition_id, consumer, args) =
         match resolve_poll_request(&state.shard, &wire, HTTP_READ_CLIENT_ID) {
@@ -1540,9 +1633,19 @@ async fn get_consumer_offset(
     Query(query): Query<GetConsumerOffset>,
     Query(consistency): Query<ConsistencyQuery>,
 ) -> Result<Json<ConsumerOffsetInfo>, ReadError> {
-    authorize_read(&state, &identity, consistency.consistency)?;
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
+    let scope = resolve_gate_topic_ids(&state, &stream_id, &topic_id);
+    authorize_read(
+        &state,
+        &identity,
+        consistency.consistency,
+        |permissioner, uid| {
+            scope.map_or(Ok(()), |(stream_id, topic_id)| {
+                permissioner.get_consumer_offset(uid, stream_id, topic_id)
+            })
+        },
+    )?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
     let (namespace, partition_id, consumer) =
@@ -1589,14 +1692,19 @@ async fn send_messages(
     Query(query): Query<ProduceQuery>,
     Json(command): Json<SendMessages>,
 ) -> Result<Response, PartitionWriteError> {
-    // Interim authorization: root-only until server-ng has an RBAC
-    // permissioner, mirroring the control-plane gate in `submit_committed`.
-    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
-    }
     let stream_id =
         Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
+    // RBAC: authorize the produce on (stream, topic) before any consensus work.
+    // Handler-side so an HTTP denial never enters the partition plane.
+    authorize_data_plane(
+        &state,
+        identity.session.user_id,
+        &stream_id,
+        &topic_id,
+        Permissioner::append_messages,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
     command.validate().map_err(PartitionWriteError::Rejected)?;
     let body = encode_send_messages(&stream_id, &topic_id, &command)
@@ -1648,14 +1756,18 @@ async fn store_consumer_offset(
     Path((stream_id, topic_id)): Path<(String, String)>,
     Json(command): Json<StoreConsumerOffset>,
 ) -> Result<StatusCode, PartitionWriteError> {
-    // Interim authorization: root-only until server-ng has an RBAC
-    // permissioner, mirroring the control-plane gate in `submit_committed`.
-    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
-    }
     let stream_id =
         Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
+    // RBAC: authorize the offset write on (stream, topic) handler-side.
+    authorize_data_plane(
+        &state,
+        identity.session.user_id,
+        &stream_id,
+        &topic_id,
+        Permissioner::store_consumer_offset,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
         .map_err(PartitionWriteError::Rejected)?;
     let body = request.to_bytes();
@@ -1680,14 +1792,18 @@ async fn delete_consumer_offset(
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
     Query(query): Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, PartitionWriteError> {
-    // Interim authorization: root-only until server-ng has an RBAC
-    // permissioner, mirroring the control-plane gate in `submit_committed`.
-    if identity.session.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(PartitionWriteError::Rejected(IggyError::Unauthorized));
-    }
     let stream_id =
         Identifier::from_str_value(&stream_id).map_err(PartitionWriteError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(PartitionWriteError::Rejected)?;
+    // RBAC: authorize the offset delete on (stream, topic) handler-side.
+    authorize_data_plane(
+        &state,
+        identity.session.user_id,
+        &stream_id,
+        &topic_id,
+        Permissioner::delete_consumer_offset,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
     // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
     // handler does; HTTP cannot express a group-kind offset op.
     let consumer = Consumer::new(
@@ -1949,7 +2065,8 @@ async fn create_pat(
 }
 
 /// `DELETE /personal-access-tokens/{name}`: delete one of the caller's tokens by
-/// name. Returns 204 on commit. Inherits the root-only gate via [`submit_write`].
+/// name. Returns 204 on commit. Self-scoped: any authenticated user may delete
+/// their own tokens (the in-apply gate skips PAT ops), matching legacy parity.
 async fn delete_pat(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1976,7 +2093,8 @@ async fn delete_pat(
 /// reply body for the stream/topic/user routes, while [`create_pat`] needs the
 /// raw `Message` + request header to substitute the one-time token.
 ///
-/// Enforces the root-only admin gate, then runs the gate-locked submit
+/// Control-plane writes are authorized in-apply on the metadata STM, so this
+/// runs no pre-submit gate; it drives the gate-locked submit
 /// ([`submit_gated`]) on a detached shard-0 task and awaits its outcome over a
 /// oneshot. Axum drops this handler future the moment the HTTP client
 /// disconnects; were the gate held here, that drop could land between the
@@ -1991,12 +2109,12 @@ async fn submit_committed(
     operation: Operation,
     body: &[u8],
 ) -> Result<(RequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
-    // Interim authorization: until server-ng has an RBAC permissioner, every
-    // control-plane write is root-only. A non-root credential is authenticated
-    // but unprivileged, rejected before any consensus work is spent.
-    if session.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(WriteError::Rejected(IggyError::Unauthorized));
-    }
+    // Control writes are authorized in-apply on the metadata STM: a denial
+    // comes back as `Unauthorized` in the committed result section, which
+    // `committed_payload` maps to a 403. No pre-submit gate here, so the
+    // in-apply check is the single source of truth. Self-scoped PAT ops (which
+    // the in-apply gate skips) reach here as any authenticated user, matching
+    // legacy parity.
     let (result_slot, committed) = oneshot::channel();
     let shard = Rc::clone(&state.shard);
     let session = Rc::clone(session);
@@ -2307,6 +2425,7 @@ async fn partition_write_replicated(
         session.client_id,
         session.session,
         session.client_id,
+        Some(session.user_id),
     )
     .await;
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
@@ -2339,6 +2458,7 @@ async fn produce_unacked(state: &HttpInner, session: &HttpSession, body: &[u8]) 
         session.client_id,
         session.session,
         session.client_id,
+        Some(session.user_id),
     )
     .await;
 }
@@ -2394,20 +2514,27 @@ fn classify_partition_reply(reply: &BusMessage) -> Result<(), PartitionWriteErro
 /// the identical gate. Keeping it in one place is what guarantees no read route
 /// can silently skip authz or answer a linearizable request on a follower.
 ///
-/// Root-only: until server-ng has an RBAC permissioner, every read is root-only,
-/// mirroring the write gate in [`submit_committed`]. A non-root credential is
-/// authenticated but unprivileged -> 403. A linearizable read must come from the
-/// primary; on a follower it redirects (307) to the primary's HTTP address when
-/// resolvable, else fails closed to a 503 (see
+/// Per-op RBAC: run the route's `rule` against the caller's committed
+/// permissions via the live permissioner. A denial (always `Unauthorized`)
+/// renders 403 through the legacy `IggyError -> status` map; root holds every
+/// grant, so its reads pass without a user-id short-circuit. A linearizable
+/// read must come from the primary; on a follower it redirects (307) to the
+/// primary's HTTP address when resolvable, else fails closed to a 503 (see
 /// [`HttpInner::not_primary_read_error`]).
 fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
+    rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<(), ReadError> {
-    if identity.user_id != DEFAULT_ROOT_USER_ID {
-        return Err(ReadError::Rejected(IggyError::Unauthorized));
-    }
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .authorize(|permissioner| rule(permissioner, identity.user_id))
+        .map_err(ReadError::Rejected)?;
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query));
     }
@@ -2432,12 +2559,90 @@ fn read_local(
     consistency: Consistency,
     code: u32,
     body: &[u8],
+    rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
-    authorize_read(state, identity, consistency)?;
+    authorize_read(state, identity, consistency, rule)?;
     match build_non_replicated_response(&state.shard, code, body).map_err(ReadError::Rejected)? {
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
     }
+}
+
+/// Resolve a wire stream identifier to its committed slab id for a read/write
+/// gate, or `None` on a miss (the gate is then a pass-through, so the existing
+/// not-found path renders the 404). Mirrors the TCP dispatch resolvers.
+fn resolve_gate_stream(state: &HttpInner, stream_id: &WireIdentifier) -> Option<usize> {
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| resolve_stream_id(inner, stream_id))
+}
+
+/// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
+/// either misses.
+fn resolve_gate_topic(
+    state: &HttpInner,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Option<(usize, usize)> {
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| {
+            let stream_id = resolve_stream_id(inner, stream_id)?;
+            let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
+            Some((stream_id, topic_id))
+        })
+}
+
+/// Resolve an (`Identifier`, `Identifier`) pair to committed (stream, topic)
+/// slab ids for a gate, or `None` on any conversion or resolution miss. For the
+/// poll / consumer-offset read routes, which carry domain identifiers rather
+/// than the pre-converted wire form the entity reads hold.
+fn resolve_gate_topic_ids(
+    state: &HttpInner,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+) -> Option<(usize, usize)> {
+    let wire_stream = identifier_to_wire(stream_id).ok()?;
+    let wire_topic = identifier_to_wire(topic_id).ok()?;
+    resolve_gate_topic(state, &wire_stream, &wire_topic)
+}
+
+/// Authorize an HTTP data-plane write (produce / consumer-offset) on (stream,
+/// topic). A resolution miss returns `Ok(())` so the write proceeds to the
+/// dispatch gates, which render the existing 404; a resolved entity whose rule
+/// rejects returns the `Unauthorized` error for a 403. Kept handler-side so an
+/// HTTP denial never enters the partition plane (the plane's empty replies
+/// carry no status a slot-waiting handler could read as a 403).
+fn authorize_data_plane(
+    state: &HttpInner,
+    user_id: u32,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Result<(), IggyError> {
+    let (Ok(wire_stream), Ok(wire_topic)) =
+        (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
+    else {
+        return Ok(());
+    };
+    let Some((stream_id, topic_id)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
+        return Ok(());
+    };
+    state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
 }
 
 /// Build the live [`ClusterMetadata`] for `GET /cluster/metadata`.
@@ -2695,9 +2900,95 @@ mod tests {
     };
 
     use super::*;
-    use crate::responses::build_empty_reply;
+    use crate::responses::{
+        build_deny_reply, build_empty_reply, build_reply_from_bytes, build_reply_with_body,
+    };
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
+
+    // The dispatch-time deny frame: an empty body plus `ReplyHeader.status` set
+    // to the rule's error code, the request-level channel the SDK peeks before
+    // body decode. `build_empty_reply` (status 0) is the ok-shaped counterpart.
+    #[test]
+    fn deny_reply_stamps_status_over_an_empty_body() {
+        let request = build_request_message(Operation::SendMessages, 42, 7, 3, &[]);
+        let status = IggyError::Unauthorized.as_code();
+        let reply = build_deny_reply(request.header(), 42, 0, 9, status);
+        assert_eq!(
+            reply.header().size as usize,
+            HEADER_SIZE,
+            "deny body is empty (header-only)"
+        );
+        assert_eq!(
+            reply.header().status,
+            status,
+            "status carries the deny code"
+        );
+        assert_ne!(status, 0, "a deny status is nonzero so the SDK peek fires");
+        assert_eq!(reply.header().command, Command2::Reply);
+        // Echoes the request so the SDK routes it back to the waiting slot.
+        assert_eq!(reply.header().request, request.header().request);
+        assert_eq!(reply.header().operation, request.header().operation);
+    }
+
+    // Enforces the status contract: every reply builder EXCEPT build_deny_reply
+    // leaves status 0, so a future builder that leaks a nonzero reserved tail
+    // (or sets status by mistake) trips here rather than silently shipping a
+    // fake denial. build_deny_reply is the sole nonzero-status writer.
+    #[test]
+    fn only_the_deny_builder_emits_a_nonzero_status() {
+        let request = build_request_message(Operation::CreateStream, 42, 7, 3, &[]);
+        let header = request.header();
+        let commit = 9;
+        let body = Bytes::from_static(b"body");
+
+        // server-ng reply builders, all funnelled through build_reply_with_body.
+        for status in [
+            build_reply_with_body(header, 42, 7, commit, 0, |_| {})
+                .header()
+                .status,
+            build_empty_reply(header, 42, 7, commit).header().status,
+            build_reply_from_bytes(header, 42, 7, commit, &body)
+                .header()
+                .status,
+            NonReplicatedResponse::Empty
+                .into_reply(header, 42, 7, commit)
+                .header()
+                .status,
+            NonReplicatedResponse::Bytes(body.clone())
+                .into_reply(header, 42, 7, commit)
+                .header()
+                .status,
+        ] {
+            assert_eq!(status, 0, "ok-path reply builders must leave status 0");
+        }
+
+        // The consensus plane's committed-reply builder (plane_helpers path).
+        let prepare = PrepareHeader {
+            command: Command2::Prepare,
+            operation: Operation::SendMessages,
+            client: 42,
+            op: 1,
+            request: 1,
+            ..Default::default()
+        };
+        let committed = consensus::build_reply_message(&prepare, &Bytes::new());
+        assert_eq!(
+            committed.header().status,
+            0,
+            "committed replies carry status 0"
+        );
+
+        // The one intentional writer stamps nonzero.
+        assert_ne!(
+            build_deny_reply(header, 42, 7, commit, IggyError::Unauthorized.as_code())
+                .header()
+                .status,
+            0,
+            "the deny builder is the sole nonzero-status writer"
+        );
+    }
 
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {

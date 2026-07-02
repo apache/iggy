@@ -33,10 +33,11 @@ use crate::consumer_group::{
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
-    NonReplicatedResponse, build_consumer_offset_body, build_empty_reply, build_get_me_response,
-    build_non_replicated_response, build_polled_messages_body, build_raw_pat_reply,
-    connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
-    resolve_partition_request_namespace,
+    NonReplicatedResponse, build_consumer_offset_body, build_deny_reply, build_empty_reply,
+    build_get_me_response, build_non_replicated_response, build_polled_messages_body,
+    build_raw_pat_reply, connected_client_to_response, current_metadata_commit,
+    resolve_partition_namespace, resolve_partition_request_namespace, resolve_stream_id,
+    resolve_topic_id,
 };
 use crate::session_manager::SessionManager;
 use crate::users::maybe_rewrite_user_password_request;
@@ -47,16 +48,22 @@ use consensus::{
     build_incompatible_protocol_eviction_message,
 };
 use iggy_binary_protocol::codes::{
-    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_STATS_CODE,
+    GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
+    GET_USERS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
-use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
+use iggy_binary_protocol::requests::consumer_groups::{
+    GetConsumerGroupRequest, GetConsumerGroupsRequest, SyncConsumerGroupRequest,
+};
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
+use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
@@ -64,7 +71,7 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, EvictionReason, GenericHeader, KIND_CONSUMER_GROUP, Operation,
-    ProtocolVersion, RequestHeader, WireDecode, WireEncode, is_protocol_compatible,
+    ProtocolVersion, RequestHeader, WireDecode, WireEncode, WireIdentifier, is_protocol_compatible,
 };
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
@@ -73,6 +80,7 @@ use message_bus::{IggyMessageBus, MessageBus};
 use metadata::impls::metadata::{
     MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
 };
+use metadata::permissioner::Permissioner;
 use partitions::{PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
@@ -552,12 +560,17 @@ async fn handle_client_request(
     if header.operation.is_partition() {
         // `bound` is Some here (unbound transports returned above).
         let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+        // `get_session` discards the acting user id the partition gate needs;
+        // resolve it from the same bound connection. A bound transport always
+        // has one, but the gate fails closed on `None` rather than trust that.
+        let acting_user_id = sessions.borrow().get_user_id(transport_client_id);
         dispatch_partition_request(
             shard,
             request,
             vsr_client_id,
             bound_session,
             transport_client_id,
+            acting_user_id,
         )
         .await;
         return;
@@ -682,6 +695,7 @@ pub(crate) async fn dispatch_partition_request(
     vsr_client_id: u128,
     bound_session: u64,
     transport_client_id: u128,
+    acting_user_id: Option<u32>,
 ) {
     let header = *request.header();
     let namespace = match resolve_partition_request_namespace(
@@ -706,6 +720,37 @@ pub(crate) async fn dispatch_partition_request(
             return;
         }
     };
+    // Dispatch-time RBAC. The partition plane is not replicated through the
+    // metadata STM, so the in-apply gate cannot cover it; authorize here, on
+    // the connection's own shard, before burning the routable wait or touching
+    // the plane. The namespace resolved above, so its stream/topic are the
+    // committed slab ids the permissioner keys on directly. A denial replies
+    // the op's frame with an empty body and a nonzero `status` the SDK peeks.
+    //
+    // Consistency: this reads THIS shard's local committed permissioner. On a
+    // peer shard that is a replicated read-mirror, so a permission revocation
+    // takes effect on the partition plane only once this shard applies the
+    // revoking commit -- an apply-lag window bounded by replication lag.
+    // Control-plane ops are exact (gated in-apply, in the same committed order
+    // on every replica); this local-read relaxation on the data plane is the
+    // accepted trade for keeping partition ops off the metadata consensus.
+    let scope = IggyNamespace::from_raw(namespace);
+    if let Some(status) = authorize_partition_op(
+        shard,
+        header.operation,
+        acting_user_id,
+        scope.stream_id(),
+        scope.topic_id(),
+    ) {
+        warn!(
+            transport_client_id,
+            status,
+            operation = ?header.operation,
+            "partition request denied by authorization; replying with status"
+        );
+        send_partition_deny_reply(shard, transport_client_id, &header, status).await;
+        return;
+    }
     // Convergence wait: a CreateTopic commit returns to the client
     // before the per-shard reconcilers seed routing rows and
     // materialise the partition (next wake/periodic tick). The SDK
@@ -756,7 +801,7 @@ pub(crate) async fn dispatch_partition_request(
     shard.dispatch(request.into_generic());
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -765,6 +810,10 @@ async fn handle_non_replicated_request(
 ) {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
+    // Acting user for the read gates below, resolved once. `None` only on the
+    // pre-auth path (PING / GET_CLUSTER_METADATA), which serves ungated codes;
+    // the gated arms fail closed on it.
+    let user_id = sessions.borrow().get_user_id(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -805,6 +854,11 @@ async fn handle_non_replicated_request(
             .await;
         }
         GET_CLIENTS_CODE => {
+            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_clients) {
+                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             // Shared-nothing: each shard knows only its own connections, so
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
@@ -824,6 +878,11 @@ async fn handle_non_replicated_request(
             .await;
         }
         GET_CLIENT_CODE => {
+            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_client) {
+                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             // No reverse map from the wire u32 id to a u128 transport id /
             // home shard (the u32 is just the seq tail), so gather all and
             // filter -- same fan-out as `get_clients`.
@@ -862,15 +921,20 @@ async fn handle_non_replicated_request(
                 .await;
         }
         POLL_MESSAGES_CODE => {
-            handle_poll_messages(shard, transport_client_id, &request).await;
+            handle_poll_messages(shard, transport_client_id, &request, user_id).await;
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request).await;
+            handle_get_consumer_offset(shard, transport_client_id, &request, user_id).await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
+            // Self-scoped: serves the caller's own assignment keyed by the
+            // header client id, so it carries no permissioner rule.
             handle_sync_consumer_group(shard, transport_client_id, &request).await;
         }
-        _ => handle_default_non_replicated(shard, transport_client_id, code, &request).await,
+        _ => {
+            handle_default_non_replicated(shard, transport_client_id, code, &request, user_id)
+                .await;
+        }
     }
 }
 
@@ -880,7 +944,15 @@ async fn handle_default_non_replicated(
     transport_client_id: u128,
     code: u32,
     request: &Message<RequestHeader>,
+    user_id: Option<u32>,
 ) {
+    // Gate by command code before the shared builder runs. The builder stays
+    // authz-free (it is byte-shared with the HTTP read path, which gates
+    // separately); a denial replies status!=0 with an empty body.
+    if let Err(error) = authorize_default_read(shard, code, request_body(request), user_id) {
+        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+        return;
+    }
     match build_non_replicated_response(shard, code, request_body(request)) {
         Ok(response) => {
             let commit = current_metadata_commit(shard);
@@ -1081,8 +1153,37 @@ async fn handle_poll_messages(
     shard: &Rc<ServerNgShard>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
+    user_id: Option<u32>,
 ) {
-    let body = match decode_poll_request(shard, request) {
+    let Ok(wire) = PollMessagesRequest::decode_from(request_body(request)) else {
+        // Undecodable poll: keep the fail-fast empty-poll shape.
+        send_non_replicated_bytes(
+            shard,
+            request,
+            transport_client_id,
+            empty_polled_messages_body(0),
+            "poll_messages",
+        )
+        .await;
+        return;
+    };
+    // Gate on (stream, topic) before touching the partition plane. A resolution
+    // miss falls through to the resolve path below (empty-poll / not-found); a
+    // denial replies status!=0 with an empty body, distinct from the empty-poll
+    // "0 messages" shape.
+    if let Some(status) = authorize_partition_read(
+        shard,
+        &wire.stream_id,
+        &wire.topic_id,
+        user_id,
+        |permissioner, uid, stream_id, topic_id| {
+            permissioner.poll_messages(uid, stream_id, topic_id)
+        },
+    ) {
+        send_non_replicated_deny(shard, request, transport_client_id, status).await;
+        return;
+    }
+    let body = match resolve_poll_request(shard, &wire, request.header().client) {
         Ok((namespace, partition_id, consumer, args)) => {
             match shard
                 .partition_read(namespace, PartitionRead::Poll { consumer, args })
@@ -1140,8 +1241,33 @@ async fn handle_get_consumer_offset(
     shard: &Rc<ServerNgShard>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
+    user_id: Option<u32>,
 ) {
-    let body = match decode_consumer_offset_request(shard, request) {
+    let Ok(wire) = GetConsumerOffsetRequest::decode_from(request_body(request)) else {
+        // Undecodable: an empty body decodes as None (no offset) on the SDK.
+        send_non_replicated_bytes(
+            shard,
+            request,
+            transport_client_id,
+            Bytes::new(),
+            "get_consumer_offset",
+        )
+        .await;
+        return;
+    };
+    if let Some(status) = authorize_partition_read(
+        shard,
+        &wire.stream_id,
+        &wire.topic_id,
+        user_id,
+        |permissioner, uid, stream_id, topic_id| {
+            permissioner.get_consumer_offset(uid, stream_id, topic_id)
+        },
+    ) {
+        send_non_replicated_deny(shard, request, transport_client_id, status).await;
+        return;
+    }
+    let body = match resolve_consumer_offset_request(shard, &wire) {
         Ok((namespace, partition_id, consumer)) => {
             match shard
                 .partition_read(namespace, PartitionRead::ConsumerOffset { consumer })
@@ -1247,6 +1373,266 @@ async fn send_empty_partition_reply(
     }
 }
 
+// Dispatch-time authorization
+//
+// The metadata STM enforces RBAC in-apply for replicated control ops. What
+// that gate cannot see -- partition-plane ops and non-replicated reads, both
+// decided on the connection's own shard without a replicated apply -- is gated
+// here against the live permissioner via `Users::authorize`. A denial rides
+// `ReplyHeader.status` (empty body), the request-level error channel the SDK
+// peeks before body decode. Root holds every grant in the permissioner, so the
+// rules pass for it without any user-id short-circuit.
+
+/// Authorize a partition-plane op on its resolved (stream, topic) for the
+/// acting user, returning the deny status code or `None` to proceed. The
+/// namespace already resolved, so the entity exists; a `None` user id (which
+/// the bound-session gate should preclude) fails closed with `Unauthenticated`
+/// rather than allow an unattributed write.
+fn authorize_partition_op(
+    shard: &Rc<ServerNgShard>,
+    operation: Operation,
+    user_id: Option<u32>,
+    stream_id: usize,
+    topic_id: usize,
+) -> Option<u32> {
+    let Some(user_id) = user_id else {
+        return Some(IggyError::Unauthenticated.as_code());
+    };
+    let decision =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .authorize(|permissioner| match operation {
+                Operation::SendMessages => {
+                    permissioner.append_messages(user_id, stream_id, topic_id)
+                }
+                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                    permissioner.store_consumer_offset(user_id, stream_id, topic_id)
+                }
+                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                    permissioner.delete_consumer_offset(user_id, stream_id, topic_id)
+                }
+                // The caller only routes the five partition ops above here; any
+                // other op is an allow, never a surprise denial.
+                _ => Ok(()),
+            });
+    decision.err().map(|error| error.as_code())
+}
+
+/// Reply to a denied partition op with the op's frame: empty body + nonzero
+/// `status`. Distinct from [`send_empty_partition_reply`] (status 0, the
+/// fail-fast "not routable" ack); here the SDK peeks the status and surfaces
+/// the typed authorization error. Same lockstep reasoning: a silent drop would
+/// wedge every later request on the connection.
+#[allow(clippy::future_not_send)]
+async fn send_partition_deny_reply(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+    status: u32,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = build_deny_reply(request_header, transport_client_id, 0, commit, status);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            status,
+            error = %error,
+            operation = ?request_header.operation,
+            "failed to surface partition authz denial"
+        );
+    }
+}
+
+/// Run an unscoped non-replicated-read rule for the acting user. A `None` user
+/// id (only the pre-auth path, which serves ungated codes) fails closed.
+fn authorize_uid(
+    shard: &Rc<ServerNgShard>,
+    user_id: Option<u32>,
+    rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+) -> Result<(), IggyError> {
+    let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .authorize(|permissioner| rule(permissioner, user_id))
+}
+
+/// Authorize a partition-plane non-replicated read (poll / consumer-offset) on
+/// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
+/// own not-found path handles); `Some(status)` denies. A `None` user id fails
+/// closed.
+fn authorize_partition_read(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    user_id: Option<u32>,
+    rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+) -> Option<u32> {
+    let Some(user_id) = user_id else {
+        return Some(IggyError::Unauthenticated.as_code());
+    };
+    let (stream_id, topic_id) = resolve_topic_scope(shard, stream_id, topic_id)?;
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
+        .err()
+        .map(|error| error.as_code())
+}
+
+/// Authorize a non-replicated read routed through `build_non_replicated_response`
+/// (`handle_default_non_replicated`). `Ok(())` allows -- including a resolution
+/// miss, which falls through to the builder's own not-found reply so the legacy
+/// notfound-before-permission ordering holds. `Err` denies with that code.
+/// Unscoped rules gate directly; identifier-scoped rules resolve (stream[,
+/// topic]) against committed state first. `GET_CLUSTER_METADATA` is auth-only
+/// (bootstrap / leader discovery) and every other code the builder serves is
+/// ungated here.
+fn authorize_default_read(
+    shard: &Rc<ServerNgShard>,
+    code: u32,
+    body: &[u8],
+    user_id: Option<u32>,
+) -> Result<(), IggyError> {
+    match code {
+        GET_STATS_CODE => authorize_uid(shard, user_id, Permissioner::get_stats),
+        GET_USERS_CODE => authorize_uid(shard, user_id, Permissioner::get_users),
+        GET_USER_CODE => authorize_uid(shard, user_id, Permissioner::get_user),
+        GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
+        GET_STREAM_CODE => {
+            let Ok(request) = GetStreamRequest::decode_from(body) else {
+                return Ok(());
+            };
+            let Some(stream_id) = resolve_stream_scope(shard, &request.stream_id) else {
+                return Ok(());
+            };
+            authorize_uid(shard, user_id, |permissioner, uid| {
+                permissioner.get_stream(uid, stream_id)
+            })
+        }
+        GET_TOPICS_CODE => {
+            let Ok(request) = GetTopicsRequest::decode_from(body) else {
+                return Ok(());
+            };
+            let Some(stream_id) = resolve_stream_scope(shard, &request.stream_id) else {
+                return Ok(());
+            };
+            authorize_uid(shard, user_id, |permissioner, uid| {
+                permissioner.get_topics(uid, stream_id)
+            })
+        }
+        GET_TOPIC_CODE => {
+            let Ok(request) = GetTopicRequest::decode_from(body) else {
+                return Ok(());
+            };
+            let Some((stream_id, topic_id)) =
+                resolve_topic_scope(shard, &request.stream_id, &request.topic_id)
+            else {
+                return Ok(());
+            };
+            authorize_uid(shard, user_id, |permissioner, uid| {
+                permissioner.get_topic(uid, stream_id, topic_id)
+            })
+        }
+        GET_CONSUMER_GROUP_CODE => {
+            let Ok(request) = GetConsumerGroupRequest::decode_from(body) else {
+                return Ok(());
+            };
+            let Some((stream_id, topic_id)) =
+                resolve_topic_scope(shard, &request.stream_id, &request.topic_id)
+            else {
+                return Ok(());
+            };
+            authorize_uid(shard, user_id, |permissioner, uid| {
+                permissioner.get_consumer_group(uid, stream_id, topic_id)
+            })
+        }
+        GET_CONSUMER_GROUPS_CODE => {
+            let Ok(request) = GetConsumerGroupsRequest::decode_from(body) else {
+                return Ok(());
+            };
+            let Some((stream_id, topic_id)) =
+                resolve_topic_scope(shard, &request.stream_id, &request.topic_id)
+            else {
+                return Ok(());
+            };
+            authorize_uid(shard, user_id, |permissioner, uid| {
+                permissioner.get_consumer_groups(uid, stream_id, topic_id)
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Resolve a wire stream identifier to its committed slab id, or `None` on a
+/// miss (the gate then falls through to the builder's not-found reply).
+fn resolve_stream_scope(shard: &Rc<ServerNgShard>, stream_id: &WireIdentifier) -> Option<usize> {
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|inner| resolve_stream_id(inner, stream_id))
+}
+
+/// Resolve a wire (stream, topic) pair to committed slab ids, or `None` if
+/// either misses.
+fn resolve_topic_scope(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Option<(usize, usize)> {
+    shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let stream_id = resolve_stream_id(inner, stream_id)?;
+        let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
+        Some((stream_id, topic_id))
+    })
+}
+
+/// Reply to a denied non-replicated read with the request's reply frame: empty
+/// body + nonzero `status`. The SDK peeks the status before body decode and
+/// surfaces the typed error, so a poll denial never reaches the empty-poll
+/// "0 messages" body path.
+#[allow(clippy::future_not_send)]
+async fn send_non_replicated_deny(
+    shard: &Rc<ServerNgShard>,
+    request: &Message<RequestHeader>,
+    transport_client_id: u128,
+    status: u32,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = build_deny_reply(
+        request.header(),
+        request.header().client,
+        request.header().session,
+        commit,
+        status,
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            status,
+            error = %error,
+            "failed to surface non-replicated authz denial"
+        );
+    }
+}
+
 /// Wait (bounded) until `namespace` is routable: this shard's routing row
 /// exists and the owning shard answers a probe read (partition
 /// materialised). Fast path: row already present -> no probe, no wait.
@@ -1308,15 +1694,6 @@ fn empty_polled_messages_body(partition_id: u32) -> Bytes {
 
 pub(crate) type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
 
-fn decode_poll_request(
-    shard: &Rc<ServerNgShard>,
-    request: &Message<RequestHeader>,
-) -> Result<DecodedPollRequest, IggyError> {
-    let wire = PollMessagesRequest::decode_from(request_body(request))
-        .map_err(|_| IggyError::InvalidCommand)?;
-    resolve_poll_request(shard, &wire, request.header().client)
-}
-
 /// Resolve a decoded poll request into its owning-shard read: namespace,
 /// partition, polling consumer, and args. Shared by the TCP dispatch (client
 /// id = the connection's bound VSR client) and the HTTP route (client id 0,
@@ -1373,15 +1750,6 @@ pub(crate) fn resolve_poll_request(
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
     Ok((namespace, partition_id, consumer, args))
-}
-
-fn decode_consumer_offset_request(
-    shard: &Rc<ServerNgShard>,
-    request: &Message<RequestHeader>,
-) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
-    let wire = GetConsumerOffsetRequest::decode_from(request_body(request))
-        .map_err(|_| IggyError::InvalidCommand)?;
-    resolve_consumer_offset_request(shard, &wire)
 }
 
 /// Resolve a decoded consumer-offset read into its owning-shard read:

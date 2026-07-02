@@ -37,7 +37,7 @@ use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{
-    GlobalPermissions, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
+    GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
     StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,22 @@ impl Users {
         F: FnOnce(&UsersInner) -> R,
     {
         self.inner.read(f)
+    }
+
+    /// Run a permissioner rule against the committed user permissions and
+    /// return its decision. The dispatch-time authorization surface for the
+    /// checks the in-apply RBAC gate cannot cover: non-replicated reads and
+    /// partition-plane ops, both decided on the connection's own shard rather
+    /// than in a replicated apply. The permissioner stays private; callers pass
+    /// the rule closure.
+    ///
+    /// # Errors
+    /// Propagates the rule's `IggyError` (always `Unauthorized`) on denial.
+    pub fn authorize(
+        &self,
+        rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
+    ) -> Result<(), IggyError> {
+        self.read(|inner| rule(&inner.permissioner))
     }
 
     /// Ensures a root user exists in an empty user set.
