@@ -19,10 +19,12 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time;
 
 use iggy_gateway_kafka::protocol::codec::Decoder;
 use iggy_gateway_kafka::protocol::header::{request_header_version, response_header_version};
@@ -86,6 +88,60 @@ pub async fn read_response_frame(stream: &mut TcpStream, max_size: usize) -> Byt
     let mut buf = vec![0u8; frame_len];
     stream.read_exact(&mut buf).await.expect("response body");
     Bytes::from(buf)
+}
+
+/// Minimal Produce v3 body: nullable transactional_id, acks, timeout, empty topics array.
+pub fn build_produce_v3_body(acks: i16, topics_count: i32) -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_i16(-1); // null transactional_id
+    body.put_i16(acks);
+    body.put_i32(1_000); // timeout_ms
+    body.put_i32(topics_count);
+    body.freeze()
+}
+
+/// Legacy Metadata request body listing topic names (non-flexible, v0–v8).
+pub fn build_metadata_legacy_request(topic_names: &[&str]) -> Bytes {
+    let mut body = BytesMut::new();
+    body.put_i32(i32::try_from(topic_names.len()).expect("topic name count fits i32"));
+    for name in topic_names {
+        let name_bytes = name.as_bytes();
+        let len = i16::try_from(name_bytes.len()).expect("topic name fits i16");
+        body.put_i16(len);
+        body.extend_from_slice(name_bytes);
+    }
+    body.freeze()
+}
+
+/// Read one length-prefixed response frame, returning `None` on timeout.
+pub async fn read_response_frame_with_timeout(
+    stream: &mut TcpStream,
+    max_size: usize,
+    timeout: Duration,
+) -> Option<Bytes> {
+    match time::timeout(timeout, read_response_frame(stream, max_size)).await {
+        Ok(frame) => Some(frame),
+        Err(_) => None,
+    }
+}
+
+/// Concatenate multiple length-prefixed frames (for pipelining tests).
+pub fn concat_frames(frames: &[Bytes]) -> Bytes {
+    let total: usize = frames.iter().map(Bytes::len).sum();
+    let mut out = BytesMut::with_capacity(total);
+    for frame in frames {
+        out.extend_from_slice(frame);
+    }
+    out.freeze()
+}
+
+/// Read one byte or return `None` on EOF / timeout.
+pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    match time::timeout(timeout, stream.read_exact(&mut buf)).await {
+        Ok(Ok(_)) => Some(buf[0]),
+        _ => None,
+    }
 }
 
 /// Send one request frame and return parsed `(correlation_id, response_body)`.
