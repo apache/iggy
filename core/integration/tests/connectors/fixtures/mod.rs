@@ -47,8 +47,8 @@ pub(crate) fn unique_container_name(service: &str) -> String {
 
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use doris::{
-    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
-    DorisSinkPreCreatedFixture,
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
+    DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{

@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
+use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -26,6 +27,8 @@ use reqwest::{Method, StatusCode, header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use simd_json::{OwnedValue, StaticNode};
+use std::io::Write as _;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -58,6 +61,41 @@ const LABEL_HASH_HEX_LEN: usize = 16;
 // returns a giant body can't flood the logs. Bounds only what we *log*, not peak
 // memory — `response.text()` already buffers the full body first.
 const MAX_RESPONSE_LOG_BYTES: usize = 4096;
+// In-request retry budget for *transient* Stream Load failures (5xx/408/429,
+// transport error, Doris "Publish Timeout"). The runtime commits the consumer
+// offset at poll time before consume() runs, so a transient failure we don't
+// retry here is lost — an in-request re-PUT under the same label (which Doris
+// dedupes) is the connector's only redelivery lever. Keep the worst-case budget
+// well inside Doris's label_keep_max_second so a retry still dedupes.
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_DELAY: &str = "200ms";
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
+// Doris CSV framing. Control-char separators keep field/row boundaries
+// collision-improbable; `enclose`+`escape` protect any value that still contains
+// them. Doris escapes with a prefix char (`\"`), NOT RFC-4180 quote-doubling,
+// which is why we hand-roll the encoder instead of using the `csv` crate. The
+// four bytes are sent to Doris as the header forms below (it decodes the `\xNN`
+// prefix); all are visible ASCII so `validated_header` accepts them.
+const CSV_COLUMN_SEPARATOR: u8 = 0x01; // SOH
+const CSV_LINE_DELIMITER: u8 = 0x02; // STX
+const CSV_ENCLOSE: u8 = b'"';
+const CSV_ESCAPE: u8 = b'\\';
+const CSV_NULL_MARKER: &[u8] = b"\\N";
+const CSV_COLUMN_SEPARATOR_HEADER: &str = "\\x01";
+const CSV_LINE_DELIMITER_HEADER: &str = "\\x02";
+const CSV_ENCLOSE_HEADER: &str = "\"";
+const CSV_ESCAPE_HEADER: &str = "\\";
+
+/// Stream Load output serialization. `Json` (default) is name-mapped and handles
+/// embedded separators/quotes/newlines natively; `Csv` is opt-in for throughput
+/// and is positional, so it requires the `columns` config to pin column order.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Json,
+    Csv,
+}
 
 #[derive(Debug)]
 pub struct DorisSink {
@@ -85,6 +123,16 @@ struct Connected {
     // off `self` instead of threading it through every call.
     allow_insecure_redirect: bool,
     allowed_redirect_hosts: Option<Vec<String>>,
+    // In-request retry policy for transient Stream Load failures, resolved once
+    // at `open()`. `max_retries` is the total attempt count (1 = no retry).
+    max_retries: u32,
+    retry_delay: Duration,
+    retry_max_delay: Duration,
+    // Output format resolved once at `open()`. For `Csv`, `csv_columns` holds the
+    // positional column order (the leading bare names from the `columns` config);
+    // it is empty for `Json`.
+    format: Format,
+    csv_columns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +147,13 @@ pub struct DorisSinkConfig {
     pub columns: Option<String>,
     #[serde(rename = "where")]
     pub where_clause: Option<String>,
+    /// Stream Load output format: `"json"` (default) or `"csv"`. CSV is opt-in
+    /// for throughput; because Doris CSV is positional (JSON is name-mapped), it
+    /// requires `columns` to pin the column order, else `open()` fails. Named
+    /// `output_format` (not `format`) so the env override
+    /// `..._PLUGIN_CONFIG_OUTPUT_FORMAT` doesn't collide with the runtime's
+    /// top-level `plugin_config_format` (both would flatten to `..._FORMAT`).
+    pub output_format: Option<Format>,
     /// Total per-request HTTP timeout as a human-readable duration, e.g. "30s"
     /// (default 30s). Matches the `timeout` field on the http/influxdb sinks.
     pub timeout: Option<String>,
@@ -107,6 +162,19 @@ pub struct DorisSinkConfig {
     /// cross-region or cold-start FEs that are slow to accept the connection.
     pub connect_timeout: Option<String>,
     pub batch_size: Option<u32>,
+    /// Total number of Stream Load attempts per batch on a *transient* failure
+    /// (HTTP 5xx/408/429, a transport error, or Doris "Publish Timeout"). `1`
+    /// disables retries. Each retry re-PUTs under the same label — which Doris
+    /// dedupes — so an ambiguous success (e.g. a 2xx whose body we couldn't
+    /// read) is absorbed rather than doubled. Default 3.
+    pub max_retries: Option<u32>,
+    /// Base backoff before the first retry, as a human-readable duration (e.g.
+    /// "200ms"). Doubles each attempt up to `max_retry_delay`, with ±20% jitter.
+    pub retry_delay: Option<String>,
+    /// Upper bound on a single retry backoff, as a human-readable duration (e.g.
+    /// "5s"). Keep `max_retries * max_retry_delay` inside Doris's
+    /// `label_keep_max_second` so a retry still dedupes instead of re-loading.
+    pub max_retry_delay: Option<String>,
     /// Permit a redirect that downgrades the scheme (e.g. `https://` FE ->
     /// `http://` BE). Off by default: a downgrade would push Basic-auth
     /// credentials onto a cleartext hop, so we refuse it unless the operator
@@ -197,10 +265,23 @@ impl DorisSink {
                 .request(Method::PUT, url.clone())
                 .header(header::AUTHORIZATION, self.auth_header.clone())
                 .header(header::EXPECT, "100-continue")
-                .header("format", "json")
-                .header("strip_outer_array", "true")
                 .header("label", label)
                 .body(body.clone());
+
+            // Format-specific Stream Load headers. JSON is name-mapped and uses
+            // `strip_outer_array` (the body is a JSON array); CSV is positional
+            // with control-char framing + enclose/escape (no strip_outer_array).
+            request = match connected.format {
+                Format::Json => request
+                    .header("format", "json")
+                    .header("strip_outer_array", "true"),
+                Format::Csv => request
+                    .header("format", "csv")
+                    .header("column_separator", CSV_COLUMN_SEPARATOR_HEADER)
+                    .header("line_delimiter", CSV_LINE_DELIMITER_HEADER)
+                    .header("enclose", CSV_ENCLOSE_HEADER)
+                    .header("escape", CSV_ESCAPE_HEADER),
+            };
 
             // Headers were validated and built once in `open()`.
             if let Some(value) = &connected.max_filter_ratio_header {
@@ -310,6 +391,51 @@ impl DorisSink {
             }
 
             return parse_stream_load_response(&response_text);
+        }
+    }
+
+    /// Load one batch with bounded in-request retry. `send_stream_load` performs
+    /// a single full FE -> BE attempt; this wraps it (plus status
+    /// classification) so a *transient* failure re-PUTs under the same `label`.
+    /// The runtime commits the consumer offset before consume() runs, so this is
+    /// the connector's only redelivery path on a transient outage; the shared
+    /// label lets Doris dedupe a prior attempt that actually landed (e.g. a 2xx
+    /// whose body we couldn't read). A `PermanentHttpError` returns immediately —
+    /// retrying bad data would just hammer the FE.
+    async fn load_batch(&self, label: &str, body: Bytes) -> Result<StreamLoadResponse, Error> {
+        let connected = self.connected.as_ref().ok_or_else(|| {
+            Error::InitError(format!(
+                "Doris sink ID {} called before open() — not connected",
+                self.id
+            ))
+        })?;
+
+        let mut attempt = 0u32;
+        loop {
+            let result = match self.send_stream_load(label, body.clone()).await {
+                Ok(response) => classify_status(&response).map(|()| response),
+                Err(error) => Err(error),
+            };
+            let error = match result {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+
+            attempt += 1;
+            if attempt >= connected.max_retries || !is_transient_error(&error) {
+                return Err(error);
+            }
+
+            let delay = jitter(exponential_backoff(
+                connected.retry_delay,
+                attempt - 1,
+                connected.retry_max_delay,
+            ));
+            warn!(
+                "Doris sink ID {} transient Stream Load failure on attempt {attempt}/{} (label={label}): {error}; retrying in {delay:?}",
+                self.id, connected.max_retries
+            );
+            tokio::time::sleep(delay).await;
         }
     }
 }
@@ -484,6 +610,105 @@ fn effective_batch_size(configured: Option<u32>) -> usize {
     configured.unwrap_or(DEFAULT_BATCH_SIZE).max(1) as usize
 }
 
+/// Total Stream Load attempts per batch: the configured value floored at 1 so
+/// `0` (or an unset value) collapses to a single attempt with no retry.
+fn effective_max_retries(configured: Option<u32>) -> u32 {
+    configured.unwrap_or(DEFAULT_MAX_RETRIES).max(1)
+}
+
+/// The leading positional column names from a Doris `columns` header: bare names
+/// in order, stopping at the first derived `name = expr` entry (Doris computes
+/// those server-side and they consume no CSV field). Empty if there are none.
+fn csv_column_names(columns: &str) -> Vec<String> {
+    columns
+        .split(',')
+        .map(str::trim)
+        .take_while(|name| !name.is_empty() && !name.contains('='))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Serialize a chunk into the request body for the configured Stream Load format.
+fn build_request_body(
+    format: Format,
+    rows: &[&OwnedValue],
+    csv_columns: &[String],
+) -> Result<Bytes, Error> {
+    match format {
+        Format::Json => simd_json::to_vec(&rows).map(Bytes::from).map_err(|e| {
+            Error::CannotStoreData(format!("Failed to serialize JSON batch for Doris: {e}"))
+        }),
+        Format::Csv => build_csv_body(rows, csv_columns).map(Bytes::from),
+    }
+}
+
+/// Serialize JSON object rows into Doris CSV: one `enclose`-quoted/escaped field
+/// per column in `columns` order, control-char separated. A missing key or JSON
+/// `null` becomes the unenclosed `\N` NULL marker; an empty string becomes the
+/// enclosed `""` (the distinction Doris draws between NULL and empty). Numbers
+/// and bools are emitted bare; nested values are compact-JSON-stringified.
+fn build_csv_body(rows: &[&OwnedValue], columns: &[String]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(rows.len() * columns.len() * 16);
+    for &row in rows {
+        let OwnedValue::Object(object) = row else {
+            return Err(Error::InvalidRecordValue(
+                "Doris CSV format requires each message to be a JSON object".to_string(),
+            ));
+        };
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                out.push(CSV_COLUMN_SEPARATOR);
+            }
+            match object.get(column.as_str()) {
+                None => out.extend_from_slice(CSV_NULL_MARKER),
+                Some(value) => encode_csv_field(value, &mut out),
+            }
+        }
+        out.push(CSV_LINE_DELIMITER);
+    }
+    Ok(out)
+}
+
+/// Append one JSON value as a Doris CSV field (see `build_csv_body`).
+fn encode_csv_field(value: &OwnedValue, out: &mut Vec<u8>) {
+    match value {
+        OwnedValue::Static(StaticNode::Null) => out.extend_from_slice(CSV_NULL_MARKER),
+        OwnedValue::Static(StaticNode::Bool(flag)) => {
+            out.extend_from_slice(if *flag { b"true" } else { b"false" });
+        }
+        OwnedValue::Static(StaticNode::I64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::Static(StaticNode::U64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::Static(StaticNode::F64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::String(text) => encode_csv_enclosed(text.as_bytes(), out),
+        // Nested array/object: stringify to compact JSON and enclose as text. The
+        // target Doris column must accept it (STRING/JSON/VARIANT).
+        nested => match simd_json::to_string(nested) {
+            Ok(json) => encode_csv_enclosed(json.as_bytes(), out),
+            Err(_) => out.extend_from_slice(CSV_NULL_MARKER),
+        },
+    }
+}
+
+/// Append `bytes` as an `enclose`-quoted CSV field, prefix-escaping any embedded
+/// escape or enclose byte. The escape char is handled by the same branch, so a
+/// trailing backslash cannot leak past the closing quote.
+fn encode_csv_enclosed(bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(CSV_ENCLOSE);
+    for &byte in bytes {
+        if byte == CSV_ESCAPE || byte == CSV_ENCLOSE {
+            out.push(CSV_ESCAPE);
+        }
+        out.push(byte);
+    }
+    out.push(CSV_ENCLOSE);
+}
+
 /// Build a validated Stream Load header value, surfacing a bad byte (CR/LF,
 /// non-visible-ASCII) as a startup-time `InvalidConfigValue` instead of a
 /// per-batch `HttpRequestFailed` (reqwest defers `HeaderValue::try_from` to
@@ -599,6 +824,18 @@ fn validate_identifier(name: &str, field: &str, id: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// Transient Stream Load failures worth an in-request retry: HTTP 5xx/408/429
+/// and transport errors (`CannotStoreData` / `HttpRequestFailed`), plus Doris's
+/// "Publish Timeout" (also `CannotStoreData`). `PermanentHttpError` (4xx, "Fail",
+/// schema/redirect problems, unparsable body) is never retried — re-PUTing bad
+/// data just hammers the FE.
+fn is_transient_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::CannotStoreData(_) | Error::HttpRequestFailed(_)
+    )
+}
+
 fn classify_status(response: &StreamLoadResponse) -> Result<(), Error> {
     match response.status.as_str() {
         "Success" => Ok(()),
@@ -710,6 +947,46 @@ impl Sink for DorisSink {
             None => None,
         };
 
+        let retry_delay = parse_duration(self.config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let retry_max_delay = parse_duration(
+            self.config.max_retry_delay.as_deref(),
+            DEFAULT_RETRY_MAX_DELAY,
+        );
+        // `exponential_backoff` already caps at the max, but a base above the cap
+        // is a config mistake worth surfacing rather than silently flattening.
+        let (retry_delay, retry_max_delay) = if retry_delay > retry_max_delay {
+            warn!(
+                "Doris sink ID {}: retry_delay ({retry_delay:?}) exceeds max_retry_delay ({retry_max_delay:?}); clamping base to the cap",
+                self.id
+            );
+            (retry_max_delay, retry_max_delay)
+        } else {
+            (retry_delay, retry_max_delay)
+        };
+
+        let format = self.config.output_format.unwrap_or_default();
+        // CSV is positional, so it needs the explicit column order; JSON is
+        // name-mapped and ignores it. Resolve (and validate) once at open().
+        let csv_columns = match format {
+            Format::Json => Vec::new(),
+            Format::Csv => {
+                let columns = self
+                    .config
+                    .columns
+                    .as_deref()
+                    .map(csv_column_names)
+                    .unwrap_or_default();
+                if columns.is_empty() {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "Doris sink ID {}: format=\"csv\" requires a non-empty `columns` listing \
+                         the source columns in order (CSV is positional, unlike name-mapped JSON)",
+                        self.id
+                    )));
+                }
+                columns
+            }
+        };
+
         self.connected = Some(Connected {
             client: self.build_client()?,
             base_url,
@@ -718,6 +995,11 @@ impl Sink for DorisSink {
             where_header,
             allow_insecure_redirect: self.config.allow_insecure_redirect.unwrap_or(false),
             allowed_redirect_hosts: self.config.allowed_redirect_hosts.clone(),
+            max_retries: effective_max_retries(self.config.max_retries),
+            retry_delay,
+            retry_max_delay,
+            format,
+            csv_columns,
         });
 
         info!(
@@ -749,6 +1031,12 @@ impl Sink for DorisSink {
             .label_prefix
             .as_deref()
             .unwrap_or(DEFAULT_LABEL_PREFIX);
+        let connected = self.connected.as_ref().ok_or_else(|| {
+            Error::InitError(format!(
+                "Doris sink ID {} called before open() — not connected",
+                self.id
+            ))
+        })?;
         let mut first_error: Option<Error> = None;
 
         // Best-effort across chunks: on a per-chunk serialize/HTTP/status failure
@@ -787,16 +1075,15 @@ impl Sink for DorisSink {
                 continue;
             };
 
-            let body = match simd_json::to_vec(&json_values) {
-                Ok(b) => Bytes::from(b),
-                Err(e) => {
-                    error!("Doris sink ID {} failed to serialize batch: {e}", self.id);
-                    first_error.get_or_insert(Error::CannotStoreData(format!(
-                        "Failed to serialize batch for Doris: {e}"
-                    )));
-                    continue;
-                }
-            };
+            let body =
+                match build_request_body(connected.format, &json_values, &connected.csv_columns) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        error!("Doris sink ID {} failed to serialize batch: {e}", self.id);
+                        first_error.get_or_insert(e);
+                        continue;
+                    }
+                };
 
             let label = build_label(
                 label_prefix,
@@ -807,39 +1094,36 @@ impl Sink for DorisSink {
                 last_msg.offset,
             );
 
-            match self.send_stream_load(&label, body).await {
-                Ok(response) => match classify_status(&response) {
-                    Ok(()) => {
-                        if response.number_filtered_rows > 0 {
-                            // Filtered rows usually mean schema drift upstream.
-                            // Surface above debug so operators can alert on it.
-                            warn!(
-                                "Doris sink ID {} loaded {} rows but FILTERED {} rows for {}.{} (label={label}); \
-                                 likely schema drift upstream",
-                                self.id,
-                                response.number_loaded_rows,
-                                response.number_filtered_rows,
-                                self.config.database,
-                                self.config.table,
-                            );
-                        } else {
-                            debug!(
-                                "Doris sink ID {} loaded {} rows into {}.{} (label={label})",
-                                self.id,
-                                response.number_loaded_rows,
-                                self.config.database,
-                                self.config.table,
-                            );
-                        }
+            match self.load_batch(&label, body).await {
+                Ok(response) => {
+                    if response.number_filtered_rows > 0 {
+                        // Filtered rows usually mean schema drift upstream.
+                        // Surface above debug so operators can alert on it.
+                        warn!(
+                            "Doris sink ID {} loaded {} rows but FILTERED {} rows for {}.{} (label={label}); \
+                             likely schema drift upstream",
+                            self.id,
+                            response.number_loaded_rows,
+                            response.number_filtered_rows,
+                            self.config.database,
+                            self.config.table,
+                        );
+                    } else {
+                        debug!(
+                            "Doris sink ID {} loaded {} rows into {}.{} (label={label})",
+                            self.id,
+                            response.number_loaded_rows,
+                            self.config.database,
+                            self.config.table,
+                        );
                     }
-                    Err(e) => {
-                        error!("Doris sink ID {} batch failed: {e}", self.id);
-                        first_error.get_or_insert(e);
-                    }
-                },
-                Err(e) => {
-                    error!("Doris sink ID {} HTTP failed: {e}", self.id);
-                    first_error.get_or_insert(e);
+                }
+                Err(error) => {
+                    error!(
+                        "Doris sink ID {} batch failed (label={label}): {error}",
+                        self.id
+                    );
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -871,11 +1155,15 @@ mod tests {
             max_filter_ratio: None,
             columns: None,
             where_clause: None,
+            output_format: None,
             timeout: None,
             connect_timeout: None,
             batch_size: None,
             allow_insecure_redirect: None,
             allowed_redirect_hosts: None,
+            max_retries: None,
+            retry_delay: None,
+            max_retry_delay: None,
         }
     }
 
@@ -1178,6 +1466,11 @@ mod tests {
             where_header: None,
             allow_insecure_redirect: allow_insecure,
             allowed_redirect_hosts: allowed_hosts,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_delay: Duration::from_millis(1),
+            retry_max_delay: Duration::from_millis(5),
+            format: Format::Json,
+            csv_columns: Vec::new(),
         }
     }
 
@@ -1357,7 +1650,8 @@ mod tests {
 
     #[tokio::test]
     async fn consume_aborts_on_first_non_json_payload() {
-        let sink = DorisSink::new(1, make_config());
+        let mut sink = DorisSink::new(1, make_config());
+        sink.open().await.expect("open should succeed");
         let result = sink
             .consume(&topic_meta(), messages_meta(), vec![text_msg(0)])
             .await;
@@ -1369,7 +1663,8 @@ mod tests {
 
     #[tokio::test]
     async fn consume_aborts_on_non_json_in_mixed_batch() {
-        let sink = DorisSink::new(1, make_config());
+        let mut sink = DorisSink::new(1, make_config());
+        sink.open().await.expect("open should succeed");
         let result = sink
             .consume(
                 &topic_meta(),
@@ -1540,5 +1835,277 @@ mod tests {
             matches!(&result, Err(Error::PermanentHttpError(_))),
             "expected PermanentHttpError on relative Location, got {result:?}",
         );
+    }
+
+    /// A transient failure (HTTP 503) is retried in-request, and the next
+    /// attempt's success is returned. The `.expect(1)` on the 503 mock proves
+    /// the retry actually re-PUT (a single attempt would have surfaced the
+    /// transient error instead of `Ok(Success)`).
+    #[tokio::test]
+    async fn transient_failure_is_retried_then_succeeds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(3);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        // wiremock serves the first matching mock in mount order, so mount the
+        // single-shot 503 first: it serves attempt 1, then — capped at one
+        // response — stops matching, and attempt 2 falls through to the success.
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"Status": "Success", "NumberLoadedRows": 1})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Ok(r) if r.status == "Success"),
+            "expected Ok(Success) after one retry, got {result:?}",
+        );
+    }
+
+    /// When every attempt fails transiently, the budget is exhausted and the
+    /// last transient error is surfaced. `.expect(2)` pins the attempt count to
+    /// exactly `max_retries` (1 initial + 1 retry) — no over- or under-retry.
+    #[tokio::test]
+    async fn transient_failure_exhausts_retries_and_returns_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(2);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::CannotStoreData(_))),
+            "expected CannotStoreData after exhausting retries, got {result:?}",
+        );
+    }
+
+    /// A permanent failure (HTTP 400) returns on the first attempt with no
+    /// retry, even with `max_retries` high. `.expect(1)` pins it to one attempt.
+    #[tokio::test]
+    async fn permanent_failure_is_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        cfg.max_retries = Some(5);
+        cfg.retry_delay = Some("1ms".into());
+        cfg.max_retry_delay = Some("5ms".into());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .load_batch("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::PermanentHttpError(_))),
+            "expected PermanentHttpError with no retry, got {result:?}",
+        );
+    }
+
+    fn owned(json: &str) -> OwnedValue {
+        let mut bytes = json.as_bytes().to_vec();
+        simd_json::to_owned_value(&mut bytes).expect("valid JSON")
+    }
+
+    #[test]
+    fn format_deserializes_from_lowercase() {
+        assert_eq!(
+            serde_json::from_str::<Format>("\"json\"").unwrap(),
+            Format::Json
+        );
+        assert_eq!(
+            serde_json::from_str::<Format>("\"csv\"").unwrap(),
+            Format::Csv
+        );
+        assert!(serde_json::from_str::<Format>("\"xml\"").is_err());
+        assert_eq!(Format::default(), Format::Json);
+    }
+
+    #[test]
+    fn csv_column_names_takes_leading_bare_names() {
+        assert_eq!(csv_column_names("id, name, count"), ["id", "name", "count"]);
+        // A derived `name = expr` column (and anything after) is server-side.
+        assert_eq!(
+            csv_column_names("id, name, calc = count + 1"),
+            ["id", "name"]
+        );
+        assert_eq!(csv_column_names(" a ,b, c "), ["a", "b", "c"]);
+        assert!(csv_column_names("").is_empty());
+        assert!(csv_column_names("calc = x").is_empty());
+    }
+
+    #[test]
+    fn build_csv_body_encodes_scalars_nulls_and_missing() {
+        let row = owned(r#"{"i":-5,"u":10,"f":2.5,"b":false,"nul":null,"empty":""}"#);
+        let columns = ["i", "u", "f", "b", "nul", "missing", "empty"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        assert_eq!(*body.last().unwrap(), CSV_LINE_DELIMITER);
+        let fields: Vec<&[u8]> = body[..body.len() - 1]
+            .split(|&byte| byte == CSV_COLUMN_SEPARATOR)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                &b"-5"[..],  // i64
+                &b"10"[..],  // u64
+                &b"2.5"[..], // f64
+                &b"false"[..],
+                &b"\\N"[..],  // json null
+                &b"\\N"[..],  // missing key
+                &b"\"\""[..], // empty string -> enclosed empty (distinct from null)
+            ],
+        );
+    }
+
+    #[test]
+    fn build_csv_body_prefix_escapes_enclose_and_escape_bytes() {
+        // The value contains a quote and a backslash; both must be prefix-escaped
+        // inside the enclosure (escape the escape char too, in one left-to-right
+        // pass, so a trailing backslash can't leak past the closing quote).
+        let row = owned(r#"{"v":"a\"b\\c"}"#);
+        let columns = ["v"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        let expected: &[u8] = &[
+            b'"',
+            b'a',
+            b'\\',
+            b'"',
+            b'b',
+            b'\\',
+            b'\\',
+            b'c',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_keeps_embedded_separator_and_newline_inside_enclosure() {
+        // Raw separator (0x01), line delimiter (0x02), and a newline live inside
+        // the value; the enclosure protects them, so they are emitted literally
+        // (Doris reads them as data, not structure) and are NOT escaped.
+        let row = owned("{\"v\":\"a\\u0001b\\u0002c\\nd\"}");
+        let columns = ["v"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        let expected: &[u8] = &[
+            b'"',
+            b'a',
+            0x01,
+            b'b',
+            0x02,
+            b'c',
+            b'\n',
+            b'd',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_stringifies_nested_values() {
+        let row = owned(r#"{"o":{"k":1}}"#);
+        let columns = ["o"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        // {"k":1} enclosed, with its inner quotes prefix-escaped.
+        let expected: &[u8] = &[
+            b'"',
+            b'{',
+            b'\\',
+            b'"',
+            b'k',
+            b'\\',
+            b'"',
+            b':',
+            b'1',
+            b'}',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_rejects_non_object_row() {
+        let row = owned("[1, 2, 3]");
+        let columns = ["v"].map(String::from);
+        assert!(matches!(
+            build_csv_body(&[&row], &columns),
+            Err(Error::InvalidRecordValue(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_csv_format_without_columns() {
+        let mut cfg = make_config();
+        cfg.output_format = Some(Format::Csv);
+        cfg.columns = None;
+        let mut sink = DorisSink::new(1, cfg);
+        assert!(matches!(
+            sink.open().await,
+            Err(Error::InvalidConfigValue(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_resolves_csv_columns_dropping_derived() {
+        let mut cfg = make_config();
+        cfg.output_format = Some(Format::Csv);
+        cfg.columns = Some("id, name, calc = id + 1".into());
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let connected = sink.connected.as_ref().unwrap();
+        assert_eq!(connected.format, Format::Csv);
+        assert_eq!(connected.csv_columns, ["id", "name"]);
     }
 }
