@@ -83,10 +83,13 @@ pub(crate) fn verify_login_credentials(
             let _ = crypto::verify_password(password, DUMMY_PASSWORD_HASH.as_str());
             return Err(LoginRegisterError::InvalidCredentials);
         };
-        if user.status != UserStatus::Active {
-            return Err(LoginRegisterError::UserInactive);
-        }
-        if !crypto::verify_password(password, user.password_hash.as_ref()) {
+        // Verify before the status check and collapse inactive to
+        // InvalidCredentials: an inactive account must answer exactly like a
+        // wrong password (same error, same Argon2 cost), or login could probe
+        // which accounts exist but are disabled.
+        if !crypto::verify_password(password, user.password_hash.as_ref())
+            || user.status != UserStatus::Active
+        {
             return Err(LoginRegisterError::InvalidCredentials);
         }
         Ok(user.id)
