@@ -17,6 +17,7 @@
 
 use uuid::Uuid;
 
+mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
@@ -45,6 +46,9 @@ pub(crate) fn unique_container_name(service: &str) -> String {
     )
 }
 
+pub use clickhouse::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
