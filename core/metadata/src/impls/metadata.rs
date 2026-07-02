@@ -776,6 +776,7 @@ where
                         |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
                     self.client_table.borrow_mut().commit_register(
                         prepare_header.client,
+                        prepare_header.user_id,
                         reply.clone(),
                         in_flight,
                     );
@@ -936,6 +937,7 @@ where
     pub async fn submit_register_in_process(
         &self,
         client_id: u128,
+        user_id: u32,
     ) -> Result<u64, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
@@ -976,7 +978,7 @@ where
             return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let request = build_register_request_message(consensus, client_id);
+        let request = build_register_request_message(consensus, client_id, user_id);
         // Wire path runs `RequestHeader::validate` at network boundary;
         // in-process skips it. debug_assert pins drift.
         debug_assert!(
@@ -1686,9 +1688,12 @@ where
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&header, &bytes::Bytes::new());
                 let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                self.client_table
-                    .borrow_mut()
-                    .commit_register(header.client, reply, in_flight);
+                self.client_table.borrow_mut().commit_register(
+                    header.client,
+                    header.user_id,
+                    reply,
+                    in_flight,
+                );
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
                 // Mirror the on_ack path: drop the disconnected client from
@@ -1786,6 +1791,7 @@ where
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
+    user_id: u32,
 ) -> Message<RequestHeader>
 where
     B: MessageBus,
@@ -1807,6 +1813,8 @@ where
         client: client_id,
         session: 0,
         request: 0,
+        // Replicated on the prepare so every replica resolves session -> user.
+        user_id,
         // Route through the metadata consensus group. The chain-forwarded
         // prepare is re-routed on each peer by namespace; a `0` here would
         // hash to a non-zero shard with no metadata consensus and be

@@ -151,7 +151,10 @@ pub struct RequestHeader {
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub session: u64,
-    pub reserved: [u8; 56],
+    /// Acting user id for a `Register`; replicated so every replica resolves
+    /// session -> user deterministically. Zero for non-register ops.
+    pub user_id: u32,
+    pub reserved: [u8; 52],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -159,7 +162,10 @@ const _: () = {
         offset_of!(RequestHeader, client)
             == offset_of!(RequestHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 56]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
+    );
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 52]>() == HEADER_SIZE);
 };
 
 impl Default for RequestHeader {
@@ -182,7 +188,8 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             namespace: 0,
             session: 0,
-            reserved: [0; 56],
+            user_id: 0,
+            reserved: [0; 52],
         }
     }
 }
@@ -591,7 +598,11 @@ pub struct PrepareHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 32],
+    /// Acting user id, copied from the originating `RequestHeader`. Lets every
+    /// replica resolve session -> user deterministically on `Register`. Zero
+    /// for non-register ops.
+    pub user_id: u32,
+    pub reserved: [u8; 28],
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -599,7 +610,11 @@ const _: () = {
         offset_of!(PrepareHeader, client)
             == offset_of!(PrepareHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(PrepareHeader, user_id)
+            == offset_of!(PrepareHeader, namespace) + size_of::<u64>()
+    );
+    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -624,7 +639,8 @@ impl Default for PrepareHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 32],
+            user_id: 0,
+            reserved: [0; 28],
         }
     }
 }

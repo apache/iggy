@@ -79,6 +79,9 @@ pub struct ClientEntry {
     /// Session number = commit op of the register. Monotonic across
     /// registrations; new register always gets a higher session.
     pub session: u64,
+    /// Acting user id captured at register. Fixed for the entry's lifetime;
+    /// lets every replica resolve session -> user without a metadata lookup.
+    pub user_id: u32,
     /// Cached reply for client's latest committed request.
     pub reply: CachedReply,
 }
@@ -241,8 +244,13 @@ impl ClientTable {
     /// # Panics
     /// If `client_id == 0`, `session == 0`, or `client_id != reply.header().client`.
     /// Session mismatch does NOT panic.
-    pub fn commit_register<F>(&mut self, client_id: u128, reply: Message<ReplyHeader>, in_flight: F)
-    where
+    pub fn commit_register<F>(
+        &mut self,
+        client_id: u128,
+        user_id: u32,
+        reply: Message<ReplyHeader>,
+        in_flight: F,
+    ) where
         F: Fn(u128) -> bool,
     {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
@@ -291,6 +299,7 @@ impl ClientTable {
             let slot_idx = self.first_free_slot().expect("eviction must free a slot");
             self.slots[slot_idx] = Some(ClientEntry {
                 session,
+                user_id,
                 reply: cached,
             });
             self.index.insert(client_id, slot_idx);
@@ -462,6 +471,13 @@ impl ClientTable {
         self.slots[slot_idx].as_ref().map(|entry| entry.session)
     }
 
+    /// Acting user id captured when the client registered.
+    #[must_use]
+    pub fn get_user_id(&self, client_id: u128) -> Option<u32> {
+        let &slot_idx = self.index.get(&client_id)?;
+        self.slots[slot_idx].as_ref().map(|entry| entry.user_id)
+    }
+
     /// Active committed entries.
     #[must_use]
     pub fn count(&self) -> usize {
@@ -473,6 +489,10 @@ impl ClientTable {
 mod tests {
     use super::*;
     use iggy_binary_protocol::{Command2, Operation};
+
+    /// Arbitrary non-zero user id for register fixtures; most tests don't
+    /// assert on it (see `register_stores_user_id` for the accessor check).
+    const TEST_USER_ID: u32 = 7;
 
     fn make_register_reply(client: u128, commit: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
@@ -519,7 +539,12 @@ mod tests {
     fn table_with_client() -> (ClientTable, u64) {
         let mut table = ClientTable::new(10);
         let session = 10;
-        table.commit_register(1, make_register_reply(1, session), no_in_flight());
+        table.commit_register(
+            1,
+            TEST_USER_ID,
+            make_register_reply(1, session),
+            no_in_flight(),
+        );
         (table, session)
     }
 
@@ -528,9 +553,25 @@ mod tests {
     #[test]
     fn register_creates_session() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, make_register_reply(1, 42), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 42), no_in_flight());
         assert_eq!(table.get_session(1), Some(42));
+        assert_eq!(table.get_user_id(1), Some(TEST_USER_ID));
         assert_eq!(table.count(), 1);
+    }
+
+    // Each entry keeps the user id it registered with; lookups are per-client.
+    #[test]
+    fn register_stores_user_id() {
+        let mut table = ClientTable::new(10);
+        table.commit_register(1, 11, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(2, 22, make_register_reply(2, 20), no_in_flight());
+        assert_eq!(table.get_user_id(1), Some(11));
+        assert_eq!(table.get_user_id(2), Some(22));
+        assert_eq!(
+            table.get_user_id(3),
+            None,
+            "unregistered client has no user"
+        );
     }
 
     #[test]
@@ -696,9 +737,24 @@ mod tests {
     #[test]
     fn eviction_removes_oldest_commit() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, make_register_reply(100, 10), no_in_flight());
-        table.commit_register(200, make_register_reply(200, 20), no_in_flight());
-        table.commit_register(300, make_register_reply(300, 30), no_in_flight());
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 20),
+            no_in_flight(),
+        );
+        table.commit_register(
+            300,
+            TEST_USER_ID,
+            make_register_reply(300, 30),
+            no_in_flight(),
+        );
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert!(table.get_reply(300).is_some());
@@ -708,9 +764,24 @@ mod tests {
     #[test]
     fn eviction_is_deterministic_by_slot_index() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, make_register_reply(100, 10), no_in_flight());
-        table.commit_register(200, make_register_reply(200, 10), no_in_flight());
-        table.commit_register(300, make_register_reply(300, 30), no_in_flight());
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            300,
+            TEST_USER_ID,
+            make_register_reply(300, 30),
+            no_in_flight(),
+        );
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert!(table.get_reply(300).is_some());
@@ -719,8 +790,18 @@ mod tests {
     #[test]
     fn slot_reuse_after_eviction() {
         let mut table = ClientTable::new(1);
-        table.commit_register(100, make_register_reply(100, 10), no_in_flight());
-        table.commit_register(200, make_register_reply(200, 20), no_in_flight());
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 20),
+            no_in_flight(),
+        );
         assert!(table.get_reply(100).is_none());
         assert!(table.get_reply(200).is_some());
         assert_eq!(table.count(), 1);
@@ -732,11 +813,21 @@ mod tests {
     #[test]
     fn eviction_skips_in_flight_clients() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, make_register_reply(100, 10), no_in_flight());
-        table.commit_register(200, make_register_reply(200, 20), no_in_flight());
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 20),
+            no_in_flight(),
+        );
         // 100 in-flight; eviction must pick 200.
         let in_flight = |c: u128| c == 100;
-        table.commit_register(300, make_register_reply(300, 30), in_flight);
+        table.commit_register(300, TEST_USER_ID, make_register_reply(300, 30), in_flight);
         assert!(
             table.get_reply(100).is_some(),
             "in-flight client must survive"
@@ -753,10 +844,25 @@ mod tests {
     #[test]
     fn eviction_falls_back_to_oldest_when_all_in_flight() {
         let mut table = ClientTable::new(2);
-        table.commit_register(100, make_register_reply(100, 10), no_in_flight());
-        table.commit_register(200, make_register_reply(200, 20), no_in_flight());
+        table.commit_register(
+            100,
+            TEST_USER_ID,
+            make_register_reply(100, 10),
+            no_in_flight(),
+        );
+        table.commit_register(
+            200,
+            TEST_USER_ID,
+            make_register_reply(200, 20),
+            no_in_flight(),
+        );
         let all_in_flight = |_| true;
-        table.commit_register(300, make_register_reply(300, 30), all_in_flight);
+        table.commit_register(
+            300,
+            TEST_USER_ID,
+            make_register_reply(300, 30),
+            all_in_flight,
+        );
         assert!(
             table.get_reply(100).is_none(),
             "100 evicted (oldest fallback)"
@@ -770,9 +876,9 @@ mod tests {
     #[test]
     fn commit_register_idempotent_on_replay() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
         // Same client_id + session = idempotent (WAL replay).
-        table.commit_register(1, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
         assert_eq!(table.get_session(1), Some(10));
         assert_eq!(table.count(), 1);
     }
@@ -783,12 +889,12 @@ mod tests {
     #[test]
     fn commit_register_different_session_logs_and_skips() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
         // existing=10, replay=20.
-        table.commit_register(1, make_register_reply(1, 20), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 20), no_in_flight());
         assert_eq!(table.get_session(1), Some(10), "first session stays");
         // Smaller replay session: same skip.
-        table.commit_register(1, make_register_reply(1, 5), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 5), no_in_flight());
         assert_eq!(table.get_session(1), Some(10));
     }
 
@@ -814,8 +920,8 @@ mod tests {
     #[test]
     fn different_clients_independent_sessions() {
         let mut table = ClientTable::new(10);
-        table.commit_register(1, make_register_reply(1, 10), no_in_flight());
-        table.commit_register(2, make_register_reply(2, 20), no_in_flight());
+        table.commit_register(1, TEST_USER_ID, make_register_reply(1, 10), no_in_flight());
+        table.commit_register(2, TEST_USER_ID, make_register_reply(2, 20), no_in_flight());
         assert_eq!(table.get_session(1), Some(10));
         assert_eq!(table.get_session(2), Some(20));
         assert!(matches!(table.check_request(1, 10, 1), RequestStatus::New));

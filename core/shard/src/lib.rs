@@ -143,6 +143,7 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
+        user_id: u32,
         reply: Sender<Option<u64>>,
     },
     Logout {

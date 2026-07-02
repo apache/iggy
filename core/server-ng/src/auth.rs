@@ -160,7 +160,7 @@ pub(crate) async fn complete_login_register(
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let session = match submit_register_on_owner(shard, vsr_client_id).await {
+    let session = match submit_register_on_owner(shard, vsr_client_id, user_id).await {
         Ok(session) => session,
         Err(error) => {
             return Err(LoginRegisterError::Transient(error));

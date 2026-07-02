@@ -318,12 +318,13 @@ pub(crate) fn make_metadata_submit_handler(
             match submit {
                 shard::MetadataSubmit::Register {
                     vsr_client_id,
+                    user_id,
                     reply,
                 } => {
                     let session = shard
                         .plane
                         .metadata()
-                        .submit_register_in_process(vsr_client_id)
+                        .submit_register_in_process(vsr_client_id, user_id)
                         .await
                         .ok();
                     let _ = reply.try_send(session);
@@ -1467,17 +1468,19 @@ fn polling_strategy_from_wire(
 pub(crate) async fn submit_register_on_owner(
     shard: &Rc<ServerNgShard>,
     vsr_client_id: u128,
+    user_id: u32,
 ) -> Result<u64, MetadataSubmitError> {
     if shard.id == 0 {
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id)
+            .submit_register_in_process(vsr_client_id, user_id)
             .await;
     }
     let (reply, rx) = shard::channel::<Option<u64>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
+        user_id,
         reply,
     });
     match rx.recv().await {

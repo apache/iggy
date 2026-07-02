@@ -757,7 +757,7 @@ impl HttpInner {
         }
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
-        let session = submit_register_on_owner(&self.shard, client_id)
+        let session = submit_register_on_owner(&self.shard, client_id, user_id)
             .await
             .map_err(|error| {
                 warn!(?error, "server-ng HTTP: VSR Register submit failed");

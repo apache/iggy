@@ -2087,6 +2087,9 @@ where
                 timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
+                // Inert for non-register ops (they carry 0); on Register it
+                // replicates the acting user to every backup.
+                user_id: old.user_id,
                 ..Default::default()
             }
         })

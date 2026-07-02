@@ -114,7 +114,7 @@ pub(crate) fn encode_request_header(
         .checked_add(payload.len())
         .ok_or(IggyError::InvalidConfiguration)?;
     let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 56];
+    let mut reserved = [0; 52];
     if operation == Operation::NonReplicated {
         reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
     }
