@@ -172,6 +172,10 @@ impl ShardHandles {
     /// does not need to read the trace log to discover late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Shards run thread-per-core with compio's blocking fallback pool
+        // disabled, so an io_uring opcode the kernel lacks aborts every shard
+        // with the same panic. Surface the actionable diagnostic once.
+        let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
             match handle.join() {
                 Ok(Ok(())) => {
@@ -187,6 +191,13 @@ impl ShardHandles {
                 Err(panic_payload) => {
                     let message = panic_payload_to_string(&*panic_payload);
                     error!(shard_id, message = %message, "shard thread panicked");
+                    if !io_uring_diagnostic_shown
+                        && message
+                            .contains(server_common::diagnostics::ASYNCIFY_POOL_DISABLED_PANIC_MSG)
+                    {
+                        server_common::diagnostics::print_incomplete_io_uring_ops_info();
+                        io_uring_diagnostic_shown = true;
+                    }
                     failures.push(ShardJoinFailure {
                         shard_id,
                         kind: ShardJoinFailureKind::Panic { message },
