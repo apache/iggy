@@ -295,6 +295,11 @@ TEST_F(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                       "server_default", 0, "server_default"),
                  std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(unauthenticated_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                                      "server_default", 0, "server_default"),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, DeleteTopicAfterCreate) {
@@ -398,6 +403,11 @@ TEST_F(LowLevelE2E_Topic, DeleteTopicBeforeLoginThrows) {
     ASSERT_THROW(
         unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
         std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(
+        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, DeleteTopicWithInvalidStreamIdentifierThrows) {
@@ -494,6 +504,11 @@ TEST_F(LowLevelE2E_Topic, GetTopicBeforeLoginThrows) {
         unauthenticated_client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
         std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(
         unauthenticated_client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
         std::exception);
@@ -729,6 +744,9 @@ TEST_F(LowLevelE2E_Topic, GetTopicsBeforeLoginThrows) {
 
     ASSERT_THROW(unauthenticated_client->get_topics(make_string_identifier(stream_name)), std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->get_topics(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->get_topics(make_string_identifier(stream_name)), std::exception);
 }
 
@@ -1076,6 +1094,12 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicBeforeLoginThrows) {
                                              updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
         std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
+                                             updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(
         unauthenticated_client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                              updated_topic_name, "gzip", 1, "duration", 1000, "1GiB"),
@@ -1539,6 +1563,11 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicBeforeLoginThrows) {
         unauthenticated_client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
         std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(
+        unauthenticated_client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(
         unauthenticated_client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
         std::exception);

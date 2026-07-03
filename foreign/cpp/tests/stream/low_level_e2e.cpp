@@ -52,6 +52,9 @@ TEST_F(LowLevelE2E_Stream, CreateStreamBeforeLoginThrows) {
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->create_stream(stream_name), std::exception);
 }
 
 TEST_F(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
@@ -158,6 +161,10 @@ TEST_F(LowLevelE2E_Stream, UpdateStreamBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
                  std::exception);
 }
@@ -396,6 +403,9 @@ TEST_F(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
     ASSERT_NO_THROW(client->connect());
 
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
 }
 
 TEST_F(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
@@ -475,6 +485,9 @@ TEST_F(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
 
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 }
 
@@ -591,6 +604,9 @@ TEST_F(LowLevelE2E_Stream, GetStreamsBeforeLoginThrows) {
 
     ASSERT_THROW(client->get_streams(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_streams(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_streams(), std::exception);
 }
 
@@ -1034,5 +1050,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamBeforeLoginThrows) {
 
     ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
 }

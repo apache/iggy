@@ -153,6 +153,70 @@ TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
     client = nullptr;
 }
 
+TEST_F(LowLevelE2E_Client, ConnectLoginThenDisconnect) {
+    RecordProperty("description",
+                   "Connects, logs in, disconnects successfully, and rejects authenticated operations afterward.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DisconnectWithoutConnect) {
+    RecordProperty("description", "Allows disconnect to be called on a client that was never explicitly connected.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->disconnect());
+}
+
+TEST_F(LowLevelE2E_Client, DisconnectWithoutLogin) {
+    RecordProperty("description", "Allows disconnect after connect even when no user has authenticated.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_stats(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DisconnectThenReconnectWithoutRelogin) {
+    RecordProperty("description",
+                   "Requires logging in again after a disconnect and reconnect before authenticated operations work.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DisconnectAfterFailedLogin) {
+    RecordProperty("description", "Allows disconnect after a failed login attempt leaves the client unauthenticated.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
     RecordProperty("description", "Supports login without an explicit prior connect call.");
     iggy::ffi::Client *client = nullptr;
@@ -174,6 +238,18 @@ TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     client = nullptr;
 }
 
+TEST_F(LowLevelE2E_Client, DeleteWithoutDisconnect) {
+    RecordProperty("description", "Allows deleting a connected and authenticated client without disconnecting first.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(iggy::ffi::delete_client(client));
+    client = nullptr;
+}
+
 TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     RecordProperty("description",
                    "Keeps repeated connect, login, and delete calls stable across duplicate invocations.");
@@ -191,6 +267,20 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     ASSERT_NO_THROW(iggy::ffi::delete_client(client));
 }
 
+TEST_F(LowLevelE2E_Client, RepeatedDisconnectCallsHaveStableBehavior) {
+    RecordProperty("description", "Keeps repeated disconnect calls stable across duplicate invocations.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
 TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     RecordProperty("description", "Treats deleting a null client pointer as a no-op.");
     iggy::ffi::Client *client = nullptr;
@@ -198,11 +288,15 @@ TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
 }
 
 TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
-    RecordProperty("description", "Rejects get_stats before connect, and after connect but before login.");
+    RecordProperty("description",
+                   "Rejects get_stats before connect, after connect but before login, and after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_stats(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_stats(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_stats(), std::exception);
 }
 
@@ -247,12 +341,17 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingEmptyPartition) 
 
 TEST_F(LowLevelE2E_Client, FlushUnsavedBufferBeforeLoginThrows) {
     RecordProperty("description",
-                   "Throws when flush_unsaved_buffer is called before connect, and after connect but before login.");
+                   "Throws when flush_unsaved_buffer is called before connect, after connect but before login, and "
+                   "after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
                  std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
+                 std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(1), make_numeric_identifier(1), 0, true),
                  std::exception);
 }
@@ -529,11 +628,15 @@ TEST_F(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
 }
 
 TEST_F(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
-    RecordProperty("description", "Rejects get_me before connect, and after connect but before login.");
+    RecordProperty("description",
+                   "Rejects get_me before connect, after connect but before login, and after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_me(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_me(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_me(), std::exception);
 }
 
@@ -699,11 +802,15 @@ TEST_F(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
 }
 
 TEST_F(LowLevelE2E_Client, GetClientBeforeLoginThrows) {
-    RecordProperty("description", "Rejects get_client before connect, and after connect but before login.");
+    RecordProperty("description",
+                   "Rejects get_client before connect, after connect but before login, and after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_client(1), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_client(1), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_client(1), std::exception);
 }
 
@@ -786,11 +893,15 @@ TEST_F(LowLevelE2E_Client, GetClientIsStableAcrossBackToBackCalls) {
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsBeforeLoginThrows) {
-    RecordProperty("description", "Rejects get_clients before connect, and after connect but before login.");
+    RecordProperty("description",
+                   "Rejects get_clients before connect, after connect but before login, and after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_clients(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_clients(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_clients(), std::exception);
 }
 
@@ -980,12 +1091,16 @@ TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnection
 }
 
 TEST_F(LowLevelE2E_Client, SnapshotBeforeLoginThrows) {
-    RecordProperty("description", "Rejects snapshot before connect, and after connect but before login.");
+    RecordProperty("description",
+                   "Rejects snapshot before connect, after connect but before login, and after disconnect.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
 
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
 }
 

@@ -123,6 +123,15 @@ TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
                                        partition_id_bytes(0), std::move(messages)),
                  std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> disconnected_messages;
+    auto disconnected_msg = iggy::ffi::make_message(to_payload("should-still-fail"));
+    disconnected_messages.push_back(std::move(disconnected_msg));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
+                                       partition_id_bytes(0), std::move(disconnected_messages)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
@@ -440,6 +449,11 @@ TEST_F(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
     iggy::ffi::Client *client = GetLoggedOutClient();
     ASSERT_NO_THROW(client->connect());
 
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
+                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                 std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), make_numeric_identifier(0), 0, "consumer",
                                        make_numeric_identifier(1), "offset", 0, 10, false),
                  std::exception);
