@@ -22,12 +22,10 @@ use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, IggyConsumer as RustIggyConsumer, IggyDuration,
+    AutoCommitWhen as RustAutoCommitWhen, ConsumerGroup as RustConsumerGroup,
+    ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
     IggyError, ReceivedMessage,
-};
-use iggy_common::{
-    ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
