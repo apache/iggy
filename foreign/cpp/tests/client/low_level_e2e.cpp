@@ -141,6 +141,87 @@ TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
     ASSERT_THROW(client->logout_user(), std::exception);
 }
 
+TEST_F(LowLevelE2E_Client, ChangePasswordBeforeLoginThrows) {
+    RecordProperty("description",
+                   "Rejects change_password before connect, after connect but before login, and after disconnect.");
+    iggy::ffi::Client *client      = GetLoggedOutClient();
+    const auto user_id             = make_string_identifier("iggy");
+    const std::string old_password = "iggy";
+    const std::string new_password = "iggy-updated-secret";
+
+    ASSERT_THROW(client->change_password(user_id, old_password, new_password), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->change_password(user_id, old_password, new_password), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->change_password(user_id, old_password, new_password), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ChangePasswordWithInvalidCurrentPasswordThrows) {
+    RecordProperty("description", "Rejects change_password when the provided current password is incorrect.");
+    iggy::ffi::Client *client        = GetLoggedInClient();
+    const auto user_id               = make_string_identifier("iggy");
+    const std::string wrong_password = "not-the-current-password";
+    const std::string new_password   = "iggy-updated-secret";
+
+    ASSERT_THROW(client->change_password(user_id, wrong_password, new_password), std::exception);
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+}
+
+TEST_F(LowLevelE2E_Client, ChangePasswordWithInvalidNewPasswordThrows) {
+    RecordProperty("description",
+                   "Rejects change_password when the replacement password violates client-side length bounds.");
+    iggy::ffi::Client *client      = GetLoggedInClient();
+    const auto user_id             = make_string_identifier("iggy");
+    const std::string old_password = "iggy";
+    const std::string too_short    = "";
+    const std::string too_long(256, 'a');
+
+    ASSERT_THROW(client->change_password(user_id, old_password, too_short), std::exception);
+    ASSERT_THROW(client->change_password(user_id, old_password, too_long), std::exception);
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+}
+
+TEST_F(LowLevelE2E_Client, ChangePasswordForWrongUserThrows) {
+    RecordProperty("description", "Rejects change_password when targeting a user that does not exist.");
+    iggy::ffi::Client *client            = GetLoggedInClient();
+    const auto wrong_user_id             = make_string_identifier(GetRandomName());
+    const std::string current_password   = "iggy";
+    const std::string replacement_secret = "iggy-updated-secret";
+
+    ASSERT_THROW(client->change_password(wrong_user_id, current_password, replacement_secret), std::exception);
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+}
+
+TEST_F(LowLevelE2E_Client, ChangePasswordUpdatesCredentialsAndCanBeRestored) {
+    RecordProperty("description",
+                   "Changes the password for the current user, updates login behavior, and restores the original "
+                   "password before the test exits.");
+    iggy::ffi::Client *client        = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedOutClient();
+    iggy::ffi::Client *third_client  = GetLoggedOutClient();
+    const auto user_id               = make_string_identifier("iggy");
+    const std::string old_password   = "iggy";
+    const std::string new_password   = "iggy-updated-secret";
+    bool password_changed            = false;
+
+    ASSERT_NO_THROW(client->change_password(user_id, old_password, new_password));
+    password_changed = true;
+
+    EXPECT_THROW(second_client->login_user("iggy", old_password), std::exception);
+    EXPECT_NO_THROW(second_client->login_user("iggy", new_password));
+
+    if (password_changed) {
+        EXPECT_NO_THROW(client->change_password(user_id, new_password, old_password));
+        password_changed = false;
+    }
+
+    EXPECT_NO_THROW(third_client->login_user("iggy", old_password));
+}
+
 TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
     RecordProperty("description", "Allows client cleanup after a failed login leaves the connection unauthenticated.");
     iggy::ffi::Client *client = nullptr;
