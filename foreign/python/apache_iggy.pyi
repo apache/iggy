@@ -28,12 +28,16 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "ConsumerGroup",
+    "ConsumerGroupDetails",
+    "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "Topic",
     "TopicDetails",
 ]
 
@@ -231,6 +235,75 @@ class AutoCommitWhen:
     ...
 
 @typing.final
+class ConsumerGroup:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        Gets the name of the consumer group.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group is consuming.
+        """
+    @property
+    def members_count(self) -> builtins.int:
+        r"""
+        Gets the number of members in the consumer group.
+        """
+
+@typing.final
+class ConsumerGroupDetails:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        Gets the name of the consumer group.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group is consuming.
+        """
+    @property
+    def members_count(self) -> builtins.int:
+        r"""
+        Gets the number of members in the consumer group.
+        """
+    @property
+    def members(self) -> builtins.list[ConsumerGroupMember]:
+        r"""
+        Gets the collection of members in the consumer group.
+        """
+
+@typing.final
+class ConsumerGroupMember:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group member.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group member is consuming.
+        """
+    @property
+    def partitions(self) -> builtins.list[builtins.int]:
+        r"""
+        Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -301,6 +374,150 @@ class IggyClient:
         r"""
         Gets topic by stream and id.
         Returns Option of topic details or a PyRuntimeError on failure.
+        """
+    def get_topics(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[list[Topic]]:
+        r"""
+        Get all topics in a stream.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[Topic]`.
+
+        Raises:
+            PyRuntimeError: If the identifier is invalid or the request fails.
+        """
+    def update_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+        compression_algorithm: builtins.str | None = None,
+        replication_factor: builtins.int | None = None,
+        message_expiry: datetime.timedelta | None = None,
+        max_topic_size: builtins.int | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Update an existing topic.
+
+        This is a full replacement: any optional parameter left unset is reset to
+        its server default rather than preserved.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: New topic name as `str`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            replication_factor: Replication factor as `int | None`.
+            message_expiry: Message expiry as `datetime.timedelta | None`.
+            max_topic_size: Maximum topic size in bytes as `int | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is updated.
+
+        Raises:
+            PyRuntimeError: If an argument is invalid or the request fails.
+        """
+    def delete_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a topic from a stream.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is deleted.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
+        """
+    def purge_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Purge all messages from a topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is purged.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
+        """
+    def create_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        name: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Create a consumer group for a stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            name: Consumer group name as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the consumer group is created.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def get_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
+        r"""
+        Retrieve details for a consumer group from the specified stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `ConsumerGroupDetails` if the consumer group exists,
+            or `None` otherwise.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def get_consumer_groups(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
+        r"""
+        Get all consumer groups for the specified stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `list[ConsumerGroup]`.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def send_messages(
         self,
@@ -520,12 +737,57 @@ class StreamDetails:
     def topics_count(self) -> builtins.int: ...
 
 @typing.final
+class Topic:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The unique name of the topic.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages in the topic.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions in the topic.
+        """
+
+@typing.final
 class TopicDetails:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        The unique name of the topic.
+        """
     @property
-    def messages_count(self) -> builtins.int: ...
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages in the topic.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions in the topic.
+        """
+    @property
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
+    @property
+    def replication_factor(self) -> builtins.int:
+        r"""
+        Replication factor for the topic.
+        """

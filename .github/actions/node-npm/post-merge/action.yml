@@ -38,6 +38,10 @@ runs:
         cache: "npm"
         cache-dependency-path: foreign/node/package-lock.json
 
+    - name: Pin npm to 11 to match Dependabot lockfile format
+      run: npm install -g npm@11
+      shell: bash
+
     - name: Install dependencies
       run: |
         cd foreign/node
