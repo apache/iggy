@@ -35,7 +35,6 @@ mod cli;
 #[cfg(not(feature = "vsr"))]
 mod cluster;
 mod config_provider;
-#[cfg(not(feature = "vsr"))]
 mod connectors;
 // TODO(vsr): enable the `data_integrity` suite under the `vsr` feature once
 // the full VSR path is done. Tier 1 (`verify_user_login_after_restart`,
