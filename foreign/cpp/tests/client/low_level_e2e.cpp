@@ -217,6 +217,183 @@ TEST_F(LowLevelE2E_Client, DisconnectAfterFailedLogin) {
     ASSERT_THROW(client->get_me(), std::exception);
 }
 
+TEST_F(LowLevelE2E_Client, ConnectLoginThenShutdown) {
+    RecordProperty("description",
+                   "Connects, logs in, shuts down successfully, and rejects further operations afterward.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->ping());
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->get_me(), std::exception);
+    ASSERT_THROW(client->get_stats(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ShutdownWithoutConnect) {
+    RecordProperty("description", "Allows shutdown to be called on a client that was never explicitly connected.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->shutdown());
+}
+
+TEST_F(LowLevelE2E_Client, ShutdownWithoutLogin) {
+    RecordProperty("description", "Allows shutdown after connect even when no user has authenticated.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->get_stats(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ShutdownAfterFailedLogin) {
+    RecordProperty("description", "Allows shutdown after a failed login attempt leaves the client unauthenticated.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, RepeatedShutdownCallsHaveStableBehavior) {
+    RecordProperty("description", "Keeps repeated shutdown calls stable across duplicate invocations.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->get_me(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ShutdownThenConnectThrows) {
+    RecordProperty("description", "Rejects reconnecting a client after shutdown transitions it to a terminal state.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->connect(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ShutdownThenLoginThrows) {
+    RecordProperty("description",
+                   "Rejects logging in again after shutdown, even when login would normally auto-connect.");
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    ASSERT_NO_THROW(client->shutdown());
+    ASSERT_THROW(client->login_user("iggy", "iggy"), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
+    RecordProperty("description",
+                   "Removes a shut down authenticated session from subsequent get_clients and get_client results.");
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
+
+    iggy::ffi::ClientInfoDetails first_me{};
+    rust::Vec<iggy::ffi::ClientInfo> clients_after_shutdown;
+    ASSERT_NO_THROW({ first_me = first_client->get_me(); });
+
+    ASSERT_NO_THROW(first_client->shutdown());
+    ASSERT_NO_THROW({ clients_after_shutdown = second_client->get_clients(); });
+
+    bool found_first = false;
+    for (const auto &client : clients_after_shutdown) {
+        if (client.client_id == first_me.client_id) {
+            found_first = true;
+            break;
+        }
+    }
+
+    EXPECT_FALSE(found_first);
+    ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
+    RecordProperty("description",
+                   "Removes a disconnected authenticated session from subsequent get_clients and get_client results.");
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
+
+    iggy::ffi::ClientInfoDetails first_me{};
+    rust::Vec<iggy::ffi::ClientInfo> clients_after_disconnect;
+    ASSERT_NO_THROW({ first_me = first_client->get_me(); });
+
+    ASSERT_NO_THROW(first_client->disconnect());
+    ASSERT_NO_THROW({ clients_after_disconnect = second_client->get_clients(); });
+
+    bool found_first = false;
+    for (const auto &client : clients_after_disconnect) {
+        if (client.client_id == first_me.client_id) {
+            found_first = true;
+            break;
+        }
+    }
+
+    EXPECT_FALSE(found_first);
+    ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) {
+    RecordProperty("description",
+                   "Keeps a logged out session visible in get_clients and get_client, but marks it unauthenticated.");
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
+
+    iggy::ffi::ClientInfoDetails first_me{};
+    iggy::ffi::ClientInfoDetails logged_out_client{};
+    rust::Vec<iggy::ffi::ClientInfo> clients_after_logout;
+    ASSERT_NO_THROW({ first_me = first_client->get_me(); });
+
+    ASSERT_NO_THROW(first_client->logout_user());
+    ASSERT_NO_THROW({
+        clients_after_logout = second_client->get_clients();
+        logged_out_client    = second_client->get_client(first_me.client_id);
+    });
+
+    bool found_first = false;
+    for (const auto &client : clients_after_logout) {
+        if (client.client_id != first_me.client_id) {
+            continue;
+        }
+
+        found_first = true;
+        EXPECT_FALSE(client.has_user_id);
+        EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(first_me.address));
+        EXPECT_EQ(static_cast<std::string>(client.transport), static_cast<std::string>(first_me.transport));
+        break;
+    }
+
+    EXPECT_TRUE(found_first);
+    EXPECT_EQ(logged_out_client.client_id, first_me.client_id);
+    EXPECT_FALSE(logged_out_client.has_user_id);
+    EXPECT_EQ(static_cast<std::string>(logged_out_client.address), static_cast<std::string>(first_me.address));
+    EXPECT_EQ(static_cast<std::string>(logged_out_client.transport), static_cast<std::string>(first_me.transport));
+}
+
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
     RecordProperty("description", "Supports login without an explicit prior connect call.");
     iggy::ffi::Client *client = nullptr;
