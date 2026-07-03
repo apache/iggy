@@ -136,9 +136,9 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the sa
 # 1. Generate fixtures
 cargo run -p kafka-message-gen -- generate \
   --output gateways/kafka/tools/kafka-tool/kafka_messages \
-  --api-key 0 
+  --api-key 0
  ## use one api-key in each command. Bulk API kys needs to be implemented
- allowed values are 
+ allowed values are
   --api-key 1 --api-key 2 --api-key 19
 
 # 2. Run regression suite
