@@ -58,7 +58,7 @@ pub fn build_metadata_flexible_request(topic_names: &[&str]) -> Bytes {
     enc.freeze()
 }
 
-/// Minimal ListOffsets request for supported versions (v1–v6).
+/// Minimal `ListOffsets` request for supported versions (v1–v6).
 pub fn build_list_offsets_request(version: i16, topic: &str, partition: i32) -> Bytes {
     let flexible = version >= 6;
     let mut enc = Encoder::with_capacity(128);
@@ -93,7 +93,7 @@ pub fn build_list_offsets_request(version: i16, topic: &str, partition: i32) -> 
     enc.freeze()
 }
 
-/// CreateTopics v2+ with zero topics (valid empty create).
+/// `CreateTopics` v2+ with zero topics (valid empty create).
 pub fn build_create_topics_empty_request(version: i16) -> Bytes {
     let flexible = version >= 5;
     let mut enc = Encoder::with_capacity(32);

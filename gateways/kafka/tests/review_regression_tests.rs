@@ -97,7 +97,7 @@ async fn e2e_produce_v3_acks_one_still_returns_response() {
 
 // ── ListOffsets v0 wire shape (review: old_style_offsets array, not bare i64) ─
 
-/// Parse one ListOffsets v0 partition entry the way a v0 Kafka client would.
+/// Parse one `ListOffsets` v0 partition entry the way a v0 Kafka client would.
 fn parse_list_offsets_v0_partition(d: &mut Decoder) {
     let _partition_index = d.read_i32().expect("partition_index");
     let _error_code = d.read_i16().expect("error_code");
@@ -153,7 +153,7 @@ fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
     assert_eq!(d.remaining(), 0);
 }
 
-/// ListOffsets v0 request below firewall min (mirrors atharvalade repro script body).
+/// `ListOffsets` v0 request below firewall min (mirrors atharvalade repro script body).
 fn build_list_offsets_v0_request_with_topic_t() -> Bytes {
     let mut body = BytesMut::new();
     body.put_i32(-1); // replica_id

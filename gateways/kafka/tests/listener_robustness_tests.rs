@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 
 use iggy_gateway_kafka::ServerConfig;
-use iggy_gateway_kafka::protocol::api::API_KEY_API_VERSIONS;
+use iggy_gateway_kafka::protocol::api::{API_KEY_API_VERSIONS, API_KEY_METADATA, API_KEY_PRODUCE};
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
 use server::{spawn_test_server, spawn_test_server_with_config};
@@ -139,7 +139,7 @@ async fn e2e_truncated_frame_body_closes_connection() {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let full = build_request_frame(API_KEY_API_VERSIONS, 1, 66, Some("trunc-test"), &[]);
-    let payload_len = i32::from_be_bytes([full[0], full[1], full[2], full[3]]) as usize;
+    let payload_len = u32::from_be_bytes([full[0], full[1], full[2], full[3]]) as usize;
     assert!(full.len() >= 4 + payload_len);
 
     stream
@@ -327,8 +327,6 @@ async fn e2e_mixed_api_key_pipeline_returns_responses_in_order() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    use iggy_gateway_kafka::protocol::api::{API_KEY_METADATA, API_KEY_PRODUCE};
-
     let frames = [
         build_request_frame(API_KEY_API_VERSIONS, 1, 501, Some("mix-test"), &[]),
         build_request_frame(
@@ -392,7 +390,6 @@ async fn e2e_connection_idle_after_response_accepts_next_request() {
 #[tokio::test]
 async fn e2e_flexible_metadata_v9_empty_topics_round_trip() {
     let (addr, _shutdown) = spawn_test_server().await;
-    use iggy_gateway_kafka::protocol::api::API_KEY_METADATA;
 
     let body = wire::build_metadata_flexible_request(&[]);
     let (corr, resp) = tcp::round_trip(addr, API_KEY_METADATA, 9, 701, &body).await;

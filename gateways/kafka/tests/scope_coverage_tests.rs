@@ -52,7 +52,8 @@ use tcp::{
 };
 use wire::{
     OUT_OF_SCOPE_API_KEYS, build_create_topics_empty_request, build_fetch_empty_topics_request,
-    build_list_offsets_request, build_metadata_flexible_request, build_produce_flexible_empty_request,
+    build_list_offsets_request, build_metadata_flexible_request,
+    build_produce_flexible_empty_request,
 };
 
 fn metadata_empty_legacy_body() -> Bytes {
@@ -63,7 +64,6 @@ fn metadata_empty_legacy_body() -> Bytes {
 
 fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes {
     match api_key {
-        API_KEY_API_VERSIONS => Bytes::new(),
         API_KEY_METADATA => metadata_empty_legacy_body(),
         API_KEY_PRODUCE => {
             if fixture_exists(api_key, name, version) {
@@ -464,8 +464,7 @@ async fn produce_v3_through_v9_e2e_preserve_correlation_id() {
             build_produce_v3_body(1, 0)
         };
         let correlation_id = 510 + i32::from(version);
-        let (corr, resp) =
-            round_trip(addr, API_KEY_PRODUCE, version, correlation_id, &body).await;
+        let (corr, resp) = round_trip(addr, API_KEY_PRODUCE, version, correlation_id, &body).await;
         assert_eq!(corr, correlation_id, "Produce v{version} correlation");
         assert!(!resp.is_empty(), "Produce v{version} response");
     }
@@ -576,8 +575,14 @@ async fn metadata_empty_body_e2e_all_topics_request_returns_broker() {
 #[tokio::test]
 async fn list_offsets_v7_unsupported_e2e_returns_error() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let (corr, body) =
-        round_trip(addr, API_KEY_LIST_OFFSETS, 7, 370, &[0x00, 0x00, 0x00, 0x00]).await;
+    let (corr, body) = round_trip(
+        addr,
+        API_KEY_LIST_OFFSETS,
+        7,
+        370,
+        &[0x00, 0x00, 0x00, 0x00],
+    )
+    .await;
     assert_eq!(corr, 370);
     assert!(
         scan_for_error_code(&body, ERROR_UNSUPPORTED_VERSION),
@@ -611,7 +616,10 @@ async fn corrupt_produce_body_e2e_returns_error_without_disconnect() {
     stream.write_all(&bad).await.expect("corrupt produce");
     let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert!(
-        scan_for_error_code(&parse_response_payload(API_KEY_PRODUCE, 3, payload).1, ERROR_INVALID_REQUEST),
+        scan_for_error_code(
+            &parse_response_payload(API_KEY_PRODUCE, 3, payload).1,
+            ERROR_INVALID_REQUEST
+        ),
         "corrupt Produce must surface INVALID_REQUEST"
     );
 
@@ -639,7 +647,10 @@ async fn corrupt_fetch_body_e2e_returns_error_without_disconnect() {
     stream.write_all(&bad).await.expect("corrupt fetch");
     let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert!(
-        scan_for_error_code(&parse_response_payload(API_KEY_FETCH, 4, payload).1, ERROR_INVALID_REQUEST),
+        scan_for_error_code(
+            &parse_response_payload(API_KEY_FETCH, 4, payload).1,
+            ERROR_INVALID_REQUEST
+        ),
         "corrupt Fetch must surface INVALID_REQUEST"
     );
 

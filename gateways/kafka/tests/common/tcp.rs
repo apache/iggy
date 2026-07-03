@@ -90,7 +90,7 @@ pub async fn read_response_frame(stream: &mut TcpStream, max_size: usize) -> Byt
     Bytes::from(buf)
 }
 
-/// Minimal Produce v3 body: nullable transactional_id, acks, timeout, empty topics array.
+/// Minimal Produce v3 body: nullable `transactional_id`, acks, timeout, empty topics array.
 pub fn build_produce_v3_body(acks: i16, topics_count: i32) -> Bytes {
     let mut body = BytesMut::new();
     body.put_i16(-1); // null transactional_id
@@ -119,10 +119,9 @@ pub async fn read_response_frame_with_timeout(
     max_size: usize,
     timeout: Duration,
 ) -> Option<Bytes> {
-    match time::timeout(timeout, read_response_frame(stream, max_size)).await {
-        Ok(frame) => Some(frame),
-        Err(_) => None,
-    }
+    time::timeout(timeout, read_response_frame(stream, max_size))
+        .await
+        .ok()
 }
 
 /// Concatenate multiple length-prefixed frames (for pipelining tests).
