@@ -57,9 +57,10 @@ pub(crate) fn serialize_row(
     for col in columns {
         let field_value = obj.get(col.name.as_str());
 
-        // RowBinaryWithDefaults prefix byte
-        let is_null_or_absent = field_value.map(|v| v.is_null()).unwrap_or(true);
-        if is_null_or_absent && col.has_default {
+        // RowBinaryWithDefaults prefix byte. Only an absent field defers to the
+        // server DEFAULT; an explicit JSON null must fall through to the
+        // Nullable path so it is stored as NULL rather than the default value.
+        if field_value.is_none() && col.has_default {
             buf.push(0x01); // use DEFAULT
             continue;
         }
@@ -895,9 +896,7 @@ mod tests {
     fn serialize_int64_rejects_u64_above_i64_max() {
         let mut buf = vec![];
         assert!(serialize_value(&json_u64(u64::MAX), &ChType::Int64, &mut buf).is_err());
-        assert!(
-            serialize_value(&json_u64(i64::MAX as u64 + 1), &ChType::Int64, &mut buf).is_err()
-        );
+        assert!(serialize_value(&json_u64(i64::MAX as u64 + 1), &ChType::Int64, &mut buf).is_err());
     }
 
     #[test]
@@ -1186,6 +1185,19 @@ mod tests {
         let mut buf = vec![];
         serialize_row(&value, &columns, &mut buf).unwrap();
         assert_eq!(buf, [0x00, 0x01]);
+    }
+
+    #[test]
+    fn serialize_row_nullable_with_default_explicit_null_writes_null_marker() {
+        // Field explicitly null + Nullable column + has_default=true.
+        // Explicit null must be stored as NULL, not the server DEFAULT.
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("x".into(), json_null());
+        let value = OwnedValue::Object(Box::new(obj));
+        let columns = vec![col("x", ChType::Nullable(Box::new(ChType::Int32)), true)];
+        let mut buf = vec![];
+        serialize_row(&value, &columns, &mut buf).unwrap();
+        assert_eq!(buf, [0x00, 0x01]); // value follows + null marker, not 0x01 DEFAULT
     }
 
     #[test]
