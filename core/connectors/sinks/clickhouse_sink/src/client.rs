@@ -138,29 +138,7 @@ impl ClickHouseClient {
         );
 
         let body = self.run_query(&query).await?;
-        let mut columns = Vec::new();
-
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let row: SchemaRow = serde_json::from_str(line).map_err(|e| {
-                error!("Failed to parse schema row '{line}': {e}");
-                Error::InitError(format!("Schema parse error: {e}"))
-            })?;
-
-            let ch_type = parse_type(&row.r#type)?;
-            let has_default = matches!(
-                row.default_kind.as_deref(),
-                Some("DEFAULT") | Some("MATERIALIZED") | Some("ALIAS")
-            );
-            columns.push(Column {
-                name: row.name,
-                ch_type,
-                has_default,
-            });
-        }
+        let columns = parse_schema_body(&body)?;
 
         if columns.is_empty() {
             error!(
@@ -309,6 +287,41 @@ struct SchemaRow {
     default_kind: Option<String>,
 }
 
+/// Parse a `system.columns` JSONEachRow response into insertable columns.
+///
+/// MATERIALIZED / ALIAS / EPHEMERAL columns are not part of the
+/// RowBinaryWithDefaults insert set: ClickHouse expects zero bytes for them,
+/// not even the DEFAULT flag. Emitting a prefix byte would shift the whole row
+/// stream by one, so they are dropped entirely. `has_default` is set only for
+/// ordinary DEFAULT columns.
+fn parse_schema_body(body: &str) -> Result<Vec<Column>, Error> {
+    let mut columns = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row: SchemaRow = serde_json::from_str(line).map_err(|e| {
+            error!("Failed to parse schema row '{line}': {e}");
+            Error::InitError(format!("Schema parse error: {e}"))
+        })?;
+
+        let default_kind = row.default_kind.as_deref().unwrap_or("");
+        match default_kind {
+            "MATERIALIZED" | "ALIAS" | "EPHEMERAL" => continue,
+            _ => {}
+        }
+
+        let ch_type = parse_type(&row.r#type)?;
+        columns.push(Column {
+            name: row.name,
+            ch_type,
+            has_default: default_kind == "DEFAULT",
+        });
+    }
+    Ok(columns)
+}
+
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -440,6 +453,40 @@ mod tests {
             "URL was: {}",
             client.insert_url
         );
+    }
+
+    #[test]
+    fn given_materialized_alias_ephemeral_columns_parse_schema_body_should_drop_them() {
+        // (id UInt64, m UInt64 MATERIALIZED id*2, a UInt64 ALIAS id, e UInt64 EPHEMERAL, name String)
+        // Only id and name are insertable, so the connector must emit 2 slots per row.
+        let body = concat!(
+            r#"{"name":"id","type":"UInt64","default_kind":""}"#,
+            "\n",
+            r#"{"name":"m","type":"UInt64","default_kind":"MATERIALIZED"}"#,
+            "\n",
+            r#"{"name":"a","type":"UInt64","default_kind":"ALIAS"}"#,
+            "\n",
+            r#"{"name":"e","type":"UInt64","default_kind":"EPHEMERAL"}"#,
+            "\n",
+            r#"{"name":"name","type":"String","default_kind":""}"#,
+        );
+        let columns = parse_schema_body(body).unwrap();
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name"]);
+        assert!(columns.iter().all(|c| !c.has_default));
+    }
+
+    #[test]
+    fn given_default_column_parse_schema_body_should_flag_has_default() {
+        let body = concat!(
+            r#"{"name":"id","type":"UInt64","default_kind":""}"#,
+            "\n",
+            r#"{"name":"created","type":"DateTime","default_kind":"DEFAULT"}"#,
+        );
+        let columns = parse_schema_body(body).unwrap();
+        assert_eq!(columns.len(), 2);
+        assert!(!columns[0].has_default);
+        assert!(columns[1].has_default);
     }
 
     #[test]

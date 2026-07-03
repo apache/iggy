@@ -81,8 +81,10 @@ use tracing::error;
 pub struct Column {
     pub name: String,
     pub ch_type: ChType,
-    /// True when the column has a DEFAULT or MATERIALIZED expression, meaning
-    /// RowBinaryWithDefaults can skip it with a 0x01 prefix byte.
+    /// True only for columns with an ordinary DEFAULT expression, meaning
+    /// RowBinaryWithDefaults can skip them with a 0x01 prefix byte.
+    /// MATERIALIZED / ALIAS / EPHEMERAL columns are not insertable and are
+    /// excluded from the schema entirely rather than flagged here.
     pub has_default: bool,
 }
 
