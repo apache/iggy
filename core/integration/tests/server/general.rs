@@ -17,12 +17,12 @@
 
 use crate::server::scenarios::{
     authentication_scenario, consumer_timestamp_polling_scenario, create_message_payload,
-    message_headers_scenario,
+    invalid_consumer_offset_scenario, message_headers_scenario, stream_size_validation_scenario,
+    system_scenario,
 };
 #[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{
-    bench_scenario, invalid_consumer_offset_scenario, permissions_scenario, snapshot_scenario,
-    stream_size_validation_scenario, system_scenario, user_scenario,
+    bench_scenario, permissions_scenario, snapshot_scenario, user_scenario,
 };
 use integration::iggy_harness;
 
@@ -40,11 +40,6 @@ async fn authentication(harness: &TestHarness) {
     authentication_scenario::run(harness).await;
 }
 
-// Blocked under vsr: asserts on responses server-ng still stubs --
-// `MaxTopicSize::ServerDefault` is echoed instead of resolved against
-// server config, and stats/cluster-metadata fields are hardcoded zeros.
-// Re-enable as the response wiring lands.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -126,9 +121,6 @@ async fn create_message_payload_scenario(harness: &TestHarness) {
     create_message_payload::run(harness).await;
 }
 
-// Blocked under vsr: stream/topic size accounting is not surfaced into
-// the get_stream/get_topic responses yet (sizes report 0).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
@@ -188,12 +180,10 @@ async fn snapshot(harness: &TestHarness) {
     snapshot_scenario::run(harness).await;
 }
 
-// Blocked under vsr (unsolved): expects typed errors (`InvalidOffset`)
-// for invalid offset stores, but the partition plane neither validates
-// stored offsets nor has a wire vehicle for per-request errors (the vsr
-// Reply carries no status; Eviction is session-terminal). Needs an
-// error-reply design on the partition plane.
-#[cfg(not(feature = "vsr"))]
+// Under vsr the partition plane validates the stored offset at admission and
+// replies with a terminal, result-framed `InvalidOffset` (see
+// `store_consumer_offset` handling in `iggy_partition::on_request`). HTTP is
+// auto-dropped by the harness macro, so this runs over [Tcp, Quic, WebSocket].
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(

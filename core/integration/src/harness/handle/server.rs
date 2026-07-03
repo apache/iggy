@@ -793,11 +793,28 @@ impl TestBinary for ServerHandle {
                 path: cert_dir.clone(),
                 source: e,
             })?;
-            generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
-                TestBinaryError::InvalidState {
-                    message: format!("Failed to generate TLS certificates: {e}"),
-                }
-            })?;
+            // One keypair per test dir (vsr only): the vsr harness spawns a
+            // multi-node cluster and every node's `start()` runs this block
+            // against the SHARED `certs/` dir. Regenerating would overwrite the
+            // PEM with a fresh keypair -- nodes started earlier then present a
+            // certificate signed by a different key than the one the client
+            // trusts (rcgen self-signed certs share the same subject DN), which
+            // rustls rejects as `BadSignature`. Generate only when absent so all
+            // nodes and clients share one keypair; this also keeps the
+            // certificate stable across a restart. The legacy single-node
+            // harness keeps its regenerate-per-start behavior.
+            #[cfg(feature = "vsr")]
+            let should_generate = !(cert_dir.join("test_cert.pem").exists()
+                && cert_dir.join("test_key.pem").exists());
+            #[cfg(not(feature = "vsr"))]
+            let should_generate = true;
+            if should_generate {
+                generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
+                    TestBinaryError::InvalidState {
+                        message: format!("Failed to generate TLS certificates: {e}"),
+                    }
+                })?;
+            }
             self.generated_cert_dir = Some(cert_dir);
         }
 

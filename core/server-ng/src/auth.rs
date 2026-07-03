@@ -26,12 +26,12 @@ use crate::dispatch::submit_register_on_owner;
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::{ClientVersionInfo, RequestHeader};
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use iggy_common::{IggyTimestamp, PersonalAccessToken, UserStatus};
+use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::crypto;
@@ -210,6 +210,42 @@ pub(crate) async fn surface_login_failure(
 ) {
     if error.is_terminal() {
         send_login_failure_reply(shard, transport_client_id, request_header).await;
+    } else {
+        // Transient consensus failure (not-caught-up / not-primary / pipeline
+        // full): send the explicit `TransientNotCommitted` frame instead of
+        // staying silent, so the SDK replays the login immediately rather than
+        // waiting out its read-timeout. Same contract as a transient metadata
+        // request -- nothing committed, so the replayed Register is idempotent.
+        send_login_transient_reply(shard, transport_client_id, request_header).await;
+    }
+}
+
+/// Result-framed `TransientNotCommitted` Reply on a transient (non-terminal)
+/// failed Register. The SDK decodes the nonzero result code and replays the
+/// same login on the same connection. Only call for transient errors -- see
+/// [`surface_login_failure`].
+#[allow(clippy::future_not_send)]
+async fn send_login_transient_reply(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = build_result_rejection_reply(
+        request_header,
+        commit,
+        IggyError::TransientNotCommitted.as_code(),
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send login transient reply"
+        );
     }
 }
 

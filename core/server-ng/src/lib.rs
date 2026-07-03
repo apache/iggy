@@ -29,6 +29,7 @@ pub mod pat;
 pub(crate) mod personal_access_token_cleaner;
 pub mod responses;
 pub(crate) mod segment_cleaner;
+pub(crate) mod segment_recovery;
 pub mod server_error;
 pub mod session_manager;
 pub mod users;

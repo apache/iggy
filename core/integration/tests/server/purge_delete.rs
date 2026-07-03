@@ -44,10 +44,12 @@ async fn should_delete_segments_and_validate_filesystem(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
-// server-ng restarts the cluster on restart_on, which currently fails in
-// bootstrap independently of segment deletion: an `Index data must be exactly
-// 16 bytes` recovery panic (cache_indexes all/none) and a replica-port rebind
-// race. Run only the no-restart matrix under vsr until those are fixed.
+// Recovery on restart is fixed -- server-ng reads its own 24-byte segment index
+// via `segment_recovery` (no more "Index data must be exactly 16 bytes" panic;
+// the server restarts + re-meshes cleanly). restart_on stays vsr-gated on a
+// CLIENT blocker: the SDK `ConsensusSession` cannot reconnect after restart --
+// `register_request_id already called` (core/sdk/src/session.rs:121), the same
+// reconnect/re-register lifecycle `user_scenario` hits. Re-enable once that lands.
 #[cfg_attr(not(feature = "vsr"), test_matrix([restart_off(), restart_on()]))]
 #[cfg_attr(feature = "vsr", test_matrix([restart_off()]))]
 async fn should_delete_segments_without_consumers(harness: &mut TestHarness, restart_server: bool) {
@@ -97,11 +99,11 @@ async fn should_block_deletion_until_all_consumers_pass_segment(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
-// restart_on is vsr-gated: cluster restart hits a pre-existing server-ng
-// bootstrap failure (legacy 16-byte index reader vs server-ng 24-byte writer),
-// unrelated to purge. The scenario asserts the exact [0, 7, 14, 21] layout only
-// on the legacy path; under vsr it verifies the framing-agnostic purge outcome
-// (offsets cleared, files deleted, partition reset to a single segment at 0).
+// The scenario asserts the exact [0, 7, 14, 21] layout only on the legacy path;
+// under vsr it verifies the framing-agnostic purge outcome (offsets cleared,
+// files deleted, partition reset to a single segment at offset 0). restart_on
+// stays vsr-gated on the SDK reconnect-after-restart lifecycle (see
+// `should_delete_segments_without_consumers`).
 #[cfg_attr(not(feature = "vsr"), test_matrix([restart_off(), restart_on()]))]
 #[cfg_attr(feature = "vsr", test_matrix([restart_off()]))]
 async fn should_purge_topic_and_clear_consumer_offsets(
@@ -115,6 +117,8 @@ fn restart_off() -> bool {
     false
 }
 
+// Only the `not(vsr)` matrix cell uses restart_on (restart is vsr-gated on the
+// SDK reconnect lifecycle above), so it is unused under the vsr feature.
 #[cfg(not(feature = "vsr"))]
 fn restart_on() -> bool {
     true

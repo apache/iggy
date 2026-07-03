@@ -23,6 +23,38 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, assert_clean_system};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+// The partition plane applies committed ops asynchronously on the owning
+// shard, so partition-level stats (segments/offset/messages/size) can lag a
+// commit by one apply pass. Fetch until `matches` holds (or the deadline
+// expires), then run the terminal assertions on the returned details.
+const TOPIC_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
+const TOPIC_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+async fn get_topic_when(
+    client: &IggyClient,
+    stream_name: &str,
+    topic_name: &str,
+    matches: impl Fn(&TopicDetails) -> bool,
+) -> TopicDetails {
+    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
+    loop {
+        let topic = client
+            .get_topic(
+                &Identifier::named(stream_name).unwrap(),
+                &Identifier::named(topic_name).unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("Failed to get topic");
+        if matches(&topic) || Instant::now() >= deadline {
+            return topic;
+        }
+        sleep(TOPIC_RETRY_INTERVAL).await;
+    }
+}
 
 pub async fn run(harness: &TestHarness) {
     let client = harness
@@ -120,15 +152,15 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
     assert_eq!(topic.replication_factor, 1);
 
-    // 11. Get topic details by ID
-    let topic = client
-        .get_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("Failed to get topic");
+    // 11. Get topic details by ID; the owning shards materialize the fresh
+    // partitions (first segment included) asynchronously after the commit.
+    let topic = get_topic_when(&client, STREAM_NAME, TOPIC_NAME, |topic| {
+        topic
+            .partitions
+            .iter()
+            .all(|partition| partition.segments_count == 1)
+    })
+    .await;
     assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
@@ -244,20 +276,22 @@ pub async fn run(harness: &TestHarness) {
         }
     }
 
-    // 20. Get topic details and validate the partition details
-    let topic = client
-        .get_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("Failed to get topic");
+    // 20. Get topic details and validate the partition details, once the
+    // owning shard's commit-apply folds the send into the shared stats.
+    let topic = get_topic_when(&client, STREAM_NAME, TOPIC_NAME, |topic| {
+        topic.messages_count == u64::from(MESSAGES_COUNT)
+    })
+    .await;
     assert_eq!(topic.id, topic_id);
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
+    // The exact byte size is framing-specific: legacy counts a 64-byte header
+    // per message; server-ng counts its on-disk batch framing.
+    #[cfg(not(feature = "vsr"))]
     assert_eq!(topic.size, 100502);
+    #[cfg(feature = "vsr")]
+    assert!(topic.size > 0);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
     let topic_partition = topic.partitions.get((PARTITION_ID) as usize).unwrap();
     assert_eq!(topic_partition.id, PARTITION_ID);
@@ -607,18 +641,29 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    let polled_messages = client
-        .poll_messages(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-            Some(PARTITION_ID),
-            &consumer,
-            &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
-        )
-        .await
-        .unwrap();
+    // The purge is applied by the owning shard's reconciler after the commit;
+    // poll until the wiped partition is observable.
+    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
+    let polled_messages = loop {
+        let polled_messages = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(&updated_topic_name).unwrap(),
+                Some(PARTITION_ID),
+                &consumer,
+                &PollingStrategy::offset(0),
+                MESSAGES_COUNT,
+                false,
+            )
+            .await
+            .unwrap();
+        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
+            || Instant::now() >= deadline
+        {
+            break polled_messages;
+        }
+        sleep(TOPIC_RETRY_INTERVAL).await;
+    };
     assert_eq!(polled_messages.current_offset, 0);
     assert!(polled_messages.messages.is_empty());
 
@@ -658,18 +703,29 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    let polled_messages = client
-        .poll_messages(
-            &Identifier::named(&updated_stream_name).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-            Some(PARTITION_ID),
-            &consumer,
-            &PollingStrategy::offset(0),
-            MESSAGES_COUNT,
-            false,
-        )
-        .await
-        .unwrap();
+    // As with the topic purge above, the stream purge is applied by the
+    // owning shard's reconciler after the commit; poll until observable.
+    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
+    let polled_messages = loop {
+        let polled_messages = client
+            .poll_messages(
+                &Identifier::named(&updated_stream_name).unwrap(),
+                &Identifier::named(&updated_topic_name).unwrap(),
+                Some(PARTITION_ID),
+                &consumer,
+                &PollingStrategy::offset(0),
+                MESSAGES_COUNT,
+                false,
+            )
+            .await
+            .unwrap();
+        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
+            || Instant::now() >= deadline
+        {
+            break polled_messages;
+        }
+        sleep(TOPIC_RETRY_INTERVAL).await;
+    };
     assert_eq!(polled_messages.current_offset, 0);
     assert!(polled_messages.messages.is_empty());
 
@@ -725,15 +781,15 @@ pub async fn run(harness: &TestHarness) {
 
     assert_eq!(topic.name, topic_name);
 
-    // 45. Delete segments and validate partition segments count before and after
-    let topic_before_delete = client
-        .get_topic(
-            &Identifier::named(&stream_name).unwrap(),
-            &Identifier::named(&topic_name).unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("Failed to get topic");
+    // 45. Delete segments and validate partition segments count before and
+    // after; the recreated topic's partitions materialize asynchronously.
+    let topic_before_delete = get_topic_when(&client, &stream_name, &topic_name, |topic| {
+        topic
+            .partitions
+            .get(PARTITION_ID as usize)
+            .is_some_and(|partition| partition.segments_count > 0)
+    })
+    .await;
     let segments_count_before_delete =
         topic_before_delete.partitions[PARTITION_ID as usize].segments_count;
     assert!(

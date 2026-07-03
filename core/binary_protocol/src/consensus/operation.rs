@@ -155,6 +155,29 @@ impl Operation {
         )
     }
 
+    /// Whether a committed/rejected reply for this operation carries the
+    /// result section (`[count: u32]` then `count` x `{index, result}`) ahead
+    /// of the payload. This is the single source of truth the encode sites
+    /// (`ApplyReply::write_reply_body`, the partition plane's
+    /// `committed_reply_body`, `build_result_rejection_reply` callers) and the
+    /// SDK decode carve-out (`split_metadata_result`) must agree on; a drifted
+    /// site decodes a rejection as `Ok` or misreads a payload as the count.
+    /// Metadata ops are all result-framed; on the partition plane only the
+    /// consumer-offset ops are (they reject with typed errors at admission).
+    /// `Register` is result-framed only when non-empty -- that nuance stays in
+    /// the SDK, the one place that sees Register replies.
+    #[must_use]
+    pub const fn is_result_framed(&self) -> bool {
+        self.is_metadata()
+            || matches!(
+                self,
+                Self::StoreConsumerOffset
+                    | Self::StoreConsumerOffset2
+                    | Self::DeleteConsumerOffset
+                    | Self::DeleteConsumerOffset2
+            )
+    }
+
     /// Data-plane operations routed to the shard owning the partition.
     #[must_use]
     #[inline]
