@@ -1237,6 +1237,67 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
     EXPECT_TRUE(found_after);
 }
 
+TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginThrows) {
+    RecordProperty(
+        "description",
+        "Rejects get_cluster_metadata before connect, after connect but before login, and after disconnect.");
+    iggy::ffi::Client *client = GetLoggedOutClient();
+
+    ASSERT_THROW(client->get_cluster_metadata(), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_cluster_metadata(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_cluster_metadata(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetClusterMetadataReturnsSingleNodeMetadata) {
+    RecordProperty("description",
+                   "Returns the expected single-node cluster metadata shape from the default test server.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::ClusterMetadata metadata{};
+    ASSERT_NO_THROW({ metadata = client->get_cluster_metadata(); });
+
+    EXPECT_EQ(static_cast<std::string>(metadata.name), "single-node");
+    ASSERT_EQ(metadata.nodes.size(), 1u);
+
+    const auto &node = metadata.nodes[0];
+    EXPECT_FALSE(static_cast<std::string>(node.name).empty());
+    EXPECT_FALSE(static_cast<std::string>(node.ip).empty());
+    EXPECT_EQ(static_cast<std::string>(node.role), "leader");
+    EXPECT_EQ(static_cast<std::string>(node.status), "healthy");
+    EXPECT_NE(node.endpoints.tcp, 0u);
+    EXPECT_NE(node.endpoints.http, 0u);
+}
+
+TEST_F(LowLevelE2E_Client, GetClusterMetadataIsStableAcrossBackToBackCalls) {
+    RecordProperty("description", "Returns stable single-node cluster metadata across back-to-back calls.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::ClusterMetadata first_metadata{};
+    iggy::ffi::ClusterMetadata second_metadata{};
+    ASSERT_NO_THROW({
+        first_metadata  = client->get_cluster_metadata();
+        second_metadata = client->get_cluster_metadata();
+    });
+
+    EXPECT_EQ(static_cast<std::string>(first_metadata.name), static_cast<std::string>(second_metadata.name));
+    ASSERT_EQ(first_metadata.nodes.size(), 1u);
+    ASSERT_EQ(second_metadata.nodes.size(), 1u);
+
+    const auto &first_node  = first_metadata.nodes[0];
+    const auto &second_node = second_metadata.nodes[0];
+    EXPECT_EQ(static_cast<std::string>(first_node.name), static_cast<std::string>(second_node.name));
+    EXPECT_EQ(static_cast<std::string>(first_node.ip), static_cast<std::string>(second_node.ip));
+    EXPECT_EQ(static_cast<std::string>(first_node.role), static_cast<std::string>(second_node.role));
+    EXPECT_EQ(static_cast<std::string>(first_node.status), static_cast<std::string>(second_node.status));
+    EXPECT_EQ(first_node.endpoints.tcp, second_node.endpoints.tcp);
+    EXPECT_EQ(first_node.endpoints.quic, second_node.endpoints.quic);
+    EXPECT_EQ(first_node.endpoints.http, second_node.endpoints.http);
+    EXPECT_EQ(first_node.endpoints.websocket, second_node.endpoints.websocket);
+}
+
 TEST_F(LowLevelE2E_Client, PingSucceedsForNewConnection) {
     RecordProperty("description", "Successfully pings the server from a fresh unauthenticated client session.");
     iggy::ffi::Client *client = GetLoggedOutClient();
