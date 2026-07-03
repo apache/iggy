@@ -15,9 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::TopicDetails as RustTopicDetails;
+use iggy::prelude::{Topic as RustTopic, TopicDetails as RustTopicDetails};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct Topic {
+    pub(crate) inner: RustTopic,
+}
+
+impl From<RustTopic> for Topic {
+    fn from(topic: RustTopic) -> Self {
+        Self { inner: topic }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Topic {
+    /// The unique identifier (numeric) of the topic.
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    /// The unique name of the topic.
+    #[getter]
+    pub fn name(&self) -> String {
+        self.inner.name.to_string()
+    }
+
+    /// The total number of messages in the topic.
+    #[getter]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
+    }
+
+    /// The total number of partitions in the topic.
+    #[getter]
+    pub fn partitions_count(&self) -> u32 {
+        self.inner.partitions_count
+    }
+}
 
 #[gen_stub_pyclass]
 #[pyclass]
@@ -36,23 +76,39 @@ impl From<RustTopicDetails> for TopicDetails {
 #[gen_stub_pymethods]
 #[pymethods]
 impl TopicDetails {
+    /// The unique identifier (numeric) of the topic.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
+    /// The unique name of the topic.
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
     }
 
+    /// The total number of messages in the topic.
     #[getter]
     pub fn messages_count(&self) -> u64 {
         self.inner.messages_count
     }
 
+    /// The total number of partitions in the topic.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
+    }
+
+    /// Compression algorithm for the topic.
+    #[getter]
+    pub fn compression_algorithm(&self) -> String {
+        self.inner.compression_algorithm.to_string()
+    }
+
+    /// Replication factor for the topic.
+    #[getter]
+    pub fn replication_factor(&self) -> u8 {
+        self.inner.replication_factor
     }
 }
