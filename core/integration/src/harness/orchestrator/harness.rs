@@ -171,8 +171,20 @@ impl TestHarness {
         {
             const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
             for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
+                let mut spawn_error = None;
                 for server in &mut self.servers {
-                    server.start()?;
+                    if let Err(error) = server.start() {
+                        spawn_error = Some(error);
+                        break;
+                    }
+                }
+                if let Some(error) = spawn_error {
+                    // Mirror the not-ready arm below: never bail with earlier
+                    // nodes of this attempt still running.
+                    for server in &mut self.servers {
+                        let _ = server.stop();
+                    }
+                    return Err(error);
                 }
                 match self.wait_for_cluster_ready().await {
                     Ok(()) => break,

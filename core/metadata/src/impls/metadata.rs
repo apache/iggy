@@ -26,8 +26,8 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    build_reply_message_with, build_transient_reply, drain_committable_prefix, emit_sim_event,
-    fence_old_prepare_by_commit, is_caught_up_primary,
+    build_reply_message_with, build_result_rejection_reply, drain_committable_prefix,
+    emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
     replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
     send_prepare_ok as send_prepare_ok_common,
@@ -604,14 +604,14 @@ where
         // Durable here but not yet committed, and the primary is retransmitting
         // it: our original PrepareOk was lost (e.g. the primary's inbox
         // overflowed under a client burst). Re-forward the tail down the chain
-        // so a downstream replica that missed it recovers, then re-ack every
-        // op in our uncommitted prepared suffix - not just this one. Acks are
-        // tracked per-op (see `ack_quorum_reached`), and the primary's commit
-        // frontier only advances over a contiguous quorum-acked prefix, so a
-        // lost ack for a lower op keeps that prefix pinned even after we re-ack
-        // the tail. Re-acking the whole suffix the backup holds restores
-        // quorum on the gap. Bounded by the pipeline depth; both downstream
-        // and primary are idempotent on a duplicate (replica, op).
+        // so a downstream replica that missed it recovers, then re-ack ONLY
+        // the retransmitted op. The primary's retransmit cycle walks every
+        // un-acked op in the window (`retransmit_targets`), so a lost ack for
+        // a lower op gets its own retransmit and its own re-ack; re-acking the
+        // whole suffix here is O(window^2) PrepareOks per cycle across the
+        // backups, which can overflow the primary's inbox -- the very failure
+        // this path recovers from. Both downstream and primary are idempotent
+        // on a duplicate (replica, op).
         #[allow(clippy::cast_possible_truncation)]
         if journal.handle().header(header.op as usize).is_some() {
             warn!(
@@ -622,16 +622,10 @@ where
                 op = header.op,
                 commit = consensus.commit_max(),
                 operation = ?header.operation,
-                "journal already holds prepare, re-forwarding + re-acking suffix"
+                "journal already holds prepare, re-forwarding + re-acking it"
             );
             self.replicate(&message).await;
-            for op in (consensus.commit_max() + 1)..=header.op {
-                if let Some(suffix_header) =
-                    journal.handle().header(op as usize).map(|header| *header)
-                {
-                    self.send_prepare_ok(&suffix_header).await;
-                }
-            }
+            self.send_prepare_ok(&header).await;
             return;
         }
 
@@ -1365,7 +1359,7 @@ where
         // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
         // sync, so the client resends on the same connection (session intact).
         if !is_caught_up_primary(consensus) {
-            return Ok(build_transient_reply(
+            return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotCommitted.as_code(),
@@ -1396,7 +1390,7 @@ where
             // In-flight prepare from this client: replaying the same request_id
             // is absorbed until the original commits, then served from cache.
             PreflightOutcome::NotReady => {
-                return Ok(build_transient_reply(
+                return Ok(build_result_rejection_reply(
                     &request_header,
                     consensus.commit_max(),
                     IggyError::TransientNotCommitted.as_code(),
@@ -1408,7 +1402,7 @@ where
 
         // Pipeline full: backpressure, not failure. Tell the client to replay.
         if consensus.pipeline().borrow().is_full() {
-            return Ok(build_transient_reply(
+            return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotCommitted.as_code(),
@@ -1431,7 +1425,7 @@ where
         // so reply with the transient frame rather than staying silent.
         match self.dispatch_prepare_and_await(consensus, prepare).await {
             Ok(reply) => Ok(reply.into_generic()),
-            Err(Canceled) => Ok(build_transient_reply(
+            Err(Canceled) => Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
                 IggyError::TransientNotCommitted.as_code(),
@@ -1552,12 +1546,38 @@ where
             return;
         }
 
+        // Interleave push + drain per header instead of push-all-then-drain-once:
+        // each `on_ack` below can promote a full window of buffered requests
+        // (`drain_request_queue_into_prepares`), and every promoted prepare
+        // self-acks through `send_or_loopback(self)` -> `push_loopback`. The
+        // consensus-tick arm of the shard pump never drains the loopback
+        // queue, so residuals would accumulate across ticks and trip the
+        // `push_loopback` capacity assert (`PIPELINE_PREPARE_QUEUE_MAX`).
+        // Draining to empty BEFORE each push bounds queue occupancy to one
+        // promotion window; the trailing drain applies the acks this pass
+        // produced (including promotion self-acks) instead of leaving them
+        // for a tick that never comes.
+        let mut loopback = Vec::new();
         for header in &headers {
+            while self.apply_self_ack_loopback(&mut loopback).await {}
             self.send_prepare_ok(header).await;
         }
-        let mut loopback = Vec::new();
-        consensus.drain_loopback_into(&mut loopback);
-        for message in loopback {
+        while self.apply_self_ack_loopback(&mut loopback).await {}
+    }
+
+    /// Drain the consensus loopback queue once and feed every self-`PrepareOk`
+    /// through [`Self::on_ack`], dropping anything else with a warning.
+    /// Returns whether any message was processed, so callers can loop until
+    /// the queue is empty (an `on_ack` can promote buffered requests whose
+    /// self-acks land back on the queue).
+    #[allow(clippy::future_not_send)]
+    async fn apply_self_ack_loopback(&self, loopback: &mut Vec<Message<GenericHeader>>) -> bool {
+        let consensus = self.consensus.as_ref().unwrap();
+        consensus.drain_loopback_into(loopback);
+        if loopback.is_empty() {
+            return false;
+        }
+        for message in loopback.drain(..) {
             match message.header().command {
                 Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
@@ -1572,6 +1592,7 @@ where
                 ),
             }
         }
+        true
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after

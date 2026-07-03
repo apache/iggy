@@ -33,24 +33,28 @@
 //! 2. read exactly one inbound frame from the `RecvStream`, note its
 //!    `request` id, and forward it to [`ActorContext::in_tx`];
 //! 3. wait on [`ActorContext::rx`] for the reply whose `request` id matches,
-//!    discarding any stale/duplicate reply left by an abandoned bidi; on
-//!    [`REPLY_WAIT_TIMEOUT`] abandon this bidi (the dispatch stayed silent on
-//!    a transient submit, expecting a replay) and accept the next; write the
-//!    matched reply, then `finish()` to deliver pending data + FIN;
+//!    discarding any stale/duplicate reply left by an earlier attempt's bidi
+//!    (the SDK replays an explicit transient with the SAME request id); write
+//!    the matched reply, then `finish()` to deliver pending data + FIN;
 //! 4. drop the bidi pair and loop to the next `accept_bi`.
 //!
-//! The `accept_bi` loop is still serial (the iggy SDK serialises per
-//! connection via an internal `RwLock`, so one bidi at a time is a semantic
-//! match), but the reply wait is now `request_id`-KEYED rather than "next
-//! frame on `rx`". This matters because the server stays deliberately silent
-//! on a transient submit (it expects the SDK to replay): an unkeyed,
-//! untimed wait would block this bidi - and, serial, the whole connection -
-//! forever, so the replay's fresh bidi could never be accepted (acute at
-//! `max_concurrent_bidi_streams=1`). Keying + the timeout let a transient
-//! bidi be abandoned safely: the SDK replays with the SAME request id, so a
-//! late reply for the abandoned request matches the replay's bidi and is
-//! consumed there, never misrouted to a later request. A future
-//! pipelining upgrade would additionally run per-bidi handlers concurrently.
+//! The `accept_bi` loop is serial (the iggy SDK serialises per connection via
+//! an internal `RwLock`, so one bidi at a time is a semantic match) and the
+//! reply wait is `request_id`-KEYED. The wait is NOT bounded by a short
+//! abandon-timeout: every transient submit is answered with an explicit
+//! `TransientNotCommitted` rejection frame these days, so an unanswered bidi
+//! means the dispatch truly dropped the request (both partition queues full)
+//! or the op is pathologically slow -- and abandoning the bidi while the op
+//! can still commit would strand its reply. All partition ops on a
+//! connection share ONE request id (only metadata ops advance the dedup
+//! counter), so a stranded reply would be consumed by the NEXT partition
+//! op's bidi and shift the connection's data-plane stream off by one,
+//! permanently. Instead, [`REPLY_WAIT_BACKSTOP`] (longer than the SDK's
+//! whole-request deadline, so the client always gives up first and
+//! reconnects) closes the CONNECTION, which drops the mailbox and every
+//! pending reply with it -- nothing can strand or cross request ids. A
+//! future pipelining upgrade would additionally run per-bidi handlers
+//! concurrently (and would then require a real per-op correlation id).
 //!
 //! The handshake itself is driven by [`accept_handshake`] (no bidi
 //! captured). To avoid a single slow / hostile peer wedging the entire
@@ -287,12 +291,15 @@ pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// A replicated submit the server cannot yet commit is answered with silence
 /// (the server expects the SDK to replay), so without a bound the per-bidi
 /// wait - and, since `accept_bi` is serial, the whole connection - would wedge:
-/// the SDK's replay opens a fresh bidi that, at `max_concurrent_bidi_streams=1`,
-/// can only be accepted once this one is released. Kept below the SDK's
-/// per-attempt retry interval so the slot frees before the client replays; a
-/// late reply for the abandoned request carries the same request id and is
-/// matched (and consumed) by the replay's bidi, so abandoning early is safe.
-const REPLY_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Backstop for a bidi whose dispatch never produced a reply (a true drop:
+/// both partition queues full, or a pathologically slow commit). Longer than
+/// the SDK's whole-request deadline (30s), so the client always times out
+/// first, surfaces `Disconnected`, and reconnects. On firing the CONNECTION
+/// is closed rather than the bidi abandoned: partition ops all share one
+/// request id, so a reply stranded by an abandoned bidi would be consumed by
+/// the next data-plane op and shift every subsequent reply off by one.
+/// Closing the connection drops the mailbox and any late reply with it.
+const REPLY_WAIT_BACKSTOP: Duration = Duration::from_mins(1);
 
 /// `Command2` byte offset shared by every consensus header (after the
 /// fixed checksum/cluster/size/view/release prefix).
@@ -437,18 +444,20 @@ impl TransportConn for QuicTransportConn {
 
             // Wait for THIS bidi's reply, keyed by request id. The bus `rx` is
             // a single unkeyed per-connection channel, so filter by id and
-            // discard replies belonging to an abandoned earlier bidi (the SDK
-            // replays with the SAME request id, so a late reply matches and is
-            // consumed by the replay's bidi - never misrouted to a later
-            // request). On timeout the dispatch produced no reply (a transient
-            // submit: the server stays silent expecting a replay); abandon this
-            // bidi and accept the next so the replay's fresh stream is not
-            // blocked behind us (acute at `max_concurrent_bidi_streams=1`).
+            // discard replies belonging to an earlier attempt's bidi (an
+            // explicit-transient replay reuses the SAME request id, so a late
+            // reply matches and is consumed by the replay's bidi - never
+            // misrouted to a later request). There is no short abandon-timeout:
+            // transient submits are answered with explicit rejection frames, so
+            // silence here means the dispatch dropped the request or the op is
+            // pathologically slow. `REPLY_WAIT_BACKSTOP` (see its doc) closes
+            // the whole connection instead of abandoning the bidi, so a late
+            // reply can never strand and shift onto the next data-plane op.
             let mut matched: Option<BusMessage> = None;
             let mut connection_gone = false;
             {
                 let mut reply_deadline =
-                    std::pin::pin!(compio::time::sleep(REPLY_WAIT_TIMEOUT).fuse());
+                    std::pin::pin!(compio::time::sleep(REPLY_WAIT_BACKSTOP).fuse());
                 loop {
                     futures::select! {
                         () = shutdown_fut.as_mut() => {
@@ -457,7 +466,8 @@ impl TransportConn for QuicTransportConn {
                             break;
                         }
                         () = reply_deadline.as_mut() => {
-                            debug!(%label, %peer, ?request_id, "quic: no reply within timeout; abandoning bidi for client replay");
+                            warn!(%label, %peer, ?request_id, "quic: no reply within backstop; closing connection so no reply can strand");
+                            connection_gone = true;
                             break;
                         }
                         res = rx.recv().fuse() => if let Ok(m) = res {
@@ -486,10 +496,10 @@ impl TransportConn for QuicTransportConn {
                 break;
             }
             let Some(first) = matched else {
-                // Timeout: close our send half so the SDK's read ends, then
-                // accept the next bidi (the client's replay).
+                // Unreachable in practice: every no-reply path above sets
+                // `connection_gone`. Close the send half defensively.
                 if let Err(e) = send.finish() {
-                    debug!(%label, %peer, error = ?e, "quic: send.finish() failed after reply timeout");
+                    debug!(%label, %peer, error = ?e, "quic: send.finish() failed with no reply");
                 }
                 continue;
             };

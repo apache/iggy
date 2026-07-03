@@ -33,10 +33,10 @@ use crate::{
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_from_request, build_reply_message, build_transient_reply,
-    drain_committable_prefix, emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
-    fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
-    send_prepare_ok as send_prepare_ok_common,
+    ack_quorum_reached, build_reply_from_request, build_reply_message,
+    build_result_rejection_reply, drain_committable_prefix, emit_namespace_progress_event,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -370,21 +370,25 @@ where
                 });
                 Ok(())
             }
-            // Commit-time apply is a genuine invariant check, NOT to be softened:
-            // VSR commits in log order, so a committed delete always follows its
-            // committed store on every replica -- the offset MUST be present
-            // here. Absence means real divergence (log corruption / out-of-order
-            // apply); surfacing it wedges the replica (the correct VSR response)
-            // rather than silently masking a split state. The prepare-time race
-            // that used to false-positive here is handled by not re-checking
-            // existence at staging (see `stage_consumer_offset_delete`).
+            // Commit-time apply keeps its invariant check on the PRIMARY:
+            // admission verified the offset exists there, so a miss on the
+            // primary is real divergence (log corruption / out-of-order apply)
+            // and must surface rather than silently mask a split state. A
+            // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
+            // (v2) stores apply on the primary only and are never replicated,
+            // so a later quorum delete finds nothing on the backups -- erroring
+            // there would fail the committed apply, panic the replica as
+            // divergent, and crash-loop on every journal replay. The
+            // prepare-time race is handled by not re-checking existence at
+            // staging (see `stage_consumer_offset_delete`).
             PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
                 let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                let _ = guard
-                    .remove(&key)
-                    .ok_or(IggyError::ConsumerOffsetNotFound(key))?;
+                let removed = guard.remove(&key).is_some();
+                if !removed && !self.consensus.is_follower() {
+                    return Err(IggyError::ConsumerOffsetNotFound(key));
+                }
                 Ok(())
             }
             PendingConsumerOffsetMutation::Delete
@@ -395,9 +399,10 @@ where
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                let _ = guard
-                    .remove(&key)
-                    .ok_or(IggyError::ConsumerOffsetNotFound(key.0))?;
+                let removed = guard.remove(&key).is_some();
+                if !removed && !self.consensus.is_follower() {
+                    return Err(IggyError::ConsumerOffsetNotFound(key.0));
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -1053,7 +1058,7 @@ where
                 // rather than replaying until its read-timeout (a client hang).
                 // The op is NOT admitted/replicated, so no replica ever applies a
                 // delete for an offset the primary knows is absent.
-                let reply = build_transient_reply(
+                let reply = build_result_rejection_reply(
                     message.header(),
                     self.consensus().commit_max(),
                     error.as_code(),
@@ -1089,7 +1094,7 @@ where
                         .with_operation(message.header().operation)
                         .with_error(IggyError::InvalidOffset(requested_offset).to_string()),
                     );
-                    let reply = build_transient_reply(
+                    let reply = build_result_rejection_reply(
                         message.header(),
                         self.consensus().commit_max(),
                         IggyError::InvalidOffset(requested_offset).as_code(),
@@ -2722,19 +2727,16 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     .operation
 }
 
-/// Success reply body for a committed partition op. The consumer-offset ops are
-/// result-framed on the SDK side so a rejection (`ConsumerOffsetNotFound` on
-/// delete, `InvalidOffset` on store) surfaces as a terminal error rather than
-/// decoding as `Ok`; their success reply must therefore carry an explicit empty
-/// result section (`[count = 0]`) instead of an empty body. Every other
-/// partition op carries no result section and replies with an empty body.
+/// Success reply body for a committed partition op. Result-framed ops
+/// (`Operation::is_result_framed`; on this plane the consumer-offset ops,
+/// whose rejections ship typed errors) must carry an explicit empty result
+/// section (`[count = 0]`) so the SDK's framed decode does not misread the
+/// payload; every other partition op replies with an empty body.
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
-    match operation {
-        Operation::StoreConsumerOffset
-        | Operation::StoreConsumerOffset2
-        | Operation::DeleteConsumerOffset
-        | Operation::DeleteConsumerOffset2 => bytes::Bytes::from_static(&[0, 0, 0, 0]),
-        _ => bytes::Bytes::new(),
+    if operation.is_result_framed() {
+        bytes::Bytes::from_static(&[0, 0, 0, 0])
+    } else {
+        bytes::Bytes::new()
     }
 }
 

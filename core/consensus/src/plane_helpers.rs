@@ -334,25 +334,27 @@ where
         .expect("reply buffer must contain a valid reply message")
 }
 
-/// Builds a `Reply` carrying only a metadata result section, no payload.
+/// Builds a `Reply` carrying only a single-entry result section, no payload:
+/// the generic `[count=1][index=0][result=code]` rejection frame.
 ///
-/// For a request that could not be committed *right now* (not-caught-up /
-/// in-flight / pipeline-full / view-change cancel): the body is
-/// `[count=1][index=0][result=code]`. The SDK decodes the nonzero `result` to a
-/// typed retryable error (`IggyError::TransientNotCommitted`) and replays the
-/// same `request_id` immediately, instead of waiting out its response
-/// read-timeout.
+/// Two families of `code` ride this frame. `TransientNotCommitted` marks a
+/// request that could not be committed *right now* (not-caught-up / in-flight
+/// / pipeline-full / view-change cancel); the SDK decodes it and replays the
+/// same `request_id` immediately instead of waiting out its response
+/// read-timeout. Any other code is a TERMINAL rejection (e.g.
+/// `ConsumerOffsetNotFound` / `InvalidOffset` from partition-plane admission)
+/// that the SDK surfaces as the typed error.
 ///
-/// Stamped from the request header (no prepare exists for an uncommitted op).
-/// `commit` is the primary's current commit position and is informational here:
-/// a transient reply is sent, never cached in the `ClientTable`, so it is not
-/// subject to the `commit_reply` regression order.
+/// Stamped from the request header (no prepare exists for a rejected op).
+/// `commit` is the primary's current commit position and is informational
+/// here: a rejection reply is sent, never cached in the `ClientTable`, so it
+/// is not subject to the `commit_reply` regression order.
 ///
 /// # Panics
 /// If the constructed message buffer is not a valid reply.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn build_transient_reply(
+pub fn build_result_rejection_reply(
     request_header: &RequestHeader,
     commit: u64,
     code: u32,
@@ -375,7 +377,10 @@ pub fn build_transient_reply(
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: request_header.client,
-        op: request_header.session,
+        // Position-typed like the sibling builders (`build_reply_from_request`
+        // stamps `op: commit` too); inert on this path -- rejections are never
+        // cached -- but keeps the wire field convention for frame inspection.
+        op: commit,
         commit,
         timestamp: request_header.timestamp,
         request: request_header.request,

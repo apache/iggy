@@ -32,8 +32,10 @@ use configs::server_ng::ServerNgConfig;
 use iggy_common::{IggyByteSize, IggyError, PartitionStats};
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
+use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use std::fs;
-use tracing::error;
+use std::os::unix::fs::FileExt;
+use tracing::{error, warn};
 
 const LOG_EXTENSION: &str = "log";
 
@@ -85,11 +87,48 @@ pub async fn load_persisted_segments(
         let messages_size = file_len(&messages_path);
         let index_size = file_len(&index_path);
 
+        let bounds = recover_segment_bounds(
+            &index_path,
+            &messages_path,
+            start_offset,
+            messages_size,
+            stream_id,
+            topic_id,
+            partition_id,
+        )
+        .await?;
+
+        // An index without a single whole entry means any log bytes were torn
+        // off mid-write (the crash landed between the message write and the
+        // index write). Recover the segment as EMPTY: counting the bytes with
+        // `end_offset == start_offset` would fabricate one phantom message for
+        // the bootstrap non-empty filters, and appending after the torn bytes
+        // would strand undecodable garbage inside the readable range. Zeroed
+        // sizes make the next append overwrite the torn bytes instead.
+        let (start_timestamp, end_timestamp, end_offset, effective_messages_size) =
+            if let Some((start_timestamp, end_timestamp, end_offset)) = bounds {
+                (start_timestamp, end_timestamp, end_offset, messages_size)
+            } else {
+                if messages_size > 0 {
+                    warn!(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        start_offset,
+                        messages_size,
+                        "segment log holds bytes but its index holds no whole \
+                         entry (torn write); recovering the segment as empty"
+                    );
+                }
+                (0, 0, start_offset, 0)
+            };
+        let effective_index_size = if bounds.is_some() { index_size } else { 0 };
+
         let storage = SegmentStorage::new(
             &messages_path,
             &index_path,
-            messages_size,
-            index_size,
+            effective_messages_size,
+            effective_index_size,
             enforce_fsync,
             enforce_fsync,
             true,
@@ -107,28 +146,18 @@ pub async fn load_persisted_segments(
             source
         })?;
 
-        let (start_timestamp, end_timestamp, end_offset) = recover_segment_bounds(
-            &index_path,
-            start_offset,
-            messages_size,
-            stream_id,
-            topic_id,
-            partition_id,
-        )
-        .await?;
-
         let mut segment = Segment::new(start_offset, max_size);
         segment.sealed = true;
         segment.start_timestamp = start_timestamp;
         segment.end_timestamp = end_timestamp;
         segment.max_timestamp = end_timestamp;
         segment.end_offset = end_offset;
-        segment.size = IggyByteSize::from(messages_size);
-        segment.current_position = messages_size;
+        segment.size = IggyByteSize::from(effective_messages_size);
+        segment.current_position = effective_messages_size;
 
         stats.increment_segments_count(1);
-        stats.increment_size_bytes(messages_size);
-        if messages_size > 0 {
+        stats.increment_size_bytes(effective_messages_size);
+        if effective_messages_size > 0 {
             // Offsets in a segment are contiguous, so the message count is the
             // inclusive span between the first (segment start) and last offset.
             stats.increment_messages_count(end_offset - start_offset + 1);
@@ -183,17 +212,22 @@ fn file_len(path: &str) -> u64 {
 }
 
 /// Derives `(start_timestamp, end_timestamp, end_offset)` from a segment's
-/// 24-byte sparse index. The last entry's `offset` is the segment end offset;
-/// its `position` (the last flushed batch's start byte) must fall inside the
-/// messages file, otherwise the index references data the file never received.
+/// 24-byte sparse index. `None` when the index holds no whole entry (the
+/// caller recovers the segment as empty). The last entry's `position` is only
+/// the last flushed batch's START byte, so the batch header is read back from
+/// the messages file to prove the batch also ENDS inside it -- without
+/// `enforce_fsync` there is no ordering barrier between the message write and
+/// the index write, and a tail torn mid-flush would otherwise pass while
+/// `end_offset` claims offsets whose bytes are incomplete.
 async fn recover_segment_bounds(
     index_path: &str,
+    messages_path: &str,
     start_offset: u64,
     messages_size: u64,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<(u64, u64, u64), ServerNgError> {
+) -> Result<Option<(u64, u64, u64)>, ServerNgError> {
     let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
         error!(
             stream_id,
@@ -230,8 +264,8 @@ async fn recover_segment_bounds(
 
     match (first, last) {
         (Some(first), Some(last)) => {
-            if last.position >= messages_size {
-                return Err(ServerNgError::RecoveredSegmentSizeDivergence {
+            let last_batch_extent = read_batch_extent(messages_path, last.position, messages_size)
+                .ok_or(ServerNgError::RecoveredSegmentSizeDivergence {
                     stream_id,
                     topic_id,
                     partition_id,
@@ -239,10 +273,34 @@ async fn recover_segment_bounds(
                     end_offset: last.offset,
                     messages_size_bytes: messages_size,
                     indexed_size_bytes: last.position,
+                })?;
+            if last_batch_extent > messages_size {
+                return Err(ServerNgError::RecoveredSegmentSizeDivergence {
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    start_offset,
+                    end_offset: last.offset,
+                    messages_size_bytes: messages_size,
+                    indexed_size_bytes: last_batch_extent,
                 });
             }
-            Ok((first.timestamp, last.timestamp, last.offset))
+            Ok(Some((first.timestamp, last.timestamp, last.offset)))
         }
-        _ => Ok((0, 0, start_offset)),
+        _ => Ok(None),
     }
+}
+
+/// End byte of the batch whose command header sits at `position` in the
+/// messages file, or `None` when the header itself does not fit / decode
+/// (`position` past the file, header truncated, or garbage bytes).
+fn read_batch_extent(messages_path: &str, position: u64, messages_size: u64) -> Option<u64> {
+    if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
+        return None;
+    }
+    let file = fs::File::open(messages_path).ok()?;
+    let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
+    file.read_exact_at(&mut header_bytes, position).ok()?;
+    let header = SendMessages2Header::decode(&header_bytes).ok()?;
+    position.checked_add(header.total_size() as u64)
 }

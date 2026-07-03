@@ -247,21 +247,12 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     // login decodes to `TransientNotCommitted` and the SDK replays it. The one
     // exception is a terminal failure, which ships an empty body (no result
     // section) and is passed through to fail the typed `LoginRegisterResponse`
-    // decode. The consumer-offset ops are the partition-plane ops that carry a
-    // result section: they can be rejected (`ConsumerOffsetNotFound` on delete,
-    // `InvalidOffset` on store), which must reach the client as a terminal error
-    // rather than decoding as `Ok` (their success reply ships `[count = 0]` to
-    // match). Other reads, data-plane ops, and Logout carry no result section and
-    // pass through untouched.
-    let result_framed = operation.is_metadata()
-        || (operation == Operation::Register && !body.is_empty())
-        || matches!(
-            operation,
-            Operation::StoreConsumerOffset
-                | Operation::StoreConsumerOffset2
-                | Operation::DeleteConsumerOffset
-                | Operation::DeleteConsumerOffset2
-        );
+    // decode. `Operation::is_result_framed` is the shared source of truth with
+    // the server-side encode sites; the Register empty-body-is-terminal nuance
+    // is the one SDK-side addition. Other reads, data-plane ops, and Logout
+    // carry no result section and pass through untouched.
+    let result_framed =
+        operation.is_result_framed() || (operation == Operation::Register && !body.is_empty());
     if !result_framed {
         return Ok(body);
     }

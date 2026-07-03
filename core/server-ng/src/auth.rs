@@ -26,7 +26,7 @@ use crate::dispatch::submit_register_on_owner;
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
-use consensus::{MetadataHandle, build_transient_reply};
+use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::{ClientVersionInfo, RequestHeader};
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
@@ -231,7 +231,7 @@ async fn send_login_transient_reply(
     request_header: &RequestHeader,
 ) {
     let commit = current_metadata_commit(shard);
-    let reply = build_transient_reply(
+    let reply = build_result_rejection_reply(
         request_header,
         commit,
         IggyError::TransientNotCommitted.as_code(),
