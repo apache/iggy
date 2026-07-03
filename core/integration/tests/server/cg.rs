@@ -21,6 +21,7 @@ use crate::server::scenarios::{
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
+    poll_messages_wait_timeout_scenario,
 };
 use integration::iggy_harness;
 
@@ -80,4 +81,13 @@ async fn offset_cleanup(harness: &TestHarness) {
 )]
 async fn duplicate_name_create_preserves_live_group(harness: &TestHarness) {
     consumer_group_duplicate_name_create_scenario::run(harness).await;
+}
+
+#[cfg(not(feature = "vsr"))]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn poll_messages_wait_timeout_consumer_group(harness: &TestHarness) {
+    poll_messages_wait_timeout_scenario::run_consumer_group_checks(harness).await;
 }

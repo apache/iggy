@@ -27,6 +27,7 @@ pub struct BenchmarkConsumerConfig {
     pub stream_id: String,
     pub messages_per_batch: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
+    pub poll_wait_timeout: IggyDuration,
     pub polling_kind: PollingKind,
     pub origin_timestamp_latency_calculation: bool,
     pub pretty: bool,

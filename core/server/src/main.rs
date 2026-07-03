@@ -35,6 +35,7 @@ use server::log::logger::Logging;
 use server::metadata::{Metadata, create_metadata_handles};
 use server::server_error::ServerError;
 use server::shard::system::info::SystemInfo;
+use server::shard::waiters::PollWaiterRegistry;
 use server::shard::{IggyShard, calculate_shard_assignment};
 use server::state::file::FileState;
 use server::state::system::SystemState;
@@ -49,9 +50,9 @@ use shard_allocator::ShardAllocator;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info, instrument, warn};
@@ -339,6 +340,7 @@ fn main() -> Result<(), ServerError> {
         let client_manager = Box::leak(client_manager);
         let client_manager: EternalPtr<DashMap<u32, Client>> = client_manager.into();
         let client_manager = ClientManager::new(client_manager);
+        let poll_waiters = Arc::new(Mutex::new(PollWaiterRegistry::default()));
 
         // Populate shards_table from SharedMetadata partitions (hierarchical traversal)
         metadata.with_metadata(|metadata| {
@@ -384,6 +386,7 @@ fn main() -> Result<(), ServerError> {
                 state_term.clone(),
             );
             let client_manager = client_manager.clone();
+            let poll_waiters = poll_waiters.clone();
             let shard_metadata = metadata.clone();
 
             // Take metadata_writer for shard 0 only
@@ -431,7 +434,8 @@ fn main() -> Result<(), ServerError> {
                                 .metrics(metrics)
                                 .is_follower(is_follower)
                                 .current_replica_id(replica_id)
-                                .metadata(shard_metadata);
+                                .metadata(shard_metadata)
+                                .poll_waiters(poll_waiters);
 
                             if let Some(writer) = shard_metadata_writer {
                                 builder = builder.metadata_writer(writer);

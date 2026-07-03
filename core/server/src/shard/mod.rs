@@ -43,7 +43,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -80,7 +80,7 @@ pub struct IggyShard {
     pub(crate) metadata_writer: Option<RefCell<MetadataWriter>>,
     pub(crate) local_partitions: RefCell<LocalPartitions>,
     pub(crate) pending_partition_inits: RefCell<AHashSet<IggyNamespace>>,
-    pub(crate) poll_waiters: RefCell<PollWaiterRegistry>,
+    pub(crate) poll_waiters: Arc<Mutex<PollWaiterRegistry>>,
 
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, PartitionLocation>>,
     pub(crate) state: FileState,

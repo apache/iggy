@@ -64,7 +64,7 @@ impl ConsumerClient for LowLevelConsumerClient {
 
         let before_poll = Instant::now();
         let polled = client
-            .poll_messages(
+            .poll_messages_with_timeout(
                 &self.stream_id,
                 &self.topic_id,
                 self.partition_id,
@@ -72,6 +72,7 @@ impl ConsumerClient for LowLevelConsumerClient {
                 &self.polling_strategy,
                 messages_to_receive,
                 self.auto_commit,
+                self.config.poll_wait_timeout.get_duration(),
             )
             .await;
 
