@@ -410,7 +410,7 @@ impl IggyClient {
         })
     }
 
-    /// Create a consumer group for a stream topic.
+    /// Create a consumer group for a stream and topic.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -444,7 +444,7 @@ impl IggyClient {
         })
     }
 
-    /// Get a consumer group in a stream topic.
+    /// Retrieve details for a consumer group from the specified stream and topic.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -452,7 +452,8 @@ impl IggyClient {
     ///     group_id: Consumer group identifier as `str | int`.
     ///
     /// Returns:
-    ///     An awaitable that resolves to `ConsumerGroupDetails | None`.
+    ///     An awaitable that resolves to `ConsumerGroupDetails` if the consumer group exists,
+    ///     or `None` otherwise.
     ///
     /// Raises:
     ///     PyValueError: If an identifier is invalid.
@@ -479,7 +480,7 @@ impl IggyClient {
         })
     }
 
-    /// Get all consumer groups in a stream topic.
+    /// Get all consumer groups for the specified stream and topic.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.

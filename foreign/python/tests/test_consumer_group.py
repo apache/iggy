@@ -355,8 +355,7 @@ class TestGetConsumerGroups:
         groups = await iggy_client.get_consumer_groups(stream_name, topic_name)
 
         assert len(groups) == 2
-        groups_by_name = {group.name: group for group in groups}
-        assert set(groups_by_name) == {first_group_name, second_group_name}
+        assert [group.name for group in groups] == [first_group_name, second_group_name]
         assert all(group.partitions_count == 1 for group in groups)
         assert all(group.members_count == 0 for group in groups)
 
@@ -400,7 +399,7 @@ class TestGetConsumerGroups:
         """Test repeated get_consumer_groups calls return a stable topic view."""
         stream_name = unique_name()
         topic_name = unique_name()
-        group_names = {unique_name() for _ in range(2)}
+        group_names = [unique_name() for _ in range(2)]
 
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
@@ -418,9 +417,9 @@ class TestGetConsumerGroups:
         first = await iggy_client.get_consumer_groups(stream_name, topic_name)
         second = await iggy_client.get_consumer_groups(stream_name, topic_name)
 
-        assert {group.name for group in first} == group_names
-        assert {group.name for group in second} == group_names
-        assert {group.id for group in first} == {group.id for group in second}
+        assert [group.name for group in first] == group_names
+        assert [group.id for group in first] == [group.id for group in second]
+        assert [group.name for group in first] == [group.name for group in second]
 
     @pytest.mark.asyncio
     async def test_get_consumer_groups_requires_connection_and_auth(self, unique_name):

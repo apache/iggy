@@ -235,21 +235,25 @@ impl From<RustConsumerGroup> for ConsumerGroup {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroup {
+    /// Gets the unique identifier (numeric) of the consumer group.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
+    /// Gets the name of the consumer group.
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
     }
 
+    /// Gets the number of partitions the consumer group is consuming.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
+    /// Gets the number of members in the consumer group.
     #[getter]
     pub fn members_count(&self) -> u32 {
         self.inner.members_count
@@ -271,26 +275,31 @@ impl From<RustConsumerGroupDetails> for ConsumerGroupDetails {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroupDetails {
+    /// Gets the unique identifier (numeric) of the consumer group.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
+    /// Gets the name of the consumer group.
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
     }
 
+    /// Gets the number of partitions the consumer group is consuming.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
+    /// Gets the number of members in the consumer group.
     #[getter]
     pub fn members_count(&self) -> u32 {
         self.inner.members_count
     }
 
+    /// Gets the collection of members in the consumer group.
     #[getter]
     pub fn members(&self) -> Vec<ConsumerGroupMember> {
         self.inner
@@ -322,16 +331,19 @@ impl From<&RustConsumerGroupMember> for ConsumerGroupMember {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroupMember {
+    /// Gets the unique identifier (numeric) of the consumer group member.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
+    /// Gets the number of partitions the consumer group member is consuming.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
+    /// Gets the collection of partitions the consumer group member is consuming.
     #[getter]
     pub fn partitions(&self) -> Vec<u32> {
         self.inner.partitions.clone()

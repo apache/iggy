@@ -237,35 +237,71 @@ class AutoCommitWhen:
 @typing.final
 class ConsumerGroup:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        Gets the name of the consumer group.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group is consuming.
+        """
     @property
-    def members_count(self) -> builtins.int: ...
+    def members_count(self) -> builtins.int:
+        r"""
+        Gets the number of members in the consumer group.
+        """
 
 @typing.final
 class ConsumerGroupDetails:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group.
+        """
     @property
-    def name(self) -> builtins.str: ...
+    def name(self) -> builtins.str:
+        r"""
+        Gets the name of the consumer group.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group is consuming.
+        """
     @property
-    def members_count(self) -> builtins.int: ...
+    def members_count(self) -> builtins.int:
+        r"""
+        Gets the number of members in the consumer group.
+        """
     @property
-    def members(self) -> builtins.list[ConsumerGroupMember]: ...
+    def members(self) -> builtins.list[ConsumerGroupMember]:
+        r"""
+        Gets the collection of members in the consumer group.
+        """
 
 @typing.final
 class ConsumerGroupMember:
     @property
-    def id(self) -> builtins.int: ...
+    def id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the consumer group member.
+        """
     @property
-    def partitions_count(self) -> builtins.int: ...
+    def partitions_count(self) -> builtins.int:
+        r"""
+        Gets the number of partitions the consumer group member is consuming.
+        """
     @property
-    def partitions(self) -> builtins.list[builtins.int]: ...
+    def partitions(self) -> builtins.list[builtins.int]:
+        r"""
+        Gets the collection of partitions the consumer group member is consuming.
+        """
 
 @typing.final
 class IggyClient:
@@ -428,7 +464,7 @@ class IggyClient:
         name: builtins.str,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Create a consumer group for a stream topic.
+        Create a consumer group for a stream and topic.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -449,7 +485,7 @@ class IggyClient:
         group_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[ConsumerGroupDetails | None]:
         r"""
-        Get a consumer group in a stream topic.
+        Retrieve details for a consumer group from the specified stream and topic.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -457,7 +493,8 @@ class IggyClient:
             group_id: Consumer group identifier as `str | int`.
 
         Returns:
-            An awaitable that resolves to `ConsumerGroupDetails | None`.
+            An awaitable that resolves to `ConsumerGroupDetails` if the consumer group exists,
+            or `None` otherwise.
 
         Raises:
             PyValueError: If an identifier is invalid.
@@ -469,7 +506,7 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[list[ConsumerGroup]]:
         r"""
-        Get all consumer groups in a stream topic.
+        Get all consumer groups for the specified stream and topic.
 
         Args:
             stream_id: Stream identifier as `str | int`.
