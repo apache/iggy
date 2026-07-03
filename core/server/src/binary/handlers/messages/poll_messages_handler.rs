@@ -21,9 +21,13 @@ use crate::binary::dispatch::{
 use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
+use crate::shard::transmission::message::ResolvedTopic;
+use crate::shard::waiters::PollWaiterRegistration;
+use crate::streaming::segments::IggyMessagesBatchSet;
 use crate::streaming::session::Session;
+use futures::future::select_all;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-use iggy_common::IggyError;
+use iggy_common::{Consumer, IggyError, IggyPollMetadata, PollingStrategy};
 use server_common::PooledBuffer;
 use server_common::sharding::IggyNamespace;
 use std::{rc::Rc, time::Duration};
@@ -58,41 +62,56 @@ pub async fn handle_poll_messages(
             topic,
             consumer.clone(),
             partition_id,
-            PollingArgs::with_wait_timeout(strategy.clone(), count, auto_commit, wait_timeout),
+            PollingArgs::with_wait_timeout(strategy, count, auto_commit, wait_timeout),
         )
         .await?;
 
-    if !wait_timeout.is_zero() && batch.is_empty() {
-        let namespace = IggyNamespace::new(
-            topic.stream_id,
-            topic.topic_id,
-            metadata.partition_id as usize,
-        );
+    if count > 0 && !wait_timeout.is_zero() && batch.is_empty() {
+        let namespaces =
+            shard.resolve_poll_wait_namespaces(topic, &consumer, client_id, partition_id)?;
+        let waiters = namespaces
+            .iter()
+            .filter_map(|namespace| shard.register_poll_waiter(*namespace, wait_timeout))
+            .collect::<Vec<_>>();
 
-        if let Some(waiter) = shard.register_poll_waiter(namespace, wait_timeout) {
-            let immediate_args = || PollingArgs::new(strategy.clone(), count, auto_commit);
-            (metadata, batch) = shard
-                .poll_messages(
+        if let Some((next_metadata, next_batch)) = poll_wait_namespaces(
+            shard,
+            client_id,
+            topic,
+            &consumer,
+            &namespaces,
+            &strategy,
+            count,
+            auto_commit,
+        )
+        .await?
+        {
+            metadata = next_metadata;
+            batch = next_batch;
+        }
+
+        if batch.is_empty() && !waiters.is_empty() {
+            let woke = matches!(
+                compio::time::timeout(wait_timeout, wait_for_any_poll_waiter(&waiters)).await,
+                Ok(true)
+            );
+            drop(waiters);
+
+            if woke
+                && let Some((next_metadata, next_batch)) = poll_wait_namespaces(
+                    shard,
                     client_id,
                     topic,
-                    consumer.clone(),
-                    partition_id,
-                    immediate_args(),
+                    &consumer,
+                    &namespaces,
+                    &strategy,
+                    count,
+                    auto_commit,
                 )
-                .await?;
-
-            if batch.is_empty() {
-                let woke = matches!(
-                    compio::time::timeout(wait_timeout, waiter.wait()).await,
-                    Ok(true)
-                );
-                drop(waiter);
-
-                if woke {
-                    (metadata, batch) = shard
-                        .poll_messages(client_id, topic, consumer, partition_id, immediate_args())
-                        .await?;
-                }
+                .await?
+            {
+                metadata = next_metadata;
+                batch = next_batch;
             }
         }
     }
@@ -125,4 +144,40 @@ pub async fn handle_poll_messages(
         .send_ok_response_vectored(&response_length_bytes, bufs)
         .await?;
     Ok(HandlerResult::Finished)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_wait_namespaces(
+    shard: &IggyShard,
+    client_id: u32,
+    topic: ResolvedTopic,
+    consumer: &Consumer,
+    namespaces: &[IggyNamespace],
+    strategy: &PollingStrategy,
+    count: u32,
+    auto_commit: bool,
+) -> Result<Option<(IggyPollMetadata, IggyMessagesBatchSet)>, IggyError> {
+    for namespace in namespaces {
+        let result = shard
+            .poll_messages(
+                client_id,
+                topic,
+                consumer.clone(),
+                Some(namespace.partition_id() as u32),
+                PollingArgs::new(*strategy, count, auto_commit),
+            )
+            .await?;
+        if !result.1.is_empty() {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+async fn wait_for_any_poll_waiter(waiters: &[PollWaiterRegistration]) -> bool {
+    let waits = waiters
+        .iter()
+        .map(|waiter| Box::pin(waiter.wait()))
+        .collect::<Vec<_>>();
+    select_all(waits).await.0
 }

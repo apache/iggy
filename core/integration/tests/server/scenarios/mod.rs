@@ -53,6 +53,7 @@ pub mod message_size_scenario;
 pub mod offset_scenario;
 #[cfg(not(feature = "vsr"))]
 pub mod permissions_scenario;
+pub mod poll_messages_wait_timeout_scenario;
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 #[cfg(not(feature = "vsr"))]

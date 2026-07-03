@@ -19,7 +19,7 @@ use crate::shard::IggyShard;
 use ahash::AHashMap;
 use async_channel::{Receiver, Sender};
 use server_common::sharding::IggyNamespace;
-use std::{cell::RefCell, time::Duration, time::Instant};
+use std::{sync::Arc, sync::Mutex, time::Duration, time::Instant};
 
 const MAX_WAITERS_PER_NAMESPACE: usize = 1024;
 
@@ -31,7 +31,7 @@ struct PollWaiter {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct PollWaiterRegistry {
+pub struct PollWaiterRegistry {
     next_id: u64,
     waiters: AHashMap<IggyNamespace, Vec<PollWaiter>>,
 }
@@ -126,22 +126,25 @@ impl PollWaiterRegistry {
     }
 }
 
-pub(crate) struct PollWaiterRegistration<'a> {
+pub(crate) struct PollWaiterRegistration {
     namespace: IggyNamespace,
     id: u64,
     receiver: Receiver<()>,
-    registry: &'a RefCell<PollWaiterRegistry>,
+    registry: Arc<Mutex<PollWaiterRegistry>>,
 }
 
-impl PollWaiterRegistration<'_> {
+impl PollWaiterRegistration {
     pub(crate) async fn wait(&self) -> bool {
         self.receiver.recv().await.is_ok()
     }
 }
 
-impl Drop for PollWaiterRegistration<'_> {
+impl Drop for PollWaiterRegistration {
     fn drop(&mut self) {
-        self.registry.borrow_mut().remove(&self.namespace, self.id);
+        self.registry
+            .lock()
+            .expect("poll waiter registry poisoned")
+            .remove(&self.namespace, self.id);
     }
 }
 
@@ -150,30 +153,66 @@ impl IggyShard {
         &self,
         namespace: IggyNamespace,
         timeout: Duration,
-    ) -> Option<PollWaiterRegistration<'_>> {
+    ) -> Option<PollWaiterRegistration> {
         let (id, receiver) = self
             .poll_waiters
-            .borrow_mut()
+            .lock()
+            .expect("poll waiter registry poisoned")
             .register(namespace, timeout)?;
         Some(PollWaiterRegistration {
             namespace,
             id,
             receiver,
-            registry: &self.poll_waiters,
+            registry: self.poll_waiters.clone(),
         })
     }
 
     pub(crate) fn wake_poll_waiters(&self, namespace: &IggyNamespace) {
-        self.poll_waiters.borrow_mut().wake_namespace(namespace);
+        self.poll_waiters
+            .lock()
+            .expect("poll waiter registry poisoned")
+            .wake_namespace(namespace);
     }
 
     pub(crate) fn wake_topic_poll_waiters(&self, stream_id: usize, topic_id: usize) {
         self.poll_waiters
-            .borrow_mut()
+            .lock()
+            .expect("poll waiter registry poisoned")
             .wake_topic(stream_id, topic_id);
     }
 
     pub(crate) fn wake_stream_poll_waiters(&self, stream_id: usize) {
-        self.poll_waiters.borrow_mut().wake_stream(stream_id);
+        self.poll_waiters
+            .lock()
+            .expect("poll waiter registry poisoned")
+            .wake_stream(stream_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropped_registration_removes_waiter() {
+        let registry = Arc::new(Mutex::new(PollWaiterRegistry::default()));
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let (id, receiver) = registry
+            .lock()
+            .unwrap()
+            .register(namespace, Duration::from_secs(1))
+            .expect("waiter should register");
+
+        assert_eq!(registry.lock().unwrap().waiters[&namespace].len(), 1);
+
+        let registration = PollWaiterRegistration {
+            namespace,
+            id,
+            receiver,
+            registry: registry.clone(),
+        };
+        drop(registration);
+
+        assert!(!registry.lock().unwrap().waiters.contains_key(&namespace));
     }
 }

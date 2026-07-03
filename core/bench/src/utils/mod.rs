@@ -21,7 +21,7 @@ use bench_report::{
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use std::{fs, path::Path};
+use std::{fmt::Write, fs, path::Path};
 use tracing::{error, info};
 
 use crate::args::{
@@ -31,8 +31,8 @@ use crate::args::{
         DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE,
         DEFAULT_MESSAGES_PER_BATCH, DEFAULT_NUMBER_OF_CONSUMER_GROUPS, DEFAULT_NUMBER_OF_CONSUMERS,
         DEFAULT_NUMBER_OF_PRODUCERS, DEFAULT_PINNED_NUMBER_OF_PARTITIONS,
-        DEFAULT_PINNED_NUMBER_OF_STREAMS, DEFAULT_QUIC_SERVER_ADDRESS, DEFAULT_TCP_SERVER_ADDRESS,
-        DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME,
+        DEFAULT_PINNED_NUMBER_OF_STREAMS, DEFAULT_POLL_WAIT_TIMEOUT, DEFAULT_QUIC_SERVER_ADDRESS,
+        DEFAULT_TCP_SERVER_ADDRESS, DEFAULT_TOTAL_MESSAGES_SIZE, DEFAULT_WARMUP_TIME,
     },
 };
 
@@ -140,7 +140,10 @@ pub fn params_from_args_and_metrics(
         consumer_groups.to_string(),
     ];
 
-    let params_identifier = params_identifier.join("_");
+    let mut params_identifier = params_identifier.join("_");
+    if !args.poll_wait_timeout().is_zero() {
+        let _ = write!(params_identifier, "_poll_wait_{}", args.poll_wait_timeout());
+    }
 
     BenchmarkParams {
         benchmark_kind,
@@ -226,6 +229,13 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
 
     if args.warmup_time().to_string() != DEFAULT_WARMUP_TIME {
         parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
+    }
+
+    if args.poll_wait_timeout().to_string() != DEFAULT_POLL_WAIT_TIMEOUT {
+        parts.push(format!(
+            "--poll-wait-timeout \'{}\'",
+            args.poll_wait_timeout()
+        ));
     }
 }
 

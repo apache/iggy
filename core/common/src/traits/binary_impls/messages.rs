@@ -188,6 +188,7 @@ async fn resolve_partitioning<B: BinaryClient>(
 /// (round-robin) and send an explicit-partition poll. A coordinator fence
 /// rejection (stale assignment after a rebalance) triggers one re-sync + retry.
 #[cfg(feature = "vsr")]
+#[allow(clippy::too_many_arguments)]
 async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,

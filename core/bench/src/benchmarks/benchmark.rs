@@ -193,7 +193,12 @@ pub trait Benchmarkable: Send {
             .rate_limit()
             .map(|rl| format!(" global rate limit: {rl}/s"))
             .unwrap_or_default();
+        let poll_wait_timeout = if self.args().poll_wait_timeout().is_zero() {
+            String::new()
+        } else {
+            format!(" poll wait timeout: {},", self.args().poll_wait_timeout())
+        };
 
-        format!("{message_size}{messages_per_batch}{data}{rate_limit}")
+        format!("{message_size}{messages_per_batch}{data}{poll_wait_timeout}{rate_limit}")
     }
 }

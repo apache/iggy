@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(not(feature = "vsr"))]
+use crate::server::scenarios::poll_messages_wait_timeout_scenario;
 use crate::server::scenarios::{message_size_scenario, single_message_per_batch_scenario};
 #[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{reconnect_after_restart_scenario, restart_offset_skip_scenario};
@@ -68,6 +70,24 @@ async fn message_size_scenario(harness: &TestHarness) {
 #[iggy_harness(server(partition.messages_required_to_save = "10000"))]
 async fn should_handle_single_message_per_batch_with_delayed_persistence(harness: &TestHarness) {
     single_message_per_batch_scenario::run(harness, 5).await;
+}
+
+#[cfg(not(feature = "vsr"))]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn poll_messages_wait_timeout_wakes_after_append(harness: &TestHarness) {
+    poll_messages_wait_timeout_scenario::run_wake_after_append_checks(harness).await;
+}
+
+#[cfg(not(feature = "vsr"))]
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn poll_messages_wait_timeout_semantics(harness: &TestHarness) {
+    poll_messages_wait_timeout_scenario::run_semantics_checks(harness).await;
 }
 
 #[cfg(not(feature = "vsr"))]

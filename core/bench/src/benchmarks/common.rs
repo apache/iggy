@@ -165,6 +165,7 @@ pub fn build_consumer_futures(
     let consumers = args.consumers();
     let actors = args.producers() + args.consumers();
     let warmup_time = args.warmup_time();
+    let poll_wait_timeout = args.poll_wait_timeout();
     let messages_per_batch = args.messages_per_batch();
     let sampling_time = args.sampling_time();
     let moving_average_window = args.moving_average_window();
@@ -233,6 +234,7 @@ pub fn build_consumer_futures(
                     messages_per_batch,
                     finish_condition,
                     warmup_time,
+                    poll_wait_timeout,
                     sampling_time,
                     moving_average_window,
                     polling_kind,
@@ -255,6 +257,7 @@ pub fn build_producing_consumers_futures(
     let streams = args.streams();
     let partitions = args.number_of_partitions();
     let warmup_time = args.warmup_time();
+    let poll_wait_timeout = args.poll_wait_timeout();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let polling_kind = PollingKind::Offset;
@@ -296,6 +299,7 @@ pub fn build_producing_consumers_futures(
                     send_finish_condition.clone(),
                     poll_finish_condition.clone(),
                     warmup_time,
+                    poll_wait_timeout,
                     args_clone.sampling_time(),
                     args_clone.moving_average_window(),
                     rate_limit,
@@ -320,6 +324,7 @@ pub fn build_producing_consumer_groups_futures(
     let partitions = args.number_of_partitions();
     let cg_count = args.number_of_consumer_groups();
     let warmup_time = args.warmup_time();
+    let poll_wait_timeout = args.poll_wait_timeout();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
@@ -399,6 +404,7 @@ pub fn build_producing_consumer_groups_futures(
                     send_finish_condition,
                     poll_finish_condition,
                     warmup_time,
+                    poll_wait_timeout,
                     args_clone.sampling_time(),
                     args_clone.moving_average_window(),
                     rate_limit,

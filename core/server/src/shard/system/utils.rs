@@ -26,6 +26,7 @@ use crate::{
     streaming::polling_consumer::PollingConsumer,
 };
 use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
+use server_common::sharding::IggyNamespace;
 
 impl IggyShard {
     /// Resolves stream identifier to typed `ResolvedStream`.
@@ -187,6 +188,60 @@ impl IggyShard {
                 )
             }
         }
+    }
+
+    pub fn resolve_poll_wait_namespaces(
+        &self,
+        topic: ResolvedTopic,
+        consumer: &Consumer,
+        client_id: u32,
+        partition_id: Option<u32>,
+    ) -> Result<Vec<IggyNamespace>, IggyError> {
+        if consumer.kind == ConsumerKind::Consumer {
+            let Some((_, partition_id)) = self.resolve_consumer_with_partition_id(
+                topic,
+                consumer,
+                client_id,
+                partition_id,
+                false,
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![IggyNamespace::new(
+                topic.stream_id,
+                topic.topic_id,
+                partition_id,
+            )]);
+        }
+
+        if self.client_manager.try_get_client(client_id).is_none() {
+            return Err(IggyError::StaleClient);
+        }
+
+        let mut namespaces = Vec::new();
+        for partition_id in self
+            .metadata
+            .get_partition_ids(topic.stream_id, topic.topic_id)
+        {
+            let Some((_, partition_id)) = self.metadata.resolve_consumer_group_partition(
+                topic.stream_id,
+                topic.topic_id,
+                &consumer.id,
+                client_id,
+                Some(partition_id as u32),
+                false,
+            )?
+            else {
+                continue;
+            };
+            namespaces.push(IggyNamespace::new(
+                topic.stream_id,
+                topic.topic_id,
+                partition_id,
+            ));
+        }
+        Ok(namespaces)
     }
 
     /// Resolves topic and verifies user has append permission atomically.
