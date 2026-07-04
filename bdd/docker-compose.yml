@@ -33,6 +33,7 @@ services:
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
       - ./scenarios/raw_command.feature:/app/features/raw_command.feature
       - ./scenarios/stream_crud.feature:/app/features/stream_crud.feature
+      - ./scenarios/stream_topic_purge.feature:/app/features/stream_topic_purge.feature
     command:
       - sh
       - -c
@@ -42,6 +43,7 @@ services:
           leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
           raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
           stream_crud)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_crud ;;
+          stream_topic_purge) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test stream_topic_purge ;;
           *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
     networks:
