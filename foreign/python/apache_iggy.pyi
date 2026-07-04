@@ -519,6 +519,69 @@ class IggyClient:
             PyValueError: If an identifier is invalid.
             PyRuntimeError: If the request fails.
         """
+    def delete_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a consumer group for a stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the consumer group is deleted.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def join_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Join a consumer group for a stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the client joins the consumer group.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def leave_consumer_group(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        group_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Leave a consumer group for a stream and topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            group_id: Consumer group identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the client leaves the consumer group.
+
+        Raises:
+            PyValueError: If an identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
     def send_messages(
         self,
         stream: builtins.str | builtins.int,
