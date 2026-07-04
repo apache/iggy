@@ -79,6 +79,9 @@ runs:
         echo "Running ruff format --check..."
         uv run ruff format --check $DIRS_TO_CHECK
 
+        echo "Running cargo fmt for Python extension..."
+        cargo fmt --manifest-path Cargo.toml -- --check
+
         echo "Running pyrefly on SDK..."
         uv run pyrefly check "$DIR_SDK"
         echo "pyrefly version: $(uv run pyrefly --version)"

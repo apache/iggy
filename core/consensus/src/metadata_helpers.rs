@@ -46,8 +46,13 @@ pub enum PreflightOutcome {
     /// Session gone (`NoSession`) or rotated past the retry (`SessionTooLow`):
     /// the client must be told with an eviction frame.
     Evict(EvictionReason),
-    /// Absorbed with nothing to send: in-flight prepare, not-caught-up
-    /// primary, stale/gap retry, or a client-bug newer session.
+    /// Transient: the request could not be committed *right now* but a replay of
+    /// the same `request_id` is expected to succeed (in-flight prepare,
+    /// not-caught-up primary). The caller sends a `TransientNotCommitted` reply
+    /// so the client replays immediately instead of waiting out its read-timeout.
+    NotReady,
+    /// Absorbed with nothing to send: stale/gap retry or a client-bug newer
+    /// session. Replaying the same `request_id` cannot help, so stay silent.
     Drop,
 }
 
@@ -77,9 +82,9 @@ where
         tracing::debug!(
             client_id,
             request,
-            "request_preflight: in-flight prepare, drop"
+            "request_preflight: in-flight prepare, not ready"
         );
-        return PreflightOutcome::Drop;
+        return PreflightOutcome::NotReady;
     }
 
     // Catch-up gate: stale ClientTable on a new primary could return `New`
@@ -95,9 +100,9 @@ where
             is_syncing = consensus.is_syncing(),
             commit_min = consensus.commit_min(),
             commit_max = consensus.commit_max(),
-            "request_preflight: not caught up, drop"
+            "request_preflight: not caught up, not ready"
         );
-        return PreflightOutcome::Drop;
+        return PreflightOutcome::NotReady;
     }
 
     let status = client_table
@@ -172,7 +177,12 @@ where
             send_eviction_to_client(consensus, client_id, reason).await;
             false
         }
-        PreflightOutcome::Drop => false,
+        // The wire-ingress plane has no per-request transport context to build a
+        // correlated `TransientNotCommitted` reply (that lives on the in-process
+        // home-shard path); stay silent here as before. NotReady and Drop both
+        // mean "do not dispatch"; the difference (explicit retry frame) only
+        // applies where the request header is in scope.
+        PreflightOutcome::NotReady | PreflightOutcome::Drop => false,
     }
 }
 

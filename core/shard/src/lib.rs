@@ -1463,9 +1463,13 @@ where
     /// Each plane's loopback is dispatched directly to that plane's `on_ack`,
     /// avoiding a flat merge that would require re-routing through `on_message`.
     ///
-    /// Invariant: planes do not produce loopback messages for each other.
-    /// `on_ack` commits and applies but never calls `push_loopback`, so
-    /// draining metadata before partitions is order-independent.
+    /// Invariant: planes do not produce loopback messages FOR EACH OTHER.
+    /// `on_ack` never pushes to another plane's loopback, so draining
+    /// metadata before partitions is order-independent. Within its own
+    /// plane, `on_ack` CAN push loopback entries (a metadata commit promotes
+    /// buffered requests, and each promoted prepare self-acks through
+    /// `send_or_loopback(self)`) -- `repair_primary_self_acks` drains those
+    /// residuals itself; see its interleaved drain.
     ///
     /// # Panics
     /// Panics if a loopback message is not a valid `PrepareOk` message.
@@ -1830,6 +1834,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = metadata::stm::result::ApplyReply,
+                Error = iggy_common::IggyError,
+            > + StreamsFrontend,
     {
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
@@ -1839,6 +1848,13 @@ where
         let actions = consensus.tick(PlaneKind::Metadata);
 
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+
+        // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
+        // no-op, so the timer-driven retransmit above cannot recover the
+        // primary's own missing vote. Without this the commit prefix can pin
+        // forever (commit_min stuck below commit_max). See
+        // `IggyMetadata::repair_primary_self_acks`.
+        metadata.repair_primary_self_acks().await;
     }
 }
 
