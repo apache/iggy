@@ -368,12 +368,16 @@ async fn given_cursor_set_when_empty_poll_should_preserve_cursor() {
     );
 }
 
+fn hit_with_sort_no_source(doc_id: &str, timestamp: &str) -> Value {
+    json!({
+        "_id": doc_id,
+        "sort": [timestamp, doc_id]
+    })
+}
+
 #[tokio::test]
 async fn given_all_hits_missing_source_when_poll_should_return_error() {
-    let hit = json!({
-        "_id": "doc-1",
-        "sort": ["2024-01-01T00:00:00Z", "doc-1"]
-    });
+    let hit = hit_with_sort_no_source("doc-1", "2024-01-01T00:00:00Z");
     let body = search_response(vec![hit]).to_string();
     let app = mock_router(StatusCode::OK, move |_| {
         let body = body.clone();
@@ -399,26 +403,57 @@ async fn given_all_hits_missing_source_when_poll_should_return_error() {
 }
 
 #[tokio::test]
-async fn given_trailing_hit_without_source_when_poll_should_advance_cursor_past_it() {
+async fn given_first_hit_missing_source_when_poll_should_return_error_without_advancing_cursor() {
+    let body = search_response(vec![
+        hit_with_sort_no_source("doc-1", "2024-01-01T00:00:00Z"),
+        search_hit("doc-2", "2024-01-02T00:00:00Z", json!({})),
+    ])
+    .to_string();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let body = body.clone();
+        async move { (StatusCode::OK, body) }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let error = source
+        .poll()
+        .await
+        .expect_err("first hit missing _source and nothing published must error");
+    assert!(
+        matches!(error, Error::Storage(_)),
+        "expected Storage error, got {error:?}"
+    );
+    assert!(
+        source.test_search_after().await.is_none(),
+        "cursor must not advance when no document was published"
+    );
+}
+
+#[tokio::test]
+async fn given_trailing_hit_missing_source_when_poll_should_advance_cursor_only_to_last_published()
+{
     let request_count = Arc::new(AtomicUsize::new(0));
     let count = request_count.clone();
 
     let first_page = search_response(vec![
         search_hit("doc-1", "2024-01-01T00:00:00Z", json!({})),
-        json!({
-            "_id": "doc-2",
-            "sort": ["2024-01-02T00:00:00Z", "doc-2"]
-        }),
+        hit_with_sort_no_source("doc-2", "2024-01-02T00:00:00Z"),
     ]);
-    let empty_page = search_response(vec![]);
+    // Second poll still returns doc-2 (no _source) because cursor stayed at doc-1.
+    let second_page = search_response(vec![hit_with_sort_no_source(
+        "doc-2",
+        "2024-01-02T00:00:00Z",
+    )]);
 
     let app = mock_router(StatusCode::OK, move |_| {
         let first_page = first_page.clone();
-        let empty_page = empty_page.clone();
+        let second_page = second_page.clone();
         let count = count.clone();
         async move {
             let page = count.fetch_add(1, Ordering::SeqCst);
-            let response = if page == 0 { first_page } else { empty_page };
+            let response = if page == 0 { first_page } else { second_page };
             (StatusCode::OK, response.to_string())
         }
     });
@@ -433,23 +468,66 @@ async fn given_trailing_hit_without_source_when_poll_should_advance_cursor_past_
         "only doc-1 published; doc-2 has no _source"
     );
 
-    let cursor = source.test_search_after().await;
-    assert!(
-        cursor.is_some(),
-        "cursor must be set after batch with trailing no-_source hit"
-    );
-    let cursor_vals = cursor.unwrap();
+    let cursor = source
+        .test_search_after()
+        .await
+        .expect("cursor after publish");
     assert_eq!(
-        cursor_vals[1].as_str(),
-        Some("doc-2"),
-        "cursor must point to doc-2 (trailing no-_source), not doc-1"
+        cursor[1].as_str(),
+        Some("doc-1"),
+        "cursor must stay at last published doc, not advance past unpublished doc-2"
     );
 
-    // Second poll must get empty page (cursor past doc-2), not re-fetch doc-2.
-    let produced2 = source.poll().await.expect("second poll");
-    assert!(
-        produced2.messages.is_empty(),
-        "doc-2 (no _source) must not be re-fetched after cursor advances past it"
+    // Next poll sees doc-2 again; still unpublished → error, cursor unchanged.
+    let error = source
+        .poll()
+        .await
+        .expect_err("stuck no-_source hit must error rather than skip");
+    assert!(matches!(error, Error::Storage(_)));
+    let cursor_after_error = source.test_search_after().await.expect("cursor preserved");
+    assert_eq!(
+        cursor_after_error[1].as_str(),
+        Some("doc-1"),
+        "failed poll must not move cursor past last published document"
+    );
+}
+
+#[tokio::test]
+async fn given_middle_hit_missing_source_when_poll_should_publish_prefix_only_and_not_skip_gap() {
+    let body = search_response(vec![
+        search_hit("doc-a", "2024-01-01T00:00:00Z", json!({"name": "a"})),
+        hit_with_sort_no_source("doc-b", "2024-01-02T00:00:00Z"),
+        search_hit("doc-c", "2024-01-03T00:00:00Z", json!({"name": "c"})),
+    ])
+    .to_string();
+    let app = mock_router(StatusCode::OK, move |_| {
+        let body = body.clone();
+        async move { (StatusCode::OK, body) }
+    });
+    let base = start_server(app).await;
+    let mut source = OpenSearchSource::new(1, base_config(&base), None);
+    source.open().await.unwrap();
+
+    let produced = source.poll().await.expect("poll with middle gap");
+    assert_eq!(
+        produced.messages.len(),
+        1,
+        "batch must stop at first missing _source; doc-c must not be published yet"
+    );
+
+    let payload: Value = serde_json::from_slice(&produced.messages[0].payload).unwrap();
+    assert_eq!(payload["name"], "a");
+
+    let cursor = source.test_search_after().await.expect("cursor set");
+    assert_eq!(
+        cursor[1].as_str(),
+        Some("doc-a"),
+        "cursor must be doc-a only; advancing to doc-c would permanently skip doc-b"
+    );
+    assert_ne!(
+        cursor[1].as_str(),
+        Some("doc-c"),
+        "must not advance cursor to a later published hit past an unpublished gap"
     );
 }
 

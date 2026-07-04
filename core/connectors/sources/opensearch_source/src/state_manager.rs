@@ -153,6 +153,16 @@ impl StateStorage for FileStateStorage {
             .open(&tmp_path)
             .await
             .map_err(|e| Error::Storage(format!("Failed to open state temp file: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600); // Similar to core/connectors/runtime/src/state.rs open_options_for_state
+            std::fs::set_permissions(&tmp_path, perms).map_err(|e| {
+                Error::Storage(format!("Failed to set state temp file permissions: {e}"))
+            })?;
+        }
+
         if let Err(e) = tmp_file.write_all(json.as_bytes()).await {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(Error::Storage(format!(

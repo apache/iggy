@@ -484,6 +484,7 @@ impl OpenSearchSource {
         let mut batch_bytes = 0u64;
         let mut last_sort = None;
         let mut last_poll_timestamp = None;
+        let mut hits_with_sort = 0usize;
 
         for hit in &hits {
             let Some(sort) = hit
@@ -498,16 +499,18 @@ impl OpenSearchSource {
                 );
                 continue;
             };
-
-            last_sort = Some(sort);
+            hits_with_sort += 1;
 
             let Some(source) = hit.get("_source") else {
                 warn!(
                     connector_id = self.id,
                     hit_id = hit.get("_id").and_then(|v| v.as_str()),
-                    "Skipping OpenSearch hit without _source; document will not be published"
+                    "OpenSearch hit missing _source; stopping batch so cursor does not \
+                     advance past an unpublished document"
                 );
-                continue;
+                // Keep messages published so far; do not process later hits (would
+                // advance search_after past this doc).
+                break;
             };
 
             if let Some(timestamp_value) = source.get(timestamp_field)
@@ -528,9 +531,11 @@ impl OpenSearchSource {
                 origin_timestamp: None,
                 payload,
             });
+            // Cursor advances only after the document is queued for publish.
+            last_sort = Some(sort);
         }
 
-        if !hits.is_empty() && last_sort.is_none() {
+        if !hits.is_empty() && hits_with_sort == 0 {
             return Err(Error::Storage(format!(
                 "OpenSearch returned {} hit(s) but none had a sort tuple; \
                  index may be missing the sort field or using an incompatible mapping",
@@ -538,13 +543,13 @@ impl OpenSearchSource {
             )));
         }
 
-        // Guard: cursor would advance past the entire batch but nothing would be published.
-        // This happens when _source is disabled on the index (all sort-bearing hits lack _source).
-        if !hits.is_empty() && messages.is_empty() && last_sort.is_some() {
+        // All sort-bearing hits failed to publish (e.g. _source disabled), or the first
+        // hit lacked _source — refuse to advance search_after.
+        if hits_with_sort > 0 && messages.is_empty() {
             return Err(Error::Storage(format!(
-                "OpenSearch returned {} hit(s) with valid sort tuples but all were missing \
-                 _source; index may have _source disabled. Refusing to advance cursor \
-                 without publishing any messages.",
+                "OpenSearch returned {} hit(s) with valid sort tuples but none could be \
+                 published (missing _source). Refusing to advance cursor without \
+                 publishing any messages.",
                 hits.len()
             )));
         }

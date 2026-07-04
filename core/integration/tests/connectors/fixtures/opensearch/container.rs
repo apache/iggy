@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::connectors::fixtures;
 use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
@@ -24,13 +23,22 @@ use serde::Deserialize;
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers_modules::testcontainers::{
+    ContainerAsync, GenericImage, ImageExt, ReuseDirective,
+};
 use tracing::info;
 
 const OPENSEARCH_IMAGE: &str = "docker.io/opensearchproject/opensearch";
 const OPENSEARCH_TAG: &str = "2.19.1";
 const OPENSEARCH_PORT: u16 = 9200;
 const OPENSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
+// Fixed name + ReuseDirective::Always shares one container across nextest's
+// per-test processes: the first test creates it, every later test attaches by
+// name. Per-test isolation comes from a unique index per fixture (see
+// source.rs), not a fresh container; create_index/create_typed_fields_index
+// still delete any leftover index of the same name first as a defensive
+// cleanup against stale data in the shared instance.
+const OPENSEARCH_CONTAINER_NAME: &str = "iggy-test-opensearch";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -110,7 +118,8 @@ impl OpenSearchContainer {
             .with_env_var("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "iggy-test-password1!")
             .with_env_var("OPENSEARCH_JAVA_OPTS", "-Xms512m -Xmx512m")
             .with_mapped_port(0, OPENSEARCH_PORT.tcp())
-            .with_container_name(fixtures::unique_container_name("opensearch"))
+            .with_container_name(OPENSEARCH_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
             .start()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
@@ -158,11 +167,43 @@ pub trait OpenSearchOps: Sync {
     fn container(&self) -> &OpenSearchContainer;
     fn http_client(&self) -> &HttpClient;
 
+    /// Deletes `index_name` if it exists, guarding against stale data left
+    /// behind under the same name in the shared, reused container.
+    fn delete_index_if_exists(
+        &self,
+        index_name: &str,
+    ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
+        async move {
+            let url = format!("{}/{}", self.container().base_url, index_name);
+            let response = self.http_client().delete(&url).send().await.map_err(|e| {
+                TestBinaryError::FixtureSetup {
+                    fixture_type: "OpenSearchOps".to_string(),
+                    message: format!("Failed to delete stale index: {e}"),
+                }
+            })?;
+
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::NOT_FOUND
+            {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(TestBinaryError::FixtureSetup {
+                    fixture_type: "OpenSearchOps".to_string(),
+                    message: format!("Failed to delete stale index: status={status}, body={body}"),
+                });
+            }
+
+            Ok(())
+        }
+    }
+
     fn create_index(
         &self,
         index_name: &str,
     ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
         async move {
+            self.delete_index_if_exists(index_name).await?;
+
             let url = format!("{}/{}", self.container().base_url, index_name);
             let mapping = serde_json::json!({
                 "mappings": {
@@ -206,6 +247,8 @@ pub trait OpenSearchOps: Sync {
         index_name: &str,
     ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
         async move {
+            self.delete_index_if_exists(index_name).await?;
+
             let url = format!("{}/{}", self.container().base_url, index_name);
             let mapping = serde_json::json!({
                 "mappings": {
