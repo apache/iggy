@@ -20,6 +20,7 @@
 // TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
 // attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -727,6 +728,243 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
         ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                   invalid_partition_id, true),
                      std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsBeforeLoginThrows) {
+    RecordProperty("description",
+                   "Rejects delete_segments before connect, after connect but before login, and after disconnect.");
+    const std::string stream_name   = GetRandomName();
+    const std::string topic_name    = GetRandomName();
+    iggy::ffi::Client *setup_client = GetLoggedInClient();
+
+    ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
+                                               "never_expire", 0, "server_default"));
+
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
+                                                         make_string_identifier(topic_name), 0, 1),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
+                                                         make_string_identifier(topic_name), 0, 1),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
+                                                         make_string_identifier(topic_name), 0, 1),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when deleting segments from a stream that does not exist.");
+    const std::string stream_name         = GetRandomName();
+    const std::string topic_name          = GetRandomName();
+    const std::string missing_stream_name = GetRandomName();
+    iggy::ffi::Client *client             = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    ASSERT_THROW(
+        client->delete_segments(make_string_identifier(missing_stream_name), make_string_identifier(topic_name), 0, 1),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when deleting segments from a topic that does not exist.");
+    const std::string stream_name        = GetRandomName();
+    const std::string topic_name         = GetRandomName();
+    const std::string missing_topic_name = GetRandomName();
+    iggy::ffi::Client *client            = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    ASSERT_THROW(
+        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(missing_topic_name), 0, 1),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentPartitionThrows) {
+    RecordProperty("description", "Throws when deleting segments from a partition that does not exist.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    ASSERT_THROW(
+        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 999, 1),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
+    RecordProperty("description", "Treats delete_segments with count 0 as a no-op.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    std::uint32_t stream_id = 0;
+    std::uint32_t topic_id  = 0;
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        ASSERT_EQ(stream_details.topics.size(), 1u);
+        stream_id = stream_details.id;
+        topic_id  = stream_details.topics.front().id;
+    });
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 5; ++i) {
+        messages.push_back(iggy::ffi::make_message(to_payload("zero-count-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    iggy::ffi::Partition partition_before_delete{};
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
+        for (const auto &partition : topic_details.partitions) {
+            if (partition.id == 0) {
+                partition_before_delete = partition;
+                break;
+            }
+        }
+    });
+
+    iggy::ffi::PolledMessages polled_before_delete{};
+    ASSERT_NO_THROW({
+        polled_before_delete =
+            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+                                  make_numeric_identifier(1005), "offset", 0, 1000, false);
+    });
+
+    ASSERT_NO_THROW(
+        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 0, 0));
+
+    iggy::ffi::Partition partition_after_delete{};
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
+        for (const auto &partition : topic_details.partitions) {
+            if (partition.id == 0) {
+                partition_after_delete = partition;
+                break;
+            }
+        }
+    });
+
+    iggy::ffi::PolledMessages polled_after_delete{};
+    ASSERT_NO_THROW({
+        polled_after_delete =
+            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+                                  make_numeric_identifier(1006), "offset", 0, 1000, false);
+    });
+
+    EXPECT_EQ(partition_after_delete.segments_count, partition_before_delete.segments_count);
+    EXPECT_EQ(partition_after_delete.current_offset, partition_before_delete.current_offset);
+    EXPECT_EQ(partition_after_delete.messages_count, partition_before_delete.messages_count);
+    EXPECT_EQ(partition_after_delete.size_bytes, partition_before_delete.size_bytes);
+    EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
+    ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
+    for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
+        EXPECT_EQ(polled_after_delete.messages[i].offset, polled_before_delete.messages[i].offset);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
+    RecordProperty("description",
+                   "Keeps the partition unchanged when delete_segments is called with only the active segment.");
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
+                                         0, "server_default"));
+
+    std::uint32_t stream_id = 0;
+    std::uint32_t topic_id  = 0;
+    ASSERT_NO_THROW({
+        const auto stream_details = client->get_stream(make_string_identifier(stream_name));
+        ASSERT_EQ(stream_details.topics.size(), 1u);
+        stream_id = stream_details.id;
+        topic_id  = stream_details.topics.front().id;
+    });
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 5; ++i) {
+        messages.push_back(iggy::ffi::make_message(to_payload("active-only-" + std::to_string(i))));
+    }
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    iggy::ffi::Partition partition_before_delete{};
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
+        for (const auto &partition : topic_details.partitions) {
+            if (partition.id == 0) {
+                partition_before_delete = partition;
+                break;
+            }
+        }
+    });
+    ASSERT_EQ(partition_before_delete.segments_count, 1u);
+
+    iggy::ffi::PolledMessages polled_before_delete{};
+    ASSERT_NO_THROW({
+        polled_before_delete =
+            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+                                  make_numeric_identifier(1007), "offset", 0, 1000, false);
+    });
+
+    ASSERT_NO_THROW(
+        client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 0, 1));
+
+    iggy::ffi::Partition partition_after_delete{};
+    ASSERT_NO_THROW({
+        const auto topic_details =
+            client->get_topic(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id));
+        for (const auto &partition : topic_details.partitions) {
+            if (partition.id == 0) {
+                partition_after_delete = partition;
+                break;
+            }
+        }
+    });
+
+    iggy::ffi::PolledMessages polled_after_delete{};
+    ASSERT_NO_THROW({
+        polled_after_delete =
+            client->poll_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id), 0, "consumer",
+                                  make_numeric_identifier(1008), "offset", 0, 1000, false);
+    });
+
+    EXPECT_EQ(partition_after_delete.segments_count, partition_before_delete.segments_count);
+    EXPECT_EQ(partition_after_delete.current_offset, partition_before_delete.current_offset);
+    EXPECT_EQ(partition_after_delete.messages_count, partition_before_delete.messages_count);
+    EXPECT_EQ(partition_after_delete.size_bytes, partition_before_delete.size_bytes);
+    EXPECT_EQ(polled_after_delete.count, polled_before_delete.count);
+    ASSERT_EQ(polled_after_delete.messages.size(), polled_before_delete.messages.size());
+    for (std::size_t i = 0; i < polled_before_delete.messages.size(); ++i) {
+        EXPECT_EQ(polled_after_delete.messages[i].offset, polled_before_delete.messages[i].offset);
     }
 }
 
