@@ -29,6 +29,7 @@ publish = false
 
 [features]
 systemd = ["dep:sd-notify", "dep:tokio-util"]
+vsr = ["iggy/vsr"]
 
 [dependencies]
 axum = { workspace = true }

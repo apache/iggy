@@ -27,6 +27,7 @@ mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod s3;
 mod wiremock;
 
 /// Prefix on every test container name so `just clean-test-containers` reaps
@@ -76,4 +77,5 @@ pub use postgres::{
     PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

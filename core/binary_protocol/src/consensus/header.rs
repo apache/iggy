@@ -372,6 +372,12 @@ pub enum EvictionReason {
     /// Client missed heartbeats past the configured threshold; the server
     /// evicted the session (and dropped it from any consumer groups).
     StaleClient = 13,
+    /// Client protocol version outside the server's accepted range; the
+    /// header carries `server_protocol_version{,_min}` so the SDK can
+    /// report the exact window.
+    IncompatibleProtocol = 14,
+    /// Login body without a decodable `ClientVersionInfo` prefix.
+    MalformedLogin = 15,
 }
 
 // EvictionHeader - primary -> client (session-terminal, no body)
@@ -393,7 +399,10 @@ pub struct EvictionHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    pub reserved: [u8; 111],
+    /// Accepted protocol window on `IncompatibleProtocol`; zero otherwise.
+    pub server_protocol_version: u32,
+    pub server_protocol_version_min: u32,
+    pub reserved: [u8; 103],
     pub reason: EvictionReason,
 }
 const _: () = {
@@ -402,6 +411,8 @@ const _: () = {
         offset_of!(EvictionHeader, client)
             == offset_of!(EvictionHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
+    assert!(offset_of!(EvictionHeader, server_protocol_version) == 144);
+    assert!(offset_of!(EvictionHeader, server_protocol_version_min) == 148);
     assert!(offset_of!(EvictionHeader, reason) + size_of::<EvictionReason>() == HEADER_SIZE);
 };
 
@@ -414,7 +425,8 @@ impl EvictionHeader {
     /// # Panics (debug)
     /// On `ClientReleaseTooLow`/`ClientReleaseTooHigh`: `release` hardcoded
     /// to 0, those reasons need real bounds. Add `release_min`/`release_max`
-    /// params before emitting them.
+    /// params before emitting them. On `IncompatibleProtocol`: needs the
+    /// accepted protocol window, use [`Self::incompatible_protocol`] instead.
     ///
     /// # Safety
     /// `client` must be non-zero , `validate` rejects zero so SDKs can
@@ -431,9 +443,11 @@ impl EvictionHeader {
         debug_assert!(
             !matches!(
                 reason,
-                EvictionReason::ClientReleaseTooLow | EvictionReason::ClientReleaseTooHigh,
+                EvictionReason::ClientReleaseTooLow
+                    | EvictionReason::ClientReleaseTooHigh
+                    | EvictionReason::IncompatibleProtocol,
             ),
-            "EvictionHeader::new: ClientRelease* needs release_min/release_max",
+            "EvictionHeader::new: ClientRelease*/IncompatibleProtocol need extra fields",
         );
         // Cap from consensus REPLICAS_MAX=32; literal here to avoid
         // wire-proto crate depending on consensus crate.
@@ -452,9 +466,29 @@ impl EvictionHeader {
             replica,
             reserved_frame: [0; 66],
             client,
-            reserved: [0; 111],
+            server_protocol_version: 0,
+            server_protocol_version_min: 0,
+            reserved: [0; 103],
             reason,
         }
+    }
+
+    /// Protocol-version rejection carrying the accepted window so the SDK
+    /// can report `client X, server accepts [min, max]`.
+    #[must_use]
+    pub const fn incompatible_protocol(
+        cluster: u128,
+        view: u32,
+        replica: u8,
+        client: u128,
+        server_protocol_version: u32,
+        server_protocol_version_min: u32,
+    ) -> Self {
+        let mut header = Self::new(cluster, view, replica, client, EvictionReason::NoSession);
+        header.reason = EvictionReason::IncompatibleProtocol;
+        header.server_protocol_version = server_protocol_version;
+        header.server_protocol_version_min = server_protocol_version_min;
+        header
     }
 }
 
@@ -509,6 +543,22 @@ impl ConsensusHeader for EvictionHeader {
         if self.reason == EvictionReason::Reserved {
             return Err(ConsensusError::InvalidField(
                 "eviction: reason must not be Reserved".to_string(),
+            ));
+        }
+        // Protocol window only travels on IncompatibleProtocol; anywhere
+        // else a nonzero value is smuggling (same rule as reserved bytes).
+        if self.reason == EvictionReason::IncompatibleProtocol {
+            if self.server_protocol_version_min == 0
+                || self.server_protocol_version < self.server_protocol_version_min
+            {
+                return Err(ConsensusError::InvalidField(
+                    "eviction: incompatible-protocol window must satisfy 1 <= min <= max"
+                        .to_string(),
+                ));
+            }
+        } else if self.server_protocol_version != 0 || self.server_protocol_version_min != 0 {
+            return Err(ConsensusError::InvalidField(
+                "eviction: protocol window bytes must be zero".to_string(),
             ));
         }
         Ok(())
@@ -1079,6 +1129,38 @@ mod tests {
         assert_eq!(EvictionReason::UserInactive as u8, 11);
         assert_eq!(EvictionReason::SessionError as u8, 12);
         assert_eq!(EvictionReason::StaleClient as u8, 13);
+        assert_eq!(EvictionReason::IncompatibleProtocol as u8, 14);
+        assert_eq!(EvictionReason::MalformedLogin as u8, 15);
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_accepts_valid_window() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 2, 1);
+        assert!(header.validate().is_ok());
+        assert_eq!(header.reason, EvictionReason::IncompatibleProtocol);
+        assert_eq!(header.server_protocol_version, 2);
+        assert_eq!(header.server_protocol_version_min, 1);
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_rejects_inverted_window() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 1, 2);
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_rejects_zero_min() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 1, 0);
+        assert!(header.validate().is_err());
+    }
+
+    // Protocol window is IncompatibleProtocol-only; nonzero elsewhere is
+    // smuggling, same rule as the reserved-byte guards.
+    #[test]
+    fn eviction_validate_rejects_window_on_other_reason() {
+        let mut header = EvictionHeader::new(0, 0, 0, 0xCAFE, EvictionReason::NoSession);
+        header.server_protocol_version = 1;
+        assert!(header.validate().is_err());
     }
 
     #[test]
