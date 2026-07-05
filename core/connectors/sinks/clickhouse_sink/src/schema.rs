@@ -244,6 +244,16 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             .trim()
             .parse()
             .map_err(|_| init_err(format!("Invalid Decimal scale: {s_str}")))?;
+        // This sink does not support Decimal256 (precision 39-76): it needs a
+        // 256-bit integer with no std equivalent, and is rare enough in practice
+        // not to justify the dependency. The serialiser only emits up to i128
+        // (16 bytes), so a 32-byte Decimal256 would silently shift every
+        // following column. Reject at parse time so open() fails fast.
+        if precision > 38 {
+            return Err(init_err(format!(
+                "Decimal precision must be 1-38 (Decimal256 unsupported), got {precision}"
+            )));
+        }
         return Ok(ChType::Decimal(precision, scale));
     }
     // e.g. "Decimal32(4)"
@@ -556,6 +566,13 @@ mod tests {
     fn parses_decimal64() {
         let t = parse_type("Decimal64(6)").unwrap();
         assert!(matches!(t, ChType::Decimal(18, 6)));
+    }
+
+    #[test]
+    fn rejects_decimal256_precision() {
+        // Precision 39-76 is Decimal256 (32 bytes), unsupported by RowBinary here.
+        assert!(parse_type("Decimal(39, 2)").is_err());
+        assert!(parse_type("Decimal(76, 2)").is_err());
     }
 
     #[test]
