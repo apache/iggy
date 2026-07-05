@@ -218,11 +218,17 @@ pub(crate) fn serialize_value(
         // ── Date types ───────────────────────────────────────────────────────
         ChType::Date => {
             // Days since 1970-01-01 as UInt16. Accept integer or "YYYY-MM-DD".
-            let days = coerce_to_days(value)? as u16;
+            let days = u16::try_from(coerce_to_days(value)?).map_err(|_| {
+                error!("Value out of range for Date (1970-01-01..2149-06-06)");
+                Error::InvalidRecord
+            })?;
             buf.extend_from_slice(&days.to_le_bytes());
         }
         ChType::Date32 => {
-            let days = coerce_to_days(value)? as i32;
+            let days = i32::try_from(coerce_to_days(value)?).map_err(|_| {
+                error!("Value out of range for Date32");
+                Error::InvalidRecord
+            })?;
             buf.extend_from_slice(&days.to_le_bytes());
         }
         ChType::DateTime => {
