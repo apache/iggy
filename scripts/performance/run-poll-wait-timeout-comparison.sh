@@ -140,7 +140,7 @@ function bench_transport() {
         echo "tcp"
         ;;
     websocket)
-        echo "websocket"
+        echo "web-socket"
         ;;
     quic)
         echo "quic"
