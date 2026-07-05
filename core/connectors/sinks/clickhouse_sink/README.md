@@ -80,9 +80,9 @@ insert_format = "json_each_row"
 
 Accepts messages with a `Payload::Json` payload. At startup the connector fetches the table schema from `system.columns` and validates that all column types are supported. Messages are then serialised to ClickHouse's `RowBinaryWithDefaults` binary format, which is more efficient than JSON for large volumes.
 
-The table must already exist. Columns with a `DEFAULT` or `MATERIALIZED` expression can be omitted from the message — the connector will emit a `0x01` prefix byte to signal that the default should be used.
+The table must already exist. Columns with an ordinary `DEFAULT` expression can be omitted from the message — the connector emits a `0x01` prefix byte to signal that the default should be used. `MATERIALIZED`, `ALIAS`, and `EPHEMERAL` columns are not insertable and are dropped from the schema entirely.
 
-**Supported types:** all integer and float primitives, `String`, `FixedString(n)`, `Bool`/`Boolean`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64(p)`, `Decimal`, `IPv4`, `IPv6`, `Enum8`, `Enum16`, and the composites `Nullable(T)`, `Array(T)`, `Map(K, V)`, `Tuple(...)`. `LowCardinality(T)` is transparently unwrapped to its inner type `T` (RowBinary serialises it identically).
+**Supported types:** all integer and float primitives, `String`, `FixedString(n)`, `Bool`/`Boolean`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64(p)`, `Decimal` (precision 1-38; `Decimal256` is not supported), `IPv4`, `IPv6`, `Enum8`, `Enum16`, and the composites `Nullable(T)`, `Array(T)`, `Map(K, V)`, `Tuple(...)`. `LowCardinality(T)` is transparently unwrapped to its inner type `T` (RowBinary serialises it identically).
 
 **Unsupported types** (cause startup to fail): `Variant`, `JSON` (native column type), and geo types.
 
@@ -166,7 +166,7 @@ string_format = "csv"
 
 ## Reliability
 
-The connector retries failed inserts up to `max_retries` times with a fixed delay of `retry_delay` between attempts. The delay is applied as-is on each attempt (not exponential backoff). Non-retryable errors fail immediately.
+The connector retries failed inserts up to `max_retries` times, starting from `retry_delay`. Retryable HTTP errors back off exponentially with full jitter; network errors back off linearly with the attempt count. Non-retryable errors fail immediately.
 
 On shutdown the connector logs the total number of messages processed.
 
