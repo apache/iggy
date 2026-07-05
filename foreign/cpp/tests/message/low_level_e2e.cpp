@@ -449,6 +449,355 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     EXPECT_EQ(polled.messages[3].payload[3], 0xEF);
 }
 
+TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
+    RecordProperty(
+        "description",
+        "Sends one message per typed header kind and verifies payload, IDs, header contents, and encoded size.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    struct ExpectedHeaderMessage {
+        const char *key;
+        iggy::ffi::HeaderKind value_kind;
+        const rust::Vec<std::uint8_t> *value;
+    };
+
+    const rust::Vec<std::uint8_t> raw_value{0xDE, 0xAD, 0xBE, 0xEF};                            // raw bytes 0xDEADBEEF
+    const rust::Vec<std::uint8_t> string_value = to_payload("hello");                           // UTF-8 string "hello"
+    const rust::Vec<std::uint8_t> bool_value{0x01};                                             // bool true
+    const rust::Vec<std::uint8_t> int8_value{0xFB};                                             // int8 -5
+    const rust::Vec<std::uint8_t> int16_value{0x2E, 0xFB};                                      // int16 -1234
+    const rust::Vec<std::uint8_t> int32_value{0xEB, 0x32, 0xA4, 0xF8};                          // int32 -123456789
+    const rust::Vec<std::uint8_t> int64_value{0x79, 0x29, 0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // int64 -1234567
+    const rust::Vec<std::uint8_t> int128_value{
+        0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11};                 // int128 0x112233445566778899AABBCCDDEEFF00
+    const rust::Vec<std::uint8_t> uint8_value{0xFA};                     // uint8 250
+    const rust::Vec<std::uint8_t> uint16_value{0xD2, 0x04};              // uint16 1234
+    const rust::Vec<std::uint8_t> uint32_value{0x78, 0x56, 0x34, 0x12};  // uint32 0x12345678
+    const rust::Vec<std::uint8_t> uint64_value{0x88, 0x77, 0x66, 0x55,
+                                               0x44, 0x33, 0x22, 0x11};  // uint64 0x1122334455667788
+    const rust::Vec<std::uint8_t> uint128_value{
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
+        0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01};                  // uint128 0x0123456789ABCDEFFEDCBA9876543210
+    const rust::Vec<std::uint8_t> float32_value{0x00, 0x00, 0x80, 0x3F};  // float32 1.0
+    const rust::Vec<std::uint8_t> float64_value{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F};  // float64 1.0
+    const ExpectedHeaderMessage expected_messages[] = {
+        {"raw", iggy::ffi::HeaderKind::Raw, &raw_value},
+        {"string", iggy::ffi::HeaderKind::String, &string_value},
+        {"bool", iggy::ffi::HeaderKind::Bool, &bool_value},
+        {"int8", iggy::ffi::HeaderKind::Int8, &int8_value},
+        {"int16", iggy::ffi::HeaderKind::Int16, &int16_value},
+        {"int32", iggy::ffi::HeaderKind::Int32, &int32_value},
+        {"int64", iggy::ffi::HeaderKind::Int64, &int64_value},
+        {"int128", iggy::ffi::HeaderKind::Int128, &int128_value},
+        {"uint8", iggy::ffi::HeaderKind::UInt8, &uint8_value},
+        {"uint16", iggy::ffi::HeaderKind::UInt16, &uint16_value},
+        {"uint32", iggy::ffi::HeaderKind::UInt32, &uint32_value},
+        {"uint64", iggy::ffi::HeaderKind::UInt64, &uint64_value},
+        {"uint128", iggy::ffi::HeaderKind::UInt128, &uint128_value},
+        {"float32", iggy::ffi::HeaderKind::Float32, &float32_value},
+        {"float64", iggy::ffi::HeaderKind::Float64, &float64_value},
+    };
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (const auto &expected : expected_messages) {
+        rust::Vec<iggy::ffi::HeaderEntry> headers;
+        headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload(expected.key)),
+                                            make_header_field(expected.value_kind, *expected.value)));
+
+        messages.push_back(
+            iggy::ffi::make_message(to_payload(std::string("payload-") + expected.key), std::move(headers)));
+    }
+
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), "offset", 0, 100, false);
+
+    constexpr std::size_t expected_message_count = sizeof(expected_messages) / sizeof(expected_messages[0]);
+    ASSERT_EQ(polled.count, expected_message_count);
+    ASSERT_EQ(polled.messages.size(), expected_message_count);
+    for (std::size_t i = 0; i < expected_message_count; ++i) {
+        const auto &expected       = expected_messages[i];
+        const auto &polled_message = polled.messages[i];
+
+        EXPECT_EQ(std::string(polled_message.payload.begin(), polled_message.payload.end()),
+                  std::string("payload-") + expected.key);
+        ASSERT_EQ(polled_message.user_headers.size(), 1u);
+        EXPECT_EQ(polled_message.user_headers_length,
+                  static_cast<std::uint32_t>(10 + std::string(expected.key).size() + expected.value->size()));
+        EXPECT_TRUE(has_header(polled_message.user_headers, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::String),
+                               to_payload(expected.key), static_cast<std::uint8_t>(expected.value_kind),
+                               *expected.value));
+    }
+}
+
+TEST_F(LowLevelE2E_Message, SendMessageWithDuplicateTypedHeaderKeysThrows) {
+    RecordProperty("description", "Throws when a single message contains duplicate typed header keys.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::HeaderEntry> headers;
+    headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("dup-key")),
+                                        make_header_field(iggy::ffi::HeaderKind::String, to_payload("first"))));
+    headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("dup-key")),
+                                        make_header_field(iggy::ffi::HeaderKind::String, to_payload("second"))));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
+
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(messages)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
+    RecordProperty("description", "Throws when a typed header uses a fixed-width kind with the wrong byte count.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    struct FixedWidthHeaderCase {
+        const char *key;
+        iggy::ffi::HeaderKind kind;
+    };
+    const FixedWidthHeaderCase fixed_width_header_cases[] = {
+        {"broken-bool", iggy::ffi::HeaderKind::Bool},       {"broken-int8", iggy::ffi::HeaderKind::Int8},
+        {"broken-int16", iggy::ffi::HeaderKind::Int16},     {"broken-int32", iggy::ffi::HeaderKind::Int32},
+        {"broken-int64", iggy::ffi::HeaderKind::Int64},     {"broken-int128", iggy::ffi::HeaderKind::Int128},
+        {"broken-uint8", iggy::ffi::HeaderKind::UInt8},     {"broken-uint16", iggy::ffi::HeaderKind::UInt16},
+        {"broken-uint32", iggy::ffi::HeaderKind::UInt32},   {"broken-uint64", iggy::ffi::HeaderKind::UInt64},
+        {"broken-uint128", iggy::ffi::HeaderKind::UInt128}, {"broken-float32", iggy::ffi::HeaderKind::Float32},
+        {"broken-float64", iggy::ffi::HeaderKind::Float64},
+    };
+
+    for (const auto &test_case : fixed_width_header_cases) {
+        SCOPED_TRACE(test_case.key);
+
+        rust::Vec<iggy::ffi::HeaderEntry> headers;
+        rust::Vec<std::uint8_t> broken_width_value;
+        broken_width_value.push_back(0x01);
+        broken_width_value.push_back(0x02);
+        broken_width_value.push_back(0x03);
+        headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload(test_case.key)),
+                                            make_header_field(test_case.kind, std::move(broken_width_value))));
+
+        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+        messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
+
+        ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                           "partition_id", partition_id_bytes(0), std::move(messages)),
+                     std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderKindThrows) {
+    RecordProperty("description", "Throws when a typed header uses an unsupported header kind code.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    iggy::ffi::HeaderField invalid_key;
+    invalid_key.kind  = 255;
+    invalid_key.value = to_payload("bad-kind");
+
+    rust::Vec<iggy::ffi::HeaderEntry> headers;
+    headers.push_back(make_header_entry(std::move(invalid_key),
+                                        make_header_field(iggy::ffi::HeaderKind::String, to_payload("value"))));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(headers)));
+
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(messages)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
+    RecordProperty("description", "Throws when typed header key or value sizes violate Rust header size constraints.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::HeaderEntry> empty_key_headers;
+    empty_key_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, rust::Vec<std::uint8_t>()),
+                          make_header_field(iggy::ffi::HeaderKind::String, to_payload("value"))));
+    rust::Vec<iggy::ffi::IggyMessageToSend> empty_key_messages;
+    empty_key_messages.push_back(iggy::ffi::make_message(to_payload("payload"), std::move(empty_key_headers)));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(empty_key_messages)),
+                 std::exception);
+
+    rust::Vec<iggy::ffi::HeaderEntry> empty_raw_value_headers;
+    empty_raw_value_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("key")),
+                          make_header_field(iggy::ffi::HeaderKind::Raw, rust::Vec<std::uint8_t>())));
+    rust::Vec<iggy::ffi::IggyMessageToSend> empty_raw_value_messages;
+    empty_raw_value_messages.push_back(
+        iggy::ffi::make_message(to_payload("payload"), std::move(empty_raw_value_headers)));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(empty_raw_value_messages)),
+                 std::exception);
+
+    rust::Vec<std::uint8_t> oversized_value_bytes;
+    for (std::size_t index = 0; index < 256; ++index) {
+        oversized_value_bytes.push_back(static_cast<std::uint8_t>(index));
+    }
+    rust::Vec<iggy::ffi::HeaderEntry> oversized_value_headers;
+    oversized_value_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("key")),
+                          make_header_field(iggy::ffi::HeaderKind::Raw, std::move(oversized_value_bytes))));
+    rust::Vec<iggy::ffi::IggyMessageToSend> oversized_value_messages;
+    oversized_value_messages.push_back(
+        iggy::ffi::make_message(to_payload("payload"), std::move(oversized_value_headers)));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(oversized_value_messages)),
+                 std::exception);
+
+    rust::Vec<std::uint8_t> oversized_string_bytes;
+    for (std::size_t index = 0; index < 256; ++index) {
+        oversized_string_bytes.push_back('a');
+    }
+    rust::Vec<iggy::ffi::HeaderEntry> oversized_string_headers;
+    oversized_string_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("key")),
+                          make_header_field(iggy::ffi::HeaderKind::String, std::move(oversized_string_bytes))));
+    rust::Vec<iggy::ffi::IggyMessageToSend> oversized_string_messages;
+    oversized_string_messages.push_back(
+        iggy::ffi::make_message(to_payload("payload"), std::move(oversized_string_headers)));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(oversized_string_messages)),
+                 std::exception);
+}
+
+TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
+    RecordProperty("description",
+                   "Throws when encoded user headers exceed 100_000 bytes and succeeds at exactly 100_000 bytes.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    constexpr std::uint32_t kMaxUserHeadersBytes     = 100'000u;
+    constexpr std::uint32_t kFullHeaderEncodedBytes  = 267u;  // 10 bytes framing + 2-byte key + 255-byte value
+    constexpr std::uint32_t kFullHeaderCount         = 374u;
+    constexpr std::uint32_t kTailExactValueBytes     = 130u;
+    constexpr std::uint32_t kTailOversizedValueBytes = 131u;
+
+    rust::Vec<iggy::ffi::HeaderEntry> oversized_headers;
+    for (std::uint32_t index = 0; index < kFullHeaderCount; ++index) {
+        rust::Vec<std::uint8_t> key_bytes;
+        key_bytes.push_back(static_cast<std::uint8_t>(index & 0xFF));
+        key_bytes.push_back(static_cast<std::uint8_t>((index >> 8) & 0xFF));
+
+        rust::Vec<std::uint8_t> value_bytes;
+        for (std::uint32_t value_index = 0; value_index < 255u; ++value_index) {
+            value_bytes.push_back(static_cast<std::uint8_t>(value_index));
+        }
+
+        oversized_headers.push_back(
+            make_header_entry(make_header_field(iggy::ffi::HeaderKind::Raw, std::move(key_bytes)),
+                              make_header_field(iggy::ffi::HeaderKind::Raw, std::move(value_bytes))));
+    }
+    rust::Vec<std::uint8_t> oversized_tail_key_bytes;
+    oversized_tail_key_bytes.push_back(static_cast<std::uint8_t>(kFullHeaderCount & 0xFF));
+    oversized_tail_key_bytes.push_back(static_cast<std::uint8_t>((kFullHeaderCount >> 8) & 0xFF));
+    rust::Vec<std::uint8_t> oversized_tail_value_bytes;
+    for (std::uint32_t value_index = 0; value_index < kTailOversizedValueBytes; ++value_index) {
+        oversized_tail_value_bytes.push_back(static_cast<std::uint8_t>(value_index));
+    }
+    oversized_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::Raw, std::move(oversized_tail_key_bytes)),
+                          make_header_field(iggy::ffi::HeaderKind::Raw, std::move(oversized_tail_value_bytes))));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> oversized_messages;
+    oversized_messages.push_back(
+        iggy::ffi::make_message(to_payload("oversized-user-headers"), std::move(oversized_headers)));
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                                       partition_id_bytes(0), std::move(oversized_messages)),
+                 std::exception);
+
+    rust::Vec<iggy::ffi::HeaderEntry> exact_headers;
+    for (std::uint32_t index = 0; index < kFullHeaderCount; ++index) {
+        rust::Vec<std::uint8_t> key_bytes;
+        key_bytes.push_back(static_cast<std::uint8_t>(index & 0xFF));
+        key_bytes.push_back(static_cast<std::uint8_t>((index >> 8) & 0xFF));
+
+        rust::Vec<std::uint8_t> value_bytes;
+        for (std::uint32_t value_index = 0; value_index < 255u; ++value_index) {
+            value_bytes.push_back(static_cast<std::uint8_t>(value_index));
+        }
+
+        exact_headers.push_back(
+            make_header_entry(make_header_field(iggy::ffi::HeaderKind::Raw, std::move(key_bytes)),
+                              make_header_field(iggy::ffi::HeaderKind::Raw, std::move(value_bytes))));
+    }
+    rust::Vec<std::uint8_t> exact_tail_key_bytes;
+    exact_tail_key_bytes.push_back(static_cast<std::uint8_t>(kFullHeaderCount & 0xFF));
+    exact_tail_key_bytes.push_back(static_cast<std::uint8_t>((kFullHeaderCount >> 8) & 0xFF));
+    rust::Vec<std::uint8_t> exact_tail_value_bytes;
+    for (std::uint32_t value_index = 0; value_index < kTailExactValueBytes; ++value_index) {
+        exact_tail_value_bytes.push_back(static_cast<std::uint8_t>(value_index));
+    }
+    exact_headers.push_back(
+        make_header_entry(make_header_field(iggy::ffi::HeaderKind::Raw, std::move(exact_tail_key_bytes)),
+                          make_header_field(iggy::ffi::HeaderKind::Raw, std::move(exact_tail_value_bytes))));
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> exact_messages;
+    exact_messages.push_back(iggy::ffi::make_message(to_payload("exact-user-headers"), std::move(exact_headers)));
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                          "partition_id", partition_id_bytes(0), std::move(exact_messages)));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), "offset", 0, 10, false);
+
+    ASSERT_EQ(polled.count, 1u);
+    ASSERT_EQ(polled.messages.size(), 1u);
+    EXPECT_EQ(std::string(polled.messages[0].payload.begin(), polled.messages[0].payload.end()), "exact-user-headers");
+    EXPECT_EQ(polled.messages[0].user_headers_length, kMaxUserHeadersBytes);
+    EXPECT_EQ(polled.messages[0].user_headers.size(), kFullHeaderCount + 1u);
+    EXPECT_EQ(kFullHeaderCount * kFullHeaderEncodedBytes + 10u + 2u + kTailExactValueBytes, kMaxUserHeadersBytes);
+}
+
 TEST_F(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
     RecordProperty("description", "Throws when polling messages before authentication.");
     iggy::ffi::Client *client = GetLoggedOutClient();
