@@ -28,6 +28,8 @@ TRANSPORT="tcp"
 SKIP_BUILD=false
 DRY_RUN=false
 QUICK=false
+RESOURCE_SAMPLING=true
+SAMPLE_INTERVAL_SECONDS=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +52,14 @@ while [[ $# -gt 0 ]]; do
     --transport)
         TRANSPORT="$2"
         shift 2
+        ;;
+    --sample-interval)
+        SAMPLE_INTERVAL_SECONDS="$2"
+        shift 2
+        ;;
+    --no-resource-sampling)
+        RESOURCE_SAMPLING=false
+        shift
         ;;
     --skip-build)
         SKIP_BUILD=true
@@ -78,6 +88,11 @@ tcp | websocket | quic)
     exit 1
     ;;
 esac
+
+if ! [[ "$SAMPLE_INTERVAL_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Invalid sample interval: ${SAMPLE_INTERVAL_SECONDS}" >&2
+    exit 1
+fi
 
 source "$(dirname "$0")/../utils.sh"
 source "$(dirname "$0")/utils.sh"
@@ -108,13 +123,16 @@ if [[ "$QUICK" == true ]]; then
     SPARSE_BATCHES=30
     SATURATED_BATCHES=20
     GROUP_BATCHES=20
+    BUSY_LOOP_BATCHES=20
 else
     SPARSE_BATCHES=1000
     SATURATED_BATCHES=250
     GROUP_BATCHES=1000
+    BUSY_LOOP_BATCHES=200
 fi
 
 wait_timeouts=("0s" "10ms" "100ms" "1s")
+busy_loop_wait_timeouts=("0s" "100ms")
 
 function bench_transport() {
     case "$TRANSPORT" in
@@ -134,6 +152,108 @@ function result_log_name() {
     local suite="$1"
     local wait_timeout="$2"
     echo "${OUTPUT_DIR}/${suite}_wait_${wait_timeout//[^a-zA-Z0-9]/_}.log"
+}
+
+function snapshot_network_bytes() {
+    local platform
+    platform=$(uname -s)
+
+    if [[ "$platform" == "Darwin" ]]; then
+        netstat -ibn 2>/dev/null | awk 'NR > 1 { rx += $7; tx += $10 } END { printf "%.0f %.0f\n", rx, tx }'
+        return
+    fi
+
+    if [[ -d /sys/class/net ]]; then
+        local rx=0
+        local tx=0
+        local iface
+        for iface in /sys/class/net/*; do
+            if [[ -r "$iface/statistics/rx_bytes" && -r "$iface/statistics/tx_bytes" ]]; then
+                rx=$((rx + $(<"$iface/statistics/rx_bytes")))
+                tx=$((tx + $(<"$iface/statistics/tx_bytes")))
+            fi
+        done
+        echo "$rx $tx"
+        return
+    fi
+
+    echo "0 0"
+}
+
+function sample_role_resources() {
+    local role="$1"
+    local process_name="$2"
+    local resource_log="$3"
+    local pids
+    local pid
+    local line
+
+    pids=$(pgrep -x "$process_name" || true)
+    for pid in $pids; do
+        line=$(ps -p "$pid" -o pid= -o %cpu= -o rss= 2>/dev/null | awk '{$1=$1; print}' || true)
+        if [[ -n "$line" ]]; then
+            awk -v ts="$(date +%s)" -v role="$role" '{ print ts "," role "," $1 "," $2 "," $3 }' <<<"$line" >>"$resource_log"
+        fi
+    done
+}
+
+function sample_process_resources() {
+    local resource_log="$1"
+
+    while true; do
+        sample_role_resources "server" "iggy-server" "$resource_log"
+        sample_role_resources "bench" "iggy-bench" "$resource_log"
+        sleep "$SAMPLE_INTERVAL_SECONDS"
+    done
+}
+
+function stop_resource_sampler() {
+    local sampler_pid="$1"
+
+    if [[ -n "$sampler_pid" ]]; then
+        kill "$sampler_pid" 2>/dev/null || true
+        wait "$sampler_pid" 2>/dev/null || true
+    fi
+}
+
+function summarize_resource_role() {
+    local resource_log="$1"
+    local role="$2"
+
+    awk -F, -v role="$role" '
+        $2 == role {
+            count++;
+            cpu += $4;
+            if ($4 > max_cpu) { max_cpu = $4; }
+            if ($5 > max_rss) { max_rss = $5; }
+        }
+        END {
+            if (count > 0) {
+                printf "Resource summary: %s avg_cpu=%.2f%% max_cpu=%.2f%% max_rss_kb=%d samples=%d\n", role, cpu / count, max_cpu, max_rss, count;
+            } else {
+                printf "Resource summary: %s no samples captured\n", role;
+            }
+        }
+    ' "$resource_log"
+}
+
+function append_resource_summary() {
+    local log_file="$1"
+    local resource_log="$2"
+    local net_before_rx="$3"
+    local net_before_tx="$4"
+    local net_after_rx="$5"
+    local net_after_tx="$6"
+    local rx_delta=$((net_after_rx - net_before_rx))
+    local tx_delta=$((net_after_tx - net_before_tx))
+
+    {
+        echo
+        echo "Resource sampling log: ${resource_log}"
+        summarize_resource_role "$resource_log" "server"
+        summarize_resource_role "$resource_log" "bench"
+        echo "Network bytes delta: rx_bytes=${rx_delta} tx_bytes=${tx_delta}"
+    } | tee -a "$log_file"
 }
 
 function start_server() {
@@ -160,7 +280,14 @@ function run_suite() {
     local wait_timeout="$2"
     local command="$3"
     local log_file
+    local resource_log
+    local sampler_pid=""
+    local net_before_rx=0
+    local net_before_tx=0
+    local net_after_rx=0
+    local net_after_tx=0
     log_file=$(result_log_name "$suite" "$wait_timeout")
+    resource_log="${log_file%.log}_resources.csv"
 
     echo
     echo "Suite: ${suite}, poll wait timeout: ${wait_timeout}"
@@ -171,15 +298,30 @@ function run_suite() {
     fi
 
     start_server
+
+    if [[ "$RESOURCE_SAMPLING" == true ]]; then
+        echo "timestamp,role,pid,cpu_percent,rss_kb" >"$resource_log"
+        read -r net_before_rx net_before_tx < <(snapshot_network_bytes)
+        sample_process_resources "$resource_log" &
+        sampler_pid=$!
+    fi
+
     set +e
     eval "$command" 2>&1 | tee "$log_file"
     local status=${PIPESTATUS[0]}
     set -e
+
+    if [[ "$RESOURCE_SAMPLING" == true ]]; then
+        stop_resource_sampler "$sampler_pid"
+        read -r net_after_rx net_after_tx < <(snapshot_network_bytes)
+        append_resource_summary "$log_file" "$resource_log" "$net_before_rx" "$net_before_tx" "$net_after_rx" "$net_after_tx"
+    fi
+
     stop_server
 
     echo
     echo "Summary from ${log_file}:"
-    grep -E "Results:|Total throughput|latency:" "$log_file" || true
+    grep -E "Results:|Total throughput|latency:|Resource summary:|Network bytes delta:" "$log_file" || true
 
     if [[ $status -ne 0 ]]; then
         echo "Benchmark failed with status ${status}: ${suite}, wait=${wait_timeout}" >&2
@@ -200,6 +342,13 @@ function command_for_sparse_single() {
     echo "${IGGY_BENCH_CMD} --message-size 1000 --messages-per-batch 1 --message-batches ${SPARSE_BATCHES} --rate-limit 10KB --poll-wait-timeout ${wait_timeout} pinned-producer-and-consumer --streams 1 --producers 1 --consumers 1 $(bench_transport) ${output_args}"
 }
 
+function command_for_busy_loop_single() {
+    local wait_timeout="$1"
+    local output_args
+    output_args=$(common_output_args "busy_loop_single" "$wait_timeout")
+    echo "${IGGY_BENCH_CMD} --message-size 1000 --messages-per-batch 1 --message-batches ${BUSY_LOOP_BATCHES} --rate-limit 5KB --poll-wait-timeout ${wait_timeout} pinned-producer-and-consumer --streams 1 --producers 1 --consumers 1 $(bench_transport) ${output_args}"
+}
+
 function command_for_sparse_consumer_group() {
     local wait_timeout="$1"
     local output_args
@@ -215,10 +364,14 @@ function command_for_saturated_control() {
 }
 
 echo "Running PollMessages wait-timeout benchmark comparison"
-echo "transport=${TRANSPORT}, identifier=${IDENTIFIER}, output_dir=${OUTPUT_DIR}, quick=${QUICK}, dry_run=${DRY_RUN}"
+echo "transport=${TRANSPORT}, identifier=${IDENTIFIER}, output_dir=${OUTPUT_DIR}, quick=${QUICK}, dry_run=${DRY_RUN}, resource_sampling=${RESOURCE_SAMPLING}, sample_interval=${SAMPLE_INTERVAL_SECONDS}s"
 
 for wait_timeout in "${wait_timeouts[@]}"; do
     run_suite "sparse_single" "$wait_timeout" "$(command_for_sparse_single "$wait_timeout")"
+done
+
+for wait_timeout in "${busy_loop_wait_timeouts[@]}"; do
+    run_suite "busy_loop_single" "$wait_timeout" "$(command_for_busy_loop_single "$wait_timeout")"
 done
 
 for wait_timeout in "${wait_timeouts[@]}"; do
@@ -230,4 +383,4 @@ for wait_timeout in "0s" "100ms"; do
 done
 
 echo
-echo "Comparison complete. Full logs and benchmark artifacts are in ${OUTPUT_DIR}."
+echo "Comparison complete. Full logs, resource samples, and benchmark artifacts are in ${OUTPUT_DIR}."
