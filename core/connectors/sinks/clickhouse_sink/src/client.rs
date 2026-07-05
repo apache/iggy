@@ -68,11 +68,10 @@ impl ClickHouseClient {
             HeaderValue::from_str(username)
                 .map_err(|e| Error::InitError(format!("Invalid username header value: {e}")))?,
         );
-        auth_headers.insert(
-            KEY_HEADER,
-            HeaderValue::from_str(password)
-                .map_err(|e| Error::InitError(format!("Invalid password header value: {e}")))?,
-        );
+        let mut key_value = HeaderValue::from_str(password)
+            .map_err(|e| Error::InitError(format!("Invalid password header value: {e}")))?;
+        key_value.set_sensitive(true);
+        auth_headers.insert(KEY_HEADER, key_value);
 
         let inner = reqwest::Client::builder()
             .timeout(timeout)
