@@ -233,7 +233,10 @@ pub(crate) fn serialize_value(
         }
         ChType::DateTime => {
             // Unix seconds as UInt32. Accept integer or RFC 3339 string.
-            let secs = coerce_to_unix_seconds(value)? as u32;
+            let secs = u32::try_from(coerce_to_unix_seconds(value)?).map_err(|_| {
+                error!("Value out of range for DateTime (1970-01-01..2106-02-07)");
+                Error::InvalidRecord
+            })?;
             buf.extend_from_slice(&secs.to_le_bytes());
         }
         ChType::DateTime64(precision) => {
@@ -1296,6 +1299,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(buf, 86400u32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_pre_1970_datetime_rejected() {
+        // "1969-12-31T00:00:00Z" is negative unix seconds. `as u32` used to wrap
+        // it to 4294880896; try_from must reject it as out of DateTime range.
+        let mut buf = vec![];
+        let err = serialize_value(
+            &json_str("1969-12-31T00:00:00Z"),
+            &ChType::DateTime,
+            &mut buf,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRecord));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn serialize_pre_1970_date_rejected() {
+        let mut buf = vec![];
+        let err = serialize_value(&json_str("1969-12-31"), &ChType::Date, &mut buf).unwrap_err();
+        assert!(matches!(err, Error::InvalidRecord));
+        assert!(buf.is_empty());
     }
 
     #[test]
