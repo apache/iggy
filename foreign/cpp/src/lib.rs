@@ -88,11 +88,40 @@ mod ffi {
         topics_count: u32,
     }
 
+    #[repr(u8)]
+    enum HeaderKind {
+        Raw = 1,
+        String = 2,
+        Bool = 3,
+        Int8 = 4,
+        Int16 = 5,
+        Int32 = 6,
+        Int64 = 7,
+        Int128 = 8,
+        Uint8 = 9,
+        Uint16 = 10,
+        Uint32 = 11,
+        Uint64 = 12,
+        Uint128 = 13,
+        Float32 = 14,
+        Float64 = 15,
+    }
+
+    struct HeaderField {
+        kind: u8,
+        value: Vec<u8>,
+    }
+
+    struct HeaderEntry {
+        key: HeaderField,
+        value: HeaderField,
+    }
+
     struct IggyMessageToSend {
         id_lo: u64,
         id_hi: u64,
         payload: Vec<u8>,
-        user_headers: Vec<u8>,
+        user_headers: Vec<HeaderEntry>,
     }
 
     struct IggyMessagePolled {
@@ -106,7 +135,7 @@ mod ffi {
         payload_length: u32,
         reserved: u64,
         payload: Vec<u8>,
-        user_headers: Vec<u8>,
+        user_headers: Vec<HeaderEntry>,
     }
 
     struct PolledMessages {
@@ -422,7 +451,7 @@ mod ffi {
             auto_commit: bool,
         ) -> Result<PolledMessages>;
 
-        fn make_message(payload: Vec<u8>) -> IggyMessageToSend;
+        fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(

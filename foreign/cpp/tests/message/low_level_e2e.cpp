@@ -42,7 +42,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("test message " + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("test message " + std::to_string(i)),
+                                           rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -76,7 +77,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
                          "server_default");
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg  = iggy::ffi::make_message(to_payload("id-test-message"));
+    auto msg  = iggy::ffi::make_message(to_payload("id-test-message"), rust::Vec<iggy::ffi::HeaderEntry>());
     msg.id_lo = 42;
     msg.id_hi = 0;
     messages.push_back(std::move(msg));
@@ -117,7 +118,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     ASSERT_NO_THROW(client->connect());
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("should-fail"));
+    auto msg = iggy::ffi::make_message(to_payload("should-fail"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
@@ -127,7 +128,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     ASSERT_NO_THROW(client->disconnect());
 
     rust::Vec<iggy::ffi::IggyMessageToSend> disconnected_messages;
-    auto disconnected_msg = iggy::ffi::make_message(to_payload("should-still-fail"));
+    auto disconnected_msg =
+        iggy::ffi::make_message(to_payload("should-still-fail"), rust::Vec<iggy::ffi::HeaderEntry>());
     disconnected_messages.push_back(std::move(disconnected_msg));
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
                                        partition_id_bytes(0), std::move(disconnected_messages)),
@@ -139,7 +141,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
     iggy::ffi::Client *client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     iggy::ffi::Identifier invalid_id;
@@ -156,7 +158,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesToNonExistentStream) {
     iggy::ffi::Client *client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_string_identifier("nonexistent-stream-12345"), make_numeric_identifier(0),
@@ -177,7 +179,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
                          "server_default");
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "invalid_kind",
@@ -198,7 +200,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
                          "server_default");
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     rust::Vec<std::uint8_t> short_bytes;
@@ -225,7 +227,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("partition-test-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("partition-test-" + std::to_string(i)),
+                                           rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -276,7 +279,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     rust::Vec<std::uint8_t> empty_payload;
-    auto msg = iggy::ffi::make_message(std::move(empty_payload));
+    auto msg = iggy::ffi::make_message(std::move(empty_payload), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -305,7 +308,7 @@ TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     }
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(std::move(oversized_payload));
+    auto msg = iggy::ffi::make_message(std::move(oversized_payload), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -327,7 +330,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 50; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("order-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("order-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -360,7 +364,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; i++) {
-        auto msg  = iggy::ffi::make_message(to_payload("dup-id-msg-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("dup-id-msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         msg.id_lo = 99;
         msg.id_hi = 0;
         messages.push_back(std::move(msg));
@@ -405,16 +410,16 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
 
-    auto msg0 = iggy::ffi::make_message(to_payload("simple ascii"));
+    auto msg0 = iggy::ffi::make_message(to_payload("simple ascii"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg0));
 
-    auto msg1 = iggy::ffi::make_message(std::move(payload_null));
+    auto msg1 = iggy::ffi::make_message(std::move(payload_null), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg1));
 
-    auto msg2 = iggy::ffi::make_message(to_payload("héllo wörld"));
+    auto msg2 = iggy::ffi::make_message(to_payload("héllo wörld"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg2));
 
-    auto msg3 = iggy::ffi::make_message(std::move(payload_binary));
+    auto msg3 = iggy::ffi::make_message(std::move(payload_binary), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg3));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -529,7 +534,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -557,7 +562,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -585,7 +590,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -620,7 +625,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -656,7 +661,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -698,7 +703,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -746,7 +751,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -780,7 +785,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -788,7 +794,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch2;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -828,7 +835,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     const std::uint64_t id_values[] = {100, 200, 300, 400, 500};
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg  = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         msg.id_lo = id_values[i];
         msg.id_hi = 0;
         messages.push_back(std::move(msg));
@@ -860,7 +867,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
                          "server_default");
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -924,7 +931,7 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -960,7 +967,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -970,7 +978,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch2;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1021,7 +1030,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 20; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("mono-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("mono-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1059,7 +1069,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 1000; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("batch-msg-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("batch-msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
 
@@ -1080,7 +1091,7 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
     iggy::ffi::Client *client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    auto msg = iggy::ffi::make_message(to_payload("test"));
+    auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
     messages.push_back(std::move(msg));
 
     iggy::ffi::Identifier invalid_id;
@@ -1153,7 +1164,8 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("cg-msg-" + std::to_string(i)));
+        auto msg =
+            iggy::ffi::make_message(to_payload("cg-msg-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",

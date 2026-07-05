@@ -371,7 +371,7 @@ impl Client {
                 )
                 .await
                 .map_err(|error| format!("Could not poll messages: {error}"))?;
-            Ok(ffi::PolledMessages::from(polled))
+            ffi::PolledMessages::try_from(polled)
         })
     }
 

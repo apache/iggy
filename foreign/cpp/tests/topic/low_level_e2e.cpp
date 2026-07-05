@@ -893,7 +893,8 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicDoesNotChangeMessages) {
     const auto topic_id = created_stream.topics.front().id;
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(to_payload("message-before-topic-update")));
+    messages.push_back(
+        iggy::ffi::make_message(to_payload("message-before-topic-update"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
 
@@ -1267,7 +1268,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicPreservesTopicMetadata) {
     const auto topic_before_messages = stream_before_purge.topics.front();
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(to_payload("preserve-topic-metadata")));
+    messages.push_back(
+        iggy::ffi::make_message(to_payload("preserve-topic-metadata"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_before_purge.id),
                                           make_numeric_identifier(topic_before_messages.id), "partition_id",
                                           partition_id_bytes(1), std::move(messages)));
@@ -1331,7 +1333,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-first-" + std::to_string(i))));
+        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-first-" + std::to_string(i)),
+                                                               rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(first_topic_id), "partition_id",
@@ -1339,7 +1342,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
     for (std::uint32_t i = 0; i < 2; ++i) {
-        second_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-second-" + std::to_string(i))));
+        second_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-topic-second-" + std::to_string(i)),
+                                                                rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(second_topic_id), "partition_id",
@@ -1397,7 +1401,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions)
         rust::Vec<iggy::ffi::IggyMessageToSend> messages;
         for (std::uint32_t i = 0; i < 2; ++i) {
             messages.push_back(iggy::ffi::make_message(
-                to_payload("purge-topic-partition-" + std::to_string(partition_id) + "-" + std::to_string(i))));
+                to_payload("purge-topic-partition-" + std::to_string(partition_id) + "-" + std::to_string(i)),
+                rust::Vec<iggy::ffi::HeaderEntry>()));
         }
         ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                               make_numeric_identifier(topic_id), "partition_id",
@@ -1437,15 +1442,18 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicThenSendMessagesAgainSucceeds) {
     const std::uint32_t topic_id = created_stream.topics.front().id;
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_batch;
-    first_batch.push_back(iggy::ffi::make_message(to_payload("before-topic-purge")));
+    first_batch.push_back(
+        iggy::ffi::make_message(to_payload("before-topic-purge"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(first_batch)));
 
     ASSERT_NO_THROW(client->purge_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> second_batch;
-    second_batch.push_back(iggy::ffi::make_message(to_payload("after-topic-purge-0")));
-    second_batch.push_back(iggy::ffi::make_message(to_payload("after-topic-purge-1")));
+    second_batch.push_back(
+        iggy::ffi::make_message(to_payload("after-topic-purge-0"), rust::Vec<iggy::ffi::HeaderEntry>()));
+    second_batch.push_back(
+        iggy::ffi::make_message(to_payload("after-topic-purge-1"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(second_batch)));
 
@@ -1494,8 +1502,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUnto
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        first_topic_messages.push_back(
-            iggy::ffi::make_message(to_payload("purge-topic-twice-first-" + std::to_string(i))));
+        first_topic_messages.push_back(iggy::ffi::make_message(
+            to_payload("purge-topic-twice-first-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(first_topic_id), "partition_id",
@@ -1503,8 +1511,8 @@ TEST_F(LowLevelE2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUnto
 
     rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
     for (std::uint32_t i = 0; i < 2; ++i) {
-        second_topic_messages.push_back(
-            iggy::ffi::make_message(to_payload("purge-topic-twice-second-" + std::to_string(i))));
+        second_topic_messages.push_back(iggy::ffi::make_message(
+            to_payload("purge-topic-twice-second-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(second_topic_id), "partition_id",

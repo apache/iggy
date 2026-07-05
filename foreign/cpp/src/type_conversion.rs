@@ -29,9 +29,10 @@ use iggy_common::{
     ClusterMetadata as RustClusterMetadata, ClusterNode as RustClusterNode,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
-    GlobalPermissions as RustGlobalPermissions, Permissions as RustPermissions, Stats as RustStats,
-    StreamPermissions as RustStreamPermissions, TopicPermissions as RustTopicPermissions,
-    TransportEndpoints as RustTransportEndpoints,
+    GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
+    HeaderKey as RustHeaderKey, HeaderKind as RustHeaderKind, HeaderValue as RustHeaderValue,
+    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
 };
 use std::collections::BTreeMap;
 
@@ -431,12 +432,25 @@ impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
     }
 }
 
-impl From<RustIggyMessage> for ffi::IggyMessagePolled {
-    fn from(message: RustIggyMessage) -> Self {
+impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
+    type Error = String;
+
+    fn try_from(message: RustIggyMessage) -> Result<Self, Self::Error> {
         let id_bytes = message.header.id.to_le_bytes();
         let id_lo = u64::from_le_bytes(id_bytes[0..8].try_into().unwrap());
         let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
-        ffi::IggyMessagePolled {
+        let user_headers = match message
+            .user_headers_map()
+            .map_err(|error| format!("Could not convert polled message user headers: {error}"))?
+        {
+            Some(headers) => headers
+                .into_iter()
+                .map(|(key, value)| ffi::HeaderEntry::from(RustHeaderEntry { key, value }))
+                .collect(),
+            None => Vec::new(),
+        };
+
+        Ok(ffi::IggyMessagePolled {
             checksum: message.header.checksum,
             id_lo,
             id_hi,
@@ -447,11 +461,300 @@ impl From<RustIggyMessage> for ffi::IggyMessagePolled {
             payload_length: message.header.payload_length,
             reserved: message.header.reserved,
             payload: message.payload.to_vec(),
-            user_headers: message
-                .user_headers
-                .map(|headers| headers.to_vec())
-                .unwrap_or_default(),
+            user_headers,
+        })
+    }
+}
+
+impl From<RustHeaderEntry> for ffi::HeaderEntry {
+    fn from(entry: RustHeaderEntry) -> Self {
+        ffi::HeaderEntry {
+            key: ffi::HeaderField {
+                kind: entry.key.kind().as_code(),
+                value: entry.key.as_bytes().to_vec(),
+            },
+            value: ffi::HeaderField {
+                kind: entry.value.kind().as_code(),
+                value: entry.value.as_bytes().to_vec(),
+            },
         }
+    }
+}
+
+impl TryFrom<ffi::HeaderEntry> for RustHeaderEntry {
+    type Error = String;
+
+    fn try_from(entry: ffi::HeaderEntry) -> Result<Self, Self::Error> {
+        Ok(RustHeaderEntry {
+            key: {
+                let kind = RustHeaderKind::from_code(entry.key.kind)
+                    .map_err(|error| format!("Could not convert header field: {error}"))?;
+
+                match kind {
+                    RustHeaderKind::Raw => RustHeaderKey::try_from(entry.key.value)
+                        .map_err(|error| format!("Could not convert header field: {error}"))?,
+                    RustHeaderKind::String => {
+                        let value = String::from_utf8(entry.key.value).map_err(|_| {
+                            "Could not convert header field: invalid UTF-8 string".to_string()
+                        })?;
+                        RustHeaderKey::try_from(value)
+                            .map_err(|error| format!("Could not convert header field: {error}"))?
+                    }
+                    RustHeaderKind::Bool => match entry.key.value.as_slice() {
+                        [0] => RustHeaderKey::from(false),
+                        [1] => RustHeaderKey::from(true),
+                        _ => {
+                            return Err(
+                                "Could not convert header field: bool values must encode as 0 or 1"
+                                    .to_string(),
+                            );
+                        }
+                    },
+                    RustHeaderKind::Int8 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(i8::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int16 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(i16::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int32 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(i32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int64 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(i64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int128 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(i128::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint8 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(u8::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint16 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(u16::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint32 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(u32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint64 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(u64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint128 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(u128::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Float32 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(f32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Float64 => match entry.key.value.try_into() {
+                        Ok(bytes) => RustHeaderKey::from(f64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                }
+            },
+            value: {
+                let kind = RustHeaderKind::from_code(entry.value.kind)
+                    .map_err(|error| format!("Could not convert header field: {error}"))?;
+
+                match kind {
+                    RustHeaderKind::Raw => RustHeaderValue::try_from(entry.value.value)
+                        .map_err(|error| format!("Could not convert header field: {error}"))?,
+                    RustHeaderKind::String => {
+                        let value = String::from_utf8(entry.value.value).map_err(|_| {
+                            "Could not convert header field: invalid UTF-8 string".to_string()
+                        })?;
+                        RustHeaderValue::try_from(value)
+                            .map_err(|error| format!("Could not convert header field: {error}"))?
+                    }
+                    RustHeaderKind::Bool => match entry.value.value.as_slice() {
+                        [0] => RustHeaderValue::from(false),
+                        [1] => RustHeaderValue::from(true),
+                        _ => {
+                            return Err(
+                                "Could not convert header field: bool values must encode as 0 or 1"
+                                    .to_string(),
+                            );
+                        }
+                    },
+                    RustHeaderKind::Int8 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(i8::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int16 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(i16::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int32 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(i32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int64 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(i64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Int128 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(i128::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint8 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(u8::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint16 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(u16::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint32 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(u32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint64 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(u64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Uint128 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(u128::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Float32 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(f32::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                    RustHeaderKind::Float64 => match entry.value.value.try_into() {
+                        Ok(bytes) => RustHeaderValue::from(f64::from_le_bytes(bytes)),
+                        Err(value) => {
+                            return Err(format!(
+                                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
+                                value.len()
+                            ));
+                        }
+                    },
+                }
+            },
+        })
     }
 }
 
@@ -459,33 +762,51 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
     type Error = String;
 
     fn try_from(message: ffi::IggyMessageToSend) -> Result<Self, Self::Error> {
-        if !message.user_headers.is_empty() {
-            return Err(
-                "Could not convert message: user_headers are not yet supported in the C++ SDK"
-                    .to_string(),
-            );
+        let mut user_headers = BTreeMap::new();
+        for entry in message.user_headers {
+            let header_entry = RustHeaderEntry::try_from(entry)
+                .map_err(|error| format!("Could not convert message user headers: {error}"))?;
+            if user_headers
+                .insert(header_entry.key, header_entry.value)
+                .is_some()
+            {
+                return Err(
+                    "Could not convert message user headers: duplicate header key".to_string(),
+                );
+            }
         }
         let id = ((message.id_hi as u128) << 64) | (message.id_lo as u128);
         let payload = Bytes::from(message.payload);
-        RustIggyMessage::builder()
-            .id(id)
-            .payload(payload)
-            .build()
-            .map_err(|error| format!("Could not convert message: {error}"))
+        if user_headers.is_empty() {
+            RustIggyMessage::builder()
+                .id(id)
+                .payload(payload)
+                .build()
+                .map_err(|error| format!("Could not convert message: {error}"))
+        } else {
+            RustIggyMessage::builder()
+                .id(id)
+                .payload(payload)
+                .user_headers(user_headers)
+                .build()
+                .map_err(|error| format!("Could not convert message: {error}"))
+        }
     }
 }
 
-impl From<RustPolledMessages> for ffi::PolledMessages {
-    fn from(messages: RustPolledMessages) -> Self {
-        ffi::PolledMessages {
+impl TryFrom<RustPolledMessages> for ffi::PolledMessages {
+    type Error = String;
+
+    fn try_from(messages: RustPolledMessages) -> Result<Self, Self::Error> {
+        Ok(ffi::PolledMessages {
             partition_id: messages.partition_id,
             current_offset: messages.current_offset,
             count: messages.count,
             messages: messages
                 .messages
                 .into_iter()
-                .map(ffi::IggyMessagePolled::from)
-                .collect(),
-        }
+                .map(ffi::IggyMessagePolled::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
     }
 }

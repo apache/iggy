@@ -574,7 +574,7 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingPartition) {
                                          0, "server_default"));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(to_payload("flush-me")));
+    messages.push_back(iggy::ffi::make_message(to_payload("flush-me"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
@@ -700,7 +700,7 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceSucceeds) {
                                          0, "server_default"));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
-    messages.push_back(iggy::ffi::make_message(to_payload("flush-twice")));
+    messages.push_back(iggy::ffi::make_message(to_payload("flush-twice"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
@@ -830,7 +830,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; ++i) {
-        messages.push_back(iggy::ffi::make_message(to_payload("zero-count-" + std::to_string(i))));
+        messages.push_back(iggy::ffi::make_message(to_payload("zero-count-" + std::to_string(i)),
+                                                   rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
@@ -910,7 +911,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; ++i) {
-        messages.push_back(iggy::ffi::make_message(to_payload("active-only-" + std::to_string(i))));
+        messages.push_back(iggy::ffi::make_message(to_payload("active-only-" + std::to_string(i)),
+                                                   rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
