@@ -147,7 +147,7 @@ class TestCreateConsumerGroup:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.create_consumer_group(
                 unique_name(),
@@ -287,7 +287,7 @@ class TestGetConsumerGroup:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.get_consumer_group(
                 unique_name(),
@@ -427,7 +427,7 @@ class TestGetConsumerGroups:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.get_consumer_groups(unique_name(), unique_name())
 
@@ -1020,9 +1020,9 @@ class TestConsumerGroup:
             offset_messages.append(message)
 
         assert offset_messages[0].offset() == start_offset
-        assert [
-            message.payload().decode() for message in offset_messages
-        ] == test_messages[2:]
+        assert [message.payload().decode() for message in offset_messages] == (
+            test_messages[2:]
+        )
         assert (
             offset_consumer.get_last_consumed_offset(partition_id)
             == offset_messages[-1].offset()
@@ -1092,9 +1092,9 @@ class TestConsumerGroup:
         await offset_consumer.consume_messages(take, shutdown_event)
 
         assert offset_messages[0].offset() == start_offset
-        assert [
-            message.payload().decode() for message in offset_messages
-        ] == test_messages[2:]
+        assert [message.payload().decode() for message in offset_messages] == (
+            test_messages[2:]
+        )
         assert (
             offset_consumer.get_last_consumed_offset(partition_id)
             == offset_messages[-1].offset()
@@ -1165,9 +1165,9 @@ class TestConsumerGroup:
             timestamp_messages.append(message)
 
         assert timestamp_messages[0].timestamp() >= start_timestamp
-        assert [
-            message.payload().decode() for message in timestamp_messages
-        ] == test_messages[1:]
+        assert [message.payload().decode() for message in timestamp_messages] == (
+            test_messages[1:]
+        )
         assert (
             timestamp_consumer.get_last_consumed_offset(partition_id)
             == timestamp_messages[-1].offset()
@@ -1241,9 +1241,9 @@ class TestConsumerGroup:
         await timestamp_consumer.consume_messages(take, shutdown_event)
 
         assert timestamp_messages[0].timestamp() >= start_timestamp
-        assert [
-            message.payload().decode() for message in timestamp_messages
-        ] == test_messages[1:]
+        assert [message.payload().decode() for message in timestamp_messages] == (
+            test_messages[1:]
+        )
         assert (
             timestamp_consumer.get_last_consumed_offset(partition_id)
             == timestamp_messages[-1].offset()
@@ -1653,7 +1653,7 @@ class TestConsumerGroup:
     async def test_consumer_group_before_connect_fails(self, unique_name):
         """Test consumer_group requires an established connection."""
         host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
 
         with pytest.raises(RuntimeError):
             await client.consumer_group(
@@ -1673,7 +1673,7 @@ class TestConsumerGroup:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
 

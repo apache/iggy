@@ -62,12 +62,15 @@ class TestCreateTopic:
         topic_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name, name=topic_name, partitions_count=2
         )
+        assert created_topic.name == topic_name
+        assert created_topic.partitions_count == 2
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
         assert topic.partitions_count == 2
 
@@ -110,6 +113,32 @@ class TestCreateTopic:
             )
 
     @pytest.mark.asyncio
+    async def test_get_topic_by_name_and_id(self, iggy_client: IggyClient, unique_name):
+        """Test repeated topic lookup works by both name and numeric id."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        created_topic = await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        topic_by_name = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic_by_name is not None
+        assert topic_by_name.id == created_topic.id
+        assert topic_by_name.name == created_topic.name
+
+        topic_by_name_again = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic_by_name_again is not None
+        assert topic_by_name_again.id == topic_by_name.id
+        assert topic_by_name_again.name == topic_by_name.name
+
+        topic_by_id = await iggy_client.get_topic(stream_name, topic_by_name.id)
+        assert topic_by_id is not None
+        assert topic_by_id.id == topic_by_name.id
+        assert topic_by_id.name == topic_by_name.name
+
+    @pytest.mark.asyncio
     async def test_create_and_get_topic_with_numeric_stream_id(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -121,12 +150,15 @@ class TestCreateTopic:
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
 
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream.id, name=topic_name, partitions_count=2
         )
+        assert created_topic.name == topic_name
+        assert created_topic.partitions_count == 2
 
         topic_by_name = await iggy_client.get_topic(stream.id, topic_name)
         assert topic_by_name is not None
+        assert topic_by_name.id == created_topic.id
         assert topic_by_name.name == topic_name
         assert topic_by_name.partitions_count == 2
 
@@ -192,15 +224,18 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
             partitions_count=1,
             compression_algorithm=compression_algorithm,
         )
+        assert created_topic.name == topic_name
+        assert created_topic.partitions_count == 1
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
         assert topic.partitions_count == 1
 
@@ -244,15 +279,17 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
             partitions_count=1,
             message_expiry=message_expiry,
         )
+        assert created_topic.name == topic_name
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
 
     @pytest.mark.asyncio
@@ -291,15 +328,17 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
             partitions_count=1,
             max_topic_size=max_topic_size,
         )
+        assert created_topic.name == topic_name
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
 
     @pytest.mark.asyncio
@@ -350,15 +389,17 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
             partitions_count=1,
             replication_factor=replication_factor,
         )
+        assert created_topic.name == topic_name
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
 
     @pytest.mark.asyncio
@@ -420,12 +461,15 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name, name=topic_name, partitions_count=partitions_count
         )
+        assert created_topic.name == topic_name
+        assert created_topic.partitions_count == partitions_count
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
         assert topic.partitions_count == partitions_count
 
@@ -464,20 +508,21 @@ class TestCreateTopic:
         topic_name = unique_name()
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created_topic = await iggy_client.create_topic(
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")
 
         topic = await client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created_topic.id
         assert topic.name == topic_name
         assert topic.partitions_count == 1
 
@@ -500,7 +545,7 @@ class TestCreateTopic:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
@@ -571,7 +616,7 @@ class TestGetTopic:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.get_topic(unique_name(), unique_name())
 
@@ -678,7 +723,7 @@ class TestGetTopics:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.get_topics(unique_name())
 
@@ -1061,7 +1106,7 @@ class TestUpdateTopic:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
@@ -1176,7 +1221,7 @@ class TestDeleteTopic:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.delete_topic(unique_name(), unique_name())
 
@@ -1288,7 +1333,7 @@ class TestPurgeTopic:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         with pytest.raises(RuntimeError):
             await client.purge_topic(unique_name(), unique_name())
 

@@ -31,6 +31,7 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "IdentityInfo",
     "IggyClient",
     "IggyConsumer",
     "PollingStrategy",
@@ -44,11 +45,13 @@ __all__ = [
 class AutoCommit:
     r"""
     The auto-commit configuration for storing the offset on the server.
+
+    Use this type with `IggyClient.consumer_group(..., auto_commit=...)`.
     """
     @typing.final
     class Disabled(AutoCommit):
         r"""
-        The auto-commit is disabled and the offset must be stored manually by the consumer.
+        Disable automatic offset commits. Offsets must be stored manually.
         """
 
         __match_args__ = ()
@@ -59,7 +62,8 @@ class AutoCommit:
     @typing.final
     class Interval(AutoCommit):
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval.
+        Commit offsets on a fixed interval.
+        Payload: `datetime.timedelta`.
         """
 
         __match_args__ = ("_0",)
@@ -72,7 +76,8 @@ class AutoCommit:
     @typing.final
     class IntervalOrWhen(AutoCommit):
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
+        Commit offsets on a fixed interval or according to an `AutoCommitWhen` mode.
+        Payload: `(datetime.timedelta, AutoCommitWhen)`.
         """
 
         __match_args__ = (
@@ -92,7 +97,8 @@ class AutoCommit:
     @typing.final
     class IntervalOrAfter(AutoCommit):
         r"""
-        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
+        Commit offsets on a fixed interval or according to an `AutoCommitAfter` mode.
+        Payload: `(datetime.timedelta, AutoCommitAfter)`.
         """
 
         __match_args__ = (
@@ -112,7 +118,8 @@ class AutoCommit:
     @typing.final
     class When(AutoCommit):
         r"""
-        The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
+        Commit offsets according to an `AutoCommitWhen` mode.
+        Payload: `AutoCommitWhen`.
         """
 
         __match_args__ = ("_0",)
@@ -125,7 +132,8 @@ class AutoCommit:
     @typing.final
     class After(AutoCommit):
         r"""
-        The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
+        Commit offsets according to an `AutoCommitAfter` mode.
+        Payload: `AutoCommitAfter`.
         """
 
         __match_args__ = ("_0",)
@@ -140,11 +148,13 @@ class AutoCommit:
 class AutoCommitAfter:
     r"""
     The auto-commit mode for storing the offset on the server **after** receiving the messages.
+
+    Use this type inside `AutoCommit.After(...)` or `AutoCommit.IntervalOrAfter(...)`.
     """
     @typing.final
     class ConsumingAllMessages(AutoCommitAfter):
         r"""
-        The offset is stored on the server after all the messages are consumed.
+        Store the offset after all messages from a poll have been consumed.
         """
 
         __match_args__ = ()
@@ -155,7 +165,7 @@ class AutoCommitAfter:
     @typing.final
     class ConsumingEachMessage(AutoCommitAfter):
         r"""
-        The offset is stored on the server after consuming each message.
+        Store the offset after each consumed message.
         """
 
         __match_args__ = ()
@@ -166,7 +176,8 @@ class AutoCommitAfter:
     @typing.final
     class ConsumingEveryNthMessage(AutoCommitAfter):
         r"""
-        The offset is stored on the server after consuming every Nth message.
+        Store the offset after every Nth consumed message.
+        Payload: `int`.
         """
 
         __match_args__ = ("_0",)
@@ -183,11 +194,13 @@ class AutoCommitAfter:
 class AutoCommitWhen:
     r"""
     The auto-commit mode for storing the offset on the server.
+
+    Use this type inside `AutoCommit.When(...)` or `AutoCommit.IntervalOrWhen(...)`.
     """
     @typing.final
     class PollingMessages(AutoCommitWhen):
         r"""
-        The offset is stored on the server when the messages are received.
+        Store the offset when messages are polled from the server.
         """
 
         __match_args__ = ()
@@ -198,7 +211,7 @@ class AutoCommitWhen:
     @typing.final
     class ConsumingAllMessages(AutoCommitWhen):
         r"""
-        The offset is stored on the server when all the messages are consumed.
+        Store the offset after all messages from a poll have been consumed.
         """
 
         __match_args__ = ()
@@ -209,7 +222,7 @@ class AutoCommitWhen:
     @typing.final
     class ConsumingEachMessage(AutoCommitWhen):
         r"""
-        The offset is stored on the server when consuming each message.
+        Store the offset after each consumed message.
         """
 
         __match_args__ = ()
@@ -220,7 +233,8 @@ class AutoCommitWhen:
     @typing.final
     class ConsumingEveryNthMessage(AutoCommitWhen):
         r"""
-        The offset is stored on the server when consuming every Nth message.
+        Store the offset after every Nth consumed message.
+        Payload: `int`.
         """
 
         __match_args__ = ("_0",)
@@ -304,53 +318,172 @@ class ConsumerGroupMember:
         """
 
 @typing.final
+class IdentityInfo:
+    r"""
+    Authentication details returned by `IggyClient.login_user()`.
+
+    This object contains the authenticated user id and any access token details
+    returned by the server.
+    """
+    def user_id(self) -> builtins.int:
+        r"""
+        Get the authenticated user id.
+
+        Returns:
+            The user id as `int`.
+        """
+    def access_token_value(self) -> builtins.str | None:
+        r"""
+        Get the access token value.
+
+        Returns:
+            The access token as `str`, or `None` if no access token was returned.
+        """
+    def access_token_expiry(self) -> builtins.int | None:
+        r"""
+        Get the access token expiry value.
+
+        Returns:
+            The encoded expiry value as `int`, or `None` if no access token expiry
+            was returned.
+        """
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
     """
-    def __new__(cls, conn: builtins.str | None = None) -> IggyClient:
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        reconnection_max_retries: builtins.int | None = None,
+        reconnection_interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+        tls_enabled: builtins.bool | None = None,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool | None = None,
+        no_delay: builtins.bool = False,
+    ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address.
-        This initializes a new runtime for asynchronous operations.
-        Future versions might utilize asyncio for more Pythonic async.
+        Create an `IggyClient`.
+
+        Use this constructor when you want to configure the connection with
+        explicit keyword arguments instead of a connection string.
+
+        Args:
+            server_address: Server address as `str` in `host:port` form. Defaults to
+                `127.0.0.1:8090`.
+            reconnection_max_retries: Maximum number of reconnect attempts as `int`
+                after a disconnect. If `None`, retries are unlimited.
+            reconnection_interval: Delay between reconnect attempts as
+                `datetime.timedelta`. Defaults to 1 second.
+            reestablish_after: Delay before attempting to reestablish the
+                connection as `datetime.timedelta`. Defaults to 5 seconds.
+            tls_enabled: Whether to use TLS for the connection as `bool`. Defaults
+                to `False`.
+            tls_domain: Server name as `str` to validate against the TLS certificate.
+            tls_ca_file: Path as `str` to a CA certificate file used to validate
+                the server certificate.
+            tls_validate_certificate: Whether to validate the server certificate.
+                Accepts `bool | None`. Defaults to `True`.
+            no_delay: Whether to send packets immediately instead of allowing the
+                socket to coalesce small writes. Accepts `bool`. Defaults to `False`.
+
+        Returns:
+            A configured `IggyClient`.
+
+        Raises:
+            PyRuntimeError: If the connection settings are invalid.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a connection string.
-        Returns an error if the connection string provided is invalid.
+        Create an `IggyClient` from a connection string.
+
+        Use this when the connection configuration is already available as a single string.
+
+        Args:
+            connection_string: Connection string as `str` describing how to connect
+                to the server.
+
+        Returns:
+            A configured `IggyClient`.
+
+        Raises:
+            PyRuntimeError: If the connection string is invalid.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
-        Sends a ping request to the server to check connectivity.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the connection fails.
+        Check whether the server is reachable.
+
+        Sends a ping request and waits for the server to respond.
+
+        Returns:
+            An awaitable that resolves to `None` when the server responds.
+
+        Raises:
+            PyRuntimeError: If the request fails or the server cannot be reached.
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[IdentityInfo]:
         r"""
-        Logs in the user with the given credentials.
-        Returns `Ok(())` on success, or a PyRuntimeError on failure.
+        Authenticate with a username and password.
+
+        Args:
+            username: Username as `str`.
+            password: Password as `str`.
+
+        Returns:
+            An awaitable that resolves to `IdentityInfo` for the authenticated user.
+
+        Raises:
+            PyRuntimeError: If authentication fails or the request cannot be completed.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
-        Connects the IggyClient to its service.
-        Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+        Open the connection to the server.
+
+        Returns:
+            An awaitable that resolves to `None` when the connection is established.
+
+        Raises:
+            PyRuntimeError: If the connection attempt fails.
         """
-    def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
+    def create_stream(
+        self, name: builtins.str
+    ) -> collections.abc.Awaitable[StreamDetails]:
         r"""
-        Creates a new stream with the provided ID and name.
-        Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
+        Create a stream.
+
+        Args:
+            name: Stream name as `str`.
+
+        Returns:
+            An awaitable that resolves to `StreamDetails` for the created stream.
+
+        Raises:
+            PyRuntimeError: If the stream cannot be created.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[StreamDetails | None]:
         r"""
-        Gets stream by id.
-        Returns Option of stream details or a PyRuntimeError on failure.
+        Get a stream by identifier.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `StreamDetails` if the stream exists,
+            or `None` if it does not.
+
+        Raises:
+            PyRuntimeError: If the identifier is invalid or the request fails.
         """
     def create_topic(
         self,
@@ -361,10 +494,33 @@ class IggyClient:
         replication_factor: builtins.int | None = None,
         message_expiry: datetime.timedelta | None = None,
         max_topic_size: builtins.int | None = None,
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[TopicDetails]:
         r"""
-        Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+        Create a topic in a stream.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            name: Topic name as `str`.
+            partitions_count: Number of partitions to create as `int`.
+            compression_algorithm: Compression algorithm as `str | None`. Supported
+                values are `\"none\"` and `\"gzip\"`, case-insensitive. If `None`,
+                the default compression setting is used.
+            replication_factor: Replication factor as `int | None` from `0` to `255`.
+                Passing `0` or `None` uses the server default. The current server
+                default is `1`.
+            message_expiry: Message retention period as `datetime.timedelta | None`.
+                Use `datetime.timedelta(0)` to request the server default, which
+                currently means messages do not expire. If `None`, the server default
+                is also used.
+            max_topic_size: Maximum topic size in bytes as `int | None`. Use `0` to request the
+                server default, which is currently unlimited. If `None`, the server
+                default is also used.
+
+        Returns:
+            An awaitable that resolves to `TopicDetails` for the created topic.
+
+        Raises:
+            PyRuntimeError: If an argument is invalid or the topic cannot be created.
         """
     def get_topic(
         self,
@@ -372,8 +528,18 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
     ) -> collections.abc.Awaitable[TopicDetails | None]:
         r"""
-        Gets topic by stream and id.
-        Returns Option of topic details or a PyRuntimeError on failure.
+        Get a topic by stream and topic identifier.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `TopicDetails` if the topic exists,
+            or `None` if it does not.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the request fails.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
@@ -527,8 +693,20 @@ class IggyClient:
         messages: list[SendMessage],
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Send messages to a topic partition.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            topic: Topic identifier as `str | int`.
+            partitioning: Partition id as `int`.
+            messages: Messages to publish as `list[SendMessage]`.
+
+        Returns:
+            An awaitable that resolves to `None` after the messages are sent.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid, the messages cannot be
+                converted, or the send request fails.
         """
     def poll_messages(
         self,
@@ -540,8 +718,23 @@ class IggyClient:
         auto_commit: builtins.bool,
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
-        Polls for messages from the specified topic and partition.
-        Returns a list of received messages or a PyRuntimeError on failure.
+        Poll messages from a topic partition.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            topic: Topic identifier as `str | int`.
+            partition_id: Partition to read from as `int`.
+            polling_strategy: Polling strategy as `PollingStrategy`. See
+                `PollingStrategy` for the available variants and their payloads.
+            count: Maximum number of messages to return as `int`.
+            auto_commit: Whether to store the consumer offset automatically after
+                polling as `bool`.
+
+        Returns:
+            An awaitable that resolves to a `list[ReceiveMessage]`.
+
+        Raises:
+            PyRuntimeError: If an identifier is invalid or the poll request fails.
         """
     def consumer_group(
         self,
@@ -561,8 +754,44 @@ class IggyClient:
         allow_replay: builtins.bool = False,
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
-        Creates a new consumer group consumer.
-        Returns the consumer or a PyRuntimeError on failure.
+        Create a consumer group consumer.
+
+        Args:
+            name: Consumer group name as `str`.
+            stream: Stream identifier as `str`.
+            topic: Topic identifier as `str`.
+            partition_id: Partition id as `int | None`. If `None`, partition
+                assignment is left to the consumer group.
+            polling_strategy: Polling strategy as `PollingStrategy | None`. See
+                `PollingStrategy` for the available variants and their payloads.
+                If `None`, reading starts from the next message after the stored offset.
+            batch_length: Maximum number of messages to fetch per poll as `int | None`.
+                If `None`, the default is `1000`.
+            auto_commit: Offset commit policy as `AutoCommit | None`. See
+                `AutoCommit` for the available modes. If `None`, offsets are committed
+                every second and when messages are polled.
+            create_consumer_group_if_not_exists: Whether to create the consumer
+                group automatically if it does not exist as `bool`. Defaults to `True`.
+            auto_join_consumer_group: Whether to join the consumer group automatically
+                during initialization as `bool`. Defaults to `True`.
+            poll_interval: Delay between polling attempts as `datetime.timedelta | None`.
+                If `None`, no poll interval is configured.
+            polling_retry_interval: Delay before retrying polling after a disconnect
+                as `datetime.timedelta | None`. If `None`, the default is 1 second.
+            init_retries: Number of retries to use during initialization when the
+                stream or topic is not available as `int | None`. If `None`,
+                initialization is not retried.
+            init_retry_interval: Delay between initialization retries as
+                `datetime.timedelta | None`. Must be set together with `init_retries`.
+            allow_replay: Whether replaying previously available messages is allowed.
+                Accepts `bool`. Defaults to `False`.
+
+        Returns:
+            An awaitable that resolves to `IggyConsumer`.
+
+        Raises:
+            PyRuntimeError: If the configuration is invalid or the consumer cannot
+                be initialized.
         """
 
 @typing.final
@@ -576,55 +805,107 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset or `None` if no offset has been consumed yet.
+        Get the last consumed offset for a partition.
+
+        Args:
+            partition_id: Partition id as `int`.
+
+        Returns:
+            The last consumed offset as `int`, or `None` if no offset has been consumed yet.
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset or `None` if no offset has been stored yet.
+        Get the last stored offset for a partition.
+
+        Args:
+            partition_id: Partition id as `int`.
+
+        Returns:
+            The last stored offset as `int`, or `None` if no offset has been stored yet.
         """
     def name(self) -> builtins.str:
         r"""
-        Gets the name of the consumer group.
+        Get the consumer group name.
+
+        Returns:
+            The consumer group name as `str`.
         """
     def partition_id(self) -> builtins.int:
         r"""
-        Gets the current partition id or `0` if no messages have been polled yet.
+        Get the current partition id.
+
+        Returns:
+            The current partition id as `int`. Returns `0` if no messages have been
+            polled yet.
         """
     def stream(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the stream this consumer group is configured for.
+        Get the configured stream identifier.
+
+        Returns:
+            The stream identifier as `str | int`, depending on how the consumer was configured.
+
+        Raises:
+            PyRuntimeError: If the identifier cannot be converted for Python.
         """
     def topic(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the topic this consumer group is configured for.
+        Get the configured topic identifier.
+
+        Returns:
+            The topic identifier as `str | int`, depending on how the consumer was configured.
+
+        Raises:
+            PyRuntimeError: If the identifier cannot be converted for Python.
         """
     def store_offset(
         self, offset: builtins.int, partition_id: builtins.int | None
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Stores the provided offset for the provided partition id or if none is specified
-        uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the operation fails.
+        Store a consumer offset on the server.
+
+        Args:
+            offset: Offset to store as `int`.
+            partition_id: Partition id as `int | None`. If `None`, the current
+                consumer partition is used.
+
+        Returns:
+            An awaitable that resolves to `None` when the offset is stored.
+
+        Raises:
+            PyRuntimeError: If storing the offset fails.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Deletes the offset for the provided partition id or if none is specified
-        uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the operation fails.
+        Delete a stored consumer offset from the server.
+
+        Args:
+            partition_id: Partition id as `int | None`. If `None`, the current
+                consumer partition is used.
+
+        Returns:
+            An awaitable that resolves to `None` when the offset is deleted.
+
+        Raises:
+            PyRuntimeError: If deleting the offset fails.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
         r"""
-        Asynchronously iterate over `ReceiveMessage`s.
-        Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-        or a `PyRuntimeError` on failure.
-        Note: This method does not currently support `AutoCommit.After`.
-        For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
-        only the interval part is applied; the `after` mode is ignored.
-        Use `consume_messages()` if you need commit-after-processing semantics.
+        Create an async iterator over `ReceiveMessage`.
+
+        Returns:
+            A `collections.abc.AsyncIterator[ReceiveMessage]`.
+
+        Raises:
+            PyRuntimeError: If polling messages fails while iterating.
+
+        Notes:
+            This method does not currently support `AutoCommit.After`.
+            For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
+            only the interval part is applied; the `after` mode is ignored.
+            Use `consume_messages()` if you need commit-after-processing semantics.
         """
     def consume_messages(
         self,
@@ -634,13 +915,36 @@ class IggyConsumer:
         shutdown_event: asyncio.Event | None,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-        Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+        Consume messages continuously with an async callback.
+
+        Args:
+            callback: Async callback as
+                `collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]]`.
+                It is called once for each `ReceiveMessage`.
+            shutdown_event: Optional `asyncio.Event`. If provided, consumption
+                stops when the event is set.
+
+        Returns:
+            An awaitable that resolves to `None` when consumption stops.
+
+        Raises:
+            PyRuntimeError: If message consumption fails or shutdown signaling fails.
         """
 
 class PollingStrategy:
+    r"""
+    The starting point used when polling messages.
+
+    Use this type with `IggyClient.poll_messages(..., polling_strategy=...)` and
+    `IggyClient.consumer_group(..., polling_strategy=...)`.
+    """
     @typing.final
     class Offset(PollingStrategy):
+        r"""
+        Start reading from an absolute offset.
+        Payload: `int`.
+        """
+
         __match_args__ = ("value",)
         @property
         def value(self) -> builtins.int: ...
@@ -648,6 +952,11 @@ class PollingStrategy:
 
     @typing.final
     class Timestamp(PollingStrategy):
+        r"""
+        Start reading from the first message at or after a timestamp.
+        Payload: `int`.
+        """
+
         __match_args__ = ("value",)
         @property
         def value(self) -> builtins.int: ...
@@ -655,16 +964,28 @@ class PollingStrategy:
 
     @typing.final
     class First(PollingStrategy):
+        r"""
+        Start reading from the first available message.
+        """
+
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.First: ...
 
     @typing.final
     class Last(PollingStrategy):
+        r"""
+        Start reading from the most recent available message.
+        """
+
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.Last: ...
 
     @typing.final
     class Next(PollingStrategy):
+        r"""
+        Start reading from the next message after the stored consumer offset.
+        """
+
         __match_args__ = ()
         def __new__(cls) -> PollingStrategy.Next: ...
 
@@ -673,56 +994,77 @@ class PollingStrategy:
 @typing.final
 class ReceiveMessage:
     r"""
-    A Python class representing a received message.
-    This class wraps a Rust message, allowing for access to its payload and offset from Python.
+    A message returned by `IggyClient.poll_messages()` or `IggyConsumer`.
+
+    This object exposes the payload and metadata for a single received message.
     """
     def payload(self) -> bytes:
         r"""
-        Retrieves the payload of the received message.
-        The payload is returned as a Python bytes object.
+        Get the message payload.
+
+        Returns:
+            The payload as `bytes`.
         """
     def offset(self) -> builtins.int:
         r"""
-        Retrieves the offset of the received message.
-        The offset represents the position of the message within its topic.
+        Get the message offset.
+
+        Returns:
+            The message offset as `int`.
         """
     def timestamp(self) -> builtins.int:
         r"""
-        Retrieves the timestamp of the received message.
-        The timestamp represents the time of the message within its topic.
+        Get the message timestamp.
+
+        Returns:
+            The message timestamp as `int`.
         """
     def id(self) -> builtins.int:
         r"""
-        Retrieves the id of the received message.
-        The id represents unique identifier of the message within its topic.
+        Get the message id.
+
+        Returns:
+            The message id as `int`.
         """
     def checksum(self) -> builtins.int:
         r"""
-        Retrieves the checksum of the received message.
-        The checksum represents the integrity of the message within its topic.
+        Get the message checksum.
+
+        Returns:
+            The checksum as `int`.
         """
     def length(self) -> builtins.int:
         r"""
-        Retrieves the length of the received message.
-        The length represents the length of the payload.
+        Get the payload length.
+
+        Returns:
+            The payload length in bytes as `int`.
         """
     def partition_id(self) -> builtins.int:
         r"""
-        Retrieves the partition this message belongs to.
+        Get the partition id for this message.
+
+        Returns:
+            The partition id as `int`.
         """
 
 @typing.final
 class SendMessage:
     r"""
-    A Python class representing a message to be sent.
-    This class wraps a Rust message meant for sending, facilitating
-    the creation of such messages from Python and their subsequent use in Rust.
+    A message to publish with `IggyClient.send_messages()`.
     """
     def __new__(cls, data: builtins.str | bytes) -> SendMessage:
         r"""
-        Constructs a new `SendMessage` instance from a string or bytes.
-        This method allows for the creation of a `SendMessage` instance
-        directly from Python using the provided string or bytes data.
+        Create a `SendMessage`.
+
+        Args:
+            data: Message payload as `str | bytes`.
+
+        Returns:
+            A `SendMessage`.
+
+        Raises:
+            PyValueError: If the payload cannot be converted into a message.
         """
 
 @typing.final

@@ -86,7 +86,7 @@ class TestConnectivity:
         value = invalid_value.format(host=host, port=port)
 
         with pytest.raises(RuntimeError):
-            IggyClient(value)
+            IggyClient(server_address=value)
 
         with pytest.raises(RuntimeError, match=expected_error):
             IggyClient.from_connection_string(value)
@@ -97,7 +97,7 @@ class TestConnectivity:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await client.connect()
 
@@ -106,7 +106,7 @@ class TestConnectivity:
         """Test login can establish authentication without an explicit connect call."""
         host, port = get_server_config()
         wait_for_server(host, port)
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
 
         await client.login_user("iggy", "iggy")
         await wait_for_ping(client)
@@ -130,7 +130,7 @@ class TestConnectivity:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
 
@@ -144,7 +144,7 @@ class TestConnectivity:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")
@@ -158,7 +158,7 @@ class TestConnectivity:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")

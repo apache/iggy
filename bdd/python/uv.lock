@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [[package]]
 name = "apache-iggy"
-version = "0.8.1.dev2"
+version = "0.8.1.dev3"
 source = { directory = "../../foreign/python" }
 
 [package.metadata]
@@ -49,23 +49,31 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "apache-iggy" },
-    { name = "pyrefly" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-bdd" },
     { name = "pytest-cov" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pyrefly" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "apache-iggy", directory = "../../foreign/python" },
-    { name = "pyrefly", specifier = ">=1.1.1" },
-    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pytest-bdd", specifier = ">=6.0.0" },
     { name = "pytest-cov", specifier = ">=4.0.0" },
-    { name = "ruff", specifier = ">=0.15.19" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pyrefly", specifier = ">=1.0.0" },
+    { name = "ruff", specifier = ">=0.15.15" },
 ]
 
 [[package]]

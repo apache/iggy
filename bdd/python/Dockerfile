@@ -32,8 +32,6 @@ FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && \
     apt-get install -y \
-    python3 \
-    python3-dev \
     curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -48,7 +46,7 @@ COPY . .
 
 # Install Python dependencies for BDD (includes local apache-iggy source)
 WORKDIR /workspace/bdd/python
-RUN uv sync --frozen
+RUN uv sync --frozen --no-dev
 
 # Set up BDD test directory
 WORKDIR /app
@@ -59,4 +57,4 @@ RUN mkdir -p /app/tests
 RUN cp -r /workspace/bdd/python/tests/* /app/tests/
 
 # Default command
-CMD ["uv", "run", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v"]
+CMD ["uv", "run", "--no-sync", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v"]

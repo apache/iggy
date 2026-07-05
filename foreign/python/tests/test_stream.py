@@ -58,10 +58,13 @@ class TestStreamOperations:
         """Test stream creation and retrieval."""
         stream_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
-        await iggy_client.create_stream(stream_name)
+        created_stream = await iggy_client.create_stream(stream_name)
+        assert created_stream.name == stream_name
+        assert created_stream.topics_count == 0
 
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
+        assert stream.id == created_stream.id
         assert stream.name == stream_name
         assert stream.topics_count == 0
 
@@ -100,10 +103,12 @@ class TestStreamOperations:
     ):
         """Test repeated stream lookup works by both name and numeric id."""
         stream_name = unique_name()
-        await iggy_client.create_stream(stream_name)
+        created_stream = await iggy_client.create_stream(stream_name)
 
         stream_by_name = await iggy_client.get_stream(stream_name)
         assert stream_by_name is not None
+        assert stream_by_name.id == created_stream.id
+        assert stream_by_name.name == created_stream.name
 
         stream_by_name_again = await iggy_client.get_stream(stream_name)
         assert stream_by_name_again is not None
@@ -122,18 +127,19 @@ class TestStreamOperations:
         """Test a stream remains retrievable after reconnecting with a fresh client."""
         stream_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
+        created_stream = await iggy_client.create_stream(stream_name)
 
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")
 
         stream = await client.get_stream(stream_name)
         assert stream is not None
+        assert stream.id == created_stream.id
         assert stream.name == stream_name
         assert stream.topics_count == 0
 
@@ -166,7 +172,7 @@ class TestStreamOperations:
     async def test_get_stream_before_connect_fails(self, unique_name):
         """Test get_stream requires an established connection."""
         host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
 
         with pytest.raises(RuntimeError):
             await client.get_stream(unique_name())
@@ -177,7 +183,7 @@ class TestStreamOperations:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
 
         with pytest.raises(RuntimeError):
@@ -187,7 +193,7 @@ class TestStreamOperations:
     async def test_create_stream_before_connect_fails(self, unique_name):
         """Test create_stream requires an established connection."""
         host, port = get_server_config()
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
 
         with pytest.raises(RuntimeError):
             await client.create_stream(unique_name())
@@ -198,7 +204,7 @@ class TestStreamOperations:
         host, port = get_server_config()
         wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
+        client = IggyClient(server_address=f"{host}:{port}")
         await client.connect()
 
         with pytest.raises(RuntimeError):

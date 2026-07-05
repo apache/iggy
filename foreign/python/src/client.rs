@@ -29,12 +29,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::consumer::{
-    AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
-    IggyConsumer, py_delta_to_iggy_duration,
+    AutoCommit, ConsumerGroup, ConsumerGroupDetails, IggyConsumer, py_delta_to_iggy_duration,
 };
-use crate::identifier::PyIdentifier;
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
-use crate::send_message::SendMessage;
+use crate::identity::{IdentityInfo, PyIdentifier};
+use crate::message::{PollingStrategy, ReceiveMessage, SendMessage};
 use crate::stream::StreamDetails;
 use crate::topic::{Topic, TopicDetails};
 use tokio::sync::Mutex;
@@ -51,17 +49,95 @@ pub struct IggyClient {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address.
-    /// This initializes a new runtime for asynchronous operations.
-    /// Future versions might utilize asyncio for more Pythonic async.
+    /// Create an `IggyClient`.
+    ///
+    /// Use this constructor when you want to configure the connection with
+    /// explicit keyword arguments instead of a connection string.
+    ///
+    /// Args:
+    ///     server_address: Server address as `str` in `host:port` form. Defaults to
+    ///         `127.0.0.1:8090`.
+    ///     reconnection_max_retries: Maximum number of reconnect attempts as `int`
+    ///         after a disconnect. If `None`, retries are unlimited.
+    ///     reconnection_interval: Delay between reconnect attempts as
+    ///         `datetime.timedelta`. Defaults to 1 second.
+    ///     reestablish_after: Delay before attempting to reestablish the
+    ///         connection as `datetime.timedelta`. Defaults to 5 seconds.
+    ///     tls_enabled: Whether to use TLS for the connection as `bool`. Defaults
+    ///         to `False`.
+    ///     tls_domain: Server name as `str` to validate against the TLS certificate.
+    ///     tls_ca_file: Path as `str` to a CA certificate file used to validate
+    ///         the server certificate.
+    ///     tls_validate_certificate: Whether to validate the server certificate.
+    ///         Accepts `bool | None`. Defaults to `True`.
+    ///     no_delay: Whether to send packets immediately instead of allowing the
+    ///         socket to coalesce small writes. Accepts `bool`. Defaults to `False`.
+    ///
+    /// Returns:
+    ///     A configured `IggyClient`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the connection settings are invalid.
+    #[allow(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (conn=None))]
+    #[pyo3(signature = (
+        *,
+        server_address = None,
+        reconnection_max_retries = None,
+        reconnection_interval = None,
+        reestablish_after = None,
+        tls_enabled = None,
+        tls_domain = None,
+        tls_ca_file = None,
+        tls_validate_certificate = None,
+        no_delay = false
+    ))]
     fn new(
-        #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        reconnection_max_retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        reconnection_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        reestablish_after: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] tls_enabled: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_domain: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] tls_ca_file: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))]
+        tls_validate_certificate: Option<bool>,
+        no_delay: bool,
     ) -> PyResult<Self> {
-        let client = IggyClientBuilder::new()
+        let mut builder = IggyClientBuilder::new()
             .with_tcp()
-            .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
+            .with_server_address(server_address.unwrap_or_else(|| "127.0.0.1:8090".to_string()));
+        let tls_enabled = tls_enabled.unwrap_or(false);
+
+        if let Some(retries) = reconnection_max_retries {
+            builder = builder.with_reconnection_max_retries(Some(retries));
+        }
+        if let Some(interval) = reconnection_interval {
+            builder = builder.with_reconnection_interval(py_delta_to_iggy_duration(&interval));
+        }
+        if let Some(duration) = reestablish_after {
+            builder = builder.with_reestablish_after(py_delta_to_iggy_duration(&duration));
+        }
+        builder = builder.with_tls_enabled(tls_enabled);
+        if let Some(domain) = tls_domain {
+            builder = builder.with_tls_domain(domain);
+        }
+        if let Some(ca_file) = tls_ca_file {
+            builder = builder.with_tls_ca_file(ca_file);
+        }
+        if let Some(validate) = tls_validate_certificate {
+            builder = builder.with_tls_validate_certificate(validate);
+        }
+        if no_delay {
+            builder = builder.with_no_delay();
+        }
+
+        let client = builder
             .build()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(IggyClient {
@@ -69,10 +145,19 @@ impl IggyClient {
         })
     }
 
-    /// Constructs a new IggyClient from a connection string.
-    /// Returns an error if the connection string provided is invalid.
-    // TODO: add examples for connection strings or at least a link to the doc page where
-    // connection strings are explained.
+    /// Create an `IggyClient` from a connection string.
+    ///
+    /// Use this when the connection configuration is already available as a single string.
+    ///
+    /// Args:
+    ///     connection_string: Connection string as `str` describing how to connect
+    ///         to the server.
+    ///
+    /// Returns:
+    ///     A configured `IggyClient`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the connection string is invalid.
     #[classmethod]
     #[pyo3(signature = (connection_string))]
     fn from_connection_string(
@@ -86,9 +171,15 @@ impl IggyClient {
         })
     }
 
-    /// Sends a ping request to the server to check connectivity.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the connection fails.
+    /// Check whether the server is reachable.
+    ///
+    /// Sends a ping request and waits for the server to respond.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the server responds.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails or the server cannot be reached.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -100,9 +191,18 @@ impl IggyClient {
         })
     }
 
-    /// Logs in the user with the given credentials.
-    /// Returns `Ok(())` on success, or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    /// Authenticate with a username and password.
+    ///
+    /// Args:
+    ///     username: Username as `str`.
+    ///     password: Password as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IdentityInfo` for the authenticated user.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If authentication fails or the request cannot be completed.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[IdentityInfo]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
         py: Python<'a>,
@@ -111,16 +211,21 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
+            let identity_info = inner
                 .login_user(&username, &password)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Ok(IdentityInfo::from(identity_info))
         })
     }
 
-    /// Connects the IggyClient to its service.
-    /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+    /// Open the connection to the server.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the connection is established.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the connection attempt fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -133,23 +238,40 @@ impl IggyClient {
         })
     }
 
-    /// Creates a new stream with the provided ID and name.
-    /// Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
+    /// Create a stream.
+    ///
+    /// Args:
+    ///     name: Stream name as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `StreamDetails` for the created stream.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the stream cannot be created.
     #[pyo3(signature = (name))]
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails]", imports=("collections.abc")))]
     fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
+            let stream = inner
                 .create_stream(&name)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Python::attach(|py| Py::new(py, StreamDetails::from(stream)))
         })
     }
 
-    /// Gets stream by id.
-    /// Returns Option of stream details or a PyRuntimeError on failure.
+    /// Get a stream by identifier.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `StreamDetails` if the stream exists,
+    ///     or `None` if it does not.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
@@ -168,13 +290,36 @@ impl IggyClient {
         })
     }
 
-    /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+    /// Create a topic in a stream.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     name: Topic name as `str`.
+    ///     partitions_count: Number of partitions to create as `int`.
+    ///     compression_algorithm: Compression algorithm as `str | None`. Supported
+    ///         values are `\"none\"` and `\"gzip\"`, case-insensitive. If `None`,
+    ///         the default compression setting is used.
+    ///     replication_factor: Replication factor as `int | None` from `0` to `255`.
+    ///         Passing `0` or `None` uses the server default. The current server
+    ///         default is `1`.
+    ///     message_expiry: Message retention period as `datetime.timedelta | None`.
+    ///         Use `datetime.timedelta(0)` to request the server default, which
+    ///         currently means messages do not expire. If `None`, the server default
+    ///         is also used.
+    ///     max_topic_size: Maximum topic size in bytes as `int | None`. Use `0` to request the
+    ///         server default, which is currently unlimited. If `None`, the server
+    ///         default is also used.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `TopicDetails` for the created topic.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an argument is invalid or the topic cannot be created.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
     #[allow(clippy::too_many_arguments)]
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails]", imports=("collections.abc")))]
     fn create_topic<'a>(
         &self,
         py: Python<'a>,
@@ -208,7 +353,7 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let topic = inner
                 .create_topic(
                     &stream,
                     &name,
@@ -220,12 +365,22 @@ impl IggyClient {
                 )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Python::attach(|py| Py::new(py, TopicDetails::from(topic)))
         })
     }
 
-    /// Gets topic by stream and id.
-    /// Returns Option of topic details or a PyRuntimeError on failure.
+    /// Get a topic by stream and topic identifier.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `TopicDetails` if the topic exists,
+    ///     or `None` if it does not.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
@@ -476,7 +631,7 @@ impl IggyClient {
                 .get_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(group.map(PyConsumerGroupDetails::from))
+            Ok(group.map(ConsumerGroupDetails::from))
         })
     }
 
@@ -510,13 +665,25 @@ impl IggyClient {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(groups
                 .into_iter()
-                .map(PyConsumerGroup::from)
+                .map(ConsumerGroup::from)
                 .collect::<Vec<_>>())
         })
     }
 
-    /// Sends a list of messages to the specified topic.
-    /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+    /// Send messages to a topic partition.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     topic: Topic identifier as `str | int`.
+    ///     partitioning: Partition id as `int`.
+    ///     messages: Messages to publish as `list[SendMessage]`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` after the messages are sent.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid, the messages cannot be
+    ///         converted, or the send request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
@@ -552,8 +719,23 @@ impl IggyClient {
         })
     }
 
-    /// Polls for messages from the specified topic and partition.
-    /// Returns a list of received messages or a PyRuntimeError on failure.
+    /// Poll messages from a topic partition.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     topic: Topic identifier as `str | int`.
+    ///     partition_id: Partition to read from as `int`.
+    ///     polling_strategy: Polling strategy as `PollingStrategy`. See
+    ///         `PollingStrategy` for the available variants and their payloads.
+    ///     count: Maximum number of messages to return as `int`.
+    ///     auto_commit: Whether to store the consumer offset automatically after
+    ///         polling as `bool`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to a `list[ReceiveMessage]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an identifier is invalid or the poll request fails.
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
@@ -598,8 +780,44 @@ impl IggyClient {
         })
     }
 
-    /// Creates a new consumer group consumer.
-    /// Returns the consumer or a PyRuntimeError on failure.
+    /// Create a consumer group consumer.
+    ///
+    /// Args:
+    ///     name: Consumer group name as `str`.
+    ///     stream: Stream identifier as `str`.
+    ///     topic: Topic identifier as `str`.
+    ///     partition_id: Partition id as `int | None`. If `None`, partition
+    ///         assignment is left to the consumer group.
+    ///     polling_strategy: Polling strategy as `PollingStrategy | None`. See
+    ///         `PollingStrategy` for the available variants and their payloads.
+    ///         If `None`, reading starts from the next message after the stored offset.
+    ///     batch_length: Maximum number of messages to fetch per poll as `int | None`.
+    ///         If `None`, the default is `1000`.
+    ///     auto_commit: Offset commit policy as `AutoCommit | None`. See
+    ///         `AutoCommit` for the available modes. If `None`, offsets are committed
+    ///         every second and when messages are polled.
+    ///     create_consumer_group_if_not_exists: Whether to create the consumer
+    ///         group automatically if it does not exist as `bool`. Defaults to `True`.
+    ///     auto_join_consumer_group: Whether to join the consumer group automatically
+    ///         during initialization as `bool`. Defaults to `True`.
+    ///     poll_interval: Delay between polling attempts as `datetime.timedelta | None`.
+    ///         If `None`, no poll interval is configured.
+    ///     polling_retry_interval: Delay before retrying polling after a disconnect
+    ///         as `datetime.timedelta | None`. If `None`, the default is 1 second.
+    ///     init_retries: Number of retries to use during initialization when the
+    ///         stream or topic is not available as `int | None`. If `None`,
+    ///         initialization is not retried.
+    ///     init_retry_interval: Delay between initialization retries as
+    ///         `datetime.timedelta | None`. Must be set together with `init_retries`.
+    ///     allow_replay: Whether replaying previously available messages is allowed.
+    ///         Accepts `bool`. Defaults to `False`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `IggyConsumer`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the configuration is invalid or the consumer cannot
+    ///         be initialized.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,

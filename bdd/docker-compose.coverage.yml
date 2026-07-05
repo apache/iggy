@@ -44,7 +44,7 @@ services:
       - sh
       - -c
       - >-
-        uv run --project /workspace/bdd/python
+        uv run --no-sync --project /workspace/bdd/python
         pytest tests/ -v
         --cov --cov-report=xml:/reports/python-bdd-coverage.xml
 

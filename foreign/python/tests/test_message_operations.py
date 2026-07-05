@@ -335,9 +335,9 @@ class TestMessageOperations:
         )
 
         assert len(polled_messages) == len(test_messages)
-        assert [
-            message.payload().decode("utf-8") for message in polled_messages
-        ] == test_messages
+        assert [message.payload().decode("utf-8") for message in polled_messages] == (
+            test_messages
+        )
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_count_zero_is_rejected(
@@ -474,9 +474,9 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(last_messages) == 2
-        assert [
-            message.payload().decode("utf-8") for message in last_messages
-        ] == test_messages[-2:]
+        assert [message.payload().decode("utf-8") for message in last_messages] == (
+            test_messages[-2:]
+        )
 
     @pytest.mark.asyncio
     async def test_polling_strategy_offset_starts_at_exact_message(
@@ -521,9 +521,9 @@ class TestMessageOperations:
         )
         assert len(offset_messages) == len(test_messages[2:])
         assert offset_messages[0].offset() == start_offset
-        assert [
-            message.payload().decode("utf-8") for message in offset_messages
-        ] == test_messages[2:]
+        assert [message.payload().decode("utf-8") for message in offset_messages] == (
+            test_messages[2:]
+        )
 
     @pytest.mark.asyncio
     async def test_polling_strategy_offset_beyond_newest_returns_no_messages(
@@ -715,9 +715,9 @@ class TestMessageOperations:
             auto_commit=True,
         )
         assert len(next_messages) == len(new_messages)
-        assert [
-            message.payload().decode("utf-8") for message in next_messages
-        ] == new_messages
+        assert [message.payload().decode("utf-8") for message in next_messages] == (
+            new_messages
+        )
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_auto_commit_false_does_not_advance_next(
@@ -773,6 +773,6 @@ class TestMessageOperations:
             auto_commit=False,
         )
         assert len(next_messages) == len(existing_messages) + len(new_messages)
-        assert [
-            message.payload().decode("utf-8") for message in next_messages
-        ] == existing_messages + new_messages
+        assert [message.payload().decode("utf-8") for message in next_messages] == (
+            existing_messages + new_messages
+        )

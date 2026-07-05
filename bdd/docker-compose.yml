@@ -53,7 +53,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
     working_dir: /app
-    command: [ "uv", "run", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v" ]
+    command: [ "uv", "run", "--no-sync", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v" ]
     networks:
       - iggy-bdd-network
 

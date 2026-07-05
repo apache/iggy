@@ -59,7 +59,7 @@ async def iggy_client() -> IggyClient:
     wait_for_server(host, port)
 
     # Create and connect client
-    client = IggyClient(f"{host}:{port}")
+    client = IggyClient(server_address=f"{host}:{port}")
     await client.connect()
 
     # Wait for server to be fully ready

@@ -39,8 +39,8 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
-use crate::identifier::PyIdentifier;
-use crate::receive_message::ReceiveMessage;
+use crate::identity::PyIdentifier;
+use crate::message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
 /// It wraps the RustIggyConsumer and provides asynchronous functionality
@@ -54,7 +54,13 @@ pub struct IggyConsumer {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyConsumer {
-    /// Get the last consumed offset or `None` if no offset has been consumed yet.
+    /// Get the last consumed offset for a partition.
+    ///
+    /// Args:
+    ///     partition_id: Partition id as `int`.
+    ///
+    /// Returns:
+    ///     The last consumed offset as `int`, or `None` if no offset has been consumed yet.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
@@ -62,7 +68,13 @@ impl IggyConsumer {
             .get_last_consumed_offset(partition_id)
     }
 
-    /// Get the last stored offset or `None` if no offset has been stored yet.
+    /// Get the last stored offset for a partition.
+    ///
+    /// Args:
+    ///     partition_id: Partition id as `int`.
+    ///
+    /// Returns:
+    ///     The last stored offset as `int`, or `None` if no offset has been stored yet.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
@@ -70,32 +82,59 @@ impl IggyConsumer {
             .get_last_stored_offset(partition_id)
     }
 
-    /// Gets the name of the consumer group.
+    /// Get the consumer group name.
+    ///
+    /// Returns:
+    ///     The consumer group name as `str`.
     fn name(&self) -> String {
         self.inner.blocking_lock().name().to_string()
     }
 
-    /// Gets the current partition id or `0` if no messages have been polled yet.
+    /// Get the current partition id.
+    ///
+    /// Returns:
+    ///     The current partition id as `int`. Returns `0` if no messages have been
+    ///     polled yet.
     fn partition_id(&self) -> u32 {
         self.inner.blocking_lock().partition_id()
     }
 
-    /// Gets the name of the stream this consumer group is configured for.
+    /// Get the configured stream identifier.
+    ///
+    /// Returns:
+    ///     The stream identifier as `str | int`, depending on how the consumer was configured.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the identifier cannot be converted for Python.
     fn stream(&self) -> PyResult<PyIdentifier> {
         let guard = self.inner.blocking_lock();
         PyIdentifier::try_from(guard.stream())
     }
 
-    /// Gets the name of the topic this consumer group is configured for.
+    /// Get the configured topic identifier.
+    ///
+    /// Returns:
+    ///     The topic identifier as `str | int`, depending on how the consumer was configured.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the identifier cannot be converted for Python.
     fn topic(&self) -> PyResult<PyIdentifier> {
         let guard = self.inner.blocking_lock();
         PyIdentifier::try_from(guard.topic())
     }
 
-    /// Stores the provided offset for the provided partition id or if none is specified
-    /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the operation fails.
+    /// Store a consumer offset on the server.
+    ///
+    /// Args:
+    ///     offset: Offset to store as `int`.
+    ///     partition_id: Partition id as `int | None`. If `None`, the current
+    ///         consumer partition is used.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the offset is stored.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If storing the offset fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
         &self,
@@ -114,10 +153,17 @@ impl IggyConsumer {
         })
     }
 
-    /// Deletes the offset for the provided partition id or if none is specified
-    /// uses the current partition id for the consumer group.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the operation fails.
+    /// Delete a stored consumer offset from the server.
+    ///
+    /// Args:
+    ///     partition_id: Partition id as `int | None`. If `None`, the current
+    ///         consumer partition is used.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the offset is deleted.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If deleting the offset fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,
@@ -135,21 +181,39 @@ impl IggyConsumer {
         })
     }
 
-    /// Asynchronously iterate over `ReceiveMessage`s.
-    /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-    /// or a `PyRuntimeError` on failure.
-    /// Note: This method does not currently support `AutoCommit.After`.
-    /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
-    /// only the interval part is applied; the `after` mode is ignored.
-    /// Use `consume_messages()` if you need commit-after-processing semantics.
+    /// Create an async iterator over `ReceiveMessage`.
+    ///
+    /// Returns:
+    ///     A `collections.abc.AsyncIterator[ReceiveMessage]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If polling messages fails while iterating.
+    ///
+    /// Notes:
+    ///     This method does not currently support `AutoCommit.After`.
+    ///     For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
+    ///     only the interval part is applied; the `after` mode is ignored.
+    ///     Use `consume_messages()` if you need commit-after-processing semantics.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
     fn iter_messages(&self) -> ReceiveMessageIterator {
         let inner = self.inner.clone();
         ReceiveMessageIterator { inner }
     }
 
-    /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-    /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+    /// Consume messages continuously with an async callback.
+    ///
+    /// Args:
+    ///     callback: Async callback as
+    ///         `collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]]`.
+    ///         It is called once for each `ReceiveMessage`.
+    ///     shutdown_event: Optional `asyncio.Event`. If provided, consumption
+    ///         stops when the event is set.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when consumption stops.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If message consumption fails or shutdown signaling fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
@@ -355,6 +419,14 @@ pub struct ReceiveMessageIterator {
 
 #[pymethods]
 impl ReceiveMessageIterator {
+    /// Return the next message from the iterator.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ReceiveMessage`.
+    ///
+    /// Raises:
+    ///     StopAsyncIteration: If there are no more messages.
+    ///     PyRuntimeError: If polling the next message fails.
     pub fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -374,6 +446,7 @@ impl ReceiveMessageIterator {
         })
     }
 
+    /// Return this async iterator.
     pub fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -411,21 +484,28 @@ impl MessageConsumer for PyCallbackConsumer {
 }
 
 /// The auto-commit configuration for storing the offset on the server.
+///
+/// Use this type with `IggyClient.consumer_group(..., auto_commit=...)`.
 // #[derive(Debug, PartialEq, Copy, Clone)]
 #[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum AutoCommit {
-    /// The auto-commit is disabled and the offset must be stored manually by the consumer.
+    /// Disable automatic offset commits. Offsets must be stored manually.
     Disabled(),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval.
+    /// Commit offsets on a fixed interval.
+    /// Payload: `datetime.timedelta`.
     Interval(Py<PyDelta>),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
+    /// Commit offsets on a fixed interval or according to an `AutoCommitWhen` mode.
+    /// Payload: `(datetime.timedelta, AutoCommitWhen)`.
     IntervalOrWhen(Py<PyDelta>, AutoCommitWhen),
-    /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
+    /// Commit offsets on a fixed interval or according to an `AutoCommitAfter` mode.
+    /// Payload: `(datetime.timedelta, AutoCommitAfter)`.
     IntervalOrAfter(Py<PyDelta>, AutoCommitAfter),
-    /// The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
+    /// Commit offsets according to an `AutoCommitWhen` mode.
+    /// Payload: `AutoCommitWhen`.
     When(AutoCommitWhen),
-    /// The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
+    /// Commit offsets according to an `AutoCommitAfter` mode.
+    /// Payload: `AutoCommitAfter`.
     After(AutoCommitAfter),
 }
 
@@ -452,17 +532,20 @@ impl From<&AutoCommit> for RustAutoCommit {
 }
 
 /// The auto-commit mode for storing the offset on the server.
+///
+/// Use this type inside `AutoCommit.When(...)` or `AutoCommit.IntervalOrWhen(...)`.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[gen_stub_pyclass_complex_enum(skip_stub_type)]
 #[pyclass(from_py_object)]
 pub enum AutoCommitWhen {
-    /// The offset is stored on the server when the messages are received.
+    /// Store the offset when messages are polled from the server.
     PollingMessages(),
-    /// The offset is stored on the server when all the messages are consumed.
+    /// Store the offset after all messages from a poll have been consumed.
     ConsumingAllMessages(),
-    /// The offset is stored on the server when consuming each message.
+    /// Store the offset after each consumed message.
     ConsumingEachMessage(),
-    /// The offset is stored on the server when consuming every Nth message.
+    /// Store the offset after every Nth consumed message.
+    /// Payload: `int`.
     ConsumingEveryNthMessage(u32),
 }
 
@@ -486,16 +569,19 @@ impl PyStubType for AutoCommitWhen {
 }
 
 /// The auto-commit mode for storing the offset on the server **after** receiving the messages.
+///
+/// Use this type inside `AutoCommit.After(...)` or `AutoCommit.IntervalOrAfter(...)`.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[gen_stub_pyclass_complex_enum(skip_stub_type)]
 #[pyclass(from_py_object)]
 #[allow(clippy::enum_variant_names)]
 pub enum AutoCommitAfter {
-    /// The offset is stored on the server after all the messages are consumed.
+    /// Store the offset after all messages from a poll have been consumed.
     ConsumingAllMessages(),
-    /// The offset is stored on the server after consuming each message.
+    /// Store the offset after each consumed message.
     ConsumingEachMessage(),
-    /// The offset is stored on the server after consuming every Nth message.
+    /// Store the offset after every Nth consumed message.
+    /// Payload: `int`.
     ConsumingEveryNthMessage(u32),
 }
 

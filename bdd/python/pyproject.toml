@@ -23,12 +23,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "apache-iggy",
-    "pyrefly>=1.1.1",
-    "pytest>=9.1.1",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "pytest-bdd>=6.0.0",
     "pytest-cov>=4.0.0",
-    "ruff>=0.15.19",
 ]
 
 [tool.uv.sources]
@@ -58,4 +56,10 @@ select = [
 [tool.pyrefly]
 project-includes = [
     "**/*.py*",
+]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.0.0",
+    "ruff>=0.15.15",
 ]
