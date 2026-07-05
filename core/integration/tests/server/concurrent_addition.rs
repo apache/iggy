@@ -37,12 +37,19 @@ use test_case::test_matrix;
     quic.max_idle_timeout = "500s",
     quic.keep_alive_interval = "15s"
 ))]
-#[test_matrix(
+// vsr excludes HTTP only (server-ng exposes no HTTP listener).
+#[cfg_attr(not(feature = "vsr"), test_matrix(
     [tcp(), http(), quic(), websocket()],
     [user(), stream(), topic(), partition(), consumer_group()],
     [hot(), cold()],
     [barrier_on(), barrier_off()]
-)]
+))]
+#[cfg_attr(feature = "vsr", test_matrix(
+    [tcp(), quic(), websocket()],
+    [user(), stream(), topic(), partition(), consumer_group()],
+    [hot(), cold()],
+    [barrier_on(), barrier_off()]
+))]
 async fn matrix(
     harness: &TestHarness,
     transport: TransportProtocol,
@@ -57,6 +64,7 @@ fn tcp() -> TransportProtocol {
     TransportProtocol::Tcp
 }
 
+#[cfg(not(feature = "vsr"))]
 fn http() -> TransportProtocol {
     TransportProtocol::Http
 }

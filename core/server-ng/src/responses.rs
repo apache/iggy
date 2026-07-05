@@ -33,6 +33,7 @@ use iggy_binary_protocol::codes::{
     GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE,
     GET_USERS_CODE,
 };
+use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -51,6 +52,9 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::consumer_groups::GetConsumerGroupsResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::{
+    GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
+};
 use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_binary_protocol::responses::streams::get_stream::{
     GetStreamResponse, TopicHeader as StreamTopicHeader,
@@ -84,6 +88,36 @@ use std::rc::Rc;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
+pub(crate) fn build_get_personal_access_tokens_response(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) -> GetPersonalAccessTokensResponse {
+    // PATs are per-user; list the requesting connection's own tokens, resolved
+    // from this shard's `SessionManager` (like `get_me`) then read out of the
+    // replicated Users STM.
+    let Some(user_id) = sessions.borrow().get_user_id(transport_client_id) else {
+        return GetPersonalAccessTokensResponse { tokens: Vec::new() };
+    };
+    shard.plane.metadata().mux_stm.users().read(|users| {
+        let tokens = users
+            .personal_access_tokens
+            .get(&user_id)
+            .map(|pats| {
+                pats.values()
+                    .filter_map(|pat| {
+                        Some(PersonalAccessTokenResponse {
+                            name: WireName::new(pat.name.as_ref()).ok()?,
+                            expiry_at: pat.expiry_at.map_or(0, |expiry| expiry.as_micros()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        GetPersonalAccessTokensResponse { tokens }
+    })
+}
+
 pub(crate) fn build_get_me_response(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -476,36 +510,48 @@ fn build_cluster_metadata_response() -> ClusterMetadataResponse {
 }
 
 fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
-    let (streams_count, topics_count, partitions_count, messages_size_bytes, messages_count) =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                let mut topics_count = 0u32;
-                let mut partitions_count = 0u32;
-                let mut messages_size_bytes = 0u64;
-                let mut messages_count = 0u64;
-                for (_, stream) in &streams.items {
-                    topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-                    messages_size_bytes =
-                        messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-                    messages_count =
-                        messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                    for (_, topic) in &stream.topics {
-                        partitions_count =
-                            partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-                    }
+    let (
+        streams_count,
+        topics_count,
+        partitions_count,
+        segments_count,
+        messages_size_bytes,
+        messages_count,
+    ) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| -> Result<_, IggyError> {
+            let mut topics_count = 0u32;
+            let mut partitions_count = 0u32;
+            let mut segments_count = 0u32;
+            let mut messages_size_bytes = 0u64;
+            let mut messages_count = 0u64;
+            for (_, stream) in &streams.items {
+                topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
+                messages_size_bytes =
+                    messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
+                messages_count =
+                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+                // Segment counts roll up from the partition plane through
+                // the shared stats registry (partition -> topic -> stream).
+                segments_count =
+                    segments_count.saturating_add(stream.stats.segments_count_inconsistent());
+                for (_, topic) in &stream.topics {
+                    partitions_count =
+                        partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
                 }
-                Ok((
-                    usize_to_u32(streams.items.len())?,
-                    topics_count,
-                    partitions_count,
-                    messages_size_bytes,
-                    messages_count,
-                ))
-            })?;
+            }
+            Ok((
+                usize_to_u32(streams.items.len())?,
+                topics_count,
+                partitions_count,
+                segments_count,
+                messages_size_bytes,
+                messages_count,
+            ))
+        })?;
     let consumer_groups_count = usize_to_u32(
         shard
             .plane
@@ -530,7 +576,7 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
         streams_count,
         topics_count,
         partitions_count,
-        segments_count: 0,
+        segments_count,
         messages_count,
         clients_count: 0,
         consumer_groups_count,
@@ -653,7 +699,7 @@ fn build_get_topic_response(
             partitions: topic
                 .partitions
                 .iter()
-                .map(partition_response)
+                .map(|partition| partition_response(streams, stream_id, topic_id, partition))
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
@@ -735,15 +781,34 @@ fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeade
 }
 
 fn partition_response(
+    streams: &metadata::stm::stream::StreamsInner,
+    stream_id: usize,
+    topic_id: usize,
     partition: &metadata::stm::stream::Partition,
 ) -> Result<PartitionResponse, IggyError> {
+    // Per-partition counters live in the shared stats registry (one `Arc`
+    // across all shards and both left-right buffers), populated when the
+    // owning shard materializes the partition; `None` only in the window
+    // before that first materialization.
+    let stats = streams
+        .stats_registry
+        .partition_get(stream_id, topic_id, partition.id);
+    let (segments_count, current_offset, size_bytes, messages_count) =
+        stats.map_or((0, 0, 0, 0), |stats| {
+            (
+                stats.segments_count_inconsistent(),
+                stats.current_offset(),
+                stats.size_bytes_inconsistent(),
+                stats.messages_count_inconsistent(),
+            )
+        });
     Ok(PartitionResponse {
         id: usize_to_u32(partition.id)?,
         created_at: partition.created_at.as_micros(),
-        segments_count: 0,
-        current_offset: 0,
-        size_bytes: 0,
-        messages_count: 0,
+        segments_count,
+        current_offset,
+        size_bytes,
+        messages_count,
     })
 }
 
@@ -788,14 +853,28 @@ pub(crate) fn build_login_register_reply(
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    let body = LoginRegisterResponse {
+    // Result-framed like every metadata reply: a zero result-count (success)
+    // followed by the `LoginRegisterResponse` payload. A transient Register
+    // instead ships a `[count=1][index=0][TransientNotCommitted]` frame
+    // (`build_transient_reply`), which the SDK decodes and replays. The matching
+    // strip is in the SDK `split_metadata_result` (Register is result-framed).
+    let payload = LoginRegisterResponse {
         user_id,
         session,
         server_protocol_version: IGGY_PROTOCOL_VERSION,
         server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
     }
     .to_bytes();
-    build_reply_from_bytes(request_header, client_id, session, commit, &body)
+    let mut body = Vec::with_capacity(RESULT_COUNT_LEN + payload.len());
+    body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
+    body.extend_from_slice(&payload);
+    build_reply_from_bytes(
+        request_header,
+        client_id,
+        session,
+        commit,
+        &Bytes::from(body),
+    )
 }
 
 pub(crate) fn build_reply_from_bytes(
@@ -839,12 +918,30 @@ pub(crate) fn build_raw_pat_reply(
         return Ok(committed);
     }
     let header_len = std::mem::size_of::<ReplyHeader>();
+    // A `Reply` whose result section is nonzero is not a successful commit but a
+    // committed business rejection or a `TransientNotCommitted` retry frame, both
+    // with no payload and no token to ship. Pass it through so the client decodes
+    // the typed result (and, for a transient, replays) instead of having a raw
+    // token grafted onto a rejection body.
+    if result_code(&committed.as_slice()[header_len..]) != Some(0) {
+        return Ok(committed);
+    }
     let committed_header =
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
-    let body = RawPersonalAccessTokenResponse { token }.to_bytes();
+    let token_payload = RawPersonalAccessTokenResponse { token }.to_bytes();
+    // Metadata reply bodies are framed `[result_count:u32][payload]`; a success
+    // is `count == 0` followed by the payload (see `ApplyReply::write_reply_body`
+    // / `result_code`). The committed reply carried an empty payload with this
+    // same framing, so reproduce it here - prepend the zero result-count rather
+    // than shipping a bare `RawPersonalAccessTokenResponse`, which the client
+    // would misread as the result-count and reject as a bogus error.
+    let mut framed = Vec::with_capacity(RESULT_COUNT_LEN + token_payload.len());
+    framed.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
+    framed.extend_from_slice(&token_payload);
+    let body = Bytes::from(framed);
     let reply = build_reply_from_bytes(
         request_header,
         request_header.client,

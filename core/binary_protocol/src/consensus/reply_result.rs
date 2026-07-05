@@ -17,7 +17,7 @@
 
 //! Decoder for the committed-result section that leads a metadata reply body.
 //!
-//! A metadata op (`Operation::is_metadata`) commits a TigerBeetle-style result
+//! A metadata op (`Operation::is_metadata`) commits a result
 //! section ahead of its typed payload: `[count: u32]` then `count` x
 //! `{index: u32, result: u32}`, little-endian. Success is `count == 0` followed
 //! by the payload; a committed business rejection is one `{index: 0, result}`

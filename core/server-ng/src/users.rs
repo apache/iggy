@@ -31,8 +31,7 @@ use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
 use iggy_binary_protocol::{Operation, RequestHeader};
 use iggy_common::IggyError;
-use server::streaming::utils::crypto;
-use server_common::Message;
+use server_common::{Message, crypto};
 
 /// Replace a raw wire password with its Argon2 hash before replication.
 ///

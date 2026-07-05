@@ -46,6 +46,9 @@ writeable = "writeable"
 Paket = "Paket"
 # Visual Studio dockerignore glob "[Pp]ublish.xml" tokenizes to "ublish"
 ublish = "ublish"
+# Valid English prefix in hyphenated compounds ("mis-strides", "mis-decoded");
+# typos tokenizes on the hyphen and misreads the prefix as "miss"/"mist"
+mis = "mis"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
