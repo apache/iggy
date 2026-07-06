@@ -26,6 +26,8 @@ mod scope;
 mod server;
 #[path = "common/tcp.rs"]
 mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
 use std::time::Duration;
 
@@ -47,6 +49,7 @@ use tcp::{
     build_metadata_legacy_request, build_produce_v3_body, build_request_frame,
     parse_response_payload, read_response_frame_with_timeout,
 };
+use wire::build_metadata_flexible_request_v10;
 
 // ── Produce acks=0 (review: broker must stay silent) ─────────────────────────
 
@@ -250,6 +253,45 @@ async fn e2e_list_offsets_v0_unsupported_version_no_trailing_bytes() {
 }
 
 // ── Metadata topic name echo (review: must not hardcode "unknown-topic") ────
+
+#[test]
+fn metadata_v10_unsupported_decodes_client_body_not_clamped_version() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        10,
+        build_metadata_flexible_request_v10(&["payments"]),
+        &default_broker(),
+    )
+    .expect("test request has acks != 0 and expects a response");
+
+    let mut d = Decoder::new(body);
+    d.read_i32().unwrap(); // throttle_time_ms
+    let broker_count = usize::try_from(d.read_varint().unwrap())
+        .unwrap()
+        .saturating_sub(1);
+    for _ in 0..broker_count {
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_i32().unwrap();
+        d.read_compact_nullable_string().unwrap();
+        d.read_tagged_fields().unwrap();
+    }
+    d.read_compact_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    assert_eq!(
+        usize::try_from(d.read_varint().unwrap())
+            .unwrap()
+            .saturating_sub(1),
+        1
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(
+        d.read_compact_nullable_string()
+            .unwrap()
+            .expect("topic name"),
+        "payments"
+    );
+}
 
 fn read_metadata_v1_topics(d: &mut Decoder, expected_count: i32) -> Vec<String> {
     let _brokers_count = d.read_i32().unwrap();

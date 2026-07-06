@@ -174,11 +174,13 @@ fn handle_other_request(
         }
         API_KEY_METADATA => {
             if is_supported_version(api_key, api_version) {
-                encode_metadata_response(api_version, body, broker, ERROR_NONE)
+                encode_metadata_response(api_version, api_version, body, broker, ERROR_NONE)
             } else {
-                // Encode at the highest version we implement, not the client's unknown version.
+                let response_version = api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION);
+                // Decode at the client's wire version; encode at the highest version we implement.
                 encode_metadata_response(
-                    api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION),
+                    response_version,
+                    api_version,
                     body,
                     broker,
                     ERROR_UNSUPPORTED_VERSION,
@@ -285,12 +287,13 @@ fn encode_api_versions_response(api_version: i16, error_code: i16) -> Bytes {
 }
 
 fn encode_metadata_response(
-    api_version: i16,
+    response_version: i16,
+    decode_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
     top_level_error_code: i16,
 ) -> Bytes {
-    let flexible = api_version >= 9;
+    let flexible = response_version >= 9;
     // Empty body = all-topics request; 0 topics is correct for this stub.
     // Non-empty body that fails to decode = malformed request; return 0 topics.
     // Kafka Metadata response has no top-level error code field: errors are per-topic only.
@@ -298,7 +301,7 @@ fn encode_metadata_response(
     let (topics, effective_error) = if body.is_empty() {
         (Vec::new(), top_level_error_code)
     } else {
-        decode_metadata_request_topics(body, api_version)
+        decode_metadata_request_topics(body, decode_version)
             .map_or((Vec::new(), ERROR_INVALID_REQUEST), |names| {
                 (names, top_level_error_code)
             })
@@ -312,7 +315,7 @@ fn encode_metadata_response(
 
     let mut e = Encoder::with_capacity(256);
 
-    if api_version >= 3 {
+    if response_version >= 3 {
         e.write_i32(0); // throttle_time_ms (Metadata v3+)
     }
 
@@ -347,14 +350,14 @@ fn encode_metadata_response(
             return encode_error_only_response(ERROR_INVALID_REQUEST);
         }
         e.write_i32(broker.port);
-        if api_version >= 1 {
+        if response_version >= 1 {
             e.write_nullable_string_unchecked(None); // rack
         }
 
-        if api_version >= 2 {
+        if response_version >= 2 {
             e.write_nullable_string_unchecked(None); // cluster_id
         }
-        if api_version >= 1 {
+        if response_version >= 1 {
             e.write_i32(1); // controller_id — must come before topics array
         }
 
@@ -362,15 +365,15 @@ fn encode_metadata_response(
         for name in &topics {
             e.write_i16(topic_error);
             e.write_nullable_string_unchecked(Some(name));
-            if api_version >= 1 {
+            if response_version >= 1 {
                 e.write_bool(false); // is_internal
             }
             e.write_i32(0); // partitions array (empty)
-            if api_version >= 8 {
+            if response_version >= 8 {
                 e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations
             }
         }
-        if api_version >= 8 {
+        if response_version >= 8 {
             e.write_i32(AUTHORIZED_OPS_UNKNOWN); // cluster_authorized_operations
         }
     }
@@ -398,6 +401,10 @@ pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> R
 
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
+        if flexible && api_version >= 10 {
+            // MetadataRequestTopic.topic_id: 16-byte UUID before name (v10+).
+            let _topic_id = d.read_bytes(16)?;
+        }
         let name = if flexible {
             d.read_compact_nullable_string()?
                 .ok_or(KafkaProtocolError::NullTopicName)?

@@ -63,6 +63,19 @@ pub fn build_metadata_flexible_request(topic_names: &[&str]) -> Bytes {
     enc.freeze()
 }
 
+/// Metadata v10+ flexible request: each topic entry includes a 16-byte `topic_id` before `name`.
+pub fn build_metadata_flexible_request_v10(topic_names: &[&str]) -> Bytes {
+    let mut enc = Encoder::with_capacity(96);
+    enc.write_varint((topic_names.len() + 1) as u64);
+    for name in topic_names {
+        enc.write_bytes(&[0u8; 16]);
+        enc.write_compact_nullable_string(Some(name));
+        enc.write_empty_tagged_fields();
+    }
+    enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
 /// Minimal `ListOffsets` request for supported versions (v1–v6).
 pub fn build_list_offsets_request(version: i16, topic: &str, partition: i32) -> Bytes {
     let flexible = version >= 6;

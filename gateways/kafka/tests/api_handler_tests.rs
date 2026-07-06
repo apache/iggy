@@ -29,7 +29,7 @@ fn test_broker() -> BrokerAdvertise {
     BrokerAdvertise::default()
 }
 use iggy_gateway_kafka::protocol::codec::Decoder;
-use wire::build_metadata_flexible_request;
+use wire::build_metadata_flexible_request_v10;
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
@@ -110,13 +110,12 @@ fn metadata_response_has_broker_array_and_topic_array() {
 
 #[test]
 fn unsupported_version_returns_protocol_error() {
-    // v99 client sends a well-formed v9 flexible body requesting "orders".
-    // The gateway caps at v9 (highest supported Metadata version) for both parsing
-    // and encoding, so the response uses the flexible (v9) wire format.
+    // v99 client sends a well-formed v10+ flexible body (topic_id + name) requesting "orders".
+    // Response encodes at v9 (highest supported); request decodes at client version 99.
     let body = handle_request(
         API_KEY_METADATA,
         99,
-        build_metadata_flexible_request(&["orders"]),
+        build_metadata_flexible_request_v10(&["orders"]),
         &test_broker(),
     )
     .expect("test request has acks != 0 and expects a response");

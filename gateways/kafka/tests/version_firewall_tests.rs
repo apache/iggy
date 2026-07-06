@@ -38,7 +38,7 @@ use iggy_gateway_kafka::protocol::codec::Decoder;
 use fixtures::load_fixture_body;
 use scope::{SCOPED_API_KEYS, default_broker};
 use tcp::build_metadata_legacy_request;
-use wire::build_metadata_flexible_request;
+use wire::build_metadata_flexible_request_v10;
 
 #[test]
 fn supported_ranges_table_has_six_entries() {
@@ -180,11 +180,11 @@ fn metadata_below_min_version_returns_topic_error() {
 
 #[test]
 fn metadata_above_max_version_returns_topic_error() {
-    // v10 request uses flexible encoding; response is clamped to v9.
+    // v10 request uses flexible encoding with topic_id; response is clamped to v9.
     let body = handle_request(
         API_KEY_METADATA,
         10,
-        build_metadata_flexible_request(&["test-topic"]),
+        build_metadata_flexible_request_v10(&["test-topic"]),
         &default_broker(),
     )
     .expect("test request has acks != 0 and expects a response");
@@ -208,6 +208,13 @@ fn metadata_above_max_version_returns_topic_error() {
         .saturating_sub(1);
     assert_eq!(topic_count, 1);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
+    assert_eq!(
+        d.read_compact_nullable_string()
+            .unwrap()
+            .expect("topic name"),
+        "test-topic",
+        "unsupported-version path must decode client v10 body and echo topic name in v9 response"
+    );
 }
 
 #[test]
