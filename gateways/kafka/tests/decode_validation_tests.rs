@@ -68,6 +68,7 @@ fn produce_all_supported_versions_decode() {
     for version in 3i16..=9 {
         let body = load_body(0, "Produce", version);
         let req = decode_produce_request(version, body)
+            .into_request()
             .unwrap_or_else(|e| panic!("Produce v{version} decode failed: {e}"));
 
         assert_eq!(req.acks, -1, "Produce v{version}: unexpected acks");
@@ -101,6 +102,7 @@ fn produce_response_encodes_for_all_supported_versions() {
     for version in 3i16..=9 {
         let body = load_body(0, "Produce", version);
         let req = decode_produce_request(version, body)
+            .into_request()
             .unwrap_or_else(|e| panic!("Produce v{version} decode failed: {e}"));
         let resp = encode_produce_response(version, &req);
         assert!(
@@ -114,7 +116,7 @@ fn produce_response_encodes_for_all_supported_versions() {
 fn produce_response_v3_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(0, "Produce", 3);
-    let req = decode_produce_request(3, body).unwrap();
+    let req = decode_produce_request(3, body).into_request().unwrap();
     let resp = encode_produce_response(3, &req);
 
     let mut d = Decoder::new(resp);
@@ -141,7 +143,7 @@ fn produce_response_v3_roundtrip() {
 fn produce_response_v8_includes_record_errors() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
     let body = load_body(0, "Produce", 8);
-    let req = decode_produce_request(8, body).unwrap();
+    let req = decode_produce_request(8, body).into_request().unwrap();
     let resp = encode_produce_response(8, &req);
 
     let mut d = Decoder::new(resp);

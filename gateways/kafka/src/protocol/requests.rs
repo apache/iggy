@@ -44,72 +44,122 @@ pub struct ProducePartitionData {
     pub records: Option<Bytes>, // Raw RecordBatch bytes
 }
 
-pub fn decode_produce_request(version: i16, body: Bytes) -> Result<ProduceRequest> {
+/// Outcome of decoding a Produce request body.
+///
+/// Carries `acks` on failure so callers can honor fire-and-forget (`acks=0`) silence
+/// even when later fields are malformed.
+#[derive(Debug)]
+pub enum ProduceDecodeResult {
+    Ok(ProduceRequest),
+    Err {
+        acks: Option<i16>,
+        error: KafkaProtocolError,
+    },
+}
+
+impl ProduceDecodeResult {
+    /// Collapse to `Result` for tests and callers that only need a successful `ProduceRequest`.
+    pub fn into_request(self) -> Result<ProduceRequest> {
+        match self {
+            Self::Ok(req) => Ok(req),
+            Self::Err { error, .. } => Err(error),
+        }
+    }
+}
+
+macro_rules! produce_decode {
+    ($acks:expr, $expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(error) => {
+                return ProduceDecodeResult::Err { acks: $acks, error };
+            }
+        }
+    };
+}
+
+pub fn decode_produce_request(version: i16, body: Bytes) -> ProduceDecodeResult {
     let mut d = Decoder::new(body);
     let flexible = version >= 9;
 
     // transactional_id (v3+)
     let transactional_id = if version >= 3 {
-        if flexible {
-            d.read_compact_nullable_string()?
-        } else {
-            d.read_nullable_string()?
-        }
+        produce_decode!(
+            None,
+            if flexible {
+                d.read_compact_nullable_string()
+            } else {
+                d.read_nullable_string()
+            }
+        )
     } else {
         None
     };
 
-    let acks = d.read_i16()?;
-    let timeout_ms = d.read_i32()?;
+    let acks = produce_decode!(None, d.read_i16());
+    let acks_read = Some(acks);
+
+    let timeout_ms = produce_decode!(acks_read, d.read_i32());
 
     // topics array
-    let topics_count = if flexible {
-        d.read_compact_array_count()?
-    } else {
-        d.read_i32_array_count()?
-    };
+    let topics_count = produce_decode!(
+        acks_read,
+        if flexible {
+            d.read_compact_array_count()
+        } else {
+            d.read_i32_array_count()
+        }
+    );
 
     let mut topics = Vec::with_capacity(topics_count);
     for _ in 0..topics_count {
-        let topic = if flexible {
-            d.read_compact_nullable_string()?
-                .ok_or(KafkaProtocolError::NullTopicName)?
-        } else {
-            d.read_nullable_string()?
-                .ok_or(KafkaProtocolError::NullTopicName)?
-        };
+        let topic = produce_decode!(
+            acks_read,
+            if flexible {
+                d.read_compact_nullable_string()
+            } else {
+                d.read_nullable_string()
+            }
+            .and_then(|name| name.ok_or(KafkaProtocolError::NullTopicName))
+        );
 
-        let partitions_count = if flexible {
-            d.read_compact_array_count()?
-        } else {
-            d.read_i32_array_count()?
-        };
+        let partitions_count = produce_decode!(
+            acks_read,
+            if flexible {
+                d.read_compact_array_count()
+            } else {
+                d.read_i32_array_count()
+            }
+        );
 
         let mut partitions = Vec::with_capacity(partitions_count);
         for _ in 0..partitions_count {
-            let partition = d.read_i32()?;
-            let records = if flexible {
-                d.read_compact_nullable_bytes()?
-            } else {
-                d.read_nullable_bytes()?
-            };
+            let partition = produce_decode!(acks_read, d.read_i32());
+            let records = produce_decode!(
+                acks_read,
+                if flexible {
+                    d.read_compact_nullable_bytes()
+                } else {
+                    d.read_nullable_bytes()
+                }
+            );
             partitions.push(ProducePartitionData { partition, records });
             if flexible {
-                d.read_tagged_fields()?;
+                produce_decode!(acks_read, d.read_tagged_fields());
             }
         }
 
         topics.push(ProduceTopicData { topic, partitions });
         if flexible {
-            d.read_tagged_fields()?;
+            produce_decode!(acks_read, d.read_tagged_fields());
         }
     }
 
     if flexible {
-        d.read_tagged_fields()?;
+        produce_decode!(acks_read, d.read_tagged_fields());
     }
 
-    Ok(ProduceRequest {
+    ProduceDecodeResult::Ok(ProduceRequest {
         transactional_id,
         acks,
         timeout_ms,

@@ -50,6 +50,21 @@ use tcp::{
 
 // ── Produce acks=0 (review: broker must stay silent) ─────────────────────────
 
+#[test]
+fn produce_acks_zero_malformed_body_decode_carries_acks() {
+    use iggy_gateway_kafka::protocol::requests::{ProduceDecodeResult, decode_produce_request};
+
+    let body = build_produce_v3_body(0, 1);
+    match decode_produce_request(3, body.clone()) {
+        ProduceDecodeResult::Err { acks: Some(0), .. } => {}
+        other => panic!("expected decode error with acks=0, got {other:?}"),
+    }
+    assert!(
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_none(),
+        "handler must not respond when acks=0 even if decode fails after acks"
+    );
+}
+
 #[tokio::test]
 async fn e2e_produce_v3_acks_zero_sends_no_response() {
     let (addr, _shutdown) = spawn_test_server().await;
@@ -69,6 +84,30 @@ async fn e2e_produce_v3_acks_zero_sends_no_response() {
     assert!(
         response.is_none(),
         "Produce with acks=0 must not receive a response frame (Kafka spec); got {} bytes",
+        response.as_ref().map_or(0, Bytes::len)
+    );
+}
+
+#[tokio::test]
+async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
+    let (addr, _shutdown) = spawn_test_server().await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    // acks=0, claims one topic, no topic bytes — decode fails after acks is read.
+    let body = build_produce_v3_body(0, 1);
+    let frame = build_request_frame(API_KEY_PRODUCE, 3, 99, Some("review-test"), &body);
+    stream
+        .write_all(&frame)
+        .await
+        .expect("write produce acks=0 malformed");
+
+    let response =
+        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_millis(500))
+            .await;
+
+    assert!(
+        response.is_none(),
+        "Produce with acks=0 must stay silent even when the body is malformed; got {} bytes",
         response.as_ref().map_or(0, Bytes::len)
     );
 }

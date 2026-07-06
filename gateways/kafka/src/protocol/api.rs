@@ -20,8 +20,8 @@ use bytes::Bytes;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::requests::{
-    decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
-    decode_produce_request,
+    ProduceDecodeResult, decode_create_topics_request, decode_fetch_request,
+    decode_list_offsets_request, decode_produce_request,
 };
 use crate::protocol::responses::{
     encode_create_topics_error_response, encode_create_topics_response,
@@ -135,10 +135,20 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> Option<Bytes> {
     match decode_produce_request(api_version, body) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
-        Ok(req) if req.acks == 0 => None,
-        Ok(req) => Some(encode_produce_response(api_version, &req)),
-        Err(e) => {
-            tracing::warn!("Failed to decode Produce request: {:?}", e);
+        ProduceDecodeResult::Ok(req) if req.acks == 0 => None,
+        ProduceDecodeResult::Ok(req) => Some(encode_produce_response(api_version, &req)),
+        ProduceDecodeResult::Err {
+            acks: Some(0),
+            error,
+        } => {
+            tracing::warn!(
+                "Failed to decode Produce request with acks=0 (no response): {:?}",
+                error
+            );
+            None
+        }
+        ProduceDecodeResult::Err { error, .. } => {
+            tracing::warn!("Failed to decode Produce request: {:?}", error);
             Some(encode_produce_error_response(
                 api_version,
                 ERROR_INVALID_REQUEST,

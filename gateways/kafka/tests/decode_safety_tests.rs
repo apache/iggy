@@ -58,7 +58,9 @@ fn produce_decoder_rejects_truncated_flexible_body() {
     body.push(0x02); // topics compact array: 1 element (varint = count+1)
     // truncated before topic name
 
-    let err = decode_produce_request(9, Bytes::from(body)).unwrap_err();
+    let err = decode_produce_request(9, Bytes::from(body))
+        .into_request()
+        .unwrap_err();
     assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
 }
 
