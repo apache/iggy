@@ -25,13 +25,16 @@ use crate::bootstrap::ServerNgShard;
 use crate::dispatch::submit_register_on_owner;
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
-use crate::session_manager::SessionManager;
-use consensus::MetadataHandle;
-use iggy_binary_protocol::RequestHeader;
-use iggy_common::{IggyTimestamp, PersonalAccessToken, UserStatus};
+use crate::session_manager::{ClientSdkInfo, SessionManager};
+use consensus::{MetadataHandle, build_result_rejection_reply};
+use iggy_binary_protocol::{ClientVersionInfo, RequestHeader};
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
+use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use server::streaming::utils::crypto;
+use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tracing::warn;
@@ -41,6 +44,15 @@ pub(crate) fn verify_login_credentials(
     username: &str,
     password: &str,
 ) -> Result<u32, LoginRegisterError> {
+    // Same bounds the legacy server enforces before any lookup or hashing;
+    // also keeps arbitrary-length input out of the password hash. Collapsed
+    // to InvalidCredentials on purpose (legacy: InvalidUsername /
+    // InvalidPassword): don't leak which field failed.
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username.len())
+        || !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password.len())
+    {
+        return Err(LoginRegisterError::InvalidCredentials);
+    }
     shard.plane.metadata().mux_stm.users().read(|users| {
         let Some(user_id) = users.index.get(username).copied() else {
             return Err(LoginRegisterError::InvalidCredentials);
@@ -98,7 +110,13 @@ pub(crate) async fn complete_login_register(
     vsr_client_id: u128,
     request_header: &RequestHeader,
     user_id: u32,
+    client_version: &ClientVersionInfo,
 ) -> Result<(), LoginRegisterError> {
+    let sdk_info = ClientSdkInfo {
+        sdk_name: client_version.sdk_name.as_str().to_owned(),
+        sdk_version: client_version.sdk_version.as_str().to_owned(),
+        protocol_version: client_version.protocol_version,
+    };
     let existing_session = {
         let sessions = sessions.borrow();
         sessions
@@ -106,6 +124,11 @@ pub(crate) async fn complete_login_register(
             .map(|(_, session)| session)
     };
     if let Some(session) = existing_session {
+        // Re-login on a bound connection: refresh the recorded SDK info
+        // (a reconnecting client may have been upgraded) and replay.
+        sessions
+            .borrow_mut()
+            .record_sdk_info(transport_client_id, sdk_info);
         let commit = current_metadata_commit(shard);
         let reply =
             build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
@@ -136,6 +159,7 @@ pub(crate) async fn complete_login_register(
         sessions
             .login(transport_client_id, user_id)
             .map_err(LoginRegisterError::Session)?;
+        sessions.record_sdk_info(transport_client_id, sdk_info);
         if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
             // No local rollback: `submit_register_in_process` above has
             // already committed cluster-wide. A local-only
@@ -186,6 +210,42 @@ pub(crate) async fn surface_login_failure(
 ) {
     if error.is_terminal() {
         send_login_failure_reply(shard, transport_client_id, request_header).await;
+    } else {
+        // Transient consensus failure (not-caught-up / not-primary / pipeline
+        // full): send the explicit `TransientNotCommitted` frame instead of
+        // staying silent, so the SDK replays the login immediately rather than
+        // waiting out its read-timeout. Same contract as a transient metadata
+        // request -- nothing committed, so the replayed Register is idempotent.
+        send_login_transient_reply(shard, transport_client_id, request_header).await;
+    }
+}
+
+/// Result-framed `TransientNotCommitted` Reply on a transient (non-terminal)
+/// failed Register. The SDK decodes the nonzero result code and replays the
+/// same login on the same connection. Only call for transient errors -- see
+/// [`surface_login_failure`].
+#[allow(clippy::future_not_send)]
+async fn send_login_transient_reply(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = build_result_rejection_reply(
+        request_header,
+        commit,
+        IggyError::TransientNotCommitted.as_code(),
+    );
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send login transient reply"
+        );
     }
 }
 

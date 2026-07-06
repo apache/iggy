@@ -30,22 +30,31 @@
 //! at a time:
 //!
 //! 1. accept the next bidi (or break on shutdown / connection close);
-//! 2. read exactly one inbound frame from the `RecvStream` and forward it
-//!    to [`ActorContext::in_tx`];
-//! 3. await one outbound frame on [`ActorContext::rx`] (the reply), drain
-//!    any additional immediate replies via `try_recv` (defensive — 1:1 in
-//!    steady state), write each to the `SendStream`, then `finish()` to
-//!    deliver pending data + FIN to the peer;
+//! 2. read exactly one inbound frame from the `RecvStream`, note its
+//!    `request` id, and forward it to [`ActorContext::in_tx`];
+//! 3. wait on [`ActorContext::rx`] for the reply whose `request` id matches,
+//!    discarding any stale/duplicate reply left by an earlier attempt's bidi
+//!    (the SDK replays an explicit transient with the SAME request id); write
+//!    the matched reply, then `finish()` to deliver pending data + FIN;
 //! 4. drop the bidi pair and loop to the next `accept_bi`.
 //!
-//! The `accept_bi` loop is serial by design: the single
-//! [`ActorContext::rx`] channel per connection is unkeyed, so two
-//! concurrent in-flight bidis would race the reply queue with no way to
-//! tell which reply belongs to which bidi. The iggy SDK on a single
-//! connection already serialises via an internal `RwLock`, so this is a
-//! semantic match, not a regression. A future pipelining upgrade would
-//! introduce `request_id`-keyed reply routing and run per-bidi handlers
-//! concurrently.
+//! The `accept_bi` loop is serial (the iggy SDK serialises per connection via
+//! an internal `RwLock`, so one bidi at a time is a semantic match) and the
+//! reply wait is `request_id`-KEYED. The wait is NOT bounded by a short
+//! abandon-timeout: every transient submit is answered with an explicit
+//! `TransientNotCommitted` rejection frame these days, so an unanswered bidi
+//! means the dispatch truly dropped the request (both partition queues full)
+//! or the op is pathologically slow -- and abandoning the bidi while the op
+//! can still commit would strand its reply. All partition ops on a
+//! connection share ONE request id (only metadata ops advance the dedup
+//! counter), so a stranded reply would be consumed by the NEXT partition
+//! op's bidi and shift the connection's data-plane stream off by one,
+//! permanently. Instead, [`REPLY_WAIT_BACKSTOP`] (longer than the SDK's
+//! whole-request deadline, so the client always gives up first and
+//! reconnects) closes the CONNECTION, which drops the mailbox and every
+//! pending reply with it -- nothing can strand or cross request ids. A
+//! future pipelining upgrade would additionally run per-bidi handlers
+//! concurrently (and would then require a real per-op correlation id).
 //!
 //! The handshake itself is driven by [`accept_handshake`] (no bidi
 //! captured). To avoid a single slow / hostile peer wedging the entire
@@ -73,6 +82,7 @@
 use super::{ActorContext, TransportConn, TransportListener};
 use crate::config::QuicTuning;
 use crate::framing;
+use crate::lifecycle::connection_registry::BusMessage;
 use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{
@@ -80,6 +90,7 @@ use compio_quic::{
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
+use iggy_binary_protocol::{Command2, HEADER_SIZE, ReplyHeader, RequestHeader};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -276,6 +287,54 @@ async fn accept_handshake_inner(incoming: Incoming) -> Option<(QuicTransportConn
 /// using `MessageBusConfig::close_grace`.
 pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a bidi waits for its keyed reply before abandoning the stream.
+/// A replicated submit the server cannot yet commit is answered with silence
+/// (the server expects the SDK to replay), so without a bound the per-bidi
+/// wait - and, since `accept_bi` is serial, the whole connection - would wedge:
+/// Backstop for a bidi whose dispatch never produced a reply (a true drop:
+/// both partition queues full, or a pathologically slow commit). Longer than
+/// the SDK's whole-request deadline (30s), so the client always times out
+/// first, surfaces `Disconnected`, and reconnects. On firing the CONNECTION
+/// is closed rather than the bidi abandoned: partition ops all share one
+/// request id, so a reply stranded by an abandoned bidi would be consumed by
+/// the next data-plane op and shift every subsequent reply off by one.
+/// Closing the connection drops the mailbox and any late reply with it.
+const REPLY_WAIT_BACKSTOP: Duration = Duration::from_mins(1);
+
+/// `Command2` byte offset shared by every consensus header (after the
+/// fixed checksum/cluster/size/view/release prefix).
+const COMMAND_OFFSET: usize = 60;
+
+/// How an outbound frame routes to a waiting bidi.
+enum ReplyRoute {
+    /// A request-keyed `Reply`: deliver only to the bidi whose request id
+    /// matches; a non-matching one is a stale/duplicate from an abandoned bidi.
+    Keyed(u64),
+    /// A terminal/control frame (`Eviction`, etc.) with no `request` field, or
+    /// an undecodable header: deliver to the in-flight bidi unconditionally.
+    /// Filtering these out would silently swallow session-terminal signals
+    /// (e.g. `NoSession` -> `Unauthenticated`), leaving the client to time out.
+    Unkeyed,
+}
+
+/// Decide how to route an outbound frame. Only `Command2::Reply` carries a
+/// `request` id; everything else must pass through unfiltered.
+fn reply_route(frame: &BusMessage) -> ReplyRoute {
+    let bytes = frame.as_slice();
+    let is_reply = bytes
+        .get(COMMAND_OFFSET)
+        .is_some_and(|&command| command == Command2::Reply as u8);
+    if !is_reply {
+        return ReplyRoute::Unkeyed;
+    }
+    bytes
+        .get(..HEADER_SIZE)
+        .and_then(|header| bytemuck::checked::try_from_bytes::<ReplyHeader>(header).ok())
+        .map_or(ReplyRoute::Unkeyed, |header| {
+            ReplyRoute::Keyed(header.request)
+        })
+}
+
 /// A single accepted QUIC connection.
 ///
 /// Per-request bidirectional streams are accepted on demand inside
@@ -317,7 +376,7 @@ impl QuicTransportConn {
 }
 
 impl TransportConn for QuicTransportConn {
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn run(self, ctx: ActorContext) {
         let connection = self.connection;
         let ActorContext {
@@ -369,45 +428,88 @@ impl TransportConn for QuicTransportConn {
                     continue;
                 }
             };
+            // Request id this bidi is waiting on. Used to match its reply and
+            // to discard stale/duplicate replies left by an abandoned bidi.
+            // `None` (unparsable) degrades to accepting the first reply.
+            let request_id = req
+                .as_slice()
+                .get(..HEADER_SIZE)
+                .and_then(|bytes| bytemuck::checked::try_from_bytes::<RequestHeader>(bytes).ok())
+                .map(|header| header.request);
+
             if in_tx.send(req).await.is_err() {
                 debug!(%label, %peer, "quic: inbound queue dropped");
                 break;
             }
 
-            // Wait for the matching reply. The single bus rx channel is
-            // unkeyed; serialising one bidi at a time guarantees the
-            // next frame on `rx` is the reply for THIS bidi.
-            // `async_channel::Receiver::recv` and `FusedShutdown` are
-            // both cancel-safe and compio-buffer-free, so select-drop
-            // here cannot poison anything.
-            let first = futures::select! {
-                () = shutdown_fut.as_mut() => {
-                    debug!(%label, %peer, "quic: shutdown during reply wait");
-                    break;
+            // Wait for THIS bidi's reply, keyed by request id. The bus `rx` is
+            // a single unkeyed per-connection channel, so filter by id and
+            // discard replies belonging to an earlier attempt's bidi (an
+            // explicit-transient replay reuses the SAME request id, so a late
+            // reply matches and is consumed by the replay's bidi - never
+            // misrouted to a later request). There is no short abandon-timeout:
+            // transient submits are answered with explicit rejection frames, so
+            // silence here means the dispatch dropped the request or the op is
+            // pathologically slow. `REPLY_WAIT_BACKSTOP` (see its doc) closes
+            // the whole connection instead of abandoning the bidi, so a late
+            // reply can never strand and shift onto the next data-plane op.
+            let mut matched: Option<BusMessage> = None;
+            let mut connection_gone = false;
+            {
+                let mut reply_deadline =
+                    std::pin::pin!(compio::time::sleep(REPLY_WAIT_BACKSTOP).fuse());
+                loop {
+                    futures::select! {
+                        () = shutdown_fut.as_mut() => {
+                            debug!(%label, %peer, "quic: shutdown during reply wait");
+                            connection_gone = true;
+                            break;
+                        }
+                        () = reply_deadline.as_mut() => {
+                            warn!(%label, %peer, ?request_id, "quic: no reply within backstop; closing connection so no reply can strand");
+                            connection_gone = true;
+                            break;
+                        }
+                        res = rx.recv().fuse() => if let Ok(m) = res {
+                            let deliver = match reply_route(&m) {
+                                // Eviction / control frame: always deliver.
+                                ReplyRoute::Unkeyed => true,
+                                // Keyed reply: only this bidi's; else it's a
+                                // stale/duplicate from an abandoned bidi -> drop.
+                                ReplyRoute::Keyed(id) => {
+                                    request_id.is_none() || Some(id) == request_id
+                                }
+                            };
+                            if deliver {
+                                matched = Some(m);
+                                break;
+                            }
+                        } else {
+                            debug!(%label, %peer, "quic: mailbox closed");
+                            connection_gone = true;
+                            break;
+                        },
+                    }
                 }
-                res = rx.recv().fuse() => if let Ok(m) = res {
-                    m
-                } else {
-                    debug!(%label, %peer, "quic: mailbox closed");
-                    break;
-                },
+            }
+            if connection_gone {
+                break;
+            }
+            let Some(first) = matched else {
+                // Unreachable in practice: every no-reply path above sets
+                // `connection_gone`. Close the send half defensively.
+                if let Err(e) = send.finish() {
+                    debug!(%label, %peer, error = ?e, "quic: send.finish() failed with no reply");
+                }
+                continue;
             };
 
-            // Write the reply, drain any additional immediate replies
-            // (defensive 1:N), then `finish()` so quinn-proto flushes
-            // pending data + a FIN, signalling the SDK that the reply
-            // is complete.
+            // Write the reply, then `finish()` so quinn-proto flushes pending
+            // data + a FIN, signalling the SDK that the reply is complete.
             let BufResult(result, _frozen) = send.write_all(first).await;
             if let Err(e) = result {
                 debug!(%label, %peer, error = ?e, "quic: write failed");
                 continue;
-            }
-            while let Ok(more) = rx.try_recv() {
-                let BufResult(result, _frozen) = send.write_all(more).await;
-                if let Err(e) = result {
-                    debug!(%label, %peer, error = ?e, "quic: write failed during burst drain");
-                    break;
-                }
             }
             if let Err(e) = send.finish() {
                 debug!(%label, %peer, error = ?e, "quic: send.finish() failed");

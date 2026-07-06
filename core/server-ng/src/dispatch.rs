@@ -34,24 +34,29 @@ use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
     NonReplicatedResponse, build_consumer_offset_body, build_empty_reply, build_get_me_response,
-    build_non_replicated_response, build_polled_messages_body, build_raw_pat_reply,
-    connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
-    resolve_partition_request_namespace,
+    build_get_personal_access_tokens_response, build_non_replicated_response,
+    build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
+    current_metadata_commit, resolve_partition_namespace, resolve_partition_request_namespace,
 };
 use crate::session_manager::SessionManager;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 use bytes::Bytes;
-use consensus::{MetadataHandle, PartitionsHandle};
+use consensus::{
+    EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
+    build_incompatible_protocol_eviction_message,
+};
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
@@ -59,14 +64,17 @@ use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::{
-    GenericHeader, KIND_CONSUMER_GROUP, Operation, RequestHeader, WireDecode, WireEncode,
+    ClientVersionInfo, EvictionReason, GenericHeader, KIND_CONSUMER_GROUP, Operation,
+    ProtocolVersion, RequestHeader, WireDecode, WireEncode, is_protocol_compatible,
 };
 use iggy_common::{IggyError, PollingStrategy};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{IggyMessageBus, MessageBus};
-use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
-use partitions::{Partition, PollingArgs, PollingConsumer};
+use metadata::impls::metadata::{
+    MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
+};
+use partitions::{PollPlan, PollingArgs, PollingConsumer};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -141,81 +149,100 @@ pub(crate) fn make_partition_read_handler(
     shard_handle: &ServerNgShardHandle,
 ) -> PartitionReadHandler {
     let shard_handle = Rc::clone(shard_handle);
+    // Runs synchronously on the shard pump (see `process_lifecycle` ->
+    // `on_partition_read`). `build_poll_snapshot` takes the partition borrow via
+    // `with_partition` (closure-scoped, debug `BorrowGuard`) and returns an owned
+    // `PollPlan`; only owned data crosses into `spawn_poll_io`. A fully-resident
+    // poll replies here without spawning. See the `poll_plan` module docs.
     Rc::new(move |namespace, read, reply| {
-        let shard_handle = Rc::clone(&shard_handle);
-        // The poll awaits journal reads; run it as a task so the shard pump
-        // is not blocked. Same single-threaded-runtime discipline as the
-        // pump's own `on_request` path: the partition reference is resolved
-        // after the tombstone check and the read races only reconciler
-        // removal, which tombstones the namespace first.
-        compio::runtime::spawn(async move {
-            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-                return;
-            };
-            let partitions = shard.plane.partitions();
-            if partitions.is_tombstoned(&namespace) {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            }
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
-                let _ = reply.try_send(PartitionReadReply::NotFound);
-                return;
-            };
-            let result = match read {
-                PartitionRead::Poll { consumer, args } => {
-                    let poll_started = std::time::Instant::now();
-                    let poll_result = partition.poll_messages(consumer, args).await;
-                    let elapsed = poll_started.elapsed();
-                    if elapsed > std::time::Duration::from_secs(1) {
-                        warn!(
-                            namespace_raw = namespace.inner(),
-                            elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                            "slow partition poll; gather side may have timed out"
-                        );
+        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+            return;
+        };
+        let partitions = shard.plane.partitions();
+        match read {
+            PartitionRead::Poll { consumer, args } => {
+                match partitions.build_poll_snapshot(&namespace, consumer, &args) {
+                    None => {
+                        let _ = reply.try_send(PartitionReadReply::NotFound);
                     }
-                    match poll_result {
-                        Ok((fragments, _last_matching_offset)) => PartitionReadReply::Poll {
+                    Some(plan) if plan.needs_off_pump_io() => {
+                        spawn_poll_io(namespace, plan, reply);
+                    }
+                    Some(plan) => {
+                        let (fragments, current_offset) = plan.execute_resident();
+                        let _ = reply.try_send(PartitionReadReply::Poll {
                             fragments,
-                            current_offset: partition.offsets().commit_offset,
-                        },
-                        Err(error) => {
-                            warn!(
-                                namespace_raw = namespace.inner(),
-                                error = %error,
-                                "partition poll failed"
-                            );
-                            PartitionReadReply::NotFound
-                        }
+                            current_offset,
+                        });
                     }
                 }
-                PartitionRead::ConsumerOffset { consumer } => PartitionReadReply::ConsumerOffset {
-                    stored: partition.get_consumer_offset(consumer),
-                    current_offset: partition.offsets().commit_offset,
-                },
-                PartitionRead::GroupOffsetState { group_id } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let key = iggy_common::ConsumerGroupId(group_id as usize);
-                    let load = |offset: &iggy_common::ConsumerOffset| {
-                        offset.offset.load(std::sync::atomic::Ordering::Relaxed)
-                    };
-                    let committed = partition.consumer_group_offsets.pin().get(&key).map(load);
-                    let last_polled = partition.last_polled_offsets.pin().get(&key).map(load);
-                    PartitionReadReply::GroupOffsetState {
+            }
+            PartitionRead::ConsumerOffset { consumer } => {
+                let result = match partitions.consumer_offset_read(&namespace, consumer) {
+                    Some((stored, current_offset)) => PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::GroupOffsetState { group_id } => {
+                let result = match partitions.group_offset_state(&namespace, group_id) {
+                    Some((last_polled, committed)) => PartitionReadReply::GroupOffsetState {
                         last_polled,
                         committed,
-                    }
-                }
-                PartitionRead::ClearGroupLastPolled { group_id } => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let key = iggy_common::ConsumerGroupId(group_id as usize);
-                    partition.last_polled_offsets.pin().remove(&key);
-                    PartitionReadReply::Ack
-                }
-            };
-            let _ = reply.try_send(result);
-        })
-        .detach();
+                    },
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ClearGroupLastPolled { group_id } => {
+                let result = match partitions.clear_group_last_polled(&namespace, group_id) {
+                    Some(()) => PartitionReadReply::Ack,
+                    None => PartitionReadReply::NotFound,
+                };
+                let _ = reply.try_send(result);
+            }
+            PartitionRead::ResolveSegmentDeleteOffset { count } => {
+                let result = partitions
+                    .nth_oldest_sealed_end_offset(&namespace, count)
+                    .map_or_else(
+                        || PartitionReadReply::NotFound,
+                        |up_to_offset| PartitionReadReply::SegmentDeleteOffset { up_to_offset },
+                    );
+                let _ = reply.try_send(result);
+            }
+        }
     })
+}
+
+/// Spawn the off-pump leg of a partition poll: disk read + auto-commit
+/// persist/apply on the OWNED plan (disk descriptors, resident-tail `Frozen`
+/// clones, `Arc` offset map), then send the reply. Holds no partition
+/// reference, so it is sound concurrently with the pump's `&mut` writes.
+fn spawn_poll_io(
+    namespace: IggyNamespace,
+    plan: PollPlan,
+    reply: shard::Sender<PartitionReadReply>,
+) {
+    compio::runtime::spawn(async move {
+        let poll_started = std::time::Instant::now();
+        let (fragments, current_offset) = plan.execute().await;
+        let elapsed = poll_started.elapsed();
+        if elapsed > std::time::Duration::from_secs(1) {
+            warn!(
+                namespace_raw = namespace.inner(),
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "slow partition poll; gather side may have timed out"
+            );
+        }
+        let _ = reply.try_send(PartitionReadReply::Poll {
+            fragments,
+            current_offset,
+        });
+    })
+    .detach();
 }
 
 pub(crate) fn make_deferred_replica_message_handler(
@@ -512,6 +539,16 @@ async fn handle_client_request(
         return;
     }
 
+    // DeleteSegments is neither a partition nor a metadata consensus op: the
+    // owning shard resolves the requested count to a concrete offset, then a
+    // `TruncatePartition` is replicated through metadata (Option A). Each
+    // replica's reconciler trims to the committed watermark. Handle it here,
+    // ahead of the partition/metadata routing below.
+    if header.operation == Operation::DeleteSegments {
+        handle_delete_segments_request(shard, transport_client_id, bound, &request).await;
+        return;
+    }
+
     // Partition data-plane op (SendMessages / consumer-offset writes): the
     // op belongs to the partition's own consensus group, not the metadata
     // group. Route it through the shard mesh by namespace; the owning
@@ -696,6 +733,48 @@ async fn handle_client_request(
     }
 }
 
+/// Per-user PATs, resolved from this shard's session (like `get_me`) and read
+/// out of the Users STM. Built here rather than in `build_non_replicated_response`
+/// which has no session context.
+#[allow(clippy::future_not_send)]
+async fn handle_get_personal_access_tokens(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        response.to_bytes(),
+        "get_personal_access_tokens",
+    )
+    .await;
+}
+
+/// The requesting connection's own identity, sourced from this shard's
+/// `SessionManager` (not `IggyMetadata`), so built here rather than in
+/// `build_non_replicated_response`.
+#[allow(clippy::future_not_send)]
+async fn handle_get_me(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let response = build_get_me_response(shard, sessions, transport_client_id);
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        response.to_bytes(),
+        "get_me",
+    )
+    .await;
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
@@ -730,19 +809,10 @@ async fn handle_non_replicated_request(
             }
         }
         GET_ME_CODE => {
-            // `get_me` reports the requesting connection's own identity,
-            // sourced from this shard's `SessionManager` (not `IggyMetadata`),
-            // so it is built here rather than in
-            // `build_non_replicated_response`.
-            let response = build_get_me_response(shard, sessions, transport_client_id);
-            send_non_replicated_bytes(
-                shard,
-                &request,
-                transport_client_id,
-                response.to_bytes(),
-                "get_me",
-            )
-            .await;
+            handle_get_me(shard, sessions, transport_client_id, &request).await;
+        }
+        GET_PERSONAL_ACCESS_TOKENS_CODE => {
+            handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
         }
         GET_CLIENTS_CODE => {
             // Shared-nothing: each shard knows only its own connections, so
@@ -1297,7 +1367,10 @@ fn decode_poll_request(
         return Ok((namespace, partition_id, consumer, args));
     }
 
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Plain-consumer poll: an omitted partition selects partition 0, matching
+    // the legacy resolver (`resolve_consumer_with_partition_id` uses
+    // `unwrap_or(0)` for `ConsumerKind::Consumer`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
@@ -1310,7 +1383,9 @@ fn decode_consumer_offset_request(
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
     let wire = GetConsumerOffsetRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Omitted partition reads partition 0, matching the legacy resolver for
+    // both consumer kinds (`unwrap_or(0)`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     // A group offset is keyed by the group's monotonic id (any client may read
@@ -1433,6 +1508,117 @@ async fn submit_logout_on_owner(
     }
 }
 
+/// Handle a client `DeleteSegments`: resolve the requested count to an offset
+/// on the owning shard, replicate a `TruncatePartition` through metadata so
+/// every replica trims to the same watermark, then ack the client. The local
+/// deletion happens later, when each replica's reconciler observes the commit.
+///
+/// Best-effort space management: any failure (bad request, unknown namespace,
+/// nothing sealed to delete, transient submit error) is logged and still acks,
+/// so the client never blocks on it.
+#[allow(clippy::future_not_send)]
+async fn handle_delete_segments_request(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    bound: Option<(u128, u64)>,
+    request: &Message<RequestHeader>,
+) {
+    let header = *request.header();
+    let body = request_body(request);
+
+    // An unbound transport cannot be attributed a VSR request sequence; the
+    // outer handler already short-circuits these, so this is defensive.
+    let Some((vsr_client_id, session)) = bound else {
+        return;
+    };
+
+    // The client numbers DeleteSegments in the same monotonic request sequence
+    // as every other metadata op. So resolve the requested count to a concrete
+    // offset on the owning shard, then replicate a `TruncatePartition(offset)`
+    // AS the client's own request through the standard owner path: the commit
+    // records (client, session, request) in the `ClientTable` on every replica,
+    // keeping the sequence contiguous. Skipping the commit (or attributing it
+    // to an internal id) leaves a hole that fails the next metadata op's
+    // `request == committed + 1` preflight -> RequestGap -> silent drop -> the
+    // SDK blocks until timeout. A no-op delete still commits `up_to_offset = 0`
+    // (monotonic apply) for the same reason.
+    #[allow(clippy::cast_possible_truncation)]
+    let truncate = match DeleteSegmentsRequest::decode_from(body) {
+        Ok(parsed) => match resolve_partition_request_namespace(
+            shard,
+            Operation::DeleteSegments,
+            body,
+            transport_client_id,
+        ) {
+            Ok(namespace_raw) => {
+                let namespace = IggyNamespace::from_raw(namespace_raw);
+                let up_to_offset = match shard
+                    .partition_read(
+                        namespace,
+                        PartitionRead::ResolveSegmentDeleteOffset {
+                            count: parsed.segments_count,
+                        },
+                    )
+                    .await
+                {
+                    Some(PartitionReadReply::SegmentDeleteOffset {
+                        up_to_offset: Some(offset),
+                    }) => offset,
+                    _ => 0,
+                };
+                Some(build_truncate_partition_client_message(
+                    &header,
+                    vsr_client_id,
+                    session,
+                    namespace.stream_id() as u32,
+                    namespace.topic_id() as u32,
+                    namespace.partition_id() as u32,
+                    up_to_offset,
+                ))
+            }
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "delete_segments: unresolved namespace"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+
+    if let Some(truncate) = truncate
+        && submit_client_request_on_owner(shard, truncate)
+            .await
+            .is_none()
+    {
+        // Transient submit failure (not primary / view change). Stay silent;
+        // the SDK read-timeout replays the same request id, which re-resolves
+        // and commits. Acking here would advance the client past an unrecorded
+        // request and gap the next metadata op.
+        warn!(
+            transport_client_id,
+            "delete_segments: transient submit; client will replay"
+        );
+        return;
+    }
+
+    let commit = current_metadata_commit(shard);
+    let reply = build_empty_reply(&header, transport_client_id, session, commit);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "delete_segments: failed to send reply"
+        );
+    }
+}
+
 /// Disconnect cleanup: the local `SessionManager` connection is already
 /// dropped by the caller; this submits a session-matched `Logout` so the
 /// committed apply releases the `ClientTable` slot on every replica (shard 0
@@ -1550,7 +1736,7 @@ fn ensure_transport_connection(
         .ensure_connection(transport_client_id, meta.peer_addr, meta.transport);
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_login_register_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -1560,7 +1746,49 @@ async fn handle_login_register_request(
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
-    if let Ok(wire_request) = LoginRegisterRequest::decode_from(body) {
+    // Both login-register shapes share the ClientVersionInfo prefix, so the
+    // protocol gate decodes it once and runs before any credential work; the
+    // body shapes below parse from past the prefix. Only VSR clients reach
+    // this gate -- legacy SDKs use LOGIN_USER_CODE, a separate path. A
+    // pre-versioning VSR client sends the old prefix-less body, which fails
+    // ClientVersionInfo::decode (-> MalformedLogin) or the version gate
+    // (-> IncompatibleProtocol) right here, not dropped earlier.
+    let Ok((version_info, prefix_len)) = ClientVersionInfo::decode(body) else {
+        warn!(
+            transport_client_id,
+            "rejecting login: body has no decodable version prefix"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+        )
+        .await;
+        return;
+    };
+    if !is_protocol_compatible(version_info.protocol_version) {
+        warn!(
+            transport_client_id,
+            client_protocol_version = %ProtocolVersion(version_info.protocol_version),
+            sdk_name = %version_info.sdk_name,
+            sdk_version = %version_info.sdk_version,
+            "rejecting login: incompatible protocol version"
+        );
+        send_login_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::IncompatibleProtocol,
+        )
+        .await;
+        return;
+    }
+
+    let body_tail = &body[prefix_len..];
+    if let Ok((wire_request, _)) =
+        LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
+    {
         match verify_login_credentials(
             shard,
             wire_request.username.as_str(),
@@ -1574,6 +1802,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1597,7 +1826,9 @@ async fn handle_login_register_request(
         }
     }
 
-    if let Ok(wire_request) = LoginRegisterWithPatRequest::decode_from(body) {
+    if let Ok((wire_request, _)) =
+        LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
+    {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
             Ok(user_id) => {
                 if let Err(error) = complete_login_register(
@@ -1607,6 +1838,7 @@ async fn handle_login_register_request(
                     vsr_client_id,
                     request.header(),
                     user_id,
+                    &wire_request.version_info,
                 )
                 .await
                 {
@@ -1637,6 +1869,46 @@ async fn handle_login_register_request(
         "dropping register request with unsupported payload shape"
     );
     send_login_failure_reply(shard, transport_client_id, request.header()).await;
+}
+
+/// Best-effort login-rejection eviction. Terminal one-way frame; a gone
+/// connection has nothing to recover, so the send error is logged and
+/// dropped. Consensus context (cluster/view/replica) is stamped on the
+/// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
+/// plus the protocol window on `IncompatibleProtocol`.
+#[allow(clippy::future_not_send)]
+async fn send_login_eviction(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    vsr_client_id: u128,
+    reason: EvictionReason,
+) {
+    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
+        EvictionContext {
+            cluster: 0,
+            view: 0,
+            replica: 0,
+        },
+        EvictionContext::from_consensus,
+    );
+    let eviction = match reason {
+        EvictionReason::IncompatibleProtocol => {
+            build_incompatible_protocol_eviction_message(ctx, vsr_client_id)
+        }
+        _ => build_eviction_message(ctx, vsr_client_id, reason),
+    };
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            reason = ?reason,
+            "failed to send login eviction"
+        );
+    }
 }
 
 pub(crate) fn upgrade_shard_handle(

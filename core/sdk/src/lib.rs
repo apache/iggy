@@ -30,3 +30,8 @@ pub mod tcp;
 #[cfg(feature = "vsr")]
 mod vsr;
 pub mod websocket;
+
+/// Rust SDK version sent in the login-register version prefix; must be this
+/// crate's version, see `VsrSessionControl::sdk_version`.
+#[cfg(feature = "vsr")]
+pub(crate) const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");

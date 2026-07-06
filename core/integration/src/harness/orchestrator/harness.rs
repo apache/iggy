@@ -35,6 +35,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(feature = "vsr")]
 use tokio::time::{sleep, timeout};
+#[cfg(feature = "vsr")]
+use tracing::warn;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -152,11 +154,56 @@ impl TestHarness {
             self.jwks_server = Some(mock_server);
         }
 
+        // Legacy single-server harness: plain start, no cluster readiness.
+        #[cfg(not(feature = "vsr"))]
         for server in &mut self.servers {
             server.start()?;
         }
 
-        self.wait_for_cluster_ready().await?;
+        // Cluster startup (vsr) can hit a transient replica-handshake blip that
+        // leaves the mesh incomplete (a peer link drops mid-handshake, so a
+        // node never reaches "all peers connected"). Rather than fail the whole
+        // test on a startup blip, retry spawn + mesh-readiness a few times,
+        // tearing down and respawning between attempts. `ServerHandle::start`
+        // truncates the captured stdout (`File::create`), so the readiness
+        // log-grep never matches a stale marker from a prior attempt.
+        #[cfg(feature = "vsr")]
+        {
+            const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
+            for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
+                let mut spawn_error = None;
+                for server in &mut self.servers {
+                    if let Err(error) = server.start() {
+                        spawn_error = Some(error);
+                        break;
+                    }
+                }
+                if let Some(error) = spawn_error {
+                    // Mirror the not-ready arm below: never bail with earlier
+                    // nodes of this attempt still running.
+                    for server in &mut self.servers {
+                        let _ = server.stop();
+                    }
+                    return Err(error);
+                }
+                match self.wait_for_cluster_ready().await {
+                    Ok(()) => break,
+                    Err(error) if attempt < CLUSTER_STARTUP_ATTEMPTS => {
+                        warn!(
+                            attempt,
+                            max_attempts = CLUSTER_STARTUP_ATTEMPTS,
+                            error = %error,
+                            "cluster not ready; tearing down and respawning"
+                        );
+                        for server in &mut self.servers {
+                            let _ = server.stop();
+                        }
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
 
         if let Some(seed_fn) = seed {
             let client = self.tcp_root_client().await?;
@@ -172,13 +219,8 @@ impl TestHarness {
         Ok(())
     }
 
+    #[cfg(feature = "vsr")]
     async fn wait_for_cluster_ready(&self) -> Result<(), TestBinaryError> {
-        #[cfg(not(feature = "vsr"))]
-        {
-            Ok(())
-        }
-
-        #[cfg(feature = "vsr")]
         {
             if self.servers.len() <= 1 {
                 return Ok(());
@@ -203,9 +245,17 @@ impl TestHarness {
                 sleep(CLUSTER_READY_RETRY_INTERVAL).await;
             }
             if !self.servers.iter().all(ServerHandle::replica_mesh_complete) {
+                let per_node: Vec<String> = self
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!("node{i}={}", s.replica_mesh_complete()))
+                    .collect();
                 return Err(TestBinaryError::InvalidState {
-                    message: "Timed out waiting for VSR replica mesh to form on all nodes"
-                        .to_string(),
+                    message: format!(
+                        "Timed out waiting for VSR replica mesh to form on all nodes [{}]",
+                        per_node.join(", ")
+                    ),
                 });
             }
 
@@ -340,20 +390,15 @@ impl TestHarness {
 
     /// Get the MCP handle from the primary server if configured.
     ///
-    /// # Panics
-    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
+    /// MCP is attached to the primary (first) server for both single-server and
+    /// cluster setups (see the builder), so this returns the primary's handle in
+    /// either case.
     pub fn mcp(&self) -> Option<&McpHandle> {
-        assert!(
-            self.servers.len() <= 1,
-            "mcp() is only available for single-server setups. Use node(i).mcp() for clusters."
-        );
         self.servers.first().and_then(|s| s.mcp())
     }
 
-    /// Create an MCP client (convenience method).
-    ///
-    /// # Panics
-    /// Panics if called on a cluster (multiple servers). Use `node(i).mcp()` instead.
+    /// Create an MCP client (convenience method). Targets the primary's MCP
+    /// handle, for both single-server and cluster setups.
     pub async fn mcp_client(&self) -> Result<McpClient, TestBinaryError> {
         self.mcp()
             .ok_or(TestBinaryError::MissingMcp)?
@@ -361,15 +406,10 @@ impl TestHarness {
             .await
     }
 
-    /// Get the connectors runtime handle from the primary server if configured.
-    ///
-    /// # Panics
-    /// Panics if called on a cluster (multiple servers). Use `node(i).connectors_runtime()` instead.
+    /// Get the connectors runtime handle if configured. Targets the primary's
+    /// handle, for both single-server and cluster setups (the builder attaches
+    /// the runtime to node 0, mirroring `mcp()`).
     pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
-        assert!(
-            self.servers.len() <= 1,
-            "connectors_runtime() is only available for single-server setups. Use node(i).connectors_runtime() for clusters."
-        );
         self.servers.first().and_then(|s| s.connectors_runtime())
     }
 

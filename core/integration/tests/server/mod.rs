@@ -25,18 +25,17 @@ mod cg;
 #[cfg(feature = "vsr")]
 mod cg_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
-// the harness transport filter); revisit under vsr once basics are green.
-#[cfg(not(feature = "vsr"))]
+// the harness transport filter).
 mod concurrent_addition;
 mod general;
-// Asserts the periodic messages cleaner deletes expired segments from disk;
-// server-ng has no data-maintenance cleaner yet.
-#[cfg(not(feature = "vsr"))]
+// The per-shard segment cleaner deletes expired / oversize segments from disk
+// under both the legacy server and server-ng.
 mod message_cleanup;
 mod message_retrieval;
-// Mixes server restarts, consumer-group barriers, and DeleteSegments
-// maintenance; out of vsr scope for now.
-#[cfg(not(feature = "vsr"))]
+// Server restarts, consumer-group barriers, and DeleteSegments maintenance.
+// `should_delete_segments_without_consumers` is framing-agnostic + async-aware
+// and runs under server-ng; the consumer-group / restart variants stay
+// legacy-shaped (cg polling has its own vsr gaps) and are filtered out there.
 mod purge_delete;
 mod scenarios;
 mod specific;

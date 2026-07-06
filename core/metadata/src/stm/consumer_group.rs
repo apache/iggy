@@ -523,12 +523,13 @@ impl StateHandler for CreateConsumerGroupRequest {
             .consumer_groups
             .insert(id, ConsumerGroup::new(id, name.clone()));
         topic.consumer_group_index.insert(name, id);
+        let partitions_count = topic.partitions.len() as u32;
 
         ApplyReply::ok(
             ConsumerGroupDetailsResponse {
                 group: ConsumerGroupResponse {
                     id: id as u32,
-                    partitions_count: 0,
+                    partitions_count,
                     members_count: 0,
                     name: self.name.clone(),
                 },

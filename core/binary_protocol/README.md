@@ -12,6 +12,8 @@
 
 Wire protocol types and codec for the [Apache Iggy](https://iggy.apache.org) binary protocol, shared between server and SDK. This crate is an internal building block. Most users should depend on the [`iggy`](https://crates.io/crates/iggy) SDK crate instead.
 
+The language-neutral wire spec for the login protocol-version handshake (packed version layout, `ClientVersionInfo` prefix, gate semantics, rejection frame offsets) lives in the [`version` module docs](src/version.rs).
+
 > Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
 >
 > Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.

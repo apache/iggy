@@ -15,6 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/// compio's `AsyncifyPool::dispatch` panics with this exact message when a
+/// blocking fallback is required but the pool has zero worker threads. Iggy
+/// shard executors set `thread_pool_limit(0)` in `create_shard_executor`, so
+/// this panic means the kernel lacks an io_uring opcode a shard operation
+/// needed and compio could not run it natively. Shard-panic handlers match it
+/// to surface [`print_incomplete_io_uring_ops_info`] instead of the bare
+/// compio text.
+///
+/// Best-effort: if a future compio release changes the wording, matching
+/// degrades to logging the raw panic, which is still surfaced to the operator.
+pub const ASYNCIFY_POOL_DISABLED_PANIC_MSG: &str =
+    "the thread pool is needed but no worker thread is running";
+
 #[cfg(target_os = "linux")]
 const DISCORD_SUPPORT_URL: &str = "https://discord.gg/apache-iggy";
 
@@ -139,9 +152,6 @@ const SYSCTL_IO_URING_DISABLED_KERNEL_MINOR: u32 = 1;
 /// The caller is responsible for deduplication (e.g., via `std::sync::Once`).
 #[cfg(target_os = "linux")]
 pub fn print_invalid_io_uring_args_info() {
-    use nix::sys::utsname::uname;
-    use std::fs;
-
     eprintln!();
     eprintln!("=== io_uring Invalid Argument (EINVAL) ===");
     eprintln!();
@@ -156,6 +166,47 @@ pub fn print_invalid_io_uring_args_info() {
         "  These flags require Linux kernel >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR} with full io_uring support."
     );
     eprintln!();
+
+    report_io_uring_environment();
+}
+
+/// Prints diagnostic information when a shard thread panicked because compio
+/// had to run an io_uring operation on its blocking fallback pool, which Iggy
+/// disables (`thread_pool_limit(0)`).
+///
+/// Unlike [`print_invalid_io_uring_args_info`], io_uring setup succeeded here:
+/// the kernel accepted the ring flags and shards started, then at runtime
+/// compio's opcode probe (`IORING_REGISTER_PROBE`) reported an opcode a shard
+/// operation needed as unsupported. The caller is responsible for
+/// deduplication (e.g., via `std::sync::Once`).
+#[cfg(target_os = "linux")]
+pub fn print_incomplete_io_uring_ops_info() {
+    eprintln!();
+    eprintln!("=== io_uring Incomplete Opcode Support ===");
+    eprintln!();
+    eprintln!("A shard thread aborted because an io_uring operation it issued is not");
+    eprintln!("supported by this kernel. Iggy shards run thread-per-core with the");
+    eprintln!("blocking fallback pool disabled, so an unsupported opcode is fatal");
+    eprintln!("instead of being silently offloaded to a worker thread.");
+    eprintln!();
+    eprintln!("  io_uring setup succeeded (shards started), but at runtime compio");
+    eprintln!("  probed the kernel and a required opcode was absent. This is common");
+    eprintln!("  on WSL2 and on older or cut-down kernels whose io_uring support is");
+    eprintln!("  incomplete. Some opcodes need a kernel newer than the shard-setup");
+    eprintln!("  floor below.");
+    eprintln!();
+
+    report_io_uring_environment();
+}
+
+/// Probes the io_uring environment (kernel version, WSL2 detection,
+/// `kernel.io_uring_disabled` sysctl, AppArmor confinement), prints the
+/// findings plus any concrete issues, then prints the shared remediation
+/// steps. Reused by both io_uring diagnostics above.
+#[cfg(target_os = "linux")]
+fn report_io_uring_environment() {
+    use nix::sys::utsname::uname;
+    use std::fs;
 
     let mut detected_issues: Vec<String> = Vec::new();
 
@@ -194,7 +245,8 @@ pub fn print_invalid_io_uring_args_info() {
         if release_is_wsl || proc_version_is_wsl {
             eprintln!("  Environment: WSL2 (Microsoft kernel fork detected)");
             detected_issues.push(
-                "WSL2 kernel may not support IORING_SETUP_COOP_TASKRUN even if version >= 5.19"
+                "WSL2 kernels often ship incomplete io_uring: missing setup flags or \
+                 opcodes even at version >= 5.19"
                     .to_string(),
             );
         }
@@ -247,8 +299,8 @@ pub fn print_invalid_io_uring_args_info() {
     // Print detected issues
     if detected_issues.is_empty() {
         eprintln!();
-        eprintln!("  No specific issue was detected. The kernel may lack io_uring support");
-        eprintln!("  for the flags used by Iggy's shard executors.");
+        eprintln!("  No specific issue was detected. This kernel's io_uring support may be");
+        eprintln!("  incomplete for the setup flags or opcodes Iggy's shard executors require.");
     } else {
         eprintln!();
         eprintln!("  Detected issues:");
@@ -301,6 +353,9 @@ pub const fn print_io_uring_permission_info() {}
 
 #[cfg(not(target_os = "linux"))]
 pub const fn print_invalid_io_uring_args_info() {}
+
+#[cfg(not(target_os = "linux"))]
+pub const fn print_incomplete_io_uring_ops_info() {}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

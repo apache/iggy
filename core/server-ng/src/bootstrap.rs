@@ -24,6 +24,7 @@ use crate::dispatch::{
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
+use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
 use configs::server_ng::ServerNgConfig;
@@ -36,7 +37,7 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PartitionStats, TopicStats, variadic};
+use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
@@ -53,8 +54,8 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, DialedReplicaFn, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES,
-    ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus,
+    MAX_INFLIGHT_REPLICA_HANDSHAKES, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -65,7 +66,7 @@ use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
+    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
@@ -171,6 +172,10 @@ impl ShardHandles {
     /// does not need to read the trace log to discover late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Shards run thread-per-core with compio's blocking fallback pool
+        // disabled, so an io_uring opcode the kernel lacks aborts every shard
+        // with the same panic. Surface the actionable diagnostic once.
+        let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
             match handle.join() {
                 Ok(Ok(())) => {
@@ -186,6 +191,13 @@ impl ShardHandles {
                 Err(panic_payload) => {
                     let message = panic_payload_to_string(&*panic_payload);
                     error!(shard_id, message = %message, "shard thread panicked");
+                    if !io_uring_diagnostic_shown
+                        && message
+                            .contains(server_common::diagnostics::ASYNCIFY_POOL_DISABLED_PANIC_MSG)
+                    {
+                        server_common::diagnostics::print_incomplete_io_uring_ops_info();
+                        io_uring_diagnostic_shown = true;
+                    }
                     failures.push(ShardJoinFailure {
                         shard_id,
                         kind: ShardJoinFailureKind::Panic { message },
@@ -325,9 +337,10 @@ impl Drop for ShutdownOnDrop {
 /// `ReadHandleFactory`s) and pushes one clone per peer onto `bundle_tx`.
 /// Every other shard receives the bundle and rebuilds a reader-mode
 /// `MuxStateMachine` on its own runtime - no WAL access, no replay, no
-/// `RecoverySync` two-phase fence. Phase 2 of the old handshake was
-/// only there to keep peer scans away from shard 0's torn-tail repair;
-/// with no peer scan that race is structurally gone.
+/// `RecoverySync` two-phase fence. The old phase-2 WAL fence is gone
+/// because peers no longer scan the WAL. They do still scan live shared
+/// metadata to load their on-disk partitions, so a separate listener
+/// fence is still required - see [`BootstrapBarrier`].
 ///
 /// The channel is bounded to the peer count so shard 0's `send` never
 /// blocks beyond a peer drain. A peer that dies before recv drops its
@@ -340,6 +353,33 @@ enum MetadataHandoff {
     },
     Waiter {
         bundle_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<ServerNgMetadataBundle>>,
+    },
+}
+
+/// Reverse handshake to [`MetadataHandoff`]: gates shard 0's client
+/// listeners until every peer has loaded its on-disk partitions.
+///
+/// Peers build their owned-partition set from live shared metadata and
+/// load each segment from disk in `build_shard_for_thread`. If shard 0
+/// opened listeners the instant `broadcast_metadata_bundle` returned
+/// (peers have only *received* the bundle, not *loaded* partitions), a
+/// client could create a partition before a peer's load scan finished.
+/// That freshly committed partition would surface in the peer's scan
+/// with no segment dir on disk yet, and `load_partition`'s `walk_dir`
+/// would fail with `CannotReadPartitions`, aborting the whole node. A
+/// partition created after boot must take the runtime reconciler path
+/// (which creates its dir), never the bootstrap load path.
+///
+/// Shard 0 (`Owner`) drains one signal per peer before binding
+/// listeners; each peer (`Waiter`) sends one once its load completes.
+/// The cross-thread shutdown flag drives both sides out of their poll
+/// loop if any shard dies mid-boot.
+enum BootstrapBarrier {
+    Owner {
+        ready_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    },
+    Waiter {
+        ready_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
     },
 }
 
@@ -362,6 +402,7 @@ struct LocalClientAcceptFns {
     ws: AcceptedWsClientFn,
     quic: AcceptedQuicClientFn,
     tcp_tls: AcceptedTlsClientFn,
+    wss: AcceptedWssClientFn,
 }
 
 #[derive(Default)]
@@ -527,6 +568,12 @@ pub fn bootstrap(
     let (metadata_bundle_tx, metadata_bundle_rx) =
         crossfire::mpmc::bounded_async::<ServerNgMetadataBundle>(metadata_peers);
 
+    // Reverse barrier (see `BootstrapBarrier`): every peer sends one
+    // signal once it finishes loading its on-disk partitions; shard 0
+    // drains them all before binding listeners. Bounded to the peer
+    // count so a sender never blocks (each peer sends exactly once).
+    let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(metadata_peers);
+
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)> =
         Vec::with_capacity(shards_count);
     for (idx, assignment) in assignments.into_iter().enumerate() {
@@ -548,6 +595,15 @@ pub fn bootstrap(
                 bundle_rx: metadata_bundle_rx.clone(),
             }
         };
+        let barrier_for_shard = if shard_id == 0 {
+            BootstrapBarrier::Owner {
+                ready_rx: ready_rx.clone(),
+            }
+        } else {
+            BootstrapBarrier::Waiter {
+                ready_tx: ready_tx.clone(),
+            }
+        };
 
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -562,6 +618,7 @@ pub fn bootstrap(
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
+                    barrier_for_shard,
                     owner_table_for_shard,
                 )
             }) {
@@ -577,6 +634,8 @@ pub fn bootstrap(
                 // would hang until the shutdown watchdog kicks the bus.
                 drop(metadata_bundle_tx);
                 drop(metadata_bundle_rx);
+                drop(ready_tx);
+                drop(ready_rx);
                 join_partial_shard_survivors(shard_threads);
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
@@ -590,6 +649,8 @@ pub fn bootstrap(
     // disconnects.
     drop(metadata_bundle_tx);
     drop(metadata_bundle_rx);
+    drop(ready_tx);
+    drop(ready_rx);
 
     info!(
         shards_count,
@@ -615,6 +676,7 @@ fn run_shard_thread(
     config: Arc<ServerNgConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
 ) -> Result<(), ServerNgError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -650,6 +712,7 @@ fn run_shard_thread(
             &config,
             shutdown_flag,
             metadata_handoff,
+            barrier,
             owner_table,
         ))
         .await
@@ -675,6 +738,7 @@ async fn shard_main(
     config: &ServerNgConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
 ) -> Result<(), ServerNgError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -787,6 +851,9 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Shard 0's copy resolves the `MaxTopicSize::ServerDefault` sentinel at
+    // admission; every shard's copy backs the same resolution in responses.
+    metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -844,6 +911,9 @@ async fn shard_main(
         drop(metrics_for_notifier);
     }
 
+    // The pump task also drives the consensus timer tick (heartbeats, prepare
+    // retransmit, view-change timeouts) as a select! arm, serialized with frame
+    // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
     let pump_handle = compio::runtime::spawn(async move {
@@ -878,39 +948,6 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Consensus timer driver: heartbeats, prepare retransmit, and
-    // view-change timeouts only advance when `VsrConsensus::tick` runs
-    // ("call this periodically, e.g. every 10ms"). The simulator steps it
-    // explicitly; production drives it here. Without this, a prepare lost
-    // to a transient replica-link blip is never retransmitted and its
-    // client request hangs until the SDK read timeout.
-    let (consensus_tick_stop_tx, consensus_tick_stop_rx) = channel::<()>(1);
-    let tick_shard = Rc::clone(&shard);
-    let consensus_tick_handle = compio::runtime::spawn(async move {
-        const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        loop {
-            if consensus_tick_stop_rx.try_recv().is_ok() {
-                break;
-            }
-            tick_shard.tick_metadata().await;
-            tick_shard.tick_partitions().await;
-            // While a cooperative revocation is pending, wake the reconciler each
-            // tick so it completes the handoff within ~one tick of the source
-            // draining the partition, instead of waiting for the 1s periodic pass.
-            if tick_shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .has_pending_revocations()
-            {
-                tick_shard.dispatch_metadata_commit_tick();
-            }
-            compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
-        }
-    });
-    bus.track_background(consensus_tick_handle);
-
     // Per-shard heartbeat verifier: evicts connections that stop pinging,
     // releasing their consumer-group membership. Gated on config so a
     // deployment without heartbeats never reaps live sessions.
@@ -928,7 +965,6 @@ async fn shard_main(
     } else {
         None
     };
-
     // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
     // group) and only when enabled. Each pass no-ops unless this node is
     // the caught-up metadata primary, so the delete is proposed once and
@@ -951,17 +987,58 @@ async fn shard_main(
         None
     };
 
+    // Segment cleaner: runs on every shard (each replica trims its own log,
+    // primary and backup alike). Local and unreplicated; gated by the shared
+    // data-maintenance config.
+    let segment_cleaner_stop = if config.data_maintenance.messages.cleaner_enabled {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.data_maintenance.messages.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::segment_cleaner::run_segment_cleaner(cleaner_shard, stop_rx, interval).await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(stop_tx)
+    } else {
+        None
+    };
+
+    // Listener fence (see `BootstrapBarrier`). Peers still scan live
+    // shared metadata and load their on-disk partitions in
+    // `build_shard_for_thread`; the factory-bundle handoff only proves
+    // they *received* the bundle, not that they finished loading. Shard
+    // 0 must not accept client traffic until every peer's load scan is
+    // done, otherwise a partition created by the first client surfaces
+    // in a still-running scan with no segment dir on disk and aborts the
+    // node with `CannotReadPartitions`. By this point every shard has
+    // also spawned its pump + reconciler, so a partition created after
+    // the fence takes the runtime reconciler path on its owning shard.
+    match barrier {
+        BootstrapBarrier::Owner { ready_rx } => {
+            await_bootstrap_complete(
+                &ready_rx,
+                usize::from(total_shards.saturating_sub(1)),
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+        BootstrapBarrier::Waiter { ready_tx } => {
+            signal_bootstrap_complete(
+                shard_id,
+                &ready_tx,
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+    }
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
     // locally on shard 0 (their per-connection state is non-portable -
     // see `LifecycleFrame::ClientWsConnectionSetup` rustdoc).
-    //
-    // No phase-2 listener fence is needed: peer shards no longer scan
-    // the WAL, so a shard-0 append accepted mid-boot cannot race a
-    // peer's `truncate_or_fail`. The factory-bundle handoff has already
-    // installed reader-mode `MuxStateMachine`s on every peer by the
-    // time shard 0 returns from `broadcast_metadata_bundle`.
     if shard_id == 0 {
         let coord = shard
             .coordinator()
@@ -983,12 +1060,14 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
-            let _ = consensus_tick_stop_tx.try_send(());
             if let Some(tx) = &heartbeat_stop_tx {
                 let _ = tx.try_send(());
             }
             if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
                 let _ = cleaner_stop_tx.try_send(());
+            }
+            if let Some(tx) = &segment_cleaner_stop {
+                let _ = tx.try_send(());
             }
             return Err(error);
         }
@@ -997,12 +1076,14 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
-    let _ = consensus_tick_stop_tx.try_send(());
     if let Some(tx) = &heartbeat_stop_tx {
         let _ = tx.try_send(());
     }
     if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
         let _ = cleaner_stop_tx.try_send(());
+    }
+    if let Some(tx) = &segment_cleaner_stop {
+        let _ = tx.try_send(());
     }
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
@@ -1086,6 +1167,70 @@ async fn broadcast_metadata_bundle(
                     pending = returned;
                     compio::time::sleep(poll_interval).await;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Peer side of [`BootstrapBarrier`]: tell shard 0 this shard finished
+/// loading its on-disk partitions. Mirrors [`broadcast_metadata_bundle`]'s
+/// `try_send`-or-shutdown poll loop so a sibling failure (which flips the
+/// shutdown flag) drives this out instead of stranding it on a full
+/// channel. The channel is sized to the peer count and each peer sends
+/// exactly once, so `Full` is not expected; the branch only keeps the
+/// loop interruptible.
+async fn signal_bootstrap_complete(
+    shard_id: u16,
+    ready_tx: &crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut pending = shard_id;
+    loop {
+        match ready_tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(crossfire::TrySendError::Disconnected(_)) => {
+                // Shard 0 dropped its `ready_rx` before draining (it
+                // aborted before binding listeners). Propagate so this
+                // shard short-circuits; the shutdown flag flips via the
+                // normal teardown path.
+                return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+            }
+            Err(crossfire::TrySendError::Full(returned)) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+                }
+                pending = returned;
+                compio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+/// Owner side of [`BootstrapBarrier`]: drain one ready signal per peer
+/// before shard 0 binds listeners. Polls the shutdown flag so a peer that
+/// dies mid-load (flipping the flag) aborts the wait instead of hanging on
+/// a signal that will never arrive. A single shard (`peers == 0`) returns
+/// immediately.
+async fn await_bootstrap_complete(
+    ready_rx: &crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    peers: usize,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut remaining = peers;
+    while remaining > 0 {
+        match ready_rx.try_recv() {
+            Ok(_shard_id) => remaining -= 1,
+            Err(crossfire::TryRecvError::Disconnected) => {
+                return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+            }
+            Err(crossfire::TryRecvError::Empty) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+                }
+                compio::time::sleep(poll_interval).await;
             }
         }
     }
@@ -1199,7 +1344,15 @@ async fn build_shard_for_thread(
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
                     if owning_shard == shard_id {
-                        owned.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
+                        // Shared per-partition stats from the registry: the
+                        // same `Arc` backs every shard's `get_topic` reply.
+                        let stats = inner.stats_registry.partition(
+                            stream.id,
+                            topic_id,
+                            partition.id,
+                            topic.stats.clone(),
+                        );
+                        owned.push((stream.id, topic_id, stats, partition.clone()));
                     } else {
                         shards_table.insert(
                             namespace,
@@ -1219,13 +1372,13 @@ async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, topic_stats, partition_metadata) in owned {
+    for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = load_partition(
             config,
             namespace,
-            topic_stats,
+            partition_stats,
             &partition_metadata,
             topology.cluster_id,
             topology.self_replica_id,
@@ -1344,7 +1497,7 @@ fn restore_metadata_consensus(
 async fn load_partition(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
-    topic_stats: Arc<TopicStats>,
+    stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
     cluster_id: u128,
     self_replica_id: u8,
@@ -1354,7 +1507,6 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
@@ -1365,29 +1517,19 @@ async fn load_partition(
     );
     consensus.init();
 
-    // TODO: decouple the loading logic from the `server` crate and load directly
-    // into the new `partitions` log/runtime types.
-    let loaded_log = server::bootstrap::load_segments(
-        &config.system,
-        stream_id,
-        topic_id,
-        partition_id,
-        config
-            .system
-            .get_partition_path(stream_id, topic_id, partition_id),
-        stats.clone(),
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to load partition log during server-ng bootstrap"
-        );
-        source
-    })?;
+    let recovered_segments =
+        load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    error = %source,
+                    "failed to load partition log during server-ng bootstrap"
+                );
+                source
+            })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_partition_dir(config.system.get_partition_path(
@@ -1401,7 +1543,7 @@ async fn load_partition(
         stream_id,
         topic_id,
         partition_id,
-        loaded_log,
+        recovered_segments,
     )
     .await?;
 
@@ -1437,43 +1579,12 @@ async fn hydrate_partition_log(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-    loaded_log: server::streaming::partitions::log::SegmentedLog<
-        server::streaming::partitions::journal::MemoryMessageJournal,
-    >,
+    recovered_segments: Vec<RecoveredSegment>,
 ) -> Result<(), ServerNgError> {
-    // TODO: decouple the loading logic from the `server` crate. This currently
-    // adapts the old server segmented log into the new `partitions` log.
-    for (segment_index, (segment, storage)) in loaded_log
-        .segments()
-        .iter()
-        .zip(loaded_log.storages().iter().cloned())
-        .enumerate()
-    {
-        validate_recovered_segment(
-            stream_id,
-            topic_id,
-            partition_id,
-            segment,
-            &storage,
-            loaded_log
-                .indexes()
-                .get(segment_index)
-                .and_then(|indexes| indexes.as_ref()),
-        )?;
-        let max_timestamp = match loaded_log
-            .indexes()
-            .get(segment_index)
-            .and_then(|indexes| indexes.as_ref())
-        {
-            Some(indexes) => indexes_max_timestamp(indexes),
-            None => load_segment_max_timestamp(&storage, stream_id, topic_id, partition_id).await?,
-        };
-        partition.log.add_persisted_segment(
-            convert_segment(segment, max_timestamp),
-            storage,
-            None,
-            None,
-        );
+    for RecoveredSegment { segment, storage } in recovered_segments {
+        partition
+            .log
+            .add_persisted_segment(segment, storage, None, None);
     }
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
@@ -1528,85 +1639,6 @@ async fn hydrate_partition_log(
     }
 
     Ok(())
-}
-
-fn validate_recovered_segment(
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-    segment: &iggy_common::Segment,
-    storage: &server_common::SegmentStorage,
-    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
-) -> Result<(), ServerNgError> {
-    let messages_size_bytes = storage
-        .messages_reader
-        .as_ref()
-        .map_or(0, |reader| u64::from(reader.file_size()));
-    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
-    if messages_size_bytes == indexed_size_bytes {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredSegmentSizeDivergence {
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        messages_size_bytes,
-        indexed_size_bytes,
-    })
-}
-
-fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
-    Segment {
-        sealed: segment.sealed,
-        start_timestamp: segment.start_timestamp,
-        end_timestamp: segment.end_timestamp,
-        max_timestamp,
-        current_position: u64::from(segment.current_position),
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        size: segment.size,
-        max_size: segment.max_size,
-    }
-}
-
-fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) -> u64 {
-    let mut max_timestamp = 0;
-    for index in 0..indexes.count() {
-        if let Some(index_view) = indexes.get(index) {
-            max_timestamp = max_timestamp.max(index_view.timestamp());
-        }
-    }
-
-    max_timestamp
-}
-
-async fn load_segment_max_timestamp(
-    storage: &server_common::SegmentStorage,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<u64, ServerNgError> {
-    let Some(index_reader) = storage.index_reader.as_ref() else {
-        return Ok(0);
-    };
-
-    let indexes = index_reader
-        .load_all_indexes_from_disk()
-        .await
-        .map_err(|source| {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                error = %source,
-                "failed to load segment indexes while recovering max timestamp"
-            );
-            source
-        })?;
-    Ok(indexes_max_timestamp(&indexes))
 }
 
 fn resolve_tcp_topology(
@@ -1801,6 +1833,9 @@ async fn start_tcp_runtime(
     .await
 }
 
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 async fn start_via_replica_io(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
@@ -1822,34 +1857,46 @@ async fn start_via_replica_io(
         .is_some()
         .then(|| load_tcp_tls_server_credentials(config))
         .transpose()?;
+    // `websocket.tls.enabled` upgrades the websocket address to a WSS
+    // listener; the plain-WS listener must NOT also bind it (one port, one
+    // handshake kind -- a plain upgrade parser fed a TLS ClientHello rejects
+    // every connection with an httparse error).
+    let wss_enabled = config.websocket.tls.enabled;
+    let ws_listen_addr = (!wss_enabled).then_some(topology.ws_listen_addr).flatten();
+    let wss_listen_addr = wss_enabled.then_some(topology.ws_listen_addr).flatten();
+    let wss_credentials = wss_listen_addr
+        .is_some()
+        .then(|| load_wss_server_credentials(config))
+        .transpose()?;
 
     let LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     } = accepted_clients;
 
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
         topology.client_listen_addr,
-        topology.ws_listen_addr,
+        ws_listen_addr,
         topology.quic_listen_addr,
         quic_credentials,
         topology.tcp_tls_listen_addr,
         tcp_tls_credentials,
-        None,
-        None,
+        wss_listen_addr,
+        wss_credentials,
         topology.self_replica_id,
         topology.peers.clone(),
         accepted_replica,
         dialed_replica,
         tcp,
-        topology.ws_listen_addr.map(|_| ws),
+        ws_listen_addr.map(|_| ws),
         topology.quic_listen_addr.map(|_| quic),
         topology.tcp_tls_listen_addr.map(|_| tcp_tls),
-        None,
+        wss_listen_addr.map(|_| wss),
         shard.bus.config().reconnect_period,
     )
     .await
@@ -1873,7 +1920,8 @@ async fn start_via_replica_io(
         config.cluster.enabled.then_some(bound.replica),
         bound.tcp_tls,
         bound.quic,
-        bound.ws,
+        // The WSS listener occupies the configured websocket address slot.
+        bound.wss.or(bound.ws),
     )
     .await?;
     if config.cluster.enabled {
@@ -2073,6 +2121,9 @@ fn make_replica_delegation_fns(
 /// locally on shard 0 because their per-connection state is not portable
 /// across shards (`compio_quic` endpoint binds one UDP socket; rustls TLS
 /// state ties to the post-handshake reactor).
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 fn make_shard_zero_client_accept_fns(
     coord: Rc<shard::coordinator::ShardZeroCoordinator>,
     bus: &Rc<IggyMessageBus>,
@@ -2080,7 +2131,9 @@ fn make_shard_zero_client_accept_fns(
 ) -> LocalClientAcceptFns {
     let quic_bus = Rc::clone(bus);
     let tcp_tls_bus = Rc::clone(bus);
+    let wss_bus = Rc::clone(bus);
     let quic_request = on_request.clone();
+    let wss_request = on_request.clone();
     let tcp_tls_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
@@ -2107,7 +2160,7 @@ fn make_shard_zero_client_accept_fns(
         installer::install_client_quic(&quic_bus, meta, accepted, quic_request.clone());
     });
 
-    let tcp_tls_coord = coord;
+    let tcp_tls_coord = Rc::clone(&coord);
     let tcp_tls = Rc::new(move |stream, tls_config| {
         let Some(meta) =
             client_meta_from_stream(&stream, &tcp_tls_coord, ClientTransportKind::TcpTls)
@@ -2123,11 +2176,24 @@ fn make_shard_zero_client_accept_fns(
         );
     });
 
+    // WSS terminates locally on shard 0 like TCP-TLS (rustls state is not
+    // serialisable across the delegate path), minting ids through the same
+    // coordinator counter.
+    let wss_coord = coord;
+    let wss = Rc::new(move |stream, tls_config| {
+        let Some(meta) = client_meta_from_stream(&stream, &wss_coord, ClientTransportKind::Wss)
+        else {
+            return;
+        };
+        installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
+    });
+
     LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     }
 }
 
@@ -2183,18 +2249,7 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
-        let token = shard.bus.token();
-        let accepted_ws = accepted_clients.ws.clone();
-        let ws_handle = compio::runtime::spawn(async move {
-            client_listener::ws::run(listener, token, accepted_ws).await;
-        });
-        shard.bus.track_background(ws_handle);
-        bound.ws = Some(bound_addr);
+        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -2382,6 +2437,62 @@ fn load_tcp_tls_server_credentials(
     load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
         ServerNgError::ListenerCredentials {
             transport: "tcp.tls",
+            source,
+        }
+    })
+}
+
+/// Bind the websocket client listener on `ws_addr`: WSS when
+/// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
+/// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
+/// connection with an httparse error), plain WS otherwise.
+async fn start_websocket_listener(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerNgConfig,
+    ws_addr: SocketAddr,
+    accepted_clients: &LocalClientAcceptFns,
+) -> Result<SocketAddr, ServerNgError> {
+    if config.websocket.tls.enabled {
+        let credentials = load_wss_server_credentials(config)?;
+        let (listener, tls_config, bound_addr) = client_listener::wss::bind(ws_addr, credentials)
+            .map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind WSS listener");
+            source
+        })?;
+        let token = shard.bus.token();
+        let accepted_wss = accepted_clients.wss.clone();
+        let wss_handle = compio::runtime::spawn(async move {
+            client_listener::wss::run(listener, tls_config, token, accepted_wss).await;
+        });
+        shard.bus.track_background(wss_handle);
+        Ok(bound_addr)
+    } else {
+        let (listener, bound_addr) =
+            client_listener::ws::bind(ws_addr).await.map_err(|source| {
+                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+                source
+            })?;
+        let token = shard.bus.token();
+        let accepted_ws = accepted_clients.ws.clone();
+        let ws_handle = compio::runtime::spawn(async move {
+            client_listener::ws::run(listener, token, accepted_ws).await;
+        });
+        shard.bus.track_background(ws_handle);
+        Ok(bound_addr)
+    }
+}
+
+fn load_wss_server_credentials(
+    config: &ServerNgConfig,
+) -> Result<TlsServerCredentials, ServerNgError> {
+    let tls = &config.websocket.tls;
+    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+        return Ok(self_signed_for_loopback());
+    }
+
+    load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
+        ServerNgError::ListenerCredentials {
+            transport: "websocket.tls",
             source,
         }
     })
@@ -2646,6 +2757,84 @@ mod tests {
         assert!(
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 1 }),
             "expected MetadataHandoffAborted on shutdown, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_returns_immediately_for_single_shard() {
+        // A single-shard server has no peers to wait on; the owner barrier
+        // must not block when `peers == 0`.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        await_bootstrap_complete(&ready_rx, 0, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("single-shard server must not block on the barrier");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_drains_every_peer_signal() {
+        // Two peers report load-complete; shard 0 drains both, then proceeds
+        // to bind listeners.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(2);
+        let flag = Arc::new(AtomicBool::new(false));
+        signal_bootstrap_complete(1, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 1 must signal load-complete");
+        signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 2 must signal load-complete");
+        await_bootstrap_complete(&ready_rx, 2, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("owner must drain both peer signals");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_aborts_on_shutdown_flag() {
+        use compio::runtime::ResumeUnwind;
+
+        // `_ready_tx` is held so the channel is not disconnected: the owner
+        // must exit via the shutdown flag, not a dropped sender.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let owner = compio::runtime::spawn({
+            let flag = Arc::clone(&flag);
+            async move { await_bootstrap_complete(&ready_rx, 1, &flag, TEST_POLL_INTERVAL).await }
+        });
+
+        // The peer never signals, but a sibling failure flips the flag; the
+        // owner must abort instead of hanging before listeners.
+        compio::time::sleep(TEST_POLL_INTERVAL / 2).await;
+        flag.store(true, Ordering::Relaxed);
+
+        let err = owner
+            .await
+            .resume_unwind()
+            .expect("owner task was cancelled")
+            .expect_err("shutdown flag must abort the barrier wait");
+        assert!(
+            matches!(
+                err,
+                ServerNgError::ShardBootstrapBarrierAborted { remaining: 1 }
+            ),
+            "expected ShardBootstrapBarrierAborted, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn signal_bootstrap_complete_aborts_when_owner_drops_rx() {
+        // Shard 0 aborted before draining and dropped its receiver; a peer's
+        // signal must surface the disconnect instead of stranding.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(ready_rx);
+
+        let err = signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect_err("dropped rx must surface as an abort");
+        assert!(
+            matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 2 }),
+            "expected MetadataHandoffAborted, got {err:?}"
         );
     }
 }

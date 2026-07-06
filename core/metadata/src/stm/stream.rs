@@ -28,8 +28,8 @@ use crate::stm::result::{
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
-use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codec::WireEncode;
+use bytes::{BufMut, Bytes, BytesMut};
+use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -52,7 +52,8 @@ use iggy_binary_protocol::responses::streams::get_stream::{GetStreamResponse, To
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
-    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
+    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats, StreamStats,
+    TopicStats,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::IggyNamespace;
@@ -70,6 +71,12 @@ pub struct PartitionSnapshot {
     /// with revision 0 instead of failing to decode.
     #[serde(default)]
     pub created_revision: u64,
+    /// `#[serde(default)]` so pre-watermark snapshots restore at 0.
+    #[serde(default)]
+    pub deleted_up_to_offset: u64,
+    /// `#[serde(default)]` so pre-purge snapshots restore at 0.
+    #[serde(default)]
+    pub purge_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +89,17 @@ pub struct Partition {
     /// reused the slab key, so the local partition is stale and must be torn
     /// down before rebuild.
     pub created_revision: u64,
+    /// Replicated delete watermark: the reconciler on every replica removes
+    /// sealed segments with `end_offset` below this. Advanced monotonically by
+    /// `TruncatePartition` (the resolved form of a client `DeleteSegments`).
+    /// `0` means nothing has been trimmed.
+    pub deleted_up_to_offset: u64,
+    /// Replicated purge counter: `PurgeTopic` increments it for every partition
+    /// in the topic. The reconciler on every replica resets a partition to a
+    /// single empty segment at offset 0 (clearing consumer offsets) when this
+    /// exceeds the generation it last applied locally. Monotonic so a redundant
+    /// reconcile pass does not re-wipe a partition already at this generation.
+    pub purge_generation: u64,
 }
 
 impl Partition {
@@ -97,6 +115,8 @@ impl Partition {
             consensus_group_id,
             created_at,
             created_revision,
+            deleted_up_to_offset: 0,
+            purge_generation: 0,
         }
     }
 }
@@ -110,12 +130,6 @@ pub struct StatsSnapshot {
 }
 
 /// Topic snapshot representation for serialization.
-///
-/// Encoded by `rmp_serde::to_vec` as a **positional array**, so `serde(default)`
-/// only fills **trailing** elements absent from an older snapshot. The two
-/// consumer-group fields below are therefore deliberately last: a topic
-/// snapshot written before co-located consumer groups has a shorter array, and
-/// the defaults fill the missing tail. Any future field must also be appended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicSnapshot {
     pub id: usize,
@@ -131,9 +145,6 @@ pub struct TopicSnapshot {
     // load-balancing hint advanced on the `Balanced`-send read path (outside
     // the replicated apply), so each replica's value drifts independently;
     // persisting it would make the snapshot diverge per replica. Restored to 0.
-    //
-    // The two consumer-group fields are trailing so the `serde(default)` above
-    // actually works for snapshots predating co-located consumer groups.
     #[serde(default)]
     pub consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
     #[serde(default)]
@@ -319,6 +330,131 @@ impl Stream {
     }
 }
 
+/// Cross-buffer shared aggregate stats.
+///
+/// The metadata STM is left-right double-buffered; `create_stream` /
+/// `create_topic` / snapshot restore run on BOTH buffers (Absorb
+/// re-dispatches each op), which would mint a distinct `Arc<StreamStats>` /
+/// `Arc<TopicStats>` per buffer. Aggregate message/size counters are
+/// `AtomicU64`s the partition plane increments DIRECTLY (outside the consensus
+/// op-log), so per-buffer Arcs silently drop those increments on a buffer swap
+/// (a read lands on the other, un-incremented buffer -- hence the
+/// `messages_count_inconsistent` naming). This registry hands both buffers the
+/// SAME `Arc` (get-or-create by id), so a direct increment is visible on every
+/// read.
+///
+/// Shared across buffers and reader shards via `Arc` (a `StreamsInner` clone
+/// shares it). Only shard 0's writer mutates the maps, under the
+/// single-threaded Absorb; the `Mutex` is for `Sync` (uncontended), not
+/// concurrency. Ids are deterministic across replicas (same op order), so both
+/// buffers resolve the same key.
+#[derive(Debug, Default)]
+pub struct StatsRegistry {
+    streams: std::sync::Mutex<AHashMap<usize, Arc<StreamStats>>>,
+    topics: std::sync::Mutex<AHashMap<(usize, usize), Arc<TopicStats>>>,
+    partitions: std::sync::Mutex<AHashMap<(usize, usize, usize), Arc<PartitionStats>>>,
+}
+
+impl StatsRegistry {
+    fn stream(&self, id: usize) -> Arc<StreamStats> {
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry(id)
+            .or_insert_with(|| Arc::new(StreamStats::default()))
+            .clone()
+    }
+
+    fn topic(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        parent: Arc<StreamStats>,
+    ) -> Arc<TopicStats> {
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry((stream_id, topic_id))
+            .or_insert_with(|| Arc::new(TopicStats::new(parent)))
+            .clone()
+    }
+
+    /// Get-or-create the shared per-partition stats. The owning shard calls
+    /// this when it materializes the partition; any shard's `get_topic` reply
+    /// reads the same `Arc`, so partition-plane counters are visible
+    /// cross-shard without a gather.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    pub fn partition(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        parent: Arc<TopicStats>,
+    ) -> Arc<PartitionStats> {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .entry((stream_id, topic_id, partition_id))
+            .or_insert_with(|| Arc::new(PartitionStats::new(parent)))
+            .clone()
+    }
+
+    /// Read-only lookup for reply builders: `None` until the owning shard
+    /// materializes the partition.
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    pub fn partition_get(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Option<Arc<PartitionStats>> {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .get(&(stream_id, topic_id, partition_id))
+            .cloned()
+    }
+
+    fn remove_stream(&self, id: usize) {
+        self.streams
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .remove(&id);
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(stream_id, _), _| *stream_id != id);
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(stream_id, _, _), _| *stream_id != id);
+    }
+
+    fn remove_topic(&self, stream_id: usize, topic_id: usize) {
+        self.topics
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .remove(&(stream_id, topic_id));
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(sid, tid, _), _| !(*sid == stream_id && *tid == topic_id));
+    }
+
+    fn remove_partitions_from(&self, stream_id: usize, topic_id: usize, first_removed: usize) {
+        self.partitions
+            .lock()
+            .expect("stats registry mutex poisoned")
+            .retain(|(sid, tid, pid), _| {
+                !(*sid == stream_id && *tid == topic_id && *pid >= first_removed)
+            });
+    }
+}
+
 define_state! {
     Streams {
         index: AHashMap<Arc<str>, usize>,
@@ -335,6 +471,113 @@ define_state! {
         // decide whether to wake the reconciler. Deterministic (same ops, same
         // recompute on every replica).
         pending_revocations_count: u64,
+        // Shared aggregate stats, one `Arc` per stream/topic across both
+        // left-right buffers (see `StatsRegistry`). Not snapshotted -- rebuilt
+        // as streams/topics restore.
+        stats_registry: Arc<StatsRegistry>,
+    }
+}
+
+/// Server-originated request that advances a partition's delete watermark.
+///
+/// `up_to_offset` is resolved on the owning shard from a client
+/// `DeleteSegments` count, then replicated through metadata so every replica
+/// applies the same monotonic watermark (see [`Partition::deleted_up_to_offset`]).
+#[derive(Debug, Clone)]
+pub struct TruncatePartitionRequest {
+    pub stream_id: WireIdentifier,
+    pub topic_id: WireIdentifier,
+    pub partition_id: u32,
+    pub up_to_offset: u64,
+}
+
+impl WireEncode for TruncatePartitionRequest {
+    fn encoded_size(&self) -> usize {
+        self.stream_id.encoded_size() + self.topic_id.encoded_size() + 4 + 8
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        self.stream_id.encode(buf);
+        self.topic_id.encode(buf);
+        buf.put_u32_le(self.partition_id);
+        buf.put_u64_le(self.up_to_offset);
+    }
+}
+
+impl WireDecode for TruncatePartitionRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
+        let (topic_id, n) = WireIdentifier::decode(&buf[pos..])?;
+        pos += n;
+        let partition_slice = buf.get(pos..pos + 4).ok_or_else(|| {
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: 4,
+                have: buf.len().saturating_sub(pos),
+            }
+        })?;
+        let partition_id = u32::from_le_bytes(partition_slice.try_into().expect("4 bytes"));
+        pos += 4;
+        let offset_slice = buf.get(pos..pos + 8).ok_or_else(|| {
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: 8,
+                have: buf.len().saturating_sub(pos),
+            }
+        })?;
+        let up_to_offset = u64::from_le_bytes(offset_slice.try_into().expect("8 bytes"));
+        pos += 8;
+        Ok((
+            Self {
+                stream_id,
+                topic_id,
+                partition_id,
+                up_to_offset,
+            },
+            pos,
+        ))
+    }
+}
+
+impl StateHandler for TruncatePartitionRequest {
+    type State = StreamsInner;
+    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        // Internal op (no client result enum): a missing parent / partition is
+        // an idempotent no-op, like the other reconciler-fed internal ops.
+        {
+            let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+                return ApplyReply::ok(Bytes::new());
+            };
+            let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+                return ApplyReply::ok(Bytes::new());
+            };
+            let Some(stream) = state.items.get_mut(stream_id) else {
+                return ApplyReply::ok(Bytes::new());
+            };
+            let Some(topic) = stream.topics.get_mut(topic_id) else {
+                return ApplyReply::ok(Bytes::new());
+            };
+            let Some(partition) = topic
+                .partitions
+                .iter_mut()
+                .find(|partition| partition.id == self.partition_id as usize)
+            else {
+                return ApplyReply::ok(Bytes::new());
+            };
+            // Monotonic: a stale or duplicate replay never rewinds the watermark.
+            if self.up_to_offset > partition.deleted_up_to_offset {
+                partition.deleted_up_to_offset = self.up_to_offset;
+            }
+        }
+        // Bump on every applied truncate (partition resolved), even when the
+        // watermark did not advance. A client `DeleteSegments` re-resolving to
+        // an already-committed offset must still re-drive the reconciler so
+        // segments the consumer barrier has since released are removed -- legacy
+        // `delete_segments` re-evaluates the barrier on every call. The
+        // watermark itself stays monotonic (set above); only the
+        // reconcile-trigger fires unconditionally.
+        state.revision = state.revision.wrapping_add(1);
+        ApplyReply::ok(Bytes::new())
     }
 }
 
@@ -360,6 +603,7 @@ collect_handlers! {
         LeaveConsumerGroup,
         RemoveConsumerGroupMember,
         CompleteConsumerGroupRevocation,
+        TruncatePartition,
     }
 }
 
@@ -434,6 +678,68 @@ impl Streams {
         F: FnOnce(&StreamsInner) -> R,
     {
         self.inner.read(f)
+    }
+
+    /// Committed delete watermark for a partition (the offset below which
+    /// sealed segments are removed), or `0` if the partition is unknown or
+    /// never trimmed. The per-shard reconciler reads this to enforce a
+    /// committed `TruncatePartition` against its local segments.
+    #[must_use]
+    pub fn partition_delete_watermark(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> u64 {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .get(stream_id)
+                .and_then(|stream| stream.topics.get(topic_id))
+                .and_then(|topic| topic.partitions.iter().find(|p| p.id == partition_id))
+                .map_or(0, |partition| partition.deleted_up_to_offset)
+        })
+    }
+
+    /// Committed purge generation for a partition. The reconciler resets the
+    /// local partition (single empty segment at offset 0, cleared consumer
+    /// offsets) whenever this exceeds the generation it last applied. `0` means
+    /// never purged. Mirrors [`Self::partition_delete_watermark`].
+    #[must_use]
+    pub fn partition_purge_generation(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> u64 {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .get(stream_id)
+                .and_then(|stream| stream.topics.get(topic_id))
+                .and_then(|topic| topic.partitions.iter().find(|p| p.id == partition_id))
+                .map_or(0, |partition| partition.purge_generation)
+        })
+    }
+
+    /// Retention policy for a topic: `(message_expiry, max_topic_size,
+    /// partition_count)`, or `None` if the stream or topic is unknown. The
+    /// per-shard segment cleaner reads this off-pump to decide local segment
+    /// deletion; `partition_count` lets it derive a per-partition size budget.
+    #[must_use]
+    pub fn topic_retention_config(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Option<(IggyExpiry, MaxTopicSize, usize)> {
+        self.inner.read(|inner| {
+            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
+            Some((
+                topic.message_expiry,
+                topic.max_topic_size,
+                topic.partitions.len(),
+            ))
+        })
     }
 
     /// Build the `ConsumerGroupDetailsResponse` for a group (members + their
@@ -870,19 +1176,21 @@ impl StateHandler for CreateStreamRequest {
             return ApplyReply::err(CreateStreamResult::NameAlreadyExists);
         }
 
+        // Share one `Arc<StreamStats>` across both left-right buffers via the
+        // registry (see `StatsRegistry`). The id the next insert will use is
+        // deterministic, so both buffers resolve the same registry key.
+        let id = state.items.vacant_key();
+        let stream_stats = state.stats_registry.stream(id);
         let stream = Stream {
-            id: 0,
+            id,
             name: name_arc.clone(),
             created_at: timestamp,
-            stats: Arc::new(StreamStats::default()),
+            stats: stream_stats,
             topics: Slab::new(),
             topic_index: AHashMap::default(),
         };
-
-        let id = state.items.insert(stream);
-        if let Some(stream) = state.items.get_mut(id) {
-            stream.id = id;
-        }
+        let inserted = state.items.insert(stream);
+        debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
         state.index.insert(name_arc, id);
 
         // Reply body: a freshly created stream has no topics. The SDK
@@ -942,6 +1250,8 @@ impl StateHandler for DeleteStreamRequest {
         let name = stream.name.clone();
         state.items.remove(stream_id);
         state.index.remove(&name);
+        // Evict registry entries so a reused slab id starts with fresh stats.
+        state.stats_registry.remove_stream(stream_id);
         state.revision = state.revision.wrapping_add(1);
         // The dropped stream may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -952,15 +1262,29 @@ impl StateHandler for DeleteStreamRequest {
 impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        // Message data lives in the partition plane, not metadata. A purge leaves
-        // the metadata shape (streams, topics, partition ids) intact, so apply
-        // only validates the parent and acks: no mutation, no `revision` bump
-        // (the reconciler keys off partition shape, which a purge preserves). The
-        // partition-journal segment drop is not yet wired off this committed op,
-        // so a committed purge is a metadata-plane no-op for now.
-        // TODO: partition-plane purge off the committed op.
-        if state.resolve_stream_id(&self.stream_id).is_none() {
-            return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+        // Stream purge = topic purge over every topic in the stream: advance
+        // each partition's monotonic purge generation; every replica's
+        // reconciler observes the committed generation and resets the
+        // partition to a single empty segment at offset 0 with cleared
+        // offsets (see `PurgeTopicRequest`). Metadata shape stays intact.
+        let advanced = {
+            let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+                return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+            };
+            let Some(stream) = state.items.get_mut(stream_id) else {
+                return ApplyReply::err(PurgeStreamResult::StreamNotFound);
+            };
+            let mut advanced = false;
+            for (_, topic) in &mut stream.topics {
+                for partition in &mut topic.partitions {
+                    partition.purge_generation = partition.purge_generation.wrapping_add(1);
+                    advanced = true;
+                }
+            }
+            advanced
+        };
+        if advanced {
+            state.revision = state.revision.wrapping_add(1);
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -991,6 +1315,21 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let new_revision = state.revision.wrapping_add(1);
         state.revision = new_revision;
 
+        // Share one `Arc<TopicStats>` across both left-right buffers via the
+        // registry, parented to the stream's shared `Arc<StreamStats>`. The id
+        // the next insert will use is deterministic across buffers. Fetched
+        // under an immutable borrow that ends before the `&mut stream` below,
+        // so the registry access (a sibling field) does not alias.
+        let (topic_id, parent_stats) = {
+            let Some(stream) = state.items.get(stream_id) else {
+                return ApplyReply::err(CreateTopicResult::StreamNotFound);
+            };
+            (stream.topics.vacant_key(), stream.stats.clone())
+        };
+        let topic_stats = state
+            .stats_registry
+            .topic(stream_id, topic_id, parent_stats);
+
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
@@ -1002,7 +1341,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         };
 
         let topic = Topic {
-            id: 0,
+            id: topic_id,
             name: name_arc.clone(),
             created_at: timestamp,
             replication_factor,
@@ -1012,7 +1351,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             )
             .unwrap_or_default(),
             max_topic_size: MaxTopicSize::from(self.request.max_topic_size),
-            stats: Arc::new(TopicStats::new(stream.stats.clone())),
+            stats: topic_stats,
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
@@ -1020,16 +1359,17 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             next_consumer_group_id: 1,
         };
 
-        let topic_id = stream.topics.insert(topic);
-        if let Some(topic) = stream.topics.get_mut(topic_id) {
-            topic.id = topic_id;
-
+        let inserted = stream.topics.insert(topic);
+        debug_assert_eq!(inserted, topic_id, "vacant_key must match the insert slot");
+        if let Some(topic) = stream.topics.get_mut(inserted) {
             for partition in &self.partitions {
                 let partition = Partition {
                     id: partition.partition_id as usize,
                     consensus_group_id: partition.consensus_group_id,
                     created_at: timestamp,
                     created_revision: new_revision,
+                    deleted_up_to_offset: 0,
+                    purge_generation: 0,
                 };
                 topic.partitions.push(partition);
             }
@@ -1161,6 +1501,8 @@ impl StateHandler for DeleteTopicRequest {
         let name = topic.name.clone();
         stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
+        // Evict registry entry so a reused slab id starts with fresh stats.
+        state.stats_registry.remove_topic(stream_id, topic_id);
         state.revision = state.revision.wrapping_add(1);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -1171,14 +1513,32 @@ impl StateHandler for DeleteTopicRequest {
 impl StateHandler for PurgeTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        // See `PurgeStreamRequest`: the data drop is partition-plane work, not
-        // yet wired off this committed op; the metadata commit only resolves the
-        // parents and acks.
-        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return ApplyReply::err(PurgeTopicResult::StreamNotFound);
+        // Purge keeps the topic, its partitions, and consumer-group membership;
+        // it wipes message data and consumer offsets per partition. The on-disk
+        // reset happens on every replica's reconciler -- here we only advance
+        // each partition's monotonic purge generation, which the reconciler
+        // observes (committed generation > locally applied) and turns into a
+        // single empty segment at offset 0 plus cleared offsets.
+        let advanced = {
+            let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+                return ApplyReply::err(PurgeTopicResult::StreamNotFound);
+            };
+            let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+                return ApplyReply::err(PurgeTopicResult::TopicNotFound);
+            };
+            let Some(stream) = state.items.get_mut(stream_id) else {
+                return ApplyReply::err(PurgeTopicResult::StreamNotFound);
+            };
+            let Some(topic) = stream.topics.get_mut(topic_id) else {
+                return ApplyReply::err(PurgeTopicResult::TopicNotFound);
+            };
+            for partition in &mut topic.partitions {
+                partition.purge_generation = partition.purge_generation.wrapping_add(1);
+            }
+            !topic.partitions.is_empty()
         };
-        if state.resolve_topic_id(stream_id, &self.topic_id).is_none() {
-            return ApplyReply::err(PurgeTopicResult::TopicNotFound);
+        if advanced {
+            state.revision = state.revision.wrapping_add(1);
         }
         ApplyReply::ok(Bytes::new())
     }
@@ -1246,6 +1606,8 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 consensus_group_id: partition.consensus_group_id,
                 created_at: timestamp,
                 created_revision: new_revision,
+                deleted_up_to_offset: 0,
+                purge_generation: 0,
             });
         }
         // Added partitions are unassigned until the groups rebalance.
@@ -1278,11 +1640,15 @@ impl StateHandler for DeletePartitionsRequest {
         let count_to_delete = self.partitions_count as usize;
         let did_delete = count_to_delete > 0 && count_to_delete <= topic.partitions.len();
         if did_delete {
-            topic
-                .partitions
-                .truncate(topic.partitions.len() - count_to_delete);
+            let retained = topic.partitions.len() - count_to_delete;
+            topic.partitions.truncate(retained);
             // Members assigned the removed partitions must give them up.
             topic.rebalance_consumer_groups();
+            // Evict registry entries so re-created partition ids start with
+            // fresh stats.
+            state
+                .stats_registry
+                .remove_partitions_from(stream_id, topic_id, retained);
         }
         if did_delete {
             state.revision = state.revision.wrapping_add(1);
@@ -1339,6 +1705,8 @@ impl Snapshotable for Streams {
                                             consensus_group_id: p.consensus_group_id,
                                             created_at: p.created_at,
                                             created_revision: p.created_revision,
+                                            deleted_up_to_offset: p.deleted_up_to_offset,
+                                            purge_generation: p.purge_generation,
                                         })
                                         .collect(),
                                     consumer_groups: topic
@@ -1381,9 +1749,13 @@ impl Snapshotable for Streams {
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
         let mut index: AHashMap<Arc<str>, usize> = AHashMap::new();
         let mut stream_entries: Vec<(usize, Stream)> = Vec::new();
+        // Register restored stats in the shared registry so both left-right
+        // buffers (and any post-restore op) reference one `Arc` per
+        // stream/topic (see `StatsRegistry`).
+        let stats_registry = Arc::new(StatsRegistry::default());
 
         for (slab_key, stream_snap) in snapshot.items {
-            let stream_stats = Arc::new(StreamStats::default());
+            let stream_stats = stats_registry.stream(slab_key);
             stream_stats.store_from_snapshot(
                 stream_snap.stats.size_bytes,
                 stream_snap.stats.messages_count,
@@ -1394,7 +1766,8 @@ impl Snapshotable for Streams {
             let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
 
             for (topic_slab_key, topic_snap) in stream_snap.topics {
-                let topic_stats = Arc::new(TopicStats::new(stream_stats.clone()));
+                let topic_stats =
+                    stats_registry.topic(slab_key, topic_slab_key, stream_stats.clone());
                 topic_stats.store_from_snapshot(
                     topic_snap.stats.size_bytes,
                     topic_snap.stats.messages_count,
@@ -1418,6 +1791,8 @@ impl Snapshotable for Streams {
                             consensus_group_id: p.consensus_group_id,
                             created_at: p.created_at,
                             created_revision: p.created_revision,
+                            deleted_up_to_offset: p.deleted_up_to_offset,
+                            purge_generation: p.purge_generation,
                         })
                         .collect(),
                     // Not snapshotted (see `TopicSnapshot`): start fresh.
@@ -1472,6 +1847,7 @@ impl Snapshotable for Streams {
             // Recomputed from the restored groups just below.
             pending_revocations_count: 0,
             last_result: None,
+            stats_registry,
         };
         inner.recompute_pending_revocations_count();
         Ok(inner.into())
@@ -1494,6 +1870,23 @@ mod tests {
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
+
+    #[test]
+    fn truncate_partition_request_round_trips() {
+        let request = TruncatePartitionRequest {
+            stream_id: WireIdentifier::numeric(7),
+            topic_id: WireIdentifier::numeric(3),
+            partition_id: 5,
+            up_to_offset: 1234,
+        };
+        let bytes = request.to_bytes();
+        let (decoded, consumed) = TruncatePartitionRequest::decode(&bytes).expect("decode");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.stream_id, request.stream_id);
+        assert_eq!(decoded.topic_id, request.topic_id);
+        assert_eq!(decoded.partition_id, request.partition_id);
+        assert_eq!(decoded.up_to_offset, request.up_to_offset);
+    }
 
     fn create_stream(inner: &mut StreamsInner, name: &str) {
         let request = CreateStreamRequest {

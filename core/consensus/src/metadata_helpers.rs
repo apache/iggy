@@ -21,7 +21,9 @@
 
 use crate::client_table::{ClientTable, REGISTER_REQUEST_ID, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
-use iggy_binary_protocol::{EvictionHeader, EvictionReason, HEADER_SIZE};
+use iggy_binary_protocol::{
+    EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
+};
 use message_bus::MessageBus;
 use server_common::iobuf::Frozen;
 use server_common::{MESSAGE_ALIGN, Message};
@@ -44,8 +46,13 @@ pub enum PreflightOutcome {
     /// Session gone (`NoSession`) or rotated past the retry (`SessionTooLow`):
     /// the client must be told with an eviction frame.
     Evict(EvictionReason),
-    /// Absorbed with nothing to send: in-flight prepare, not-caught-up
-    /// primary, stale/gap retry, or a client-bug newer session.
+    /// Transient: the request could not be committed *right now* but a replay of
+    /// the same `request_id` is expected to succeed (in-flight prepare,
+    /// not-caught-up primary). The caller sends a `TransientNotCommitted` reply
+    /// so the client replays immediately instead of waiting out its read-timeout.
+    NotReady,
+    /// Absorbed with nothing to send: stale/gap retry or a client-bug newer
+    /// session. Replaying the same `request_id` cannot help, so stay silent.
     Drop,
 }
 
@@ -75,9 +82,9 @@ where
         tracing::debug!(
             client_id,
             request,
-            "request_preflight: in-flight prepare, drop"
+            "request_preflight: in-flight prepare, not ready"
         );
-        return PreflightOutcome::Drop;
+        return PreflightOutcome::NotReady;
     }
 
     // Catch-up gate: stale ClientTable on a new primary could return `New`
@@ -93,9 +100,9 @@ where
             is_syncing = consensus.is_syncing(),
             commit_min = consensus.commit_min(),
             commit_max = consensus.commit_max(),
-            "request_preflight: not caught up, drop"
+            "request_preflight: not caught up, not ready"
         );
-        return PreflightOutcome::Drop;
+        return PreflightOutcome::NotReady;
     }
 
     let status = client_table
@@ -170,7 +177,12 @@ where
             send_eviction_to_client(consensus, client_id, reason).await;
             false
         }
-        PreflightOutcome::Drop => false,
+        // The wire-ingress plane has no per-request transport context to build a
+        // correlated `TransientNotCommitted` reply (that lives on the in-process
+        // home-shard path); stay silent here as before. NotReady and Drop both
+        // mean "do not dispatch"; the difference (explicit retry frame) only
+        // applies where the request header is in scope.
+        PreflightOutcome::NotReady | PreflightOutcome::Drop => false,
     }
 }
 
@@ -302,13 +314,48 @@ pub fn build_eviction_message(
         reason != EvictionReason::Reserved,
         "build_eviction_message: Reserved is sentinel; pick a real variant"
     );
+    build_eviction_from_header(EvictionHeader::new(
+        ctx.cluster,
+        ctx.view,
+        ctx.replica,
+        client_id,
+        reason,
+    ))
+}
 
+/// `IncompatibleProtocol` eviction carrying the server's accepted protocol
+/// window, see [`EvictionHeader::incompatible_protocol`].
+///
+/// # Panics
+/// Unreachable: zeroed `HEADER_SIZE` buffer is always a valid `EvictionHeader`.
+#[must_use]
+pub fn build_incompatible_protocol_eviction_message(
+    ctx: EvictionContext,
+    client_id: u128,
+) -> Message<EvictionHeader> {
+    debug_assert!(
+        client_id != 0,
+        "build_incompatible_protocol_eviction_message: client_id != 0"
+    );
+    build_eviction_from_header(EvictionHeader::incompatible_protocol(
+        ctx.cluster,
+        ctx.view,
+        ctx.replica,
+        client_id,
+        IGGY_PROTOCOL_VERSION,
+        IGGY_PROTOCOL_VERSION_MIN,
+    ))
+}
+
+/// # Panics
+/// Unreachable: zeroed `HEADER_SIZE` buffer is always a valid `EvictionHeader`.
+fn build_eviction_from_header(header: EvictionHeader) -> Message<EvictionHeader> {
     let mut msg = Message::<EvictionHeader>::new(HEADER_SIZE);
-    let header = bytemuck::checked::try_from_bytes_mut::<EvictionHeader>(
+    let slot = bytemuck::checked::try_from_bytes_mut::<EvictionHeader>(
         &mut msg.as_mut_slice()[..HEADER_SIZE],
     )
     .expect("zeroed bytes are valid");
-    *header = EvictionHeader::new(ctx.cluster, ctx.view, ctx.replica, client_id, reason);
+    *slot = header;
     msg
 }
 

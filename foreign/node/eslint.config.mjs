@@ -17,8 +17,6 @@
  * under the License.
  */
 
-import { builtinModules } from "module"
-
 // import jsLint from "@eslint/js"
 // import stylistic from "@stylistic/eslint-plugin"
 // import globals from "globals"

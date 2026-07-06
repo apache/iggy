@@ -104,6 +104,11 @@ pub enum ServerNgError {
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
     )]
     MetadataHandoffAborted { shard_id: u16 },
+    #[error(
+        "shard 0 aborted before binding listeners with {remaining} peer shard(s) still loading \
+         their on-disk partitions; a peer most likely failed during bootstrap (shutdown flag set)"
+    )]
+    ShardBootstrapBarrierAborted { remaining: usize },
     #[error("failed to parse {context} socket address '{address}'")]
     SocketAddressParse {
         context: &'static str,
