@@ -29,7 +29,7 @@ use compio::fs::create_dir_all;
 use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats, TopicStats,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats,
 };
 use message_bus::IggyMessageBus;
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
@@ -428,7 +428,7 @@ pub async fn ensure_initial_segment(
 pub async fn build_partition_fresh(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
-    topic_stats: Arc<TopicStats>,
+    stats: Arc<PartitionStats>,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -452,7 +452,6 @@ pub async fn build_partition_fresh(
             source
         })?;
 
-    let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,

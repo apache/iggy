@@ -33,10 +33,10 @@ use crate::{
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_from_request, build_reply_message, drain_committable_prefix,
-    emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
-    fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
-    send_prepare_ok as send_prepare_ok_common,
+    ack_quorum_reached, build_reply_from_request, build_reply_message,
+    build_result_rejection_reply, drain_committable_prefix, emit_namespace_progress_event,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -277,20 +277,20 @@ where
     /// Stage a consumer offset delete for the replicated op. See
     /// [`stage_consumer_offset_upsert`] for the ordering contract.
     ///
-    /// # Errors
-    ///
-    /// Returns `ConsumerOffsetNotFound` if the consumer or group has no
-    /// existing on-disk / in-memory offset to delete.
+    /// Deliberately infallible: this runs on the replicated-apply path (every
+    /// replica), where the offset may legitimately be absent (e.g. a backup
+    /// that never observed the primary-only `NoAck` store). The client-facing
+    /// "offset must exist" precondition is enforced once at primary admission
+    /// (`ensure_consumer_offset_exists` in `on_request`); re-checking here would
+    /// fail the replicated apply on such a replica and wedge the group.
     pub(crate) fn stage_consumer_offset_delete(
         &mut self,
         op: u64,
         kind: ConsumerKind,
         consumer_id: u32,
-    ) -> Result<(), IggyError> {
-        self.ensure_consumer_offset_exists(kind, consumer_id)?;
+    ) {
         let pending = PendingConsumerOffsetCommit::delete(kind, consumer_id);
         self.pending_consumer_offset_commits.insert(op, pending);
-        Ok(())
     }
 
     pub(crate) async fn apply_staged_consumer_offset_commit(
@@ -370,13 +370,25 @@ where
                 });
                 Ok(())
             }
+            // Commit-time apply keeps its invariant check on the PRIMARY:
+            // admission verified the offset exists there, so a miss on the
+            // primary is real divergence (log corruption / out-of-order apply)
+            // and must surface rather than silently mask a split state. A
+            // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
+            // (v2) stores apply on the primary only and are never replicated,
+            // so a later quorum delete finds nothing on the backups -- erroring
+            // there would fail the committed apply, panic the replica as
+            // divergent, and crash-loop on every journal replay. The
+            // prepare-time race is handled by not re-checking existence at
+            // staging (see `stage_consumer_offset_delete`).
             PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
                 let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                let _ = guard
-                    .remove(&key)
-                    .ok_or(IggyError::ConsumerOffsetNotFound(key))?;
+                let removed = guard.remove(&key).is_some();
+                if !removed && !self.consensus.is_follower() {
+                    return Err(IggyError::ConsumerOffsetNotFound(key));
+                }
                 Ok(())
             }
             PendingConsumerOffsetMutation::Delete
@@ -387,9 +399,10 @@ where
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                let _ = guard
-                    .remove(&key)
-                    .ok_or(IggyError::ConsumerOffsetNotFound(key.0))?;
+                let removed = guard.remove(&key).is_some();
+                if !removed && !self.consensus.is_follower() {
+                    return Err(IggyError::ConsumerOffsetNotFound(key.0));
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -496,7 +509,11 @@ where
             return;
         }
 
-        let reply = build_reply_from_request(&self.consensus, &request_header, bytes::Bytes::new());
+        let reply = build_reply_from_request(
+            &self.consensus,
+            &request_header,
+            committed_reply_body(request_header.operation),
+        );
         let reply_buffers = reply.into_generic().into_frozen();
         if let Err(error) = self
             .consensus
@@ -920,16 +937,24 @@ where
                 (segment_index, position)
             }
             MessageLookup::Timestamp { timestamp, .. } => {
-                for (segment_index, _) in segments.iter().enumerate() {
-                    if let Some(index) = self
-                        .log
-                        .segment_indexes(segment_index)
-                        .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
-                    {
-                        return (segment_index, index.position);
-                    }
-                }
-                (0, 0)
+                // Resolve the starting SEGMENT from segment metadata, not from
+                // the per-segment index caches: sealed segments drop their
+                // cache at rotation, and a cache miss must not read as "the
+                // timestamp is not in this segment" (skipping a sealed segment
+                // loses its messages). Timestamps are monotone across
+                // segments, so the first segment whose max timestamp reaches
+                // the query is the correct start; the walk filters precisely,
+                // so an early start is safe.
+                let segment_index = segments
+                    .iter()
+                    .position(|segment| segment.max_timestamp >= *timestamp)
+                    .unwrap_or_else(|| segments.len().saturating_sub(1));
+                let position = self
+                    .log
+                    .segment_indexes(segment_index)
+                    .and_then(|cache| cache.timestamp_lower_bound(*timestamp))
+                    .map_or(0, |index| index.position);
+                (segment_index, position)
             }
         }
     }
@@ -1027,7 +1052,60 @@ where
                     .with_operation(message.header().operation)
                     .with_error(error.to_string()),
                 );
+                // Reply with a terminal error instead of dropping the request:
+                // the SDK decodes any non-`TransientNotCommitted` result code as a
+                // final error, so the client gets `ConsumerOffsetNotFound` at once
+                // rather than replaying until its read-timeout (a client hang).
+                // The op is NOT admitted/replicated, so no replica ever applies a
+                // delete for an offset the primary knows is absent.
+                let reply = build_result_rejection_reply(
+                    message.header(),
+                    self.consensus().commit_max(),
+                    error.as_code(),
+                );
+                let _ = self
+                    .consensus()
+                    .message_bus()
+                    .send_to_client(client_id, reply.into_generic().into_frozen())
+                    .await;
                 return;
+            }
+
+            // Reject an out-of-range consumer-offset store at admission with a
+            // terminal `InvalidOffset` (result-framed like the delete rejection),
+            // mirroring the legacy `validate_partition_offset`: an empty partition
+            // accepts no offset, and a stored offset may not run ahead of the
+            // committed offset. Done here so the doomed op is never replicated.
+            if matches!(
+                message.header().operation,
+                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
+            ) && let Some((_, _, Some(requested_offset), _)) = consumer_offset
+            {
+                let current_offset = self.stats.current_offset();
+                let partition_empty =
+                    self.stats.messages_count_inconsistent() == 0 && current_offset == 0;
+                if partition_empty || requested_offset > current_offset {
+                    emit_partition_diag(
+                        tracing::Level::WARN,
+                        &PartitionDiagEvent::new(
+                            ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                            "rejecting store_consumer_offset for out-of-range offset",
+                        )
+                        .with_operation(message.header().operation)
+                        .with_error(IggyError::InvalidOffset(requested_offset).to_string()),
+                    );
+                    let reply = build_result_rejection_reply(
+                        message.header(),
+                        self.consensus().commit_max(),
+                        IggyError::InvalidOffset(requested_offset).as_code(),
+                    );
+                    let _ = self
+                        .consensus()
+                        .message_bus()
+                        .send_to_client(client_id, reply.into_generic().into_frozen())
+                        .await;
+                    return;
+                }
             }
 
             assert!(!consensus.is_follower(), "on_request: primary only");
@@ -1503,7 +1581,7 @@ where
                         );
                     }
                     Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
-                        self.stage_consumer_offset_delete(header.op, kind, consumer_id)?;
+                        self.stage_consumer_offset_delete(header.op, kind, consumer_id);
                     }
                     _ => unreachable!(),
                 }
@@ -1701,11 +1779,10 @@ where
             self.rotate_segment(config).await?;
         }
 
-        self.stats
-            .increment_size_bytes(committed_info.size.as_bytes_u64());
-        self.stats
-            .increment_messages_count(u64::from(committed_info.messages_count));
-
+        // Aggregate stats (`messages_count`/`size_bytes`) advance at commit in
+        // `commit_partition_entry`, not here: this persist path is threshold-
+        // gated, so counting here would leave the stats lagging the visible
+        // offset until a flush and would double-count once it fires.
         let durable_offset = committed_info.current_offset;
         self.offset.store(durable_offset, Ordering::Release);
         self.stats.set_current_offset(durable_offset);
@@ -1812,7 +1889,10 @@ where
             // No reply cache: at-least-once means retries re-commit at new
             // offsets. Only primary delivers replies; backups just advance
             // commit. Session lifecycle is metadata-only.
-            let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+            let reply = build_reply_message(
+                &prepare_header,
+                &committed_reply_body(prepare_header.operation),
+            );
 
             // TODO: no production caller yet. Partition has no in-process
             // subscriber (only metadata uses pipeline_message_with_subscriber);
@@ -1863,7 +1943,7 @@ where
     async fn resolve_committed_visible_offsets(
         &self,
         drained: &[PipelineEntry],
-    ) -> HashMap<u64, u64> {
+    ) -> HashMap<u64, CommittedBatchStats> {
         let mut committed_visible_offsets = HashMap::new();
 
         for entry in drained {
@@ -1871,9 +1951,9 @@ where
                 continue;
             }
 
-            match self.committed_end_offset_for_prepare(&entry.header).await {
-                Ok(Some(end_offset)) => {
-                    committed_visible_offsets.insert(entry.header.op, end_offset);
+            match self.committed_batch_stats_for_prepare(&entry.header).await {
+                Ok(Some(batch_stats)) => {
+                    committed_visible_offsets.insert(entry.header.op, batch_stats);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1898,7 +1978,7 @@ where
         &mut self,
         prepare_header: PrepareHeader,
         messages_committed: &mut bool,
-        committed_visible_offsets: &HashMap<u64, u64>,
+        committed_visible_offsets: &HashMap<u64, CommittedBatchStats>,
         failed_commit: &mut bool,
         config: &PartitionsConfig,
     ) -> bool {
@@ -1922,9 +2002,16 @@ where
                     *messages_committed = true;
                 }
 
-                if let Some(visible_offset) = committed_visible_offsets.get(&prepare_header.op) {
-                    self.offset.store(*visible_offset, Ordering::Release);
-                    self.stats.set_current_offset(*visible_offset);
+                if let Some(batch_stats) = committed_visible_offsets.get(&prepare_header.op) {
+                    self.offset.store(batch_stats.end_offset, Ordering::Release);
+                    self.stats.set_current_offset(batch_stats.end_offset);
+                    // Advance the aggregate stats with the visible offset. Disk
+                    // persistence is threshold-gated in `commit_messages`, which
+                    // must not also touch these counters or committed messages
+                    // would be double-counted once they flush.
+                    self.stats
+                        .increment_messages_count(u64::from(batch_stats.message_count));
+                    self.stats.increment_size_bytes(batch_stats.size_bytes);
                 }
                 !*failed_commit
             }
@@ -1950,10 +2037,10 @@ where
         }
     }
 
-    async fn committed_end_offset_for_prepare(
+    async fn committed_batch_stats_for_prepare(
         &self,
         prepare_header: &PrepareHeader,
-    ) -> Result<Option<u64>, IggyError> {
+    ) -> Result<Option<CommittedBatchStats>, IggyError> {
         let Some(entry) = self.log.journal().inner.entry(prepare_header).await else {
             return Err(IggyError::InvalidCommand);
         };
@@ -1964,9 +2051,11 @@ where
             return Ok(None);
         }
 
-        Ok(Some(
-            batch.header.base_offset + u64::from(message_count) - 1,
-        ))
+        Ok(Some(CommittedBatchStats {
+            end_offset: batch.header.base_offset + u64::from(message_count) - 1,
+            message_count,
+            size_bytes: batch.header.total_size() as u64,
+        }))
     }
 
     fn parse_consumer_offset_request(
@@ -2253,6 +2342,12 @@ where
         let _ = old_storage.shutdown();
         self.log.messages_writers_mut()[old_segment_index] = None;
         self.log.index_writers_mut()[old_segment_index] = None;
+        // Drop the sealed segment's in-memory index cache: only the ACTIVE
+        // segment's cache is ever read (the `commit_messages` flush staging),
+        // so a sealed cache is dead weight -- and `ensure_indexes` preallocates
+        // a 16 MiB-capacity `Vec` per segment, which under small-segment
+        // workloads retains hundreds of MB across thousands of sealed segments.
+        self.log.indexes_mut()[old_segment_index] = None;
 
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -2630,6 +2725,29 @@ fn peek_operation(entry: &Frozen<4096>) -> Operation {
     )
     .expect("journal entry must begin with a valid prepare header")
     .operation
+}
+
+/// Success reply body for a committed partition op. Result-framed ops
+/// (`Operation::is_result_framed`; on this plane the consumer-offset ops,
+/// whose rejections ship typed errors) must carry an explicit empty result
+/// section (`[count = 0]`) so the SDK's framed decode does not misread the
+/// payload; every other partition op replies with an empty body.
+const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
+    if operation.is_result_framed() {
+        bytes::Bytes::from_static(&[0, 0, 0, 0])
+    } else {
+        bytes::Bytes::new()
+    }
+}
+
+/// Committed-batch accounting surfaced at commit time so the aggregate stats
+/// (`messages_count`, `size_bytes`) advance with the visible offset rather than
+/// waiting on the threshold-gated disk persist.
+#[derive(Clone, Copy)]
+struct CommittedBatchStats {
+    end_offset: u64,
+    message_count: u32,
+    size_bytes: u64,
 }
 
 /// Fold one `SendMessages` batch's accounting into a running `JournalInfo`,

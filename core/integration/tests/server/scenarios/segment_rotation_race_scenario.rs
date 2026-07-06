@@ -48,6 +48,15 @@ const MAX_ALLOWED_MEMORY_BYTES: u64 = 200 * 1024 * 1024;
 /// Uses all available transports from the harness (TCP, HTTP, QUIC, WebSocket).
 /// 2 producers are spawned per protocol, all writing to the same partition.
 pub async fn run(harness: &TestHarness) {
+    // HTTP (REST) carries no VSR framing, so under vsr the race runs over the
+    // three VSR transports; the legacy path exercises all four.
+    #[cfg(feature = "vsr")]
+    let transports = [
+        TransportProtocol::Tcp,
+        TransportProtocol::Quic,
+        TransportProtocol::WebSocket,
+    ];
+    #[cfg(not(feature = "vsr"))]
     let transports = [
         TransportProtocol::Tcp,
         TransportProtocol::Http,
@@ -69,6 +78,12 @@ pub async fn run(harness: &TestHarness) {
     let stats = admin_client.get_stats().await.unwrap();
     let server_pid = stats.process_id;
     init_system(&admin_client, total_producers).await;
+
+    let memory_before_load = get_process_memory(server_pid);
+    println!(
+        "Server memory before load: {:.2} MB",
+        memory_before_load as f64 / 1024.0 / 1024.0
+    );
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let total_messages = Arc::new(AtomicU64::new(0));
@@ -126,6 +141,14 @@ pub async fn run(harness: &TestHarness) {
     println!(
         "Final server memory: {:.2} MB",
         final_memory as f64 / 1024.0 / 1024.0
+    );
+    let final_stats = admin_client.get_stats().await.unwrap();
+    println!(
+        "Final segments_count: {} (memory per segment: {:.1} KiB)",
+        final_stats.segments_count,
+        (final_memory.saturating_sub(memory_before_load)) as f64
+            / 1024.0
+            / f64::from(final_stats.segments_count.max(1))
     );
     assert!(
         final_memory < MAX_ALLOWED_MEMORY_BYTES,

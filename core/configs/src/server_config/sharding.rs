@@ -30,7 +30,7 @@ pub use cpu_allocation::{CpuAllocation, NumaConfig};
 
 /// Default capacity of the per-shard inter-shard inbox channel. Sized
 /// comfortably above the consensus working set, which is roughly
-/// `PIPELINE_PREPARE_QUEUE_MAX (= 8) * replica_count * directions`
+/// `PIPELINE_PREPARE_QUEUE_MAX (= 32) * replica_count * directions`
 /// frames in flight per shard, without allowing a runaway producer to
 /// eat unbounded memory. Tunable via `[system.sharding] inbox_capacity`
 /// in TOML.

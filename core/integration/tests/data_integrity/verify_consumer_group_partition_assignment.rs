@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::time::{Duration, sleep};
 
 const STREAM_NAME: &str = "cg-partition-test-stream";
@@ -3249,11 +3250,23 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
     // 4. Consumer3 disconnects — triggers full rebalance (rebalance_members).
     //    Leave clears only consumer3's polled offsets, not consumer1's.
     drop(client3);
-    sleep(Duration::from_secs(3)).await;
 
     // 5. After full rebalance, consumer1 and consumer2 split all partitions.
     //    The key invariant: no partition is assigned to two members.
-    let cg = get_consumer_group(&root_client).await;
+    //    Convergence is load-dependent: the dead connection is noticed by the
+    //    heartbeat verifier (interval 2s, worst case ~2x), then the Leave
+    //    commits and the reconciler rebalances -- a fixed sleep flakes under
+    //    parallel-suite load. Poll until the membership and assignments
+    //    converge, then make the terminal assertions.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let cg = loop {
+        let cg = get_consumer_group(&root_client).await;
+        let assigned: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
+        if (cg.members_count == 2 && assigned == PARTITIONS_COUNT) || Instant::now() >= deadline {
+            break cg;
+        }
+        sleep(Duration::from_millis(200)).await;
+    };
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();

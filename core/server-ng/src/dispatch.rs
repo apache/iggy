@@ -34,9 +34,9 @@ use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
     NonReplicatedResponse, build_consumer_offset_body, build_empty_reply, build_get_me_response,
-    build_non_replicated_response, build_polled_messages_body, build_raw_pat_reply,
-    connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
-    resolve_partition_request_namespace,
+    build_get_personal_access_tokens_response, build_non_replicated_response,
+    build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
+    current_metadata_commit, resolve_partition_namespace, resolve_partition_request_namespace,
 };
 use crate::session_manager::SessionManager;
 use crate::users::maybe_rewrite_user_password_request;
@@ -48,7 +48,8 @@ use consensus::{
 };
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -732,6 +733,48 @@ async fn handle_client_request(
     }
 }
 
+/// Per-user PATs, resolved from this shard's session (like `get_me`) and read
+/// out of the Users STM. Built here rather than in `build_non_replicated_response`
+/// which has no session context.
+#[allow(clippy::future_not_send)]
+async fn handle_get_personal_access_tokens(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let response = build_get_personal_access_tokens_response(shard, sessions, transport_client_id);
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        response.to_bytes(),
+        "get_personal_access_tokens",
+    )
+    .await;
+}
+
+/// The requesting connection's own identity, sourced from this shard's
+/// `SessionManager` (not `IggyMetadata`), so built here rather than in
+/// `build_non_replicated_response`.
+#[allow(clippy::future_not_send)]
+async fn handle_get_me(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: &Message<RequestHeader>,
+) {
+    let response = build_get_me_response(shard, sessions, transport_client_id);
+    send_non_replicated_bytes(
+        shard,
+        request,
+        transport_client_id,
+        response.to_bytes(),
+        "get_me",
+    )
+    .await;
+}
+
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
@@ -766,19 +809,10 @@ async fn handle_non_replicated_request(
             }
         }
         GET_ME_CODE => {
-            // `get_me` reports the requesting connection's own identity,
-            // sourced from this shard's `SessionManager` (not `IggyMetadata`),
-            // so it is built here rather than in
-            // `build_non_replicated_response`.
-            let response = build_get_me_response(shard, sessions, transport_client_id);
-            send_non_replicated_bytes(
-                shard,
-                &request,
-                transport_client_id,
-                response.to_bytes(),
-                "get_me",
-            )
-            .await;
+            handle_get_me(shard, sessions, transport_client_id, &request).await;
+        }
+        GET_PERSONAL_ACCESS_TOKENS_CODE => {
+            handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
         }
         GET_CLIENTS_CODE => {
             // Shared-nothing: each shard knows only its own connections, so
@@ -1333,7 +1367,10 @@ fn decode_poll_request(
         return Ok((namespace, partition_id, consumer, args));
     }
 
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Plain-consumer poll: an omitted partition selects partition 0, matching
+    // the legacy resolver (`resolve_consumer_with_partition_id` uses
+    // `unwrap_or(0)` for `ConsumerKind::Consumer`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
@@ -1346,7 +1383,9 @@ fn decode_consumer_offset_request(
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
     let wire = GetConsumerOffsetRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Omitted partition reads partition 0, matching the legacy resolver for
+    // both consumer kinds (`unwrap_or(0)`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     // A group offset is keyed by the group's monotonic id (any client may read

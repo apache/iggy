@@ -8296,6 +8296,7 @@ dependencies = [
  "ahash 0.8.12",
  "async-channel",
  "blake3",
+ "bytemuck",
  "bytes",
  "compio",
  "compio-quic",

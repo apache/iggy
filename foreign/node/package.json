@@ -54,12 +54,12 @@
     "uuidv7": "1.2.1"
   },
   "devDependencies": {
-    "@commitlint/cli": "21.0.2",
-    "@commitlint/config-conventional": "21.0.2",
+    "@commitlint/cli": "21.1.0",
+    "@commitlint/config-conventional": "21.1.0",
     "@cucumber/cucumber": "13.0.0",
     "@swc-node/register": "1.11.1",
     "@types/debug": "4.1.13",
-    "@types/node": "25.9.3",
+    "@types/node": "26.0.1",
     "c8": "^11.0.0",
     "husky": "9.1.7",
     "typescript": "6.0.3",
