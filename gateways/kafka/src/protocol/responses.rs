@@ -264,13 +264,17 @@ fn encode_list_offsets_response_inner(
             e.write_i32(partition.partition);
             e.write_i16(partition_error);
 
-            let offset = 0i64;
-            if version >= 1 {
-                e.write_i64(-1); // -1 = timestamp not available (Kafka sentinel)
-            }
-            e.write_i64(offset);
-            if version >= 4 {
-                e.write_i32(-1);
+            if version == 0 {
+                // v0 has no `timestamp`/`offset` fields; it returns the legacy
+                // `old_style_offsets` ARRAY (i32 count + i64 entries) instead.
+                // Empty since this stub never resolves a real offset.
+                e.write_i32(0);
+            } else {
+                e.write_i64(-1); // timestamp: -1 = not available (Kafka sentinel)
+                e.write_i64(0); // offset
+                if version >= 4 {
+                    e.write_i32(-1); // leader_epoch
+                }
             }
             if flexible {
                 e.write_empty_tagged_fields();

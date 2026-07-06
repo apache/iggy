@@ -151,7 +151,16 @@ fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
         "partition error code"
     );
 
-    parse_list_offsets_v0_partition(&mut d);
+    // partition_index and error_code were already asserted above; only the
+    // trailing old_style_offsets array remains for this single partition.
+    let offset_count = d.read_i32().expect("old_style_offsets array length");
+    assert!(
+        offset_count >= 0,
+        "old_style_offsets count must be non-negative, got {offset_count}"
+    );
+    for _ in 0..offset_count {
+        d.read_i64().expect("old_style_offsets entry");
+    }
     assert_eq!(d.remaining(), 0);
 }
 
