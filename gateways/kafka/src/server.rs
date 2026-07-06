@@ -176,6 +176,9 @@ impl KafkaServer {
                             if let Err(e) = stream.set_nodelay(true) {
                                 warn!(%peer, "TCP_NODELAY failed: {e}");
                             }
+                            if let Err(e) = enable_tcp_keepalive(&stream) {
+                                warn!(%peer, "TCP_KEEPALIVE failed: {e}");
+                            }
                             let cfg = Arc::clone(&self.config);
                             let broker = Arc::clone(&broker);
                             tracker.spawn(async move {
@@ -194,6 +197,7 @@ impl KafkaServer {
                         Err(e) => return Err(e.into()),
                     }
                 }
+
             }
         }
         Ok(())
@@ -211,6 +215,12 @@ fn is_transient_accept_error(err: &std::io::Error) -> bool {
         // EMFILE / ENFILE are common across Unix platforms when fd limits are hit.
         Some(23 | 24)
     )
+}
+
+fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    sock.set_keepalive(true)?;
+    Ok(())
 }
 
 async fn handle_connection(
@@ -337,20 +347,14 @@ pub async fn read_frame(
     max_frame_size: usize,
     read_timeout: Duration,
 ) -> Result<bytes::Bytes> {
-    // Single deadline for both the length-prefix read and the body read. Without this, a
-    // slow-drip sender could hold a connection open for 2x read_timeout by sending one byte
-    // per timeout window.
-    let deadline = tokio::time::Instant::now() + read_timeout;
     let mut len_buf = [0u8; 4];
-    timeout_at(deadline, stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
+    // Idle: block until client starts next frame (or EOF). No read_timeout here.
+    stream.read_exact(&mut len_buf).await?;
 
     let frame_len_i32 = i32::from_be_bytes(len_buf);
     if frame_len_i32 <= 0 {
         return Err(KafkaProtocolError::InvalidFrameLength(frame_len_i32));
     }
-
     let frame_len =
         usize::try_from(frame_len_i32).map_err(|_| KafkaProtocolError::FrameTooLarge {
             max_bytes: max_frame_size,
@@ -363,6 +367,8 @@ pub async fn read_frame(
         });
     }
 
+    // In-flight: read_timeout applies only after the length prefix is complete.
+    let deadline = tokio::time::Instant::now() + read_timeout;
     // read_buf() exposes all BytesMut spare capacity to the OS; after reserve(n) the
     // allocator may give more than n bytes, so the OS can fill past frame_len and silently
     // consume bytes belonging to the next pipelined frame. Use read() with a bounded slice

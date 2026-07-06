@@ -347,8 +347,7 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    // Longer than read_timeout: today the server closes idle connections here.
-    // After fix (separate idle timeout), the connection should remain usable.
+    // Idle longer than read_timeout: prefix wait has no timer; connection stays open.
     time::sleep(Duration::from_secs(4)).await;
 
     let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 502, Some("idle-test"), &[]);
@@ -361,8 +360,8 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
         read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_secs(2))
             .await
             .expect(
-                "request after idle period longer than read_timeout should succeed once \
-             idle timeout is decoupled from frame read timeout",
+                "request after idle period longer than read_timeout should succeed \
+                 (read_timeout applies to in-flight frame body only)",
             );
 
     let (corr, _) = parse_response_payload(API_KEY_API_VERSIONS, 1, payload);

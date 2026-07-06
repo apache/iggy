@@ -6757,6 +6757,7 @@ name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

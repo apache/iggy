@@ -391,6 +391,7 @@ fn metadata_v9_flexible_echoes_each_requested_topic_name() {
             0,
             "empty partitions array"
         );
+        d.read_i32().unwrap(); // topic_authorized_operations (v8+)
         d.read_tagged_fields().unwrap();
     }
 

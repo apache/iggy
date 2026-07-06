@@ -21,6 +21,10 @@
 mod fixtures;
 #[path = "common/scope.rs"]
 mod scope;
+#[path = "common/tcp.rs"]
+mod tcp;
+#[path = "common/wire.rs"]
+mod wire;
 
 use bytes::Bytes;
 
@@ -33,6 +37,8 @@ use iggy_gateway_kafka::protocol::codec::Decoder;
 
 use fixtures::load_fixture_body;
 use scope::{SCOPED_API_KEYS, default_broker};
+use tcp::build_metadata_legacy_request;
+use wire::build_metadata_flexible_request;
 
 #[test]
 fn supported_ranges_table_has_six_entries() {
@@ -151,9 +157,7 @@ fn apiversions_out_of_range_returns_unsupported_in_body() {
 }
 
 fn metadata_request_one_topic() -> Bytes {
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&1_i32.to_be_bytes());
-    Bytes::from(raw)
+    build_metadata_legacy_request(&["test-topic"])
 }
 
 #[test]
@@ -176,11 +180,11 @@ fn metadata_below_min_version_returns_topic_error() {
 
 #[test]
 fn metadata_above_max_version_returns_topic_error() {
-    // v10 uses flexible encoding; compact array varint(2) = 1 topic.
+    // v10 request uses flexible encoding; response is clamped to v9.
     let body = handle_request(
         API_KEY_METADATA,
         10,
-        Bytes::from_static(&[0x02]),
+        build_metadata_flexible_request(&["test-topic"]),
         &default_broker(),
     )
     .expect("test request has acks != 0 and expects a response");
@@ -259,9 +263,9 @@ fn list_offsets_unsupported_version_returns_well_formed_error_response() {
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
     assert_eq!(d.read_i32().unwrap(), 1);
-    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i32().unwrap(), 0); // partition index
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(d.read_i64().unwrap(), 0);
+    assert_eq!(d.read_i32().unwrap(), 0); // old_style_offsets empty array (v0 wire)
     assert_eq!(d.remaining(), 0);
 }
 

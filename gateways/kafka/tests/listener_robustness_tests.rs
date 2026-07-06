@@ -383,7 +383,7 @@ async fn e2e_connection_idle_after_response_accepts_next_request() {
     assert_eq!(
         parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
         602,
-        "idle gap under read_timeout must not drop connection"
+        "idle gap between requests must not drop connection (read_timeout is in-flight only)"
     );
 }
 
