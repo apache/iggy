@@ -47,9 +47,9 @@ enum Command {
     Generate {
         #[arg(short, long, default_value = "kafka_messages")]
         output: PathBuf,
-        /// Filter to a single API key integer
-        #[arg(long)]
-        api_key: Option<i16>,
+        /// Filter to API key(s), repeatable: --api-key 0 --api-key 1
+        #[arg(long, action = clap::ArgAction::Append)]
+        api_key: Vec<i16>,
         /// Filter to a single version
         #[arg(long)]
         version: Option<i16>,
@@ -685,14 +685,14 @@ fn cmd_list() {
 
 async fn cmd_generate(
     out: PathBuf,
-    fk: Option<i16>,
+    filter_keys: Vec<i16>,
     fv: Option<i16>,
     hex_dump: bool,
 ) -> Result<()> {
     tokio::fs::create_dir_all(&out).await?;
     let (mut n, mut corr) = (0usize, 1i32);
     for &(ak, name, min, max) in API_REGISTRY {
-        if fk.is_some_and(|k| k != ak) {
+        if !filter_keys.is_empty() && !filter_keys.contains(&ak) {
             continue;
         }
         for v in min..=max {
