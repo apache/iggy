@@ -71,6 +71,20 @@ python basic/consumer.py
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
 
+### Message Headers
+
+Shows how to attach and read Python SDK user headers with `str`, `bytes`, `bool`, `int`, and `float` values:
+
+```bash
+# Using uv
+uv run message-headers/producer.py
+uv run message-headers/consumer.py
+
+# Without using uv
+python message-headers/producer.py
+python message-headers/consumer.py
+```
+
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:

@@ -16,12 +16,25 @@
 # under the License.
 
 import asyncio
+import logging
 import uuid
+from typing import TypeAlias
 
 import pytest
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import (
+    HeaderKey,
+    HeaderValue,
+    IggyClient,
+    PollingStrategy,
+    UserHeaders,
+)
 from apache_iggy import SendMessage as Message
+
+HTTP_CREATED = 201
+JsonValue: TypeAlias = (
+    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+)
 
 
 class TestMessageOperations:
@@ -136,8 +149,160 @@ class TestMessageOperations:
         assert isinstance(msg.offset(), int) and msg.offset() >= 0
         assert isinstance(msg.id(), int) and msg.id() > 0
         assert isinstance(msg.timestamp(), int) and msg.timestamp() > 0
+        assert isinstance(msg.origin_timestamp(), int) and msg.origin_timestamp() > 0
         assert isinstance(msg.checksum(), int)
         assert isinstance(msg.length(), int) and msg.length() > 0
+        assert msg.user_headers() is None
+
+    @pytest.mark.asyncio
+    async def test_message_user_headers_round_trip(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test plain user headers round-trip through the typed representation."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        message_id = 123456789
+        user_headers = {
+            "content-type": "application/json",
+            "trace-blob": b"\x00\x01",
+            "is-retry": False,
+            "attempt": 3,
+            "score": 0.99,
+        }
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[
+                Message(
+                    "header round trip",
+                    user_headers=user_headers,
+                    id=message_id,
+                )
+            ],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Last(),
+            count=1,
+            auto_commit=True,
+        )
+
+        assert len(polled_messages) == 1
+        message = polled_messages[0]
+        assert message.id() == message_id
+        typed_headers = message.user_headers()
+        assert typed_headers is not None
+        assert typed_headers == {
+            HeaderKey.String("content-type"): HeaderValue.String("application/json"),
+            HeaderKey.String("trace-blob"): HeaderValue.Raw(b"\x00\x01"),
+            HeaderKey.String("is-retry"): HeaderValue.Bool(False),
+            HeaderKey.String("attempt"): HeaderValue.UnsignedInt8(3),
+            HeaderKey.String("score"): HeaderValue.Float64(0.99),
+        }
+        assert typed_headers.to_plain() == user_headers
+        assert isinstance(message.origin_timestamp(), int)
+        assert message.origin_timestamp() > 0
+
+    @pytest.mark.asyncio
+    async def test_typed_message_user_headers_round_trip(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test typed user headers preserve explicit header kinds."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        typed_key = HeaderKey.UnsignedInt128(42)
+        typed_value = HeaderValue.UnsignedInt128(2**96)
+        user_headers: dict[HeaderKey, HeaderValue] = {
+            typed_key: typed_value,
+            HeaderKey.String("float32"): HeaderValue.Float32(1.25),
+        }
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message("typed headers", user_headers=user_headers)],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Last(),
+            count=1,
+            auto_commit=True,
+        )
+
+        assert len(polled_messages) == 1
+        headers = polled_messages[0].user_headers()
+        assert headers == user_headers
+
+    @pytest.mark.asyncio
+    async def test_plain_scalars_pick_smallest_lossless_kind(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test plain ints/floats map to the narrowest lossless header kind."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        plain_headers = {
+            "small": 200,
+            "negative": -5,
+            "large": 2**63,
+            "huge": 2**96,
+            "exact-float": 1.25,
+            "wide-float": 0.1,
+        }
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message("plain scalars", user_headers=plain_headers)],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Last(),
+            count=1,
+            auto_commit=True,
+        )
+
+        headers = polled_messages[0].user_headers()
+        assert headers is not None
+        assert headers == {
+            HeaderKey.String("small"): HeaderValue.UnsignedInt8(200),
+            HeaderKey.String("negative"): HeaderValue.Int8(-5),
+            HeaderKey.String("large"): HeaderValue.UnsignedInt64(2**63),
+            HeaderKey.String("huge"): HeaderValue.UnsignedInt128(2**96),
+            HeaderKey.String("exact-float"): HeaderValue.Float32(1.25),
+            HeaderKey.String("wide-float"): HeaderValue.Float64(0.1),
+        }
+        assert headers.to_plain() == plain_headers
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -148,6 +313,115 @@ class TestMessageOperations:
         """Test empty string and bytes payloads are rejected."""
         with pytest.raises(ValueError, match="Invalid message payload length"):
             Message(payload)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "error"),
+        [
+            ({"": "value"}, "Invalid header value"),
+            ({"x" * 256: "value"}, "Invalid header value"),
+            ({"key": ""}, "Invalid header value"),
+            ({"key": b""}, "Invalid header value"),
+            ({"key": "x" * 256}, "Invalid header value"),
+            ({object(): "value"}, "User header keys must be"),
+            ({"key": object()}, "User header values must be"),
+            ({"key": 2**128}, "128-bit range"),
+            ({"key": -(2**200)}, "128-bit range"),
+        ],
+    )
+    async def test_invalid_user_headers_are_rejected(self, headers, error):
+        """Test invalid user header input raises ValueError."""
+        with pytest.raises(ValueError, match=error):
+            Message("payload", user_headers=headers)
+
+    def test_explicit_float32_out_of_range_is_rejected(self):
+        """Test an explicit Float32 whose value overflows f32 is rejected."""
+        with pytest.raises(ValueError, match="32-bit float"):
+            Message("payload", user_headers={"k": HeaderValue.Float32(1e40)})
+
+    def test_mixed_typed_and_plain_headers_can_be_constructed(self):
+        """Test each key/value pair is converted independently and can be mixed."""
+        Message(
+            "payload",
+            user_headers={
+                HeaderKey.String("typed-key"): HeaderValue.UnsignedInt16(7),
+                HeaderKey.String("plain-value"): "still-a-string",
+                "plain-key": HeaderValue.Bool(True),
+                "fully-plain": 42,
+            },
+        )
+
+    def test_typed_user_headers_can_be_constructed(self):
+        """Test typed header keys and values cover the full header kind surface."""
+        Message(
+            "payload",
+            user_headers={
+                HeaderKey.Raw(b"raw-key"): HeaderValue.Raw(b"raw-value"),
+                HeaderKey.String("string-key"): HeaderValue.String("string-value"),
+                HeaderKey.Bool(True): HeaderValue.Bool(False),
+                HeaderKey.Int8(-8): HeaderValue.Int8(-7),
+                HeaderKey.Int16(-16): HeaderValue.Int16(-15),
+                HeaderKey.Int32(-32): HeaderValue.Int32(-31),
+                HeaderKey.Int64(-64): HeaderValue.Int64(-63),
+                HeaderKey.Int128(-(2**80)): HeaderValue.Int128(-(2**79)),
+                HeaderKey.UnsignedInt8(8): HeaderValue.UnsignedInt8(9),
+                HeaderKey.UnsignedInt16(16): HeaderValue.UnsignedInt16(17),
+                HeaderKey.UnsignedInt32(32): HeaderValue.UnsignedInt32(33),
+                HeaderKey.UnsignedInt64(64): HeaderValue.UnsignedInt64(65),
+                HeaderKey.UnsignedInt128(2**80): HeaderValue.UnsignedInt128(2**79),
+                HeaderKey.Float32(1.25): HeaderValue.Float32(2.5),
+                HeaderKey.Float64(3.5): HeaderValue.Float64(4.75),
+            },
+        )
+
+    def test_plain_user_headers_convert_every_kind_losslessly(self, caplog):
+        """Test every header kind converts to a plain scalar without logging."""
+        headers = UserHeaders(
+            {
+                HeaderKey.String("content-type"): HeaderValue.String(
+                    "application/json"
+                ),
+                HeaderKey.String("trace-blob"): HeaderValue.Raw(b"\x00\x01"),
+                HeaderKey.String("is-retry"): HeaderValue.Bool(True),
+                HeaderKey.String("attempt"): HeaderValue.Int64(3),
+                HeaderKey.String("schema-version"): HeaderValue.UnsignedInt16(1),
+                HeaderKey.String("big"): HeaderValue.UnsignedInt128(2**96),
+                HeaderKey.String("ratio"): HeaderValue.Float32(1.25),
+                HeaderKey.String("score"): HeaderValue.Float64(0.5),
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="apache_iggy"):
+            plain = headers.to_plain()
+
+        assert plain == {
+            "content-type": "application/json",
+            "trace-blob": b"\x00\x01",
+            "is-retry": True,
+            "attempt": 3,
+            "schema-version": 1,
+            "big": 2**96,
+            "ratio": 1.25,
+            "score": 0.5,
+        }
+        assert caplog.records == []
+
+    def test_plain_user_headers_accepts_plain_dict(self):
+        """Test the plain dictionary form passes through unchanged."""
+        headers = {"content-type": "application/json", "attempt": 3}
+        assert UserHeaders(headers).to_plain() == headers
+
+    def test_plain_user_headers_preserve_non_string_keys(self, caplog):
+        """Test non-string typed keys convert back to their scalar Python type."""
+        headers = UserHeaders(
+            {HeaderKey.UnsignedInt32(7): HeaderValue.String("order-id")}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="apache_iggy"):
+            plain = headers.to_plain()
+
+        assert plain == {7: "order-id"}
+        assert caplog.records == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
