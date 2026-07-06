@@ -277,7 +277,11 @@ async fn handle_connection(
         );
 
         let body = decoder.read_bytes(decoder.remaining())?;
-        let body_response = handle_request(req.api_key, req.api_version, body, &broker);
+        let Some(body_response) = handle_request(req.api_key, req.api_version, body, &broker)
+        else {
+            // Produce with acks=0: the wire protocol forbids a response.
+            continue;
+        };
 
         let resp_header = ResponseHeader {
             correlation_id: req.correlation_id,

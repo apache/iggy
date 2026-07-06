@@ -38,7 +38,7 @@ fn metadata_reflects_broker_addr() {
     };
     let mut req = Encoder::with_capacity(4);
     req.write_i32(0);
-    let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker);
+    let body = handle_request(API_KEY_METADATA, 0, req.freeze(), &broker).expect("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);

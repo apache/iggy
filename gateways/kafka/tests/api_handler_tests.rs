@@ -31,7 +31,7 @@ use iggy_gateway_kafka::protocol::codec::Decoder;
 
 #[test]
 fn api_versions_v1_response_non_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker());
+    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -55,7 +55,7 @@ fn api_versions_v1_response_non_flexible_format() {
 
 #[test]
 fn api_versions_v3_response_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker());
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -85,7 +85,7 @@ fn api_versions_v3_response_flexible_format() {
 
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
-    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker());
+    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let broker_count = d.read_i32().unwrap();
@@ -111,7 +111,7 @@ fn unsupported_version_returns_protocol_error() {
         99,
         Bytes::from_static(&[0x02]),
         &test_broker(),
-    );
+    ).expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     // v9 flexible response layout:
     d.read_i32().unwrap(); // throttle_time_ms (v3+)
@@ -141,7 +141,7 @@ fn unsupported_version_returns_protocol_error() {
 
 #[test]
 fn unknown_api_key_returns_error_only_payload() {
-    let body = handle_request(999, 0, Bytes::new(), &test_broker());
+    let body = handle_request(999, 0, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
@@ -156,7 +156,7 @@ fn version_support_table_is_applied() {
 
 #[test]
 fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
-    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker());
+    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
     // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 — no throttle_time_ms.
     assert_eq!(body.len(), 42);
     let mut d = Decoder::new(body);

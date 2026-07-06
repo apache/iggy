@@ -109,87 +109,113 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
+/// Handles one decoded request frame and returns the response to write back,
+/// or `None` when the wire protocol forbids a response (Produce with `acks=0`).
 pub fn handle_request(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
-) -> Bytes {
+) -> Option<Bytes> {
     match api_key {
         API_KEY_API_VERSIONS => {
             if is_supported_version(api_key, api_version) {
-                encode_api_versions_response(api_version, ERROR_NONE)
+                Some(encode_api_versions_response(api_version, ERROR_NONE))
             } else {
                 // KIP-511: reply with v0 when the requested version is not understood.
-                encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION)
+                Some(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
             }
         }
         API_KEY_METADATA => {
             if is_supported_version(api_key, api_version) {
-                encode_metadata_response(api_version, body, broker, ERROR_NONE)
+                Some(encode_metadata_response(api_version, body, broker, ERROR_NONE))
             } else {
                 // Encode at the highest version we implement, not the client's unknown version.
-                encode_metadata_response(
+                Some(encode_metadata_response(
                     api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION),
                     body,
                     broker,
                     ERROR_UNSUPPORTED_VERSION,
-                )
+                ))
             }
         }
         API_KEY_PRODUCE => {
             if is_supported_version(api_key, api_version) {
                 match decode_produce_request(api_version, body) {
-                    Ok(req) => encode_produce_response(api_version, &req),
+                    // acks=0 is fire-and-forget: the client isn't reading a response, so
+                    // sending one desyncs the next correlation id it expects.
+                    Ok(req) if req.acks == 0 => None,
+                    Ok(req) => Some(encode_produce_response(api_version, &req)),
                     Err(e) => {
                         tracing::warn!("Failed to decode Produce request: {:?}", e);
-                        encode_produce_error_response(api_version, ERROR_INVALID_REQUEST)
+                        Some(encode_produce_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_produce_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                Some(encode_produce_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
         API_KEY_FETCH => {
             if is_supported_version(api_key, api_version) {
                 match decode_fetch_request(api_version, body) {
-                    Ok(req) => encode_fetch_response(api_version, &req),
+                    Ok(req) => Some(encode_fetch_response(api_version, &req)),
                     Err(e) => {
                         tracing::warn!("Failed to decode Fetch request: {:?}", e);
-                        encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST)
+                        Some(encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST))
                     }
                 }
             } else {
-                encode_fetch_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                Some(encode_fetch_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
         API_KEY_LIST_OFFSETS => {
             if is_supported_version(api_key, api_version) {
                 match decode_list_offsets_request(api_version, body) {
-                    Ok(req) => encode_list_offsets_response(api_version, &req),
+                    Ok(req) => Some(encode_list_offsets_response(api_version, &req)),
                     Err(e) => {
                         tracing::warn!("Failed to decode ListOffsets request: {:?}", e);
-                        encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST)
+                        Some(encode_list_offsets_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_list_offsets_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                Some(encode_list_offsets_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
         API_KEY_CREATE_TOPICS => {
             if is_supported_version(api_key, api_version) {
                 match decode_create_topics_request(api_version, body) {
-                    Ok(req) => encode_create_topics_response(api_version, &req),
+                    Ok(req) => Some(encode_create_topics_response(api_version, &req)),
                     Err(e) => {
                         tracing::warn!("Failed to decode CreateTopics request: {:?}", e);
-                        encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST)
+                        Some(encode_create_topics_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_create_topics_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                Some(encode_create_topics_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
-        _ => encode_error_only_response(ERROR_UNSUPPORTED_VERSION),
+        _ => Some(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
     }
 }
 
