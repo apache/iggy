@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, SendMessage
+from apache_iggy import IggyClient, IggyExpiry, MaxTopicSize, SendMessage
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -70,6 +70,10 @@ class TestCreateTopic:
         assert topic is not None
         assert topic.name == topic_name
         assert topic.partitions_count == 2
+        assert topic.created_at > 0
+        assert topic.size == 0
+        assert len(topic.partitions) == 2
+        assert all(partition.messages_count == 0 for partition in topic.partitions)
 
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
@@ -254,6 +258,13 @@ class TestCreateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
+        if message_expiry == timedelta(0):
+            # A zero duration is the server-default sentinel; the server
+            # resolves it to the configured default, which is "never expire".
+            assert isinstance(topic.message_expiry, IggyExpiry.NeverExpire)
+        else:
+            assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
+            assert topic.message_expiry.duration == message_expiry
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("invalid_message_expiry", [1, "1s", object()])
@@ -276,15 +287,19 @@ class TestCreateTopic:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "max_topic_size",
+        ("max_topic_size", "expected_kind"),
         [
-            0,  # value for server default max topic size
-            2**64 - 1,
-            2_000_000_000,
+            (0, "unlimited"),  # server-default sentinel; create_topic resolves it
+            (2**64 - 1, "unlimited"),  # explicit unlimited sentinel
+            (2_000_000_000, "custom"),
         ],
     )
     async def test_create_topic_with_valid_max_topic_size(
-        self, iggy_client: IggyClient, unique_name, max_topic_size: int
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        max_topic_size: int,
+        expected_kind: str,
     ):
         """Test create_topic accepts supported maximum topic size values."""
         stream_name = unique_name()
@@ -301,6 +316,11 @@ class TestCreateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
+        if expected_kind == "unlimited":
+            assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
+        else:
+            assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
+            assert topic.max_topic_size.bytes == max_topic_size
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -539,6 +559,28 @@ class TestGetTopic:
         assert topic_by_id is not None
         assert topic_by_id.id == topic_by_name.id
         assert topic_by_id.name == topic_by_name.name
+
+    @pytest.mark.asyncio
+    async def test_get_topic_partitions(self, iggy_client: IggyClient, unique_name):
+        """Test TopicDetails.partitions returns one Partition per partition."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=3
+        )
+
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert len(topic.partitions) == 3
+        assert [partition.id for partition in topic.partitions] == [0, 1, 2]
+        for partition in topic.partitions:
+            assert partition.created_at > 0
+            assert partition.segments_count == 1
+            assert partition.current_offset == 0
+            assert partition.size == 0
+            assert partition.messages_count == 0
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_topic(self, iggy_client: IggyClient, unique_name):
@@ -948,13 +990,27 @@ class TestUpdateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        # TODO: assert topic.message_expiry once TopicDetails exposes that
-        # getter (tracked for a follow-up PR).
+        assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
+        assert topic.message_expiry.duration == timedelta(minutes=10)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("max_topic_size", [0, 2_000_000_000, 2**64 - 1])
+    @pytest.mark.parametrize(
+        ("max_topic_size", "expected_kind"),
+        [
+            # Unlike create_topic, update_topic does not resolve the
+            # server-default sentinel (0) to a concrete value, so it round
+            # trips as-is instead of becoming "unlimited".
+            (0, "server_default"),
+            (2_000_000_000, "custom"),
+            (2**64 - 1, "unlimited"),
+        ],
+    )
     async def test_update_topic_with_valid_max_topic_size(
-        self, iggy_client: IggyClient, unique_name, max_topic_size: int
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        max_topic_size: int,
+        expected_kind: str,
     ):
         """Test update_topic accepts supported maximum topic size values."""
         stream_name = unique_name()
@@ -975,8 +1031,13 @@ class TestUpdateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        # TODO: assert topic.message_expiry and topic.max_topic_size once
-        # TopicDetails exposes those getters (tracked for a follow-up PR).
+        if expected_kind == "server_default":
+            assert isinstance(topic.max_topic_size, MaxTopicSize.ServerDefault)
+        elif expected_kind == "unlimited":
+            assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
+        else:
+            assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
+            assert topic.max_topic_size.bytes == max_topic_size
 
     @pytest.mark.asyncio
     async def test_update_topic_applies_repeated_updates(
@@ -1213,12 +1274,18 @@ class TestPurgeTopic:
         after = await iggy_client.get_topic(stream_name, topic_name)
         assert after is not None
         assert after.messages_count == 0
-        # Purging clears messages only; every other field is left unchanged.
+        assert after.size == 0
+        # Purging clears messages and size only; topic config is unchanged.
         assert after.id == before.id
         assert after.name == before.name
+        assert after.created_at == before.created_at
         assert after.partitions_count == before.partitions_count
         assert after.compression_algorithm == before.compression_algorithm
         assert after.replication_factor == before.replication_factor
+        assert isinstance(before.message_expiry, IggyExpiry.NeverExpire)
+        assert isinstance(after.message_expiry, IggyExpiry.NeverExpire)
+        assert isinstance(before.max_topic_size, MaxTopicSize.Unlimited)
+        assert isinstance(after.max_topic_size, MaxTopicSize.Unlimited)
 
     @pytest.mark.asyncio
     async def test_purge_empty_topic_succeeds(
