@@ -259,71 +259,125 @@ class AutoCommitWhen:
 
 @typing.final
 class ConsumerGroup:
+    r"""
+    Summary information about a consumer group.
+
+    This lightweight view is returned when listing consumer groups and includes
+    the group identity together with partition and member counts.
+    """
     @property
     def id(self) -> builtins.int:
         r"""
-        Gets the unique identifier (numeric) of the consumer group.
+        Get the numeric identifier of the consumer group.
+
+        Returns:
+            The consumer group identifier as `int`.
         """
     @property
     def name(self) -> builtins.str:
         r"""
-        Gets the name of the consumer group.
+        Get the name of the consumer group.
+
+        Returns:
+            The consumer group name as `str`.
         """
     @property
     def partitions_count(self) -> builtins.int:
         r"""
-        Gets the number of partitions the consumer group is consuming.
+        Get the number of partitions assigned across the consumer group.
+
+        Returns:
+            The number of partitions assigned to the group as `int`.
         """
     @property
     def members_count(self) -> builtins.int:
         r"""
-        Gets the number of members in the consumer group.
+        Get the number of members currently in the consumer group.
+
+        Returns:
+            The number of group members as `int`.
         """
 
 @typing.final
 class ConsumerGroupDetails:
+    r"""
+    Detailed information about a consumer group.
+
+    This view includes the same identity and count metadata as `ConsumerGroup`,
+    plus the list of currently active members.
+    """
     @property
     def id(self) -> builtins.int:
         r"""
-        Gets the unique identifier (numeric) of the consumer group.
+        Get the numeric identifier of the consumer group.
+
+        Returns:
+            The consumer group identifier as `int`.
         """
     @property
     def name(self) -> builtins.str:
         r"""
-        Gets the name of the consumer group.
+        Get the name of the consumer group.
+
+        Returns:
+            The consumer group name as `str`.
         """
     @property
     def partitions_count(self) -> builtins.int:
         r"""
-        Gets the number of partitions the consumer group is consuming.
+        Get the number of partitions assigned across the consumer group.
+
+        Returns:
+            The number of partitions assigned to the group as `int`.
         """
     @property
     def members_count(self) -> builtins.int:
         r"""
-        Gets the number of members in the consumer group.
+        Get the number of members currently in the consumer group.
+
+        Returns:
+            The number of group members as `int`.
         """
     @property
     def members(self) -> builtins.list[ConsumerGroupMember]:
         r"""
-        Gets the collection of members in the consumer group.
+        Get the members currently active in the consumer group.
+
+        Returns:
+            A `list[ConsumerGroupMember]` describing the active members.
         """
 
 @typing.final
 class ConsumerGroupMember:
+    r"""
+    A member of a consumer group returned by `ConsumerGroupDetails.members`.
+
+    Each member tracks its numeric identifier together with the partitions
+    currently assigned to it.
+    """
     @property
     def id(self) -> builtins.int:
         r"""
-        Gets the unique identifier (numeric) of the consumer group member.
+        Get the numeric identifier of the consumer group member.
+
+        Returns:
+            The member identifier as `int`.
         """
     @property
     def partitions_count(self) -> builtins.int:
         r"""
-        Gets the number of partitions the consumer group member is consuming.
+        Get the number of partitions currently assigned to the member.
+
+        Returns:
+            The number of assigned partitions as `int`.
         """
     @property
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
-        Gets the collection of partitions the consumer group member is consuming.
+        Get the partition identifiers currently assigned to the member.
+
+        Returns:
+            A `list[int]` containing the assigned partition ids.
         """
 
 @typing.final

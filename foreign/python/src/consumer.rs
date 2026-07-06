@@ -293,6 +293,10 @@ impl IggyConsumer {
 
 #[gen_stub_pyclass]
 #[pyclass]
+/// Summary information about a consumer group.
+///
+/// This lightweight view is returned when listing consumer groups and includes
+/// the group identity together with partition and member counts.
 pub struct ConsumerGroup {
     pub(crate) inner: RustConsumerGroup,
 }
@@ -306,25 +310,37 @@ impl From<RustConsumerGroup> for ConsumerGroup {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroup {
-    /// Gets the unique identifier (numeric) of the consumer group.
+    /// Get the numeric identifier of the consumer group.
+    ///
+    /// Returns:
+    ///     The consumer group identifier as `int`.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
-    /// Gets the name of the consumer group.
+    /// Get the name of the consumer group.
+    ///
+    /// Returns:
+    ///     The consumer group name as `str`.
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
     }
 
-    /// Gets the number of partitions the consumer group is consuming.
+    /// Get the number of partitions assigned across the consumer group.
+    ///
+    /// Returns:
+    ///     The number of partitions assigned to the group as `int`.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
-    /// Gets the number of members in the consumer group.
+    /// Get the number of members currently in the consumer group.
+    ///
+    /// Returns:
+    ///     The number of group members as `int`.
     #[getter]
     pub fn members_count(&self) -> u32 {
         self.inner.members_count
@@ -333,6 +349,10 @@ impl ConsumerGroup {
 
 #[gen_stub_pyclass]
 #[pyclass]
+/// Detailed information about a consumer group.
+///
+/// This view includes the same identity and count metadata as `ConsumerGroup`,
+/// plus the list of currently active members.
 pub struct ConsumerGroupDetails {
     pub(crate) inner: RustConsumerGroupDetails,
 }
@@ -346,31 +366,46 @@ impl From<RustConsumerGroupDetails> for ConsumerGroupDetails {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroupDetails {
-    /// Gets the unique identifier (numeric) of the consumer group.
+    /// Get the numeric identifier of the consumer group.
+    ///
+    /// Returns:
+    ///     The consumer group identifier as `int`.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
-    /// Gets the name of the consumer group.
+    /// Get the name of the consumer group.
+    ///
+    /// Returns:
+    ///     The consumer group name as `str`.
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
     }
 
-    /// Gets the number of partitions the consumer group is consuming.
+    /// Get the number of partitions assigned across the consumer group.
+    ///
+    /// Returns:
+    ///     The number of partitions assigned to the group as `int`.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
-    /// Gets the number of members in the consumer group.
+    /// Get the number of members currently in the consumer group.
+    ///
+    /// Returns:
+    ///     The number of group members as `int`.
     #[getter]
     pub fn members_count(&self) -> u32 {
         self.inner.members_count
     }
 
-    /// Gets the collection of members in the consumer group.
+    /// Get the members currently active in the consumer group.
+    ///
+    /// Returns:
+    ///     A `list[ConsumerGroupMember]` describing the active members.
     #[getter]
     pub fn members(&self) -> Vec<ConsumerGroupMember> {
         self.inner
@@ -383,6 +418,10 @@ impl ConsumerGroupDetails {
 
 #[gen_stub_pyclass]
 #[pyclass]
+/// A member of a consumer group returned by `ConsumerGroupDetails.members`.
+///
+/// Each member tracks its numeric identifier together with the partitions
+/// currently assigned to it.
 pub struct ConsumerGroupMember {
     pub(crate) inner: RustConsumerGroupMember,
 }
@@ -402,19 +441,28 @@ impl From<&RustConsumerGroupMember> for ConsumerGroupMember {
 #[gen_stub_pymethods]
 #[pymethods]
 impl ConsumerGroupMember {
-    /// Gets the unique identifier (numeric) of the consumer group member.
+    /// Get the numeric identifier of the consumer group member.
+    ///
+    /// Returns:
+    ///     The member identifier as `int`.
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
     }
 
-    /// Gets the number of partitions the consumer group member is consuming.
+    /// Get the number of partitions currently assigned to the member.
+    ///
+    /// Returns:
+    ///     The number of assigned partitions as `int`.
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 
-    /// Gets the collection of partitions the consumer group member is consuming.
+    /// Get the partition identifiers currently assigned to the member.
+    ///
+    /// Returns:
+    ///     A `list[int]` containing the assigned partition ids.
     #[getter]
     pub fn partitions(&self) -> Vec<u32> {
         self.inner.partitions.clone()
