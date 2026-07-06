@@ -48,11 +48,16 @@ pub const FLEXIBLE_FROM_VERSION: &[(i16, i16)] = &[
 ];
 
 /// Metadata v9+ flexible request listing topic names (compact strings).
+///
+/// Each topic entry is its own tagged struct per the Kafka protocol schema
+/// (`topics => name TAG_BUFFER`), so the per-topic tag buffer is written
+/// right after each name, not once for the whole array.
 pub fn build_metadata_flexible_request(topic_names: &[&str]) -> Bytes {
     let mut enc = Encoder::with_capacity(64);
     enc.write_varint((topic_names.len() + 1) as u64);
     for name in topic_names {
         enc.write_compact_nullable_string(Some(name));
+        enc.write_empty_tagged_fields();
     }
     enc.write_empty_tagged_fields();
     enc.freeze()

@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 
-use crate::error::Result;
+use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::codec::{Decoder, Encoder};
 use crate::protocol::requests::{
     decode_create_topics_request, decode_fetch_request, decode_list_offsets_request,
@@ -117,105 +117,104 @@ pub fn handle_request(
     body: Bytes,
     broker: &BrokerAdvertise,
 ) -> Option<Bytes> {
+    if api_key == API_KEY_PRODUCE {
+        return handle_produce_request(api_version, body);
+    }
+    Some(handle_other_request(api_key, api_version, body, broker))
+}
+
+/// Produce is the only request the wire protocol allows to go unanswered
+/// (`acks=0`), so it gets its own `Option`-returning path.
+fn handle_produce_request(api_version: i16, body: Bytes) -> Option<Bytes> {
+    if !is_supported_version(API_KEY_PRODUCE, api_version) {
+        return Some(encode_produce_error_response(
+            api_version,
+            ERROR_UNSUPPORTED_VERSION,
+        ));
+    }
+    match decode_produce_request(api_version, body) {
+        // acks=0 is fire-and-forget: the client isn't reading a response, so
+        // sending one desyncs the next correlation id it expects.
+        Ok(req) if req.acks == 0 => None,
+        Ok(req) => Some(encode_produce_response(api_version, &req)),
+        Err(e) => {
+            tracing::warn!("Failed to decode Produce request: {:?}", e);
+            Some(encode_produce_error_response(
+                api_version,
+                ERROR_INVALID_REQUEST,
+            ))
+        }
+    }
+}
+
+fn handle_other_request(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+) -> Bytes {
     match api_key {
         API_KEY_API_VERSIONS => {
             if is_supported_version(api_key, api_version) {
-                Some(encode_api_versions_response(api_version, ERROR_NONE))
+                encode_api_versions_response(api_version, ERROR_NONE)
             } else {
                 // KIP-511: reply with v0 when the requested version is not understood.
-                Some(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
+                encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_METADATA => {
             if is_supported_version(api_key, api_version) {
-                Some(encode_metadata_response(api_version, body, broker, ERROR_NONE))
+                encode_metadata_response(api_version, body, broker, ERROR_NONE)
             } else {
                 // Encode at the highest version we implement, not the client's unknown version.
-                Some(encode_metadata_response(
+                encode_metadata_response(
                     api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION),
                     body,
                     broker,
                     ERROR_UNSUPPORTED_VERSION,
-                ))
-            }
-        }
-        API_KEY_PRODUCE => {
-            if is_supported_version(api_key, api_version) {
-                match decode_produce_request(api_version, body) {
-                    // acks=0 is fire-and-forget: the client isn't reading a response, so
-                    // sending one desyncs the next correlation id it expects.
-                    Ok(req) if req.acks == 0 => None,
-                    Ok(req) => Some(encode_produce_response(api_version, &req)),
-                    Err(e) => {
-                        tracing::warn!("Failed to decode Produce request: {:?}", e);
-                        Some(encode_produce_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
-                    }
-                }
-            } else {
-                Some(encode_produce_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
+                )
             }
         }
         API_KEY_FETCH => {
             if is_supported_version(api_key, api_version) {
                 match decode_fetch_request(api_version, body) {
-                    Ok(req) => Some(encode_fetch_response(api_version, &req)),
+                    Ok(req) => encode_fetch_response(api_version, &req),
                     Err(e) => {
                         tracing::warn!("Failed to decode Fetch request: {:?}", e);
-                        Some(encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST))
+                        encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                Some(encode_fetch_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
+                encode_fetch_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_LIST_OFFSETS => {
             if is_supported_version(api_key, api_version) {
                 match decode_list_offsets_request(api_version, body) {
-                    Ok(req) => Some(encode_list_offsets_response(api_version, &req)),
+                    Ok(req) => encode_list_offsets_response(api_version, &req),
                     Err(e) => {
                         tracing::warn!("Failed to decode ListOffsets request: {:?}", e);
-                        Some(encode_list_offsets_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
+                        encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                Some(encode_list_offsets_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
+                encode_list_offsets_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
         API_KEY_CREATE_TOPICS => {
             if is_supported_version(api_key, api_version) {
                 match decode_create_topics_request(api_version, body) {
-                    Ok(req) => Some(encode_create_topics_response(api_version, &req)),
+                    Ok(req) => encode_create_topics_response(api_version, &req),
                     Err(e) => {
                         tracing::warn!("Failed to decode CreateTopics request: {:?}", e);
-                        Some(encode_create_topics_error_response(
-                            api_version,
-                            ERROR_INVALID_REQUEST,
-                        ))
+                        encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST)
                     }
                 }
             } else {
-                Some(encode_create_topics_error_response(
-                    api_version,
-                    ERROR_UNSUPPORTED_VERSION,
-                ))
+                encode_create_topics_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
             }
         }
-        _ => Some(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
+        _ => encode_error_only_response(ERROR_UNSUPPORTED_VERSION),
     }
 }
 
@@ -286,12 +285,15 @@ fn encode_metadata_response(
     // Non-empty body that fails to decode = malformed request; return 0 topics.
     // Kafka Metadata response has no top-level error code field: errors are per-topic only.
     // 0 topics is spec-correct and unambiguous for a decode failure.
-    let (topics_count, effective_error) = if body.is_empty() {
-        (0usize, top_level_error_code)
+    let (topics, effective_error) = if body.is_empty() {
+        (Vec::new(), top_level_error_code)
     } else {
-        split_metadata_request_topics(body, api_version)
-            .map_or((0, ERROR_INVALID_REQUEST), |n| (n, top_level_error_code))
+        decode_metadata_request_topics(body, api_version)
+            .map_or((Vec::new(), ERROR_INVALID_REQUEST), |names| {
+                (names, top_level_error_code)
+            })
     };
+    let topics_count = topics.len();
     let topic_error = if effective_error == ERROR_NONE {
         ERROR_UNKNOWN_TOPIC_OR_PARTITION
     } else {
@@ -316,9 +318,9 @@ fn encode_metadata_response(
         e.write_i32(1); // controller_id (v1+)
 
         e.write_varint((topics_count + 1) as u64);
-        for _ in 0..topics_count {
+        for name in &topics {
             e.write_i16(topic_error);
-            e.write_compact_nullable_string(Some("unknown-topic"));
+            e.write_compact_nullable_string(Some(name));
             e.write_bool(false); // is_internal (v1+)
             e.write_varint(1); // empty partitions array
             e.write_i32(AUTHORIZED_OPS_UNKNOWN); // topic_authorized_operations (v8+)
@@ -347,9 +349,9 @@ fn encode_metadata_response(
         }
 
         e.write_i32(i32::try_from(topics_count).expect("topic count bounded"));
-        for _ in 0..topics_count {
+        for name in &topics {
             e.write_i16(topic_error);
-            e.write_nullable_string_unchecked(Some("unknown-topic"));
+            e.write_nullable_string_unchecked(Some(name));
             if api_version >= 1 {
                 e.write_bool(false); // is_internal
             }
@@ -373,11 +375,31 @@ pub fn encode_error_only_response(error_code: i16) -> Bytes {
     e.freeze()
 }
 
-pub(crate) fn split_metadata_request_topics(body: Bytes, api_version: i16) -> Result<usize> {
+/// Decodes the requested topic names from a Metadata request body so the
+/// response can echo them back; clients match metadata by name, not position.
+pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> Result<Vec<String>> {
     let mut d = Decoder::new(body);
-    if api_version >= 9 {
-        d.read_compact_array_count()
+    let flexible = api_version >= 9;
+    let topics_count = if flexible {
+        d.read_compact_array_count()?
     } else {
-        d.read_i32_array_count()
+        d.read_i32_array_count()?
+    };
+
+    let mut topics = Vec::with_capacity(topics_count);
+    for _ in 0..topics_count {
+        let name = if flexible {
+            d.read_compact_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
+        } else {
+            d.read_nullable_string()?
+                .ok_or(KafkaProtocolError::NullTopicName)?
+        };
+        topics.push(name);
+        if flexible {
+            d.read_tagged_fields()?;
+        }
     }
+
+    Ok(topics)
 }

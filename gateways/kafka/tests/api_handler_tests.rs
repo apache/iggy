@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[path = "common/wire.rs"]
+mod wire;
+
 use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
@@ -26,12 +29,14 @@ fn test_broker() -> BrokerAdvertise {
     BrokerAdvertise::default()
 }
 use iggy_gateway_kafka::protocol::codec::Decoder;
+use wire::build_metadata_flexible_request;
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
 
 #[test]
 fn api_versions_v1_response_non_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -55,7 +60,8 @@ fn api_versions_v1_response_non_flexible_format() {
 
 #[test]
 fn api_versions_v3_response_flexible_format() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -85,7 +91,8 @@ fn api_versions_v3_response_flexible_format() {
 
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
-    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let broker_count = d.read_i32().unwrap();
@@ -103,15 +110,16 @@ fn metadata_response_has_broker_array_and_topic_array() {
 
 #[test]
 fn unsupported_version_returns_protocol_error() {
-    // v99 client sends a compact-array body (count+1 = 2 = 0x02 for 1 topic).
+    // v99 client sends a well-formed v9 flexible body requesting "orders".
     // The gateway caps at v9 (highest supported Metadata version) for both parsing
     // and encoding, so the response uses the flexible (v9) wire format.
     let body = handle_request(
         API_KEY_METADATA,
         99,
-        Bytes::from_static(&[0x02]),
+        build_metadata_flexible_request(&["orders"]),
         &test_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     // v9 flexible response layout:
     d.read_i32().unwrap(); // throttle_time_ms (v3+)
@@ -134,14 +142,19 @@ fn unsupported_version_returns_protocol_error() {
     let topic_error = d.read_i16().unwrap();
     assert_eq!(topic_error, ERROR_UNSUPPORTED_VERSION);
     let topic_name = d.read_compact_nullable_string().unwrap();
-    assert_eq!(topic_name, Some("unknown-topic".to_string()));
+    assert_eq!(
+        topic_name,
+        Some("orders".to_string()),
+        "metadata must echo the requested topic name even on an unsupported-version reply"
+    );
 }
 
 // ── Misc ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn unknown_api_key_returns_error_only_payload() {
-    let body = handle_request(999, 0, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(999, 0, Bytes::new(), &test_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
@@ -156,7 +169,8 @@ fn version_support_table_is_applied() {
 
 #[test]
 fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
-    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker())
+        .expect("test request has acks != 0 and expects a response");
     // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 — no throttle_time_ms.
     assert_eq!(body.len(), 42);
     let mut d = Decoder::new(body);

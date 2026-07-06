@@ -65,7 +65,8 @@ fn is_supported_version_matches_scope_table() {
 
 #[test]
 fn apiversions_advertises_exact_supported_ranges_v1() {
-    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_i32().unwrap()).expect("api count fits usize");
@@ -88,7 +89,8 @@ fn apiversions_advertises_exact_supported_ranges_v1() {
 
 #[test]
 fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
-    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize");
@@ -133,7 +135,8 @@ fn apiversions_all_versions_return_success() {
             version,
             Bytes::new(),
             &default_broker(),
-        ).expect("test request has acks != 0 and expects a response");
+        )
+        .expect("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(d.read_i16().unwrap(), 0, "ApiVersions v{version}");
     }
@@ -141,7 +144,8 @@ fn apiversions_all_versions_return_success() {
 
 #[test]
 fn apiversions_out_of_range_returns_unsupported_in_body() {
-    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
@@ -159,7 +163,8 @@ fn metadata_below_min_version_returns_topic_error() {
         -1,
         metadata_request_one_topic(),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _brokers = d.read_i32().unwrap();
     let _ = d.read_i32().unwrap();
@@ -177,7 +182,8 @@ fn metadata_above_max_version_returns_topic_error() {
         10,
         Bytes::from_static(&[0x02]),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     // Response is in v9 flexible format (highest supported).
     let mut d = Decoder::new(body);
     d.read_i32().unwrap(); // throttle_time_ms (v3+)
@@ -202,7 +208,8 @@ fn metadata_above_max_version_returns_topic_error() {
 
 #[test]
 fn produce_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -217,7 +224,8 @@ fn produce_unsupported_version_returns_well_formed_error_response() {
 
 #[test]
 fn fetch_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_FETCH, 3, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -232,7 +240,8 @@ fn fetch_unsupported_version_returns_well_formed_error_response() {
 
 #[test]
 fn fetch_unsupported_version_above_max_uses_top_level_error() {
-    let body = handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_FETCH, 13, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
@@ -244,7 +253,8 @@ fn fetch_unsupported_version_above_max_uses_top_level_error() {
 
 #[test]
 fn list_offsets_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -257,7 +267,8 @@ fn list_offsets_unsupported_version_returns_well_formed_error_response() {
 
 #[test]
 fn create_topics_unsupported_version_returns_well_formed_error_response() {
-    let body = handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_CREATE_TOPICS, 1, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -269,7 +280,8 @@ fn create_topics_unsupported_version_returns_well_formed_error_response() {
 #[test]
 fn unsupported_api_keys_return_error_only() {
     for key in [8, 9, 10, 11, 17, 20, 42, 999] {
-        let body = handle_request(key, 0, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+        let body = handle_request(key, 0, Bytes::new(), &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(
             d.read_i16().unwrap(),
@@ -283,7 +295,8 @@ fn unsupported_api_keys_return_error_only() {
 fn supported_produce_versions_accept_valid_fixture() {
     for version in 3i16..=9 {
         let body = load_fixture_body(0, "Produce", version);
-        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         assert!(!resp.is_empty(), "Produce v{version} response empty");
     }
 }
@@ -292,7 +305,8 @@ fn supported_produce_versions_accept_valid_fixture() {
 fn supported_fetch_versions_accept_valid_fixture() {
     for version in 4i16..=12 {
         let body = load_fixture_body(1, "Fetch", version);
-        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         assert!(!resp.is_empty(), "Fetch v{version} response empty");
     }
 }
@@ -300,7 +314,8 @@ fn supported_fetch_versions_accept_valid_fixture() {
 #[test]
 fn corrupt_produce_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-    let resp = handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let resp = handle_request(API_KEY_PRODUCE, 3, body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -312,7 +327,8 @@ fn corrupt_produce_body_returns_invalid_request_error() {
 #[test]
 fn corrupt_fetch_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-    let resp = handle_request(API_KEY_FETCH, 4, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let resp = handle_request(API_KEY_FETCH, 4, body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(resp);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_i32().unwrap(), 1);

@@ -154,7 +154,8 @@ async fn apiversions_v0_and_v2_e2e_return_success() {
 #[test]
 fn out_of_scope_api_keys_return_unsupported_version_without_panic() {
     for &(api_key, name) in OUT_OF_SCOPE_API_KEYS {
-        let body = handle_request(api_key, 0, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+        let body = handle_request(api_key, 0, Bytes::new(), &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         assert_eq!(
             d.read_i16().unwrap(),
@@ -267,7 +268,8 @@ fn produce_advertises_min_zero_but_firewall_rejects_below_v3() {
     assert!(!is_supported_version(API_KEY_PRODUCE, 0));
     assert!(!is_supported_version(API_KEY_PRODUCE, 2));
 
-    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_PRODUCE, 2, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _topics = d.read_i32().unwrap();
     let _name = d.read_nullable_string().unwrap();
@@ -285,7 +287,8 @@ fn metadata_v0_empty_topics_returns_zero_length_topic_array() {
         0,
         metadata_empty_legacy_body(),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _brokers = d.read_i32().unwrap();
     d.read_i32().unwrap();
@@ -302,7 +305,8 @@ fn metadata_v3_includes_throttle_time_ms_before_brokers() {
         3,
         metadata_empty_legacy_body(),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 0, "throttle_time_ms");
 }
@@ -314,7 +318,8 @@ fn metadata_v9_flexible_empty_topics_returns_zero_topics() {
         9,
         build_metadata_flexible_request(&[]),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     d.read_i32().unwrap(); // throttle
     let broker_count = usize::try_from(d.read_varint().unwrap())
@@ -343,7 +348,8 @@ fn metadata_v9_flexible_echoes_each_requested_topic_name() {
         9,
         build_metadata_flexible_request(&topics),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);
     d.read_i32().unwrap();
@@ -406,7 +412,8 @@ fn metadata_v1_legacy_multiple_topics_echo_names() {
         1,
         build_metadata_legacy_request(&topics),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
 
     let mut d = Decoder::new(body);
     d.read_i32().unwrap();
@@ -668,7 +675,8 @@ async fn corrupt_fetch_body_e2e_returns_error_without_disconnect() {
 #[test]
 fn corrupt_list_offsets_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-    let resp = handle_request(API_KEY_LIST_OFFSETS, 1, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let resp = handle_request(API_KEY_LIST_OFFSETS, 1, body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     assert!(!resp.is_empty());
     assert!(
         scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
@@ -680,7 +688,8 @@ fn corrupt_list_offsets_body_returns_invalid_request_error() {
 #[test]
 fn corrupt_create_topics_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
-    let resp = handle_request(API_KEY_CREATE_TOPICS, 2, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let resp = handle_request(API_KEY_CREATE_TOPICS, 2, body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     assert!(!resp.is_empty());
     assert!(
         scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
@@ -691,7 +700,8 @@ fn corrupt_create_topics_body_returns_invalid_request_error() {
 #[test]
 fn corrupt_metadata_body_returns_zero_topics_not_panic() {
     let body = Bytes::from_static(&[0x00, 0x00]);
-    let resp = handle_request(API_KEY_METADATA, 0, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let resp = handle_request(API_KEY_METADATA, 0, body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     assert!(!resp.is_empty());
     let mut d = Decoder::new(resp);
     d.read_i32().unwrap();
@@ -738,7 +748,8 @@ fn metadata_v9_request_with_three_topics_yields_three_response_slots() {
         9,
         build_metadata_flexible_request(&topics),
         &default_broker(),
-    ).expect("test request has acks != 0 and expects a response");
+    )
+    .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     d.read_i32().unwrap();
     skip_metadata_v9_prefix(&mut d);
@@ -774,7 +785,8 @@ fn every_in_range_version_returns_non_empty_handler_response() {
     for &(api_key, name, min_ver, max_ver) in SCOPED_API_KEYS {
         for version in min_ver..=max_ver {
             let body = request_body_for_scoped_api(api_key, name, version);
-            let resp = handle_request(api_key, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+            let resp = handle_request(api_key, version, body, &default_broker())
+                .expect("test request has acks != 0 and expects a response");
             assert!(!resp.is_empty(), "{name} v{version} handler returned empty");
         }
     }

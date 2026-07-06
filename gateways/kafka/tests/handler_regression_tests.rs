@@ -37,7 +37,8 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
         if api_key == 3 || api_key == 18 {
             // Metadata / ApiVersions: empty body is valid
             for version in min_ver..=max_ver {
-                let resp = handle_request(api_key, version, bytes::Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+                let resp = handle_request(api_key, version, bytes::Bytes::new(), &default_broker())
+                    .expect("test request has acks != 0 and expects a response");
                 assert!(
                     !resp.is_empty(),
                     "{name} v{version} returned empty response"
@@ -51,7 +52,8 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
                 continue;
             }
             let body = load_fixture_body(api_key, name, version);
-            let resp = handle_request(api_key, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+            let resp = handle_request(api_key, version, body, &default_broker())
+                .expect("test request has acks != 0 and expects a response");
             assert!(
                 !resp.is_empty(),
                 "{name} v{version} returned empty response"
@@ -67,7 +69,8 @@ fn produce_stub_response_has_zero_error_per_partition() {
             continue;
         }
         let body = load_fixture_body(0, "Produce", version);
-        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 9;
         let mut d = Decoder::new(resp);
         if flexible {
@@ -91,7 +94,8 @@ fn fetch_stub_response_has_zero_partition_error() {
             continue;
         }
         let body = load_fixture_body(1, "Fetch", version);
-        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 12;
         let mut d = Decoder::new(resp);
         if version >= 1 {
@@ -126,7 +130,8 @@ fn list_offsets_stub_response_has_zero_error() {
             continue;
         }
         let body = load_fixture_body(2, "ListOffsets", version);
-        let resp = handle_request(API_KEY_LIST_OFFSETS, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_LIST_OFFSETS, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 6;
         let mut d = Decoder::new(resp);
         if version >= 2 {
@@ -153,7 +158,8 @@ fn create_topics_stub_response_has_zero_error() {
             continue;
         }
         let body = load_fixture_body(19, "CreateTopics", version);
-        let resp = handle_request(API_KEY_CREATE_TOPICS, version, body, &default_broker()).expect("test request has acks != 0 and expects a response");
+        let resp = handle_request(API_KEY_CREATE_TOPICS, version, body, &default_broker())
+            .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 5;
         let mut d = Decoder::new(resp);
         if version >= 2 {

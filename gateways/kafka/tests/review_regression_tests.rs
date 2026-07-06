@@ -113,7 +113,8 @@ fn parse_list_offsets_v0_partition(d: &mut Decoder) {
 
 #[test]
 fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i32().unwrap(), 1, "topics array length");
@@ -136,7 +137,8 @@ fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
 #[test]
 fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
     let request_body = build_list_offsets_v0_request_with_topic_t();
-    let body = handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -224,7 +226,8 @@ fn read_metadata_v1_topics(d: &mut Decoder, expected_count: i32) -> Vec<String> 
 fn metadata_v1_echoes_requested_topic_name_in_response() {
     let topic = "orders";
     let request = build_metadata_legacy_request(&[topic]);
-    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let names = read_metadata_v1_topics(&mut d, 1);
@@ -236,7 +239,8 @@ fn metadata_v1_echoes_requested_topic_name_in_response() {
 fn metadata_v1_unknown_topic_returns_error_with_requested_name() {
     let topic = "orders";
     let request = build_metadata_legacy_request(&[topic]);
-    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker()).expect("test request has acks != 0 and expects a response");
+    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
+        .expect("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let _brokers_count = d.read_i32().unwrap();

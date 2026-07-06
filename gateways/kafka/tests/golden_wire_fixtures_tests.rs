@@ -25,7 +25,8 @@ use iggy_gateway_kafka::protocol::codec::Encoder;
 #[test]
 fn golden_apiversions_v1_response_fixture() {
     let broker = BrokerAdvertise::default();
-    let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker).expect("test request has acks != 0 and expects a response");
+    let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker)
+        .expect("test request has acks != 0 and expects a response");
 
     // error_code=0, api_count=6
     // key 0  (Produce)      min=0  max=9 (KAFKA-18659 advertise min=0)
@@ -53,14 +54,18 @@ fn golden_apiversions_v1_response_fixture() {
 fn golden_metadata_v0_single_topic_response_fixture() {
     let mut request = Encoder::with_capacity(32);
     request.write_i32(1); // one topic
+    request
+        .write_nullable_string(Some("orders"))
+        .expect("topic name fits");
     let req_bytes = request.freeze();
 
-    let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default()).expect("test request has acks != 0 and expects a response");
+    let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default())
+        .expect("test request has acks != 0 and expects a response");
 
     // Metadata v0 layout: brokers[], topics[]  (no controller_id — added in v1)
     // brokers[1]: node_id=1, host=127.0.0.1, port=9093
-    // topics[1]: topic_error=3, topic_name=unknown-topic, partitions[0]
-    let expected: [u8; 48] = [
+    // topics[1]: topic_error=3, topic_name=orders (echoed from the request), partitions[0]
+    let expected: [u8; 41] = [
         0x00, 0x00, 0x00, 0x01, // broker count
         0x00, 0x00, 0x00, 0x01, // node id
         0x00, 0x09, // host len
@@ -68,9 +73,8 @@ fn golden_metadata_v0_single_topic_response_fixture() {
         0x00, 0x00, 0x23, 0x85, // port 9093
         0x00, 0x00, 0x00, 0x01, // topic count
         0x00, 0x03, // topic error code
-        0x00, 0x0d, // topic name len
-        0x75, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x2d, 0x74, 0x6f, 0x70, 0x69,
-        0x63, // unknown-topic
+        0x00, 0x06, // topic name len
+        0x6f, 0x72, 0x64, 0x65, 0x72, 0x73, // "orders"
         0x00, 0x00, 0x00, 0x00, // partition count
     ];
     assert_eq!(actual.as_ref(), &expected);
