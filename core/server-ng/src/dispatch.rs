@@ -1367,7 +1367,10 @@ fn decode_poll_request(
         return Ok((namespace, partition_id, consumer, args));
     }
 
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Plain-consumer poll: an omitted partition selects partition 0, matching
+    // the legacy resolver (`resolve_consumer_with_partition_id` uses
+    // `unwrap_or(0)` for `ConsumerKind::Consumer`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
@@ -1380,7 +1383,9 @@ fn decode_consumer_offset_request(
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError> {
     let wire = GetConsumerOffsetRequest::decode_from(request_body(request))
         .map_err(|_| IggyError::InvalidCommand)?;
-    let partition_id = wire.partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    // Omitted partition reads partition 0, matching the legacy resolver for
+    // both consumer kinds (`unwrap_or(0)`).
+    let partition_id = wire.partition_id.unwrap_or(0);
     let namespace =
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     // A group offset is keyed by the group's monotonic id (any client may read
