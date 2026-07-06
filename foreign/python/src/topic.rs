@@ -15,9 +15,79 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::{Topic as RustTopic, TopicDetails as RustTopicDetails};
+use std::time::Duration;
+
+use iggy::prelude::{
+    IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize, Partition as RustPartition,
+    Topic as RustTopic, TopicDetails as RustTopicDetails,
+};
 use pyo3::prelude::*;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3::types::PyDelta;
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+
+/// The expiry of the messages in a topic.
+#[gen_stub_pyclass_complex_enum]
+#[pyclass]
+pub enum IggyExpiry {
+    /// Use the server's default message expiry.
+    ServerDefault(),
+    /// Messages expire after this duration.
+    ExpireDuration { duration: Py<PyDelta> },
+    /// Messages never expire.
+    NeverExpire(),
+}
+
+impl From<RustIggyExpiry> for IggyExpiry {
+    fn from(expiry: RustIggyExpiry) -> Self {
+        match expiry {
+            RustIggyExpiry::ServerDefault => IggyExpiry::ServerDefault(),
+            RustIggyExpiry::ExpireDuration(duration) => IggyExpiry::ExpireDuration {
+                duration: iggy_duration_to_py_delta(duration.get_duration()),
+            },
+            RustIggyExpiry::NeverExpire => IggyExpiry::NeverExpire(),
+        }
+    }
+}
+
+fn iggy_duration_to_py_delta(duration: Duration) -> Py<PyDelta> {
+    let days = duration.as_secs() / 86_400;
+    let secs_of_day = duration.as_secs() % 86_400;
+    Python::attach(|py| {
+        PyDelta::new(
+            py,
+            days as i32,
+            secs_of_day as i32,
+            duration.subsec_micros() as i32,
+            true,
+        )
+        .expect("topic message expiry duration fits within timedelta bounds")
+        .unbind()
+    })
+}
+
+/// The maximum size of a topic.
+#[gen_stub_pyclass_complex_enum]
+#[pyclass]
+pub enum MaxTopicSize {
+    /// Use the server's default max size.
+    ServerDefault(),
+    /// The topic is limited to this many bytes.
+    Custom { bytes: u64 },
+    /// The topic has no maximum size.
+    Unlimited(),
+}
+
+impl From<RustMaxTopicSize> for MaxTopicSize {
+    fn from(max_size: RustMaxTopicSize) -> Self {
+        match max_size {
+            RustMaxTopicSize::ServerDefault => MaxTopicSize::ServerDefault(),
+            RustMaxTopicSize::Custom(size) => MaxTopicSize::Custom {
+                bytes: size.as_bytes_u64(),
+            },
+            RustMaxTopicSize::Unlimited => MaxTopicSize::Unlimited(),
+        }
+    }
+}
 
 #[gen_stub_pyclass]
 #[pyclass]
@@ -56,6 +126,42 @@ impl Topic {
     #[getter]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
+    }
+
+    /// The timestamp when the topic was created, in microseconds.
+    #[getter]
+    pub fn created_at(&self) -> u64 {
+        self.inner.created_at.as_micros()
+    }
+
+    /// The total size of the topic in bytes.
+    #[getter]
+    pub fn size(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
+    }
+
+    /// The expiry of the messages in the topic.
+    #[getter]
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.inner.message_expiry.into()
+    }
+
+    /// Compression algorithm for the topic.
+    #[getter]
+    pub fn compression_algorithm(&self) -> String {
+        self.inner.compression_algorithm.to_string()
+    }
+
+    /// The maximum size of the topic.
+    #[getter]
+    pub fn max_topic_size(&self) -> MaxTopicSize {
+        self.inner.max_topic_size.into()
+    }
+
+    /// Replication factor for the topic.
+    #[getter]
+    pub fn replication_factor(&self) -> u8 {
+        self.inner.replication_factor
     }
 }
 
@@ -100,15 +206,102 @@ impl TopicDetails {
         self.inner.partitions_count
     }
 
+    /// The timestamp when the topic was created, in microseconds.
+    #[getter]
+    pub fn created_at(&self) -> u64 {
+        self.inner.created_at.as_micros()
+    }
+
+    /// The total size of the topic in bytes.
+    #[getter]
+    pub fn size(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
+    }
+
+    /// The expiry of the messages in the topic.
+    #[getter]
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.inner.message_expiry.into()
+    }
+
     /// Compression algorithm for the topic.
     #[getter]
     pub fn compression_algorithm(&self) -> String {
         self.inner.compression_algorithm.to_string()
     }
 
+    /// The maximum size of the topic.
+    #[getter]
+    pub fn max_topic_size(&self) -> MaxTopicSize {
+        self.inner.max_topic_size.into()
+    }
+
     /// Replication factor for the topic.
     #[getter]
     pub fn replication_factor(&self) -> u8 {
         self.inner.replication_factor
+    }
+
+    /// The collection of partitions in the topic.
+    #[getter]
+    pub fn partitions(&self) -> Vec<Partition> {
+        self.inner
+            .partitions
+            .iter()
+            .cloned()
+            .map(Partition::from)
+            .collect()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct Partition {
+    pub(crate) inner: RustPartition,
+}
+
+impl From<RustPartition> for Partition {
+    fn from(partition: RustPartition) -> Self {
+        Self { inner: partition }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Partition {
+    /// The unique identifier (numeric) of the partition.
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    /// The timestamp of the partition creation, in microseconds.
+    #[getter]
+    pub fn created_at(&self) -> u64 {
+        self.inner.created_at.as_micros()
+    }
+
+    /// The number of segments in the partition.
+    #[getter]
+    pub fn segments_count(&self) -> u32 {
+        self.inner.segments_count
+    }
+
+    /// The current offset of the partition.
+    #[getter]
+    pub fn current_offset(&self) -> u64 {
+        self.inner.current_offset
+    }
+
+    /// The size of the partition in bytes.
+    #[getter]
+    pub fn size(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
+    }
+
+    /// The number of messages in the partition.
+    #[getter]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
     }
 }

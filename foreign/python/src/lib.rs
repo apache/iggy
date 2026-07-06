@@ -32,7 +32,7 @@ use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;
 use stream::StreamDetails;
-use topic::{Topic, TopicDetails};
+use topic::{IggyExpiry, MaxTopicSize, Partition, Topic, TopicDetails};
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -43,6 +43,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
+    m.add_class::<IggyExpiry>()?;
+    m.add_class::<MaxTopicSize>()?;
+    m.add_class::<Partition>()?;
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;

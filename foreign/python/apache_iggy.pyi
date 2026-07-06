@@ -33,6 +33,9 @@ __all__ = [
     "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
+    "IggyExpiry",
+    "MaxTopicSize",
+    "Partition",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
@@ -638,6 +641,117 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+class IggyExpiry:
+    r"""
+    The expiry of the messages in a topic.
+    """
+    @typing.final
+    class ServerDefault(IggyExpiry):
+        r"""
+        Use the server's default message expiry.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class ExpireDuration(IggyExpiry):
+        r"""
+        Messages expire after this duration.
+        """
+
+        __match_args__ = ("duration",)
+        @property
+        def duration(self) -> datetime.timedelta: ...
+        def __new__(cls, duration: datetime.timedelta) -> IggyExpiry.ExpireDuration: ...
+
+    @typing.final
+    class NeverExpire(IggyExpiry):
+        r"""
+        Messages never expire.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.NeverExpire: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+class MaxTopicSize:
+    r"""
+    The maximum size of a topic.
+    """
+    @typing.final
+    class ServerDefault(MaxTopicSize):
+        r"""
+        Use the server's default max size.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Custom(MaxTopicSize):
+        r"""
+        The topic is limited to this many bytes.
+        """
+
+        __match_args__ = ("bytes",)
+        @property
+        def bytes(self) -> builtins.int: ...
+        def __new__(cls, bytes: builtins.int) -> MaxTopicSize.Custom: ...
+
+    @typing.final
+    class Unlimited(MaxTopicSize):
+        r"""
+        The topic has no maximum size.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.Unlimited: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+@typing.final
+class Partition:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp of the partition creation, in microseconds.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The number of segments in the partition.
+        """
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The current offset of the partition.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The size of the partition in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The number of messages in the partition.
+        """
+
 class PollingStrategy:
     @typing.final
     class Offset(PollingStrategy):
@@ -758,6 +872,36 @@ class Topic:
         r"""
         The total number of partitions in the topic.
         """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
+    @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
+    def replication_factor(self) -> builtins.int:
+        r"""
+        Replication factor for the topic.
+        """
 
 @typing.final
 class TopicDetails:
@@ -782,12 +926,37 @@ class TopicDetails:
         The total number of partitions in the topic.
         """
     @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
     def compression_algorithm(self) -> builtins.str:
         r"""
         Compression algorithm for the topic.
         """
     @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
     def replication_factor(self) -> builtins.int:
         r"""
         Replication factor for the topic.
+        """
+    @property
+    def partitions(self) -> builtins.list[Partition]:
+        r"""
+        The collection of partitions in the topic.
         """
