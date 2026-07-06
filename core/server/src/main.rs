@@ -47,6 +47,7 @@ use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
 use server_common::MemoryPool;
+use server_common::log::{LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard_allocator::ShardAllocator;
 use std::panic::AssertUnwindSafe;
@@ -145,8 +146,9 @@ fn main() -> Result<(), ServerError> {
 
         // FIRST DISCRETE LOADING STEP.
         // Initialize early logging before config parsing so we can log during bootstrap.
-        let mut logging = Logging::new();
+        let mut logging = Logging::new(server::VERSION);
         logging.early_init();
+        server_common::print_build_info!(server::VERSION);
 
         // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
@@ -176,8 +178,8 @@ fn main() -> Result<(), ServerError> {
         // From this point on, logs are persisted to file and telemetry is active.
         logging.late_init(
             config.system.get_system_path(),
-            &config.system.logging,
-            &config.telemetry,
+            &LoggingSettings::from(&config.system.logging),
+            &TelemetrySettings::from(&config.telemetry),
         )?;
 
         if is_follower {

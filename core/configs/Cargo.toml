@@ -25,7 +25,6 @@ publish = false
 [dependencies]
 configs_derive = { workspace = true }
 cpu_allocation = { workspace = true }
-derive_more = { workspace = true }
 err_trail = { workspace = true }
 figment = { workspace = true }
 iggy_common = { workspace = true }

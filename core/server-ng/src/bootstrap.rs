@@ -37,6 +37,10 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::Operation;
+use iggy_common::defaults::{
+    DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
+    MIN_USERNAME_LENGTH,
+};
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -70,13 +74,10 @@ use partitions::{
 };
 use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
+use server_common::crypto;
 use server_common::executor::create_shard_executor;
+use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-use shard_allocator::{ShardAllocator, ShardInfo};
-// TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
-use server::log::logger::Logging;
-use server::streaming::users::user::User as LegacyUser;
-use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
@@ -85,6 +86,7 @@ use shard::{
     Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
     shard_mesh_channels,
 };
+use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -97,6 +99,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
+
+pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
+pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
@@ -435,8 +440,8 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     logging
         .late_init(
             config.system.get_system_path(),
-            &config.system.logging,
-            &config.telemetry,
+            &LoggingSettings::from(&config.system.logging),
+            &TelemetrySettings::from(&config.telemetry),
         )
         .map_err(ServerNgError::Logging)?;
 
@@ -2030,10 +2035,58 @@ fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
         return;
     }
 
-    let LegacyUser {
-        username, password, ..
-    } = server::bootstrap::create_root_user();
-    mux_stm.users().ensure_root_user(&username, &password);
+    let (username, password_hash) = create_root_credentials();
+    mux_stm.users().ensure_root_user(&username, &password_hash);
+}
+
+/// Resolve the root user credentials from `IGGY_ROOT_USERNAME` /
+/// `IGGY_ROOT_PASSWORD`, falling back to the default username with a
+/// generated password (printed to stdout, mirroring the legacy server).
+///
+/// Returns `(username, password_hash)`; the plaintext password never
+/// leaves this function.
+fn create_root_credentials() -> (String, String) {
+    let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
+    let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
+    assert_eq!(
+        username.is_ok(),
+        password.is_ok(),
+        "When providing the custom root user credentials, both username and password must be set."
+    );
+    if username.is_ok() && password.is_ok() {
+        info!("Using the custom root user credentials.");
+    } else {
+        info!("Using the default root user credentials...");
+        username = Ok(DEFAULT_ROOT_USERNAME.to_string());
+        let generated_password = crypto::generate_secret(20..40);
+        println!("Generated root user password: {generated_password}");
+        password = Ok(generated_password);
+    }
+
+    let username = username.expect("Root username is not set.");
+    let password = password.expect("Root password is not set.");
+    assert!(
+        !username.is_empty() && !password.is_empty(),
+        "Root user credentials cannot be empty."
+    );
+    assert!(
+        username.len() >= MIN_USERNAME_LENGTH,
+        "Root username is too short."
+    );
+    assert!(
+        username.len() <= MAX_USERNAME_LENGTH,
+        "Root username is too long."
+    );
+    assert!(
+        password.len() >= MIN_PASSWORD_LENGTH,
+        "Root password is too short."
+    );
+    assert!(
+        password.len() <= MAX_PASSWORD_LENGTH,
+        "Root password is too long."
+    );
+
+    (username, crypto::hash_password(&password))
 }
 
 fn validate_cluster_root_bootstrap(

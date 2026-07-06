@@ -146,7 +146,6 @@ rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
-server = { workspace = true }
 server_common = { workspace = true }
 shard = { workspace = true }
 shard_allocator = { workspace = true }

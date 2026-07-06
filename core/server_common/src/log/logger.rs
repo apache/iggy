@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::VERSION;
-use crate::configs::server::{TelemetryConfig, TelemetryTransport};
-use crate::configs::system::LoggingConfig;
-use crate::log::runtime::CompioRuntime;
-use crate::server_error::LogError;
+use super::runtime::CompioRuntime;
+use super::settings::{LoggingSettings, TelemetrySettings, TelemetryTransport};
 use iggy_common::{IggyByteSize, IggyDuration};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -52,6 +49,18 @@ use tracing_subscriber::{
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";
 const ONE_HUNDRED_THOUSAND: u64 = 100_000;
+
+#[derive(Debug, thiserror::Error)]
+pub enum LogError {
+    #[error("Logging filter reload failure")]
+    FilterReloadFailure,
+
+    #[error("Logging stdout reload failure")]
+    StdoutReloadFailure,
+
+    #[error("Logging file reload failure")]
+    FileReloadFailure,
+}
 
 // Writer that does nothing
 struct NullWriter;
@@ -121,6 +130,8 @@ type EnvFilterReloadHandle = Handle<EnvFilter, Registry>;
 type FilteredRegistry = Layered<reload::Layer<EnvFilter, Registry>, Registry>;
 
 pub struct Logging {
+    server_version: &'static str,
+
     stdout_guard: Option<WorkerGuard>,
     stdout_reload_handle: Option<ReloadHandle<FilteredRegistry>>,
 
@@ -139,8 +150,9 @@ pub struct Logging {
 }
 
 impl Logging {
-    pub fn new() -> Self {
+    pub fn new(server_version: &'static str) -> Self {
         Self {
+            server_version,
             stdout_guard: None,
             stdout_reload_handle: None,
             file_guard: None,
@@ -210,21 +222,20 @@ impl Logging {
             .with(env_filter_layer)
             .with(layers)
             .init();
-        Self::print_build_info();
     }
 
     pub fn late_init(
         &mut self,
         base_directory: String,
-        config: &LoggingConfig,
-        telemetry_config: &TelemetryConfig,
+        config: &LoggingSettings,
+        telemetry_config: &TelemetrySettings,
     ) -> Result<(), LogError> {
         // Write to stdout and file at the same time.
         // Use the non_blocking appender to avoid blocking the threads.
         // Use the rolling appender to avoid having a huge log file.
         // Make sure logs are dumped to the file during graceful shutdown.
 
-        trace!("Logging config: {config}");
+        trace!("Logging config: {config:?}");
 
         // Reload EnvFilter with config level if RUST_LOG is not set.
         // Config level supports EnvFilter syntax (e.g., "warn,server=debug,iggy=trace").
@@ -350,13 +361,13 @@ impl Logging {
         Ok(())
     }
 
-    fn init_telemetry(&mut self, telemetry_config: &TelemetryConfig) -> Result<(), LogError> {
+    fn init_telemetry(&mut self, telemetry_config: &TelemetrySettings) -> Result<(), LogError> {
         let service_name = telemetry_config.service_name.to_owned();
         let resource = Resource::builder()
             .with_service_name(service_name.clone())
             .with_attribute(KeyValue::new(
                 opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
-                VERSION,
+                self.server_version,
             ))
             .build();
 
@@ -450,22 +461,6 @@ impl Logging {
         Format::default().with_thread_names(true)
     }
 
-    fn print_build_info() {
-        if option_env!("IGGY_CI_BUILD") == Some("true") {
-            let hash = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
-            let built_at = option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or("unknown");
-            let rust_version = option_env!("VERGEN_RUSTC_SEMVER").unwrap_or("unknown");
-            let target = option_env!("VERGEN_CARGO_TARGET_TRIPLE").unwrap_or("unknown");
-            info!(
-                "Version: {VERSION}, hash: {hash}, built at: {built_at} using rust version: {rust_version} for target: {target}"
-            );
-        } else {
-            info!(
-                "It seems that you are a developer. Environment variable IGGY_CI_BUILD is not set to 'true', skipping build info print."
-            )
-        }
-    }
-
     fn calculate_max_files(
         max_total_size_bytes: IggyByteSize,
         max_file_size_bytes: IggyByteSize,
@@ -485,7 +480,7 @@ impl Logging {
 
     fn install_log_rotation_handler(
         &self,
-        config: &LoggingConfig,
+        config: &LoggingSettings,
         logs_path: Option<&PathBuf>,
     ) -> Option<std::thread::JoinHandle<()>> {
         let logs_path = logs_path?;
@@ -742,12 +737,6 @@ impl Logging {
     }
 }
 
-impl Default for Logging {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for Logging {
     fn drop(&mut self) {
         self.rotation_should_stop
@@ -865,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_logging_creation() {
-        let logging = Logging::new();
+        let logging = Logging::new("0.0.0-test");
         assert!(logging.stdout_guard.is_none());
         assert!(logging.file_guard.is_none());
         assert!(logging.env_filter_reload_handle.is_none());

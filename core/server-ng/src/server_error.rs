@@ -16,8 +16,7 @@
 // under the License.
 
 use metadata::impls::recovery::RecoveryError;
-// TODO: decouple logging errors from the `server` crate.
-use server::server_error::LogError;
+use server_common::log::LogError;
 use shard::ShardCtorError;
 use shard_allocator::ShardingError;
 use thiserror::Error;
