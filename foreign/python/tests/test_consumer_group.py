@@ -727,6 +727,58 @@ class TestConsumerGroup:
         assert received_messages == test_messages
 
     @pytest.mark.asyncio
+    async def test_consume_messages_can_read_user_headers(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test consume_messages callback receives user headers."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        expected_headers: dict[str, str | bytes | bool | int | float] = {
+            "source": "callback",
+            "attempt": 1,
+        }
+        received_headers = []
+        shutdown_event = asyncio.Event()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        async def take(message: ReceiveMessage) -> None:
+            headers = message.user_headers()
+            assert headers is not None
+            received_headers.append(headers.to_plain())
+            shutdown_event.set()
+
+        async def send() -> None:
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message("callback headers", user_headers=expected_headers)],
+            )
+
+        await asyncio.gather(consumer.consume_messages(take, shutdown_event), send())
+
+        assert received_headers == [expected_headers]
+
+    @pytest.mark.asyncio
     async def test_iter_messages(self, iggy_client: IggyClient, unique_name):
         """Test that the consumer group can iterate over messages."""
         consumer_name = unique_name()
@@ -767,6 +819,52 @@ class TestConsumerGroup:
             received_messages.append(message.payload().decode())
 
         assert received_messages == test_messages
+
+    @pytest.mark.asyncio
+    async def test_iter_messages_can_read_user_headers(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test iter_messages yields messages with user headers."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        expected_headers: dict[str, str | bytes | bool | int | float] = {
+            "source": "iterator",
+            "attempt": 2,
+        }
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message("iterator headers", user_headers=expected_headers)],
+        )
+
+        iterator = consumer.iter_messages()
+        message = await asyncio.wait_for(iterator.__anext__(), timeout=5)
+
+        headers = message.user_headers()
+        assert headers is not None
+        assert headers.to_plain() == expected_headers
 
     @pytest.mark.asyncio
     async def test_iter_messages_with_first_reads_existing_messages(
