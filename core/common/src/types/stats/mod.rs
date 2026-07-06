@@ -30,9 +30,10 @@ pub struct Stats {
     pub total_cpu_usage: f32,
     /// The memory usage of the process.
     pub memory_usage: IggyByteSize,
-    /// The total memory of the system.
+    /// The total memory of the system, or the effective cgroup memory limit when the
+    /// server runs inside a memory-capped cgroup (container, systemd slice).
     pub total_memory: IggyByteSize,
-    /// The available memory of the system.
+    /// The available memory of the system, scoped to the cgroup limit when one applies.
     pub available_memory: IggyByteSize,
     /// The run time of the process.
     pub run_time: IggyDuration,

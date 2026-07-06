@@ -519,7 +519,8 @@ pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
-    let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
+    let sharding = &config.system.sharding;
+    let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
         .map_err(ServerNgError::ShardAllocator)?;
     let assignments = allocator
         .to_shard_assignments()

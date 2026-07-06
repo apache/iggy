@@ -88,6 +88,14 @@ impl IggyShard {
                 stats.written_bytes = disk_usage.total_written_bytes.into();
 
                 stats.threads_count = process.tasks().map(|t| t.len() as u32).unwrap_or(0);
+
+                if let Some(limits) = process
+                    .cgroup_limits()
+                    .filter(|limits| limits.total_memory < sys.total_memory())
+                {
+                    stats.total_memory = limits.total_memory.into();
+                    stats.available_memory = limits.free_memory.into();
+                }
             }
 
             let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =

@@ -24,7 +24,7 @@
 //! shard. On Linux it also pins each shard's thread to its core and
 //! pins memory to the right NUMA node, so memory stays close and fast.
 
-use cpu_allocation::{CpuAllocation, NumaConfig};
+use cpu_allocation::{CpuAllocation, NumaConfig, allowed_cpus};
 use hwlocality::Topology;
 use hwlocality::bitmap::SpecializedBitmapRef;
 use hwlocality::cpu::cpuset::CpuSet;
@@ -60,6 +60,16 @@ pub enum ShardingError {
         available: usize,
         node: usize,
     },
+
+    #[error(
+        "Requested {requested} shard(s) but only {available} CPU core(s) are allowed for this process (affinity/cpuset mask)"
+    )]
+    AllowedCpusExceeded { requested: usize, available: usize },
+
+    #[error(
+        "Configured CPU {cpu} is outside the set of cores allowed for this process (affinity/cpuset mask)"
+    )]
+    CpuNotAllowed { cpu: usize },
 
     #[error("Invalid NUMA node: requested {requested}, only available {available} node")]
     InvalidNode { requested: usize, available: usize },
@@ -257,17 +267,54 @@ impl ShardInfo {
     }
 }
 
+/// One shard per core drawn from `allowed`, each pinned to its own core.
+fn pinned_from_allowed(allowed: &[usize], count: usize) -> Result<Vec<ShardInfo>, ShardingError> {
+    if count > allowed.len() {
+        return Err(ShardingError::AllowedCpusExceeded {
+            requested: count,
+            available: allowed.len(),
+        });
+    }
+
+    Ok(allowed
+        .iter()
+        .take(count)
+        .map(|&cpu_id| ShardInfo {
+            cpu_set: HashSet::from([cpu_id]),
+            numa_node: None,
+        })
+        .collect())
+}
+
+/// `count` shards with no CPU affinity: `bind_cpu` becomes a no-op and the
+/// kernel scheduler places shard threads freely. This is the right mode when
+/// the process shares its cores with other workloads (e.g. a multi-tenant
+/// host slicing CPU via cgroup quotas), where per-process pinning to the same
+/// low-numbered cores would pile every tenant onto one core.
+fn unpinned(count: usize) -> Vec<ShardInfo> {
+    (0..count)
+        .map(|_| ShardInfo {
+            cpu_set: HashSet::new(),
+            numa_node: None,
+        })
+        .collect()
+}
+
 /// Turns the operator's [`CpuAllocation`] choice into a concrete plan
 /// of shards. Reads the NUMA topology only when the choice needs it.
 pub struct ShardAllocator {
     allocation: CpuAllocation,
+    pin_cores: bool,
     topology: Option<Arc<NumaTopology>>,
 }
 
 impl ShardAllocator {
     /// Build an allocator for the given choice. Only `NumaAware` reads
     /// the machine topology up front; the simpler modes do not.
-    pub fn new(allocation: &CpuAllocation) -> Result<ShardAllocator, ShardingError> {
+    pub fn new(
+        allocation: &CpuAllocation,
+        pin_cores: bool,
+    ) -> Result<ShardAllocator, ShardingError> {
         let topology = if matches!(allocation, CpuAllocation::NumaAware(_)) {
             let numa_topology = NumaTopology::detect()?;
 
@@ -278,6 +325,7 @@ impl ShardAllocator {
 
         Ok(Self {
             allocation: allocation.clone(),
+            pin_cores,
             topology,
         })
     }
@@ -287,39 +335,66 @@ impl ShardAllocator {
     pub fn to_shard_assignments(&self) -> Result<Vec<ShardInfo>, ShardingError> {
         match &self.allocation {
             CpuAllocation::All => {
+                // `available_parallelism` already accounts for both the
+                // affinity mask and any cgroup CPU quota, so a
+                // quota-restricted process gets proportionally fewer shards.
                 let available_cpus = available_parallelism()
                     .map_err(|err| ShardingError::Other {
                         msg: format!("Failed to get available_parallelism: {:?}", err),
                     })?
                     .get();
 
-                let shard_assignments: Vec<_> = (0..available_cpus)
-                    .map(|cpu_id| ShardInfo {
-                        cpu_set: HashSet::from([cpu_id]),
-                        numa_node: None,
-                    })
-                    .collect();
+                if !self.pin_cores {
+                    info!("Using all available CPU cores ({available_cpus} shards, unpinned)");
+                    return Ok(unpinned(available_cpus));
+                }
+
+                let allowed = allowed_cpus();
+                let shard_assignments =
+                    pinned_from_allowed(&allowed, available_cpus.min(allowed.len()))?;
 
                 info!(
-                    "Using all available CPU cores ({} shards with affinity)",
-                    shard_assignments.len()
+                    "Using all available CPU cores ({} shards pinned within allowed set {:?})",
+                    shard_assignments.len(),
+                    allowed
                 );
 
                 Ok(shard_assignments)
             }
             CpuAllocation::Count(count) => {
-                let shard_assignments = (0..*count)
-                    .map(|cpu_id| ShardInfo {
-                        cpu_set: HashSet::from([cpu_id]),
-                        numa_node: None,
-                    })
+                if !self.pin_cores {
+                    info!("Using {count} shard(s), unpinned");
+                    return Ok(unpinned(*count));
+                }
+
+                let allowed = allowed_cpus();
+                let shard_assignments = pinned_from_allowed(&allowed, *count)?;
+                let cores: Vec<usize> = shard_assignments
+                    .iter()
+                    .flat_map(|shard| shard.cpu_set.iter().copied())
                     .collect();
 
-                info!("Using {count} shards with affinity to cores 0..{count}");
+                info!("Using {count} shard(s) with affinity to cores {cores:?}");
 
                 Ok(shard_assignments)
             }
             CpuAllocation::Range(start, end) => {
+                if !self.pin_cores {
+                    info!(
+                        "Using {} shard(s) for range {start}..{end}, unpinned",
+                        end - start
+                    );
+                    return Ok(unpinned(end - start));
+                }
+
+                // An explicit range is operator intent for exact cores; honor
+                // it as-is but fail fast when a core is outside the allowed
+                // set instead of letting `sched_setaffinity` EINVAL later.
+                let allowed = allowed_cpus();
+                if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {
+                    return Err(ShardingError::CpuNotAllowed { cpu });
+                }
+
                 let shard_assignments = (*start..*end)
                     .map(|cpu_id| ShardInfo {
                         cpu_set: HashSet::from([cpu_id]),
@@ -336,7 +411,16 @@ impl ShardAllocator {
             }
             CpuAllocation::NumaAware(numa_config) => {
                 let topology = self.topology.as_ref().ok_or(ShardingError::NoTopology)?;
-                self.compute_numa_assignments(topology, numa_config)
+                let assignments = self.compute_numa_assignments(topology, numa_config)?;
+
+                if !self.pin_cores {
+                    tracing::warn!(
+                        "pin_cores = false with a NUMA-aware cpu_allocation: NUMA bindings are ignored"
+                    );
+                    return Ok(unpinned(assignments.len()));
+                }
+
+                Ok(assignments)
             }
         }
     }
@@ -406,5 +490,75 @@ impl ShardAllocator {
         );
 
         Ok(shard_infos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_from_allowed_draws_cores_from_the_allowed_set() {
+        let allowed = vec![2, 3, 6, 7];
+        let shards = pinned_from_allowed(&allowed, 2).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].cpu_set, HashSet::from([2]));
+        assert_eq!(shards[1].cpu_set, HashSet::from([3]));
+        assert!(shards.iter().all(|shard| shard.numa_node.is_none()));
+    }
+
+    #[test]
+    fn pinned_from_allowed_rejects_more_shards_than_allowed_cores() {
+        let allowed = vec![0, 1];
+        let err = pinned_from_allowed(&allowed, 3).unwrap_err();
+        assert!(matches!(
+            err,
+            ShardingError::AllowedCpusExceeded {
+                requested: 3,
+                available: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn unpinned_shards_have_empty_cpu_sets() {
+        let shards = unpinned(4);
+        assert_eq!(shards.len(), 4);
+        assert!(shards.iter().all(|shard| shard.cpu_set.is_empty()));
+        assert!(shards.iter().all(|shard| shard.numa_node.is_none()));
+    }
+
+    #[test]
+    fn count_without_pinning_yields_unpinned_shards() {
+        let allocator = ShardAllocator::new(&CpuAllocation::Count(1), false).unwrap();
+        let shards = allocator.to_shard_assignments().unwrap();
+        assert_eq!(shards.len(), 1);
+        assert!(shards[0].cpu_set.is_empty());
+    }
+
+    #[test]
+    fn count_with_pinning_stays_within_the_allowed_set() {
+        let allocator = ShardAllocator::new(&CpuAllocation::Count(1), true).unwrap();
+        let shards = allocator.to_shard_assignments().unwrap();
+        assert_eq!(shards.len(), 1);
+        let allowed = allowed_cpus();
+        assert!(shards[0].cpu_set.iter().all(|cpu| allowed.contains(cpu)));
+    }
+
+    #[test]
+    fn range_without_pinning_keeps_shard_count() {
+        let allocator = ShardAllocator::new(&CpuAllocation::Range(0, 1), false).unwrap();
+        let shards = allocator.to_shard_assignments().unwrap();
+        assert_eq!(shards.len(), 1);
+        assert!(shards[0].cpu_set.is_empty());
+    }
+
+    #[test]
+    fn bind_cpu_with_empty_set_is_a_no_op() {
+        let shard = ShardInfo {
+            cpu_set: HashSet::new(),
+            numa_node: None,
+        };
+        assert!(shard.bind_cpu().is_ok());
     }
 }

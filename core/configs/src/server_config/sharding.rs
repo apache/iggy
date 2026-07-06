@@ -101,6 +101,10 @@ const fn default_inbox_capacity() -> usize {
     DEFAULT_INBOX_CAPACITY
 }
 
+const fn default_pin_cores() -> bool {
+    true
+}
+
 fn default_shutdown_drain_timeout() -> IggyDuration {
     IggyDuration::new(DEFAULT_SHUTDOWN_DRAIN_TIMEOUT)
 }
@@ -119,6 +123,18 @@ pub struct ShardingConfig {
     #[serde(default)]
     #[config_env(leaf)]
     pub cpu_allocation: CpuAllocation,
+    /// Whether shard threads are pinned to dedicated CPU cores
+    /// (`sched_setaffinity`). Pinning maximizes cache locality when this
+    /// server owns its cores (dedicated host, `numa:` allocations). Set to
+    /// `false` when the server shares cores with other workloads — e.g. a
+    /// multi-tenant host slicing CPU via cgroup quotas — where every process
+    /// pinning to the same low-numbered cores would pile onto one core while
+    /// the rest sit idle; unpinned shards let the kernel scheduler place
+    /// threads freely within the allowed set. With a NUMA-aware allocation,
+    /// `false` drops both the CPU and memory-node bindings (and logs a
+    /// warning, since NUMA placement without pinning is meaningless).
+    #[serde(default = "default_pin_cores")]
+    pub pin_cores: bool,
     /// Per-shard inter-shard inbox channel capacity. Bounded by design.
     /// Drops on full inbox of consensus frames are recovered by VSR
     /// retransmit. Drops of cross-shard client Reply frames are terminal:
@@ -176,6 +192,7 @@ impl Default for ShardingConfig {
     fn default() -> Self {
         Self {
             cpu_allocation: CpuAllocation::default(),
+            pin_cores: default_pin_cores(),
             inbox_capacity: DEFAULT_INBOX_CAPACITY,
             shutdown_drain_timeout: default_shutdown_drain_timeout(),
             shutdown_poll_interval: default_shutdown_poll_interval(),
