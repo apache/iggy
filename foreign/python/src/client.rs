@@ -38,8 +38,17 @@ use crate::topic::{Topic, TopicDetails};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
+///
 /// It wraps the RustIggyClient and provides asynchronous functionality
 /// through the contained runtime.
+///
+/// Notes:
+///     Most request, transport, authentication, and server-side failures raise
+///     `PyRuntimeError`.
+///     Client-side validation failures that happen before a request is sent,
+///     such as invalid `str | int` identifiers, raise `PyValueError`.
+///     Async message iterators created through consumers end iteration with
+///     `StopAsyncIteration`.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyClient {
@@ -284,7 +293,8 @@ impl IggyClient {
     ///     or `None` if it does not.
     ///
     /// Raises:
-    ///     PyRuntimeError: If the identifier is invalid or the request fails.
+    ///     PyValueError: If the identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
@@ -327,7 +337,9 @@ impl IggyClient {
     ///     An awaitable that resolves to `TopicDetails` for the created topic.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the topic cannot be created.
+    ///     PyValueError: If the stream identifier is invalid.
+    ///     PyRuntimeError: If another argument is invalid or the topic cannot be
+    ///         created.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -393,7 +405,8 @@ impl IggyClient {
     ///     or `None` if it does not.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
@@ -423,7 +436,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[Topic]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If the identifier is invalid or the request fails.
+    ///     PyValueError: If the stream identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Topic]]", imports=("collections.abc")))]
     fn get_topics<'a>(
         &self,
@@ -460,7 +474,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
         signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -526,7 +541,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is deleted.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_topic<'a>(
         &self,
@@ -557,7 +573,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is purged.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn purge_topic<'a>(
         &self,
@@ -695,8 +712,9 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` after the messages are sent.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid, the messages cannot be
-    ///         converted, or the send request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid, or if a
+    ///         message payload fails client-side validation.
+    ///     PyRuntimeError: If the send request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
@@ -748,7 +766,8 @@ impl IggyClient {
     ///     An awaitable that resolves to a `list[ReceiveMessage]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the poll request fails.
+    ///     PyValueError: If a stream or topic identifier is invalid.
+    ///     PyRuntimeError: If the poll request fails.
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(

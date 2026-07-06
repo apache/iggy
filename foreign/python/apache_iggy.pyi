@@ -364,8 +364,17 @@ class IdentityInfo:
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
+
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
+
+    Notes:
+        Most request, transport, authentication, and server-side failures raise
+        `PyRuntimeError`.
+        Client-side validation failures that happen before a request is sent,
+        such as invalid `str | int` identifiers, raise `PyValueError`.
+        Async message iterators created through consumers end iteration with
+        `StopAsyncIteration`.
     """
     def __new__(
         cls,
@@ -506,7 +515,8 @@ class IggyClient:
             or `None` if it does not.
 
         Raises:
-            PyRuntimeError: If the identifier is invalid or the request fails.
+            PyValueError: If the identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def create_topic(
         self,
@@ -543,7 +553,9 @@ class IggyClient:
             An awaitable that resolves to `TopicDetails` for the created topic.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the topic cannot be created.
+            PyValueError: If the stream identifier is invalid.
+            PyRuntimeError: If another argument is invalid or the topic cannot be
+                created.
         """
     def get_topic(
         self,
@@ -562,7 +574,8 @@ class IggyClient:
             or `None` if it does not.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If a stream or topic identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
@@ -577,7 +590,8 @@ class IggyClient:
             An awaitable that resolves to `list[Topic]`.
 
         Raises:
-            PyRuntimeError: If the identifier is invalid or the request fails.
+            PyValueError: If the stream identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def update_topic(
         self,
@@ -608,7 +622,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            PyValueError: If a stream or topic identifier is invalid.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -626,7 +641,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is deleted.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If a stream or topic identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def purge_topic(
         self,
@@ -644,7 +660,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is purged.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            PyValueError: If a stream or topic identifier is invalid.
+            PyRuntimeError: If the request fails.
         """
     def create_consumer_group(
         self,
@@ -728,8 +745,9 @@ class IggyClient:
             An awaitable that resolves to `None` after the messages are sent.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid, the messages cannot be
-                converted, or the send request fails.
+            PyValueError: If a stream or topic identifier is invalid, or if a
+                message payload fails client-side validation.
+            PyRuntimeError: If the send request fails.
         """
     def poll_messages(
         self,
@@ -757,7 +775,8 @@ class IggyClient:
             An awaitable that resolves to a `list[ReceiveMessage]`.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the poll request fails.
+            PyValueError: If a stream or topic identifier is invalid.
+            PyRuntimeError: If the poll request fails.
         """
     def consumer_group(
         self,
@@ -821,8 +840,15 @@ class IggyClient:
 class IggyConsumer:
     r"""
     A Python class representing the Iggy consumer.
+
     It wraps the RustIggyConsumer and provides asynchronous functionality
     through the contained runtime.
+
+    Notes:
+        Consumer operations raise `PyRuntimeError` for runtime failures such as
+        polling, offset storage, callback execution, or shutdown errors.
+        Async iteration ends with `StopAsyncIteration` from
+        `ReceiveMessageIterator.__anext__()` when no more messages are available.
     """
     def get_last_consumed_offset(
         self, partition_id: builtins.int
@@ -923,6 +949,8 @@ class IggyConsumer:
 
         Raises:
             PyRuntimeError: If polling messages fails while iterating.
+            StopAsyncIteration: From `ReceiveMessageIterator.__anext__()` when the
+                iterator is exhausted.
 
         Notes:
             This method does not currently support `AutoCommit.After`.

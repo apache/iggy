@@ -43,8 +43,15 @@ use crate::identity::PyIdentifier;
 use crate::message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
+///
 /// It wraps the RustIggyConsumer and provides asynchronous functionality
 /// through the contained runtime.
+///
+/// Notes:
+///     Consumer operations raise `PyRuntimeError` for runtime failures such as
+///     polling, offset storage, callback execution, or shutdown errors.
+///     Async iteration ends with `StopAsyncIteration` from
+///     `ReceiveMessageIterator.__anext__()` when no more messages are available.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
@@ -188,6 +195,8 @@ impl IggyConsumer {
     ///
     /// Raises:
     ///     PyRuntimeError: If polling messages fails while iterating.
+    ///     StopAsyncIteration: From `ReceiveMessageIterator.__anext__()` when the
+    ///         iterator is exhausted.
     ///
     /// Notes:
     ///     This method does not currently support `AutoCommit.After`.

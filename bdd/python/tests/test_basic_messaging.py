@@ -81,7 +81,7 @@ def create_stream(context, stream_name):
         if stream is None:
             raise RuntimeError(f"Stream {stream_name} was not found after creation")
 
-        context.last_stream_id = stream.id()
+        context.last_stream_id = stream.id
         context.last_stream_name = stream_name
 
     asyncio.run(_create())
@@ -105,7 +105,7 @@ def verify_stream_properties(context, stream_name):
     async def _verify():
         stream = await context.client.get_stream(stream_name)
         assert stream is not None
-        assert stream.name() == stream_name
+        assert stream.name == stream_name
 
     asyncio.run(_verify())
 
@@ -128,7 +128,7 @@ def create_topic(context, topic_name, stream_id, partitions):
         if topic is None:
             raise RuntimeError(f"Topic {topic_name} was not found after creation")
 
-        context.last_topic_id = topic.id()
+        context.last_topic_id = topic.id
         context.last_topic_name = topic_name
         context.last_topic_partitions = partitions
 
@@ -155,7 +155,7 @@ def verify_topic_properties(context, topic_name):
     async def _verify():
         topic = await context.client.get_topic(context.last_stream_id, topic_name)
         assert topic is not None
-        assert topic.name() == topic_name
+        assert topic.name == topic_name
 
     asyncio.run(_verify())
 
@@ -169,7 +169,7 @@ def verify_topic_partitions(context, partitions):
             context.last_stream_id, context.last_topic_name
         )
         assert topic is not None
-        assert topic.partitions_count() == partitions
+        assert topic.partitions_count == partitions
 
     asyncio.run(_verify())
 
@@ -251,10 +251,10 @@ def verify_sequential_offsets(context, start_offset, end_offset):
 
     for i, message in enumerate(context.last_polled_messages):
         expected_offset = start_offset + i
-        assert message.offset() == expected_offset
+        assert message.offset == expected_offset
 
     last_message = context.last_polled_messages[-1]
-    assert last_message.offset() == end_offset
+    assert last_message.offset == end_offset
 
 
 @then("each message should have the expected payload content")
@@ -264,7 +264,7 @@ def verify_payload_content(context):
 
     for i, message in enumerate(context.last_polled_messages):
         expected_payload = f"test message {i}"
-        actual_payload = message.payload().decode("utf-8")
+        actual_payload = message.payload.decode("utf-8")
         assert actual_payload == expected_payload
 
 
@@ -275,6 +275,6 @@ def verify_last_message_match(context):
     assert context.last_polled_messages is not None
 
     last_polled = context.last_polled_messages[-1]
-    last_polled_payload = last_polled.payload().decode("utf-8")
+    last_polled_payload = last_polled.payload.decode("utf-8")
 
     assert last_polled_payload == context.last_sent_message
