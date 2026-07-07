@@ -21,8 +21,6 @@ pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
-// Only consumed by `cg_vsr` (server-ng); legacy `cg.rs` has no equivalent.
-#[cfg(feature = "vsr")]
 pub mod consumer_group_duplicate_name_create_scenario;
 pub mod consumer_group_join_scenario;
 pub mod consumer_group_new_messages_after_restart_scenario;

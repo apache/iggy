@@ -60,6 +60,13 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
     single_message_per_batch_scenario::run(harness, 5).await;
 }
 
+// Restart-gated on the plane-primary split: the restarted node re-claims
+// metadata primaryship from its WAL, but its partition groups rejoin as
+// recovering backups and a peer wins their view change. Clients route to the
+// roster (metadata) leader, so their partition writes land on a partition
+// BACKUP, which today drops them without a reply (SDK read-timeout ->
+// Disconnected). Needs partition-op forwarding to the group primary (or
+// plane leadership alignment) to re-enable under vsr.
 #[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],

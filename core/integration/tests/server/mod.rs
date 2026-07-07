@@ -19,12 +19,7 @@
 // verifier has no trusted-issuer path.
 #[cfg(not(feature = "vsr"))]
 mod a2a_jwt;
-// Polling-based consumer-group scenarios are not implemented under vsr yet.
-#[cfg(not(feature = "vsr"))]
 mod cg;
-// The ported round-robin membership join scenario runs against server-ng.
-#[cfg(feature = "vsr")]
-mod cg_vsr;
 // Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
 #[cfg(feature = "vsr")]
 mod flush_vsr;
