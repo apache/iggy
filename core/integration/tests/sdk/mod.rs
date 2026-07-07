@@ -17,6 +17,8 @@
 
 mod hello_world;
 #[cfg(feature = "vsr")]
+mod http_refresh;
+#[cfg(feature = "vsr")]
 mod mcp_parity;
 #[cfg(feature = "vsr")]
 mod messages;

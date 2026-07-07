@@ -17,15 +17,16 @@
 
 //! Shard-0 HTTP/REST listener. This root binds the listener and assembles the
 //! router; the rest is split across submodules: the `state` bridge and axum
-//! `State`, the bearer `extractor` and `jwt` issuer, the route `handlers`, the
-//! `reads` gates, the `submit` write paths, `wire` request mapping,
-//! partition-write `admission`, committed-reply `reply` decoding, the rejection
-//! `error` types, and per-credential `session` state.
+//! `State`, the bearer `extractor`, the `jwt` issuer and its `jwks` resolver,
+//! the route `handlers`, the `reads` gates, the `submit` write paths, `wire`
+//! request mapping, partition-write `admission`, committed-reply `reply`
+//! decoding, the rejection `error` types, and per-credential `session` state.
 
 mod admission;
 mod error;
 mod extractor;
 mod handlers;
+mod jwks;
 mod jwt;
 mod reads;
 mod reply;
