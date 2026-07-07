@@ -78,7 +78,7 @@ fn available_memory_within(
     let mut available: Option<u64> = None;
 
     for level in base.ancestors() {
-        // An unlimited level reads as "max" (v2, unparseable) or a value
+        // An unlimited level reads as "max" (v2, unparsable) or a value
         // beyond the host total (v1); neither constrains anything.
         if let Some(limit) =
             read_u64(&level.join(files.limit)).filter(|limit| *limit <= host_total_memory)
