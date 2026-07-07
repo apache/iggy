@@ -497,7 +497,7 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                 Ok(())
             }
             // NUMA topology validation requires hwlocality (runtime dep).
-            // Full NUMA validation happens in server::shard_allocator at startup.
+            // Full NUMA validation happens in shard_allocator at startup.
             CpuAllocation::NumaAware(_) => Ok(()),
         }
     }
