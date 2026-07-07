@@ -329,6 +329,11 @@ where
                 self.apply_reconcile_ops();
             }
         }
+
+        // Final flush: committed messages still resident in the in-memory
+        // journal must reach segment storage before the process exits, or a
+        // graceful restart recovers consumer offsets ahead of the data.
+        self.flush_partitions().await;
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through

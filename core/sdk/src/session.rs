@@ -98,6 +98,18 @@ impl ConsensusSession {
         self.session.is_some()
     }
 
+    /// Whether a login must mint a fresh session before registering.
+    ///
+    /// The register request id is one-shot per session, so any re-login
+    /// (reconnect auto-login or a deliberate second login) on a consumed or
+    /// bound session requires recreating the session first: new random
+    /// `client_id`, unambiguous re-register; the server evicts the abandoned
+    /// entry (see the module docs).
+    #[must_use]
+    pub fn needs_fresh_register(&self) -> bool {
+        self.register_consumed || self.is_bound()
+    }
+
     /// Bind the session after register commits through consensus.
     /// The `session` value is the commit op number from the server's reply.
     ///

@@ -27,8 +27,8 @@ pub use config::CoordinatorConfig;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer,
-    VsrAction, VsrConsensus,
+    CommitOutcome, Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
+    PlaneKind, Sequencer, VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -1768,8 +1768,12 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.namespace() == header.namespace
         {
-            if consensus.handle_commit(&header) {
-                planes.0.commit_journal().await;
+            match consensus.handle_commit(&header) {
+                CommitOutcome::Advanced => planes.0.commit_journal().await,
+                CommitOutcome::RespondStartView => {
+                    respond_start_view::<B, _, MJ>(consensus).await;
+                }
+                CommitOutcome::Accepted | CommitOutcome::Ignored => {}
             }
             return;
         }
@@ -1785,8 +1789,12 @@ where
             return;
         };
         let consensus = partition.consensus();
-        if consensus.handle_commit(&header) {
-            partition.commit_journal(config).await;
+        match consensus.handle_commit(&header) {
+            CommitOutcome::Advanced => partition.commit_journal(config).await,
+            CommitOutcome::RespondStartView => {
+                respond_start_view::<B, _, MJ>(consensus).await;
+            }
+            CommitOutcome::Accepted | CommitOutcome::Ignored => {}
         }
     }
 
@@ -1825,6 +1833,34 @@ where
         }
     }
 
+    /// Flush every owned partition's committed journal prefix to segment
+    /// storage. Pump-shutdown counterpart of the commit-time persist gate:
+    /// a graceful stop must not lose committed messages still resident in
+    /// the in-memory journal (mirrors the legacy pump's final flush).
+    #[allow(clippy::future_not_send)]
+    pub async fn flush_partitions(&self)
+    where
+        B: MessageBus,
+    {
+        let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            if let Err(error) = partition
+                .flush_committed_messages(partitions.config())
+                .await
+            {
+                tracing::warn!(
+                    namespace_raw = namespace.inner(),
+                    %error,
+                    "failed to flush partition journal on shutdown"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::future_not_send)]
     pub async fn tick_metadata(&self)
     where
@@ -1857,6 +1893,36 @@ where
         // `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
     }
+}
+
+/// Broadcast a `StartView` for the current view, answering a replica that
+/// still heartbeats an older view (see `CommitOutcome::RespondStartView`).
+#[allow(clippy::future_not_send)]
+async fn respond_start_view<B, P, J>(consensus: &VsrConsensus<B, P>)
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    <J as JournalHandle>::Target: Journal<
+            <J as JournalHandle>::Storage,
+            Entry = Message<PrepareHeader>,
+            Header = PrepareHeader,
+        >,
+{
+    tracing::info!(
+        view = consensus.view(),
+        op = consensus.sequencer().current_sequence(),
+        commit = consensus.commit_max(),
+        namespace = consensus.namespace(),
+        "answering stale-view heartbeat with StartView"
+    );
+    let action = VsrAction::SendStartView {
+        view: consensus.view(),
+        op: consensus.sequencer().current_sequence(),
+        commit: consensus.commit_max(),
+        namespace: consensus.namespace(),
+    };
+    dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
 }
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate

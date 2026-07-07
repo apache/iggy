@@ -546,6 +546,19 @@ pub enum Status {
 
 /// Actions to be taken by the caller after processing a VSR event.
 #[derive(Debug, Clone)]
+pub enum CommitOutcome {
+    /// Heartbeat ignored (stale view, foreign sender, wrong status, or replay).
+    Ignored,
+    /// Heartbeat accepted; `commit_max` unchanged.
+    Accepted,
+    /// Heartbeat accepted and `commit_max` advanced; run `commit_journal`.
+    Advanced,
+    /// A replica is still heartbeating an older view in which it was
+    /// primary; this replica is the current view's primary and should
+    /// broadcast `StartView` so the stale replica adopts the view.
+    RespondStartView,
+}
+
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
@@ -1721,6 +1734,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Accept the StartView and transition to normal
+        tracing::info!(
+            replica = self.replica,
+            old_view = self.view.get(),
+            new_view = msg_view,
+            op = msg_op,
+            commit = msg_commit,
+            "adopting view from StartView"
+        );
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
@@ -1791,29 +1812,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
+    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
         assert_eq!(
             header.namespace, self.namespace,
             "Commit routed to wrong group"
         );
 
         if self.is_primary() {
-            return false;
+            // A heartbeat from the primary of an OLDER view means that
+            // replica missed our view change entirely -- typically it
+            // restarted while the view advanced and recovered the stale
+            // view from its journal (there is no durable view watermark),
+            // so the SVC/DVC/SV exchange never reached it. Left alone it
+            // wedges: it drops our newer-view traffic as foreign and we
+            // drop its stale prepares, while its live heartbeats keep its
+            // backups from electing anyone. Re-announcing the current view
+            // lets its `handle_start_view` adopt the view and cancel its
+            // stale pipeline.
+            if self.status.get() == Status::Normal
+                && header.view < self.view.get()
+                && header.replica == self.primary_index(header.view)
+            {
+                return CommitOutcome::RespondStartView;
+            }
+            return CommitOutcome::Ignored;
         }
 
         if self.status.get() != Status::Normal {
-            return false;
+            return CommitOutcome::Ignored;
         }
 
         if header.view != self.view.get() {
-            return false;
+            return CommitOutcome::Ignored;
         }
 
         // TODO: Once connection-level peer verification is added promote
         // this to an assert, the network layer would guarantee the sender
         // matches header.replica.
         if header.replica != self.primary_index(header.view) {
-            return false;
+            return CommitOutcome::Ignored;
         }
 
         // Only accept heartbeats with a strictly newer timestamp to prevent
@@ -1827,7 +1864,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let old_commit_max = self.commit_max.get();
         self.advance_commit_max(header.commit);
-        self.commit_max.get() > old_commit_max
+        if self.commit_max.get() > old_commit_max {
+            CommitOutcome::Advanced
+        } else {
+            CommitOutcome::Accepted
+        }
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.

@@ -179,13 +179,6 @@ impl BinaryTransport for TcpClient {
         #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
-            // The replayed login/register must mint a fresh Register: the
-            // failed attempt already consumed the one-shot register request
-            // id and may have half-bound the session.
-            *self
-                .consensus_session
-                .lock()
-                .expect("consensus session mutex poisoned") = ConsensusSession::new();
         }
 
         {

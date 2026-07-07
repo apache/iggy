@@ -1726,8 +1726,35 @@ where
         self.append_messages(message).await.map(|_| ())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, false).await
+    }
+
+    /// Flush the committed journal prefix to segment storage regardless of
+    /// the `messages_required_to_save` thresholds.
+    ///
+    /// Shutdown-path counterpart of the commit-time persist gate: a graceful
+    /// stop must not lose committed messages that were still resident in the
+    /// in-memory journal (consumer offsets are persisted eagerly, so losing
+    /// the messages would fail recovery with an offset ahead of the data).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError`] when writing the committed batches or their
+    /// index entries to segment storage fails.
+    pub async fn flush_committed_messages(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, true).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn commit_messages_inner(
+        &mut self,
+        config: &PartitionsConfig,
+        force: bool,
+    ) -> Result<(), IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -1748,7 +1775,7 @@ where
             >= config.size_of_messages_required_to_save.as_bytes_u64();
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
-        if !should_persist {
+        if !force && !should_persist {
             return Ok(());
         }
 

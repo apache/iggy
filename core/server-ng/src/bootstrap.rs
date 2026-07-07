@@ -34,7 +34,9 @@ use configs::server_ng::ServerNgConfig;
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
-use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
+use consensus::{
+    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+};
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
@@ -819,6 +821,7 @@ async fn shard_main(
                     recovered.journal,
                     recovered.snapshot,
                     recovered.last_applied_op,
+                    recovered.last_journaled_op,
                 )),
             )
         }
@@ -838,12 +841,14 @@ async fn shard_main(
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
     let (metadata_consensus, journal_for_metadata, snapshot_for_metadata) =
-        if let Some((journal, snapshot, last_applied_op)) = owner_state {
-            let restored_op = last_applied_op
-                .unwrap_or_else(|| snapshot.as_ref().map_or(0, IggySnapshot::sequence_number));
+        if let Some((journal, snapshot, last_applied_op, last_journaled_op)) = owner_state {
+            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
+            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
             let consensus = restore_metadata_consensus(
                 &journal,
                 restored_op,
+                commit_watermark,
                 topology.cluster_id,
                 topology.self_replica_id,
                 topology.replica_count,
@@ -1482,6 +1487,7 @@ async fn build_shard_for_thread(
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
+    commit_watermark: u64,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -1506,34 +1512,48 @@ fn restore_metadata_consensus(
 
     consensus.init();
     consensus.sequencer().set_sequence(restored_op);
-    // TODO(hubcio): clustered bootstrap does not persist a durable
-    // (view, commit_op) watermark, so we collapse commit_min/commit_max to
-    // `restored_op` (= last journaled op). VSR consequence: on a view
-    // change after partial recovery, a replica that came back with a
-    // commit_max below the cluster's true commit_min will accept stale
-    // prepares as new and overwrite already-committed log entries
-    // (split-brain on the committed prefix).
+    // The commit point is restored from the WAL's embedded watermark (each
+    // journaled prepare carries the primary's commit at send time), NOT from
+    // the journal head: journaled does not imply committed, and claiming
+    // commit for the un-quorum'd tail both risks split-brain on a later view
+    // change and starves the tail of re-replication (it would live in no
+    // pipeline). The suffix `(commit_watermark, restored_op]` is re-pipelined
+    // below when this replica is the recovered view's primary.
     //
-    // Fix direction: persist (view, commit_op) on the journal-header path
-    // (`core/journal/src/prepare_journal.rs` PrepareHeader already carries
-    // `view`; extend with `commit_op` or add a sidecar watermark file
-    // updated on every commit), seed `restore_commit_state(min, max)`
-    // from durable state on recovery, and refuse boot if the gap exceeds
-    // a configurable threshold. Tracked under the "durable
-    // PartitionJournal + durable (view, commit_op) watermark" milestone
-    // named in the multi-shard wiring commit body.
-    //
-    // Reproducible in `core/simulator` once it grows a restart-from-disk
-    // path: today `SimNetwork::enable_process` only un-disables links
-    // without replaying `SimJournal` + `SimSnapshot` through
-    // `restore_metadata_consensus`, so the flatten cannot trip. Add a
-    // crash-restart-replay primitive in the sim, then write a scenario
-    // that commits an op on the primary, crashes the primary mid-
-    // replicate-ack, triggers a view change, and asserts the recovered
-    // replica refuses to re-accept the committed prepare.
-    consensus.restore_commit_state(restored_op, restored_op);
+    // TODO(hubcio): the watermark is a lower bound (the last entry stamps
+    // the commit point as of its send). Persisting an explicit (view,
+    // commit_op) watermark on the commit path would tighten recovery and
+    // allow refusing boot on an excessive gap; a backup that recovered a
+    // LONGER tail than the cluster's primary still needs uncommitted-suffix
+    // truncation when conflicting ops arrive (message repair milestone).
+    consensus.restore_commit_state(commit_watermark, commit_watermark);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
+    }
+
+    // Re-pipeline the prepared-but-uncommitted suffix so the primary's
+    // retransmit machinery re-replicates it and quorum can (re-)commit it.
+    // A backup's suffix stays journal-only: the primary's traffic either
+    // confirms it (re-forward + re-ack path) or supersedes it.
+    if consensus.is_primary() && commit_watermark < restored_op {
+        info!(
+            commit_watermark,
+            restored_op, "re-pipelining recovered uncommitted metadata suffix"
+        );
+        let mut pipeline = consensus.pipeline().borrow_mut();
+        #[allow(clippy::cast_possible_truncation)]
+        for op in (commit_watermark + 1)..=restored_op {
+            let Some(header) = journal.header(op as usize) else {
+                warn!(
+                    op,
+                    "recovered journal suffix has a gap; stopping re-pipeline"
+                );
+                break;
+            };
+            let mut entry = PipelineEntry::new(*header);
+            entry.add_ack(self_replica_id);
+            pipeline.push(entry);
+        }
     }
 
     consensus

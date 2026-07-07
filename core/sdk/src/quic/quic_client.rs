@@ -177,13 +177,6 @@ impl BinaryTransport for QuicClient {
         #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
-            // The replayed login/register must mint a fresh Register: the failed
-            // attempt already consumed the one-shot register request id and may
-            // have half-bound the session.
-            *self
-                .consensus_session
-                .lock()
-                .expect("consensus session mutex poisoned") = ConsensusSession::new();
         }
         let server_address = self.current_server_address.lock().await.to_string();
         info!(
