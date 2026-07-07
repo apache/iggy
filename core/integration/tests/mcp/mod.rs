@@ -16,11 +16,12 @@
 // under the License.
 
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
-    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo,
-    UserInfoDetails,
+    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo,
+    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken,
+    Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
 };
+#[cfg(not(feature = "vsr"))]
+use iggy_common::{ClusterMetadata, Snapshot};
 use integration::{
     harness::{McpClient, seeds},
     iggy_harness,
@@ -85,6 +86,7 @@ async fn should_handle_ping(harness: &TestHarness) {
     invoke_empty(&mcp_client, "ping", None).await;
 }
 
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(cluster.enabled = true, mcp))]
 async fn should_return_cluster_metadata(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
@@ -359,6 +361,7 @@ async fn should_return_clients(harness: &TestHarness) {
     assert!(!clients.is_empty());
 }
 
+#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_handle_snapshot(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
