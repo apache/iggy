@@ -134,6 +134,8 @@ fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// A key absent from `memory.stat` counts as zero (kernels omit
+/// feature-gated counters); only an unreadable file yields `None`.
 fn read_reclaimable(stat_path: &Path, keys: &[&'static str; 2]) -> Option<u64> {
     let stat = fs::read_to_string(stat_path).ok()?;
     let mut reclaimable = 0u64;
@@ -145,8 +147,8 @@ fn read_reclaimable(stat_path: &Path, keys: &[&'static str; 2]) -> Option<u64> {
                 return None;
             }
             value.trim().parse::<u64>().ok()
-        })?;
-        reclaimable = reclaimable.saturating_add(value);
+        });
+        reclaimable = reclaimable.saturating_add(value.unwrap_or(0));
     }
 
     Some(reclaimable)
@@ -205,6 +207,21 @@ mod tests {
         let available = available_memory_within(&leaf, root.path(), &CGROUP_V2, HOST_TOTAL);
 
         assert_eq!(available, Some(100));
+    }
+
+    #[test]
+    fn v2_missing_reclaimable_key_counts_as_zero() {
+        let root = tempdir().unwrap();
+        let leaf = root.path().join("leaf");
+        create_dir_all(&leaf).unwrap();
+        write(root.path().join("memory.max"), "max").unwrap();
+        write(leaf.join("memory.max"), "1000").unwrap();
+        write(leaf.join("memory.current"), "900").unwrap();
+        write(leaf.join("memory.stat"), "anon 300\ninactive_file 400\n").unwrap();
+
+        let available = available_memory_within(&leaf, root.path(), &CGROUP_V2, HOST_TOTAL);
+
+        assert_eq!(available, Some(500));
     }
 
     #[test]

@@ -161,9 +161,8 @@ impl IggyShard {
 ///
 /// `global_cpu_usage` averages every host core, so a cpuset-confined
 /// instance would report its neighbors' load. `None` when the process
-/// is unrestricted (or a core id falls outside `sys.cpus()`, which
-/// indexes only online cores), where the host-global number is already
-/// the right one.
+/// is unrestricted (or an allowed core is missing from `sys.cpus()`),
+/// where the host-global number is already the right one.
 fn allowed_cores_cpu_usage(sys: &SysinfoSystem) -> Option<f32> {
     let cpus = sys.cpus();
     let allowed = allowed_cpus();
@@ -173,7 +172,8 @@ fn allowed_cores_cpu_usage(sys: &SysinfoSystem) -> Option<f32> {
 
     let mut total_usage = 0.0f32;
     for cpu_id in &allowed {
-        total_usage += cpus.get(*cpu_id)?.cpu_usage();
+        let name = format!("cpu{cpu_id}");
+        total_usage += cpus.iter().find(|cpu| cpu.name() == name)?.cpu_usage();
     }
 
     Some(total_usage / allowed.len() as f32)
