@@ -381,9 +381,6 @@ impl ShardAllocator {
                 Ok(shard_assignments)
             }
             CpuAllocation::Range(start, end) => {
-                // `ShardingConfig::validate` rejects this too, but this is a
-                // pub fn: a caller skipping validation would underflow
-                // `end - start` below.
                 if start >= end {
                     return Err(ShardingError::InvalidRange {
                         start: *start,

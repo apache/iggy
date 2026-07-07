@@ -97,11 +97,6 @@ impl IggyShard {
                     .filter(|limits| limits.total_memory < sys.total_memory())
                 {
                     stats.total_memory = limits.total_memory.into();
-                    // `limits.free_memory` is limit minus `memory.current`,
-                    // which charges reclaimable page cache as used: on a
-                    // cache-heavy server it trends toward zero long before
-                    // the kernel would OOM. Prefer the MemAvailable
-                    // equivalent that adds the reclaimable cache back.
                     stats.available_memory = cgroup_available_memory(sys.total_memory())
                         .unwrap_or(limits.free_memory)
                         .min(limits.total_memory)
