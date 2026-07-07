@@ -21,9 +21,12 @@
 #[cfg(not(feature = "vsr"))]
 mod verify_after_server_restart;
 #[cfg(not(feature = "vsr"))]
-mod verify_no_plaintext_credentials_on_disk;
-#[cfg(not(feature = "vsr"))]
 mod verify_user_login_after_restart;
+
+// Not restart-based: it creates a user + PAT, stops the server, and greps the
+// data dir for plaintext. No replica catch-up needed, and server-ng hashes the
+// password / PAT before either reaches the WAL, so it runs under vsr too.
+mod verify_no_plaintext_credentials_on_disk;
 
 // The cooperative-rebalance matrix runs under vsr too: it exercises server-ng's
 // consumer-group rebalancing (a VSR feature) and never restarts the cluster, so
@@ -33,3 +36,8 @@ mod verify_consumer_group_partition_assignment;
 // Cross-replica on-disk data identity is VSR-only.
 #[cfg(feature = "vsr")]
 mod verify_cluster_replica_data_identical;
+
+// Auto-commit offset replication is inherently a multi-node (VSR) property: the
+// backup only holds the offset if the poll's auto-commit rode consensus.
+#[cfg(feature = "vsr")]
+mod verify_auto_commit_offset_replicates;

@@ -16,12 +16,11 @@
 // under the License.
 
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo,
-    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken,
-    Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
+    ClientInfo, ClientInfoDetails, ClusterMetadata, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerOffsetInfo, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo,
+    UserInfoDetails,
 };
-#[cfg(not(feature = "vsr"))]
-use iggy_common::{ClusterMetadata, Snapshot};
 use integration::{
     harness::{McpClient, seeds},
     iggy_harness,
@@ -86,8 +85,10 @@ async fn should_handle_ping(harness: &TestHarness) {
     invoke_empty(&mcp_client, "ping", None).await;
 }
 
-#[cfg(not(feature = "vsr"))]
-#[iggy_harness(server(cluster.enabled = true, mcp))]
+// Pins two nodes: the default vsr harness spawns three, but this test asserts a
+// two-node roster. Exercises the binary GetClusterMetadata roster end-to-end
+// over MCP (MCP server -> TCP -> iggy).
+#[iggy_harness(cluster_nodes = 2, server(mcp))]
 async fn should_return_cluster_metadata(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let cluster: ClusterMetadata = invoke(&mcp_client, "get_cluster_metadata", None).await;
@@ -361,7 +362,6 @@ async fn should_return_clients(harness: &TestHarness) {
     assert!(!clients.is_empty());
 }
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]
 async fn should_handle_snapshot(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");

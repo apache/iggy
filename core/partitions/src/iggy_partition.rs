@@ -20,7 +20,7 @@ use crate::journal::{MessageLookup, PartitionJournal, PartitionJournalMemStorage
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
-use crate::offset_storage::{delete_persisted_offset, persist_offset};
+use crate::offset_storage::{delete_persisted_offset, persist_offset, persist_offset_max};
 use crate::poll_plan::{
     AutoCommitCtx, AutoCommitTarget, DiskReadPlan, DiskSegment, LastPolledCtx, PollPlan, PollTier,
     ResidentTailSnapshot,
@@ -33,8 +33,8 @@ use crate::{
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_from_request, build_reply_message,
-    build_result_rejection_reply, drain_committable_prefix, emit_namespace_progress_event,
+    ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
+    build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
     emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, replicate_preflight,
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
@@ -49,7 +49,7 @@ use iggy_common::{
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
 };
 use journal::Journal as _;
-use message_bus::{IggyMessageBus, MessageBus};
+use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
     Message, SegmentStorage,
     iobuf::Frozen,
@@ -58,7 +58,9 @@ use server_common::{
     },
     sharding::IggyNamespace,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +107,19 @@ where
     partition_dir: Option<String>,
     consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+    /// Committed-only mirror of each consumer's persisted offset file: the
+    /// last value this replica durably wrote per (kind, consumer id). Fed
+    /// exclusively by the file-writing paths (replicated commit-apply, the
+    /// primary-local `NoAck` store, purge/delete/reclaim) and never by the
+    /// eager poll-path in-memory apply, so both readers see committed state
+    /// only: the auto-commit persist gate (skip or blind-write, no per-commit
+    /// file read) and the submit-side coalesce gate
+    /// ([`Self::is_auto_commit_offset_covered`]). A cold key (first touch
+    /// after boot) folds against the file once via `persist_offset_max`, so
+    /// the tracker rebuilds from disk lazily and deterministically.
+    /// `RefCell`: mutated from `&self` paths on the single shard thread;
+    /// borrows never cross an await.
+    persisted_offsets: RefCell<HashMap<(ConsumerKind, u32), u64>>,
     observed_view: u32,
     /// Highest `PurgeTopic` generation this replica has locally applied (reset
     /// the partition to empty). The reconciler compares the committed metadata
@@ -131,6 +146,11 @@ struct PendingConsumerOffsetCommit {
     kind: ConsumerKind,
     consumer_id: u32,
     mutation: PendingConsumerOffsetMutation,
+    /// A server auto-commit (a poll's `auto_commit`, replicated via the reserved
+    /// `AUTO_COMMIT_CLIENT_ID`): the commit-apply must be monotone so it cannot
+    /// rewind the eager in-memory offset a newer poll already advanced. Explicit
+    /// client stores leave this `false` (a store may legitimately rewind).
+    auto_commit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,6 +165,17 @@ impl PendingConsumerOffsetCommit {
             kind,
             consumer_id,
             mutation: PendingConsumerOffsetMutation::Upsert(offset),
+            auto_commit: false,
+        }
+    }
+
+    /// Monotone-apply variant for a server auto-commit op. See `auto_commit`.
+    const fn upsert_auto_commit(kind: ConsumerKind, consumer_id: u32, offset: u64) -> Self {
+        Self {
+            kind,
+            consumer_id,
+            mutation: PendingConsumerOffsetMutation::Upsert(offset),
+            auto_commit: true,
         }
     }
 
@@ -153,6 +184,7 @@ impl PendingConsumerOffsetCommit {
             kind,
             consumer_id,
             mutation: PendingConsumerOffsetMutation::Delete,
+            auto_commit: false,
         }
     }
 
@@ -198,6 +230,7 @@ where
             partition_dir: None,
             consumer_offset_enforce_fsync: false,
             pending_consumer_offset_commits: HashMap::new(),
+            persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
         }
@@ -269,8 +302,13 @@ where
         kind: ConsumerKind,
         consumer_id: u32,
         offset: u64,
+        auto_commit: bool,
     ) {
-        let pending = PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset);
+        let pending = if auto_commit {
+            PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
+        } else {
+            PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
+        };
         self.pending_consumer_offset_commits.insert(op, pending);
     }
 
@@ -322,12 +360,65 @@ where
         let Some(path) = self.persisted_offset_path(pending.kind, pending.consumer_id) else {
             return Ok(());
         };
+        let key = (pending.kind, pending.consumer_id);
         match pending.mutation {
-            PendingConsumerOffsetMutation::Upsert(offset) => {
-                persist_offset(&path, offset, self.consumer_offset_enforce_fsync).await
+            // A server auto-commit persists monotonically: its op offset can
+            // trail the durably-recorded value (disk-tier polls replicate in
+            // IO-completion order), so a plain overwrite would rewind the file
+            // and re-deliver on restart. The `persisted_offsets` tracker keeps
+            // the fold off the file: a covered offset skips the write, an
+            // advancing one blind-writes, and only a cold key (first commit
+            // after boot) reads the file once. Explicit client stores
+            // overwrite, so a deliberate offset reset still holds. Mirrors the
+            // in-memory `upsert_offset_max` vs `upsert_offset` split in the
+            // commit-apply.
+            PendingConsumerOffsetMutation::Upsert(offset) if pending.auto_commit => {
+                let tracked = self.persisted_offsets.borrow().get(&key).copied();
+                let persisted = match tracked {
+                    Some(high_water) if offset <= high_water => return Ok(()),
+                    Some(_) => {
+                        persist_offset(&path, offset, self.consumer_offset_enforce_fsync).await?;
+                        offset
+                    }
+                    None => {
+                        persist_offset_max(&path, offset, self.consumer_offset_enforce_fsync)
+                            .await?
+                    }
+                };
+                self.persisted_offsets.borrow_mut().insert(key, persisted);
+                Ok(())
             }
-            PendingConsumerOffsetMutation::Delete => delete_persisted_offset(&path).await,
+            PendingConsumerOffsetMutation::Upsert(offset) => {
+                persist_offset(&path, offset, self.consumer_offset_enforce_fsync).await?;
+                self.persisted_offsets.borrow_mut().insert(key, offset);
+                Ok(())
+            }
+            PendingConsumerOffsetMutation::Delete => {
+                delete_persisted_offset(&path).await?;
+                self.persisted_offsets.borrow_mut().remove(&key);
+                Ok(())
+            }
         }
+    }
+
+    /// Whether the committed high-water for this consumer already covers
+    /// `offset`, so a poll's auto-commit submit cannot advance it and may be
+    /// skipped instead of burning a consensus op. Reads committed state only
+    /// (the tracker is fed at commit-apply, never by the eager poll-path
+    /// apply): an offset covered in memory but not yet committed keeps
+    /// resubmitting until the covering op actually lands, so a dropped
+    /// in-flight op self-heals on the next poll.
+    #[must_use]
+    pub fn is_auto_commit_offset_covered(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: u64,
+    ) -> bool {
+        self.persisted_offsets
+            .borrow()
+            .get(&(kind, consumer_id))
+            .is_some_and(|&high_water| offset <= high_water)
     }
 
     fn apply_consumer_offset_commit(
@@ -340,12 +431,19 @@ where
             {
                 let id = pending.consumer_id;
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                crate::poll_plan::upsert_offset(&self.consumer_offsets, key, offset, || {
+                let create = || {
                     self.consumer_offsets_path.as_deref().map_or_else(
                         || ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
                         |path| ConsumerOffset::default_for_consumer(id, path),
                     )
-                });
+                };
+                upsert_committed_offset(
+                    &self.consumer_offsets,
+                    key,
+                    offset,
+                    pending.auto_commit,
+                    create,
+                );
                 Ok(())
             }
             PendingConsumerOffsetMutation::Upsert(offset)
@@ -355,7 +453,7 @@ where
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                crate::poll_plan::upsert_offset(&self.consumer_group_offsets, key, offset, || {
+                let create = || {
                     self.consumer_group_offsets_path.as_deref().map_or_else(
                         || {
                             ConsumerOffset::new(
@@ -367,7 +465,14 @@ where
                         },
                         |path| ConsumerOffset::default_for_consumer_group(key, path),
                     )
-                });
+                };
+                upsert_committed_offset(
+                    &self.consumer_group_offsets,
+                    key,
+                    offset,
+                    pending.auto_commit,
+                    create,
+                );
                 Ok(())
             }
             // Commit-time apply keeps its invariant check on the PRIMARY:
@@ -443,6 +548,9 @@ where
         let mut paths = Vec::with_capacity(dead.len());
         for group_id in dead {
             pinned.remove(&ConsumerGroupId(group_id as usize));
+            self.persisted_offsets
+                .borrow_mut()
+                .remove(&(ConsumerKind::ConsumerGroup, group_id as u32));
             if let Some(path) =
                 self.persisted_offset_path(ConsumerKind::ConsumerGroup, group_id as u32)
             {
@@ -713,10 +821,11 @@ where
         }
     }
 
-    /// Capture the owned inputs for an auto-commit, if requested. The committed
-    /// offset is unknown until the poll completes, so the persist path + fsync
-    /// flag (for the disk write) and the lock-free offset-map `Arc` (for the
-    /// in-memory apply) are captured here, so both run off the partition borrow.
+    /// Capture the owned inputs for an auto-commit, if requested: the lock-free
+    /// offset-map `Arc` and the target consumer/group id, so the in-memory apply
+    /// runs off the partition borrow once the poll's served offset is known.
+    /// Durability is not captured here: the poll no longer writes the offset
+    /// file, the serving shard replicates the offset through consensus instead.
     fn auto_commit_ctx(
         &self,
         consumer: PollingConsumer,
@@ -726,7 +835,6 @@ where
             return None;
         }
         let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, 0).ok()?;
-        let offset_path = self.persisted_offset_path(pending.kind, pending.consumer_id);
         let target = match pending.kind {
             ConsumerKind::Consumer => AutoCommitTarget::Consumer {
                 offsets: self.consumer_offsets.clone(),
@@ -739,11 +847,7 @@ where
                 create_path: self.consumer_group_offsets_path.clone(),
             },
         };
-        Some(AutoCommitCtx {
-            offset_path,
-            enforce_fsync: self.consumer_offset_enforce_fsync,
-            target,
-        })
+        Some(AutoCommitCtx { target })
     }
 
     /// Synchronous in-memory journal poll, for the resident tier. Never awaits
@@ -1052,30 +1156,30 @@ where
                     .with_operation(message.header().operation)
                     .with_error(error.to_string()),
                 );
-                // Reply with a terminal error instead of dropping the request:
-                // the SDK decodes any non-`TransientNotCommitted` result code as a
-                // final error, so the client gets `ConsumerOffsetNotFound` at once
-                // rather than replaying until its read-timeout (a client hang).
-                // The op is NOT admitted/replicated, so no replica ever applies a
-                // delete for an offset the primary knows is absent.
-                let reply = build_result_rejection_reply(
+                // Deny on the primary before the op enters the pipeline: nothing
+                // replicates, so backups never see the rejected delete, and the
+                // client gets a typed failure instead of waiting out its reply
+                // timeout. The code rides `ReplyHeader.status` (not the result
+                // body): the HTTP listener's `classify_partition_reply` reads the
+                // status field to render the typed 404.
+                Self::send_partition_deny_or_log(
+                    consensus,
                     message.header(),
-                    self.consensus().commit_max(),
                     error.as_code(),
-                );
-                let _ = self
-                    .consensus()
-                    .message_bus()
-                    .send_to_client(client_id, reply.into_generic().into_frozen())
-                    .await;
+                    "delete_consumer_offset deny reply send failed",
+                )
+                .await;
                 return;
             }
 
-            // Reject an out-of-range consumer-offset store at admission with a
-            // terminal `InvalidOffset` (result-framed like the delete rejection),
-            // mirroring the legacy `validate_partition_offset`: an empty partition
-            // accepts no offset, and a stored offset may not run ahead of the
-            // committed offset. Done here so the doomed op is never replicated.
+            // Reject an out-of-range consumer-offset store at admission,
+            // mirroring the legacy `validate_partition_offset`: an empty
+            // partition accepts no offset, and a stored offset may not run ahead
+            // of the committed offset. Done here so the doomed op is never
+            // replicated. Like the delete-offset deny above, the typed
+            // `InvalidOffset` rides `ReplyHeader.status` (op=0, empty body): the
+            // status-only `classify_partition_reply` would misread a result-body
+            // code on this committed-shaped frame (op=commit_max) as success.
             if matches!(
                 message.header().operation,
                 Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
@@ -1094,16 +1198,13 @@ where
                         .with_operation(message.header().operation)
                         .with_error(IggyError::InvalidOffset(requested_offset).to_string()),
                     );
-                    let reply = build_result_rejection_reply(
+                    Self::send_partition_deny_or_log(
+                        consensus,
                         message.header(),
-                        self.consensus().commit_max(),
                         IggyError::InvalidOffset(requested_offset).as_code(),
-                    );
-                    let _ = self
-                        .consensus()
-                        .message_bus()
-                        .send_to_client(client_id, reply.into_generic().into_frozen())
-                        .await;
+                        "store_consumer_offset deny reply send failed",
+                    )
+                    .await;
                     return;
                 }
             }
@@ -1578,6 +1679,7 @@ where
                             kind,
                             consumer_id,
                             offset.expect("store_consumer_offset must include offset"),
+                            is_auto_commit_client(header.client),
                         );
                     }
                     Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
@@ -1839,7 +1941,7 @@ where
         let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
         let mut messages_committed = false;
 
-        for mut entry in drained {
+        for entry in drained {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
@@ -1889,20 +1991,17 @@ where
             // No reply cache: at-least-once means retries re-commit at new
             // offsets. Only primary delivers replies; backups just advance
             // commit. Session lifecycle is metadata-only.
-            let reply = build_reply_message(
-                &prepare_header,
-                &committed_reply_body(prepare_header.operation),
-            );
-
-            // TODO: no production caller yet. Partition has no in-process
-            // subscriber (only metadata uses pipeline_message_with_subscriber);
-            // wired for forward-compat. Fired AFTER local commit (slot-first
-            // ordering analog). Dropped receiver ignored.
-            if let Some(sender) = entry.take_reply_sender() {
-                let _ = sender.send(reply.clone());
-            }
-
-            if send_client_replies {
+            //
+            // A server-generated auto-commit op (a poll's `auto_commit`,
+            // replicated for failover) carries the reserved
+            // `AUTO_COMMIT_CLIENT_ID`: no client ever waits on it, so skip the
+            // reply. Emitting it would push an unrequested frame onto a real
+            // client's lockstep reply stream if the sentinel ever routed there.
+            if send_client_replies && !is_auto_commit_client(prepare_header.client) {
+                let reply = build_reply_message(
+                    &prepare_header,
+                    &committed_reply_body(prepare_header.operation),
+                );
                 let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
@@ -2069,6 +2168,34 @@ where
             .get(std::mem::size_of::<RequestHeader>()..total_size)
             .ok_or(IggyError::InvalidCommand)?;
         Self::parse_consumer_offset_payload(operation, body)
+    }
+
+    /// Send `header`'s deny reply with `status` on `ReplyHeader.status` (empty
+    /// body, op=0), logging a WARN under `send_fail_label` if the reply send
+    /// fails. Callers deny on the primary, before the op enters the pipeline,
+    /// so nothing replicates.
+    async fn send_partition_deny_or_log(
+        consensus: &VsrConsensus<B>,
+        header: &RequestHeader,
+        status: u32,
+        send_fail_label: &'static str,
+    ) {
+        let reply = build_deny_reply_from_request(consensus, header, status);
+        if let Err(send_error) = consensus
+            .message_bus()
+            .send_to_client(header.client, reply.into_generic().into_frozen())
+            .await
+        {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                    send_fail_label,
+                )
+                .with_operation(header.operation)
+                .with_error(send_error.to_string()),
+            );
+        }
     }
 
     fn parse_staged_consumer_offset_commit(
@@ -2680,6 +2807,10 @@ where
         for path in consumer_paths.into_iter().chain(group_paths) {
             let _ = delete_persisted_offset(&path).await;
         }
+        // The persisted-offset tracker mirrors the files unlinked above; a
+        // stale entry would make a post-purge auto-commit skip its write and
+        // lose the offset on restart.
+        self.persisted_offsets.borrow_mut().clear();
 
         // Clear the ephemeral cooperative-rebalance tracking too: after the
         // reset to offset 0 a stale `last_polled` (a high pre-purge offset)
@@ -2712,6 +2843,28 @@ where
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
         send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+    }
+}
+
+/// Commit-apply an upserted offset into a lock-free offset map. A server
+/// auto-commit already advanced this offset in memory on the serving poll and
+/// this replicated commit can land behind a newer poll, so it must be
+/// monotone (`fetch_max`) or it rewinds the map and re-serves consumed
+/// messages. An explicit client store keeps the rewinding `store` (an offset
+/// reset is a valid action).
+fn upsert_committed_offset<K>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    offset: u64,
+    auto_commit: bool,
+    create_on_miss: impl FnOnce() -> ConsumerOffset,
+) where
+    K: Hash + Eq + Clone + Send + Sync,
+{
+    if auto_commit {
+        crate::poll_plan::upsert_offset_max(map, key, offset, create_on_miss);
+    } else {
+        crate::poll_plan::upsert_offset(map, key, offset, create_on_miss);
     }
 }
 
@@ -2840,9 +2993,14 @@ mod tests {
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
+    use iggy_binary_protocol::{Command2, ReplyHeader, WireConsumer, WireEncode};
+    use message_bus::SendError;
+    use server_common::MESSAGE_ALIGN;
     use server_common::send_messages2::{
         COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
     };
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     const TEST_CLUSTER: u128 = 1;
 
@@ -2863,6 +3021,317 @@ mod tests {
             IggyByteSize::from(1024 * 1024),
             false,
         )
+    }
+
+    /// Client-facing bus that records every `send_to_client` frame so tests
+    /// can assert on reply bytes without a connection registry (whose slot
+    /// guard would borrow the partition across `on_request(&mut self)`).
+    #[derive(Debug, Default)]
+    struct RecordingBus {
+        sent_to_clients: Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>,
+    }
+
+    impl MessageBus for RecordingBus {
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+
+        async fn send_to_client(
+            &self,
+            client_id: u128,
+            data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            self.sent_to_clients.borrow_mut().push((client_id, data));
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+    }
+
+    type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
+
+    fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let bus = RecordingBus::default();
+        let sent_to_clients = bus.sent_to_clients.clone();
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            1,
+            namespace.inner(),
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        );
+        (partition, sent_to_clients)
+    }
+
+    fn delete_offset_request(
+        client_id: u128,
+        request_id: u64,
+        consumer_id: u32,
+    ) -> Message<RequestHeader> {
+        let body = DeleteConsumerOffset2Request {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
+            stream_id: WireIdentifier::Numeric(1),
+            topic_id: WireIdentifier::Numeric(1),
+            partition_id: Some(0),
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&body);
+        message.transmute_header(|_, header: &mut RequestHeader| {
+            header.command = Command2::Request;
+            header.operation = Operation::DeleteConsumerOffset2;
+            header.client = client_id;
+            header.session = 1;
+            header.request = request_id;
+            header.namespace = IggyNamespace::new(1, 1, 0).inner();
+            header.size = u32::try_from(total).expect("request size fits u32");
+        })
+    }
+
+    /// Deleting a consumer offset that was never stored must answer with a
+    /// typed deny reply (empty body, `status` = `ConsumerOffsetNotFound`,
+    /// `op` 0) before consensus: nothing may enter the pipeline, and an
+    /// awaited client write must fail fast instead of waiting out its reply
+    /// timeout. Once the offset exists, the same request must pass the gate
+    /// into the pipeline without a deny.
+    #[compio::test]
+    async fn on_request_delete_of_missing_offset_replies_typed_deny() {
+        let (mut partition, sent_to_clients) = recording_partition();
+        let client_id: u128 = 42;
+        let consumer_id: u32 = 5;
+
+        partition
+            .on_request(delete_offset_request(client_id, 7, consumer_id))
+            .await;
+
+        {
+            let sent = sent_to_clients.borrow();
+            assert_eq!(sent.len(), 1, "exactly one deny reply");
+            let (reply_client, frame) = &sent[0];
+            assert_eq!(*reply_client, client_id);
+            let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+            )
+            .expect("deny frame starts with a valid reply header");
+            assert_eq!(header.command, Command2::Reply);
+            assert_eq!(
+                header.status,
+                IggyError::ConsumerOffsetNotFound(0).as_code()
+            );
+            assert_eq!(header.op, 0, "a deny commits nothing");
+            assert_eq!(header.request, 7);
+            assert_eq!(
+                header.size as usize,
+                std::mem::size_of::<ReplyHeader>(),
+                "deny reply body must be empty"
+            );
+        }
+        assert_eq!(
+            partition.consensus().pipeline().borrow().len(),
+            0,
+            "denied delete must not replicate"
+        );
+        assert!(partition.pending_consumer_offset_commits.is_empty());
+
+        // Existing offset: the gate passes and the delete enters the pipeline.
+        partition.consumer_offsets.pin().insert(
+            consumer_id as usize,
+            ConsumerOffset::new(ConsumerKind::Consumer, consumer_id, 3, String::new()),
+        );
+        partition
+            .on_request(delete_offset_request(client_id, 8, consumer_id))
+            .await;
+        assert_eq!(
+            partition.consensus().pipeline().borrow().len(),
+            1,
+            "existing offset delete must replicate"
+        );
+    }
+
+    fn unique_temp_offset_dir() -> String {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "iggy-offset-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// A server auto-commit persists monotonically. Disk-tier polls replicate
+    /// their offsets in IO-completion order, so the last committed op can carry
+    /// a lower offset than an earlier one; the file must keep the max or a
+    /// restart reloads the rewound value and re-delivers. An explicit client
+    /// store still overwrites, so a deliberate offset reset holds.
+    #[compio::test]
+    async fn auto_commit_offset_persists_monotonically_explicit_store_rewinds() {
+        let mut partition = test_partition();
+        let dir = unique_temp_offset_dir();
+        partition.consumer_offsets_path = Some(dir.clone());
+        let consumer_id: u32 = 5;
+        let path = format!("{dir}/{consumer_id}");
+        let read_disk = |p: &str| -> u64 {
+            let bytes = std::fs::read(p).expect("offset file exists");
+            u64::from_le_bytes(bytes.try_into().expect("offset file is 8 bytes"))
+        };
+
+        // Reordered auto-commits: the later op (109) trails the earlier (114).
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+                ConsumerKind::Consumer,
+                consumer_id,
+                114,
+            ))
+            .await
+            .expect("auto-commit persist 114");
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+                ConsumerKind::Consumer,
+                consumer_id,
+                109,
+            ))
+            .await
+            .expect("auto-commit persist 109");
+        assert_eq!(
+            read_disk(&path),
+            114,
+            "auto-commit must not rewind the file on IO-completion reorder"
+        );
+
+        assert!(
+            partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            "committed high-water covers the persisted offset"
+        );
+        assert!(
+            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 115),
+            "an advancing offset is not covered and must submit"
+        );
+
+        // An explicit client store may deliberately rewind.
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert(
+                ConsumerKind::Consumer,
+                consumer_id,
+                109,
+            ))
+            .await
+            .expect("explicit store persist 109");
+        assert_eq!(read_disk(&path), 109, "explicit store may rewind the file");
+        assert!(
+            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            "explicit rewind lowers the high-water so a later auto-commit may re-advance"
+        );
+
+        // The accepted edge: an auto-commit racing the explicit rewind
+        // re-advances the file past it.
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+                ConsumerKind::Consumer,
+                consumer_id,
+                114,
+            ))
+            .await
+            .expect("auto-commit persist 114 after rewind");
+        assert_eq!(
+            read_disk(&path),
+            114,
+            "auto-commit re-advances past a rewind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The persisted-offset tracker is cold after a restart; the first
+    /// auto-commit folds against the file once (so a pre-existing higher value
+    /// wins, exactly like the old per-commit read-modify-write) and warms the
+    /// tracker with the on-disk value, not the op's. A delete drops both the
+    /// file and the tracker entry so a later auto-commit starts a fresh fold.
+    #[compio::test]
+    async fn auto_commit_cold_key_folds_against_file_once() {
+        let mut partition = test_partition();
+        let dir = unique_temp_offset_dir();
+        partition.consumer_offsets_path = Some(dir.clone());
+        let consumer_id: u32 = 5;
+        let path = format!("{dir}/{consumer_id}");
+        let read_disk = |p: &str| -> u64 {
+            let bytes = std::fs::read(p).expect("offset file exists");
+            u64::from_le_bytes(bytes.try_into().expect("offset file is 8 bytes"))
+        };
+
+        // Simulate the previous process run: the file already holds 114.
+        persist_offset(&path, 114, false)
+            .await
+            .expect("seed offset file");
+        assert!(
+            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 1),
+            "a cold key is never covered; the first submit must go through"
+        );
+
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+                ConsumerKind::Consumer,
+                consumer_id,
+                109,
+            ))
+            .await
+            .expect("auto-commit persist 109 on cold key");
+        assert_eq!(
+            read_disk(&path),
+            114,
+            "cold-key fold must not rewind the pre-existing on-disk value"
+        );
+        assert!(
+            partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            "tracker warms with the on-disk value, not the trailing op offset"
+        );
+
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::delete(
+                ConsumerKind::Consumer,
+                consumer_id,
+            ))
+            .await
+            .expect("delete persisted offset");
+        assert!(!std::path::Path::new(&path).exists(), "file unlinked");
+        assert!(
+            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 1),
+            "delete drops the tracker entry with the file"
+        );
+
+        partition
+            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
+                ConsumerKind::Consumer,
+                consumer_id,
+                7,
+            ))
+            .await
+            .expect("auto-commit persist 7 after delete");
+        assert_eq!(read_disk(&path), 7, "post-delete auto-commit starts fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `reclaim_dead_group_offsets` must drop exactly the not-`is_live` groups

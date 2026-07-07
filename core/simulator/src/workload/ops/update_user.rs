@@ -67,6 +67,9 @@ pub fn sample(
         Outcome::UsernameAlreadyExists => {
             unreachable!("update_user does not target UsernameAlreadyExists")
         }
+        Outcome::InvalidUsername => {
+            unreachable!("update_user does not target InvalidUsername")
+        }
     }
 }
 
@@ -95,6 +98,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
                 new: new.clone(),
                 password: input.current_password.clone(),
             }),
-        _ => Effect::None,
+        Outcome::UserNotFound | Outcome::UsernameAlreadyExists | Outcome::InvalidUsername => {
+            Effect::None
+        }
     }
 }
