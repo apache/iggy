@@ -151,7 +151,13 @@ pub struct RequestHeader {
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub session: u64,
-    pub reserved: [u8; 56],
+    /// Acting user id, stamped by the metadata primary at admission for every
+    /// gated client op so the in-apply RBAC gate resolves the same identity on
+    /// every replica; on `Register` it carries the freshly authenticated user.
+    /// The submitter's wire value is never trusted. Zero for `Logout`,
+    /// partition-plane, and server-internal ops.
+    pub user_id: u32,
+    pub reserved: [u8; 52],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -159,7 +165,10 @@ const _: () = {
         offset_of!(RequestHeader, client)
             == offset_of!(RequestHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 56]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
+    );
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 52]>() == HEADER_SIZE);
 };
 
 impl Default for RequestHeader {
@@ -182,7 +191,8 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             namespace: 0,
             session: 0,
-            reserved: [0; 56],
+            user_id: 0,
+            reserved: [0; 52],
         }
     }
 }
@@ -272,7 +282,20 @@ pub struct ReplyHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 32],
+    /// Request-level status: 0 = ok; nonzero = the `IggyError` code for a
+    /// failure decided before commit (e.g. a dispatch-time authorization
+    /// denial, or the partition primary rejecting a consumer-offset op).
+    ///
+    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
+    /// reply always carries an EMPTY body. So this header channel and the
+    /// committed per-sub-op results in the metadata result section are mutually
+    /// exclusive by construction: a reply either commits (status 0, result
+    /// section present) or is denied before commit (status set, no body), and a
+    /// consumer never reconciles the two. Carved from `reserved` exactly like
+    /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
+    /// moves and `validate` does not inspect it.
+    pub status: u32,
+    pub reserved: [u8; 28],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -280,7 +303,10 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ReplyHeader, status) == offset_of!(ReplyHeader, namespace) + size_of::<u64>()
+    );
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -305,7 +331,8 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 32],
+            status: 0,
+            reserved: [0; 28],
         }
     }
 }
@@ -591,7 +618,10 @@ pub struct PrepareHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 32],
+    /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
+    /// that field for the stamping contract.
+    pub user_id: u32,
+    pub reserved: [u8; 28],
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -599,7 +629,11 @@ const _: () = {
         offset_of!(PrepareHeader, client)
             == offset_of!(PrepareHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(PrepareHeader, user_id)
+            == offset_of!(PrepareHeader, namespace) + size_of::<u64>()
+    );
+    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -624,7 +658,8 @@ impl Default for PrepareHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 32],
+            user_id: 0,
+            reserved: [0; 28],
         }
     }
 }
@@ -989,8 +1024,8 @@ impl ConsensusHeader for StartViewHeader {
 mod tests {
     use super::{
         Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-        EvictionReason, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
-        RequestHeader, StartViewChangeHeader, StartViewHeader,
+        EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
+        ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -1109,6 +1144,34 @@ mod tests {
         buf[60] = Command2::Reply as u8;
         let header: &ReplyHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
         assert_eq!(header.command, Command2::Reply);
+        assert!(header.validate().is_ok());
+    }
+
+    // `status` is carved from the reserved tail; the SDK reply funnel peeks it
+    // at this offset before any body decode, so a layout drift must trip here.
+    #[test]
+    fn reply_header_status_offset_and_size_pinned() {
+        use std::mem::offset_of;
+        assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
+        assert_eq!(
+            offset_of!(ReplyHeader, status),
+            offset_of!(ReplyHeader, namespace) + size_of::<u64>()
+        );
+        assert_eq!(
+            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>(),
+            HEADER_SIZE
+        );
+    }
+
+    // A nonzero status rides the reserved region, which reply `validate` does
+    // not inspect: a status-bearing reply stays valid so the SDK can peek it.
+    #[test]
+    fn reply_header_nonzero_status_still_validates() {
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            status: 41,
+            ..ReplyHeader::default()
+        };
         assert!(header.validate().is_ok());
     }
 

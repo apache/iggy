@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod client_error;
+pub mod eviction;
 pub(crate) mod iggy_error;
 
 // preserves existing internal import paths across

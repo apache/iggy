@@ -25,10 +25,12 @@
 //! in the consensus layer. This module tracks the binding between a
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
+use crate::cluster_meta::ClusterRoster;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Connection lifecycle states.
@@ -97,6 +99,11 @@ pub struct SessionManager {
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
     client_to_connection: HashMap<u128, u128>,
+    /// This shard's copy of the configured cluster roster, served by the
+    /// pre-auth `GetClusterMetadata` read. Lives here because it is the
+    /// per-shard context already threaded to the non-replicated read path;
+    /// installed once at bootstrap, disabled until then.
+    cluster_roster: Rc<ClusterRoster>,
 }
 
 impl SessionManager {
@@ -105,7 +112,19 @@ impl SessionManager {
         Self {
             connections: HashMap::new(),
             client_to_connection: HashMap::new(),
+            cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
+    }
+
+    /// Install this shard's configured cluster roster (once, at bootstrap).
+    pub fn set_cluster_roster(&mut self, roster: Rc<ClusterRoster>) {
+        self.cluster_roster = roster;
+    }
+
+    /// The configured cluster roster for the `GetClusterMetadata` read.
+    #[must_use]
+    pub fn cluster_roster(&self) -> Rc<ClusterRoster> {
+        Rc::clone(&self.cluster_roster)
     }
 
     pub fn ensure_connection(

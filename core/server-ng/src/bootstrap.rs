@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::auth::warm_dummy_password_hash;
+use crate::cluster_meta::ClusterRoster;
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
     make_partition_read_handler,
 };
+use crate::http;
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
@@ -519,6 +522,7 @@ pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
+    warm_dummy_password_hash();
     let sharding = &config.system.sharding;
     let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
         .map_err(ServerNgError::ShardAllocator)?;
@@ -1049,7 +1053,8 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        let on_client_request = make_client_request_handler(&shard, &sessions);
+        let on_client_request =
+            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1285,6 +1290,33 @@ fn spawn_shutdown_watchdog(
     watchdog.detach();
 }
 
+/// Copy the configured cluster roster plus this node's own client ports into
+/// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
+/// the real topology. `self_*` back only the cluster-disabled self-synthesis;
+/// the HTTP port is read from config since HTTP binds outside this topology.
+fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> ClusterRoster {
+    let http_port = if config.http.enabled {
+        parse_socket_addr("http.address", &config.http.address)
+            .ok()
+            .map(|addr| addr.port())
+    } else {
+        None
+    };
+    ClusterRoster {
+        enabled: config.cluster.enabled,
+        name: config.cluster.name.clone(),
+        nodes: config.cluster.nodes.clone(),
+        self_ip: topology.client_listen_addr.ip().to_string(),
+        self_ports: configs::cluster::TransportPorts {
+            tcp: Some(topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            http: http_port,
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            tcp_replica: None,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_shard_for_thread(
     shard_id: u16,
@@ -1402,10 +1434,19 @@ async fn build_shard_for_thread(
     let shard_handle = Rc::new(RefCell::new(None));
     // One per-shard SessionManager, shared by the client-request handler
     // (binds sessions) and the get_clients handler (reads them). Created
-    // here so both wirings reference the same instance.
+    // here so both wirings reference the same instance. It also carries this
+    // shard's cluster roster for the pre-auth GetClusterMetadata read.
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    sessions
+        .borrow_mut()
+        .set_cluster_roster(Rc::new(build_cluster_roster(config, topology)));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
+    let on_client_request = make_deferred_client_request_handler(
+        &bus,
+        &shard_handle,
+        &sessions,
+        Arc::clone(&config.system),
+    );
     let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
     let on_list_clients = make_list_clients_handler(&sessions);
     let on_partition_read = make_partition_read_handler(&shard_handle);
@@ -1817,7 +1858,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(
+        start_via_replica_io(
             shard,
             config,
             topology,
@@ -1825,18 +1866,45 @@ async fn start_tcp_runtime(
             dialed_replica,
             accepted_clients,
         )
-        .await;
+        .await?;
+    } else {
+        start_manual_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await?;
     }
 
-    start_manual_runtime(
-        shard,
-        config,
-        topology,
-        accepted_replica,
-        dialed_replica,
-        accepted_clients,
-    )
-    .await
+    // HTTP is served over TCP but sits outside the replica_io / manual client
+    // reactor, so it binds independently. Shard-0 gating comes from the sole
+    // caller of this function.
+    if config.http.enabled {
+        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+        let self_ports = configs::cluster::TransportPorts {
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            ..Default::default()
+        };
+        http::start(
+            shard,
+            http_addr,
+            &config.http,
+            &config.cluster,
+            Arc::clone(&config.system),
+            self_ports,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 // ws/wss bindings intentionally mirror the transport names (same convention as

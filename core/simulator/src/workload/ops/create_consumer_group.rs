@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CreateConsumerGroup` op. Targets `Ok` (fresh group under a live
-//! stream/topic) or `NameAlreadyExists` (an existing group name).
+//! `CreateConsumerGroup` op.
+//!
+//! Targets `Ok` (fresh group under a live stream/topic), `StreamNotFound`
+//! (a fabricated parent stream), `TopicNotFound` (a live stream with a
+//! fabricated topic), or `NameAlreadyExists` (an existing group name).
 
 use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
@@ -36,7 +39,12 @@ pub struct Input {
     pub name: String,
 }
 
-pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::NameAlreadyExists];
+pub const OUTCOMES: &[Outcome] = &[
+    Outcome::Ok,
+    Outcome::StreamNotFound,
+    Outcome::TopicNotFound,
+    Outcome::NameAlreadyExists,
+];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -52,6 +60,19 @@ pub fn sample(
                 stream,
                 topic,
                 name,
+            })
+        }
+        Outcome::StreamNotFound => Some(Input {
+            stream: shadow.fabricate_absent_name("stream"),
+            topic: shadow.fabricate_absent_name("topic"),
+            name: shadow.fresh_name("cg"),
+        }),
+        Outcome::TopicNotFound => {
+            let stream = shadow.pick_stream_name(prng)?;
+            Some(Input {
+                stream,
+                topic: shadow.fabricate_absent_name("topic"),
+                name: shadow.fresh_name("cg"),
             })
         }
         Outcome::NameAlreadyExists => {
@@ -87,6 +108,10 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
             topic: input.topic.clone(),
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists => Effect::None,
+        // A committed rejection is a no-op: an absent parent stream or topic, or
+        // a duplicate group name, leaves the shadow unchanged.
+        Outcome::StreamNotFound | Outcome::TopicNotFound | Outcome::NameAlreadyExists => {
+            Effect::None
+        }
     }
 }

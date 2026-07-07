@@ -37,9 +37,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
-use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::IggyError;
+use iggy_common::{IggyError, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
@@ -72,7 +71,12 @@ pub(crate) fn encode_request_header(
 ) -> Result<(RequestHeader, usize), IggyError> {
     let (operation, request_id, session_id) = match code {
         LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE => {
-            (Operation::Register, session.register_request_id(), 0)
+            // A re-login reuses this `ConsensusSession`; `begin_register`
+            // re-arms it (fresh session) so the Register encodes cleanly instead
+            // of tripping the one-shot register guard. Safe under the transport
+            // stream lock: it is lockstep (one request in flight), so no
+            // in-flight request observes the reset.
+            (Operation::Register, session.begin_register(), 0)
         }
         _ => {
             let operation = operation_for_code(code)?;
@@ -114,7 +118,7 @@ pub(crate) fn encode_request_header(
         .checked_add(payload.len())
         .ok_or(IggyError::InvalidConfiguration)?;
     let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
-    let mut reserved = [0; 56];
+    let mut reserved = [0; 52];
     if operation == Operation::NonReplicated {
         reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
     }
@@ -179,6 +183,9 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
             if response.len() < total_size {
                 return Err(IggyError::InvalidCommand);
             }
+            if let Some(error) = read_reply_status(header_bytes) {
+                return Err(error);
+            }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, response.slice(HEADER_SIZE..total_size))
         }
@@ -206,11 +213,32 @@ pub(crate) fn decode_response_split(
             if body.len() < expected_body {
                 return Err(IggyError::InvalidCommand);
             }
+            if let Some(error) = read_reply_status(header_bytes) {
+                return Err(error);
+            }
             let operation = read_operation(header_bytes)?;
             split_metadata_result(operation, body.slice(..expected_body))
         }
         _ => Err(IggyError::InvalidCommand),
     }
+}
+
+/// Peek `ReplyHeader.status`, the pre-commit deny channel shared by every deny
+/// frame: dispatch-time denies (authorization and a malformed user-password
+/// body) via `build_deny_reply`, and partition-primary admission rejects via
+/// `consensus::build_deny_reply_from_request`. Read before any body decode:
+/// a nonzero status maps to its [`IggyError`] and fails the request, an empty
+/// or partial body notwithstanding. `None` (status 0) lets the reply flow to
+/// the body/result-section decode. Read by wire offset for the same
+/// misalignment reason as [`read_operation`]; a committed metadata reply stamps
+/// 0 here and carries its business rejection in the result section (see
+/// `split_metadata_result`).
+fn read_reply_status(header_bytes: &[u8; HEADER_SIZE]) -> Option<IggyError> {
+    const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&header_bytes[STATUS_OFFSET..STATUS_OFFSET + 4]);
+    let status = u32::from_le_bytes(bytes);
+    (status != 0).then(|| IggyError::from_code(status))
 }
 
 /// Read the [`Operation`] discriminant from a reply header by wire offset.
@@ -295,26 +323,11 @@ fn decode_eviction(header_bytes: &[u8; HEADER_SIZE]) -> IggyError {
     ) else {
         return IggyError::Unauthenticated;
     };
-    match reason {
-        EvictionReason::InvalidCredentials => IggyError::InvalidCredentials,
-        EvictionReason::InvalidToken => IggyError::InvalidPersonalAccessToken,
-        EvictionReason::UserInactive
-        | EvictionReason::SessionError
-        | EvictionReason::NoSession
-        | EvictionReason::SessionTooLow
-        | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
-        EvictionReason::StaleClient => IggyError::StaleClient,
-        EvictionReason::IncompatibleProtocol => {
-            let server_max = read_window_field(header_bytes, VERSION_OFFSET);
-            let server_min = read_window_field(header_bytes, VERSION_MIN_OFFSET);
-            if server_min == 0 || server_max < server_min {
-                return IggyError::Unauthenticated;
-            }
-            IggyError::IncompatibleProtocolVersion(IGGY_PROTOCOL_VERSION, server_min, server_max)
-        }
-        EvictionReason::MalformedLogin => IggyError::InvalidFormat,
-        _ => IggyError::InvalidCommand,
-    }
+    eviction_reason_to_error(
+        reason,
+        read_window_field(header_bytes, VERSION_OFFSET),
+        read_window_field(header_bytes, VERSION_MIN_OFFSET),
+    )
 }
 
 fn read_window_field(header_bytes: &[u8; HEADER_SIZE], offset: usize) -> u32 {
@@ -450,6 +463,7 @@ mod tests {
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+    use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
     use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
     use secrecy::SecretString;
 
@@ -483,6 +497,35 @@ mod tests {
         // Register is routed to the metadata replica (shard 0). The router's
         // namespace==METADATA short-circuit needs the sentinel, not 0.
         assert_eq!(header.namespace, METADATA_CONSENSUS_NAMESPACE);
+    }
+
+    #[test]
+    fn second_register_on_bound_session_re_arms_instead_of_panicking() {
+        let request = LoginRegisterRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("rust-sdk").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            username: WireName::new("admin").unwrap(),
+            password: SecretString::from("secret"),
+            client_context: None,
+        };
+
+        let mut session = ConsensusSession::with_client_id(7);
+        encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes()).unwrap();
+        session.bind(42);
+
+        // A second login on the same bound session must encode a fresh Register
+        // (request 0, session 0), not panic in the one-shot register guard.
+        let bytes =
+            encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
+                .unwrap();
+        let header = decode_request_header(&bytes);
+        assert_eq!(header.operation, Operation::Register);
+        assert_eq!(header.request, 0);
+        assert_eq!(header.session, 0);
+        assert!(!session.is_bound());
     }
 
     #[test]
@@ -531,6 +574,38 @@ mod tests {
                 "window [{server_min}, {server_max}] must not surface as typed error"
             );
         }
+    }
+
+    #[test]
+    fn reply_with_nonzero_status_surfaces_as_typed_error() {
+        // A dispatch-time authorization denial rides `ReplyHeader.status`; the
+        // decode funnel surfaces it as the typed error before any body decode,
+        // even though the deny body is empty.
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            size: HEADER_SIZE as u32,
+            status: IggyError::Unauthorized.as_code(),
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let result = decode_response_split(&buf, Bytes::new());
+        assert!(matches!(result, Err(IggyError::Unauthorized)));
+    }
+
+    #[test]
+    fn reply_with_zero_status_passes_body_through() {
+        // status 0 is the ok channel: a non-metadata reply returns its body.
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            operation: Operation::NonReplicated,
+            size: (HEADER_SIZE + 3) as u32,
+            ..Default::default()
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        buf.copy_from_slice(bytemuck::bytes_of(&header));
+        let out = decode_response_split(&buf, Bytes::from_static(b"abc")).unwrap();
+        assert_eq!(&out[..], b"abc");
     }
 
     #[test]
