@@ -85,5 +85,8 @@ services:
   java-bdd:
     <<: *server-bdd-deps
 
+  cpp-bdd:
+    <<: *server-bdd-deps
+
 volumes:
   iggy_data:

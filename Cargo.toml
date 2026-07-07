@@ -49,6 +49,7 @@ members = [
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
+    "core/cpu_allocation",
     "core/harness_derive",
     "core/integration",
     "core/journal",
@@ -60,6 +61,7 @@ members = [
     "core/server-ng",
     "core/server_common",
     "core/shard",
+    "core/shard_allocator",
     "core/simulator",
     "core/tools",
     "examples/rust",
@@ -136,6 +138,7 @@ configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
+cpu_allocation = { path = "core/cpu_allocation" }
 crossbeam = "0.8.4"
 crossfire = "3.1.16"
 csv = "1.4.0"
@@ -281,6 +284,7 @@ server = { path = "core/server" }
 server-ng = { path = "core/server-ng" }
 server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
+shard_allocator = { path = "core/shard_allocator" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"
 smallvec = "1.15"

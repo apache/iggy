@@ -406,15 +406,10 @@ impl TestHarness {
             .await
     }
 
-    /// Get the connectors runtime handle from the primary server if configured.
-    ///
-    /// # Panics
-    /// Panics if called on a cluster (multiple servers). Use `node(i).connectors_runtime()` instead.
+    /// Get the connectors runtime handle if configured. Targets the primary's
+    /// handle, for both single-server and cluster setups (the builder attaches
+    /// the runtime to node 0, mirroring `mcp()`).
     pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
-        assert!(
-            self.servers.len() <= 1,
-            "connectors_runtime() is only available for single-server setups. Use node(i).connectors_runtime() for clusters."
-        );
         self.servers.first().and_then(|s| s.connectors_runtime())
     }
 

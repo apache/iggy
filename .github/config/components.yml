@@ -386,6 +386,18 @@ components:
       - "bdd/scenarios/**"
     tasks: ["bdd-java"]
 
+  bdd-cpp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-cpp"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/cpp/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-cpp"]
+
   examples-rust:
     depends_on:
       - "rust-sdk"

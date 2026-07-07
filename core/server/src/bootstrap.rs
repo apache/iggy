@@ -33,7 +33,6 @@ use crate::{
             frame::ShardFrame,
         },
     },
-    shard_allocator::ShardInfo,
     state::system::{StreamState, TopicState, UserState},
     streaming::{
         partitions::{
@@ -57,6 +56,7 @@ use iggy_common::{
         MIN_USERNAME_LENGTH,
     },
 };
+use shard_allocator::ShardInfo;
 use slab::Slab;
 use std::{env, sync::Arc};
 use tracing::{info, warn};
