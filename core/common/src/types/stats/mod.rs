@@ -26,7 +26,8 @@ pub struct Stats {
     pub process_id: u32,
     /// The CPU usage of the process.
     pub cpu_usage: f32,
-    /// the total CPU usage of the system.
+    /// The total CPU usage of the system, scoped to the cores this process may run on
+    /// when confined by an affinity/cpuset mask.
     pub total_cpu_usage: f32,
     /// The memory usage of the process.
     pub memory_usage: IggyByteSize,

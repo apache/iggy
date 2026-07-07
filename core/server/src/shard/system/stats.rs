@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::shard::IggyShard;
+use crate::shard::system::cgroup_memory::cgroup_available_memory;
 use crate::{SEMANTIC_VERSION, VERSION};
+use cpu_allocation::allowed_cpus;
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
@@ -44,7 +46,8 @@ impl IggyShard {
             sys.refresh_memory();
             sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
 
-            let total_cpu_usage = sys.global_cpu_usage();
+            let total_cpu_usage =
+                allowed_cores_cpu_usage(sys).unwrap_or_else(|| sys.global_cpu_usage());
             let total_memory = sys.total_memory().into();
             let available_memory = sys.available_memory().into();
             let clients_count = self.client_manager.get_clients().len() as u32;
@@ -94,7 +97,15 @@ impl IggyShard {
                     .filter(|limits| limits.total_memory < sys.total_memory())
                 {
                     stats.total_memory = limits.total_memory.into();
-                    stats.available_memory = limits.free_memory.into();
+                    // `limits.free_memory` is limit minus `memory.current`,
+                    // which charges reclaimable page cache as used: on a
+                    // cache-heavy server it trends toward zero long before
+                    // the kernel would OOM. Prefer the MemAvailable
+                    // equivalent that adds the reclaimable cache back.
+                    stats.available_memory = cgroup_available_memory(sys.total_memory())
+                        .unwrap_or(limits.free_memory)
+                        .min(limits.total_memory)
+                        .into();
                 }
             }
 
@@ -149,4 +160,26 @@ impl IggyShard {
             Ok(stats)
         })
     }
+}
+
+/// Average usage over the cores this process may run on.
+///
+/// `global_cpu_usage` averages every host core, so a cpuset-confined
+/// instance would report its neighbors' load. `None` when the process
+/// is unrestricted (or a core id falls outside `sys.cpus()`, which
+/// indexes only online cores), where the host-global number is already
+/// the right one.
+fn allowed_cores_cpu_usage(sys: &SysinfoSystem) -> Option<f32> {
+    let cpus = sys.cpus();
+    let allowed = allowed_cpus();
+    if allowed.is_empty() || allowed.len() >= cpus.len() {
+        return None;
+    }
+
+    let mut total_usage = 0.0f32;
+    for cpu_id in &allowed {
+        total_usage += cpus.get(*cpu_id)?.cpu_usage();
+    }
+
+    Some(total_usage / allowed.len() as f32)
 }

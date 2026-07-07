@@ -489,22 +489,15 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
-                if !self.pin_cores {
-                    if *end - *start > available_cpus {
-                        eprintln!(
-                            "Invalid sharding configuration: cpu_allocation range {start}..{end} yields {} shards, exceeding available CPU cores {available_cpus}",
-                            *end - *start
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-                    return Ok(());
-                }
                 if *end - *start > available_cpus {
                     eprintln!(
                         "Invalid sharding configuration: cpu_allocation range {start}..{end} yields {} shards, exceeding available CPU cores {available_cpus}",
                         *end - *start
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
+                }
+                if !self.pin_cores {
+                    return Ok(());
                 }
                 let allowed = allowed_cpus();
                 if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {

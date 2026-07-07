@@ -71,6 +71,9 @@ pub enum ShardingError {
     )]
     CpuNotAllowed { cpu: usize },
 
+    #[error("Invalid CPU range {start}..{end}: start must be less than end")]
+    InvalidRange { start: usize, end: usize },
+
     #[error("Invalid NUMA node: requested {requested}, only available {available} node")]
     InvalidNode { requested: usize, available: usize },
 
@@ -369,16 +372,25 @@ impl ShardAllocator {
 
                 let allowed = allowed_cpus();
                 let shard_assignments = pinned_from_allowed(&allowed, *count)?;
-                let cores: Vec<usize> = shard_assignments
-                    .iter()
-                    .flat_map(|shard| shard.cpu_set.iter().copied())
-                    .collect();
 
-                info!("Using {count} shard(s) with affinity to cores {cores:?}");
+                info!(
+                    "Using {count} shard(s) with affinity to cores {:?}",
+                    &allowed[..*count]
+                );
 
                 Ok(shard_assignments)
             }
             CpuAllocation::Range(start, end) => {
+                // `ShardingConfig::validate` rejects this too, but this is a
+                // pub fn: a caller skipping validation would underflow
+                // `end - start` below.
+                if start >= end {
+                    return Err(ShardingError::InvalidRange {
+                        start: *start,
+                        end: *end,
+                    });
+                }
+
                 if !self.pin_cores {
                     info!(
                         "Using {} shard(s) for range {start}..{end}, unpinned",
@@ -387,9 +399,10 @@ impl ShardAllocator {
                     return Ok(unpinned(end - start));
                 }
 
-                // An explicit range is operator intent for exact cores; honor
-                // it as-is but fail fast when a core is outside the allowed
-                // set instead of letting `sched_setaffinity` EINVAL later.
+                // An explicit range names exact cores and is never remapped
+                // into the allowed set; each core must be a member of it, or
+                // we fail fast instead of letting `sched_setaffinity` EINVAL
+                // later.
                 let allowed = allowed_cpus();
                 if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {
                     return Err(ShardingError::CpuNotAllowed { cpu });
@@ -551,6 +564,18 @@ mod tests {
         let shards = allocator.to_shard_assignments().unwrap();
         assert_eq!(shards.len(), 1);
         assert!(shards[0].cpu_set.is_empty());
+    }
+
+    #[test]
+    fn inverted_range_is_rejected_regardless_of_pinning() {
+        for pin_cores in [false, true] {
+            let allocator = ShardAllocator::new(&CpuAllocation::Range(2, 1), pin_cores).unwrap();
+            let err = allocator.to_shard_assignments().unwrap_err();
+            assert!(matches!(
+                err,
+                ShardingError::InvalidRange { start: 2, end: 1 }
+            ));
+        }
     }
 
     #[test]
