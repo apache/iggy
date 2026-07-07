@@ -514,6 +514,9 @@ mod tests {
             nodes,
             self_ip: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
+            metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::cluster_meta::METADATA_VIEW_UNKNOWN,
+            )),
         }
     }
 

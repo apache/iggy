@@ -19,6 +19,7 @@
 //! metadata-STM read entry, and the wire/domain identifier resolvers the read
 //! and data-plane routes ground their scopes through.
 
+use crate::bootstrap::ServerNgShard;
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;
@@ -26,6 +27,7 @@ use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{Identifier, IggyError};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+use std::rc::Rc;
 
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
@@ -80,7 +82,7 @@ pub(in crate::http) fn authorize_read(
 /// await, no gate, no `SendWrapper`. An absent entity surfaces as
 /// [`NonReplicatedResponse::Empty`], mapped to 404 here because every REST read
 /// whose entity can be missing shares that not-found shape.
-pub(in crate::http) fn read_local(
+pub(in crate::http) async fn read_local(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
@@ -88,6 +90,7 @@ pub(in crate::http) fn read_local(
     body: &[u8],
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
+    await_recovery_barrier(&state.shard).await;
     authorize_read(state, identity, consistency, rule)?;
     match build_non_replicated_response(
         &state.shard,
@@ -100,6 +103,40 @@ pub(in crate::http) fn read_local(
     {
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
+    }
+}
+
+/// Hold a local read while the recovered WAL suffix re-commits.
+///
+/// Recovery re-pipelines prepared-but-uncommitted ops that clients saw
+/// committed before the restart; JWT-authenticated HTTP reads skip consensus
+/// entirely, so without this wait they can observe state that rolls back
+/// committed history in the first few hundred milliseconds after a restart.
+/// No-op (`recovery_barrier() == 0`) outside that window. Bounded: the
+/// suffix needs a backup quorum to re-commit, so serve anyway after the
+/// deadline rather than wedging reads on a partitioned cluster.
+pub(in crate::http) async fn await_recovery_barrier(shard: &Rc<ServerNgShard>) {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
+        return;
+    };
+    let barrier = consensus.recovery_barrier();
+    if barrier == 0 || consensus.commit_max() >= barrier {
+        return;
+    }
+    let deadline = std::time::Instant::now() + DEADLINE;
+    while consensus.commit_max() < barrier {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                barrier,
+                commit_max = consensus.commit_max(),
+                "recovered suffix still uncommitted past deadline; serving read anyway"
+            );
+            return;
+        }
+        compio::time::sleep(POLL).await;
     }
 }
 

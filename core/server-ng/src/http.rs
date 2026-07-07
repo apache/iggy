@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
@@ -107,6 +108,10 @@ pub async fn start(
                 http: Some(bound_addr.port()),
                 ..self_ports
             },
+            // The HTTP listener is shard-0-only, where the live consensus
+            // handle supplies the leader; the published-view fallback is
+            // never consulted here.
+            metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
         in_flight_writes: Cell::new(0),
     }));

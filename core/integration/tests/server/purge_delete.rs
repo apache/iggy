@@ -25,6 +25,14 @@ use test_case::test_matrix;
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
+// The consumer polls in this scenario auto-commit offsets, so partition ops
+// keep flowing while the restarted node rejoins. Ops prepared in that window
+// commit on the surviving quorum and leave the pipeline before the rejoining
+// replica can ack them, so its journal has a gap it cannot fill without
+// message repair; when the commit frontier crosses the gap the replica
+// correctly suicides ("replica is divergent"). Re-enable restart_on once
+// message repair lands. The consumerless variant below exercises the
+// restart + prune path without this window.
 #[cfg_attr(not(feature = "vsr"), test_matrix([restart_off(), restart_on()]))]
 #[cfg_attr(feature = "vsr", test_matrix([restart_off()]))]
 async fn should_delete_segments_and_validate_filesystem(
@@ -40,10 +48,6 @@ async fn should_delete_segments_and_validate_filesystem(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
-// Recovery on restart is fixed -- server-ng reads its own 24-byte segment index
-// via `segment_recovery` (no more "Index data must be exactly 16 bytes" panic;
-// the server restarts + re-meshes cleanly). The SDK reconnect-after-restart
-// re-login lifecycle is fixed too, so restart_on runs under vsr.
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_without_consumers(harness: &mut TestHarness, restart_server: bool) {
     purge_delete_scenario::run_no_consumers(harness, restart_server).await;

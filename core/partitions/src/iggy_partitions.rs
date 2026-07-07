@@ -430,6 +430,24 @@ where
             partition.nth_oldest_sealed_end_offset(count)
         })
     }
+
+    /// [`Self::nth_oldest_sealed_end_offset`] plus the partition's resident
+    /// journal message count, read in one partition access so the pair is
+    /// consistent. The count lets the caller tell a settled "nothing to
+    /// delete" apart from a partition that simply has not flushed the
+    /// committed log yet.
+    pub fn segment_delete_resolution(
+        &self,
+        namespace: &IggyNamespace,
+        count: u32,
+    ) -> Option<(Option<u64>, u64)> {
+        self.with_partition(namespace, |partition| {
+            (
+                partition.nth_oldest_sealed_end_offset(count),
+                partition.resident_journal_messages(),
+            )
+        })
+    }
 }
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>

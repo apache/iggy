@@ -278,8 +278,15 @@ pub enum PartitionReadReply {
     Ack,
     /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
     /// truncation offset, or `None` when the partition has no sealed segments
-    /// to delete.
-    SegmentDeleteOffset { up_to_offset: Option<u64> },
+    /// to delete. `resident_messages` counts journaled messages not yet
+    /// flushed to a segment: a `None` offset with a non-zero count means the
+    /// partition has not converged on the committed log yet (e.g. a backup
+    /// behind the commit frontier), so the resolution is transient rather
+    /// than a settled no-op.
+    SegmentDeleteOffset {
+        up_to_offset: Option<u64>,
+        resident_messages: u64,
+    },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
@@ -1718,6 +1725,12 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StreamsFrontend
+            + StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = metadata::stm::result::ApplyReply,
+                Error = iggy_common::IggyError,
+            >,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -1727,9 +1740,21 @@ where
         {
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            // `dispatch_vsr_actions` deliberately no-ops `CommitJournal` (it
+            // needs the plane); without this the ops a StartView marks
+            // committed stay journaled-but-unapplied forever, because the
+            // follow-up heartbeats see commit_max already advanced and skip
+            // their own commit_journal.
+            if actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::CommitJournal))
+            {
+                planes.0.commit_journal().await;
+            }
             return;
         }
 
+        let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
             header.namespace,
@@ -1743,6 +1768,12 @@ where
         let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
         dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
         dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if actions
+            .iter()
+            .any(|action| matches!(action, VsrAction::CommitJournal))
+        {
+            partition.commit_journal(config).await;
+        }
     }
 
     #[allow(clippy::future_not_send)]

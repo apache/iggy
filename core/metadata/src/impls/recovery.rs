@@ -113,8 +113,16 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
+/// `seed_baseline` reproduces boot-time state that never reaches the WAL
+/// (today: the locally-ensured root user). It runs on the freshly-defaulted
+/// state machine BEFORE journal replay and ONLY when no snapshot exists, so
+/// replayed ops land on the same baseline (and the same slab ids) they were
+/// originally applied over. A snapshot already contains that baseline.
 #[allow(clippy::future_not_send)]
-pub async fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
+pub async fn recover<M>(
+    data_dir: &Path,
+    seed_baseline: impl FnOnce(&M),
+) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
         + GatedApply
@@ -134,9 +142,12 @@ where
         .as_ref()
         .map_or(0, |snapshot| snapshot.sequence_number() + 1);
 
-    let mux_stm = match snapshot.as_ref() {
-        Some(snapshot) => M::restore_snapshot(snapshot.snapshot())?,
-        None => M::default(),
+    let mux_stm = if let Some(snapshot) = snapshot.as_ref() {
+        M::restore_snapshot(snapshot.snapshot())?
+    } else {
+        let mux_stm = M::default();
+        seed_baseline(&mux_stm);
+        mux_stm
     };
 
     let journal_path = metadata_dir.join("journal.wal");
@@ -178,7 +189,15 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        mux_stm.gated_update(entry)?;
+        let reply = mux_stm.gated_update(entry)?;
+        tracing::debug!(
+            target: "iggy.metadata.diag",
+            op = header.op,
+            operation = ?header.operation,
+            user_id = header.user_id,
+            reply = ?reply,
+            "recovery replayed op"
+        );
         last_applied_op = Some(header.op);
     }
 
@@ -229,7 +248,7 @@ mod tests {
     #[compio::test]
     async fn recover_empty_state() {
         let dir = tempdir().unwrap();
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
 
         assert_eq!(recovered.last_applied_op, None);
         assert!(recovered.journal.last_op().is_none());
@@ -246,7 +265,7 @@ mod tests {
             .persist(&metadata_dir.join("snapshot.bin"))
             .unwrap();
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
         assert_eq!(
             recovered
                 .snapshot
@@ -273,7 +292,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
         assert!(recovered.snapshot.is_none());
         // Op 3's entry proves commit=2; op 3 itself is journaled but not
         // provably committed, so it stays journal-only.
@@ -307,7 +326,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
         assert_eq!(recovered.last_applied_op, Some(3));
         assert_eq!(recovered.last_journaled_op, Some(5));
         assert_eq!(recovered.journal.last_op(), Some(5));
@@ -336,7 +355,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
         // Replays ops 6-9 (snapshot at 5; op 10's entry proves commit=9).
         assert_eq!(recovered.last_applied_op, Some(9));
         assert_eq!(recovered.last_journaled_op, Some(10));

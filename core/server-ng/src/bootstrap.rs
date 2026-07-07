@@ -520,6 +520,7 @@ fn validate_sharding_runtime_knobs(
 /// Panics if [`shard_mesh_channels`] returns an inbox slot already
 /// consumed - a bootstrap programming error that would only fire if this
 /// function were called twice with the same inboxes.
+#[allow(clippy::too_many_lines)]
 pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
@@ -587,6 +588,9 @@ pub fn bootstrap(
 
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)> =
         Vec::with_capacity(shards_count);
+    // Shared metadata-group view: written by shard 0's publisher task, read by
+    // every shard's cluster-metadata roster so leader marking works off-shard.
+    let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
@@ -616,6 +620,7 @@ pub fn bootstrap(
             }
         };
 
+        let metadata_view_for_shard = Arc::clone(&metadata_view);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerNgError> {
@@ -631,6 +636,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    metadata_view_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -689,6 +695,7 @@ fn run_shard_thread(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -725,6 +732,7 @@ fn run_shard_thread(
             metadata_handoff,
             barrier,
             owner_table,
+            metadata_view,
         ))
         .await
     });
@@ -751,6 +759,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -785,9 +794,14 @@ async fn shard_main(
     let data_dir = Path::new(&config.system.path);
     let (mux_stm, owner_state) = match metadata_handoff {
         MetadataHandoff::Owner { bundle_tx } => {
-            let recovered = recover::<ServerNgMuxStateMachine>(data_dir)
-                .await
-                .map_err(ServerNgError::MetadataRecovery)?;
+            // Root is created locally at boot (never journaled), so replay
+            // must start from the same baseline or every WAL-created user
+            // shifts one slab id and root is lost after the first restart.
+            let recovered = recover::<ServerNgMuxStateMachine>(data_dir, |mux_stm| {
+                ensure_default_root_user(mux_stm);
+            })
+            .await
+            .map_err(ServerNgError::MetadataRecovery)?;
             validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
             ensure_default_root_user(&recovered.mux_stm);
             // The factory bundle hands every peer a read handle over the
@@ -883,8 +897,26 @@ async fn shard_main(
         senders,
         inbox,
         shard_metrics,
+        Arc::clone(&metadata_view),
     )
     .await?;
+
+    // Shard 0 owns the metadata consensus; publish its view so every shard's
+    // cluster-metadata read (and the SDK's leader discovery) marks the live
+    // primary. Detached: dies with this shard's runtime at process exit.
+    if shard_id == 0 {
+        let publisher_shard = Rc::clone(&shard);
+        let publisher_view = Arc::clone(&metadata_view);
+        compio::runtime::spawn(async move {
+            loop {
+                if let Some(consensus) = publisher_shard.plane.metadata().consensus.as_ref() {
+                    publisher_view.store(u64::from(consensus.view()), Ordering::Relaxed);
+                }
+                compio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .detach();
+    }
 
     info!(
         shard = shard_id,
@@ -1298,7 +1330,11 @@ fn spawn_shutdown_watchdog(
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
 /// the real topology. `self_*` back only the cluster-disabled self-synthesis;
 /// the HTTP port is read from config since HTTP binds outside this topology.
-fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> ClusterRoster {
+fn build_cluster_roster(
+    config: &ServerNgConfig,
+    topology: &TcpTopology,
+    metadata_view: Arc<AtomicU64>,
+) -> ClusterRoster {
     let http_port = if config.http.enabled {
         parse_socket_addr("http.address", &config.http.address)
             .ok()
@@ -1318,6 +1354,7 @@ fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> Clus
             websocket: topology.ws_listen_addr.map(|addr| addr.port()),
             tcp_replica: None,
         },
+        metadata_view,
     }
 }
 
@@ -1332,6 +1369,7 @@ async fn build_shard_for_thread(
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerNgShard>, Rc<RefCell<SessionManager>>), ServerNgError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
@@ -1443,7 +1481,11 @@ async fn build_shard_for_thread(
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
     sessions
         .borrow_mut()
-        .set_cluster_roster(Rc::new(build_cluster_roster(config, topology)));
+        .set_cluster_roster(Rc::new(build_cluster_roster(
+            config,
+            topology,
+            metadata_view,
+        )));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
     let on_client_request = make_deferred_client_request_handler(
         &bus,
@@ -1540,6 +1582,7 @@ fn restore_metadata_consensus(
             commit_watermark,
             restored_op, "re-pipelining recovered uncommitted metadata suffix"
         );
+        consensus.set_recovery_barrier(restored_op);
         let mut pipeline = consensus.pipeline().borrow_mut();
         #[allow(clippy::cast_possible_truncation)]
         for op in (commit_watermark + 1)..=restored_op {
@@ -1581,7 +1624,18 @@ async fn load_partition(
         bus,
         LocalPipeline::new(),
     );
-    consensus.init();
+    // A recovered partition lost its consensus state with the process: the
+    // partition journal is in-memory and segments carry no op numbers, so
+    // this replica cannot know the group's (op, commit). In a cluster it must
+    // not boot as the view-0 primary heartbeating `commit_min = 0`; join as a
+    // backup and let a peer that kept its journal win the election and repair
+    // this replica through `StartView`. Single-replica groups have no peer to
+    // defer to, so they keep the plain init.
+    if replica_count > 1 {
+        consensus.init_recovering();
+    } else {
+        consensus.init();
+    }
 
     let recovered_segments =
         load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)

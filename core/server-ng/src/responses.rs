@@ -540,12 +540,15 @@ fn build_cluster_metadata_response(
     roster: &ClusterRoster,
     shard: &Rc<ServerNgShard>,
 ) -> ClusterMetadataResponse {
+    // Shard 0 reads its live consensus; delegated shards use the view shard 0
+    // publishes into the roster, so leader marking works on every shard.
     let primary_index = shard
         .plane
         .metadata()
         .consensus
         .as_ref()
-        .map(|consensus| consensus.primary_index(consensus.view()));
+        .map(|consensus| consensus.primary_index(consensus.view()))
+        .or_else(|| roster.current_primary_index());
     let metadata = roster.cluster_metadata(primary_index);
     ClusterMetadataResponse {
         name: metadata.name,
