@@ -47,6 +47,8 @@ pub fn sample(
         Outcome::UserNotFound => Some(Input {
             user: shadow.fabricate_absent_name("user"),
         }),
+        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
+        Outcome::CannotChangePermissions => None,
     }
 }
 

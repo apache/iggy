@@ -17,12 +17,20 @@
 
 #![allow(clippy::future_not_send)]
 
+use iggy_common::SemanticVersion;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
+
 pub mod auth;
 pub mod bootstrap;
+pub(crate) mod cluster_meta;
 pub mod config_writer;
 pub mod consumer_group;
 pub mod dispatch;
+pub(crate) mod http;
 pub mod login_register;
+pub(crate) mod offset_recovery;
 pub mod partition_helpers;
 pub mod partition_reconciler;
 pub mod pat;
@@ -32,5 +40,6 @@ pub(crate) mod segment_cleaner;
 pub(crate) mod segment_recovery;
 pub mod server_error;
 pub mod session_manager;
+pub(crate) mod snapshot;
 pub mod users;
 pub mod wire;
