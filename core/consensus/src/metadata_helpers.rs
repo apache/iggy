@@ -414,6 +414,10 @@ mod tests {
     use iggy_binary_protocol::{Command2, Operation, ReplyHeader};
     use message_bus::SendError;
 
+    /// Acting user for register fixtures; these tests exercise preflight /
+    /// replay, not user resolution, so the exact value is immaterial.
+    const ACTING_USER_ID: u32 = 1;
+
     /// Production-sized `ClientTable`.
     fn fresh_client_table() -> RefCell<ClientTable> {
         RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX))
@@ -475,7 +479,7 @@ mod tests {
         let original_checksum = initial_reply.header().checksum;
         client_table
             .borrow_mut()
-            .commit_register(client_id, initial_reply, |_| false);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
         let result =
             futures::executor::block_on(register_preflight(&consensus, &client_table, client_id));
@@ -511,7 +515,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, session);
         client_table
             .borrow_mut()
-            .commit_register(client_id, initial_reply, |_| false);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
         // SendMessages commits -> cached is no longer the register reply.
         let app_reply = synthesize_send_messages_reply(&consensus, client_id, session, 1, 18);
@@ -579,7 +583,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, real_session);
         client_table
             .borrow_mut()
-            .commit_register(client_id, initial_reply, |_| false);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
         // Older retry (17 < 99): stale-session case.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
@@ -615,7 +619,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, real_session);
         client_table
             .borrow_mut()
-            .commit_register(client_id, initial_reply, |_| false);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
 
         // Client claims newer session (99 > 17), client bug.
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
@@ -677,7 +681,7 @@ mod tests {
         let initial_reply = synthesize_register_reply(&consensus, client_id, session);
         client_table
             .borrow_mut()
-            .commit_register(client_id, initial_reply, |_| false);
+            .commit_register(client_id, ACTING_USER_ID, initial_reply, |_| false);
         // Cache at request 5 -> request 3 is stale.
         let advanced = synthesize_send_messages_reply(&consensus, client_id, session, 5, 100);
         client_table

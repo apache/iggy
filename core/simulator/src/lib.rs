@@ -324,7 +324,10 @@ impl Simulator {
                 "partition not found for namespace {namespace:?} on replica {replica_idx}"
             )));
         };
-        let (fragments, _commit_offset) = futures::executor::block_on(plan.execute());
+        // The simulator drives partitions directly, so it never replicates a
+        // poll's auto-commit (that is the serving shard's job in the real
+        // server); the surfaced offset is discarded here.
+        let (fragments, _commit_offset, _auto_commit) = futures::executor::block_on(plan.execute());
         Ok(fragments)
     }
 

@@ -189,6 +189,7 @@ impl<B: BinaryClient> UserClient for B {
         super::validate_password(password)?;
         #[cfg(feature = "vsr")]
         {
+            super::logout_before_relogin(self).await?;
             let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
             let response = match self
                 .send_raw_with_response(

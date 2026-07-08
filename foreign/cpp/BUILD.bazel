@@ -129,6 +129,7 @@ cc_library(
     deps = [
         ":iggy_cpp_static",
     ],
+    visibility = ["//visibility:public"],
 )
 
 cc_test(

@@ -822,7 +822,7 @@ pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{FailureCause, FailureRecord, ReconcilerCtx, reconcile_once};
-    use configs::server_ng::ServerNgConfig;
+    use configs::server_ng::{NgSystemConfig, ServerNgConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
     use iggy_binary_protocol::codec::WireEncode;
     use iggy_binary_protocol::primitives::identifier::WireName;
@@ -1024,13 +1024,13 @@ mod tests {
 
     fn test_config(tmp: &TempDir) -> ServerNgConfig {
         let mut cfg = ServerNgConfig::default();
-        // `SystemConfig` is not `Clone`, so `Arc::make_mut` is out; build a
+        // `NgSystemConfig` is not `Clone`, so `Arc::make_mut` is out; build a
         // fresh value via struct-update syntax and swap the Arc wholesale.
         // Only `path` differs from the default; every other field uses the
         // runtime's defaults.
-        let system = configs::system::SystemConfig {
+        let system = NgSystemConfig {
             path: tmp.path().to_string_lossy().into_owned(),
-            ..configs::system::SystemConfig::default()
+            ..NgSystemConfig::default()
         };
         cfg.system = Arc::new(system);
         cfg

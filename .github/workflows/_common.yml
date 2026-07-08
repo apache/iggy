@@ -93,7 +93,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.82.2
+        uses: taiki-e/install-action@v2.82.7
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -206,7 +206,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.47.2
+        uses: crate-ci/typos@v1.48.0
 
   summary:
     name: Common checks summary

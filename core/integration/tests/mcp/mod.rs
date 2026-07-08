@@ -85,7 +85,10 @@ async fn should_handle_ping(harness: &TestHarness) {
     invoke_empty(&mcp_client, "ping", None).await;
 }
 
-#[iggy_harness(server(cluster.enabled = true, mcp))]
+// Pins two nodes: the default vsr harness spawns three, but this test asserts a
+// two-node roster. Exercises the binary GetClusterMetadata roster end-to-end
+// over MCP (MCP server -> TCP -> iggy).
+#[iggy_harness(cluster_nodes = 2, server(mcp))]
 async fn should_return_cluster_metadata(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     let cluster: ClusterMetadata = invoke(&mcp_client, "get_cluster_metadata", None).await;

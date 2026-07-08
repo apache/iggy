@@ -42,7 +42,7 @@ pub struct Consumer {
 }
 
 /// `ConsumerKind` is an enum that represents the type of consumer.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone, ValueEnum)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Default, Copy, Clone, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsumerKind {
     /// `Consumer` represents a regular consumer.

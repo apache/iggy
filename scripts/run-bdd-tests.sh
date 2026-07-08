@@ -35,7 +35,7 @@ log(){ printf "%b\n" "$*"; }
 usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
-  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | all | clean (default: all)"
+  log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
   log "  feature: basic_messaging | leader_redirection | all  (default: all)"
   log ""
   log "Examples:"
@@ -132,6 +132,7 @@ case "$SDK" in
   node)     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
   csharp)   run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
   java)     run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
+  cpp)      run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"    ;;
   all)
     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
     run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
@@ -142,6 +143,7 @@ case "$SDK" in
     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"                       || exit $?
     run_suite csharp-bdd "🔷"   "Running C# BDD tests"                         || exit $?
     run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
+    run_suite cpp-bdd    "⚙️"   "Running C++ BDD tests"                        || exit $?
     ;;
   clean)
     cleanup
