@@ -40,6 +40,9 @@ use iggy_gateway_kafka::protocol::responses::{
     encode_produce_response,
 };
 
+#[path = "common/wire.rs"]
+mod wire;
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn fixtures_dir() -> PathBuf {
@@ -167,6 +170,15 @@ fn produce_response_v8_includes_record_errors() {
     assert!(error_message.is_none(), "v8 error_message must be null");
 }
 
+#[test]
+fn produce_v9_flexible_empty_topics_decode() {
+    let req = decode_produce_request(9, wire::build_produce_flexible_empty_request(0))
+        .into_request()
+        .expect("flexible produce request should decode");
+    assert_eq!(req.acks, 0);
+    assert_eq!(req.topics.len(), 0);
+}
+
 // ── Fetch (API key 1) ─────────────────────────────────────────────────────────
 
 #[test]
@@ -244,6 +256,25 @@ fn fetch_response_v7_roundtrip() {
     assert_eq!(high_watermark, 0);
 }
 
+#[test]
+fn fetch_v12_decodes_forgotten_topics_and_rack_id_sections() {
+    let req = decode_fetch_request(
+        12,
+        wire::build_fetch_request_with_sections(12, "test-topic", 2, Some("forgotten"), Some("r1")),
+    )
+    .expect("fetch request should decode");
+    assert_eq!(req.max_wait_ms, 100);
+    assert_eq!(req.min_bytes, 1);
+    assert_eq!(req.max_bytes, i32::MAX);
+    assert_eq!(req.isolation_level, 0);
+    assert_eq!(req.topics.len(), 1);
+    assert_eq!(req.topics[0].topic, "test-topic");
+    assert_eq!(req.topics[0].partitions.len(), 1);
+    assert_eq!(req.topics[0].partitions[0].partition, 2);
+    assert_eq!(req.topics[0].partitions[0].fetch_offset, 42);
+    assert_eq!(req.topics[0].partitions[0].partition_max_bytes, 1024);
+}
+
 // ── ListOffsets (API key 2) ───────────────────────────────────────────────────
 
 #[test]
@@ -272,6 +303,28 @@ fn list_offsets_all_supported_versions_decode() {
             "ListOffsets v{version}: wrong partition index"
         );
     }
+}
+
+#[test]
+fn list_offsets_v0_decodes_legacy_max_num_offsets_branch() {
+    let req =
+        decode_list_offsets_request(0, wire::build_list_offsets_branch_request(0, "legacy", 4))
+            .expect("v0 list offsets should decode");
+    assert_eq!(req.isolation_level, 0);
+    assert_eq!(req.topics.len(), 1);
+    assert_eq!(req.topics[0].topic, "legacy");
+    assert_eq!(req.topics[0].partitions[0].partition, 4);
+    assert_eq!(req.topics[0].partitions[0].timestamp, -2);
+}
+
+#[test]
+fn list_offsets_v6_decodes_flexible_leader_epoch_branch() {
+    let req = decode_list_offsets_request(6, wire::build_list_offsets_branch_request(6, "flex", 5))
+        .expect("v6 list offsets should decode");
+    assert_eq!(req.isolation_level, 1);
+    assert_eq!(req.topics[0].topic, "flex");
+    assert_eq!(req.topics[0].partitions[0].partition, 5);
+    assert_eq!(req.topics[0].partitions[0].timestamp, -2);
 }
 
 #[test]
@@ -370,6 +423,36 @@ fn create_topics_all_supported_versions_decode() {
             "CreateTopics v{version}: unexpected timeout_ms"
         );
     }
+}
+
+#[test]
+fn create_topics_v0_defaults_validate_only_to_false() {
+    let req = decode_create_topics_request(
+        0,
+        wire::build_create_topics_request_with_sections(0, "legacy-topic"),
+    )
+    .expect("create topics v0 should decode");
+    assert_eq!(req.timeout_ms, 5_000);
+    assert!(!req.validate_only);
+    assert_eq!(req.topics.len(), 1);
+    assert_eq!(req.topics[0].name, "legacy-topic");
+    assert_eq!(req.topics[0].num_partitions, 3);
+    assert_eq!(req.topics[0].replication_factor, 1);
+}
+
+#[test]
+fn create_topics_v5_decodes_flexible_assignments_and_configs() {
+    let req = decode_create_topics_request(
+        5,
+        wire::build_create_topics_request_with_sections(5, "flex-topic"),
+    )
+    .expect("create topics v5 should decode");
+    assert_eq!(req.timeout_ms, 5_000);
+    assert!(req.validate_only);
+    assert_eq!(req.topics.len(), 1);
+    assert_eq!(req.topics[0].name, "flex-topic");
+    assert_eq!(req.topics[0].num_partitions, 3);
+    assert_eq!(req.topics[0].replication_factor, 1);
 }
 
 #[test]

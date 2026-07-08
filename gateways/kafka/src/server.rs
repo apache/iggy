@@ -402,3 +402,194 @@ pub fn init_tracing() {
         .try_init()
         .map_err(|e| error!("failed to initialize tracing: {e}"));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let client = client.await.unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn transient_accept_error_classification_covers_all_branches() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert!(is_transient_accept_error(&io::Error::from(kind)));
+        }
+
+        #[cfg(unix)]
+        {
+            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(23)));
+            assert!(is_transient_accept_error(&io::Error::from_raw_os_error(24)));
+        }
+
+        assert!(!is_transient_accept_error(&io::Error::from(
+            io::ErrorKind::ConnectionRefused,
+        )));
+    }
+
+    #[test]
+    fn correlation_id_is_extracted_from_frame() {
+        let frame =
+            bytes::Bytes::from_static(&[0x00, 0x12, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44, 0xaa]);
+        assert_eq!(correlation_id_from_frame(&frame), 0x11223344);
+    }
+
+    #[tokio::test]
+    async fn send_response_writes_header_and_body() {
+        let (mut client, mut server) = tcp_pair().await;
+        let header = ResponseHeader {
+            correlation_id: 0x01020304,
+        };
+        let body = [9u8, 8, 7];
+
+        send_response(&mut server, &header, 1, &body, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        assert_eq!(i32::from_be_bytes(len), 8);
+
+        let mut payload = [0u8; 8];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload[..4], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(payload[4], 0);
+        assert_eq!(&payload[5..], &body);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_negative_length() {
+        let (mut client, mut server) = tcp_pair().await;
+        client.write_all(&(-1_i32).to_be_bytes()).await.unwrap();
+        let err = read_frame(&mut server, 64, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::InvalidFrameLength(-1)));
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_eof_after_prefix_when_body_missing() {
+        let (mut client, mut server) = tcp_pair().await;
+        client.write_all(&(5_i32).to_be_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        let err = read_frame(&mut server, 64, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn read_frame_times_out_after_partial_body() {
+        let (mut client, mut server) = tcp_pair().await;
+        client.write_all(&(5_i32).to_be_bytes()).await.unwrap();
+        client.write_all(&[1, 2]).await.unwrap();
+        let err = read_frame(&mut server, 64, Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read timeout"));
+    }
+
+    #[tokio::test]
+    async fn server_run_exits_when_shutdown_channel_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        let server = KafkaServer::new(ServerConfig::default());
+        assert!(server.run(listener, rx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_run_exits_when_shutdown_receiver_is_lagged() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, rx) = broadcast::channel(1);
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        let server = KafkaServer::new(ServerConfig::default());
+        assert!(server.run(listener, rx).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_run_exits_on_shutdown_signal_ok() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = broadcast::channel(1);
+        let server = KafkaServer::new(ServerConfig::default());
+        let handle = tokio::spawn(async move { server.run(listener, rx).await });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        tx.send(()).unwrap();
+        drop(stream);
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_frame_accepts_exact_max_frame_size() {
+        let (mut client, mut server) = tcp_pair().await;
+        let max_frame_size = 64usize;
+        let payload = vec![0xABu8; max_frame_size];
+        client
+            .write_all(&i32::try_from(max_frame_size).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&payload).await.unwrap();
+        let frame = read_frame(&mut server, max_frame_size, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(frame.len(), max_frame_size);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_frame_larger_than_max() {
+        let (mut client, mut server) = tcp_pair().await;
+        let max_frame_size = 64usize;
+        client.write_all(&65_i32.to_be_bytes()).await.unwrap();
+        let err = read_frame(&mut server, max_frame_size, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            KafkaProtocolError::FrameTooLarge {
+                max_bytes: 64,
+                actual_bytes: 65,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_response_v0_writes_correlation_id_only() {
+        let (mut client, mut server) = tcp_pair().await;
+        let header = ResponseHeader {
+            correlation_id: 0x0000_00AB,
+        };
+        let body = [5u8, 6, 7];
+
+        send_response(&mut server, &header, 0, &body, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        assert_eq!(i32::from_be_bytes(len), 7);
+
+        let mut payload = [0u8; 7];
+        client.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload[..4], &[0, 0, 0, 0xAB]);
+        assert_eq!(&payload[4..], &body);
+    }
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        init_tracing();
+        init_tracing();
+    }
+}

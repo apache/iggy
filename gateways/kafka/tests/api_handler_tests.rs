@@ -21,8 +21,9 @@ mod wire;
 use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_METADATA, BrokerAdvertise, ERROR_UNSUPPORTED_VERSION,
-    handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_PRODUCE, BrokerAdvertise, ERROR_INVALID_REQUEST,
+    ERROR_UNSUPPORTED_VERSION, handle_request, is_supported_version, supported_api_ranges,
 };
 
 fn test_broker() -> BrokerAdvertise {
@@ -176,4 +177,109 @@ fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
     assert_eq!(d.read_i32().unwrap(), 6);
     assert_eq!(d.remaining(), 36);
+}
+
+#[test]
+fn produce_malformed_body_with_acks_one_returns_invalid_request() {
+    let body = Bytes::from_static(&[
+        0xff, 0xff, // null transactional_id
+        0x00, 0x01, // acks = 1
+        0x00, 0x00, 0x03, 0xe8, // timeout_ms
+        0x00, 0x00, 0x00, 0x01, // one topic
+    ]);
+    let response = handle_request(API_KEY_PRODUCE, 3, body, &test_broker())
+        .expect("acks=1 malformed produce should get error response");
+    let mut d = Decoder::new(response);
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn fetch_malformed_body_returns_invalid_request() {
+    let response = handle_request(
+        API_KEY_FETCH,
+        12,
+        Bytes::from_static(&[
+            0xff, 0xff, 0xff, 0xff, // replica_id
+            0x00, 0x00, 0x00, 0x64, // max_wait_ms
+            0x00, 0x00, 0x00, 0x01, // min_bytes
+        ]),
+        &test_broker(),
+    )
+    .expect("fetch must return error response");
+    let mut d = Decoder::new(response);
+    assert_eq!(d.read_i32().unwrap(), 0); // throttle
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn list_offsets_malformed_body_returns_invalid_request() {
+    let response = handle_request(
+        API_KEY_LIST_OFFSETS,
+        6,
+        Bytes::from_static(&[
+            0xff, 0xff, 0xff, 0xff, // replica_id
+            0x01, // isolation_level
+            0x02, // compact topics count = one
+            0x00, // null topic name
+        ]),
+        &test_broker(),
+    )
+    .expect("list offsets must return error response");
+    let mut d = Decoder::new(response);
+    assert_eq!(d.read_i32().unwrap(), 0); // throttle
+    assert_eq!(d.read_varint().unwrap(), 2);
+    assert_eq!(
+        d.read_compact_nullable_string().unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(d.read_varint().unwrap(), 2);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn create_topics_malformed_body_returns_invalid_request() {
+    let response = handle_request(
+        API_KEY_CREATE_TOPICS,
+        5,
+        Bytes::from_static(&[
+            0x02, // compact topics count = one
+            0x00, // null compact topic name
+        ]),
+        &test_broker(),
+    )
+    .expect("create topics must return error response");
+    let mut d = Decoder::new(response);
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_varint().unwrap(), 2);
+    assert_eq!(
+        d.read_compact_nullable_string().unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+}
+
+#[test]
+fn metadata_null_topic_name_yields_zero_topics() {
+    let body = handle_request(
+        API_KEY_METADATA,
+        0,
+        Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one topic
+            0xff, 0xff, // null topic name
+        ]),
+        &test_broker(),
+    )
+    .expect("metadata request should still return response");
+    let mut d = Decoder::new(body);
+    assert_eq!(d.read_i32().unwrap(), 1);
+    d.read_i32().unwrap();
+    d.read_nullable_string().unwrap();
+    d.read_i32().unwrap();
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.remaining(), 0);
 }

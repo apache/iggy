@@ -17,6 +17,7 @@
 
 use bytes::Bytes;
 
+use iggy_gateway_kafka::error::KafkaProtocolError;
 use iggy_gateway_kafka::protocol::codec::{Decoder, Encoder};
 
 #[test]
@@ -156,4 +157,76 @@ fn tagged_fields_empty_section_round_trip() {
     dec.read_tagged_fields().unwrap(); // should consume the single 0x00 byte
     assert_eq!(dec.read_i16().unwrap(), 7);
     assert_eq!(dec.remaining(), 0);
+}
+
+#[test]
+fn decoder_rejects_unterminated_varint() {
+    let mut dec = Decoder::new(Bytes::from_static(&[
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    ]));
+    let err = dec.read_varint().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::InvalidVarint));
+}
+
+#[test]
+fn compact_array_count_above_max_returns_error() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_varint(65_538); // count = 65_537 after -1
+    let mut dec = Decoder::new(enc.freeze());
+    let err = dec.read_compact_array_count().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::CollectionTooLarge { .. }));
+}
+
+#[test]
+fn compact_nullable_string_invalid_utf8_fails() {
+    let mut raw = Vec::new();
+    raw.push(2); // len = 1
+    raw.push(0xff);
+    let mut dec = Decoder::new(Bytes::from(raw));
+    let err = dec.read_compact_nullable_string().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::InvalidUtf8));
+}
+
+#[test]
+fn tagged_fields_non_empty_section_is_skipped() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_varint(1); // one tagged field
+    enc.write_varint(7); // tag
+    enc.write_varint(3); // size
+    enc.write_bytes(&[1, 2, 3]);
+    enc.write_i16(99);
+
+    let mut dec = Decoder::new(enc.freeze());
+    dec.read_tagged_fields().unwrap();
+    assert_eq!(dec.read_i16().unwrap(), 99);
+}
+
+#[test]
+fn tagged_fields_oversized_count_fails() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_varint(65_537);
+    let mut dec = Decoder::new(enc.freeze());
+    let err = dec.read_tagged_fields().unwrap_err();
+    assert!(matches!(err, KafkaProtocolError::CollectionTooLarge { .. }));
+}
+
+#[test]
+fn write_null_bytes_and_write_bytes_round_trip() {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_null_bytes();
+    enc.write_bytes(&[9, 8, 7]);
+    let mut dec = Decoder::new(enc.freeze());
+    assert_eq!(dec.read_nullable_bytes().unwrap(), None);
+    assert_eq!(dec.read_bytes(3).unwrap(), Bytes::from_static(&[9, 8, 7]));
+}
+
+#[test]
+fn unchecked_nullable_string_matches_checked_encoding() {
+    let mut checked = Encoder::with_capacity(16);
+    checked.write_nullable_string(Some("safe")).unwrap();
+
+    let mut unchecked = Encoder::with_capacity(16);
+    unchecked.write_nullable_string_unchecked(Some("safe"));
+
+    assert_eq!(checked.freeze(), unchecked.freeze());
 }

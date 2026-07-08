@@ -420,3 +420,40 @@ pub(crate) fn decode_metadata_request_topics(body: Bytes, api_version: i16) -> R
 
     Ok(topics)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::codec::Encoder;
+
+    #[test]
+    fn decode_metadata_request_topics_legacy_null_topic_name_fails() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one topic
+            0xff, 0xff, // null topic name
+        ]);
+        let err = decode_metadata_request_topics(body, 0).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::NullTopicName));
+    }
+
+    #[test]
+    fn decode_metadata_request_topics_flexible_v10_truncated_topic_id_fails() {
+        let mut enc = Encoder::with_capacity(8);
+        enc.write_varint(2); // one topic
+        enc.write_bytes(&[0u8; 8]); // truncated topic_id, should be 16 bytes
+        let err = decode_metadata_request_topics(enc.freeze(), 10).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::BufferUnderflow { .. }));
+    }
+
+    #[test]
+    fn decode_metadata_request_topics_flexible_invalid_utf8_fails() {
+        let body = Bytes::from_static(&[
+            0x02, // one topic
+            0x02, // string len = 1
+            0xff, // invalid utf-8
+            0x00, // tagged fields
+        ]);
+        let err = decode_metadata_request_topics(body, 9).unwrap_err();
+        assert!(matches!(err, KafkaProtocolError::InvalidUtf8));
+    }
+}
