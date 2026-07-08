@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::auth::warm_dummy_password_hash;
+use crate::cluster_meta::ClusterRoster;
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
     make_partition_read_handler,
 };
+use crate::http;
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
@@ -37,6 +40,10 @@ use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrC
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::Operation;
+use iggy_common::defaults::{
+    DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
+    MIN_USERNAME_LENGTH,
+};
 use iggy_common::{IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -70,13 +77,10 @@ use partitions::{
 };
 use rustls::pki_types::ServerName;
 use server_common::bootstrap::create_directories;
+use server_common::crypto;
 use server_common::executor::create_shard_executor;
+use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-// TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
-use server::log::logger::Logging;
-use server::shard_allocator::{ShardAllocator, ShardInfo};
-use server::streaming::users::user::User as LegacyUser;
-use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
@@ -85,6 +89,7 @@ use shard::{
     Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
     shard_mesh_channels,
 };
+use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -97,6 +102,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
+
+pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
+pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
@@ -435,12 +443,41 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     logging
         .late_init(
             config.system.get_system_path(),
-            &config.system.logging,
-            &config.telemetry,
+            &LoggingSettings::from(&config.system.logging),
+            &TelemetrySettings::from(&config.telemetry),
         )
         .map_err(ServerNgError::Logging)?;
 
     Ok(config)
+}
+
+/// Resolve the operator's `cpu_allocation` into concrete shard
+/// assignments plus the checked `u16` shard count.
+///
+/// Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
+/// (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
+/// configured with `u16::MAX` shards would mint a shard id that
+/// collides with the sentinel and an owner-table lookup could never
+/// tell that shard apart from an unowned slot. Reject at boot so the
+/// invariant is held by the type system, not by hoping the operator
+/// never configures 65535 cores worth of shards.
+fn resolve_shard_assignments(
+    sharding: &configs::sharding::ShardingConfig,
+) -> Result<(Vec<ShardInfo>, u16), ServerNgError> {
+    let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
+        .map_err(ServerNgError::ShardAllocator)?;
+    let assignments = allocator
+        .to_shard_assignments()
+        .map_err(ServerNgError::ShardAllocator)?;
+    if assignments.is_empty() {
+        return Err(ServerNgError::ShardsCountZero);
+    }
+    match u16::try_from(assignments.len()) {
+        Ok(count) if count < message_bus::OWNER_NONE => Ok((assignments, count)),
+        _ => Err(ServerNgError::ShardsCountOverflow {
+            count: assignments.len(),
+        }),
+    }
 }
 
 /// Re-validate the runtime sharding knobs that the per-shard runtime
@@ -514,30 +551,9 @@ pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
-    let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
-        .map_err(ServerNgError::ShardAllocator)?;
-    let assignments = allocator
-        .to_shard_assignments()
-        .map_err(ServerNgError::ShardAllocator)?;
+    warm_dummy_password_hash();
+    let (assignments, total_shards) = resolve_shard_assignments(&config.system.sharding)?;
     let shards_count = assignments.len();
-    if shards_count == 0 {
-        return Err(ServerNgError::ShardsCountZero);
-    }
-    // Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
-    // (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
-    // configured with `u16::MAX` shards would mint a shard id that
-    // collides with the sentinel and an owner-table lookup could never
-    // tell that shard apart from an unowned slot. Reject at boot so the
-    // invariant is held by the type system above this line, not by hoping
-    // the operator never configures 65535 cores worth of shards.
-    let total_shards = match u16::try_from(shards_count) {
-        Ok(count) if count < message_bus::OWNER_NONE => count,
-        _ => {
-            return Err(ServerNgError::ShardsCountOverflow {
-                count: shards_count,
-            });
-        }
-    };
 
     // Re-check the full valid range, not just the zero floor: a caller
     // that built the config without running `ShardingConfig::validate`
@@ -1043,7 +1059,8 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        let on_client_request = make_client_request_handler(&shard, &sessions);
+        let on_client_request =
+            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -1279,6 +1296,33 @@ fn spawn_shutdown_watchdog(
     watchdog.detach();
 }
 
+/// Copy the configured cluster roster plus this node's own client ports into
+/// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
+/// the real topology. `self_*` back only the cluster-disabled self-synthesis;
+/// the HTTP port is read from config since HTTP binds outside this topology.
+fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> ClusterRoster {
+    let http_port = if config.http.enabled {
+        parse_socket_addr("http.address", &config.http.address)
+            .ok()
+            .map(|addr| addr.port())
+    } else {
+        None
+    };
+    ClusterRoster {
+        enabled: config.cluster.enabled,
+        name: config.cluster.name.clone(),
+        nodes: config.cluster.nodes.clone(),
+        self_ip: topology.client_listen_addr.ip().to_string(),
+        self_ports: configs::cluster::TransportPorts {
+            tcp: Some(topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            http: http_port,
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            tcp_replica: None,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_shard_for_thread(
     shard_id: u16,
@@ -1396,10 +1440,19 @@ async fn build_shard_for_thread(
     let shard_handle = Rc::new(RefCell::new(None));
     // One per-shard SessionManager, shared by the client-request handler
     // (binds sessions) and the get_clients handler (reads them). Created
-    // here so both wirings reference the same instance.
+    // here so both wirings reference the same instance. It also carries this
+    // shard's cluster roster for the pre-auth GetClusterMetadata read.
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    sessions
+        .borrow_mut()
+        .set_cluster_roster(Rc::new(build_cluster_roster(config, topology)));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
+    let on_client_request = make_deferred_client_request_handler(
+        &bus,
+        &shard_handle,
+        &sessions,
+        Arc::clone(&config.system),
+    );
     let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
     let on_list_clients = make_list_clients_handler(&sessions);
     let on_partition_read = make_partition_read_handler(&shard_handle);
@@ -1811,7 +1864,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(
+        start_via_replica_io(
             shard,
             config,
             topology,
@@ -1819,18 +1872,45 @@ async fn start_tcp_runtime(
             dialed_replica,
             accepted_clients,
         )
-        .await;
+        .await?;
+    } else {
+        start_manual_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await?;
     }
 
-    start_manual_runtime(
-        shard,
-        config,
-        topology,
-        accepted_replica,
-        dialed_replica,
-        accepted_clients,
-    )
-    .await
+    // HTTP is served over TCP but sits outside the replica_io / manual client
+    // reactor, so it binds independently. Shard-0 gating comes from the sole
+    // caller of this function.
+    if config.http.enabled {
+        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+        let self_ports = configs::cluster::TransportPorts {
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            ..Default::default()
+        };
+        http::start(
+            shard,
+            http_addr,
+            &config.http,
+            &config.cluster,
+            Arc::clone(&config.system),
+            self_ports,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 // ws/wss bindings intentionally mirror the transport names (same convention as
@@ -2030,10 +2110,58 @@ fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
         return;
     }
 
-    let LegacyUser {
-        username, password, ..
-    } = server::bootstrap::create_root_user();
-    mux_stm.users().ensure_root_user(&username, &password);
+    let (username, password_hash) = create_root_credentials();
+    mux_stm.users().ensure_root_user(&username, &password_hash);
+}
+
+/// Resolve the root user credentials from `IGGY_ROOT_USERNAME` /
+/// `IGGY_ROOT_PASSWORD`, falling back to the default username with a
+/// generated password (printed to stdout, mirroring the legacy server).
+///
+/// Returns `(username, password_hash)`; the plaintext password never
+/// leaves this function.
+fn create_root_credentials() -> (String, String) {
+    let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
+    let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
+    assert_eq!(
+        username.is_ok(),
+        password.is_ok(),
+        "When providing the custom root user credentials, both username and password must be set."
+    );
+    if username.is_ok() && password.is_ok() {
+        info!("Using the custom root user credentials.");
+    } else {
+        info!("Using the default root user credentials...");
+        username = Ok(DEFAULT_ROOT_USERNAME.to_string());
+        let generated_password = crypto::generate_secret(20..40);
+        println!("Generated root user password: {generated_password}");
+        password = Ok(generated_password);
+    }
+
+    let username = username.expect("Root username is not set.");
+    let password = password.expect("Root password is not set.");
+    assert!(
+        !username.is_empty() && !password.is_empty(),
+        "Root user credentials cannot be empty."
+    );
+    assert!(
+        username.len() >= MIN_USERNAME_LENGTH,
+        "Root username is too short."
+    );
+    assert!(
+        username.len() <= MAX_USERNAME_LENGTH,
+        "Root username is too long."
+    );
+    assert!(
+        password.len() >= MIN_PASSWORD_LENGTH,
+        "Root password is too short."
+    );
+    assert!(
+        password.len() <= MAX_PASSWORD_LENGTH,
+        "Root password is too long."
+    );
+
+    (username, crypto::hash_password(&password))
 }
 
 fn validate_cluster_root_bootstrap(

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use server_common::bootstrap::SystemPaths;
+use server_common::log::LoggingSettings;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
@@ -98,6 +99,20 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub sysinfo_print_interval: IggyDuration,
+}
+
+impl From<&LoggingConfig> for LoggingSettings {
+    fn from(config: &LoggingConfig) -> Self {
+        Self {
+            path: config.path.clone(),
+            level: config.level.clone(),
+            file_enabled: config.file_enabled,
+            max_file_size: config.max_file_size,
+            max_total_size: config.max_total_size,
+            rotation_check_interval: config.rotation_check_interval,
+            retention: config.retention,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]

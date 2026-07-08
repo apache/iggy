@@ -505,8 +505,21 @@ impl StateHandler for CreateConsumerGroupRequest {
         state: &mut StreamsInner,
         _timestamp: iggy_common::IggyTimestamp,
     ) -> ApplyReply {
-        let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return ApplyReply::ok(Bytes::new());
+        // A missing parent is a committed rejection, mirroring `CreateTopic`
+        // on a missing stream. Resolve level by level so the error names the
+        // level that missed.
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return ApplyReply::err(CreateConsumerGroupResult::StreamNotFound);
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return ApplyReply::err(CreateConsumerGroupResult::TopicNotFound);
+        };
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(CreateConsumerGroupResult::TopicNotFound);
         };
         let name: Arc<str> = Arc::from(self.name.as_str());
         // Per-(stream,topic) name uniqueness. A same-name group already exists:
@@ -956,6 +969,41 @@ mod tests {
             u32::from(CreateConsumerGroupResult::NameAlreadyExists)
         );
         assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_parent_when_apply_create_consumer_group_should_return_not_found() {
+        let mut state = streams_with_topic();
+
+        let missing_stream = StateHandler::apply(
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(999),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("group").unwrap(),
+            },
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(
+            missing_stream.code,
+            u32::from(CreateConsumerGroupResult::StreamNotFound)
+        );
+        assert!(missing_stream.body.is_empty());
+
+        let missing_topic = StateHandler::apply(
+            &CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(999),
+                name: WireName::new("group").unwrap(),
+            },
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(
+            missing_topic.code,
+            u32::from(CreateConsumerGroupResult::TopicNotFound)
+        );
+        assert!(missing_topic.body.is_empty());
     }
 
     #[test]

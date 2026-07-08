@@ -592,6 +592,14 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 #     + "numa:auto": Use all available numa node, cores
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
 cpu_allocation = "numa:auto"
+# Whether shard threads are pinned to dedicated CPU cores (default: true).
+# Pinned cores are drawn from the process's allowed CPU set (affinity/cpuset
+# mask), so the server cooperates with systemd `AllowedCPUs=` and container
+# cpusets. Set to false when the server shares cores with other workloads
+# (e.g. a multi-tenant host slicing CPU via cgroup quotas): unpinned shards
+# let the kernel scheduler place threads freely instead of piling every
+# process onto the same low-numbered cores.
+# pin_cores = true
 
 [websocket]
 enabled = true

@@ -287,10 +287,10 @@ TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    // Build a payload one byte over the SDK's max payload size (64 MB). cxx::Vec exposes no
-    // public reserve API, so the loop relies on amortised geometric growth.
+    // Build a payload one byte over the SDK's max payload size (64 MB).
     constexpr std::uint32_t kOversizedPayloadBytes = 64'000'001u;
     rust::Vec<std::uint8_t> oversized_payload;
+    oversized_payload.reserve(kOversizedPayloadBytes);
     for (std::uint32_t i = 0; i < kOversizedPayloadBytes; i++) {
         oversized_payload.push_back(0x41);
     }

@@ -47,6 +47,10 @@ pub type Replica = shard::IggyShard<
 
 pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
+    // Seed the root user at slab id 0, matching production bootstrap
+    // (`ensure_root_user`). Root is undeletable in-apply, so keeping it in slot
+    // 0 leaves the workload's users at slab id 1+ and out of any delete attempt.
+    users.ensure_root_user("iggy", "hash");
     let streams: Streams = StreamsInner::new().into();
     let mux = SimMuxStateMachine::new(variadic!(users, streams));
 

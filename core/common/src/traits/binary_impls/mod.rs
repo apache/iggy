@@ -31,6 +31,8 @@ use crate::IggyError;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
+#[cfg(feature = "vsr")]
+use crate::{BinaryClient, ClientState};
 use iggy_binary_protocol::WireDecode;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
@@ -50,6 +52,23 @@ pub(crate) fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionIn
         sdk_name: WireName::new(RUST_SDK_NAME).expect("RUST_SDK_NAME is 1-255 bytes"),
         sdk_version: WireName::new(sdk_version).map_err(|_| IggyError::InvalidFormat)?,
     })
+}
+
+/// Release a live session before a fresh login on the same connection.
+///
+/// server-ng binds a connection to one `(client, session)` and resolves the
+/// acting user from that binding, not the wire header. A re-login on a still-
+/// bound connection is served as an idempotent replay that keeps the old
+/// identity, so switching users on a live connection requires logging out
+/// first: the committed Logout unbinds the connection cluster-wide, so the
+/// following Register takes the full register path and rebinds the newly
+/// authenticated user. No-op when the client is not authenticated.
+#[cfg(feature = "vsr")]
+pub(crate) async fn logout_before_relogin<B: BinaryClient>(client: &B) -> Result<(), IggyError> {
+    if client.get_state().await == ClientState::Authenticated {
+        client.logout_user().await?;
+    }
+    Ok(())
 }
 
 /// Same bounds and error every server (HTTP and binary) enforces, applied

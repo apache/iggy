@@ -28,6 +28,7 @@ use super::sharding::{
 use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
 use crate::ConfigurationError;
+use cpu_allocation::allowed_cpus;
 use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
@@ -488,16 +489,27 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
-                if *end > available_cpus {
+                if *end - *start > available_cpus {
                     eprintln!(
-                        "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} yields {} shards, exceeding available CPU cores {available_cpus}",
+                        *end - *start
+                    );
+                    return Err(ConfigurationError::InvalidConfigurationValue);
+                }
+                if !self.pin_cores {
+                    return Ok(());
+                }
+                let allowed = allowed_cpus();
+                if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} includes CPU {cpu}, which is outside the set of cores allowed for this process (affinity/cpuset mask)"
                     );
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 Ok(())
             }
             // NUMA topology validation requires hwlocality (runtime dep).
-            // Full NUMA validation happens in server::shard_allocator at startup.
+            // Full NUMA validation happens in shard_allocator at startup.
             CpuAllocation::NumaAware(_) => Ok(()),
         }
     }
@@ -1003,6 +1015,74 @@ mod sharding_shutdown_knob_tests {
         let cfg = ShardingConfig {
             shutdown_drain_timeout: IggyDuration::new(Duration::from_millis(20)),
             shutdown_poll_interval: IggyDuration::new(Duration::from_millis(50)),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod sharding_cpu_range_tests {
+    use super::*;
+
+    #[test]
+    fn inverted_range_is_rejected() {
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(2, 2),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn pinned_range_within_allowed_set_is_accepted() {
+        let first = allowed_cpus()[0];
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(first, first + 1),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pinned_range_outside_allowed_set_is_rejected() {
+        let past_last = allowed_cpus().last().copied().unwrap() + 1;
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(past_last, past_last + 1),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn pinned_range_wider_than_parallelism_is_rejected() {
+        // Under a cgroup CPU quota the affinity mask stays full while
+        // `available_parallelism` shrinks, so membership alone would
+        // accept this; the shard-count cap must reject it.
+        let first = allowed_cpus()[0];
+        let available = available_parallelism().unwrap().get();
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(first, first + available + 1),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn unpinned_range_is_capped_by_shard_count_not_core_ids() {
+        // Core ids outside the machine are fine unpinned; only the
+        // resulting shard count matters.
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(1 << 20, (1 << 20) + 1),
+            pin_cores: false,
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        let available = available_parallelism().unwrap().get();
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(0, available + 1),
+            pin_cores: false,
             ..ShardingConfig::default()
         };
         assert!(cfg.validate().is_err());

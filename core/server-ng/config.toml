@@ -630,6 +630,15 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # TODO(hubcio): revert to "numa:auto" once multi-shard server-ng is stable.
 cpu_allocation = 1
 
+# Whether shard threads are pinned to dedicated CPU cores (default: true).
+# Pinned cores are drawn from the process's allowed CPU set (affinity/cpuset
+# mask), so the server cooperates with systemd `AllowedCPUs=` and container
+# cpusets. Set to false when the server shares cores with other workloads
+# (e.g. a multi-tenant host slicing CPU via cgroup quotas): unpinned shards
+# let the kernel scheduler place threads freely instead of piling every
+# process onto the same low-numbered cores.
+# pin_cores = true
+
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized
 # larger than typical TCP RTT times in-flight write-batch so writers

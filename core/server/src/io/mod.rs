@@ -15,5 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod fs_utils;
+pub use server_common::fs_utils;
+
 pub mod storage;
