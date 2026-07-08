@@ -1168,6 +1168,11 @@ mod tests {
     use iggy_connector_sdk::Schema;
     use std::collections::BTreeMap;
     use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex as TokioMutex;
 
     fn test_config() -> SurrealDbSinkConfig {
         SurrealDbSinkConfig {
@@ -1225,6 +1230,92 @@ mod tests {
     fn json_payload(value: serde_json::Value) -> Payload {
         let mut bytes = serde_json::to_vec(&value).expect("Failed to serialize JSON");
         Payload::Json(simd_json::to_owned_value(&mut bytes).expect("Failed to parse JSON"))
+    }
+
+    async fn start_surrealdb_test_server() -> (String, Arc<AtomicUsize>, Arc<TokioMutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let endpoint = listener
+            .local_addr()
+            .expect("test server should expose local address")
+            .to_string();
+        let sql_requests = Arc::new(AtomicUsize::new(0));
+        let sql_body = Arc::new(TokioMutex::new(String::new()));
+        let server_sql_requests = Arc::clone(&sql_requests);
+        let server_sql_body = Arc::clone(&sql_body);
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("request should connect");
+                let sql_requests = Arc::clone(&server_sql_requests);
+                let sql_body = Arc::clone(&server_sql_body);
+
+                tokio::spawn(async move {
+                    let (request_line, body) = read_http_request(&mut stream).await;
+                    let response_body = if request_line.starts_with("POST /sql ") {
+                        sql_requests.fetch_add(1, Ordering::Relaxed);
+                        *sql_body.lock().await = body;
+                        r#"[{"status":"OK","result":[]}]"#
+                    } else {
+                        r#"{"status":"OK"}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("response should be written");
+                });
+            }
+        });
+
+        (endpoint, sql_requests, sql_body)
+    }
+
+    async fn read_http_request(stream: &mut TcpStream) -> (String, String) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut headers_end = None;
+
+        while headers_end.is_none() {
+            let read = stream.read(&mut chunk).await.expect("request should read");
+            assert_ne!(read, 0, "request should include headers");
+            buffer.extend_from_slice(&chunk[..read]);
+            headers_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        }
+
+        let headers_end = headers_end.expect("headers should terminate");
+        let body_start = headers_end + 4;
+        let headers = String::from_utf8_lossy(&buffer[..headers_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                })
+            })
+            .unwrap_or(0);
+
+        while buffer.len() < body_start + content_length {
+            let read = stream.read(&mut chunk).await.expect("body should read");
+            assert_ne!(read, 0, "request should include declared body");
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+
+        let request_line = headers
+            .lines()
+            .next()
+            .expect("request line should exist")
+            .to_string();
+        let body =
+            String::from_utf8_lossy(&buffer[body_start..body_start + content_length]).to_string();
+
+        (request_line, body)
     }
 
     #[test]
@@ -1731,29 +1822,33 @@ mod tests {
 
     #[test]
     fn given_malformed_record_in_batch_should_still_attempt_valid_records() {
-        let mut config = test_config();
-        config.payload_format = Some("json".to_string());
-        let sink = SurrealDbSink::new(1, config);
-        let messages = vec![
-            test_message(Payload::Raw(b"not-json".to_vec())),
-            test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
-        ];
-
         tokio::runtime::Runtime::new()
             .expect("runtime should start")
             .block_on(async {
-                let outcome = sink
-                    .insert_batch(
-                        messages,
-                        &RecordIdPrefix::new(&test_topic_metadata()),
-                        &test_topic_metadata(),
-                        &test_messages_metadata(),
-                    )
+                let (endpoint, sql_requests, sql_body) = start_surrealdb_test_server().await;
+                let mut config = test_config();
+                config.endpoint = endpoint;
+                config.auth_scope = Some("none".to_string());
+                config.payload_format = Some("json".to_string());
+                let mut sink = SurrealDbSink::new(1, config);
+                sink.open().await.expect("sink should open");
+
+                let messages = vec![
+                    test_message(Payload::Raw(b"not-json".to_vec())),
+                    test_message(Payload::Raw(br#"{"valid":true}"#.to_vec())),
+                ];
+                let result = sink
+                    .process_messages(&test_topic_metadata(), &test_messages_metadata(), messages)
                     .await;
 
-                assert_eq!(outcome.inserted_count, 0);
-                assert_eq!(outcome.error_count, 2);
-                assert!(matches!(outcome.error, Some(Error::InitError(_))));
+                assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+                assert_eq!(sink.messages_processed.load(Ordering::Relaxed), 1);
+                assert_eq!(sink.insertion_errors.load(Ordering::Relaxed), 1);
+                assert_eq!(sql_requests.load(Ordering::Relaxed), 1);
+
+                let body = sql_body.lock().await;
+                assert!(body.contains(r#""valid":true"#));
+                assert!(!body.contains("not-json"));
             });
     }
 

@@ -19,7 +19,7 @@ key = "surrealdb"
 enabled = true
 version = 0
 name = "SurrealDB sink"
-path = "target/release/libiggy_connector_surrealdb_sink"
+path = "../../target/release/libiggy_connector_surrealdb_sink"
 plugin_config_format = "toml"
 
 [[streams]]
