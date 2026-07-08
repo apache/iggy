@@ -637,7 +637,14 @@ cpu_allocation = 1
 # (e.g. a multi-tenant host slicing CPU via cgroup quotas): unpinned shards
 # let the kernel scheduler place threads freely instead of piling every
 # process onto the same low-numbered cores.
-# pin_cores = true
+pin_cores = true
+
+# Per-shard inter-shard inbox capacity. Bounded by design: consensus-frame
+# drops recover via VSR retransmit, but cross-shard client-reply drops are
+# terminal. Size for the worst-case sum of both: the consensus working set
+# (~ PIPELINE_PREPARE_QUEUE_MAX (32) * replica_count * directions) plus peak
+# client-reply fan-out per shard.
+inbox_capacity = 1024
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized
@@ -652,6 +659,11 @@ shutdown_drain_timeout = "10 s"
 # cost; the default keeps shutdown observably prompt without measurable
 # scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
 shutdown_poll_interval = "50 ms"
+
+# Safety-tick cadence for the partition reconciliation loop. The reconciler
+# also wakes on every metadata commit from shard 0, so this only covers
+# dropped wake-ups and the initial post-bootstrap convergence window.
+reconcile_periodic_interval = "1 s"
 
 [websocket]
 enabled = true

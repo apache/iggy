@@ -51,7 +51,7 @@ use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, usize_to_u32};
 use bytes::Bytes;
-use configs::system::SystemConfig;
+use configs::server_ng::NgSystemConfig;
 use consensus::{
     Consensus, EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
     build_incompatible_protocol_eviction_message,
@@ -112,7 +112,7 @@ pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 pub(crate) fn make_client_request_handler(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
 ) -> RequestHandler {
     let shard = Rc::clone(shard);
     let sessions = Rc::clone(sessions);
@@ -404,7 +404,7 @@ pub(crate) fn make_deferred_client_request_handler(
     bus: &Rc<IggyMessageBus>,
     shard_handle: &ServerNgShardHandle,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
 ) -> RequestHandler {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
@@ -536,7 +536,7 @@ pub(crate) fn make_metadata_submit_handler(
 fn enqueue_client_request(
     shard: Rc<ServerNgShard>,
     sessions: Rc<RefCell<SessionManager>>,
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -561,7 +561,7 @@ fn enqueue_client_request(
 async fn drain_client_requests(
     shard: Rc<ServerNgShard>,
     sessions: Rc<RefCell<SessionManager>>,
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -598,7 +598,7 @@ fn pop_next_client_request(
 async fn handle_client_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: &Arc<SystemConfig>,
+    system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) {
@@ -1035,7 +1035,7 @@ pub(crate) async fn dispatch_partition_request(
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
-    system_config: &Arc<SystemConfig>,
+    system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) {
@@ -1232,7 +1232,7 @@ async fn handle_default_non_replicated(
 #[allow(clippy::future_not_send)]
 async fn handle_get_snapshot(
     shard: &Rc<ServerNgShard>,
-    system_config: &Arc<SystemConfig>,
+    system_config: &Arc<NgSystemConfig>,
     transport_client_id: u128,
     request: &Message<RequestHeader>,
     user_id: Option<u32>,

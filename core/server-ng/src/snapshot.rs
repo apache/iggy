@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
-use configs::system::SystemConfig;
+use configs::server_ng::NgSystemConfig;
 use futures::channel::oneshot;
 use iggy_common::{IggyDuration, IggyError, SnapshotCompression, SystemSnapshotType};
 use tracing::{error, info, warn};
@@ -55,7 +55,7 @@ static SNAPSHOT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// [`SNAPSHOT_IN_PROGRESS`]); a concurrent request busy-rejects with
 /// [`IggyError::SnapshotFileCompletionFailed`].
 pub async fn collect(
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
     compression: SnapshotCompression,
     snapshot_types: Vec<SystemSnapshotType>,
 ) -> Result<Vec<u8>, IggyError> {
@@ -128,7 +128,7 @@ impl Drop for SnapshotInProgressGuard {
 }
 
 fn collect_blocking(
-    system_config: &SystemConfig,
+    system_config: &NgSystemConfig,
     compression: SnapshotCompression,
     snapshot_types: &[SystemSnapshotType],
 ) -> Result<Vec<u8>, IggyError> {
@@ -156,7 +156,7 @@ fn collect_blocking(
 
 fn capture(
     snapshot_type: &SystemSnapshotType,
-    system_config: &SystemConfig,
+    system_config: &NgSystemConfig,
 ) -> io::Result<Vec<u8>> {
     match snapshot_type {
         SystemSnapshotType::FilesystemOverview => {
@@ -195,7 +195,7 @@ fn process_list() -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-fn server_logs(system_config: &SystemConfig) -> io::Result<Vec<u8>> {
+fn server_logs(system_config: &NgSystemConfig) -> io::Result<Vec<u8>> {
     // Mirror the logger's path derivation (server_common `Logging::late_init`):
     // it canonicalizes the configured subdirectory before joining the system
     // path, so a relative `logging.path` that already exists resolves against the
@@ -224,7 +224,7 @@ fn server_logs(system_config: &SystemConfig) -> io::Result<Vec<u8>> {
     Ok(content)
 }
 
-fn server_config(system_config: &SystemConfig) -> io::Result<Vec<u8>> {
+fn server_config(system_config: &NgSystemConfig) -> io::Result<Vec<u8>> {
     let config_path = PathBuf::from(system_config.get_runtime_path()).join("current_config.toml");
     std::fs::read(config_path)
 }
@@ -277,7 +277,7 @@ mod tests {
         // second collector thread) rather than piling up threads.
         let held = SnapshotInProgressGuard::acquire().expect("flag starts free");
         let result = futures::executor::block_on(collect(
-            Arc::new(SystemConfig::default()),
+            Arc::new(NgSystemConfig::default()),
             SnapshotCompression::Stored,
             vec![SystemSnapshotType::Test],
         ));
