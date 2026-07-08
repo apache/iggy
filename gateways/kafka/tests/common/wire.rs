@@ -185,7 +185,7 @@ pub fn build_produce_flexible_request_with_topic(topic: &str) -> Bytes {
     enc.freeze()
 }
 
-/// Fetch v3 body without isolation_level field (defaults to 0).
+/// Fetch v3 body without `isolation_level` field (defaults to 0).
 pub fn build_fetch_v3_no_isolation_request() -> Bytes {
     let mut enc = Encoder::with_capacity(32);
     enc.write_i32(-1);
@@ -337,7 +337,7 @@ pub fn build_fetch_request_with_sections(
     enc.freeze()
 }
 
-/// ListOffsets request covering legacy v0 `max_num_offsets` and newer leader-epoch branches.
+/// `ListOffsets` request covering legacy v0 `max_num_offsets` and newer leader-epoch branches.
 pub fn build_list_offsets_branch_request(version: i16, topic: &str, partition: i32) -> Bytes {
     let flexible = version >= 6;
     let mut enc = Encoder::with_capacity(128);
@@ -373,7 +373,7 @@ pub fn build_list_offsets_branch_request(version: i16, topic: &str, partition: i
     enc.freeze()
 }
 
-/// CreateTopics request with one topic, one assignment, and one config.
+/// `CreateTopics` request with one topic, one assignment, and one config.
 pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> Bytes {
     let flexible = version >= 5;
     let mut enc = Encoder::with_capacity(256);

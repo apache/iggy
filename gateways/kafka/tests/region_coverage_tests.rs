@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use iggy_gateway_kafka::error::KafkaProtocolError;
 use iggy_gateway_kafka::protocol::codec::Encoder;
 use iggy_gateway_kafka::protocol::requests::{
@@ -97,7 +97,7 @@ fn produce_null_topic_name_preserves_acks_on_error() {
             assert_eq!(acks, Some(1));
             assert!(matches!(error, KafkaProtocolError::NullTopicName));
         }
-        other => panic!("expected NullTopicName, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected NullTopicName"),
     }
 }
 
@@ -120,7 +120,7 @@ fn produce_v3_error_before_acks_has_none_acks() {
     enc.write_i16(1);
     match decode_produce_request(3, enc.freeze()) {
         ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, None),
-        other => panic!("expected decode error before acks, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error before acks"),
     }
 }
 
@@ -131,7 +131,7 @@ fn produce_v3_error_after_acks_preserves_acks() {
     enc.write_i16(7);
     match decode_produce_request(3, enc.freeze()) {
         ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(7)),
-        other => panic!("expected decode error after acks, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error after acks"),
     }
 }
 
@@ -143,7 +143,7 @@ fn produce_v3_error_after_timeout_preserves_acks() {
     enc.write_i32(500);
     match decode_produce_request(3, enc.freeze()) {
         ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(1)),
-        other => panic!("expected decode error after timeout, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error after timeout"),
     }
 }
 
@@ -160,7 +160,7 @@ fn produce_v9_error_on_null_topic_preserves_acks() {
             assert_eq!(acks, Some(2));
             assert!(matches!(error, KafkaProtocolError::NullTopicName));
         }
-        other => panic!("expected NullTopicName, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected NullTopicName"),
     }
 }
 
@@ -174,7 +174,7 @@ fn produce_v9_error_on_partition_count_preserves_acks() {
     enc.write_compact_nullable_string(Some("topic"));
     match decode_produce_request(9, enc.freeze()) {
         ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(3)),
-        other => panic!("expected decode error in partition count, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error in partition count"),
     }
 }
 
@@ -190,7 +190,7 @@ fn produce_v9_error_on_partition_records_preserves_acks() {
     enc.write_i32(0);
     match decode_produce_request(9, enc.freeze()) {
         ProduceDecodeResult::Err { acks, .. } => assert_eq!(acks, Some(4)),
-        other => panic!("expected decode error in records, got {other:?}"),
+        ProduceDecodeResult::Ok(_) => panic!("expected decode error in records"),
     }
 }
 

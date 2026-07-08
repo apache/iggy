@@ -179,9 +179,7 @@ fn compact_array_count_above_max_returns_error() {
 
 #[test]
 fn compact_nullable_string_invalid_utf8_fails() {
-    let mut raw = Vec::new();
-    raw.push(2); // len = 1
-    raw.push(0xff);
+    let raw = vec![2, 0xff]; // len = 1, invalid UTF-8 byte
     let mut dec = Decoder::new(Bytes::from(raw));
     let err = dec.read_compact_nullable_string().unwrap_err();
     assert!(matches!(err, KafkaProtocolError::InvalidUtf8));

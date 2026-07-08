@@ -441,14 +441,14 @@ mod tests {
     fn correlation_id_is_extracted_from_frame() {
         let frame =
             bytes::Bytes::from_static(&[0x00, 0x12, 0x00, 0x01, 0x11, 0x22, 0x33, 0x44, 0xaa]);
-        assert_eq!(correlation_id_from_frame(&frame), 0x11223344);
+        assert_eq!(correlation_id_from_frame(&frame), 0x1122_3344);
     }
 
     #[tokio::test]
     async fn send_response_writes_header_and_body() {
         let (mut client, mut server) = tcp_pair().await;
         let header = ResponseHeader {
-            correlation_id: 0x01020304,
+            correlation_id: 0x0102_0304,
         };
         let body = [9u8, 8, 7];
 

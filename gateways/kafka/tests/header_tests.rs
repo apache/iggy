@@ -208,11 +208,11 @@ fn response_header_version_hits_every_api_key_match_arm() {
             continue;
         }
         let req_hdr_at_v0 = request_header_version(api_key, 0);
-        let expected_at_v0 = if req_hdr_at_v0 >= 2 { 1 } else { 0 };
+        let expected_at_v0 = i16::from(req_hdr_at_v0 >= 2);
         assert_eq!(response_header_version(api_key, 0), expected_at_v0);
 
         let req_hdr_at_max = request_header_version(api_key, i16::MAX - 1);
-        let expected_at_max = if req_hdr_at_max >= 2 { 1 } else { 0 };
+        let expected_at_max = i16::from(req_hdr_at_max >= 2);
         assert_eq!(
             response_header_version(api_key, i16::MAX - 1),
             expected_at_max
