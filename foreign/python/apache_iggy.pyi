@@ -559,7 +559,7 @@ class IggyClient:
 
         Raises:
             PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
         """
     def leave_consumer_group(
         self,
@@ -580,7 +580,7 @@ class IggyClient:
 
         Raises:
             PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
         """
     def send_messages(
         self,

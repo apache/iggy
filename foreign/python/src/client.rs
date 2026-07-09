@@ -562,7 +562,7 @@ impl IggyClient {
     ///
     /// Raises:
     ///     PyValueError: If an identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn join_consumer_group<'a>(
         &self,
@@ -597,7 +597,7 @@ impl IggyClient {
     ///
     /// Raises:
     ///     PyValueError: If an identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn leave_consumer_group<'a>(
         &self,
