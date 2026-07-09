@@ -74,6 +74,7 @@ async fn handle_request(
                 .await?;
 
             shard.metrics.increment_messages(messages_count as u64);
+            shard.wake_poll_waiters(&namespace);
             Ok(ShardResponse::SendMessages)
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
@@ -419,6 +420,7 @@ async fn handle_request(
                 .await?;
 
             shard.metrics.increment_messages(messages_count as u64);
+            shard.wake_poll_waiters(&ns);
 
             sender.send_empty_ok_response().await?;
 
@@ -507,12 +509,14 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             let mut partitions = shard.local_partitions.borrow_mut();
             for partition_id in partition_ids {
                 let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+                shard.wake_poll_waiters(&ns);
                 partitions.remove(&ns);
             }
             Ok(())
         }
         ShardEvent::PurgedStream { stream_id } => {
             let stream = shard.resolve_stream(&stream_id)?;
+            shard.wake_stream_poll_waiters(stream.id());
             shard.purge_stream_local(stream).await?;
             Ok(())
         }
@@ -521,6 +525,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             topic_id,
         } => {
             let topic = shard.resolve_topic(&stream_id, &topic_id)?;
+            shard.wake_topic_poll_waiters(topic.stream_id, topic.topic_id);
             shard.purge_topic_local(topic).await?;
             Ok(())
         }

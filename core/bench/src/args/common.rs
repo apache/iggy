@@ -21,7 +21,8 @@ use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
 use super::{
     defaults::{
         DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
-        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_SAMPLING_TIME, DEFAULT_WARMUP_TIME,
+        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_POLL_WAIT_TIMEOUT, DEFAULT_SAMPLING_TIME,
+        DEFAULT_WARMUP_TIME,
     },
     transport::BenchmarkTransportCommand,
 };
@@ -70,6 +71,10 @@ pub struct IggyBenchArgs {
     /// Warmup time in human readable format, e.g. "1s", "2m", "3h"
     #[arg(long, short = 'w', default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
+
+    /// Poll wait timeout in human readable format, e.g. "10ms", "1s"
+    #[arg(long, default_value_t = IggyDuration::from_str(DEFAULT_POLL_WAIT_TIMEOUT).unwrap(), value_parser = IggyDuration::from_str)]
+    pub poll_wait_timeout: IggyDuration,
 
     /// Sampling time for metrics collection. It is also used as bucket size for time series calculations.
     #[arg(long, short = 't', default_value_t = IggyDuration::from_str(DEFAULT_SAMPLING_TIME).unwrap(), value_parser = IggyDuration::from_str)]
@@ -163,6 +168,38 @@ impl IggyBenchArgs {
                 .exit();
         }
 
+        if self.high_level_api && !self.poll_wait_timeout.is_zero() {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "--poll-wait-timeout is only supported by low-level benchmark consumers",
+                )
+                .exit();
+        }
+
+        if matches!(
+            self.kind(),
+            BenchmarkKind::PinnedProducer | BenchmarkKind::BalancedProducer
+        ) && !self.poll_wait_timeout.is_zero()
+        {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "--poll-wait-timeout requires a benchmark with consumers",
+                )
+                .exit();
+        }
+
+        if matches!(self.transport(), TransportProtocol::Http) && !self.poll_wait_timeout.is_zero()
+        {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "--poll-wait-timeout is not supported by HTTP transport",
+                )
+                .exit();
+        }
+
         self.benchmark_kind.inner().validate();
     }
 
@@ -216,6 +253,10 @@ impl IggyBenchArgs {
 
     pub const fn warmup_time(&self) -> IggyDuration {
         self.warmup_time
+    }
+
+    pub const fn poll_wait_timeout(&self) -> IggyDuration {
+        self.poll_wait_timeout
     }
 
     pub const fn sampling_time(&self) -> IggyDuration {
@@ -389,6 +430,10 @@ impl IggyBenchArgs {
             transport.to_string(),
         ];
 
+        if !self.poll_wait_timeout().is_zero() {
+            parts.push(format!("poll_wait_{}", self.poll_wait_timeout()));
+        }
+
         if let Some(remark) = &self.remark() {
             parts.push(remark.clone());
         }
@@ -445,5 +490,32 @@ impl IggyBenchArgs {
         }
 
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_wait_timeout_defaults_to_zero() {
+        let args = IggyBenchArgs::try_parse_from(["iggy-bench", "pinned-consumer", "tcp"])
+            .expect("args should parse");
+
+        assert!(args.poll_wait_timeout().is_zero());
+    }
+
+    #[test]
+    fn poll_wait_timeout_arg_parses() {
+        let args = IggyBenchArgs::try_parse_from([
+            "iggy-bench",
+            "--poll-wait-timeout",
+            "10ms",
+            "pinned-consumer",
+            "tcp",
+        ])
+        .expect("args should parse");
+
+        assert_eq!(args.poll_wait_timeout().as_micros(), 10_000);
     }
 }

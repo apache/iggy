@@ -25,6 +25,7 @@ use crate::server::scenarios::{
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
+    poll_messages_wait_timeout_scenario,
 };
 use integration::iggy_harness;
 
@@ -82,4 +83,12 @@ async fn auto_commit_reconnection(harness: &TestHarness) {
 )]
 async fn new_messages_after_restart(harness: &TestHarness) {
     consumer_group_new_messages_after_restart_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn poll_messages_wait_timeout_consumer_group(harness: &TestHarness) {
+    poll_messages_wait_timeout_scenario::run_consumer_group_checks(harness).await;
 }
