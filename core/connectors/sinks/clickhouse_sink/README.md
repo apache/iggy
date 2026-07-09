@@ -211,3 +211,11 @@ If your workload cannot tolerate duplicate rows, either:
 1. Use a `ReplicatedMergeTree` table and keep `max_retries` low enough that retries stay within the deduplication window, or
 2. Use a `CollapsingMergeTree` / `ReplacingMergeTree` and apply deduplication at query time, or
 3. Accept duplicates at write time and deduplicate with `DISTINCT` or `GROUP BY` in your queries.
+
+## Testing
+
+Integration tests against a live ClickHouse container cover only the end-to-end path from Iggy to ClickHouse: messages produced to a stream land as rows in the target table. They are intentionally **not exhaustive** over the wire format. They do not, for example, round-trip a `UUID` column, a `DEFAULT` / `MATERIALIZED` / `ALIAS` column, or the `RowBinaryWithDefaults` `0x01` use-default path against the real server.
+
+Those cases are instead pinned by unit tests that assert exact output bytes for every supported type, including `UUID` word order, the `0x01` use-default prefix byte, and the schema parser dropping `MATERIALIZED` / `ALIAS` / `EPHEMERAL` columns while flagging `DEFAULT` ones.
+
+Byte-exact unit tests plus a minimal e2e path is a deliberate trade. Containerized integration tests are costly to run, and the residual risk they would cover, a real server disagreeing with our model of the wire format, is low: the `RowBinaryWithDefaults` format is stable and unlikely to change under us.
