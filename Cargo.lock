@@ -6840,7 +6840,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "dashmap",
  "iggy_connector_sdk",
  "rand 0.10.1",
  "reqwest 0.13.4",

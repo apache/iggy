@@ -28,16 +28,12 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
