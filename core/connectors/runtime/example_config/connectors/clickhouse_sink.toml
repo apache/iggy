@@ -24,8 +24,8 @@ path = "target/release/libiggy_connector_clickhouse_sink"
 verbose = false
 
 [[streams]]
-stream = "qw"
-topics = ["records"]
+stream = "example_stream"
+topics = ["example_topic"]
 schema = "json"
 batch_length = 1000
 poll_interval = "5ms"
@@ -36,7 +36,7 @@ url = "http://localhost:8123"
 database = "default"
 username = "default"
 password = ""
-table = "users"
+table = "events"
 
 # Insert format: "json_each_row" (default), "row_binary", or "string"
 #   json_each_row  — accepts Payload::Json; ClickHouse handles type coercion
