@@ -41,9 +41,7 @@ primary_key_column = "id"
 # Custom query (optional)
 custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit"
 
-# CDC options (optional)
-enable_wal_cdc = false
-publication_name = "iggy_publication"
+# CDC options (only used when mode = "cdc")
 replication_slot = "iggy_slot"
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 cdc_backend = "builtin"
@@ -69,9 +67,7 @@ cdc_backend = "builtin"
 | `processed_column` | string | none | Boolean column to mark as processed |
 | `primary_key_column` | string | tracking_column | PK for delete/mark operations |
 | `custom_query` | string | none | Custom SQL with parameter substitution |
-| `enable_wal_cdc` | bool | `false` | Enable WAL-based CDC |
-| `publication_name` | string | `iggy_publication` | Logical replication publication |
-| `replication_slot` | string | `iggy_slot` | Replication slot name |
+| `replication_slot` | string | `iggy_slot` | Replication slot name (only used when `mode = "cdc"`) |
 | `capture_operations` | array | `["INSERT","UPDATE","DELETE"]` | CDC operations to capture |
 | `cdc_backend` | string | `builtin` | `builtin` or `pg_replicate` |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
@@ -267,7 +263,6 @@ CDC requires PostgreSQL logical replication setup:
 ```toml
 [plugin_config]
 mode = "cdc"
-enable_wal_cdc = true
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 ```
@@ -344,7 +339,6 @@ batch_length = 100
 [plugin_config]
 connection_string = "postgresql://user:pass@localhost:5432/mydb"
 mode = "cdc"
-enable_wal_cdc = true
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE"]
 ```
