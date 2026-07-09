@@ -244,7 +244,7 @@ impl ClickHouseClient {
                         )));
                     }
                     warn!("Network error on attempt {attempts}/{max_retries}: {e}. Retrying...");
-                    tokio::time::sleep(retry_delay * attempts).await;
+                    tokio::time::sleep(jittered_backoff(retry_delay, attempts)).await;
                 }
             }
         }
@@ -333,7 +333,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// Cap grows as `base * 2^attempt`, clamped to 60 s. The actual sleep is
 /// a uniform random value in `[0, cap]`, so concurrent instances spread
 /// their retries instead of thundering back together.
-fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
+pub(crate) fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
     const MAX: Duration = Duration::from_secs(60);
     let cap = base.saturating_mul(2u32.saturating_pow(attempt)).min(MAX);
     let cap_ms = cap.as_millis() as u64;

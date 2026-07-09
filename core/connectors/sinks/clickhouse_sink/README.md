@@ -170,7 +170,7 @@ string_format = "csv"
 
 ## Reliability
 
-The connector retries failed inserts up to `max_retries` times, starting from `retry_delay`. Retryable HTTP errors back off exponentially with full jitter; network errors back off linearly with the attempt count. Non-retryable errors fail immediately.
+The connector retries failed inserts up to `max_retries` times, starting from `retry_delay`. Retryable HTTP errors and network/timeout errors both back off exponentially with full jitter, so instances spread their retries instead of hammering a recovering server in lockstep. Non-retryable errors fail immediately. The startup ping and schema fetch use the same jittered backoff.
 
 On shutdown the connector logs the total number of messages processed.
 

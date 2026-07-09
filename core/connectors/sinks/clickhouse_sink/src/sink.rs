@@ -16,7 +16,10 @@
 // under the License.
 
 use crate::body::{build_json_body, build_row_binary_body, build_string_body};
-use crate::{ClickHouseSink, InsertFormat, client::ClickHouseClient};
+use crate::{
+    ClickHouseSink, InsertFormat,
+    client::{ClickHouseClient, jittered_backoff},
+};
 use async_trait::async_trait;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
 use tracing::{debug, error, info, warn};
@@ -56,7 +59,7 @@ impl Sink for ClickHouseSink {
                         error!("Ping failed after {attempts} attempt(s): {e}");
                         return Err(e);
                     }
-                    let backoff = retry_delay * attempts;
+                    let backoff = jittered_backoff(retry_delay, attempts);
                     warn!(
                         "Ping failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…"
                     );
@@ -79,7 +82,7 @@ impl Sink for ClickHouseSink {
                             error!("fetch_schema failed after {attempts} attempt(s): {e}");
                             return Err(e);
                         }
-                        let backoff = retry_delay * attempts;
+                        let backoff = jittered_backoff(retry_delay, attempts);
                         warn!(
                             "fetch_schema failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…"
                         );
