@@ -23,6 +23,7 @@ use iggy::prelude::{
     PolledMessages as RustPolledMessages, Stream as RustStream, StreamDetails as RustStreamDetails,
     Topic as RustTopic, TopicDetails as RustTopicDetails, Validatable,
 };
+use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
@@ -439,14 +440,25 @@ impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
         let id_bytes = message.header.id.to_le_bytes();
         let id_lo = u64::from_le_bytes(id_bytes[0..8].try_into().unwrap());
         let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
-        let user_headers = match message
-            .user_headers_map()
-            .map_err(|error| format!("Could not convert polled message user headers: {error}"))?
-        {
-            Some(headers) => headers
-                .into_iter()
-                .map(|(key, value)| ffi::HeaderEntry::from(RustHeaderEntry { key, value }))
-                .collect(),
+        let user_headers = match message.user_headers {
+            Some(raw_headers) => {
+                let wire_headers = WireUserHeaders::from_bytes(raw_headers).map_err(|error| {
+                    format!("Could not convert polled message user headers: {error}")
+                })?;
+                wire_headers
+                    .iter()
+                    .map(|entry| ffi::HeaderEntry {
+                        key: ffi::HeaderField {
+                            kind: entry.key_kind.0,
+                            value: entry.key.to_vec(),
+                        },
+                        value: ffi::HeaderField {
+                            kind: entry.value_kind.0,
+                            value: entry.value.to_vec(),
+                        },
+                    })
+                    .collect()
+            }
             None => Vec::new(),
         };
 
