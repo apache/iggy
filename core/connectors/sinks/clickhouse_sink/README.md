@@ -82,6 +82,8 @@ Accepts messages with a `Payload::Json` payload. At startup the connector fetche
 
 The table must already exist. Columns with an ordinary `DEFAULT` expression can be omitted from the message — the connector emits a `0x01` prefix byte to signal that the default should be used. `MATERIALIZED`, `ALIAS`, and `EPHEMERAL` columns are not insertable and are dropped from the schema entirely.
 
+The schema is captured once at startup and never refreshed. Do not `ALTER TABLE` the target while the connector runs. See [Schema changes while running](#schema-changes-while-running).
+
 **Supported types:** all integer and float primitives, `String`, `FixedString(n)`, `Bool`/`Boolean`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64(p)`, `Decimal` (precision 1-38; `Decimal256` is not supported), `IPv4`, `IPv6`, `Enum8`, `Enum16`, and the composites `Nullable(T)`, `Array(T)`, `Map(K, V)`, `Tuple(...)`. `LowCardinality(T)` is transparently unwrapped to its inner type `T` (RowBinary serialises it identically).
 
 **Unsupported types** (cause startup to fail): `Variant`, `JSON` (native column type), and geo types.
@@ -177,6 +179,21 @@ A message whose payload type does not match the chosen format (for example a tex
 The `rowbinary` format has one extra case. It turns each row into binary and writes it straight into the batch buffer, so a row that cannot be converted (a value that does not fit the target column) cannot be skipped cleanly — a half-written row would corrupt the rows after it. In that case the **whole batch fails** on the first bad row and is retried as a unit per the rules above.
 
 If a single malformed row keeps failing, every retry of that batch will fail too. Fix or remove the bad message at the source, or switch to the `json` / `string` format, which skip bad rows instead of failing the batch.
+
+### Schema changes while running
+
+In `row_binary` mode the table schema is fetched once at startup and cached for the lifetime of the connector. The insert stream is **positional**: rows are written as a bare `RowBinaryWithDefaults` body in the column order captured at startup, and ClickHouse decodes them against the table's current column order.
+
+An `ALTER TABLE` that runs while the connector is live breaks that assumption. Adding, dropping, or reordering a column shifts the byte layout by one or more columns. Depending on how the shifted bytes decode, ClickHouse either rejects the batch as malformed or, worse, stores it silently with values landing in the wrong columns. Nothing detects this at runtime, so the corruption is easy to miss.
+
+Only `row_binary` is affected. The `json_each_row` and `string` (`json_each_row` string) formats are self-describing and map values by field name, so they tolerate schema changes.
+
+Until the hardening below lands, treat the `row_binary` schema as fixed for the connector's lifetime: **restart the connector after any `ALTER TABLE`** on the target table so it re-fetches the schema.
+
+Two planned fixes remove the restriction:
+
+1. **Explicit column list in the INSERT.** Emitting `INSERT INTO db.table (col1, col2, ...) FORMAT RowBinaryWithDefaults` binds the stream to column *names* instead of table position. ClickHouse then routes each value by name, applies `DEFAULT` for columns the connector omits, and returns a hard error (instead of silently corrupting rows) when a named column has been dropped or renamed. This makes added and reordered columns safe and turns the remaining drift into a visible failure.
+2. **Refresh the schema on a failed insert.** When an insert fails with a data error, re-fetch the schema from `system.columns` and rebuild the column list before the batch is retried, letting the connector recover from a drop or rename on its own rather than failing every retry against a stale snapshot.
 
 ### Delivery semantics: at-least-once
 
