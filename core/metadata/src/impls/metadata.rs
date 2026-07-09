@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
+use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
@@ -342,8 +343,8 @@ fn require_shard_zero<'a, T>(
     slot
 }
 
-/// Late-bound callback invoked after every successful
-/// `mux_stm.update(prepare)` on shard 0's metadata commit path.
+/// Late-bound callback invoked after every committed op on shard 0's metadata
+/// commit path (via `gated_apply`, including a gated no-op).
 ///
 /// Wired by server-ng bootstrap once the metadata bundle has broadcast;
 /// receives the committed [`Operation`] so the recipient can filter (the
@@ -376,9 +377,10 @@ pub struct IggyMetadata<C, J, S, M> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
-    /// Late-bound post-commit notifier. Fires once per committed
-    /// operation after [`crate::stm::StateMachine::update`] succeeds in
-    /// both [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
+    /// Late-bound post-commit notifier. Fires once per committed normal op
+    /// after `gated_apply` returns (including a gated `Unauthorized` no-op that
+    /// never reaches [`crate::stm::StateMachine::update`]) in both
+    /// [`Plane::on_ack`] and [`Self::commit_journal`]. `None` until
     /// [`Self::set_commit_notifier`] runs (server-ng bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
@@ -825,6 +827,7 @@ where
                         |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
                     self.client_table.borrow_mut().commit_register(
                         prepare_header.client,
+                        prepare_header.user_id,
                         reply.clone(),
                         in_flight,
                     );
@@ -847,7 +850,7 @@ where
                     // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                     // only; a business rejection commits as a deterministic no-op
                     // whose `code` rides the reply body, replayed on retry.
-                    let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
                         panic!(
                             "on_ack: committed metadata op={} failed to apply: {err}",
                             prepare_header.op
@@ -985,6 +988,7 @@ where
     pub async fn submit_register_in_process(
         &self,
         client_id: u128,
+        user_id: u32,
     ) -> Result<u64, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         let consensus = self
@@ -1025,7 +1029,7 @@ where
             return Err(MetadataSubmitError::PipelineFull);
         }
 
-        let request = build_register_request_message(consensus, client_id);
+        let request = build_register_request_message(consensus, client_id, user_id);
         // Wire path runs `RequestHeader::validate` at network boundary;
         // in-process skips it. debug_assert pins drift.
         debug_assert!(
@@ -1410,6 +1414,9 @@ where
             .into_generic());
         }
 
+        // The acting-user RBAC stamp lives in the shared `prepare_request`
+        // (op-guarded, fail-closed on an unknown session). `request_preflight`
+        // above proved this client's session is live, so it resolves there.
         let Ok(prepare) = self.prepare_request(message) else {
             // Structurally-invalid request. Return an eviction frame (relayed to
             // the socket by the home shard) rather than `Canceled`, which leaves
@@ -1707,10 +1714,11 @@ where
     #[allow(clippy::too_many_lines)]
     fn prepare_request(
         &self,
-        message: Message<RequestHeader>,
+        mut message: Message<RequestHeader>,
     ) -> Result<Message<PrepareHeader>, iggy_common::IggyError> {
         let consensus = self.consensus.as_ref().unwrap();
-        let header = *message.header();
+        let operation = message.header().operation;
+        let client_id = message.header().client;
         // `TruncatePartition` is server-originated (the owning shard resolves a
         // client `DeleteSegments` count to a concrete offset) but replicated AS
         // the client's own request, so the commit records the client's request
@@ -1718,10 +1726,39 @@ where
         // maps to it, so a client cannot construct one directly -- hence the
         // `is_client_allowed` gate excludes it; admit it explicitly. The default
         // match arm below projects it through unchanged.
-        if !header.operation.is_client_allowed() && header.operation != Operation::TruncatePartition
-        {
+        if !operation.is_client_allowed() && operation != Operation::TruncatePartition {
             return Err(IggyError::InvalidCommand);
         }
+
+        // Stamp the acting user id into the replicated header so the in-apply
+        // RBAC gate (`crate::stm::authz`) resolves the same identity on every
+        // replica, WAL replay included (no session table there). Every client-op
+        // prepare funnels through here, primary-only by construction, so stamping
+        // here -- not in the in-process client path alone -- also covers the
+        // wire-plane ingresses (`on_request` and the request-queue drain). The
+        // wire `user_id` is never trusted: it is overwritten for every gated
+        // client op, and a client whose session is unknown is denied here
+        // (fail-closed), never defaulted to root. `Register` / `Logout` are exempt
+        // (see `resolve_acting_user_id`); server-originated internal ops
+        // (`CompleteConsumerGroupRevocation`, the PAT-cleaner delete) build their
+        // prepare directly, bypassing this path, and keep `user_id` 0 (gate skips).
+        if let Some(acting_user_id) =
+            resolve_acting_user_id(operation, client_id, &self.client_table)?
+        {
+            let request_header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+            );
+            request_header.user_id = acting_user_id;
+        }
+
+        // Must be read AFTER the stamp: the `CreateTopic` / `CreatePartitions`
+        // arms hand this `header` copy to `build_prepare_message`, so it has to
+        // carry the stamped acting user. Reading it before the stamp would ship
+        // those prepares with the untrusted wire `user_id` (0 = root from
+        // well-behaved SDKs, attacker-chosen otherwise), silently bypassing the
+        // authz gate. The default arm projects the mutated buffer directly and
+        // is order-independent.
+        let header = *message.header();
         let body = &message.as_slice()[size_of::<RequestHeader>()..header.size as usize];
 
         match header.operation {
@@ -1893,9 +1930,12 @@ where
                 // Register: commit_register creates session, no SM.
                 let reply = build_reply_message(&header, &bytes::Bytes::new());
                 let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                self.client_table
-                    .borrow_mut()
-                    .commit_register(header.client, reply, in_flight);
+                self.client_table.borrow_mut().commit_register(
+                    header.client,
+                    header.user_id,
+                    reply,
+                    in_flight,
+                );
             } else if header.operation == Operation::Logout {
                 self.client_table.borrow_mut().remove_client(header.client);
                 // Mirror the on_ack path: drop the disconnected client from
@@ -1908,7 +1948,7 @@ where
                 // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                 // only; a business rejection commits as a deterministic no-op
                 // whose `code` rides the reply body, replayed on retry.
-                let apply = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
                     panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
                 });
                 // Post-commit notifier (e.g. partition reconciler
@@ -1993,6 +2033,7 @@ where
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
+    user_id: u32,
 ) -> Message<RequestHeader>
 where
     B: MessageBus,
@@ -2014,6 +2055,8 @@ where
         client: client_id,
         session: 0,
         request: 0,
+        // Replicated on the prepare so every replica resolves session -> user.
+        user_id,
         // Route through the metadata consensus group. The chain-forwarded
         // prepare is re-routed on each peer by namespace; a `0` here would
         // hash to a non-zero shard with no metadata consensus and be
@@ -2179,10 +2222,11 @@ where
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions
-    // assignment rewrites, and the PAT-cleaner delete); the stamp is
-    // load-bearing for the creates and inert for the delete, whose apply
-    // ignores it. Shared `next_monotonic_timestamp` keeps the in-process path
-    // on the same monotonic-clock guard as the wire path.
+    // assignment rewrites, the UpdateTopic default-size rewrite, and the
+    // PAT-cleaner delete); the stamp is load-bearing for the creates and inert
+    // for the UpdateTopic rewrite and the delete, whose applies ignore it.
+    // Shared `next_monotonic_timestamp` keeps the in-process path on the same
+    // monotonic-clock guard as the wire path.
     let timestamp = consensus.next_monotonic_timestamp();
     *new_header = PrepareHeader {
         cluster: consensus.cluster(),
@@ -2200,6 +2244,13 @@ where
         timestamp,
         operation,
         namespace: request.namespace,
+        // Carry the acting user id so the in-apply RBAC gate sees the same
+        // identity on every replica. The default projection copies it (see
+        // `Project::project`); this helper builds prepares for the ops it
+        // rewrites (the CreateTopic/CreatePartitions assignment rewrites, the
+        // UpdateTopic default-size rewrite, and the PAT-cleaner delete), which
+        // would otherwise reset it to 0 via `..Default::default()`.
+        user_id: request.user_id,
         ..Default::default()
     };
 
@@ -2216,12 +2267,48 @@ const fn eviction_reason_for_invalid(operation: Operation) -> EvictionReason {
     }
 }
 
+/// Resolve the acting user id to stamp into a client op's replicated
+/// `RequestHeader`, so the in-apply RBAC gate (`crate::stm::authz`) reads the
+/// same identity on every replica (WAL replay has no session table).
+///
+/// - `Ok(Some(id))`: overwrite the header's `user_id` with the committed
+///   session's user; the wire-supplied value is never trusted.
+/// - `Ok(None)`: leave it untouched. `Register` carries the credential-verified
+///   user from login (a mid-`Register` client has no session yet, so resolution
+///   would miss and fail-close, denying every login) and `Logout` is not gated
+///   -- both keep their builder value.
+/// - `Err(Unauthenticated)`: fail-closed. A client op whose `client_id` has no
+///   session cannot be attributed, so it is denied rather than defaulted to
+///   root (`user_id` 0 is the gate's all-allow short-circuit). Every caller
+///   preflights a live session first (`request_preflight` dispatches only on
+///   `New`), so this guards a future ingress that reaches here without one.
+fn resolve_acting_user_id(
+    operation: Operation,
+    client_id: u128,
+    client_table: &RefCell<ClientTable>,
+) -> Result<Option<u32>, IggyError> {
+    if matches!(operation, Operation::Register | Operation::Logout) {
+        return Ok(None);
+    }
+    client_table
+        .borrow()
+        .get_user_id(client_id)
+        .ok_or(IggyError::Unauthenticated)
+        .map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stm::stream::Streams;
     use crate::stm::user::Users;
+    use consensus::LocalPipeline;
+    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_common::variadic;
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::{ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2315,6 +2402,183 @@ mod tests {
             *second_count.borrow(),
             1,
             "cleared notifier must stay quiet"
+        );
+    }
+
+    /// Minimal committed `Register` reply for `ClientTable::commit_register`,
+    /// which reads only `client` and `commit` (the assigned session).
+    fn register_reply(client: u128, session: u64) -> Message<ReplyHeader> {
+        let header_size = size_of::<ReplyHeader>();
+        let mut reply = Message::<ReplyHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut reply.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are a valid ReplyHeader");
+        *header = ReplyHeader {
+            client,
+            request: 0,
+            commit: session,
+            command: Command2::Reply,
+            operation: Operation::Register,
+            ..Default::default()
+        };
+        reply
+    }
+
+    #[test]
+    fn resolve_acting_user_id_skips_register_and_logout() {
+        // Session-lifecycle ops keep the user id their request builder set
+        // (Register's login identity, Logout's ungated value); the ClientTable
+        // is never consulted, so an empty table still yields `Ok(None)`.
+        let client_table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+        for operation in [Operation::Register, Operation::Logout] {
+            assert!(
+                matches!(
+                    resolve_acting_user_id(operation, 1, &client_table),
+                    Ok(None)
+                ),
+                "{operation:?} must not be stamped"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_acting_user_id_stamps_from_client_table() {
+        // A gated client op takes the acting user from the committed session,
+        // independent of any wire-supplied header value.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+        table.commit_register(CLIENT, ACTING_USER, register_reply(CLIENT, SESSION), |_| {
+            false
+        });
+        let client_table = RefCell::new(table);
+
+        match resolve_acting_user_id(Operation::CreateStream, CLIENT, &client_table) {
+            Ok(Some(user_id)) => assert_eq!(user_id, ACTING_USER),
+            other => panic!("expected Ok(Some({ACTING_USER})), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_acting_user_id_fails_closed_for_unknown_session() {
+        // A gated client op with no committed session is denied, never
+        // defaulted to root (user id 0).
+        let client_table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+        match resolve_acting_user_id(Operation::CreateStream, 999, &client_table) {
+            Err(IggyError::Unauthenticated) => {}
+            other => panic!("expected Err(Unauthenticated), got {other:?}"),
+        }
+    }
+
+    /// No-op bus: `prepare_request` builds a prepare without ever sending, so
+    /// every method is an unused stub.
+    #[derive(Debug, Default)]
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    /// Single-node metadata plane whose `prepare_request` is callable. `J` is
+    /// `PrepareJournal` in name only (the value is `None`) to satisfy the
+    /// impl-block bound; no journal or snapshot is constructed.
+    fn metadata_plane() -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        IggyMetadata::new(Some(consensus), None, None, TestMux::default(), None)
+    }
+
+    fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RequestHeader> {
+        let body = CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(1),
+            partitions_count: 1,
+            compression_algorithm: 0,
+            message_expiry: 0,
+            max_topic_size: 0,
+            replication_factor: 1,
+            name: WireName::new("t").unwrap(),
+        }
+        .to_bytes();
+        let header_size = size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(&body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
+                command: Command2::Request,
+                operation: Operation::CreateTopic,
+                size: u32::try_from(total).unwrap(),
+                client,
+                session: 1,
+                request: 1,
+                user_id: wire_user_id,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                ..Default::default()
+            };
+        }
+        message
+    }
+
+    #[test]
+    fn prepare_request_stamps_create_topic_from_client_table_not_wire() {
+        // `CreateTopic` is the projection that reaches `build_prepare_message`
+        // through the post-stamp `header` copy, so the built prepare must carry
+        // the ClientTable identity, not the (bogus) wire value. This pins the
+        // stamp-then-re-read ordering: a hoist would ship the untrusted wire
+        // value.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        const WIRE_USER: u32 = 999;
+        let plane = metadata_plane();
+        plane.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        let prepare = plane
+            .prepare_request(create_topic_request(CLIENT, WIRE_USER))
+            .expect("CreateTopic is client-allowed");
+        assert_eq!(
+            prepare.header().operation,
+            Operation::CreateTopicWithAssignments,
+            "CreateTopic projects to the enriched form"
+        );
+        assert_eq!(
+            prepare.header().user_id,
+            ACTING_USER,
+            "prepare must carry the ClientTable identity, not the wire value"
         );
     }
 }

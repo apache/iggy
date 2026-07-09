@@ -27,7 +27,7 @@
         <PackageVersion Include="FluentAssertions" Version="8.10.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.9" />
-        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.6.0" />
+        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.7.0" />
         <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.108" />
         <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.8.0" />
         <PackageVersion Include="Microsoft.Testing.Extensions.Retry" Version="2.2.3" />
@@ -36,7 +36,7 @@
         <PackageVersion Include="Reqnroll.xunit.v3" Version="3.3.4" />
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="Testcontainers" Version="4.12.0" />
-        <PackageVersion Include="TUnit" Version="1.56.25" />
+        <PackageVersion Include="TUnit" Version="1.57.0" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

@@ -105,6 +105,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
     ) -> Result<IdentityInfo, IggyError> {
         #[cfg(feature = "vsr")]
         {
+            super::logout_before_relogin(self).await?;
             // Same bounds the non-vsr branch gets from `WireName::new(token)`;
             // the request stores a `SecretString`, so enforce them here to keep
             // the u8 length prefix consistent with the realized bytes.

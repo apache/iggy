@@ -23,6 +23,7 @@ pub mod crypto;
 mod deduplication;
 pub mod diagnostics;
 pub mod executor;
+pub mod fs_utils;
 mod in_flight;
 mod indexes_mut;
 // TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
@@ -39,6 +40,7 @@ mod indexes_mut;
     clippy::use_self
 )]
 pub mod iobuf;
+pub mod log;
 mod memory_pool;
 mod messages_batch_mut;
 mod messages_batch_set;

@@ -26,7 +26,6 @@ use super::server::{
     PersonalAccessTokenConfig, ServerConfig, TelemetryConfig, TelemetryLogsConfig,
     TelemetryTracesConfig,
 };
-use super::sharding::ShardingConfig;
 use super::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
     MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
@@ -35,6 +34,7 @@ use super::system::{
 use super::tcp::TcpSocketConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
+use configs::ConfigEnvMappings;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use std::sync::Arc;
@@ -321,9 +321,9 @@ impl Default for PersonalAccessTokenCleanerConfig {
     }
 }
 
-impl Default for SystemConfig {
-    fn default() -> SystemConfig {
-        SystemConfig {
+impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
+    fn default() -> Self {
+        Self {
             path: SERVER_CONFIG.system.path.parse().unwrap(),
             backup: BackupConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -338,7 +338,7 @@ impl Default for SystemConfig {
             message_deduplication: MessageDeduplicationConfig::default(),
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
-            sharding: ShardingConfig::default(),
+            sharding: S::default(),
         }
     }
 }

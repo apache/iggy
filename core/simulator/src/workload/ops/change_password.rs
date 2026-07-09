@@ -62,6 +62,8 @@ pub fn sample(
             current_password: String::new(),
             new_password: "pw-missing".to_string(),
         }),
+        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
+        Outcome::InvalidCredentials => None,
     }
 }
 
@@ -86,6 +88,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
             user: input.user.clone(),
             new_password: input.new_password.clone(),
         },
-        Outcome::UserNotFound => Effect::None,
+        // A committed rejection is a no-op: a missing user, or (never targeted)
+        // a wrong current password, leaves the shadow unchanged.
+        Outcome::UserNotFound | Outcome::InvalidCredentials => Effect::None,
     }
 }

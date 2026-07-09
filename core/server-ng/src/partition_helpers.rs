@@ -24,6 +24,7 @@
 //! local partition yet. The two paths share namespace-bounds validation,
 //! consumer-offset configuration, and initial-segment provisioning.
 
+use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets};
 use crate::server_error::ServerNgError;
 use compio::fs::create_dir_all;
 use configs::server_ng::ServerNgConfig;
@@ -33,9 +34,8 @@ use iggy_common::{
 };
 use message_bus::IggyMessageBus;
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
-use server::io::fs_utils::remove_dir_all;
-use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
-use server::streaming::segments::storage::create_segment_storage;
+use server_common::SegmentStorage;
+use server_common::fs_utils::remove_dir_all;
 use server_common::sharding::IggyNamespace;
 use std::path::Path;
 use std::rc::Rc;
@@ -333,26 +333,33 @@ pub async fn ensure_initial_segment(
         return Ok(());
     }
 
-    // TODO: decouple segment storage creation from the `server` crate.
-    let storage =
-        create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to create initial segment storage"
-                );
-                source
-            })?;
     let messages_path = config
         .system
         .get_messages_file_path(stream_id, topic_id, partition_id, 0);
     let index_path = config
         .system
         .get_index_path(stream_id, topic_id, partition_id, 0);
+    let enforce_fsync = config.system.partition.enforce_fsync;
+    let storage = SegmentStorage::new(
+        &messages_path,
+        &index_path,
+        0,
+        0,
+        enforce_fsync,
+        enforce_fsync,
+        false,
+    )
+    .await
+    .map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to create initial segment storage"
+        );
+        source
+    })?;
     partition.log.add_persisted_segment(
         Segment::new(0, config.system.segment.size),
         storage,

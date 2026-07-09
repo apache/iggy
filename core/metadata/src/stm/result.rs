@@ -187,14 +187,27 @@ result_enum!(DeletePartitionsResult {
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
 // stands in until one is added (a separate `IggyError` change).
-result_enum!(CreateUserResult { UserAlreadyExists = 46 });
+result_enum!(CreateUserResult {
+    InvalidUsername = 43,
+    UserAlreadyExists = 46,
+});
 result_enum!(UpdateUserResult {
     UserNotFound = 20,
+    InvalidUsername = 43,
     UsernameAlreadyExists = 46,
 });
-result_enum!(DeleteUserResult { UserNotFound = 20 });
-result_enum!(ChangePasswordResult { UserNotFound = 20 });
-result_enum!(UpdatePermissionsResult { UserNotFound = 20 });
+result_enum!(DeleteUserResult {
+    UserNotFound = 20,
+    CannotDeleteUser = 48,
+});
+result_enum!(ChangePasswordResult {
+    UserNotFound = 20,
+    InvalidCredentials = 42,
+});
+result_enum!(UpdatePermissionsResult {
+    UserNotFound = 20,
+    CannotChangePermissions = 49,
+});
 
 // Personal access tokens.
 result_enum!(CreatePersonalAccessTokenResult {
@@ -204,17 +217,34 @@ result_enum!(CreatePersonalAccessTokenResult {
 result_enum!(DeletePersonalAccessTokenResult { NotFound = 20 });
 
 // Consumer groups.
-result_enum!(CreateConsumerGroupResult { NameAlreadyExists = 5004 });
+result_enum!(CreateConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    NameAlreadyExists = 5004,
+});
 result_enum!(DeleteConsumerGroupResult { NotFound = 5000 });
 
-/// True if `code` is one this op's result enum declares (`Ok = 0` included).
+/// `IggyError::Unauthorized`. Any control-plane op can commit as an in-apply
+/// authorization no-op, so this code is valid for every op regardless of its
+/// own result enum. Pinned to the wire discriminant in
+/// [`tests::given_result_discriminants_then_match_iggy_error_codes`].
+const UNAUTHORIZED_CODE: u32 = 41;
+
+/// True if `code` is one this op's result enum declares (`Ok = 0` included), or
+/// the global `UNAUTHORIZED_CODE`.
 ///
-/// The state machine only commits codes from the op's own enum, so an
+/// The state machine only commits codes from the op's own enum, plus the
+/// in-apply authorization gate's global `Unauthorized` denial, so an
 /// unrecognized one is a server bug, not a race (a race still yields a declared
 /// code). Enriched internal ops map to their client-op enum; ops with no result
 /// section (partition plane) return `true`.
 #[must_use]
 pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
+    // The in-apply RBAC gate can deny any control-plane op, committing an
+    // `Unauthorized` no-op, so accept it globally rather than per-op enum.
+    if code == UNAUTHORIZED_CODE {
+        return true;
+    }
     match operation {
         Operation::CreateStream => CreateStreamResult::from_u32(code).is_some(),
         Operation::UpdateStream => UpdateStreamResult::from_u32(code).is_some(),
@@ -325,6 +355,20 @@ mod tests {
         ));
         // Partition-plane ops carry no result section, so any code is accepted.
         assert!(result_code_recognized(Operation::SendMessages, 12345));
+        // `Unauthorized` commits for any control-plane op via the in-apply gate,
+        // even though no per-op result enum declares it.
+        assert!(result_code_recognized(
+            Operation::CreateStream,
+            UNAUTHORIZED_CODE
+        ));
+        assert!(result_code_recognized(
+            Operation::CreateUser,
+            UNAUTHORIZED_CODE
+        ));
+        assert!(result_code_recognized(
+            Operation::CreateConsumerGroup,
+            UNAUTHORIZED_CODE
+        ));
     }
 
     // Pins every result-enum discriminant to the `IggyError` variant its doc
@@ -377,6 +421,10 @@ mod tests {
             u32::from(DeletePartitionsResult::StreamNotFound),
             stream_not_found
         );
+        assert_eq!(
+            u32::from(CreateConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
 
         // StreamNameAlreadyExists (1012).
         let stream_name_exists = IggyError::StreamNameAlreadyExists(String::new()).as_code();
@@ -400,6 +448,10 @@ mod tests {
         );
         assert_eq!(
             u32::from(DeletePartitionsResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(CreateConsumerGroupResult::TopicNotFound),
             topic_not_found
         );
 
@@ -428,6 +480,18 @@ mod tests {
             user_exists
         );
 
+        // InvalidUsername (43) - username length outside [MIN,MAX] bytes,
+        // rejected in-apply for create and rename alike.
+        let invalid_username = IggyError::InvalidUsername.as_code();
+        assert_eq!(
+            u32::from(CreateUserResult::InvalidUsername),
+            invalid_username
+        );
+        assert_eq!(
+            u32::from(UpdateUserResult::InvalidUsername),
+            invalid_username
+        );
+
         // ResourceNotFound (20) - documented stand-in for user/PAT not-found.
         let resource_not_found = IggyError::ResourceNotFound(String::new()).as_code();
         assert_eq!(
@@ -451,6 +515,26 @@ mod tests {
             resource_not_found
         );
 
+        // CannotDeleteUser (48) - root deletion is rejected in-apply.
+        assert_eq!(
+            u32::from(DeleteUserResult::CannotDeleteUser),
+            IggyError::CannotDeleteUser(0).as_code(),
+        );
+
+        // CannotChangePermissions (49) - root permissions are immutable in-apply.
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::CannotChangePermissions),
+            IggyError::CannotChangePermissions(0).as_code(),
+        );
+
+        // InvalidCredentials (42) - wrong current password on ChangePassword,
+        // committed as a rejecting no-op so the client request sequence stays
+        // contiguous (a pre-consensus deny would gap it).
+        assert_eq!(
+            u32::from(ChangePasswordResult::InvalidCredentials),
+            IggyError::InvalidCredentials.as_code(),
+        );
+
         // PersonalAccessTokenAlreadyExists (51).
         assert_eq!(
             u32::from(CreatePersonalAccessTokenResult::AlreadyExists),
@@ -472,5 +556,8 @@ mod tests {
             u32::from(DeleteConsumerGroupResult::NotFound),
             IggyError::ConsumerGroupIdNotFound(id(), id()).as_code(),
         );
+
+        // Unauthorized (41) - the global in-apply RBAC denial code.
+        assert_eq!(UNAUTHORIZED_CODE, IggyError::Unauthorized.as_code());
     }
 }
