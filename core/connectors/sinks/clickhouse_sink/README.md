@@ -86,9 +86,9 @@ The table must already exist. Columns with an ordinary `DEFAULT` expression can 
 
 The schema is captured once at startup and never refreshed. Do not `ALTER TABLE` the target while the connector runs. See [Schema changes while running](#schema-changes-while-running).
 
-**Supported types:** all integer and float primitives, `String`, `FixedString(n)`, `Bool`/`Boolean`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64(p)`, `Decimal` (precision 1-38; `Decimal256` is not supported), `IPv4`, `IPv6`, `Enum8`, `Enum16`, and the composites `Nullable(T)`, `Array(T)`, `Map(K, V)`, `Tuple(...)`. `LowCardinality(T)` is transparently unwrapped to its inner type `T` (RowBinary serialises it identically).
+**Supported types:** the 8/16/32/64-bit integer and float primitives (`Int8`-`Int64`, `UInt8`-`UInt64`, `Float32`, `Float64`), `String`, `FixedString(n)`, `Bool`/`Boolean`, `UUID`, `Date`, `Date32`, `DateTime`, `DateTime64(p)`, `Decimal` (precision 1-38; `Decimal256` is not supported), `IPv4`, `IPv6`, `Enum8`, `Enum16`, and the composites `Nullable(T)`, `Array(T)`, `Map(K, V)`, `Tuple(...)`. `LowCardinality(T)` is transparently unwrapped to its inner type `T` (RowBinary serialises it identically).
 
-**Unsupported types** (cause startup to fail): `Variant`, `JSON` (native column type), and geo types.
+**Unsupported types** (cause startup to fail): the 128/256-bit wide integers (`Int128`, `UInt128`, `Int256`, `UInt256`), `Variant`, `JSON` (native column type), and geo types.
 
 ```toml
 [plugin_config]

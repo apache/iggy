@@ -303,6 +303,12 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
         "IPv6" => Ok(ChType::IPv6),
 
         // ── Explicitly unsupported ─────────────────────────────────────────
+        s if matches!(s, "Int128" | "UInt128" | "Int256" | "UInt256") => {
+            error!(
+                "Unsupported ClickHouse type: {s}. 128/256-bit wide integers are not supported in RowBinary mode."
+            );
+            Err(init_err(format!("Unsupported type: {s}")))
+        }
         s if s.starts_with("Variant") => {
             error!("Unsupported ClickHouse type: {s}. Variant is not supported in RowBinary mode.");
             Err(init_err(format!("Unsupported type: {s}")))
@@ -693,6 +699,14 @@ mod tests {
             parse_type("Nullable(LowCardinality(String))").unwrap(),
             ChType::Nullable(Box::new(ChType::String))
         );
+    }
+
+    #[test]
+    fn rejects_wide_integers() {
+        assert!(parse_type("Int128").is_err());
+        assert!(parse_type("UInt128").is_err());
+        assert!(parse_type("Int256").is_err());
+        assert!(parse_type("UInt256").is_err());
     }
 
     #[test]
