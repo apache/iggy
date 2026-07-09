@@ -28,6 +28,7 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod s3;
+mod surrealdb;
 mod wiremock;
 
 /// Prefix on every test container name so `just clean-test-containers` reaps
@@ -78,4 +79,8 @@ pub use postgres::{
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
+pub use surrealdb::{
+    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
+    SurrealDbSinkRawFixture,
+};
 pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

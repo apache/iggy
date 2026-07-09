@@ -1,0 +1,58 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "surrealdb"
+enabled = true
+version = 0
+name = "SurrealDB sink"
+path = "../../target/release/libiggy_connector_surrealdb_sink"
+plugin_config_format = "toml"
+verbose = false
+benchmark = false
+
+[[streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "surrealdb_sink_connector"
+
+[plugin_config]
+endpoint = "127.0.0.1:8000"
+namespace = "iggy"
+database = "connectors"
+table = "iggy_messages"
+username = "root"
+password = "root"
+auth_scope = "root"
+use_tls = false
+auto_define_table = true
+define_indexes = true
+batch_size = 1000
+payload_format = "auto"
+include_metadata = true
+include_headers = true
+include_checksum = true
+include_origin_timestamp = true
+query_timeout = "30s"
+# Total write attempts for transient failures. Minimum is 1. A value of 0 is raised to 1.
+max_retries = 3
+retry_delay = "100ms"
+max_retry_delay = "5s"
+verbose_logging = false
