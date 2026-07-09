@@ -18,13 +18,16 @@
 [package]
 name = "cpu_allocation"
 version = "0.1.0"
-description = "Shard CPU/NUMA allocation config types (CpuAllocation, NumaConfig) parsed from the iggy server config."
+description = "Shard CPU/NUMA allocation config types (CpuAllocation, NumaConfig) parsed from the iggy server config, plus the allowed-CPU-set probe."
 edition = "2024"
 license = "Apache-2.0"
 publish = false
 
 [dependencies]
 serde = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

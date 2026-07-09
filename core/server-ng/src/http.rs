@@ -47,7 +47,7 @@ use axum::middleware::{Next, from_fn};
 use axum::routing::{delete, get, post, put};
 use configs::cluster::{ClusterConfig, TransportPorts};
 use configs::http::HttpConfig;
-use configs::system::SystemConfig;
+use configs::server_ng::NgSystemConfig;
 use message_bus::client_listener;
 use send_wrapper::SendWrapper;
 use tracing::{error, info};
@@ -84,7 +84,7 @@ pub async fn start(
     addr: SocketAddr,
     http_config: &HttpConfig,
     cluster: &ClusterConfig,
-    system_config: Arc<SystemConfig>,
+    system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
 ) -> Result<(), ServerNgError> {
     let jwt = JwtManager::build(&http_config.jwt)?;

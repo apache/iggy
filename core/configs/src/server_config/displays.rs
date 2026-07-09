@@ -30,6 +30,7 @@ use super::{
     },
     tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig},
 };
+use configs::ConfigEnvMappings;
 use std::fmt::{Display, Formatter};
 
 impl Display for HttpConfig {
@@ -345,7 +346,7 @@ impl Display for TelemetryTracesConfig {
     }
 }
 
-impl Display for SystemConfig {
+impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

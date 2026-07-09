@@ -30,10 +30,10 @@ use crate::partition_helpers::{
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
-use configs::server_ng::ServerNgConfig;
-use configs::sharding::{
+use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
+use configs::server_ng::ServerNgConfig;
 use consensus::{
     LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
 };
@@ -453,13 +453,42 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     Ok(config)
 }
 
+/// Resolve the operator's `cpu_allocation` into concrete shard
+/// assignments plus the checked `u16` shard count.
+///
+/// Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
+/// (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
+/// configured with `u16::MAX` shards would mint a shard id that
+/// collides with the sentinel and an owner-table lookup could never
+/// tell that shard apart from an unowned slot. Reject at boot so the
+/// invariant is held by the type system, not by hoping the operator
+/// never configures 65535 cores worth of shards.
+fn resolve_shard_assignments(
+    sharding: &configs::ng_sharding::ShardingConfig,
+) -> Result<(Vec<ShardInfo>, u16), ServerNgError> {
+    let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
+        .map_err(ServerNgError::ShardAllocator)?;
+    let assignments = allocator
+        .to_shard_assignments()
+        .map_err(ServerNgError::ShardAllocator)?;
+    if assignments.is_empty() {
+        return Err(ServerNgError::ShardsCountZero);
+    }
+    match u16::try_from(assignments.len()) {
+        Ok(count) if count < message_bus::OWNER_NONE => Ok((assignments, count)),
+        _ => Err(ServerNgError::ShardsCountOverflow {
+            count: assignments.len(),
+        }),
+    }
+}
+
 /// Re-validate the runtime sharding knobs that the per-shard runtime
 /// consumes directly. Mirrors `ShardingConfig::validate` so a caller
 /// that built the config without running it (e.g. tests, embedded
 /// usage) cannot OOM at boot or wedge process exit with an out-of-range
 /// value.
 fn validate_sharding_runtime_knobs(
-    sharding: &configs::sharding::ShardingConfig,
+    sharding: &configs::ng_sharding::ShardingConfig,
 ) -> Result<(), ServerNgError> {
     let inbox_capacity = sharding.inbox_capacity;
     if inbox_capacity == 0 || inbox_capacity > INBOX_CAPACITY_MAX {
@@ -526,30 +555,8 @@ pub fn bootstrap(
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
     warm_dummy_password_hash();
-    let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
-        .map_err(ServerNgError::ShardAllocator)?;
-    let assignments = allocator
-        .to_shard_assignments()
-        .map_err(ServerNgError::ShardAllocator)?;
+    let (assignments, total_shards) = resolve_shard_assignments(&config.system.sharding)?;
     let shards_count = assignments.len();
-    if shards_count == 0 {
-        return Err(ServerNgError::ShardsCountZero);
-    }
-    // Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
-    // (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
-    // configured with `u16::MAX` shards would mint a shard id that
-    // collides with the sentinel and an owner-table lookup could never
-    // tell that shard apart from an unowned slot. Reject at boot so the
-    // invariant is held by the type system above this line, not by hoping
-    // the operator never configures 65535 cores worth of shards.
-    let total_shards = match u16::try_from(shards_count) {
-        Ok(count) if count < message_bus::OWNER_NONE => count,
-        _ => {
-            return Err(ServerNgError::ShardsCountOverflow {
-                count: shards_count,
-            });
-        }
-    };
 
     // Re-check the full valid range, not just the zero floor: a caller
     // that built the config without running `ShardingConfig::validate`
