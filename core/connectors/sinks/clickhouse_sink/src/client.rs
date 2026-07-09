@@ -341,11 +341,16 @@ pub(crate) fn jittered_backoff(base: Duration, attempt: u32) -> Duration {
 }
 
 fn escape_single_quote(s: &str) -> String {
-    s.replace('\'', "''")
+    // ClickHouse honours backslash escapes inside single-quoted literals, so a
+    // backslash must be doubled first; otherwise a trailing `\` would escape the
+    // closing quote and leave the string unterminated.
+    s.replace('\\', "\\\\").replace('\'', "''")
 }
 
 fn escape_backtick(s: &str) -> String {
-    s.replace('`', "``")
+    // Backtick identifiers honour backslash escapes too, so escape the backslash
+    // before doubling the backtick.
+    s.replace('\\', "\\\\").replace('`', "``")
 }
 
 fn urlencoded(s: &str) -> String {
@@ -381,15 +386,21 @@ mod tests {
 
     #[test]
     fn escape_single_quote_trailing_backslash_cannot_break_out() {
-        // A trailing backslash must not escape the closing quote in SQL.
-        // With the old \' approach, "foo\" → 'foo\'' which keeps the string open.
-        // With doubling, "foo\" → 'foo\'' is never produced; output is "foo\" untouched,
-        // and no single quote is present so no doubling occurs — the backslash is inert
-        // inside a single-quoted ClickHouse string when not followed by a special char.
+        // ClickHouse treats `\` as an escape char inside single-quoted literals, so a
+        // trailing backslash would otherwise escape the closing quote. Doubling the
+        // backslash turns it into an inert literal `\`, wrapped as 'foo\\'.
         let result = escape_single_quote("foo\\");
-        assert_eq!(result, "foo\\");
-        // Critically, the result contains no single quote, so it cannot close+reopen the literal.
-        assert!(!result.contains("\\'"));
+        assert_eq!(result, "foo\\\\");
+        // Wrapped as a literal, 'foo\\' terminates cleanly; the pair is an even count
+        // of backslashes so none is left to escape the closing quote.
+        assert!(result.matches('\\').count().is_multiple_of(2));
+    }
+
+    #[test]
+    fn escape_single_quote_backslash_quote_pair() {
+        // `\'` must not survive as an escape sequence: the backslash is doubled and
+        // the quote is doubled independently.
+        assert_eq!(escape_single_quote("a\\'b"), "a\\\\''b");
     }
 
     #[test]
@@ -404,13 +415,13 @@ mod tests {
 
     #[test]
     fn escape_backtick_trailing_backslash_cannot_break_out() {
-        // With the old \` approach, "innocent\" → `innocent\`` where \` is an escaped
-        // backtick, leaving the identifier unclosed — SQL injection vector.
-        // With doubling, the backslash is passed through as-is and is inert because
-        // no \` sequence is ever produced.
+        // ClickHouse treats `\` as an escape char inside backtick identifiers, so a
+        // trailing backslash would otherwise escape the closing backtick. Doubling the
+        // backslash makes it an inert literal `\`, wrapped as `innocent\\`.
         let result = escape_backtick("innocent\\");
-        assert_eq!(result, "innocent\\");
-        assert!(!result.contains("\\`"));
+        assert_eq!(result, "innocent\\\\");
+        // Even count of backslashes, so none escapes the closing backtick.
+        assert!(result.matches('\\').count().is_multiple_of(2));
     }
 
     fn test_client(database: &str, table: &str, format_name: &str) -> ClickHouseClient {
