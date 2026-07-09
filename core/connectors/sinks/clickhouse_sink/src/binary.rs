@@ -104,10 +104,14 @@ pub(crate) fn serialize_value(
         ChType::FixedString(n) => {
             let s = coerce_to_string(value)?;
             let bytes = s.as_bytes();
-            // Pad or truncate to exactly n bytes
-            let copy_len = bytes.len().min(*n);
-            buf.extend_from_slice(&bytes[..copy_len]);
-            buf.resize(buf.len() + (n - copy_len), 0u8);
+            // ClickHouse rejects over-length values with TOO_LARGE_STRING_SIZE
+            // rather than truncating, so reject here instead of dropping bytes.
+            if bytes.len() > *n {
+                error!("Value too large for FixedString({n})");
+                return Err(Error::InvalidRecord);
+            }
+            buf.extend_from_slice(bytes);
+            buf.resize(buf.len() + (n - bytes.len()), 0u8);
         }
 
         // ── Integers ─────────────────────────────────────────────────────────
@@ -1058,10 +1062,10 @@ mod tests {
     }
 
     #[test]
-    fn serialize_fixed_string_truncates_to_length() {
+    fn serialize_fixed_string_rejects_oversized() {
         let mut buf = vec![];
-        serialize_value(&json_str("abcdef"), &ChType::FixedString(3), &mut buf).unwrap();
-        assert_eq!(buf, [b'a', b'b', b'c']);
+        let result = serialize_value(&json_str("abcdef"), &ChType::FixedString(3), &mut buf);
+        assert!(matches!(result, Err(Error::InvalidRecord)));
     }
 
     // ── nullable ─────────────────────────────────────────────────────────────
