@@ -247,7 +247,7 @@ fn generate_struct_impl(
 
     let const_definitions = generate_const_definitions(&mappings, prefix_str);
     let mapping_entries = generate_mapping_entries(&mappings);
-    let builder_methods = generate_builder_methods(&mappings, struct_name, prefix_str);
+    let builder_methods = generate_builder_methods(&mappings, prefix_str);
     let builder_name = format_ident!("{}EnvBuilder", struct_name);
     let mappings_count = mappings.len();
 
@@ -572,16 +572,11 @@ fn generate_mapping_entries(mappings: &[EnvMapping]) -> Vec<TokenStream2> {
         .collect()
 }
 
-fn generate_builder_methods(
-    mappings: &[EnvMapping],
-    struct_name: &Ident,
-    prefix: &str,
-) -> Vec<TokenStream2> {
+fn generate_builder_methods(mappings: &[EnvMapping], prefix: &str) -> Vec<TokenStream2> {
     mappings
         .iter()
         .map(|m| {
             let method_name = &m.builder_method_name;
-            let const_name = &m.const_name;
             let env_var_name = format!("{}{}", prefix, m.env_suffix);
             let doc_secret = if m.is_secret {
                 " (secret - will be masked in logs)"
@@ -593,7 +588,7 @@ fn generate_builder_methods(
             quote! {
                 #[doc = #doc]
                 pub fn #method_name(mut self, value: impl std::fmt::Display) -> Self {
-                    self.envs.insert(#struct_name::#const_name.into(), value.to_string());
+                    self.envs.insert(#env_var_name.into(), value.to_string());
                     self
                 }
             }

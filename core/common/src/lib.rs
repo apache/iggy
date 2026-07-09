@@ -26,6 +26,7 @@ mod utils;
 pub mod wire_conversions;
 
 pub use error::client_error::ClientError;
+pub use error::eviction::eviction_reason_to_error;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;

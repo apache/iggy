@@ -95,13 +95,14 @@ pub use installer::conn_info::{
 };
 pub use lifecycle::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, FusedShutdown,
-    ReplicaRegistry, Shutdown, ShutdownToken,
+    InstanceToken, ReplicaRegistry, ReplyRoute, ReplySlotError, ReplySlotGuard, Shutdown,
+    ShutdownToken,
 };
 pub use transports::tls::TlsServerCredentials;
 
 pub use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
-use iggy_binary_protocol::GenericHeader;
+use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::array;
 use std::cell::{Cell, OnceCell, RefCell};
@@ -1225,13 +1226,21 @@ impl MessageBus for IggyMessageBus {
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
-            // Fast path: move `message` straight into `try_send`. On no-slot
-            // the registry hands it back; we drop it and surface
-            // ClientNotFound (matches prior behaviour: SendError did not
-            // preserve payload either).
+            // Route by the entry's reply target. Socket is the unchanged
+            // fast path and never decodes. InProcess resolves the waiting
+            // request id from the reply header and fires its oneshot; that
+            // decode stays off the socket path. No slot surfaces
+            // ClientNotFound (prior behaviour: SendError did not preserve
+            // the payload either).
             return match self.clients.try_send_or_return(client_id, message) {
-                Ok(send_result) => send_result.map_err(map_try_send_err),
-                Err(_msg) => Err(SendError::ClientNotFound(client_id)),
+                ReplyRoute::Delivered(send_result) => send_result.map_err(map_try_send_err),
+                ReplyRoute::InProcess(message) => {
+                    let request = reply_request_id(&message);
+                    self.clients
+                        .fire_in_process(client_id, request, message)
+                        .map_err(|_| SendError::ClientNotFound(client_id))
+                }
+                ReplyRoute::NoSlot(_message) => Err(SendError::ClientNotFound(client_id)),
             };
         }
         let forward = self
@@ -1313,6 +1322,22 @@ pub const fn client_id_owning_shard(client_id: u128) -> u16 {
     (client_id >> 112) as u16
 }
 
+/// Reserved client id stamped on server-generated auto-commit
+/// `StoreConsumerOffset2` ops (a poll's `auto_commit` replicated for failover).
+///
+/// Never belongs to a live connection: `mint_client_id` produces
+/// `(shard << 112) | seq` and no real shard is `u16::MAX`, so `u128::MAX` is
+/// unreachable. The commit path recognises it and skips the (unwaited) reply,
+/// keeping an unrequested frame off a real client's lockstep stream. Nonzero,
+/// so it still satisfies the wire header's `client != 0` validation.
+pub const AUTO_COMMIT_CLIENT_ID: u128 = u128::MAX;
+
+/// Whether `client_id` is the reserved [`AUTO_COMMIT_CLIENT_ID`] sentinel.
+#[must_use]
+pub const fn is_auto_commit_client(client_id: u128) -> bool {
+    client_id == AUTO_COMMIT_CLIENT_ID
+}
+
 /// Map an `async_channel::TrySendError` onto the bus-level [`SendError`].
 ///
 /// Shape-matches `Result::map_err` (takes the error by value) so it can be
@@ -1323,6 +1348,21 @@ fn map_try_send_err(e: async_channel::TrySendError<Frozen<MESSAGE_ALIGN>>) -> Se
         async_channel::TrySendError::Full(_) => SendError::Backpressure,
         async_channel::TrySendError::Closed(_) => SendError::ConnectionClosed,
     }
+}
+
+/// Peek `ReplyHeader.request` (the originating request id) from a reply
+/// buffer at its fixed header offset. Only the in-process reply path calls
+/// this; the socket path never decodes.
+fn reply_request_id(reply: &Frozen<MESSAGE_ALIGN>) -> u64 {
+    const OFFSET: usize = std::mem::offset_of!(ReplyHeader, request);
+    reply
+        .as_slice()
+        .get(OFFSET..OFFSET + std::mem::size_of::<u64>())
+        .and_then(|bytes| bytes.try_into().ok())
+        // Native-endian is safe: this id never leaves the process, so writer and
+        // reader share endianness. A wire reader uses little-endian instead (see
+        // the SDK's `read_reply_status`).
+        .map_or(0, u64::from_ne_bytes)
 }
 
 #[cfg(test)]
@@ -1370,6 +1410,56 @@ mod tests {
         let client_id = (3u128 << 112) | 1;
         let err = bus
             .send_to_client(client_id, dummy_message().into_frozen())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::ClientNotFound(_)));
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn reply_message(request: u64) -> Message<ReplyHeader> {
+        Message::<ReplyHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut ReplyHeader| {
+            h.command = Command2::Reply;
+            h.size = HEADER_SIZE as u32;
+            h.request = request;
+        })
+    }
+
+    /// Full in-process seam: entry + slot installed, `send_to_client`
+    /// resolves the request id from the reply header and fires the oneshot.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_in_process_fires_matching_reply_slot() {
+        let bus = IggyMessageBus::new(0);
+        let client_id = 1u128;
+        bus.clients()
+            .insert_in_process(client_id)
+            .expect("fresh key");
+        let (_guard, reply_rx) = bus
+            .clients()
+            .install_reply_slot(client_id, 42)
+            .expect("slot installs");
+
+        bus.send_to_client(client_id, reply_message(42).into_generic().into_frozen())
+            .await
+            .expect("in-process delivery");
+
+        let received = reply_rx.await.expect("reply delivered");
+        assert_eq!(reply_request_id(&received), 42);
+    }
+
+    /// Reply whose request id has no waiter (timed-out caller already
+    /// removed its slot): shed as `ClientNotFound`, nothing panics.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn send_to_client_in_process_sheds_reply_without_waiter() {
+        let bus = IggyMessageBus::new(0);
+        let client_id = 1u128;
+        bus.clients()
+            .insert_in_process(client_id)
+            .expect("fresh key");
+
+        let err = bus
+            .send_to_client(client_id, reply_message(42).into_generic().into_frozen())
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::ClientNotFound(_)));

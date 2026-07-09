@@ -34,13 +34,10 @@
 @user1_username = user1
 @user1_password = secret
 @access_token = secret
-@root_id = 1
-@user1_id = 2
+@root_id = 0
+@user1_id = 1
 @pat_name = dev_token
 @pat_raw_token = secret
-
-###
-GET {{url}}
 
 ###
 GET {{url}}/ping
@@ -63,11 +60,18 @@ Content-Type: application/json
 }
 
 ###
-GET {{url}}/metrics
-
-###
 GET {{url}}/stats
 Authorization: Bearer {{access_token}}
+
+###
+POST {{url}}/snapshot
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "compression": "Deflated",
+  "snapshot_types": ["All"]
+}
 
 ###
 GET {{url}}/cluster/metadata
@@ -80,14 +84,6 @@ Authorization: Bearer {{access_token}}
 ###
 GET {{url}}/clients/{{client_id}}
 Authorization: Bearer {{access_token}}
-
-###
-POST {{url}}/users/refresh-token
-Content-Type: application/json
-
-{
-  "token": "{{access_token}}"
-}
 
 ###
 DELETE {{url}}/users/logout
@@ -154,7 +150,7 @@ Content-Type: application/json
       "send_messages": true
     },
     "streams": {
-      "1": {
+      "0": {
         "manage_stream": false,
         "read_stream": true,
         "manage_topics": false,
@@ -162,7 +158,7 @@ Content-Type: application/json
         "poll_messages": true,
         "send_messages": true,
         "topics": {
-          "1": {
+          "0": {
             "manage_topic": false,
             "read_topic": true,
             "poll_messages": true,
@@ -192,9 +188,6 @@ Content-Type: application/json
   "name": "{{pat_name}}",
   "expiry": 1000
 }
-
-###
-
 
 ###
 DELETE {{url}}/personal-access-tokens/{{pat_name}}
@@ -290,7 +283,7 @@ Authorization: Bearer {{access_token}}
 
 ###
 ### Delete segments
-DELETE {{url}}/streams/1/topics/1/partitions/1?segments_count=3
+DELETE {{url}}/streams/{{stream_id}}/topics/{{topic_id}}/partitions/{{partition_id}}?segments_count=3
 Authorization: Bearer {{access_token}}
 
 ###

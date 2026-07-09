@@ -3349,6 +3349,7 @@ dependencies = [
 name = "cpu_allocation"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "serde",
  "serde_json",
 ]
@@ -11745,6 +11746,7 @@ dependencies = [
  "clap",
  "compio",
  "configs",
+ "cpu_allocation",
  "ctrlc",
  "cyper",
  "cyper-axum",

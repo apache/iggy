@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::shard::IggyShard;
+use crate::shard::system::cgroup_memory::cgroup_available_memory;
 use crate::{SEMANTIC_VERSION, VERSION};
+use cpu_allocation::allowed_cpus;
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
@@ -44,7 +46,8 @@ impl IggyShard {
             sys.refresh_memory();
             sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
 
-            let total_cpu_usage = sys.global_cpu_usage();
+            let total_cpu_usage =
+                allowed_cores_cpu_usage(sys).unwrap_or_else(|| sys.global_cpu_usage());
             let total_memory = sys.total_memory().into();
             let available_memory = sys.available_memory().into();
             let clients_count = self.client_manager.get_clients().len() as u32;
@@ -88,6 +91,17 @@ impl IggyShard {
                 stats.written_bytes = disk_usage.total_written_bytes.into();
 
                 stats.threads_count = process.tasks().map(|t| t.len() as u32).unwrap_or(0);
+
+                if let Some(limits) = process
+                    .cgroup_limits()
+                    .filter(|limits| limits.total_memory < sys.total_memory())
+                {
+                    stats.total_memory = limits.total_memory.into();
+                    stats.available_memory = cgroup_available_memory(sys.total_memory())
+                        .unwrap_or(limits.free_memory)
+                        .min(limits.total_memory)
+                        .into();
+                }
             }
 
             let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
@@ -141,4 +155,26 @@ impl IggyShard {
             Ok(stats)
         })
     }
+}
+
+/// Average usage over the cores this process may run on.
+///
+/// `global_cpu_usage` averages every host core, so a cpuset-confined
+/// instance would report its neighbors' load. `None` when the process
+/// is unrestricted (or an allowed core is missing from `sys.cpus()`),
+/// where the host-global number is already the right one.
+fn allowed_cores_cpu_usage(sys: &SysinfoSystem) -> Option<f32> {
+    let cpus = sys.cpus();
+    let allowed = allowed_cpus();
+    if allowed.is_empty() || allowed.len() >= cpus.len() {
+        return None;
+    }
+
+    let mut total_usage = 0.0f32;
+    for cpu_id in &allowed {
+        let name = format!("cpu{cpu_id}");
+        total_usage += cpus.iter().find(|cpu| cpu.name() == name)?.cpu_usage();
+    }
+
+    Some(total_usage / allowed.len() as f32)
 }
