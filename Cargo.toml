@@ -44,6 +44,7 @@ members = [
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
+    "core/connectors/sinks/surrealdb_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
     "core/connectors/sources/postgres_source",
