@@ -80,6 +80,8 @@ insert_format = "json_each_row"
 
 Accepts messages with a `Payload::Json` payload. At startup the connector fetches the table schema from `system.columns` and validates that all column types are supported. Messages are then serialised to ClickHouse's `RowBinaryWithDefaults` binary format, which is more efficient than JSON for large volumes.
 
+Requires ClickHouse 23.7 or newer, when `RowBinaryWithDefaults` was introduced. Older servers reject the format; use `json_each_row` instead.
+
 The table must already exist. Columns with an ordinary `DEFAULT` expression can be omitted from the message — the connector emits a `0x01` prefix byte to signal that the default should be used. `MATERIALIZED`, `ALIAS`, and `EPHEMERAL` columns are not insertable and are dropped from the schema entirely.
 
 The schema is captured once at startup and never refreshed. Do not `ALTER TABLE` the target while the connector runs. See [Schema changes while running](#schema-changes-while-running).
