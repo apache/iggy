@@ -599,7 +599,7 @@ cpu_allocation = "numa:auto"
 # (e.g. a multi-tenant host slicing CPU via cgroup quotas): unpinned shards
 # let the kernel scheduler place threads freely instead of piling every
 # process onto the same low-numbered cores.
-# pin_cores = true
+pin_cores = true
 
 [websocket]
 enabled = true

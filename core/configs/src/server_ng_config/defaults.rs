@@ -29,6 +29,7 @@
 
 use super::message_bus::MessageBusConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
+use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
@@ -38,7 +39,6 @@ use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
     PersonalAccessTokenConfig, TelemetryConfig,
 };
-use crate::server_config::system::SystemConfig;
 use std::sync::Arc;
 
 static_toml::static_toml! {
@@ -55,7 +55,7 @@ impl Default for ServerNgConfig {
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(SystemConfig::default()),
+            system: Arc::new(NgSystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),

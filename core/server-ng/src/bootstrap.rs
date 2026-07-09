@@ -30,10 +30,10 @@ use crate::partition_helpers::{
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
-use configs::server_ng::ServerNgConfig;
-use configs::sharding::{
+use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
+use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -462,7 +462,7 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
 /// invariant is held by the type system, not by hoping the operator
 /// never configures 65535 cores worth of shards.
 fn resolve_shard_assignments(
-    sharding: &configs::sharding::ShardingConfig,
+    sharding: &configs::ng_sharding::ShardingConfig,
 ) -> Result<(Vec<ShardInfo>, u16), ServerNgError> {
     let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
         .map_err(ServerNgError::ShardAllocator)?;
@@ -486,7 +486,7 @@ fn resolve_shard_assignments(
 /// usage) cannot OOM at boot or wedge process exit with an out-of-range
 /// value.
 fn validate_sharding_runtime_knobs(
-    sharding: &configs::sharding::ShardingConfig,
+    sharding: &configs::ng_sharding::ShardingConfig,
 ) -> Result<(), ServerNgError> {
     let inbox_capacity = sharding.inbox_capacity;
     if inbox_capacity == 0 || inbox_capacity > INBOX_CAPACITY_MAX {
