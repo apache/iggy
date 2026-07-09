@@ -1209,9 +1209,31 @@ where
                 }
             }
 
-            assert!(!consensus.is_follower(), "on_request: primary only");
-            assert!(consensus.is_normal(), "on_request: status must be normal");
-            assert!(!consensus.is_syncing(), "on_request: must not be syncing");
+            // A client op landing on a non-primary (or mid-view-change)
+            // replica is a routing artifact -- e.g. the roster still points
+            // here while this group's primaryship moved after a restart.
+            // Answer the typed transient instead of asserting: the SDK
+            // replays and its leader recheck re-routes, whereas a panic
+            // kills the shard and a silent drop wedges the client until its
+            // read timeout.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_syncing() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
 
             // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
@@ -1803,31 +1825,40 @@ where
         // seals segments at per-replica offsets, and the offset-keyed segment
         // GC staged by the reconciler never converges across the cluster.
         let max_segment_size = self.log.active_segment().max_size.as_bytes_u64();
-        let mut entries = committed_entries.into_iter();
-        let mut next_entry = entries.next();
+        let mut entries = committed_entries.into_iter().peekable();
         let mut durable_offset = None;
-        while next_entry.is_some() {
+        // Entries whose bytes are durable but which are still resident in the
+        // journal. Evicted ONCE after the loop: `evict_prefix` drains and
+        // re-appends the whole retained tail, so a per-chunk call would
+        // re-walk that tail once per segment crossed, quadratic in the flush
+        // span -- all under the partition write lock. On an error mid-flush
+        // the accumulated prefix is evicted before propagating, so the retry
+        // re-reads only what did not land.
+        let mut evictable = 0usize;
+        while entries.peek().is_some() {
             // A recovered active segment can already sit at or past the cap
             // (crash between persist and rotation); seal it before appending.
-            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size {
-                self.rotate_segment(config).await?;
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
             }
 
             let (frozen_batches, index_bytes, flush_index, batch_count, committed_info, chunk_len) = {
                 let segment = self.log.active_segment();
                 let mut file_position = segment.size.as_bytes_u64();
                 let mut flush_index = None;
-                let mut frozen = Vec::new();
+                let mut frozen = Vec::with_capacity(entries.len());
                 let mut batch_count = 0u32;
                 let mut committed_info = JournalInfo::default();
                 let mut chunk_len = 0usize;
 
-                while let Some(entry) = next_entry.take() {
+                for entry in entries.by_ref() {
                     chunk_len += 1;
                     // Consumer-offset ops are journaled in the same prefix but carry
                     // no segment bytes; they were applied when staged, so skip them.
                     if peek_operation(&entry) != Operation::SendMessages {
-                        next_entry = entries.next();
                         continue;
                     }
                     // A resident committed SendMessages entry decoded once at append
@@ -1839,12 +1870,10 @@ where
                             false,
                             "resident committed SendMessages entry failed to decode"
                         );
-                        next_entry = entries.next();
                         continue;
                     };
                     let message_count = batch.message_count();
                     if message_count == 0 {
-                        next_entry = entries.next();
                         continue;
                     }
 
@@ -1867,7 +1896,6 @@ where
                         message_count,
                     );
                     frozen.push(entry);
-                    next_entry = entries.next();
                     if file_position >= max_segment_size {
                         break;
                     }
@@ -1889,10 +1917,10 @@ where
 
             // No committed SendMessages batch was resident in this chunk (e.g.
             // a committed consumer-offset run that is not persisted to a
-            // segment). Nothing to flush, but the entries must still be
-            // evicted; no segment bytes are at risk, so evict directly.
+            // segment). Nothing to flush; no segment bytes are at risk, so the
+            // entries just join the evictable prefix.
             let Some(index_bytes) = index_bytes else {
-                self.evict_committed_prefix(chunk_len).await;
+                evictable += chunk_len;
                 continue;
             };
 
@@ -1900,12 +1928,16 @@ where
             // committed prefix resident for retry. The persist is idempotent on
             // failure: a batch write that lands but whose index save then fails
             // rewinds the segment write cursor, so the retry overwrites those
-            // bytes instead of appending a duplicate. Only once the bytes are
-            // durable do we evict this chunk and rebuild the tail accounting;
-            // per-chunk eviction keeps already-persisted chunks from being
-            // re-read (and re-written past a rotation) by that retry.
-            self.persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
-                .await?;
+            // bytes instead of appending a duplicate. Chunks already durable
+            // are evicted before the error propagates, so the retry cannot
+            // re-read them (and re-write them past a rotation).
+            if let Err(error) = self
+                .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
+                .await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
+            }
             // Insert the flushed sparse-index entry into the in-mem cache only now
             // that the batch + index are durable. Inserting in the build loop (before
             // persist) re-inserts a duplicate on a persist-failure retry, which
@@ -1916,7 +1948,7 @@ where
                 let indexes = self.log.active_indexes_mut().expect("indexes must exist");
                 indexes.insert(index.offset, index.timestamp, index.position);
             }
-            self.evict_committed_prefix(chunk_len).await;
+            evictable += chunk_len;
 
             // Stamp range metadata on the segment that received the batches
             // BEFORE rotating: rotation seals it and derives the next segment's
@@ -1936,10 +1968,14 @@ where
             // Seal eagerly once the committed bytes cross the cap so the
             // segment becomes removable (GC skips the active segment) without
             // waiting for the next flush.
-            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size {
-                self.rotate_segment(config).await?;
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
             }
         }
+        self.evict_committed_prefix(evictable).await;
 
         // Aggregate stats (`messages_count`/`size_bytes`) advance at commit in
         // `commit_partition_entry`, not here: this persist path is threshold-
@@ -1960,6 +1996,9 @@ where
     /// `evict_prefix` surfaced during its re-append, so the tail is not decoded
     /// a second time.
     async fn evict_committed_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
         let retained = self.log.journal().inner.evict_prefix(count).await;
         let mut retained_info = JournalInfo::default();
         for (_, meta) in &retained {
@@ -2895,13 +2934,6 @@ where
     #[must_use]
     pub fn nth_oldest_sealed_end_offset(&self, count: u32) -> Option<u64> {
         nth_oldest_sealed_end(self.log.segments(), count)
-    }
-
-    /// Journaled messages not yet flushed to a segment (committed or not).
-    /// Non-zero means the local segment layout lags the replicated log, so a
-    /// "nothing sealed to delete" answer is not settled yet.
-    pub fn resident_journal_messages(&self) -> u64 {
-        u64::from(self.log.journal().info.messages_count)
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {

@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::server::scenarios::{message_size_scenario, single_message_per_batch_scenario};
-#[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{reconnect_after_restart_scenario, restart_offset_skip_scenario};
 use crate::server::scenarios::{
     segment_rotation_race_scenario, tcp_tls_scenario, websocket_tls_scenario,
@@ -60,14 +59,6 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
     single_message_per_batch_scenario::run(harness, 5).await;
 }
 
-// Restart-gated on the plane-primary split: the restarted node re-claims
-// metadata primaryship from its WAL, but its partition groups rejoin as
-// recovering backups and a peer wins their view change. Clients route to the
-// roster (metadata) leader, so their partition writes land on a partition
-// BACKUP, which today drops them without a reply (SDK read-timeout ->
-// Disconnected). Needs partition-op forwarding to the group primary (or
-// plane leadership alignment) to re-enable under vsr.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
@@ -81,6 +72,16 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_producer(harness).await;
 }
 
+// vsr-gated on the rejoin-window state-transfer gap: the consumer's polls
+// auto-commit offsets, so an offset op in flight at the kill commits on the
+// surviving quorum and the restarted replica can never fetch it -- when the
+// commit frontier crosses the gap it correctly suicides ("replica is
+// divergent"). Racy (the window is only sometimes non-empty), so it flakes
+// rather than fails deterministically. The producer variant stays un-gated:
+// its sends are acked before the kill, leaving an empty window. QUIC has an
+// additional SDK gap (post-reconnect consumer polls return nothing; no
+// mid-connection failover), so it stays gated even once state transfer lands
+// unless that is fixed first.
 #[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
@@ -95,7 +96,6 @@ async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_consumer(harness).await;
 }
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -104,7 +104,6 @@ async fn single_message_restart_offset_zero(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_single_message_offset_zero_restart(harness).await;
 }
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -121,7 +120,6 @@ async fn consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
 /// Config: high messages_required_to_save so post-restart messages accumulate in
 /// the journal (exposing the base_offset=0 bug). message_saver flushes pre-restart
 /// data before the restart.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     partition.messages_required_to_save = "10000",
     partition.enforce_fsync = false,

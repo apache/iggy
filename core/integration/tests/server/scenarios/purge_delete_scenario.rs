@@ -408,11 +408,14 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         await_segment_layout(&partition_path, &layout[i + 1..]).await;
         #[cfg(not(feature = "vsr"))]
         assert_segment_file_sizes(&partition_path, &layout[i + 1..]);
-        assert_eq!(
-            poll_all_offsets(&client, &stream_ident, &topic_ident).await,
-            (first_surviving..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-            "Messages from offset {first_surviving} onward survive"
-        );
+        await_polled_offsets(
+            &client,
+            &stream_ident,
+            &topic_ident,
+            (first_surviving..TOTAL_MESSAGES as u64).collect(),
+            &format!("Messages from offset {first_surviving} onward survive"),
+        )
+        .await;
     }
 
     // Only the active segment remains — delete is a no-op
@@ -428,11 +431,14 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
     await_segment_layout(&partition_path, std::slice::from_ref(&active)).await;
     #[cfg(not(feature = "vsr"))]
     assert_segment_file_sizes(&partition_path, std::slice::from_ref(&active));
-    assert_eq!(
-        poll_all_offsets(&client, &stream_ident, &topic_ident).await,
-        (active..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Active segment messages still pollable"
-    );
+    await_polled_offsets(
+        &client,
+        &stream_ident,
+        &topic_ident,
+        (active..TOTAL_MESSAGES as u64).collect(),
+        "Active segment messages still pollable",
+    )
+    .await;
 
     // Cleanup
     client
@@ -1191,6 +1197,30 @@ async fn send_messages(
 }
 
 /// Polls all messages from offset 0 and returns their offsets in order.
+/// Poll until exactly `expected` offsets survive, or panic after the deadline.
+///
+/// Deletion is a replicated watermark applied by each replica's reconciler on
+/// its own tick, and the polled node need not be the node whose disk layout
+/// the test just awaited (the client follows the cluster leader, which moves
+/// on every restart under vsr). Converge instead of asserting one snapshot.
+async fn await_polled_offsets(
+    client: &IggyClient,
+    stream_ident: &Identifier,
+    topic_ident: &Identifier,
+    expected: Vec<u64>,
+    context: &str,
+) {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    let start = std::time::Instant::now();
+    let mut polled = poll_all_offsets(client, stream_ident, topic_ident).await;
+    while polled != expected && start.elapsed() < DEADLINE {
+        tokio::time::sleep(POLL).await;
+        polled = poll_all_offsets(client, stream_ident, topic_ident).await;
+    }
+    assert_eq!(polled, expected, "{context}");
+}
+
 async fn poll_all_offsets(
     client: &IggyClient,
     stream_ident: &Identifier,

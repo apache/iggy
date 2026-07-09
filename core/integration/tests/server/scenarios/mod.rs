@@ -49,9 +49,7 @@ pub mod offset_scenario;
 pub mod permissions_scenario;
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod reconnect_after_restart_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod restart_offset_skip_scenario;
 pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;

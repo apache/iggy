@@ -159,15 +159,18 @@ where
     let headers_to_replay = journal.iter_headers_from(replay_from);
 
     // Committed watermark: the `commit` field of each journaled prepare is
-    // the primary's commit point when it was sent (monotone in op order), so
-    // the last entry carries the highest commit this WAL can prove. Ops above
-    // it were prepared but not provably committed; applying them here would
-    // fabricate commit knowledge (a crashed suffix may have been discarded by
-    // a view change) and would hide the suffix from re-replication.
+    // the primary's commit point when it was sent, so the highest one is the
+    // highest commit this WAL can prove. Ops above it were prepared but not
+    // provably committed; applying them here would fabricate commit knowledge
+    // (a crashed suffix may have been discarded by a view change) and would
+    // hide the suffix from re-replication. A max fold (not `.last()`) so a
+    // future non-monotone stamping change cannot silently under-apply the
+    // committed prefix.
     let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
     let commit_watermark = headers_to_replay
-        .last()
-        .map_or(snapshot_floor, |header| header.commit.max(snapshot_floor));
+        .iter()
+        .map(|header| header.commit)
+        .fold(snapshot_floor, u64::max);
 
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;

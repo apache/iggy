@@ -278,14 +278,15 @@ pub enum PartitionReadReply {
     Ack,
     /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
     /// truncation offset, or `None` when the partition has no sealed segments
-    /// to delete. `resident_messages` counts journaled messages not yet
-    /// flushed to a segment: a `None` offset with a non-zero count means the
-    /// partition has not converged on the committed log yet (e.g. a backup
-    /// behind the commit frontier), so the resolution is transient rather
-    /// than a settled no-op.
+    /// to delete. `lagging` means this replica has not converged on the
+    /// replicated log (follower, mid-view-change, or `commit_min` behind
+    /// `commit_max`): a `None` offset is then transient rather than a settled
+    /// no-op, since sealed segments may exist that this replica has not
+    /// learned about. A converged replica's committed-but-unflushed resident
+    /// tail does NOT make the no-op transient.
     SegmentDeleteOffset {
         up_to_offset: Option<u64>,
-        resident_messages: u64,
+        lagging: bool,
     },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
@@ -1804,7 +1805,7 @@ where
                 CommitOutcome::RespondStartView => {
                     respond_start_view::<B, _, MJ>(consensus).await;
                 }
-                CommitOutcome::Accepted | CommitOutcome::Ignored => {}
+                CommitOutcome::Accepted => {}
             }
             return;
         }
@@ -1825,7 +1826,7 @@ where
             CommitOutcome::RespondStartView => {
                 respond_start_view::<B, _, MJ>(consensus).await;
             }
-            CommitOutcome::Accepted | CommitOutcome::Ignored => {}
+            CommitOutcome::Accepted => {}
         }
     }
 

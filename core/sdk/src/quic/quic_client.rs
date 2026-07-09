@@ -502,6 +502,19 @@ impl QuicClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
+                    // Leadership still matters without auto-login: the caller
+                    // signs in manually, and a login against a non-leader
+                    // replays for its whole read timeout. `GetClusterMetadata`
+                    // is sessionless and pre-auth on server-ng, so the check
+                    // works on the unauthenticated connection. vsr-only: the
+                    // legacy server auth-gates cluster metadata, so this check
+                    // would bounce `Unauthenticated` into the reconnect path
+                    // and recurse back into `connect`.
+                    #[cfg(feature = "vsr")]
+                    {
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
@@ -509,6 +522,15 @@ impl QuicClient {
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
+                    } else if self.handle_leader_redirection().await? {
+                        // Check leadership BEFORE signing in: register/login are
+                        // consensus ops a backup answers with
+                        // `TransientNotCommitted`, so signing in against a
+                        // non-leader replays for the whole read timeout instead
+                        // of failing over. `GetClusterMetadata` is sessionless
+                        // and pre-auth, so it works on the unauthenticated
+                        // connection.
+                        true
                     } else {
                         info!(
                             "{NAME} client: {} is signing in...",
@@ -757,7 +779,7 @@ impl QuicClient {
                         // needed (login replays idempotently too). Anything
                         // else - including a silent read timeout - is
                         // terminal here and handled by the caller.
-                        Err(IggyError::TransientNotCommitted)
+                        Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
                             if tokio::time::Instant::now() < deadline =>
                         {
                             // The explicit frame returns promptly (no read

@@ -383,6 +383,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
         && consensus.is_normal()
         && !consensus.is_syncing()
         && consensus.commit_min() == consensus.commit_max()

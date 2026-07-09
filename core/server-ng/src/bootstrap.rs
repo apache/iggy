@@ -910,7 +910,19 @@ async fn shard_main(
         compio::runtime::spawn(async move {
             loop {
                 if let Some(consensus) = publisher_shard.plane.metadata().consensus.as_ref() {
-                    publisher_view.store(u64::from(consensus.view()), Ordering::Relaxed);
+                    // While this replica declines its recovered view's
+                    // primaryship, that view must not reach the roster: the
+                    // delegated shards would compute a leader that never
+                    // heartbeats. Publish "unknown" until the election
+                    // resolves the role.
+                    let published = if consensus.has_ceded_primaryship()
+                        && consensus.primary_index(consensus.view()) == consensus.replica()
+                    {
+                        crate::cluster_meta::METADATA_VIEW_UNKNOWN
+                    } else {
+                        u64::from(consensus.view())
+                    };
+                    publisher_view.store(published, Ordering::Relaxed);
                 }
                 compio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -1552,7 +1564,21 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    consensus.init();
+    // On a RESTART in a cluster (a non-empty WAL proves a prior life), rejoin
+    // as a backup: resuming primaryship from the WAL's (stale) view races the
+    // peers' election and can split leadership across planes -- the partition
+    // groups always rejoin as backups (no WAL), so a metadata-primary resume
+    // here leaves metadata led by this node while the partitions elect a
+    // peer, and clients (which follow the roster's single leader) then write
+    // to a partition backup. The WAL still restores state below; only the
+    // role is ceded. A FRESH boot (empty WAL) keeps the plain init: the
+    // cluster needs its view-0 primary to exist, and a single-replica
+    // cluster has no peer to defer to.
+    if replica_count > 1 && restored_op > 0 {
+        consensus.init_as_backup();
+    } else {
+        consensus.init();
+    }
     consensus.sequencer().set_sequence(restored_op);
     // The commit point is restored from the WAL's embedded watermark (each
     // journaled prepare carries the primary's commit at send time), NOT from
@@ -1573,16 +1599,29 @@ fn restore_metadata_consensus(
         consensus.set_last_prepare_checksum(header.checksum);
     }
 
+    // The WAL's tail past the watermark is prepared-but-not-provably-committed
+    // state. Until the cluster confirms it (re-pipelined below on a resumed
+    // primary; via StartView adoption + the local commit walk on a rejoined
+    // backup), serving reads would show pre-restart state that clients already
+    // saw acked -- gate them on the barrier regardless of role. If the suffix
+    // never committed cluster-wide, the barrier times out on the read path and
+    // serving resumes (`await_recovery_barrier`).
+    if commit_watermark < restored_op {
+        consensus.set_recovery_barrier(restored_op);
+    }
+
     // Re-pipeline the prepared-but-uncommitted suffix so the primary's
     // retransmit machinery re-replicates it and quorum can (re-)commit it.
     // A backup's suffix stays journal-only: the primary's traffic either
     // confirms it (re-forward + re-ack path) or supersedes it.
-    if consensus.is_primary() && commit_watermark < restored_op {
+    if consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
+        && commit_watermark < restored_op
+    {
         info!(
             commit_watermark,
             restored_op, "re-pipelining recovered uncommitted metadata suffix"
         );
-        consensus.set_recovery_barrier(restored_op);
         let mut pipeline = consensus.pipeline().borrow_mut();
         #[allow(clippy::cast_possible_truncation)]
         for op in (commit_watermark + 1)..=restored_op {

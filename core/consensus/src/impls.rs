@@ -544,14 +544,14 @@ pub enum Status {
     Recovering,
 }
 
-/// Actions to be taken by the caller after processing a VSR event.
-#[derive(Debug, Clone)]
+/// What a received `Commit` heartbeat did, so the caller knows whether to
+/// drain the journal or correct a stale peer.
+#[derive(Debug, Clone, Copy)]
 pub enum CommitOutcome {
-    /// Heartbeat ignored (stale view, foreign sender, wrong status, or replay).
-    Ignored,
-    /// Heartbeat accepted; `commit_max` unchanged.
+    /// Nothing to do: the heartbeat was absorbed (or ignored as stale /
+    /// foreign / wrong-status) without moving `commit_max`.
     Accepted,
-    /// Heartbeat accepted and `commit_max` advanced; run `commit_journal`.
+    /// `commit_max` advanced; run `commit_journal`.
     Advanced,
     /// A replica is still heartbeating an older view in which it was
     /// primary; this replica is the current view's primary and should
@@ -559,6 +559,8 @@ pub enum CommitOutcome {
     RespondStartView,
 }
 
+/// Actions to be taken by the caller after processing a VSR event.
+#[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
@@ -674,6 +676,13 @@ where
     /// journal prefix it no longer has, so walking `commit_journal` from op 1
     /// would find nothing and declare divergence.
     recovering: Cell<bool>,
+    /// True while this replica declines the primaryship its (stale) recovered
+    /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
+    /// math, so without this flag a restarted view-N primary would still pass
+    /// the submit gate and advertise itself as the roster leader while never
+    /// heartbeating. Cleared as soon as any view transition resolves the role
+    /// legitimately (`StartView` adoption, DVC completion).
+    ceded_primaryship: Cell<bool>,
     status: Cell<Status>,
 
     /// Highest op number that has been locally executed (state machine applied,
@@ -755,6 +764,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             log_view: Cell::new(0),
             recovery_barrier: Cell::new(0),
             recovering: Cell::new(false),
+            ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
@@ -785,6 +795,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
+    /// Initialize a restarted replica as a backup regardless of what its
+    /// recovered view says about primaryship. A resumed stale primary races
+    /// the peers' election: if they moved on (or move on now), two nodes act
+    /// primary for different planes and clients route to the wrong one. Join
+    /// as a backup instead; either the peers' heartbeat timeout elects a
+    /// primary and its `StartView` brings this replica forward, or this
+    /// replica's own silence provokes that election. Unlike
+    /// [`Self::init_recovering`] the local journal is intact, so the normal
+    /// commit walk applies it -- no commit-floor fast-forward.
+    pub fn init_as_backup(&self) {
+        self.status.set(Status::Normal);
+        self.ceded_primaryship.set(true);
+        self.timeouts
+            .borrow_mut()
+            .start(TimeoutKind::NormalHeartbeat);
+    }
+
+    /// See the `ceded_primaryship` field.
+    #[must_use]
+    pub const fn has_ceded_primaryship(&self) -> bool {
+        self.ceded_primaryship.get()
+    }
+
     /// Initialize a replica whose consensus state did NOT survive restart
     /// (e.g. a partition group: its journal is in-memory and its segments
     /// carry no op numbers). Such a replica must not assume primaryship: it
@@ -793,11 +826,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// backup instead; the peers' heartbeat timeout elects a primary that
     /// still holds the log, and its `StartView` brings this replica forward.
     pub fn init_recovering(&self) {
-        self.status.set(Status::Normal);
+        self.init_as_backup();
         self.recovering.set(true);
-        self.timeouts
-            .borrow_mut()
-            .start(TimeoutKind::NormalHeartbeat);
     }
 
     #[must_use]
@@ -1191,8 +1221,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
     fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        // Only backups trigger view change on heartbeat timeout
-        if self.is_primary() {
+        // Only backups trigger view change on heartbeat timeout. `is_primary`
+        // is pure view math though: a replica that booted recovering / with
+        // ceded primaryship while sitting at the primary index is a backup by
+        // role -- if it early-returned here it would neither heartbeat nor
+        // start an election, silently dropping out of quorum until an
+        // unrelated view change rescues it. Let it climb StartViewChange like
+        // any other backup.
+        if self.is_primary() && !self.recovering.get() && !self.ceded_primaryship.get() {
             return Vec::new();
         }
 
@@ -1790,6 +1826,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(msg_commit);
         self.fast_forward_recovering_commit_floor();
         self.reset_view_change_state();
@@ -1881,22 +1918,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             {
                 return CommitOutcome::RespondStartView;
             }
-            return CommitOutcome::Ignored;
+            return CommitOutcome::Accepted;
         }
 
         if self.status.get() != Status::Normal {
-            return CommitOutcome::Ignored;
+            return CommitOutcome::Accepted;
         }
 
         if header.view != self.view.get() {
-            return CommitOutcome::Ignored;
+            return CommitOutcome::Accepted;
         }
 
         // TODO: Once connection-level peer verification is added promote
         // this to an assert, the network layer would guarantee the sender
         // matches header.replica.
         if header.replica != self.primary_index(header.view) {
-            return CommitOutcome::Ignored;
+            return CommitOutcome::Accepted;
         }
 
         // Only accept heartbeats with a strictly newer timestamp to prevent
@@ -1966,6 +2003,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Update state
         self.log_view.set(self.view.get());
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 

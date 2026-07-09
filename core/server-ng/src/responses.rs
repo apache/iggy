@@ -547,7 +547,15 @@ fn build_cluster_metadata_response(
         .metadata()
         .consensus
         .as_ref()
-        .map(|consensus| consensus.primary_index(consensus.view()))
+        .and_then(|consensus| {
+            let primary_index = consensus.primary_index(consensus.view());
+            // A restarted replica that ceded the primaryship its stale view
+            // assigns it must not advertise itself as leader: clients would
+            // pin to a node that never heartbeats. Report "no leader" until
+            // the election resolves the role.
+            (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
+                .then_some(primary_index)
+        })
         .or_else(|| roster.current_primary_index());
     let metadata = roster.cluster_metadata(primary_index);
     ClusterMetadataResponse {

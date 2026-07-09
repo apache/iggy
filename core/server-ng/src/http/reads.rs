@@ -116,23 +116,32 @@ pub(in crate::http) async fn read_local(
 /// suffix needs a backup quorum to re-commit, so serve anyway after the
 /// deadline rather than wedging reads on a partitioned cluster.
 pub(in crate::http) async fn await_recovery_barrier(shard: &Rc<ServerNgShard>) {
-    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    // Must outlast a full post-restart convergence: the peers' election
+    // (several heartbeat timeouts in the worst case) plus the new primary
+    // re-committing the journaled suffix. A shorter deadline expires mid
+    // view-change and serves pre-restart state that clients saw acked.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
     const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
     let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
         return;
     };
     let barrier = consensus.recovery_barrier();
-    if barrier == 0 || consensus.commit_max() >= barrier {
+    // Gate on commit_MIN (locally applied), not commit_max (known committed):
+    // a StartView adoption advances commit_max first and only then walks the
+    // journal applying ops, and this task interleaves with that walk at its
+    // await points -- a commit_max gate would serve state from before the
+    // suffix applied (e.g. a pre-restart password change not yet visible).
+    if barrier == 0 || consensus.commit_min() >= barrier {
         return;
     }
     let deadline = std::time::Instant::now() + DEADLINE;
-    while consensus.commit_max() < barrier {
+    while consensus.commit_min() < barrier {
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
                 barrier,
-                commit_max = consensus.commit_max(),
-                "recovered suffix still uncommitted past deadline; serving read anyway"
+                commit_min = consensus.commit_min(),
+                "recovered suffix still unapplied past deadline; serving read anyway"
             );
             return;
         }

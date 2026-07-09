@@ -89,6 +89,7 @@ use message_bus::replica::listener::MessageHandler;
 use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus, MessageBus};
 use metadata::impls::metadata::{
     MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
+    build_truncate_partition_client_message_with_identifiers,
 };
 use metadata::permissioner::Permissioner;
 use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
@@ -232,11 +233,9 @@ pub(crate) fn make_partition_read_handler(
                     .segment_delete_resolution(&namespace, count)
                     .map_or_else(
                         || PartitionReadReply::NotFound,
-                        |(up_to_offset, resident_messages)| {
-                            PartitionReadReply::SegmentDeleteOffset {
-                                up_to_offset,
-                                resident_messages,
-                            }
+                        |(up_to_offset, lagging)| PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
                         },
                     );
                 let _ = reply.try_send(result);
@@ -2001,8 +2000,9 @@ async fn handle_delete_segments_request(
         // the delete cannot be resolved to a watermark. Reply with the
         // result-framed transient rejection (under the TruncatePartition
         // operation, which the SDK decodes) so the client replays the same
-        // request once the partition catches up.
-        Err(IggyError::TransientNotCommitted) => {
+        // request once the partition catches up. Nothing was submitted, hence
+        // the re-issuable-anywhere flavor.
+        Err(IggyError::TransientNotAccepted) => {
             let template = build_truncate_partition_client_message(
                 &header,
                 vsr_client_id,
@@ -2015,7 +2015,7 @@ async fn handle_delete_segments_request(
             let reply = build_result_rejection_reply(
                 template.header(),
                 current_metadata_commit(shard),
-                IggyError::TransientNotCommitted.as_code(),
+                IggyError::TransientNotAccepted.as_code(),
             );
             if let Err(error) = shard
                 .bus
@@ -2054,9 +2054,11 @@ async fn handle_delete_segments_request(
         };
         reply
     } else {
-        // Unresolvable request (malformed body / unknown namespace): ack empty
-        // so the lockstep stream stays framed; the typed decoder surfaces the
-        // failure client-side.
+        // Undecodable body (never produced by the SDK): ack empty so the
+        // lockstep stream stays framed; the typed decoder surfaces the
+        // failure client-side. Unresolvable-but-well-formed targets commit a
+        // typed rejection instead (see the resolve), so only a wire-corrupt
+        // request can gap the sequence here.
         let commit = current_metadata_commit(shard);
         build_empty_reply(&header, transport_client_id, session, commit).into_generic()
     };
@@ -2094,11 +2096,35 @@ pub(crate) async fn resolve_delete_segments_truncate(
     body: &[u8],
 ) -> Result<Message<RequestHeader>, IggyError> {
     let parsed = DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-    let namespace_raw =
-        resolve_partition_request_namespace(shard, Operation::DeleteSegments, body, client_id)
-            .inspect_err(|error| {
-                warn!(client_id, error = %error, "delete_segments: unresolved namespace");
-            })?;
+    let namespace_raw = match resolve_partition_request_namespace(
+        shard,
+        Operation::DeleteSegments,
+        body,
+        client_id,
+    ) {
+        Ok(namespace_raw) => namespace_raw,
+        // Unresolvable stream/topic: still commit the truncate, against the
+        // client's raw identifiers -- the apply rejects it as a committed
+        // result. That keeps the request sequence contiguous (an empty ack
+        // without a commit gaps `request == committed + 1` and silently
+        // drops the NEXT metadata op) while the client gets the typed error.
+        Err(error) => {
+            debug!(
+                client_id,
+                %error,
+                "delete_segments: unresolved target; committing typed rejection"
+            );
+            return Ok(build_truncate_partition_client_message_with_identifiers(
+                template,
+                client_id,
+                session,
+                parsed.stream_id,
+                parsed.topic_id,
+                parsed.partition_id,
+                0,
+            ));
+        }
+    };
     let namespace = IggyNamespace::from_raw(namespace_raw);
     let up_to_offset = match shard
         .partition_read(
@@ -2113,22 +2139,21 @@ pub(crate) async fn resolve_delete_segments_truncate(
             up_to_offset: Some(offset),
             ..
         }) => offset,
-        // Nothing sealed to delete while journaled messages are still waiting
-        // to flush: this replica has not converged on the committed log (e.g.
-        // a backup behind the commit frontier). Answering now would commit a
-        // no-op truncate and silently drop the delete, so surface a transient
-        // and let the client replay once the partition catches up.
+        // Nothing sealed to delete on a replica that has not converged on the
+        // replicated log (a backup behind the commit frontier may be missing
+        // whole sealed segments). Answering now would commit a no-op truncate
+        // and silently drop the delete, so surface a transient and let the
+        // client replay once the partition catches up. A converged primary
+        // whose resident tail is merely unflushed settles as a no-op below.
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: None,
-            resident_messages,
-        }) if resident_messages > 0 => {
+            lagging: true,
+        }) => {
             debug!(
                 client_id,
-                namespace_raw,
-                resident_messages,
-                "delete_segments: partition not converged; transient"
+                namespace_raw, "delete_segments: partition not converged; transient"
             );
-            return Err(IggyError::TransientNotCommitted);
+            return Err(IggyError::TransientNotAccepted);
         }
         other => {
             debug!(

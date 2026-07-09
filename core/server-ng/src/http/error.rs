@@ -79,7 +79,9 @@ impl IntoResponse for CustomError {
                     // the op never committed - a transient server condition,
                     // retryable like the other cannot-commit-right-now 503s
                     // (see `service_unavailable`), never a caller error.
-                    IggyError::TransientNotCommitted => StatusCode::SERVICE_UNAVAILABLE,
+                    IggyError::TransientNotCommitted | IggyError::TransientNotAccepted => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
                     _ => StatusCode::BAD_REQUEST,
                 };
                 (status_code, Json(ErrorResponse::from_error(&error)))

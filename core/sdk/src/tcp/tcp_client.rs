@@ -552,6 +552,19 @@ impl TcpClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
+                    // Leadership still matters without auto-login: the caller
+                    // signs in manually, and a login against a non-leader
+                    // replays for its whole read timeout. `GetClusterMetadata`
+                    // is sessionless and pre-auth on server-ng, so the check
+                    // works on the unauthenticated connection. vsr-only: the
+                    // legacy server auth-gates cluster metadata, so this check
+                    // would bounce `Unauthenticated` into the reconnect path
+                    // and recurse back into `connect`.
+                    #[cfg(feature = "vsr")]
+                    {
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
@@ -739,16 +752,20 @@ impl TcpClient {
                     )
                     .await;
                 match result {
-                    Err(IggyError::TransientNotCommitted)
+                    Err(IggyError::TransientNotAccepted)
                         if tokio::time::Instant::now() < overall_deadline
                             && !is_login_register_code(code) =>
                     {
-                        // The frame was complete, so the stream is in sync and
-                        // the request was NEVER accepted: replaying it (same id
-                        // on this session) or re-issuing it (fresh session after
-                        // a failover) cannot double-apply. Keep the encoded id
-                        // for same-session replays; a redirect re-registers, so
-                        // the id is re-encoded under the new session.
+                        // The server explicitly did NOT admit the request, so
+                        // re-issuing it -- same id on this session, or a fresh
+                        // id under a new session after a failover -- cannot
+                        // double-apply. Keep the encoded id for same-session
+                        // replays; a redirect re-registers, so the id is
+                        // re-encoded under the new session.
+                        // (`TransientNotCommitted` never reaches this branch:
+                        // its outcome is unknown, so the attempt loop replays
+                        // it same-session for the whole budget and then the
+                        // error propagates to the caller.)
                         preencoded = header;
                         if let Ok(true) = self.handle_leader_redirection().await {
                             self.connect().await?;
@@ -956,13 +973,26 @@ impl TcpClient {
                     };
 
                     match crate::vsr::decode_response_split(&response_header, body) {
-                        // Server could not commit yet but answered with a
-                        // complete frame; the lockstep stream is in sync, so
-                        // replay the same request id on this connection after
-                        // a short pause (no reconnect, session intact). Once
-                        // `transient_deadline` passes, hand the transient back
-                        // to the caller for a leader recheck.
+                        // `TransientNotCommitted`: the op's outcome is unknown
+                        // (e.g. a view change canceled it in flight) -- ONLY a
+                        // same-session replay of the same request id is safe
+                        // (the client-table serves it from cache if it did
+                        // commit). Replay on this connection for the whole
+                        // request budget; never hand it to the failover path,
+                        // which re-issues under a fresh session and could
+                        // double-apply a committed write.
                         Err(IggyError::TransientNotCommitted)
+                            if tokio::time::Instant::now() < read_deadline =>
+                        {
+                            let remaining = read_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                        }
+                        // `TransientNotAccepted`: the server never admitted the
+                        // request, so it is re-issuable anywhere. Replay here
+                        // briefly, then hand it back to the caller for a
+                        // leader recheck / failover.
+                        Err(IggyError::TransientNotAccepted)
                             if tokio::time::Instant::now() < transient_deadline =>
                         {
                             let remaining = transient_deadline
