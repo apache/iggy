@@ -39,9 +39,9 @@
   "devDependencies": {
     "@types/debug": "^4.1.12",
     "@types/node": "^22.9.3",
-    "eslint": "^10.5.0",
+    "eslint": "^10.6.0",
     "jiti": "^2.7.0",
-    "tsx": "^4.22.4",
+    "tsx": "^4.22.5",
     "typescript-eslint": "^8.47.0"
   },
   "overrides": {
