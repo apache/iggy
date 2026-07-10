@@ -88,6 +88,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
+use system_stats::{cgroup_scoped_memory, scoped_total_cpu_usage};
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -674,7 +675,9 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
 /// These describe the whole process, not shard or metadata state, so any one
 /// shard can serve them without aggregation. The CPU fields are deltas over the
 /// serving thread's own [`SYSINFO`] refresh history, so they vary by serving
-/// shard (a shard's first probe reports zero CPU).
+/// shard (a shard's first probe reports zero CPU). The `total_*` fields are
+/// scoped to the process's allowed CPU set and cgroup memory cap on confined
+/// hosts (see `system_stats`), host-wide otherwise.
 struct SystemStats {
     process_id: u32,
     cpu_usage: f32,
@@ -738,7 +741,7 @@ fn probe_system_stats() -> SystemStats {
         let mut stats = SystemStats {
             process_id,
             cpu_usage: 0.0,
-            total_cpu_usage: sys.global_cpu_usage(),
+            total_cpu_usage: scoped_total_cpu_usage(sys),
             memory_usage: 0,
             total_memory: sys.total_memory(),
             available_memory: sys.available_memory(),
@@ -767,6 +770,11 @@ fn probe_system_stats() -> SystemStats {
             stats.threads_count = process
                 .tasks()
                 .map_or(0, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX));
+
+            if let Some(memory) = cgroup_scoped_memory(sys, process) {
+                stats.total_memory = memory.total;
+                stats.available_memory = memory.available;
+            }
         }
 
         stats

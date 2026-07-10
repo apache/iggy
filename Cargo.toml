@@ -64,6 +64,7 @@ members = [
     "core/shard",
     "core/shard_allocator",
     "core/simulator",
+    "core/system_stats",
     "core/tools",
     "examples/rust",
 ]
@@ -305,6 +306,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.39.5"
+system_stats = { path = "core/system_stats" }
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
