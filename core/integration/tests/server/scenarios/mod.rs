@@ -34,7 +34,6 @@ pub mod create_message_payload;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
 // Asserts server log-file rotation/archival policies; server-ng's file

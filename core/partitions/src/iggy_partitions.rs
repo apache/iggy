@@ -23,9 +23,10 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
 use message_bus::MessageBus;
+use server_common::send_messages2::{convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -468,6 +469,32 @@ where
             );
             return;
         }
+        // At-rest encryption happens HERE, once, before the op enters
+        // consensus: canonicalize the wire form first so both the legacy and
+        // v2 request encodings encrypt identically, then encrypt payload +
+        // user headers per message. The ciphertext is what gets journaled,
+        // replicated, checksummed, and persisted -- every replica stores
+        // identical bytes -- and the poll reply is the single decrypt point.
+        let message = if message.header().operation == Operation::SendMessages
+            && let Some(encryptor) = &self.config().encryptor
+        {
+            let canonical = convert_request_message(namespace, message)
+                .and_then(|message| encrypt_batch_request(message, encryptor));
+            match canonical {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "dropping send_messages: failed to encrypt batch at ingestion"
+                    );
+                    return;
+                }
+            }
+        } else {
+            message
+        };
         let Some(partition) = self.get_mut_by_ns(&namespace) else {
             warn!(
                 target: "iggy.partitions.diag",
