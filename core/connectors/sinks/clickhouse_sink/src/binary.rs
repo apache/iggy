@@ -205,7 +205,7 @@ pub(crate) fn serialize_value(
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            // ClickHouse UUID wire format: two UInt64 words, 
+            // ClickHouse UUID wire format: two UInt64 words,
             // high word first, each little-endian.
             // hex_str[..16] is the high word, hex_str[16..] the low word. from_str_radix
             // reads each as big-endian hex (most-significant nibble first); to_le_bytes
@@ -273,7 +273,19 @@ pub(crate) fn serialize_value(
                     // already carry sub-second fractions, and strings go through
                     // parse_datetime_string which returns fractional seconds.
                     let secs_f64 = coerce_to_unix_seconds_f64(value)?;
-                    (secs_f64 * scale as f64).round() as i64
+                    let scaled_f64 = (secs_f64 * scale as f64).round();
+                    // Float-to-int `as` saturates rather than erroring, so a
+                    // far-future year or huge float would silently clamp to
+                    // i64::MAX. i64::MAX is not exactly representable in f64
+                    // (rounds up to 2^63), hence the inclusive upper bound.
+                    if !scaled_f64.is_finite()
+                        || scaled_f64 < i64::MIN as f64
+                        || scaled_f64 >= i64::MAX as f64
+                    {
+                        error!("DateTime64 value out of range");
+                        return Err(Error::InvalidRecord);
+                    }
+                    scaled_f64 as i64
                 }
             };
             buf.extend_from_slice(&scaled.to_le_bytes());
