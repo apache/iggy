@@ -21,8 +21,8 @@ use iggy_common::{IggyTimestamp, SemanticVersion};
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStats};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use sysinfo::{Pid, ProcessesToUpdate, System};
-use system_stats::{cgroup_scoped_memory, scoped_total_cpu_usage};
+use sysinfo::System;
+use system_stats::SystemProbe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
@@ -30,8 +30,7 @@ const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 static SYSINFO: OnceLock<Mutex<System>> = OnceLock::new();
 
 pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntimeStats {
-    let pid = std::process::id();
-    let system = probe_system(pid);
+    let system = probe_system();
 
     let sources = context.sources.get_all().await;
     let sinks = context.sinks.get_all().await;
@@ -100,7 +99,7 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
     ConnectorRuntimeStats {
         connectors_runtime_version: VERSION.to_owned(),
         connectors_runtime_version_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
-        process_id: pid,
+        process_id: system.process_id,
         cpu_usage: system.cpu_usage,
         total_cpu_usage: system.total_cpu_usage,
         memory_usage: system.memory_usage,
@@ -116,42 +115,10 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
     }
 }
 
-struct SystemProbe {
-    cpu_usage: f32,
-    total_cpu_usage: f32,
-    memory_usage: u64,
-    total_memory: u64,
-    available_memory: u64,
-}
-
-fn probe_system(pid: u32) -> SystemProbe {
-    let pid = Pid::from_u32(pid);
-    // `new()` not `new_all()`: the refreshes below cover everything read
-    // here; `new_all()` would keep the full host process table alive forever.
+fn probe_system() -> SystemProbe {
     let mut system = SYSINFO
         .get_or_init(|| Mutex::new(System::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    system.refresh_cpu_all();
-    system.refresh_memory();
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-
-    let mut probe = SystemProbe {
-        cpu_usage: 0.0,
-        total_cpu_usage: scoped_total_cpu_usage(&system),
-        memory_usage: 0,
-        total_memory: system.total_memory(),
-        available_memory: system.available_memory(),
-    };
-
-    if let Some(process) = system.process(pid) {
-        probe.cpu_usage = process.cpu_usage();
-        probe.memory_usage = process.memory();
-        if let Some(memory) = cgroup_scoped_memory(&system, process) {
-            probe.total_memory = memory.total;
-            probe.available_memory = memory.available;
-        }
-    }
-
-    probe
+    SystemProbe::capture(&mut system)
 }

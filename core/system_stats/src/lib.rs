@@ -21,29 +21,94 @@
 //! confined by a cpuset or a memory-capped cgroup (systemd `AllowedCPUs=` /
 //! `MemoryMax=`, container limits) reports its neighbors' CPU load and a
 //! memory total it can never allocate. On a multi-tenant host that leaks
-//! host sizing to anyone who can read a stats endpoint. These probes scope
-//! the numbers to the process's allowed CPU set and effective cgroup memory
-//! cap, and fall back to the host-wide values when the process is
-//! unconfined.
+//! host sizing to anyone who can read a stats endpoint.
+//! [`SystemProbe::capture`] scopes the numbers to the process's allowed CPU
+//! set and effective cgroup memory cap, and falls back to the host-wide
+//! values when the process is unconfined.
 
 use cpu_allocation::allowed_cpus;
 use std::sync::OnceLock;
-use sysinfo::{Process, System};
+use sysinfo::{Pid, Process, ProcessesToUpdate, System};
 
 mod cgroup_memory;
 
 use cgroup_memory::cgroup_available_memory;
 
-/// Memory totals scoped to the process's effective cgroup cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CgroupMemory {
-    pub total: u64,
-    pub available: u64,
+/// One sample of the calling process's resource usage plus system totals
+/// scoped to what the process may actually use.
+///
+/// The CPU fields are deltas over the passed `System`'s refresh history,
+/// so the first capture on a fresh `System` reports zero. `run_time_secs`
+/// and `start_time_secs` are whole seconds (sysinfo's granularity);
+/// callers convert to their wire units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SystemProbe {
+    pub process_id: u32,
+    pub cpu_usage: f32,
+    pub total_cpu_usage: f32,
+    pub memory_usage: u64,
+    pub total_memory: u64,
+    pub available_memory: u64,
+    pub run_time_secs: u64,
+    pub start_time_secs: u64,
+    pub read_bytes: u64,
+    pub written_bytes: u64,
+    pub threads_count: u32,
+}
+
+impl SystemProbe {
+    /// Refresh `sys` and sample the calling process.
+    ///
+    /// Refreshes everything it reads, so `System::new()` is enough;
+    /// `System::new_all()` would keep the full host process table alive
+    /// for no benefit. Keep `sys` alive across captures: the CPU numbers
+    /// are deltas since its previous refresh.
+    pub fn capture(sys: &mut System) -> Self {
+        let process_id = std::process::id();
+        let pid = Pid::from_u32(process_id);
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+
+        let mut probe = Self {
+            process_id,
+            cpu_usage: 0.0,
+            total_cpu_usage: scoped_total_cpu_usage(sys),
+            memory_usage: 0,
+            total_memory: sys.total_memory(),
+            available_memory: sys.available_memory(),
+            run_time_secs: 0,
+            start_time_secs: 0,
+            read_bytes: 0,
+            written_bytes: 0,
+            threads_count: 0,
+        };
+
+        if let Some(process) = sys.process(pid) {
+            probe.cpu_usage = process.cpu_usage();
+            probe.memory_usage = process.memory();
+            probe.run_time_secs = process.run_time();
+            probe.start_time_secs = process.start_time();
+            let disk_usage = process.disk_usage();
+            probe.read_bytes = disk_usage.total_read_bytes;
+            probe.written_bytes = disk_usage.total_written_bytes;
+            probe.threads_count = process
+                .tasks()
+                .map_or(0, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX));
+
+            if let Some(memory) = cgroup_scoped_memory(sys, process) {
+                probe.total_memory = memory.total;
+                probe.available_memory = memory.available;
+            }
+        }
+
+        probe
+    }
 }
 
 static ALLOWED_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
 
-/// Snapshot the process's allowed CPU set for [`scoped_total_cpu_usage`].
+/// Snapshot the process's allowed CPU set for the scoped total CPU usage.
 ///
 /// Call once from the main thread at startup, before any thread pins
 /// itself to a core: `sched_getaffinity` reports the calling thread's
@@ -53,6 +118,13 @@ pub fn capture_allowed_cpus() {
     ALLOWED_CPUS.get_or_init(allowed_cpus);
 }
 
+/// Memory totals scoped to the process's effective cgroup cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CgroupMemory {
+    total: u64,
+    available: u64,
+}
+
 /// Average CPU usage over the cores this process may run on, or the
 /// host-global average when the process is unrestricted.
 ///
@@ -60,7 +132,7 @@ pub fn capture_allowed_cpus() {
 /// process would report its neighbors' load. The allowed set is the
 /// [`capture_allowed_cpus`] boot snapshot; without one this stays on the
 /// host-global average.
-pub fn scoped_total_cpu_usage(sys: &System) -> f32 {
+fn scoped_total_cpu_usage(sys: &System) -> f32 {
     ALLOWED_CPUS
         .get()
         .and_then(|allowed| allowed_cores_cpu_usage(sys, allowed))
@@ -78,7 +150,7 @@ pub fn scoped_total_cpu_usage(sys: &System) -> f32 {
 /// `available` adds reclaimable file cache back rather than taking the
 /// kernel's `limit - current`, which trends toward zero on a cache-heavy
 /// workload long before real OOM pressure.
-pub fn cgroup_scoped_memory(sys: &System, process: &Process) -> Option<CgroupMemory> {
+fn cgroup_scoped_memory(sys: &System, process: &Process) -> Option<CgroupMemory> {
     let limits = process
         .cgroup_limits()
         .filter(|limits| limits.total_memory < sys.total_memory())?;
@@ -113,6 +185,18 @@ fn allowed_cores_cpu_usage(sys: &System, allowed: &[usize]) -> Option<f32> {
 mod tests {
     use super::*;
     use sysinfo::{Pid, ProcessesToUpdate};
+
+    #[test]
+    fn given_fresh_system_when_capturing_probe_should_sample_own_process() {
+        let mut sys = System::new();
+
+        let probe = SystemProbe::capture(&mut sys);
+
+        assert_eq!(probe.process_id, std::process::id());
+        assert!(probe.memory_usage > 0);
+        assert!(probe.total_memory > 0);
+        assert!(probe.available_memory <= probe.total_memory);
+    }
 
     #[test]
     fn given_unrefreshed_system_when_probing_scoped_cpu_should_fall_back_to_global() {

@@ -87,8 +87,8 @@ use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
-use system_stats::{cgroup_scoped_memory, scoped_total_cpu_usage};
+use sysinfo::System as SysinfoSystem;
+use system_stats::SystemProbe;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -728,57 +728,32 @@ impl HostIdentity {
 static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 
 fn probe_system_stats() -> SystemStats {
-    let process_id = std::process::id();
     let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
-    SYSINFO.with_borrow_mut(|slot| {
-        // `new()` not `new_all()`: the refreshes below cover everything read
-        // here; `new_all()` would keep the full host process table alive forever.
+    let probe = SYSINFO.with_borrow_mut(|slot| {
         let sys = slot.get_or_insert_with(SysinfoSystem::new);
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
+        SystemProbe::capture(sys)
+    });
 
-        let mut stats = SystemStats {
-            process_id,
-            cpu_usage: 0.0,
-            total_cpu_usage: scoped_total_cpu_usage(sys),
-            memory_usage: 0,
-            total_memory: sys.total_memory(),
-            available_memory: sys.available_memory(),
-            run_time: 0,
-            start_time: 0,
-            read_bytes: 0,
-            written_bytes: 0,
-            threads_count: 0,
-            hostname: host.hostname.clone(),
-            os_name: host.os_name.clone(),
-            os_version: host.os_version.clone(),
-            kernel_version: host.kernel_version.clone(),
-        };
-
-        if let Some(process) = sys.process(Pid::from_u32(process_id)) {
-            stats.cpu_usage = process.cpu_usage();
-            stats.memory_usage = process.memory();
-            // sysinfo reports whole seconds; the wire fields are micros (the
-            // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
-            // micro-based).
-            stats.run_time = process.run_time().saturating_mul(1_000_000);
-            stats.start_time = process.start_time().saturating_mul(1_000_000);
-            let disk_usage = process.disk_usage();
-            stats.read_bytes = disk_usage.total_read_bytes;
-            stats.written_bytes = disk_usage.total_written_bytes;
-            stats.threads_count = process
-                .tasks()
-                .map_or(0, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX));
-
-            if let Some(memory) = cgroup_scoped_memory(sys, process) {
-                stats.total_memory = memory.total;
-                stats.available_memory = memory.available;
-            }
-        }
-
-        stats
-    })
+    SystemStats {
+        process_id: probe.process_id,
+        cpu_usage: probe.cpu_usage,
+        total_cpu_usage: probe.total_cpu_usage,
+        memory_usage: probe.memory_usage,
+        total_memory: probe.total_memory,
+        available_memory: probe.available_memory,
+        // sysinfo reports whole seconds; the wire fields are micros (the
+        // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
+        // micro-based).
+        run_time: probe.run_time_secs.saturating_mul(1_000_000),
+        start_time: probe.start_time_secs.saturating_mul(1_000_000),
+        read_bytes: probe.read_bytes,
+        written_bytes: probe.written_bytes,
+        threads_count: probe.threads_count,
+        hostname: host.hostname.clone(),
+        os_name: host.os_name.clone(),
+        os_version: host.os_version.clone(),
+        kernel_version: host.kernel_version.clone(),
+    }
 }
 
 fn build_get_stream_response(
