@@ -430,6 +430,28 @@ where
             partition.nth_oldest_sealed_end_offset(count)
         })
     }
+
+    /// [`Self::nth_oldest_sealed_end_offset`] plus whether this replica is
+    /// still behind the replicated log, read in one partition access so the
+    /// pair is consistent. "Nothing sealed to delete" is settled on a
+    /// converged replica (a committed-but-unflushed resident tail is normal
+    /// under a large `messages_required_to_save` and must ack as a no-op),
+    /// but transient on a lagging one (a backup that has not learned the
+    /// commit frontier may be missing whole sealed segments).
+    pub fn segment_delete_resolution(
+        &self,
+        namespace: &IggyNamespace,
+        count: u32,
+    ) -> Option<(Option<u64>, bool)> {
+        self.with_partition(namespace, |partition| {
+            let consensus = partition.consensus();
+            let lagging = consensus.is_follower()
+                || !consensus.is_normal()
+                || consensus.is_syncing()
+                || consensus.commit_min() < consensus.commit_max();
+            (partition.nth_oldest_sealed_end_offset(count), lagging)
+        })
+    }
 }
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>

@@ -1358,15 +1358,18 @@ where
 
         // Not-primary / not-caught-up is transient: the same request replayed
         // once a primary is caught up commits fine. Reply with the explicit
-        // `TransientNotCommitted` frame (relayed to the socket by the home shard)
-        // so the client replays immediately rather than waiting out its
-        // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
-        // sync, so the client resends on the same connection (session intact).
+        // transient frame (relayed to the socket by the home shard) so the
+        // client replays immediately rather than waiting out its read-timeout.
+        // `TransientNotAccepted` specifically: the request never entered the
+        // pipeline here, so the client may re-issue it ANYWHERE -- including
+        // under a fresh session after failing over to the current leader --
+        // without double-apply risk. (`TransientNotCommitted` conversely means
+        // the outcome is unknown and only a same-session replay is safe.)
         if !is_caught_up_primary(consensus) {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
+                IggyError::TransientNotAccepted.as_code(),
             )
             .into_generic());
         }
@@ -1404,12 +1407,13 @@ where
             PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
-        // Pipeline full: backpressure, not failure. Tell the client to replay.
+        // Pipeline full: backpressure, not failure. The request was not
+        // admitted, so `TransientNotAccepted` (re-issuable anywhere).
         if consensus.pipeline().borrow().is_full() {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
+                IggyError::TransientNotAccepted.as_code(),
             )
             .into_generic());
         }
@@ -2164,9 +2168,40 @@ pub fn build_truncate_partition_client_message(
     partition_id: u32,
     up_to_offset: u64,
 ) -> Message<RequestHeader> {
+    build_truncate_partition_client_message_with_identifiers(
+        template,
+        client_id,
+        session,
+        WireIdentifier::numeric(stream_id),
+        WireIdentifier::numeric(topic_id),
+        partition_id,
+        up_to_offset,
+    )
+}
+
+/// [`build_truncate_partition_client_message`] with the client's raw wire
+/// identifiers (name or id) instead of resolved numeric ids.
+///
+/// Used when the target does not resolve on the handling node: the truncate
+/// still commits, and the apply rejects it as a committed result, keeping the
+/// client's request sequence contiguous while surfacing the typed error.
+///
+/// # Panics
+/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
+/// a few small fields, so this cannot happen in practice.
+#[must_use]
+pub fn build_truncate_partition_client_message_with_identifiers(
+    template: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RequestHeader> {
     let body = TruncatePartitionRequest {
-        stream_id: WireIdentifier::numeric(stream_id),
-        topic_id: WireIdentifier::numeric(topic_id),
+        stream_id,
+        topic_id,
         partition_id,
         up_to_offset,
     }

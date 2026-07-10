@@ -15,15 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClusterMetadata, IggyError};
-use async_trait::async_trait;
+mod container;
+mod sink;
 
-/// This trait defines the methods to interact with the cluster module.
-#[async_trait]
-pub trait ClusterClient {
-    /// Get the metadata of the cluster including node information, roles, and status.
-    ///
-    /// Served pre-auth so an unauthenticated client can locate the cluster
-    /// leader before signing in; the server applies its own policy.
-    async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError>;
-}
+pub use container::SurrealDbOps;
+pub use sink::{
+    SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
+    SurrealDbSinkRawFixture,
+};

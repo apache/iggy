@@ -174,6 +174,10 @@ pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
+    // Credential verification is a consensus-free STM read; hold it while a
+    // recovered WAL suffix (which may carry the user's create/password ops)
+    // re-commits, like every other local read.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
     let user_id = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -187,6 +191,7 @@ pub(in crate::http) async fn login_with_personal_access_token(
     State(state): State<HttpState>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
@@ -248,14 +253,15 @@ pub(in crate::http) async fn get_streams(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<Stream>>, ReadError> {
     let body = GetStreamsRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_STREAMS_CODE,
         &body,
         Permissioner::get_streams,
-    )?;
+    ))
+    .await?;
     let response = GetStreamsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(streams_from_wire(response)))
@@ -279,7 +285,7 @@ pub(in crate::http) async fn get_stream(
         stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -288,7 +294,8 @@ pub(in crate::http) async fn get_stream(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
-    )?;
+    ))
+    .await?;
     let response = GetStreamResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -312,7 +319,7 @@ pub(in crate::http) async fn get_topics(
         stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -321,7 +328,8 @@ pub(in crate::http) async fn get_topics(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
-    )?;
+    ))
+    .await?;
     let response = GetTopicsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -348,7 +356,7 @@ pub(in crate::http) async fn get_topic(
         topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -359,7 +367,8 @@ pub(in crate::http) async fn get_topic(
                 permissioner.get_topic(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = GetTopicResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -375,14 +384,15 @@ pub(in crate::http) async fn get_users(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<UserInfo>>, ReadError> {
     let body = GetUsersRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_USERS_CODE,
         &body,
         Permissioner::get_users,
-    )?;
+    ))
+    .await?;
     let response = GetUsersResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -412,7 +422,7 @@ pub(in crate::http) async fn get_user(
         user_id: wire_user_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -425,7 +435,8 @@ pub(in crate::http) async fn get_user(
                 permissioner.get_user(uid)
             }
         },
-    )?;
+    ))
+    .await?;
     let response = UserDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -452,7 +463,7 @@ pub(in crate::http) async fn get_cgs(
         topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -463,7 +474,8 @@ pub(in crate::http) async fn get_cgs(
                 permissioner.get_consumer_groups(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = GetConsumerGroupsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(consumer_groups_from_wire(response)))
@@ -491,7 +503,7 @@ pub(in crate::http) async fn get_cg(
         group_id: identifier_to_wire(&group_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -502,7 +514,8 @@ pub(in crate::http) async fn get_cg(
                 permissioner.get_consumer_group(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(ConsumerGroupDetails::from(response)))
@@ -518,14 +531,15 @@ pub(in crate::http) async fn get_stats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Stats>, ReadError> {
     let body = GetStatsRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_STATS_CODE,
         &body,
         Permissioner::get_stats,
-    )?;
+    ))
+    .await?;
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
@@ -1454,14 +1468,15 @@ pub(in crate::http) async fn get_pats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<PersonalAccessTokenInfo>>, ReadError> {
     let body = GetPersonalAccessTokensRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_PERSONAL_ACCESS_TOKENS_CODE,
         &body,
         |_, _| Ok(()),
-    )?;
+    ))
+    .await?;
     let response = GetPersonalAccessTokensResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(personal_access_tokens_from_wire(response)))

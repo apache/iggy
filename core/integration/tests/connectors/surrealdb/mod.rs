@@ -15,15 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClusterMetadata, IggyError};
-use async_trait::async_trait;
+mod surrealdb_sink;
 
-/// This trait defines the methods to interact with the cluster module.
-#[async_trait]
-pub trait ClusterClient {
-    /// Get the metadata of the cluster including node information, roles, and status.
-    ///
-    /// Served pre-auth so an unauthenticated client can locate the cluster
-    /// leader before signing in; the server applies its own policy.
-    async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError>;
-}
+const TEST_MESSAGE_COUNT: usize = 3;
+const LARGE_BATCH_COUNT: usize = 50;
+const POLL_ATTEMPTS: usize = 120;
+const POLL_INTERVAL_MS: u64 = 50;

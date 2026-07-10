@@ -7162,6 +7162,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_surrealdb_sink"
+version = "0.4.1-edge.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_examples"
 version = "0.0.6"
 dependencies = [

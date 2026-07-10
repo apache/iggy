@@ -540,12 +540,23 @@ fn build_cluster_metadata_response(
     roster: &ClusterRoster,
     shard: &Rc<ServerNgShard>,
 ) -> ClusterMetadataResponse {
+    // Shard 0 reads its live consensus; delegated shards use the view shard 0
+    // publishes into the roster, so leader marking works on every shard.
     let primary_index = shard
         .plane
         .metadata()
         .consensus
         .as_ref()
-        .map(|consensus| consensus.primary_index(consensus.view()));
+        .and_then(|consensus| {
+            let primary_index = consensus.primary_index(consensus.view());
+            // A restarted replica that ceded the primaryship its stale view
+            // assigns it must not advertise itself as leader: clients would
+            // pin to a node that never heartbeats. Report "no leader" until
+            // the election resolves the role.
+            (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
+                .then_some(primary_index)
+        })
+        .or_else(|| roster.current_primary_index());
     let metadata = roster.cluster_metadata(primary_index);
     ClusterMetadataResponse {
         name: metadata.name,

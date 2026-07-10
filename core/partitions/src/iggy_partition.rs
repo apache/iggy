@@ -1209,9 +1209,31 @@ where
                 }
             }
 
-            assert!(!consensus.is_follower(), "on_request: primary only");
-            assert!(consensus.is_normal(), "on_request: status must be normal");
-            assert!(!consensus.is_syncing(), "on_request: must not be syncing");
+            // A client op landing on a non-primary (or mid-view-change)
+            // replica is a routing artifact -- e.g. the roster still points
+            // here while this group's primaryship moved after a restart.
+            // Answer the typed transient instead of asserting: the SDK
+            // replays and its leader recheck re-routes, whereas a panic
+            // kills the shard and a silent drop wedges the client until its
+            // read timeout.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_syncing() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
 
             // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
@@ -1726,8 +1748,35 @@ where
         self.append_messages(message).await.map(|_| ())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, false).await
+    }
+
+    /// Flush the committed journal prefix to segment storage regardless of
+    /// the `messages_required_to_save` thresholds.
+    ///
+    /// Shutdown-path counterpart of the commit-time persist gate: a graceful
+    /// stop must not lose committed messages that were still resident in the
+    /// in-memory journal (consumer offsets are persisted eagerly, so losing
+    /// the messages would fail recovery with an offset ahead of the data).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError`] when writing the committed batches or their
+    /// index entries to segment storage fails.
+    pub async fn flush_committed_messages(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, true).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn commit_messages_inner(
+        &mut self,
+        config: &PartitionsConfig,
+        force: bool,
+    ) -> Result<(), IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -1748,7 +1797,7 @@ where
             >= config.size_of_messages_required_to_save.as_bytes_u64();
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
-        if !should_persist {
+        if !force && !should_persist {
             return Ok(());
         }
 
@@ -1768,126 +1817,174 @@ where
         if committed_entries.is_empty() {
             return Ok(());
         }
-        let committed_count = committed_entries.len();
-
-        let (frozen_batches, index_bytes, flush_index, batch_count, committed_info) = {
-            let segment = self.log.active_segment();
-            let mut file_position = segment.size.as_bytes_u64();
-            let mut flush_index = None;
-            let mut frozen = Vec::with_capacity(committed_entries.len());
-            let mut batch_count = 0u32;
-            let mut committed_info = JournalInfo::default();
-
-            for entry in committed_entries {
-                // Consumer-offset ops are journaled in the same prefix but carry
-                // no segment bytes; they were applied when staged, so skip them.
-                if peek_operation(&entry) != Operation::SendMessages {
-                    continue;
-                }
-                // A resident committed SendMessages entry decoded once at append
-                // (the offset index) with its checksum stamped over these exact
-                // bytes, so it must decode again here. Guard the invariant for a
-                // future disk read-back path that could make decode fallible.
-                let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
-                    debug_assert!(
-                        false,
-                        "resident committed SendMessages entry failed to decode"
-                    );
-                    continue;
-                };
-                let message_count = batch.message_count();
-                if message_count == 0 {
-                    continue;
-                }
-
-                if flush_index.is_none() {
-                    // Record only; the in-mem cache insert is deferred until the
-                    // batch + index are durable (see post-persist below).
-                    flush_index = Some(crate::iggy_index::IggyIndex::new(
-                        batch.header.base_offset,
-                        batch.header.base_timestamp,
-                        file_position,
-                    ));
-                }
-                file_position += batch.header.total_size() as u64;
-                batch_count += message_count;
-                accumulate_committed_info(
-                    &mut committed_info,
-                    batch.header.base_offset,
-                    batch.header.base_timestamp,
-                    batch.header.total_size() as u64,
-                    message_count,
-                );
-                frozen.push(entry);
+        // Persist the prefix in segment-sized chunks: a segment seals exactly
+        // when its committed bytes reach `max_size`, no matter how many
+        // entries this flush happens to cover. A backup commits in bursts
+        // behind the primary, so any grouping- or timing-sensitive roll rule
+        // (like keying rotation on the journal-position `is_full` above)
+        // seals segments at per-replica offsets, and the offset-keyed segment
+        // GC staged by the reconciler never converges across the cluster.
+        let max_segment_size = self.log.active_segment().max_size.as_bytes_u64();
+        let mut entries = committed_entries.into_iter().peekable();
+        let mut durable_offset = None;
+        // Entries whose bytes are durable but which are still resident in the
+        // journal. Evicted ONCE after the loop: `evict_prefix` drains and
+        // re-appends the whole retained tail, so a per-chunk call would
+        // re-walk that tail once per segment crossed, quadratic in the flush
+        // span -- all under the partition write lock. On an error mid-flush
+        // the accumulated prefix is evicted before propagating, so the retry
+        // re-reads only what did not land.
+        let mut evictable = 0usize;
+        while entries.peek().is_some() {
+            // A recovered active segment can already sit at or past the cap
+            // (crash between persist and rotation); seal it before appending.
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
             }
 
-            let index_bytes = flush_index
-                .as_ref()
-                .map(crate::iggy_index::IggyIndexCache::serialize);
+            let (frozen_batches, index_bytes, flush_index, batch_count, committed_info, chunk_len) = {
+                let segment = self.log.active_segment();
+                let mut file_position = segment.size.as_bytes_u64();
+                let mut flush_index = None;
+                let mut frozen = Vec::with_capacity(entries.len());
+                let mut batch_count = 0u32;
+                let mut committed_info = JournalInfo::default();
+                let mut chunk_len = 0usize;
 
-            (
-                frozen,
-                index_bytes,
-                flush_index,
-                batch_count,
-                committed_info,
-            )
-        };
+                for entry in entries.by_ref() {
+                    chunk_len += 1;
+                    // Consumer-offset ops are journaled in the same prefix but carry
+                    // no segment bytes; they were applied when staged, so skip them.
+                    if peek_operation(&entry) != Operation::SendMessages {
+                        continue;
+                    }
+                    // A resident committed SendMessages entry decoded once at append
+                    // (the offset index) with its checksum stamped over these exact
+                    // bytes, so it must decode again here. Guard the invariant for a
+                    // future disk read-back path that could make decode fallible.
+                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                        debug_assert!(
+                            false,
+                            "resident committed SendMessages entry failed to decode"
+                        );
+                        continue;
+                    };
+                    let message_count = batch.message_count();
+                    if message_count == 0 {
+                        continue;
+                    }
 
-        // No committed SendMessages batch was resident (e.g. only uncommitted
-        // ops, or a committed consumer-offset prefix that is not persisted to a
-        // segment). Nothing to flush, but the committed prefix must still be
-        // evicted; no segment bytes are at risk, so evict directly.
-        let Some(index_bytes) = index_bytes else {
-            self.evict_committed_prefix(committed_count).await;
-            return Ok(());
-        };
+                    if flush_index.is_none() {
+                        // Record only; the in-mem cache insert is deferred until the
+                        // batch + index are durable (see post-persist below).
+                        flush_index = Some(crate::iggy_index::IggyIndex::new(
+                            batch.header.base_offset,
+                            batch.header.base_timestamp,
+                            file_position,
+                        ));
+                    }
+                    file_position += batch.header.total_size() as u64;
+                    batch_count += message_count;
+                    accumulate_committed_info(
+                        &mut committed_info,
+                        batch.header.base_offset,
+                        batch.header.base_timestamp,
+                        batch.header.total_size() as u64,
+                        message_count,
+                    );
+                    frozen.push(entry);
+                    if file_position >= max_segment_size {
+                        break;
+                    }
+                }
 
-        // Persist BEFORE eviction so a write failure leaves the committed prefix
-        // resident for retry. The persist is idempotent on failure: a batch
-        // write that lands but whose index save then fails rewinds the segment
-        // write cursor, so the retry overwrites those bytes instead of appending
-        // a duplicate. Only once the bytes are durable do we evict and rebuild
-        // the tail accounting.
-        self.persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
-            .await?;
-        // Insert the flushed sparse-index entry into the in-mem cache only now
-        // that the batch + index are durable. Inserting in the build loop (before
-        // persist) re-inserts a duplicate on a persist-failure retry, which
-        // re-reads the same prefix. The active segment has not rotated yet, so
-        // this targets the segment that received the batches.
-        if let Some(index) = flush_index {
-            self.log.ensure_indexes();
-            let indexes = self.log.active_indexes_mut().expect("indexes must exist");
-            indexes.insert(index.offset, index.timestamp, index.position);
+                let index_bytes = flush_index
+                    .as_ref()
+                    .map(crate::iggy_index::IggyIndexCache::serialize);
+
+                (
+                    frozen,
+                    index_bytes,
+                    flush_index,
+                    batch_count,
+                    committed_info,
+                    chunk_len,
+                )
+            };
+
+            // No committed SendMessages batch was resident in this chunk (e.g.
+            // a committed consumer-offset run that is not persisted to a
+            // segment). Nothing to flush; no segment bytes are at risk, so the
+            // entries just join the evictable prefix.
+            let Some(index_bytes) = index_bytes else {
+                evictable += chunk_len;
+                continue;
+            };
+
+            // Persist BEFORE eviction so a write failure leaves the rest of the
+            // committed prefix resident for retry. The persist is idempotent on
+            // failure: a batch write that lands but whose index save then fails
+            // rewinds the segment write cursor, so the retry overwrites those
+            // bytes instead of appending a duplicate. Chunks already durable
+            // are evicted before the error propagates, so the retry cannot
+            // re-read them (and re-write them past a rotation).
+            if let Err(error) = self
+                .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
+                .await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
+            }
+            // Insert the flushed sparse-index entry into the in-mem cache only now
+            // that the batch + index are durable. Inserting in the build loop (before
+            // persist) re-inserts a duplicate on a persist-failure retry, which
+            // re-reads the same prefix. The active segment has not rotated yet, so
+            // this targets the segment that received the batches.
+            if let Some(index) = flush_index {
+                self.log.ensure_indexes();
+                let indexes = self.log.active_indexes_mut().expect("indexes must exist");
+                indexes.insert(index.offset, index.timestamp, index.position);
+            }
+            evictable += chunk_len;
+
+            // Stamp range metadata on the segment that received the batches
+            // BEFORE rotating: rotation seals it and derives the next segment's
+            // start offset from `end_offset`, so updating after rotation would
+            // tag the fresh segment with the old range and shift every
+            // subsequent segment boundary off the file contents.
+            let segment_index = self.log.segments().len() - 1;
+            let segment = &mut self.log.segments_mut()[segment_index];
+            if segment.start_timestamp == 0 && committed_info.first_timestamp != 0 {
+                segment.start_timestamp = committed_info.first_timestamp;
+            }
+            segment.end_timestamp = committed_info.end_timestamp;
+            segment.max_timestamp = segment.max_timestamp.max(committed_info.max_timestamp);
+            segment.end_offset = committed_info.current_offset;
+            durable_offset = Some(committed_info.current_offset);
+
+            // Seal eagerly once the committed bytes cross the cap so the
+            // segment becomes removable (GC skips the active segment) without
+            // waiting for the next flush.
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
+            }
         }
-        self.evict_committed_prefix(committed_count).await;
-
-        // Stamp range metadata on the segment that received the batches
-        // BEFORE rotating: rotation seals it and derives the next segment's
-        // start offset from `end_offset`, so updating after rotation would
-        // tag the fresh segment with the old range and shift every
-        // subsequent segment boundary off the file contents.
-        let segment_index = self.log.segments().len() - 1;
-        let segment = &mut self.log.segments_mut()[segment_index];
-        if segment.start_timestamp == 0 && committed_info.first_timestamp != 0 {
-            segment.start_timestamp = committed_info.first_timestamp;
-        }
-        segment.end_timestamp = committed_info.end_timestamp;
-        segment.max_timestamp = segment.max_timestamp.max(committed_info.max_timestamp);
-        segment.end_offset = committed_info.current_offset;
-
-        if is_full {
-            self.rotate_segment(config).await?;
-        }
+        self.evict_committed_prefix(evictable).await;
 
         // Aggregate stats (`messages_count`/`size_bytes`) advance at commit in
         // `commit_partition_entry`, not here: this persist path is threshold-
         // gated, so counting here would leave the stats lagging the visible
         // offset until a flush and would double-count once it fires.
-        let durable_offset = committed_info.current_offset;
-        self.offset.store(durable_offset, Ordering::Release);
-        self.stats.set_current_offset(durable_offset);
+        if let Some(durable_offset) = durable_offset {
+            self.offset.store(durable_offset, Ordering::Release);
+            self.stats.set_current_offset(durable_offset);
+        }
         Ok(())
     }
 
@@ -1899,6 +1996,9 @@ where
     /// `evict_prefix` surfaced during its re-append, so the tail is not decoded
     /// a second time.
     async fn evict_committed_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
         let retained = self.log.journal().inner.evict_prefix(count).await;
         let mut retained_info = JournalInfo::default();
         for (_, meta) in &retained {
