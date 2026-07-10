@@ -675,9 +675,7 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
 /// These describe the whole process, not shard or metadata state, so any one
 /// shard can serve them without aggregation. The CPU fields are deltas over the
 /// serving thread's own [`SYSINFO`] refresh history, so they vary by serving
-/// shard (a shard's first probe reports zero CPU). The `total_*` fields are
-/// scoped to the process's allowed CPU set and cgroup memory cap on confined
-/// hosts (see `system_stats`), host-wide otherwise.
+/// shard (a shard's first probe reports zero CPU).
 struct SystemStats {
     process_id: u32,
     cpu_usage: f32,
@@ -733,7 +731,9 @@ fn probe_system_stats() -> SystemStats {
     let process_id = std::process::id();
     let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
     SYSINFO.with_borrow_mut(|slot| {
-        let sys = slot.get_or_insert_with(SysinfoSystem::new_all);
+        // `new()` not `new_all()`: the refreshes below cover everything read
+        // here; `new_all()` would keep the full host process table alive forever.
+        let sys = slot.get_or_insert_with(SysinfoSystem::new);
         sys.refresh_cpu_all();
         sys.refresh_memory();
         sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);

@@ -32,14 +32,10 @@ impl IggyShard {
 
         SYSINFO.with(|sysinfo_cell| {
             let mut sysinfo_opt = sysinfo_cell.borrow_mut();
-
-            if sysinfo_opt.is_none() {
-                let mut sys = SysinfoSystem::new_all();
-                sys.refresh_all();
-                *sysinfo_opt = Some(sys);
-            }
-
-            let sys = sysinfo_opt.as_mut().unwrap();
+            // `new()` not `new_all()`: the refreshes below cover everything
+            // read here; `new_all()` would keep the full host process table
+            // alive forever.
+            let sys = sysinfo_opt.get_or_insert_with(SysinfoSystem::new);
             let process_id = std::process::id();
             sys.refresh_cpu_all();
             sys.refresh_memory();
@@ -71,11 +67,7 @@ impl IggyShard {
                 ..Default::default()
             };
 
-            if let Some(process) = sys
-                .processes()
-                .values()
-                .find(|p| p.pid() == Pid::from_u32(process_id))
-            {
+            if let Some(process) = sys.process(Pid::from_u32(process_id)) {
                 stats.process_id = process.pid().as_u32();
                 stats.cpu_usage = process.cpu_usage();
                 stats.memory_usage = process.memory().into();

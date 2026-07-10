@@ -124,19 +124,17 @@ struct SystemProbe {
     available_memory: u64,
 }
 
-/// CPU and memory scoped to what this process may actually use. On a
-/// shared host the runtime runs cpuset- or cgroup-confined; the host-wide
-/// `sysinfo` numbers would report the neighbors' CPU load and a memory
-/// total the runtime can never allocate, and they leak host sizing to
-/// whoever can read `/stats`.
 fn probe_system(pid: u32) -> SystemProbe {
+    let pid = Pid::from_u32(pid);
+    // `new()` not `new_all()`: the refreshes below cover everything read
+    // here; `new_all()` would keep the full host process table alive forever.
     let mut system = SYSINFO
-        .get_or_init(|| Mutex::new(System::new_all()))
+        .get_or_init(|| Mutex::new(System::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     system.refresh_cpu_all();
     system.refresh_memory();
-    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
 
     let mut probe = SystemProbe {
         cpu_usage: 0.0,
@@ -146,7 +144,7 @@ fn probe_system(pid: u32) -> SystemProbe {
         available_memory: system.available_memory(),
     };
 
-    if let Some(process) = system.process(Pid::from_u32(pid)) {
+    if let Some(process) = system.process(pid) {
         probe.cpu_usage = process.cpu_usage();
         probe.memory_usage = process.memory();
         if let Some(memory) = cgroup_scoped_memory(&system, process) {
