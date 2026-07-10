@@ -77,7 +77,7 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{Identifier, IggyError, IggyTimestamp, MaxTopicSize};
+use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
@@ -1307,6 +1307,7 @@ pub(crate) fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
     fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
     // Body head: [partition_id:4][current_offset:8][count:4]. `count` sits at
     // COUNT_OFFSET and is backpatched once the walk below knows it.
@@ -1374,20 +1375,56 @@ pub(crate) fn build_polled_messages_body(
             body.extend_from_slice(&offset.to_le_bytes());
             body.extend_from_slice(&timestamp.to_le_bytes());
             body.extend_from_slice(&origin_timestamp.to_le_bytes());
-            body.extend_from_slice(
-                &u32::try_from(user_headers_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(
-                &u32::try_from(payload_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(&0u64.to_le_bytes()); // reserved
-            // Stored sections are already in legacy order
-            // (`[payload][user_headers]`): copy through contiguously.
-            body.extend_from_slice(&stream[sections_start..sections_end]);
+            if let Some(encryptor) = encryptor {
+                // At-rest encryption: stored sections are ciphertext (encrypted
+                // once at ingestion, replicated verbatim); this reply is the
+                // single decrypt point, so lengths are rewritten to the
+                // plaintext sizes. The stored per-message checksum still covers
+                // the ciphertext and is passed through untouched (the SDK does
+                // not re-validate it against the reply layout).
+                let payload_end = sections_start + payload_length;
+                let payload = encryptor
+                    .decrypt(&stream[sections_start..payload_end])
+                    .map_err(|_| IggyError::CannotDecryptData)?;
+                let user_headers = if user_headers_length > 0 {
+                    Some(
+                        encryptor
+                            .decrypt(&stream[payload_end..sections_end])
+                            .map_err(|_| IggyError::CannotDecryptData)?,
+                    )
+                } else {
+                    None
+                };
+                let user_headers_bytes: &[u8] = user_headers.as_deref().unwrap_or_default();
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_bytes.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                body.extend_from_slice(&payload);
+                body.extend_from_slice(user_headers_bytes);
+            } else {
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                // Stored sections are already in legacy order
+                // (`[payload][user_headers]`): copy through contiguously.
+                body.extend_from_slice(&stream[sections_start..sections_end]);
+            }
 
             count += 1;
             cursor = sections_end;

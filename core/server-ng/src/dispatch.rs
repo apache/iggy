@@ -1512,15 +1512,20 @@ async fn handle_poll_messages(
                 Some(PartitionReadReply::Poll {
                     fragments,
                     current_offset,
-                }) => build_polled_messages_body(partition_id, current_offset, fragments)
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            transport_client_id,
-                            error = %error,
-                            "failed to re-encode polled batches; replying empty poll"
-                        );
-                        empty_polled_messages_body(partition_id)
-                    }),
+                }) => build_polled_messages_body(
+                    partition_id,
+                    current_offset,
+                    fragments,
+                    shard.plane.partitions().config().encryptor.as_deref(),
+                )
+                .unwrap_or_else(|error| {
+                    warn!(
+                        transport_client_id,
+                        error = %error,
+                        "failed to re-encode polled batches; replying empty poll"
+                    );
+                    empty_polled_messages_body(partition_id)
+                }),
                 other => {
                     warn!(
                         transport_client_id,

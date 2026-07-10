@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{IggyByteSize, PollingStrategy};
+use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -216,6 +217,13 @@ pub struct PartitionsConfig {
     pub enforce_fsync: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+    /// Server-side at-rest encryption. Applied ONCE, on the primary at
+    /// ingestion, so the ciphertext replicates verbatim: every replica
+    /// journals, acks, and persists identical bytes (checksums and the
+    /// deterministic segment rolls both depend on that), and the poll path
+    /// decrypts uniformly whether a fragment came from the resident journal
+    /// or from disk.
+    pub encryptor: Option<Arc<EncryptorKind>>,
 }
 
 impl PartitionsConfig {

@@ -46,7 +46,7 @@ use iggy_common::defaults::{
     DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
     MIN_USERNAME_LENGTH,
 };
-use iggy_common::{IggyByteSize, PartitionStats, variadic};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
@@ -1414,6 +1414,16 @@ async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
+    // At-rest encryption: built once per shard from the shared config; the
+    // ingestion path encrypts on the primary and the poll reply decrypts.
+    // A bad key fails the boot rather than silently serving plaintext.
+    let encryptor = if config.system.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+            .map_err(|error| ServerNgError::Iggy(Box::new(error)))?;
+        Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
+    } else {
+        None
+    };
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
@@ -1424,6 +1434,7 @@ async fn build_shard_for_thread(
                 .size_of_messages_required_to_save,
             enforce_fsync: config.system.partition.enforce_fsync,
             segment_size: config.system.segment.size,
+            encryptor,
         },
         owned_partitions_capacity,
     );

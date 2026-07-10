@@ -27,7 +27,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Local;
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
     GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
     GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
@@ -1030,8 +1030,13 @@ pub(in crate::http) async fn poll_messages(
             fragments,
             current_offset,
         }) => {
-            let body = build_polled_messages_body(partition_id, current_offset, fragments)
-                .map_err(ReadError::Rejected)?;
+            let body = build_polled_messages_body(
+                partition_id,
+                current_offset,
+                fragments,
+                state.shard.plane.partitions().config().encryptor.as_deref(),
+            )
+            .map_err(ReadError::Rejected)?;
             Ok(Json(
                 PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?,
             ))
