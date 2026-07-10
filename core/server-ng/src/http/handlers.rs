@@ -220,7 +220,10 @@ pub(in crate::http) async fn refresh_token(
     if command.token.is_empty() {
         return Err(IggyError::Unauthenticated.into());
     }
-    let claims = state.jwt.decode(&command.token)?;
+    // Refresh rejects trusted-issuer tokens (they keep their own lifecycle);
+    // `decode_for_refresh` is `!Send` (a trusted-issuer token may await a JWKS
+    // fetch), so bridge it like every other shard-0 path (see [`logout_user`]).
+    let claims = SendWrapper::new(state.jwt.decode_for_refresh(&command.token)).await?;
     let user_id = claims
         .sub
         .parse::<u32>()
@@ -945,7 +948,7 @@ pub(in crate::http) async fn delete_partitions(
 /// the path.
 ///
 /// `DeleteSegments` is not itself a consensus op: [`submit_write`] carries it
-/// through [`submit_gated`], which resolves it to the `TruncatePartition` that
+/// through `submit_gated`, which resolves it to the `TruncatePartition` that
 /// commits the trim. RBAC (`delete_segments`) is enforced in-apply on that
 /// truncate, like the sibling topic writes.
 pub(in crate::http) async fn delete_segments(
@@ -1321,7 +1324,8 @@ pub(in crate::http) async fn delete_cg(
 ///
 /// The plaintext password rides the JSON body; [`submit_write`] hashes it on
 /// shard 0 before the request enters consensus (see
-/// [`maybe_rewrite_user_password_request`]), so no plaintext is ever replicated.
+/// [`crate::users::maybe_rewrite_user_password_request`]), so no plaintext is
+/// ever replicated.
 pub(in crate::http) async fn create_user(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1402,8 +1406,8 @@ pub(in crate::http) async fn delete_user(
 /// `PUT /users/{user_id}/password`: change a user's password. Returns 204.
 ///
 /// Both passwords ride the JSON body in plaintext. On shard 0, before the op
-/// enters consensus, [`maybe_rewrite_user_password_request`] hashes the new
-/// password and strips the current one (so neither plaintext is ever
+/// enters consensus, [`crate::users::maybe_rewrite_user_password_request`] hashes
+/// the new password and strips the current one (so neither plaintext is ever
 /// replicated), and verifies `current_password` against the target's stored
 /// hash. A wrong current password is not denied pre-consensus: the op still
 /// commits, carrying an empty new-password hash the replicated apply turns into
@@ -1488,7 +1492,7 @@ pub(in crate::http) async fn get_pats(
 /// legacy server returns, with HTTP 200.
 ///
 /// The raw token is non-deterministic and secret, so it must never enter
-/// consensus: [`rewrite_pat_request_for_user`] (invoked inside
+/// consensus: [`crate::pat::rewrite_pat_request_for_user`] (invoked inside
 /// [`submit_committed`]) mints it on shard 0 and replicates only its hash, so a
 /// successful committed reply body is empty. [`build_raw_pat_reply`] then splices
 /// the raw secret back into that reply locally, using the confirmed commit

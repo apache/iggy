@@ -126,11 +126,24 @@ decoding_secret = ""
 # `false` means the secret is in plain text.
 use_base64_secret = false
 
-# Trusted issuers for A2A (Application-to-Application) authentication
-[[http.jwt.trusted_issuers]]
-issuer = "test-issuer"
-jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
-audience = "iggy.apache.org"
+# Trusted issuers for A2A (Application-to-Application) authentication. Opt-in:
+# with none configured the listener accepts only self-issued HS256 tokens.
+# `issuer`, `audience` and `jwks_url` are required per entry; `user_id` is
+# optional but defaults to 0 (root), which is rejected - set it to the non-zero
+# iggy user every token from that issuer is remapped onto.
+#
+# Operational note: enabling an issuer opens an outbound JWKS fetch that is
+# reachable before a token's signature is verified - a token naming this issuer
+# with an unknown key id can trigger a fetch to `jwks_url`. The target is fixed
+# (not attacker-chosen); concurrent misses coalesce onto one fetch and repeats
+# are rate-limited to at most one outbound request per issuer per short window,
+# so an unknown-key-id flood cannot amplify. The same window bounds how quickly a
+# freshly rotated signing key is picked up.
+# [[http.jwt.trusted_issuers]]
+# issuer = "test-issuer"
+# jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
+# audience = "iggy.apache.org"
+# user_id = 1
 
 # Metrics configuration for HTTP.
 [http.metrics]

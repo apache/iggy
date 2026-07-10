@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// a2a_jwt exercises trusted-issuer (JWKS) tokens; server-ng's HTTP JWT
-// verifier has no trusted-issuer path.
-#[cfg(not(feature = "vsr"))]
+// a2a_jwt exercises trusted-issuer (JWKS) tokens; both the legacy verifier and
+// server-ng's ported trusted-issuer path verify them.
 mod a2a_jwt;
 mod cg;
 // Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
