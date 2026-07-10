@@ -65,7 +65,9 @@ enabled = true
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 
 # Defines which origins are permitted to make cross-origin requests.
-# An asterisk "*" allows all origins. Specific domains can be listed to restrict access.
+# An asterisk "*" as the first entry allows all origins (any entries after it
+# are ignored); "*" in any other position fails the config. Specific domains
+# can be listed to restrict access.
 allowed_origins = ["*"]
 
 # Lists allowed headers that can be used in CORS requests.
@@ -73,11 +75,14 @@ allowed_origins = ["*"]
 allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
-# An empty array means no additional headers are exposed to browsers.
-exposed_headers = [""]
+# `x-iggy-view` carries the current VSR view number; exposing it lets browser
+# clients read it on cross-origin responses.
+exposed_headers = ["x-iggy-view"]
 
 # Determines if credentials like cookies or HTTP auth can be included in CORS requests.
-# `true` allows credentials to be included, useful for authenticated sessions.
+# `true` allows credentials to be included, useful for authenticated sessions;
+# it requires explicit (non-wildcard) allowed_origins, allowed_headers, and
+# exposed_headers.
 # `false` prevents credentials, enhancing privacy and security.
 allow_credentials = false
 

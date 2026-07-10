@@ -73,7 +73,6 @@ ignored = [
     "strum",
     "sysinfo",
     "tempfile",
-    "tower-http",
     "tracing-appender",
     "tracing-opentelemetry",
     "ulid",
