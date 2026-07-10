@@ -233,15 +233,18 @@ class TestCreateTopic:
     @pytest.mark.parametrize(
         "message_expiry",
         [
-            timedelta(0),  # value for server default message expiry
-            timedelta(microseconds=1),
-            timedelta(seconds=1),
-            timedelta(minutes=10),
-            timedelta(days=1, seconds=2, microseconds=3),
+            IggyExpiry.ExpireDuration(timedelta(0)),  # server default sentinel
+            IggyExpiry.ExpireDuration(timedelta(microseconds=1)),
+            IggyExpiry.ExpireDuration(timedelta(seconds=1)),
+            IggyExpiry.ExpireDuration(timedelta(minutes=10)),
+            IggyExpiry.ExpireDuration(timedelta(days=1, seconds=2, microseconds=3)),
         ],
     )
     async def test_create_topic_with_message_expiry(
-        self, iggy_client: IggyClient, unique_name, message_expiry: timedelta
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        message_expiry: IggyExpiry.ExpireDuration,
     ):
         """Test create_topic accepts an explicit message expiry."""
         stream_name = unique_name()
@@ -258,20 +261,22 @@ class TestCreateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        if message_expiry == timedelta(0):
+        if message_expiry.duration == timedelta(0):
             # A zero duration is the server-default sentinel; the server
             # resolves it to the configured default, which is "never expire".
             assert isinstance(topic.message_expiry, IggyExpiry.NeverExpire)
         else:
             assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
-            assert topic.message_expiry.duration == message_expiry
+            assert topic.message_expiry.duration == message_expiry.duration
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("invalid_message_expiry", [1, "1s", object()])
+    @pytest.mark.parametrize(
+        "invalid_message_expiry", [1, "1s", object(), timedelta(seconds=1)]
+    )
     async def test_create_topic_invalid_message_expiry(
         self, iggy_client: IggyClient, unique_name, invalid_message_expiry
     ):
-        """Test create_topic rejects message_expiry values that are not timedeltas."""
+        """Test create_topic rejects non-IggyExpiry message_expiry values."""
         stream_name = unique_name()
         topic_name = unique_name()
 
@@ -289,16 +294,16 @@ class TestCreateTopic:
     @pytest.mark.parametrize(
         ("max_topic_size", "expected_kind"),
         [
-            (0, "unlimited"),  # server-default sentinel; create_topic resolves it
-            (2**64 - 1, "unlimited"),  # explicit unlimited sentinel
-            (2_000_000_000, "custom"),
+            (MaxTopicSize.ServerDefault(), "unlimited"),  # resolved by create_topic
+            (MaxTopicSize.Unlimited(), "unlimited"),
+            (MaxTopicSize.Custom(2_000_000_000), "custom"),
         ],
     )
     async def test_create_topic_with_valid_max_topic_size(
         self,
         iggy_client: IggyClient,
         unique_name,
-        max_topic_size: int,
+        max_topic_size: MaxTopicSize,
         expected_kind: str,
     ):
         """Test create_topic accepts supported maximum topic size values."""
@@ -320,11 +325,12 @@ class TestCreateTopic:
             assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
         else:
             assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
-            assert topic.max_topic_size.bytes == max_topic_size
+            assert isinstance(max_topic_size, MaxTopicSize.Custom)
+            assert topic.max_topic_size.bytes == max_topic_size.bytes
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("max_topic_size", "expected_exception"),
+        ("max_topic_size_bytes", "expected_exception"),
         [
             (4563, RuntimeError),
             (-1, OverflowError),
@@ -335,7 +341,7 @@ class TestCreateTopic:
         self,
         iggy_client: IggyClient,
         unique_name,
-        max_topic_size,
+        max_topic_size_bytes,
         expected_exception,
     ):
         """Test create_topic rejects invalid maximum topic size values."""
@@ -349,7 +355,7 @@ class TestCreateTopic:
                 stream=stream_name,
                 name=topic_name,
                 partitions_count=1,
-                max_topic_size=max_topic_size,
+                max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
             )
 
     @pytest.mark.asyncio
@@ -854,11 +860,13 @@ class TestUpdateTopic:
             )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("invalid_message_expiry", [1, "1s", object()])
+    @pytest.mark.parametrize(
+        "invalid_message_expiry", [1, "1s", object(), timedelta(seconds=1)]
+    )
     async def test_update_topic_invalid_message_expiry(
         self, iggy_client: IggyClient, unique_name, invalid_message_expiry
     ):
-        """Test update_topic rejects message_expiry values that are not timedeltas."""
+        """Test update_topic rejects non-IggyExpiry message_expiry values."""
         stream_name = unique_name()
         topic_name = unique_name()
 
@@ -937,7 +945,7 @@ class TestUpdateTopic:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("max_topic_size", "expected_exception"),
+        ("max_topic_size_bytes", "expected_exception"),
         [
             (-1, OverflowError),
             (2e64, TypeError),
@@ -947,7 +955,7 @@ class TestUpdateTopic:
         self,
         iggy_client: IggyClient,
         unique_name,
-        max_topic_size,
+        max_topic_size_bytes,
         expected_exception,
     ):
         """Test update_topic rejects invalid maximum topic size values."""
@@ -964,7 +972,7 @@ class TestUpdateTopic:
                 stream_id=stream_name,
                 topic_id=topic_name,
                 name=topic_name,
-                max_topic_size=max_topic_size,
+                max_topic_size=MaxTopicSize.Custom(max_topic_size_bytes),
             )
 
     @pytest.mark.asyncio
@@ -984,7 +992,7 @@ class TestUpdateTopic:
             stream_id=stream_name,
             topic_id=topic_name,
             name=topic_name,
-            message_expiry=timedelta(minutes=10),
+            message_expiry=IggyExpiry.ExpireDuration(timedelta(minutes=10)),
         )
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
@@ -997,19 +1005,16 @@ class TestUpdateTopic:
     @pytest.mark.parametrize(
         ("max_topic_size", "expected_kind"),
         [
-            # Unlike create_topic, update_topic does not resolve the
-            # server-default sentinel (0) to a concrete value, so it round
-            # trips as-is instead of becoming "unlimited".
-            (0, "server_default"),
-            (2_000_000_000, "custom"),
-            (2**64 - 1, "unlimited"),
+            (MaxTopicSize.ServerDefault(), "server_default"),
+            (MaxTopicSize.Custom(2_000_000_000), "custom"),
+            (MaxTopicSize.Unlimited(), "unlimited"),
         ],
     )
     async def test_update_topic_with_valid_max_topic_size(
         self,
         iggy_client: IggyClient,
         unique_name,
-        max_topic_size: int,
+        max_topic_size: MaxTopicSize,
         expected_kind: str,
     ):
         """Test update_topic accepts supported maximum topic size values."""
@@ -1037,7 +1042,8 @@ class TestUpdateTopic:
             assert isinstance(topic.max_topic_size, MaxTopicSize.Unlimited)
         else:
             assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
-            assert topic.max_topic_size.bytes == max_topic_size
+            assert isinstance(max_topic_size, MaxTopicSize.Custom)
+            assert topic.max_topic_size.bytes == max_topic_size.bytes
 
     @pytest.mark.asyncio
     async def test_update_topic_applies_repeated_updates(

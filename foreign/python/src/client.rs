@@ -16,7 +16,8 @@
 // under the License.
 
 use iggy::prelude::{
-    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
+    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyExpiry as RustIggyExpiry,
+    IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
@@ -36,7 +37,7 @@ use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
-use crate::topic::{Topic, TopicDetails};
+use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
@@ -187,9 +188,12 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u8,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
@@ -197,12 +201,9 @@ impl IggyClient {
             None => CompressionAlgorithm::default(),
         };
 
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
-        };
+        let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
 
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let max_size = max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
@@ -285,8 +286,8 @@ impl IggyClient {
     ///     name: New topic name as `str`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
     ///     replication_factor: Replication factor as `int | None`.
-    ///     message_expiry: Message expiry as `datetime.timedelta | None`.
-    ///     max_topic_size: Maximum topic size in bytes as `int | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
@@ -310,9 +311,12 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
             u8,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
+        >,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
@@ -320,12 +324,9 @@ impl IggyClient {
             None => CompressionAlgorithm::default(),
         };
 
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
-        };
+        let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
 
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
+        let max_size = max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;

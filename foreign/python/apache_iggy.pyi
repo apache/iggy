@@ -362,8 +362,8 @@ class IggyClient:
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
@@ -400,8 +400,8 @@ class IggyClient:
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
         replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -415,8 +415,8 @@ class IggyClient:
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
             replication_factor: Replication factor as `int | None`.
-            message_expiry: Message expiry as `datetime.timedelta | None`.
-            max_topic_size: Maximum topic size in bytes as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
