@@ -205,8 +205,11 @@ pub(crate) fn serialize_value(
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            // ClickHouse UUID: two LE UInt64 words, low word (bytes 8-15) first.
-            // hex_str[..16] is the high u64, hex_str[16..] the low u64 (both big-endian).
+            // ClickHouse UUID wire format: two UInt64 words, 
+            // high word first, each little-endian.
+            // hex_str[..16] is the high word, hex_str[16..] the low word. from_str_radix
+            // reads each as big-endian hex (most-significant nibble first); to_le_bytes
+            // then emits it little-endian for the wire.
             let hi = u64::from_str_radix(&hex_str[..16], 16).map_err(|_| {
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
@@ -215,8 +218,8 @@ pub(crate) fn serialize_value(
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            buf.extend_from_slice(&lo.to_le_bytes());
             buf.extend_from_slice(&hi.to_le_bytes());
+            buf.extend_from_slice(&lo.to_le_bytes());
         }
 
         // ── Date types ───────────────────────────────────────────────────────
@@ -1098,12 +1101,12 @@ mod tests {
     // ── uuid ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn serialize_uuid_clickhouse_wire_format() {
+    fn serialize_uuid_writes_high_u64_then_low_u64_little_endian() {
         let mut buf = vec![];
-        // ClickHouse UUID wire format: two LE UInt64 words, low word (bytes 8-15) first.
+        // ClickHouse UUID wire format: two LE UInt64 words, high word first.
         // 550e8400-e29b-41d4-a716-446655440000
-        //   low  u64 = 0xa716446655440000 → LE: [00 00 44 55 66 44 16 a7]
-        //   high u64 = 0x550e8400e29b41d4 → LE: [d4 41 9b e2 00 84 0e 55]
+        // high_u64 = 0x550e8400e29b41d4  →  LE: [d4 41 9b e2 00 84 0e 55]
+        // low_u64  = 0xa716446655440000  →  LE: [00 00 44 55 66 44 16 a7]
         serialize_value(
             &json_str("550e8400-e29b-41d4-a716-446655440000"),
             &ChType::Uuid,
@@ -1113,8 +1116,8 @@ mod tests {
         assert_eq!(
             buf,
             [
-                0x00, 0x00, 0x44, 0x55, 0x66, 0x44, 0x16, 0xa7, 0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84,
-                0x0e, 0x55,
+                0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x00, 0x00, 0x44, 0x55, 0x66, 0x44,
+                0x16, 0xa7,
             ]
         );
     }
