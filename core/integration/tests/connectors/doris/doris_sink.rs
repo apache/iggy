@@ -256,6 +256,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
     // the production label format.
     let label = iggy_connector_doris_sink::build_label(
         "iggy_test",
+        TEST_TABLE,
         seeds::names::STREAM,
         seeds::names::TOPIC,
         0,
