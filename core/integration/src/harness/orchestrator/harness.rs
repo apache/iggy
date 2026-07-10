@@ -364,6 +364,19 @@ impl TestHarness {
         &self.servers
     }
 
+    /// Number of requests the trusted-issuer JWKS mock has served, or 0 when no
+    /// JWKS mock is configured. Lets a test bound the server's outbound JWKS
+    /// fetches (e.g. assert an unknown-`kid` flood does not amplify).
+    pub async fn jwks_request_count(&self) -> usize {
+        match &self.jwks_server {
+            Some(server) => server
+                .received_requests()
+                .await
+                .map_or(0, |reqs| reqs.len()),
+            None => 0,
+        }
+    }
+
     /// Get the number of server nodes (1 for single server, N for cluster).
     pub fn cluster_size(&self) -> usize {
         self.servers.len()

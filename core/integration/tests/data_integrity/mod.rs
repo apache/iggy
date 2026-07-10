@@ -20,7 +20,6 @@
 // transfer lands (a restarted replica has no way to catch up).
 #[cfg(not(feature = "vsr"))]
 mod verify_after_server_restart;
-#[cfg(not(feature = "vsr"))]
 mod verify_user_login_after_restart;
 
 // Not restart-based: it creates a user + PAT, stops the server, and greps the

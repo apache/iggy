@@ -15,6 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! JWKS key resolver for trusted-issuer (A2A) JWT verification.
+//!
+//! Ported from `server::http::jwt::jwks`. Keys are fetched lazily per
+//! `{issuer, kid}` and cached in a `DashMap`; a refresh re-reads the issuer's
+//! key set and evicts cached kids no longer present (rotation cleanup).
+
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +30,7 @@ use dashmap::DashMap;
 use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
-use strum::{Display, EnumString};
+use strum::EnumString;
 use tokio::sync::Mutex;
 
 /// Minimum wall-clock gap between outbound JWKS fetches for one trusted issuer.
@@ -35,10 +42,10 @@ use tokio::sync::Mutex;
 const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 thread_local! {
-    // cyper 0.9's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()`
-    // now returns a `Result`, so it can no longer be a global `OnceLock`.
-    // compio is thread-per-core; keep one client per thread. The `Rc`
-    // inner makes cloning cheap, so callers take an owned handle.
+    // cyper's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()` returns a
+    // `Result`, so it cannot be a global `OnceLock`. compio is thread-per-core;
+    // keep one client per thread. The `Rc` inner makes cloning cheap, so callers
+    // take an owned handle.
     static HTTP_CLIENT: cyper::Client =
         cyper::Client::new().expect("failed to build cyper HTTP client for JWKS");
 }
@@ -48,22 +55,18 @@ fn get_http_client() -> cyper::Client {
 }
 
 /// JWK key type enumeration
-#[derive(Debug, Clone, Copy, Display, EnumString, Deserialize, PartialEq, Eq)]
-#[strum(serialize_all = "UPPERCASE")]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 enum JwkKeyType {
     /// RSA key type
-    #[strum(serialize = "RSA")]
     Rsa,
     /// EC (Elliptic Curve) key type
-    #[strum(serialize = "EC")]
     Ec,
 }
 
 /// EC curve type enumeration
-#[derive(Debug, Clone, Copy, Display, EnumString, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, EnumString)]
 #[strum(serialize_all = "UPPERCASE")]
-#[serde(rename_all = "UPPERCASE")]
 enum EcCurve {
     /// P-256 curve
     #[strum(serialize = "P-256")]
@@ -98,7 +101,7 @@ struct CacheKey {
     kid: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct JwksClient {
     cache: DashMap<CacheKey, DecodingKey>,
     /// Per-issuer single-flight and rate-limit guard. The async mutex serialises
@@ -109,18 +112,11 @@ pub struct JwksClient {
     refresh_guards: DashMap<String, Arc<Mutex<Option<Instant>>>>,
 }
 
-impl Default for JwksClient {
-    fn default() -> Self {
-        Self {
-            cache: DashMap::new(),
-            refresh_guards: DashMap::new(),
-        }
-    }
-}
-
 impl JwksClient {
     /// Resolve the decoding key for `{issuer, kid}`, fetching and caching the
-    /// issuer's JWKS on a cache miss.
+    /// issuer's JWKS on a cache miss. Returns the rich [`IggyError`] built during
+    /// the fetch so the caller can log why a trusted-issuer token could not be
+    /// verified instead of collapsing every failure into an opaque miss.
     ///
     /// A cache miss is served under a per-issuer guard: concurrent misses fetch
     /// once, and within [`JWKS_REFRESH_MIN_INTERVAL`] of the last fetch a miss is
@@ -131,7 +127,12 @@ impl JwksClient {
     // is what serialises concurrent misses onto a single outbound request. Drop-
     // tightening would release it before the await and defeat the single-flight.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn get_key(&self, issuer: &str, jwks_url: &str, kid: &str) -> Option<DecodingKey> {
+    pub async fn get_key(
+        &self,
+        issuer: &str,
+        jwks_url: &str,
+        kid: &str,
+    ) -> Result<DecodingKey, IggyError> {
         let cache_key = CacheKey {
             issuer: issuer.to_string(),
             kid: kid.to_string(),
@@ -139,7 +140,7 @@ impl JwksClient {
 
         // Positive-cache fast path: no lock, no fetch.
         if let Some(key) = self.cache.get(&cache_key) {
-            return Some(key.clone());
+            return Ok(key.clone());
         }
 
         // Take the per-issuer guard so concurrent misses serialise onto one
@@ -152,7 +153,7 @@ impl JwksClient {
 
         // A prior holder of the guard may have populated our kid while we waited.
         if let Some(key) = self.cache.get(&cache_key) {
-            return Some(key.clone());
+            return Ok(key.clone());
         }
 
         // Inside the refresh window the last fetch's key set still stands, so a
@@ -162,43 +163,43 @@ impl JwksClient {
         if let Some(fetched_at) = *last_fetch
             && fetched_at.elapsed() < JWKS_REFRESH_MIN_INTERVAL
         {
-            return None;
+            return Err(IggyError::InvalidAccessToken);
         }
 
         // Stale or first contact: fetch. Record the attempt up front so a failing
         // issuer is rate-limited too, not re-hit on every miss.
         *last_fetch = Some(Instant::now());
-        if self.refresh_keys(issuer, jwks_url).await.is_err() {
-            return None;
-        }
+        self.refresh_keys(issuer, jwks_url).await?;
 
-        self.cache.get(&cache_key).map(|entry| entry.clone())
+        self.cache
+            .get(&cache_key)
+            .map(|entry| entry.clone())
+            .ok_or(IggyError::InvalidAccessToken)
     }
 
     async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {
-        // The cyper client is `!Send` since 0.9; callers reached from axum
-        // middleware wrap this future in `SendWrapper` (see
-        // `http::jwt::middleware::jwt_auth`), so it's free to await cyper
-        // directly here.
+        // The cyper client is `!Send`; callers reached from the axum extractor
+        // wrap this future in `SendWrapper` (see `http::extractor`), so it is
+        // free to await cyper directly here.
         let client = get_http_client();
         let request = client
             .get(jwks_url)
-            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to build request: {}", e)))?
+            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to build request: {e}")))?
             .build();
         let response = client
             .execute(request)
             .await
-            .map_err(|e| IggyError::CannotFetchJwks(format!("HTTP request failed: {}", e)))?;
+            .map_err(|e| IggyError::CannotFetchJwks(format!("HTTP request failed: {e}")))?;
 
         let body = response.text().await.map_err(|e| {
-            IggyError::CannotFetchJwks(format!("Failed to read response body: {}", e))
+            IggyError::CannotFetchJwks(format!("Failed to read response body: {e}"))
         })?;
 
         let jwks: JwkSet = serde_json::from_str(&body)
-            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to parse JWKS: {}", e)))?;
+            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to parse JWKS: {e}")))?;
 
         // Collect all current kids from the JWKS response
-        let current_kids: std::collections::HashSet<String> =
+        let current_kids: HashSet<String> =
             jwks.keys.iter().filter_map(|key| key.kid.clone()).collect();
 
         // Remove cached keys for this issuer that are no longer in the JWKS response
@@ -222,7 +223,7 @@ impl JwksClient {
                     JwkKeyType::Rsa => {
                         if let (Some(n), Some(e)) = (key.n.as_deref(), key.e.as_deref()) {
                             DecodingKey::from_rsa_components(n, e).map_err(|e| {
-                                IggyError::CannotFetchJwks(format!("Invalid RSA key: {}", e))
+                                IggyError::CannotFetchJwks(format!("Invalid RSA key: {e}"))
                             })?
                         } else {
                             continue;
@@ -234,7 +235,7 @@ impl JwksClient {
                         {
                             if let Ok(_curve) = crv_str.parse::<EcCurve>() {
                                 DecodingKey::from_ec_components(x, y).map_err(|e| {
-                                    IggyError::CannotFetchJwks(format!("Invalid EC key: {}", e))
+                                    IggyError::CannotFetchJwks(format!("Invalid EC key: {e}"))
                                 })?
                             } else {
                                 continue;
@@ -325,10 +326,9 @@ mod tests {
         };
         let decoding_key = create_test_decoding_key();
 
-        client.cache.insert(cache_key.clone(), decoding_key.clone());
+        client.cache.insert(cache_key.clone(), decoding_key);
 
-        let cached = client.cache.get(&cache_key);
-        assert!(cached.is_some());
+        assert!(client.cache.get(&cache_key).is_some());
     }
 
     #[test]
