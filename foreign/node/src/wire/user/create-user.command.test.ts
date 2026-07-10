@@ -19,24 +19,49 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CREATE_USER } from './create-user.command.js';
+import type { UserPermissions } from './permissions.utils.js';
 
 describe('CreateUser', () => {
 
   describe('serialize', () => {
 
     const u1 = {
-      id: 1,
       username: 'test-user',
       password: 'test-pwd',
       status: 1, // Active,
-      // perms: undefined // @TODO
     };
 
-    it('serialize username, password, status, permissions into buffer', () => {
-      assert.deepEqual(
-        CREATE_USER.serialize(u1).length,
-        1 + u1.username.length + 1 + u1.password.length + 1 + 1 + 4 + 1
-      );
+    const baseLength = 1 + Buffer.byteLength(u1.username)
+      + 1 + Buffer.byteLength(u1.password) + 1;
+
+    it('serialize without permissions', () => {
+      const serialized = CREATE_USER.serialize(u1);
+      assert.equal(serialized.length, baseLength + 1);
+      assert.equal(serialized.readUInt8(baseLength), 0);
+    });
+
+    it('serialize with permissions', () => {
+      const permissions: UserPermissions = {
+        global: {
+          ManageServers: false,
+          ReadServers: false,
+          ManageUsers: false,
+          ReadUsers: false,
+          ManageStreams: false,
+          ReadStreams: false,
+          ManageTopics: false,
+          ReadTopics: false,
+          PollMessages: false,
+          SendMessages: false
+        },
+        streams: []
+      };
+      const serialized = CREATE_USER.serialize({ ...u1, permissions });
+
+      assert.equal(serialized.length, baseLength + 1 + 4 + 11);
+      assert.equal(serialized.readUInt8(baseLength), 1);
+      assert.equal(serialized.readUInt32LE(baseLength + 1), 11);
+      assert.deepEqual(serialized.subarray(baseLength + 5), Buffer.alloc(11));
     });
 
     it('throw on username < 1', () => {
@@ -83,4 +108,3 @@ describe('CreateUser', () => {
 
   });
 });
-
