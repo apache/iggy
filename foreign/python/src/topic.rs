@@ -31,11 +31,19 @@ use crate::consumer::py_delta_to_iggy_duration;
 #[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum IggyExpiry {
-    /// Use the server's default message expiry.
+    /// Use the message expiry configured on the server for this topic,
+    /// rather than an explicit value set by the client.
     ServerDefault(),
-    /// Messages expire after this duration.
+    /// Expire messages this long after they are appended to the topic.
+    ///
+    /// `duration` must be greater than zero: a zero-length `timedelta` is
+    /// indistinguishable on the wire from `ServerDefault` and is treated as
+    /// such by the server. The upper bound is whatever a `datetime.timedelta`
+    /// can represent that also fits in a `u64` microsecond count (about
+    /// 584,942 years); in practice the server-configured maximum is reached
+    /// long before that.
     ExpireDuration { duration: Py<PyDelta> },
-    /// Messages never expire.
+    /// Retain messages indefinitely; they never expire.
     NeverExpire(),
 }
 
@@ -83,11 +91,20 @@ fn iggy_duration_to_py_delta(duration: Duration) -> Py<PyDelta> {
 #[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum MaxTopicSize {
-    /// Use the server's default max size.
+    /// Use the maximum topic size configured on the server, rather than an
+    /// explicit value set by the client.
     ServerDefault(),
-    /// The topic is limited to this many bytes.
+    /// Cap the topic at this many bytes; as the topic approaches this size,
+    /// the server deletes the oldest sealed segments to make room for new
+    /// messages.
+    ///
+    /// `bytes` must be greater than zero and less than `u64::MAX`: those two
+    /// values are reserved on the wire for `ServerDefault` and `Unlimited`
+    /// respectively, so a `Custom` size at either boundary would be
+    /// indistinguishable from one of the other variants and is treated as
+    /// such by the server.
     Custom { bytes: u64 },
-    /// The topic has no maximum size.
+    /// Do not cap the topic size; it may grow without bound.
     Unlimited(),
 }
 

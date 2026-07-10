@@ -203,7 +203,8 @@ impl IggyClient {
 
         let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
 
-        let max_size = max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
+        let max_size =
+            max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
@@ -326,7 +327,8 @@ impl IggyClient {
 
         let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
 
-        let max_size = max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
+        let max_size =
+            max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
