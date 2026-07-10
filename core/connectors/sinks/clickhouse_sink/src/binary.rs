@@ -203,14 +203,14 @@ pub(crate) fn serialize_value(
                 error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
-            // ClickHouse serialises UUID as UInt128 little-endian, writing the low 64-bit
-            // word before the high 64-bit word. The UUID bytes decoded above are in
-            // big-endian (network) order, so bytes[8..] is the low word and bytes[..8]
-            // is the high word. We copy them into the output in that order and reverse
-            // each half in place to convert from big-endian to little-endian.
+            // ClickHouse serialises UUID as two little-endian 64-bit words, high word
+            // first. The decoded bytes are in big-endian (network) order, 
+            // so bytes[..8] is the high word and bytes[8..] is the low word: 
+            // copy them in that order and reverse each half in place to
+            // convert from big-endian to little-endian.
             let mut uuid_buf = [0u8; 16];
-            uuid_buf[..8].copy_from_slice(&bytes[8..]); // low_u64
-            uuid_buf[8..].copy_from_slice(&bytes[..8]); // high_u64
+            uuid_buf[..8].copy_from_slice(&bytes[..8]); // high_u64
+            uuid_buf[8..].copy_from_slice(&bytes[8..]); // low_u64
             uuid_buf[..8].reverse();
             uuid_buf[8..].reverse();
             buf.extend_from_slice(&uuid_buf);
@@ -246,15 +246,13 @@ pub(crate) fn serialize_value(
                         Error::InvalidRecord
                     })?
                 }
-                OwnedValue::Static(simd_json::StaticNode::U64(n)) => {
-                    i64::try_from(*n)
-                        .ok()
-                        .and_then(|n| n.checked_mul(scale))
-                        .ok_or_else(|| {
-                            error!("DateTime64 overflow");
-                            Error::InvalidRecord
-                        })?
-                }
+                OwnedValue::Static(simd_json::StaticNode::U64(n)) => i64::try_from(*n)
+                    .ok()
+                    .and_then(|n| n.checked_mul(scale))
+                    .ok_or_else(|| {
+                        error!("DateTime64 overflow");
+                        Error::InvalidRecord
+                    })?,
                 _ => {
                     // Float or string inputs: f64 path is acceptable since floats
                     // already carry sub-second fractions, and strings go through
@@ -1052,12 +1050,11 @@ mod tests {
     // ── uuid ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn serialize_uuid_writes_low_u64_then_high_u64_little_endian() {
+    fn serialize_uuid_writes_high_u64_then_low_u64_little_endian() {
         let mut buf = vec![];
         // 550e8400-e29b-41d4-a716-446655440000
         // high_u64 = 0x550e8400e29b41d4  →  LE: [d4 41 9b e2 00 84 0e 55]
         // low_u64  = 0xa716446655440000  →  LE: [00 00 44 55 66 44 16 a7]
-        // Wire order (UInt128 LE): low_u64 first, high_u64 second.
         serialize_value(
             &json_str("550e8400-e29b-41d4-a716-446655440000"),
             &ChType::Uuid,
@@ -1067,8 +1064,8 @@ mod tests {
         assert_eq!(
             buf,
             [
-                0x00, 0x00, 0x44, 0x55, 0x66, 0x44, 0x16, 0xa7, 0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84,
-                0x0e, 0x55,
+                0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x00, 0x00, 0x44, 0x55, 0x66, 0x44,
+                0x16, 0xa7,
             ]
         );
     }
@@ -1211,21 +1208,11 @@ mod tests {
         let mut buf = vec![];
         // Current-era timestamp: 1_700_000_000 s * 10^9 = 1_700_000_000_000_000_000 ns.
         // The f64 path would round to the nearest 256 ns boundary; the integer path is exact.
-        serialize_value(
-            &json_i64(1_700_000_000),
-            &ChType::DateTime64(9),
-            &mut buf,
-        )
-        .unwrap();
+        serialize_value(&json_i64(1_700_000_000), &ChType::DateTime64(9), &mut buf).unwrap();
         assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
 
         buf.clear();
-        serialize_value(
-            &json_u64(1_700_000_000),
-            &ChType::DateTime64(9),
-            &mut buf,
-        )
-        .unwrap();
+        serialize_value(&json_u64(1_700_000_000), &ChType::DateTime64(9), &mut buf).unwrap();
         assert_eq!(buf, 1_700_000_000_000_000_000i64.to_le_bytes());
     }
 

@@ -120,7 +120,8 @@ impl ClickHouseSink {
     pub fn new(id: u32, config: ClickHouseSinkConfig) -> Self {
         let insert_format = config.insert_format.unwrap_or_default();
         let string_format = config.string_format.unwrap_or_default();
-        let retry_delay = Duration::from_secs(config.retry_delay.unwrap_or(DEFAULT_RETRY_DELAY_SECS));
+        let retry_delay =
+            Duration::from_secs(config.retry_delay.unwrap_or(DEFAULT_RETRY_DELAY_SECS));
 
         ClickHouseSink {
             id,
