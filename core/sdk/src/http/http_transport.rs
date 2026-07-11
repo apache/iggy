@@ -72,13 +72,9 @@ pub trait HttpTransport {
     /// Returns true if the client is authenticated.
     async fn is_authenticated(&self) -> bool;
 
-    /// Refresh the access token using the provided refresh token.
-    //method `refresh_access_token` is never used
-    async fn _refresh_access_token(&self) -> Result<(), IggyError>;
-
     /// Set the access token.
     async fn set_access_token(&self, token: Option<String>);
 
-    /// Set the access token and refresh token from the provided identity.
+    /// Set the access token from the provided identity.
     async fn set_token_from_identity(&self, identity: &IdentityInfo) -> Result<(), IggyError>;
 }

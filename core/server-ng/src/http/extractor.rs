@@ -61,12 +61,16 @@ impl FromRequestParts<HttpState> for Authenticated {
     ) -> Result<Self, Self::Rejection> {
         let bearer = bearer_token(parts)?;
 
-        let (key, user_id, expiry) = resolve_credential(state, bearer)?;
-
-        // `resolve_session` is `Rc`-based and `!Send`, yet axum requires this
-        // extractor future to be `Send`. `SendWrapper` bridges the gap: sound
-        // because compio pins the future to shard 0's thread - the only thread
-        // that ever touches the session table (mirrors legacy `HttpSafeShard`).
+        // Both `resolve_credential` (its JWT verify may await a `!Send` JWKS
+        // fetch through cyper) and `resolve_session` (`Rc`-based, `!Send`) must
+        // run, yet axum requires this extractor future to be `Send`.
+        // `SendWrapper` bridges each: sound because compio pins the future to
+        // shard 0's thread - the only thread the JWKS client and session table
+        // ever run on (mirrors legacy `HttpSafeShard`). Neither future holds a
+        // `RefCell` borrow or `DashMap` guard across the `.await` (each such
+        // critical section is synchronous), so a cooperatively-scheduled sibling
+        // task on this thread never observes a borrowed session table.
+        let (key, user_id, expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
         let session = SendWrapper::new(state.resolve_session(key, user_id, expiry)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
@@ -74,8 +78,9 @@ impl FromRequestParts<HttpState> for Authenticated {
     }
 }
 
-/// Read-only caller identity for a protected read route: the authenticated
-/// user id and nothing else.
+/// Read-only caller identity for a protected read route: the authenticated user
+/// id plus the request path/query used for follower redirects, and no minted VSR
+/// session.
 ///
 /// Unlike [`Authenticated`], it verifies the bearer WITHOUT minting or
 /// Registering a VSR session. Reads are served from the local metadata STM and
@@ -103,10 +108,13 @@ impl FromRequestParts<HttpState> for Identity {
 
         // Verify only. The session key and expiry `resolve_credential` also
         // returns feed the write path's session table; a read discards them.
-        // No `.await` and no session borrow here, so the extractor future needs
-        // no `SendWrapper` bridge (contrast [`Authenticated`], which awaits the
-        // `!Send` `resolve_session`).
-        let (_key, user_id, _expiry) = resolve_credential(state, bearer)?;
+        // The verify is `!Send` (a trusted-issuer JWT may await a JWKS fetch),
+        // so bridge it with `SendWrapper` - sound only because compio pins this
+        // future to shard 0's single thread, the only thread the JWKS client
+        // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
+        // borrow or `DashMap` guard across the `.await`, so a sibling task
+        // scheduled on this thread meanwhile never observes a borrowed cell.
+        let (_key, user_id, _expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -137,10 +145,14 @@ fn bearer_token(parts: &Parts) -> Result<&str, IggyError> {
 /// the bearer is the documented fallback, keyed by the same 256-bit BLAKE3
 /// digest (`PersonalAccessToken::hash_token`) Iggy already indexes PATs by, so
 /// the key is stable and collision-free while the raw secret never enters the
-/// table. Both checks are local and synchronous, so no borrow is held across an
-/// await here.
-fn resolve_credential(state: &HttpState, bearer: &str) -> Result<(String, u32, u64), AuthError> {
-    if let Ok(claims) = state.jwt.decode(bearer)
+/// table. The JWT verify is `async` and `!Send` (a trusted-issuer token may
+/// fetch the issuer's JWKS on a cache miss), so both call sites drive it inside
+/// a `SendWrapper`; the PAT check is local and synchronous.
+async fn resolve_credential(
+    state: &HttpState,
+    bearer: &str,
+) -> Result<(String, u32, u64), AuthError> {
+    if let Ok(claims) = state.jwt.decode(bearer).await
         && let Ok(user_id) = claims.sub.parse::<u32>()
     {
         return Ok((

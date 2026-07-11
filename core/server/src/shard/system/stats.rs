@@ -16,12 +16,11 @@
 // under the License.
 
 use crate::shard::IggyShard;
-use crate::shard::system::cgroup_memory::cgroup_available_memory;
 use crate::{SEMANTIC_VERSION, VERSION};
-use cpu_allocation::allowed_cpus;
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::cell::RefCell;
-use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
+use sysinfo::System as SysinfoSystem;
+use system_stats::SystemProbe;
 
 thread_local! {
     static SYSINFO: RefCell<Option<SysinfoSystem>> = const { RefCell::new(None) };
@@ -31,150 +30,91 @@ impl IggyShard {
     pub async fn get_stats(&self) -> Result<Stats, IggyError> {
         assert_eq!(self.id, 0, "GetStats should only be called on shard0");
 
-        SYSINFO.with(|sysinfo_cell| {
-            let mut sysinfo_opt = sysinfo_cell.borrow_mut();
+        let probe = SYSINFO.with_borrow_mut(|slot| {
+            let sys = slot.get_or_insert_with(SysinfoSystem::new);
+            SystemProbe::capture(sys)
+        });
 
-            if sysinfo_opt.is_none() {
-                let mut sys = SysinfoSystem::new_all();
-                sys.refresh_all();
-                *sysinfo_opt = Some(sys);
-            }
+        let clients_count = self.client_manager.get_clients().len() as u32;
+        let hostname = sysinfo::System::host_name().unwrap_or("unknown_hostname".to_string());
+        let os_name = sysinfo::System::name().unwrap_or("unknown_os_name".to_string());
+        let os_version =
+            sysinfo::System::long_os_version().unwrap_or("unknown_os_version".to_string());
+        let kernel_version =
+            sysinfo::System::kernel_version().unwrap_or("unknown_kernel_version".to_string());
 
-            let sys = sysinfo_opt.as_mut().unwrap();
-            let process_id = std::process::id();
-            sys.refresh_cpu_all();
-            sys.refresh_memory();
-            sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
+        let mut stats = Stats {
+            process_id: probe.process_id,
+            cpu_usage: probe.cpu_usage,
+            total_cpu_usage: probe.total_cpu_usage,
+            memory_usage: probe.memory_usage.into(),
+            total_memory: probe.total_memory.into(),
+            available_memory: probe.available_memory.into(),
+            run_time: IggyDuration::new_from_secs(probe.run_time_secs),
+            start_time: IggyDuration::new_from_secs(probe.start_time_secs)
+                .as_micros()
+                .into(),
+            read_bytes: probe.read_bytes.into(),
+            written_bytes: probe.written_bytes.into(),
+            threads_count: probe.threads_count,
+            clients_count,
+            hostname,
+            os_name,
+            os_version,
+            kernel_version,
+            iggy_server_version: VERSION.to_owned(),
+            iggy_server_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
+            ..Default::default()
+        };
 
-            let total_cpu_usage =
-                allowed_cores_cpu_usage(sys).unwrap_or_else(|| sys.global_cpu_usage());
-            let total_memory = sys.total_memory().into();
-            let available_memory = sys.available_memory().into();
-            let clients_count = self.client_manager.get_clients().len() as u32;
-            let hostname = sysinfo::System::host_name().unwrap_or("unknown_hostname".to_string());
-            let os_name = sysinfo::System::name().unwrap_or("unknown_os_name".to_string());
-            let os_version =
-                sysinfo::System::long_os_version().unwrap_or("unknown_os_version".to_string());
-            let kernel_version =
-                sysinfo::System::kernel_version().unwrap_or("unknown_kernel_version".to_string());
-
-            let mut stats = Stats {
-                process_id,
-                total_cpu_usage,
-                total_memory,
-                available_memory,
-                clients_count,
-                hostname,
-                os_name,
-                os_version,
-                kernel_version,
-                iggy_server_version: VERSION.to_owned(),
-                iggy_server_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
-                ..Default::default()
-            };
-
-            if let Some(process) = sys
-                .processes()
-                .values()
-                .find(|p| p.pid() == Pid::from_u32(process_id))
-            {
-                stats.process_id = process.pid().as_u32();
-                stats.cpu_usage = process.cpu_usage();
-                stats.memory_usage = process.memory().into();
-                stats.run_time = IggyDuration::new_from_secs(process.run_time());
-                stats.start_time = IggyDuration::new_from_secs(process.start_time())
-                    .as_micros()
-                    .into();
-
-                let disk_usage = process.disk_usage();
-                stats.read_bytes = disk_usage.total_read_bytes.into();
-                stats.written_bytes = disk_usage.total_written_bytes.into();
-
-                stats.threads_count = process.tasks().map(|t| t.len() as u32).unwrap_or(0);
-
-                if let Some(limits) = process
-                    .cgroup_limits()
-                    .filter(|limits| limits.total_memory < sys.total_memory())
-                {
-                    stats.total_memory = limits.total_memory.into();
-                    stats.available_memory = cgroup_available_memory(sys.total_memory())
-                        .unwrap_or(limits.free_memory)
-                        .min(limits.total_memory)
-                        .into();
-                }
-            }
-
-            let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
-                self.metadata.with_metadata(|m| {
-                    let mut topics = 0u32;
-                    let mut partitions = 0u32;
-                    let mut cg = 0u32;
-                    let ids: Vec<_> = m.streams.iter().map(|(k, _)| k).collect();
-                    for (_, stream) in m.streams.iter() {
-                        topics += stream.topics.len() as u32;
-                        for (_, topic) in stream.topics.iter() {
-                            partitions += topic.partitions.len() as u32;
-                            cg += topic.consumer_groups.len() as u32;
-                        }
+        let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
+            self.metadata.with_metadata(|m| {
+                let mut topics = 0u32;
+                let mut partitions = 0u32;
+                let mut cg = 0u32;
+                let ids: Vec<_> = m.streams.iter().map(|(k, _)| k).collect();
+                for (_, stream) in m.streams.iter() {
+                    topics += stream.topics.len() as u32;
+                    for (_, topic) in stream.topics.iter() {
+                        partitions += topic.partitions.len() as u32;
+                        cg += topic.consumer_groups.len() as u32;
                     }
-                    (m.streams.len() as u32, topics, partitions, cg, ids)
-                });
-
-            stats.streams_count = streams_count;
-            stats.topics_count = topics_count;
-            stats.partitions_count = partitions_count;
-            stats.consumer_groups_count = consumer_groups_count;
-
-            for stream_id in stream_ids {
-                if let Some(stream_stat) = self.metadata.get_stream_stats(stream_id) {
-                    stats.messages_count += stream_stat.messages_count_inconsistent();
-                    stats.segments_count += stream_stat.segments_count_inconsistent();
-                    stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
                 }
+                (m.streams.len() as u32, topics, partitions, cg, ids)
+            });
+
+        stats.streams_count = streams_count;
+        stats.topics_count = topics_count;
+        stats.partitions_count = partitions_count;
+        stats.consumer_groups_count = consumer_groups_count;
+
+        for stream_id in stream_ids {
+            if let Some(stream_stat) = self.metadata.get_stream_stats(stream_id) {
+                stats.messages_count += stream_stat.messages_count_inconsistent();
+                stats.segments_count += stream_stat.segments_count_inconsistent();
+                stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
             }
+        }
 
-            match fs2::available_space(&self.config.system.path) {
-                Ok(space) => stats.free_disk_space = space.into(),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to get available disk space for '{}': {err}",
-                        self.config.system.path
-                    );
-                }
+        match fs2::available_space(&self.config.system.path) {
+            Ok(space) => stats.free_disk_space = space.into(),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get available disk space for '{}': {err}",
+                    self.config.system.path
+                );
             }
-            match fs2::total_space(&self.config.system.path) {
-                Ok(space) => stats.total_disk_space = space.into(),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to get total disk space for '{}': {err}",
-                        self.config.system.path
-                    );
-                }
+        }
+        match fs2::total_space(&self.config.system.path) {
+            Ok(space) => stats.total_disk_space = space.into(),
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get total disk space for '{}': {err}",
+                    self.config.system.path
+                );
             }
+        }
 
-            Ok(stats)
-        })
+        Ok(stats)
     }
-}
-
-/// Average usage over the cores this process may run on.
-///
-/// `global_cpu_usage` averages every host core, so a cpuset-confined
-/// instance would report its neighbors' load. `None` when the process
-/// is unrestricted (or an allowed core is missing from `sys.cpus()`),
-/// where the host-global number is already the right one.
-fn allowed_cores_cpu_usage(sys: &SysinfoSystem) -> Option<f32> {
-    let cpus = sys.cpus();
-    let allowed = allowed_cpus();
-    if allowed.is_empty() || allowed.len() >= cpus.len() {
-        return None;
-    }
-
-    let mut total_usage = 0.0f32;
-    for cpu_id in &allowed {
-        let name = format!("cpu{cpu_id}");
-        total_usage += cpus.iter().find(|cpu| cpu.name() == name)?.cpu_usage();
-    }
-
-    Some(total_usage / allowed.len() as f32)
 }

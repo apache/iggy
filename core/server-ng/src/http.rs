@@ -17,15 +17,16 @@
 
 //! Shard-0 HTTP/REST listener. This root binds the listener and assembles the
 //! router; the rest is split across submodules: the `state` bridge and axum
-//! `State`, the bearer `extractor` and `jwt` issuer, the route `handlers`, the
-//! `reads` gates, the `submit` write paths, `wire` request mapping,
-//! partition-write `admission`, committed-reply `reply` decoding, the rejection
-//! `error` types, and per-credential `session` state.
+//! `State`, the bearer `extractor`, the `jwt` issuer and its `jwks` resolver,
+//! the route `handlers`, the `reads` gates, the `submit` write paths, `wire`
+//! request mapping, partition-write `admission`, committed-reply `reply`
+//! decoding, the rejection `error` types, and per-credential `session` state.
 
 mod admission;
 mod error;
 mod extractor;
 mod handlers;
+mod jwks;
 mod jwt;
 mod reads;
 mod reply;
@@ -39,6 +40,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
@@ -107,6 +109,10 @@ pub async fn start(
                 http: Some(bound_addr.port()),
                 ..self_ports
             },
+            // The HTTP listener is shard-0-only, where the live consensus
+            // handle supplies the leader; the published-view fallback is
+            // never consulted here.
+            metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
         in_flight_writes: Cell::new(0),
     }));
