@@ -48,7 +48,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
-cpu_allocation = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -87,6 +86,7 @@ slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
+system_stats = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

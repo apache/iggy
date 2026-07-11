@@ -20,31 +20,17 @@ use crate::metrics::ConnectorType;
 use iggy_common::{IggyTimestamp, SemanticVersion};
 use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStats};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use sysinfo::System;
+use system_stats::SystemProbe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 
+static SYSINFO: OnceLock<Mutex<System>> = OnceLock::new();
+
 pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntimeStats {
-    let pid = std::process::id();
-
-    let mut system = System::new_all();
-    system.refresh_cpu_all();
-    system.refresh_memory();
-    system.refresh_processes(
-        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
-        true,
-    );
-
-    let total_cpu_usage = system.global_cpu_usage();
-    let total_memory = system.total_memory();
-    let available_memory = system.available_memory();
-
-    let (cpu_usage, memory_usage) = system
-        .process(sysinfo::Pid::from_u32(pid))
-        .map(|p| (p.cpu_usage(), p.memory()))
-        .unwrap_or((0.0, 0));
+    let system = probe_system();
 
     let sources = context.sources.get_all().await;
     let sinks = context.sinks.get_all().await;
@@ -113,12 +99,12 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
     ConnectorRuntimeStats {
         connectors_runtime_version: VERSION.to_owned(),
         connectors_runtime_version_semver: SEMANTIC_VERSION.get_numeric_version().ok(),
-        process_id: pid,
-        cpu_usage,
-        total_cpu_usage,
-        memory_usage,
-        total_memory,
-        available_memory,
+        process_id: system.process_id,
+        cpu_usage: system.cpu_usage,
+        total_cpu_usage: system.total_cpu_usage,
+        memory_usage: system.memory_usage,
+        total_memory: system.total_memory,
+        available_memory: system.available_memory,
         run_time,
         start_time: start,
         sources_total,
@@ -127,4 +113,12 @@ pub async fn get_runtime_stats(context: &Arc<RuntimeContext>) -> ConnectorRuntim
         sinks_running,
         connectors,
     }
+}
+
+fn probe_system() -> SystemProbe {
+    let mut system = SYSINFO
+        .get_or_init(|| Mutex::new(System::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    SystemProbe::capture(&mut system)
 }
