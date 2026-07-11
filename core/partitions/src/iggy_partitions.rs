@@ -23,9 +23,10 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
 use message_bus::MessageBus;
+use server_common::send_messages2::{convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -430,6 +431,28 @@ where
             partition.nth_oldest_sealed_end_offset(count)
         })
     }
+
+    /// [`Self::nth_oldest_sealed_end_offset`] plus whether this replica is
+    /// still behind the replicated log, read in one partition access so the
+    /// pair is consistent. "Nothing sealed to delete" is settled on a
+    /// converged replica (a committed-but-unflushed resident tail is normal
+    /// under a large `messages_required_to_save` and must ack as a no-op),
+    /// but transient on a lagging one (a backup that has not learned the
+    /// commit frontier may be missing whole sealed segments).
+    pub fn segment_delete_resolution(
+        &self,
+        namespace: &IggyNamespace,
+        count: u32,
+    ) -> Option<(Option<u64>, bool)> {
+        self.with_partition(namespace, |partition| {
+            let consensus = partition.consensus();
+            let lagging = consensus.is_follower()
+                || !consensus.is_normal()
+                || consensus.is_syncing()
+                || consensus.commit_min() < consensus.commit_max();
+            (partition.nth_oldest_sealed_end_offset(count), lagging)
+        })
+    }
 }
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>
@@ -446,6 +469,32 @@ where
             );
             return;
         }
+        // At-rest encryption happens HERE, once, before the op enters
+        // consensus: canonicalize the wire form first so both the legacy and
+        // v2 request encodings encrypt identically, then encrypt payload +
+        // user headers per message. The ciphertext is what gets journaled,
+        // replicated, checksummed, and persisted -- every replica stores
+        // identical bytes -- and the poll reply is the single decrypt point.
+        let message = if message.header().operation == Operation::SendMessages
+            && let Some(encryptor) = &self.config().encryptor
+        {
+            let canonical = convert_request_message(namespace, message)
+                .and_then(|message| encrypt_batch_request(message, encryptor));
+            match canonical {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "dropping send_messages: failed to encrypt batch at ingestion"
+                    );
+                    return;
+                }
+            }
+        } else {
+            message
+        };
         let Some(partition) = self.get_mut_by_ns(&namespace) else {
             warn!(
                 target: "iggy.partitions.diag",

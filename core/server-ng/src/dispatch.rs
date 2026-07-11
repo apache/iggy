@@ -54,7 +54,7 @@ use bytes::Bytes;
 use configs::server_ng::NgSystemConfig;
 use consensus::{
     Consensus, EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
-    build_incompatible_protocol_eviction_message,
+    build_incompatible_protocol_eviction_message, build_result_rejection_reply,
 };
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
@@ -89,6 +89,7 @@ use message_bus::replica::listener::MessageHandler;
 use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus, MessageBus};
 use metadata::impls::metadata::{
     MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
+    build_truncate_partition_client_message_with_identifiers,
 };
 use metadata::permissioner::Permissioner;
 use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
@@ -104,7 +105,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
@@ -229,10 +230,13 @@ pub(crate) fn make_partition_read_handler(
             }
             PartitionRead::ResolveSegmentDeleteOffset { count } => {
                 let result = partitions
-                    .nth_oldest_sealed_end_offset(&namespace, count)
+                    .segment_delete_resolution(&namespace, count)
                     .map_or_else(
                         || PartitionReadReply::NotFound,
-                        |up_to_offset| PartitionReadReply::SegmentDeleteOffset { up_to_offset },
+                        |(up_to_offset, lagging)| PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                        },
                     );
                 let _ = reply.try_send(result);
             }
@@ -1508,15 +1512,20 @@ async fn handle_poll_messages(
                 Some(PartitionReadReply::Poll {
                     fragments,
                     current_offset,
-                }) => build_polled_messages_body(partition_id, current_offset, fragments)
-                    .unwrap_or_else(|error| {
-                        warn!(
-                            transport_client_id,
-                            error = %error,
-                            "failed to re-encode polled batches; replying empty poll"
-                        );
-                        empty_polled_messages_body(partition_id)
-                    }),
+                }) => build_polled_messages_body(
+                    partition_id,
+                    current_offset,
+                    fragments,
+                    shard.plane.partitions().config().encryptor.as_deref(),
+                )
+                .unwrap_or_else(|error| {
+                    warn!(
+                        transport_client_id,
+                        error = %error,
+                        "failed to re-encode polled batches; replying empty poll"
+                    );
+                    empty_polled_messages_body(partition_id)
+                }),
                 other => {
                     warn!(
                         transport_client_id,
@@ -1951,9 +1960,11 @@ pub(crate) async fn submit_logout_on_owner(
 /// every replica trims to the same watermark, then ack the client. The local
 /// deletion happens later, when each replica's reconciler observes the commit.
 ///
-/// Best-effort space management: any failure (bad request, unknown namespace,
-/// nothing sealed to delete, transient submit error) is logged and still acks,
-/// so the client never blocks on it.
+/// The consensus reply is forwarded verbatim: nothing-to-delete commits a
+/// no-op `TruncatePartition(0)` and acks, while a not-primary rejection
+/// reaches the client as `TransientNotCommitted` so the SDK replays instead
+/// of mistaking a dropped delete for success. Only a malformed / unresolvable
+/// request is acked empty without a commit.
 #[allow(clippy::future_not_send)]
 async fn handle_delete_segments_request(
     shard: &Rc<ServerNgShard>,
@@ -1980,31 +1991,85 @@ async fn handle_delete_segments_request(
     // `request == committed + 1` preflight -> RequestGap -> silent drop -> the
     // SDK blocks until timeout. A no-op delete still commits `up_to_offset = 0`
     // (monotonic apply) for the same reason.
-    let truncate = resolve_delete_segments_truncate(shard, &header, vsr_client_id, session, body)
-        .await
-        .ok();
-
-    if let Some(truncate) = truncate
-        && submit_client_request_on_owner(shard, truncate)
-            .await
-            .is_none()
+    let truncate = match resolve_delete_segments_truncate(
+        shard,
+        &header,
+        vsr_client_id,
+        session,
+        body,
+    )
+    .await
     {
-        // Transient submit failure (not primary / view change). Stay silent;
-        // the SDK read-timeout replays the same request id, which re-resolves
-        // and commits. Acking here would advance the client past an unrecorded
-        // request and gap the next metadata op.
-        warn!(
-            transport_client_id,
-            "delete_segments: transient submit; client will replay"
-        );
-        return;
-    }
+        Ok(truncate) => Some(truncate),
+        // The owning partition has not converged on the committed log yet, so
+        // the delete cannot be resolved to a watermark. Reply with the
+        // result-framed transient rejection (under the TruncatePartition
+        // operation, which the SDK decodes) so the client replays the same
+        // request once the partition catches up. Nothing was submitted, hence
+        // the re-issuable-anywhere flavor.
+        Err(IggyError::TransientNotAccepted) => {
+            let template = build_truncate_partition_client_message(
+                &header,
+                vsr_client_id,
+                session,
+                0,
+                0,
+                0,
+                0,
+            );
+            let reply = build_result_rejection_reply(
+                template.header(),
+                current_metadata_commit(shard),
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "delete_segments: failed to send transient rejection"
+                );
+            }
+            return;
+        }
+        Err(_) => None,
+    };
 
-    let commit = current_metadata_commit(shard);
-    let reply = build_empty_reply(&header, transport_client_id, session, commit);
+    let reply = if let Some(truncate) = truncate {
+        // Forward the consensus reply verbatim, exactly like the generic
+        // metadata path: a committed success acks the delete, and a
+        // result-framed `TransientNotCommitted` rejection makes the SDK
+        // replay the request. Acking unconditionally here would swallow a
+        // not-primary rejection and drop the delete on the floor while the
+        // client believes it succeeded.
+        let Some(reply) = submit_client_request_on_owner(shard, truncate).await else {
+            // Transient submit failure (not primary / view change). Stay
+            // silent; the SDK read-timeout replays the same request id,
+            // which re-resolves and commits. Acking here would advance the
+            // client past an unrecorded request and gap the next metadata
+            // op.
+            warn!(
+                transport_client_id,
+                "delete_segments: transient submit; client will replay"
+            );
+            return;
+        };
+        reply
+    } else {
+        // Undecodable body (never produced by the SDK): ack empty so the
+        // lockstep stream stays framed; the typed decoder surfaces the
+        // failure client-side. Unresolvable-but-well-formed targets commit a
+        // typed rejection instead (see the resolve), so only a wire-corrupt
+        // request can gap the sequence here.
+        let commit = current_metadata_commit(shard);
+        build_empty_reply(&header, transport_client_id, session, commit).into_generic()
+    };
     if let Err(error) = shard
         .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .send_to_client(transport_client_id, reply.into_frozen())
         .await
     {
         warn!(
@@ -2036,11 +2101,35 @@ pub(crate) async fn resolve_delete_segments_truncate(
     body: &[u8],
 ) -> Result<Message<RequestHeader>, IggyError> {
     let parsed = DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-    let namespace_raw =
-        resolve_partition_request_namespace(shard, Operation::DeleteSegments, body, client_id)
-            .inspect_err(|error| {
-                warn!(client_id, error = %error, "delete_segments: unresolved namespace");
-            })?;
+    let namespace_raw = match resolve_partition_request_namespace(
+        shard,
+        Operation::DeleteSegments,
+        body,
+        client_id,
+    ) {
+        Ok(namespace_raw) => namespace_raw,
+        // Unresolvable stream/topic: still commit the truncate, against the
+        // client's raw identifiers -- the apply rejects it as a committed
+        // result. That keeps the request sequence contiguous (an empty ack
+        // without a commit gaps `request == committed + 1` and silently
+        // drops the NEXT metadata op) while the client gets the typed error.
+        Err(error) => {
+            debug!(
+                client_id,
+                %error,
+                "delete_segments: unresolved target; committing typed rejection"
+            );
+            return Ok(build_truncate_partition_client_message_with_identifiers(
+                template,
+                client_id,
+                session,
+                parsed.stream_id,
+                parsed.topic_id,
+                parsed.partition_id,
+                0,
+            ));
+        }
+    };
     let namespace = IggyNamespace::from_raw(namespace_raw);
     let up_to_offset = match shard
         .partition_read(
@@ -2053,8 +2142,33 @@ pub(crate) async fn resolve_delete_segments_truncate(
     {
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: Some(offset),
+            ..
         }) => offset,
-        _ => 0,
+        // Nothing sealed to delete on a replica that has not converged on the
+        // replicated log (a backup behind the commit frontier may be missing
+        // whole sealed segments). Answering now would commit a no-op truncate
+        // and silently drop the delete, so surface a transient and let the
+        // client replay once the partition catches up. A converged primary
+        // whose resident tail is merely unflushed settles as a no-op below.
+        Some(PartitionReadReply::SegmentDeleteOffset {
+            up_to_offset: None,
+            lagging: true,
+        }) => {
+            debug!(
+                client_id,
+                namespace_raw, "delete_segments: partition not converged; transient"
+            );
+            return Err(IggyError::TransientNotAccepted);
+        }
+        other => {
+            debug!(
+                client_id,
+                namespace_raw,
+                reply = ?other,
+                "delete_segments: nothing to delete; committing no-op truncate"
+            );
+            0
+        }
     };
     Ok(build_truncate_partition_client_message(
         template,

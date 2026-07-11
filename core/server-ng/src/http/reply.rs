@@ -102,7 +102,12 @@ pub(in crate::http) fn committed_payload(
 /// must replay the same request id rather than grade it as a committed
 /// result or advance the session gate.
 pub(in crate::http) fn is_transient_not_committed(reply: &Message<GenericHeader>) -> bool {
-    result_code(reply_body(reply)) == Some(IggyError::TransientNotCommitted.as_code())
+    matches!(
+        result_code(reply_body(reply)),
+        Some(code)
+            if code == IggyError::TransientNotCommitted.as_code()
+                || code == IggyError::TransientNotAccepted.as_code()
+    )
 }
 
 /// The reply body past the generic header, bounded by the header's `size`.

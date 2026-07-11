@@ -1054,6 +1054,7 @@ mod tests {
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
                 segment_size: config.system.segment.size,
+                encryptor: None,
             },
         );
         let shards_table = PapayaShardsTable::new();

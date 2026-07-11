@@ -27,7 +27,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Local;
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::codes::{
     GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
     GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
@@ -174,6 +174,10 @@ pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
+    // Credential verification is a consensus-free STM read; hold it while a
+    // recovered WAL suffix (which may carry the user's create/password ops)
+    // re-commits, like every other local read.
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
     let user_id = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -187,6 +191,7 @@ pub(in crate::http) async fn login_with_personal_access_token(
     State(state): State<HttpState>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
+    SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard)).await;
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
@@ -215,7 +220,10 @@ pub(in crate::http) async fn refresh_token(
     if command.token.is_empty() {
         return Err(IggyError::Unauthenticated.into());
     }
-    let claims = state.jwt.decode(&command.token)?;
+    // Refresh rejects trusted-issuer tokens (they keep their own lifecycle);
+    // `decode_for_refresh` is `!Send` (a trusted-issuer token may await a JWKS
+    // fetch), so bridge it like every other shard-0 path (see [`logout_user`]).
+    let claims = SendWrapper::new(state.jwt.decode_for_refresh(&command.token)).await?;
     let user_id = claims
         .sub
         .parse::<u32>()
@@ -245,14 +253,15 @@ pub(in crate::http) async fn get_streams(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<Stream>>, ReadError> {
     let body = GetStreamsRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_STREAMS_CODE,
         &body,
         Permissioner::get_streams,
-    )?;
+    ))
+    .await?;
     let response = GetStreamsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(streams_from_wire(response)))
@@ -276,7 +285,7 @@ pub(in crate::http) async fn get_stream(
         stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -285,7 +294,8 @@ pub(in crate::http) async fn get_stream(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
-    )?;
+    ))
+    .await?;
     let response = GetStreamResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -309,7 +319,7 @@ pub(in crate::http) async fn get_topics(
         stream_id: wire_stream_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -318,7 +328,8 @@ pub(in crate::http) async fn get_topics(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
-    )?;
+    ))
+    .await?;
     let response = GetTopicsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -345,7 +356,7 @@ pub(in crate::http) async fn get_topic(
         topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -356,7 +367,8 @@ pub(in crate::http) async fn get_topic(
                 permissioner.get_topic(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = GetTopicResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -372,14 +384,15 @@ pub(in crate::http) async fn get_users(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<UserInfo>>, ReadError> {
     let body = GetUsersRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_USERS_CODE,
         &body,
         Permissioner::get_users,
-    )?;
+    ))
+    .await?;
     let response = GetUsersResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -409,7 +422,7 @@ pub(in crate::http) async fn get_user(
         user_id: wire_user_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -422,7 +435,8 @@ pub(in crate::http) async fn get_user(
                 permissioner.get_user(uid)
             }
         },
-    )?;
+    ))
+    .await?;
     let response = UserDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(
@@ -449,7 +463,7 @@ pub(in crate::http) async fn get_cgs(
         topic_id: wire_topic_id,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -460,7 +474,8 @@ pub(in crate::http) async fn get_cgs(
                 permissioner.get_consumer_groups(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = GetConsumerGroupsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(consumer_groups_from_wire(response)))
@@ -488,7 +503,7 @@ pub(in crate::http) async fn get_cg(
         group_id: identifier_to_wire(&group_id).map_err(ReadError::Rejected)?,
     };
     let body = request.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
@@ -499,7 +514,8 @@ pub(in crate::http) async fn get_cg(
                 permissioner.get_consumer_group(uid, stream_id, topic_id)
             })
         },
-    )?;
+    ))
+    .await?;
     let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(ConsumerGroupDetails::from(response)))
@@ -515,14 +531,15 @@ pub(in crate::http) async fn get_stats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Stats>, ReadError> {
     let body = GetStatsRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_STATS_CODE,
         &body,
         Permissioner::get_stats,
-    )?;
+    ))
+    .await?;
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
@@ -931,7 +948,7 @@ pub(in crate::http) async fn delete_partitions(
 /// the path.
 ///
 /// `DeleteSegments` is not itself a consensus op: [`submit_write`] carries it
-/// through [`submit_gated`], which resolves it to the `TruncatePartition` that
+/// through `submit_gated`, which resolves it to the `TruncatePartition` that
 /// commits the trim. RBAC (`delete_segments`) is enforced in-apply on that
 /// truncate, like the sibling topic writes.
 pub(in crate::http) async fn delete_segments(
@@ -1016,8 +1033,13 @@ pub(in crate::http) async fn poll_messages(
             fragments,
             current_offset,
         }) => {
-            let body = build_polled_messages_body(partition_id, current_offset, fragments)
-                .map_err(ReadError::Rejected)?;
+            let body = build_polled_messages_body(
+                partition_id,
+                current_offset,
+                fragments,
+                state.shard.plane.partitions().config().encryptor.as_deref(),
+            )
+            .map_err(ReadError::Rejected)?;
             Ok(Json(
                 PolledMessages::from_bytes(body).map_err(ReadError::Rejected)?,
             ))
@@ -1302,7 +1324,8 @@ pub(in crate::http) async fn delete_cg(
 ///
 /// The plaintext password rides the JSON body; [`submit_write`] hashes it on
 /// shard 0 before the request enters consensus (see
-/// [`maybe_rewrite_user_password_request`]), so no plaintext is ever replicated.
+/// [`crate::users::maybe_rewrite_user_password_request`]), so no plaintext is
+/// ever replicated.
 pub(in crate::http) async fn create_user(
     State(state): State<HttpState>,
     identity: Authenticated,
@@ -1383,8 +1406,8 @@ pub(in crate::http) async fn delete_user(
 /// `PUT /users/{user_id}/password`: change a user's password. Returns 204.
 ///
 /// Both passwords ride the JSON body in plaintext. On shard 0, before the op
-/// enters consensus, [`maybe_rewrite_user_password_request`] hashes the new
-/// password and strips the current one (so neither plaintext is ever
+/// enters consensus, [`crate::users::maybe_rewrite_user_password_request`] hashes
+/// the new password and strips the current one (so neither plaintext is ever
 /// replicated), and verifies `current_password` against the target's stored
 /// hash. A wrong current password is not denied pre-consensus: the op still
 /// commits, carrying an empty new-password hash the replicated apply turns into
@@ -1450,14 +1473,15 @@ pub(in crate::http) async fn get_pats(
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<PersonalAccessTokenInfo>>, ReadError> {
     let body = GetPersonalAccessTokensRequest.to_bytes();
-    let bytes = read_local(
+    let bytes = SendWrapper::new(read_local(
         &state,
         &identity,
         query.consistency,
         GET_PERSONAL_ACCESS_TOKENS_CODE,
         &body,
         |_, _| Ok(()),
-    )?;
+    ))
+    .await?;
     let response = GetPersonalAccessTokensResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(personal_access_tokens_from_wire(response)))
@@ -1468,7 +1492,7 @@ pub(in crate::http) async fn get_pats(
 /// legacy server returns, with HTTP 200.
 ///
 /// The raw token is non-deterministic and secret, so it must never enter
-/// consensus: [`rewrite_pat_request_for_user`] (invoked inside
+/// consensus: [`crate::pat::rewrite_pat_request_for_user`] (invoked inside
 /// [`submit_committed`]) mints it on shard 0 and replicates only its hash, so a
 /// successful committed reply body is empty. [`build_raw_pat_reply`] then splices
 /// the raw secret back into that reply locally, using the confirmed commit

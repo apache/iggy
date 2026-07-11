@@ -274,10 +274,13 @@ async fn send_login_transient_reply(
     request_header: &RequestHeader,
 ) {
     let commit = current_metadata_commit(shard);
+    // `TransientNotAccepted`: a login/register replay is safe under any
+    // session (a duplicate register mints a fresh session and the server
+    // evicts the abandoned one), so the client may fail over freely.
     let reply = build_result_rejection_reply(
         request_header,
         commit,
-        IggyError::TransientNotCommitted.as_code(),
+        IggyError::TransientNotAccepted.as_code(),
     );
     if let Err(error) = shard
         .bus
