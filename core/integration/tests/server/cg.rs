@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::server::scenarios::{
-    consumer_group_auto_commit_reconnection_scenario, consumer_group_join_scenario,
+    consumer_group_auto_commit_reconnection_scenario,
+    consumer_group_duplicate_name_create_scenario, consumer_group_join_scenario,
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario,
@@ -71,4 +72,12 @@ async fn new_messages_after_restart(harness: &TestHarness) {
 )]
 async fn offset_cleanup(harness: &TestHarness) {
     consumer_group_offset_cleanup_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+)]
+async fn duplicate_name_create_preserves_live_group(harness: &TestHarness) {
+    consumer_group_duplicate_name_create_scenario::run(harness).await;
 }

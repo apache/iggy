@@ -79,7 +79,9 @@ impl IntoResponse for CustomError {
                     // the op never committed - a transient server condition,
                     // retryable like the other cannot-commit-right-now 503s
                     // (see `service_unavailable`), never a caller error.
-                    IggyError::TransientNotCommitted => StatusCode::SERVICE_UNAVAILABLE,
+                    IggyError::TransientNotCommitted | IggyError::TransientNotAccepted => {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
                     _ => StatusCode::BAD_REQUEST,
                 };
                 (status_code, Json(ErrorResponse::from_error(&error)))
@@ -514,6 +516,9 @@ mod tests {
             nodes,
             self_ip: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
+            metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::cluster_meta::METADATA_VIEW_UNKNOWN,
+            )),
         }
     }
 

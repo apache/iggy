@@ -544,6 +544,21 @@ pub enum Status {
     Recovering,
 }
 
+/// What a received `Commit` heartbeat did, so the caller knows whether to
+/// drain the journal or correct a stale peer.
+#[derive(Debug, Clone, Copy)]
+pub enum CommitOutcome {
+    /// Nothing to do: the heartbeat was absorbed (or ignored as stale /
+    /// foreign / wrong-status) without moving `commit_max`.
+    Accepted,
+    /// `commit_max` advanced; run `commit_journal`.
+    Advanced,
+    /// A replica is still heartbeating an older view in which it was
+    /// primary; this replica is the current view's primary and should
+    /// broadcast `StartView` so the stale replica adopts the view.
+    RespondStartView,
+}
+
 /// Actions to be taken by the caller after processing a VSR event.
 #[derive(Debug, Clone)]
 pub enum VsrAction {
@@ -651,6 +666,23 @@ where
     // * `replica.log_view ≥ replica.log_view_durable`
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
+    /// Commit point the recovered WAL suffix must re-reach before admitting
+    /// client requests as primary (`0` = no recovered suffix pending).
+    recovery_barrier: Cell<u64>,
+    /// True until a replica that booted without its consensus state (see
+    /// `init_recovering`) learns the cluster commit point. While set, the
+    /// first `StartView` / `Commit` fast-forwards `commit_min` to the learned
+    /// `commit_max`: the replica's recovered durable state stands in for the
+    /// journal prefix it no longer has, so walking `commit_journal` from op 1
+    /// would find nothing and declare divergence.
+    recovering: Cell<bool>,
+    /// True while this replica declines the primaryship its (stale) recovered
+    /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
+    /// math, so without this flag a restarted view-N primary would still pass
+    /// the submit gate and advertise itself as the roster leader while never
+    /// heartbeating. Cleared as soon as any view transition resolves the role
+    /// legitimately (`StartView` adoption, DVC completion).
+    ceded_primaryship: Cell<bool>,
     status: Cell<Status>,
 
     /// Highest op number that has been locally executed (state machine applied,
@@ -730,6 +762,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             namespace,
             view: Cell::new(0),
             log_view: Cell::new(0),
+            recovery_barrier: Cell::new(0),
+            recovering: Cell::new(false),
+            ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
@@ -758,6 +793,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         } else {
             timeouts.start(TimeoutKind::NormalHeartbeat);
         }
+    }
+
+    /// Initialize a restarted replica as a backup regardless of what its
+    /// recovered view says about primaryship. A resumed stale primary races
+    /// the peers' election: if they moved on (or move on now), two nodes act
+    /// primary for different planes and clients route to the wrong one. Join
+    /// as a backup instead; either the peers' heartbeat timeout elects a
+    /// primary and its `StartView` brings this replica forward, or this
+    /// replica's own silence provokes that election. Unlike
+    /// [`Self::init_recovering`] the local journal is intact, so the normal
+    /// commit walk applies it -- no commit-floor fast-forward.
+    pub fn init_as_backup(&self) {
+        self.status.set(Status::Normal);
+        self.ceded_primaryship.set(true);
+        self.timeouts
+            .borrow_mut()
+            .start(TimeoutKind::NormalHeartbeat);
+    }
+
+    /// See the `ceded_primaryship` field.
+    #[must_use]
+    pub const fn has_ceded_primaryship(&self) -> bool {
+        self.ceded_primaryship.get()
+    }
+
+    /// Initialize a replica whose consensus state did NOT survive restart
+    /// (e.g. a partition group: its journal is in-memory and its segments
+    /// carry no op numbers). Such a replica must not assume primaryship: it
+    /// would heartbeat `commit_min = 0`, dragging the group behind backups
+    /// that kept their journals, and it has no ops to re-pipeline. Join as a
+    /// backup instead; the peers' heartbeat timeout elects a primary that
+    /// still holds the log, and its `StartView` brings this replica forward.
+    pub fn init_recovering(&self) {
+        self.init_as_backup();
+        self.recovering.set(true);
     }
 
     #[must_use]
@@ -886,6 +956,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn view(&self) -> u32 {
         self.view.get()
+    }
+
+    /// Commit point the recovered WAL suffix must re-reach before this
+    /// replica (as primary) admits new client requests; `0` when no suffix
+    /// was re-pipelined. See `is_caught_up_primary`.
+    pub const fn recovery_barrier(&self) -> u64 {
+        self.recovery_barrier.get()
+    }
+
+    pub fn set_recovery_barrier(&self, required_commit: u64) {
+        self.recovery_barrier.set(required_commit);
     }
 
     pub fn set_view(&mut self, view: u32) {
@@ -1140,8 +1221,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
     fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        // Only backups trigger view change on heartbeat timeout
-        if self.is_primary() {
+        // Only backups trigger view change on heartbeat timeout. `is_primary`
+        // is pure view math though: a replica that booted recovering / with
+        // ceded primaryship while sitting at the primary index is a backup by
+        // role -- if it early-returned here it would neither heartbeat nor
+        // start an election, silently dropping out of quorum until an
+        // unrelated view change rescues it. Let it climb StartViewChange like
+        // any other backup.
+        if self.is_primary() && !self.recovering.get() && !self.ceded_primaryship.get() {
             return Vec::new();
         }
 
@@ -1371,6 +1458,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        tracing::debug!(
+            replica = self.replica,
+            view = self.view.get(),
+            targets = targets.len(),
+            first_op = targets.first().map(|(h, _)| h.op),
+            "prepare timeout: retransmitting un-acked prepares"
+        );
         self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
 
         vec![VsrAction::RetransmitPrepares { targets }]
@@ -1721,10 +1815,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Accept the StartView and transition to normal
+        tracing::info!(
+            replica = self.replica,
+            old_view = self.view.get(),
+            new_view = msg_view,
+            op = msg_op,
+            commit = msg_commit,
+            "adopting view from StartView"
+        );
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(msg_commit);
+        self.fast_forward_recovering_commit_floor();
         self.reset_view_change_state();
 
         // Stale pipeline entries from the old view must be discarded
@@ -1791,29 +1895,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
+    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
         assert_eq!(
             header.namespace, self.namespace,
             "Commit routed to wrong group"
         );
 
         if self.is_primary() {
-            return false;
+            // A heartbeat from the primary of an OLDER view means that
+            // replica missed our view change entirely -- typically it
+            // restarted while the view advanced and recovered the stale
+            // view from its journal (there is no durable view watermark),
+            // so the SVC/DVC/SV exchange never reached it. Left alone it
+            // wedges: it drops our newer-view traffic as foreign and we
+            // drop its stale prepares, while its live heartbeats keep its
+            // backups from electing anyone. Re-announcing the current view
+            // lets its `handle_start_view` adopt the view and cancel its
+            // stale pipeline.
+            if self.status.get() == Status::Normal
+                && header.view < self.view.get()
+                && header.replica == self.primary_index(header.view)
+            {
+                return CommitOutcome::RespondStartView;
+            }
+            return CommitOutcome::Accepted;
         }
 
         if self.status.get() != Status::Normal {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         if header.view != self.view.get() {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         // TODO: Once connection-level peer verification is added promote
         // this to an assert, the network layer would guarantee the sender
         // matches header.replica.
         if header.replica != self.primary_index(header.view) {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         // Only accept heartbeats with a strictly newer timestamp to prevent
@@ -1827,7 +1947,37 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let old_commit_max = self.commit_max.get();
         self.advance_commit_max(header.commit);
-        self.commit_max.get() > old_commit_max
+        if self.recovering.get() {
+            // First learned commit point after a state-less boot: the
+            // recovered durable data stands in for the journal prefix, so
+            // there is nothing local to apply for it.
+            self.fast_forward_recovering_commit_floor();
+            return CommitOutcome::Accepted;
+        }
+        if self.commit_max.get() > old_commit_max {
+            CommitOutcome::Advanced
+        } else {
+            CommitOutcome::Accepted
+        }
+    }
+
+    /// See the `recovering` field: align `commit_min` with the learned
+    /// `commit_max` exactly once, then leave recovery mode.
+    fn fast_forward_recovering_commit_floor(&self) {
+        if !self.recovering.get() {
+            return;
+        }
+        self.recovering.set(false);
+        let commit_max = self.commit_max.get();
+        if commit_max > self.commit_min.get() {
+            tracing::info!(
+                replica = self.replica,
+                namespace_raw = self.namespace,
+                commit_max,
+                "recovering replica adopting cluster commit floor"
+            );
+            self.commit_min.set(commit_max);
+        }
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
@@ -1853,6 +2003,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Update state
         self.log_view.set(self.view.get());
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 
