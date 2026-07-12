@@ -21,6 +21,7 @@ use iggy::prelude::{
     IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
     Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
 };
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDelta;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
@@ -101,11 +102,11 @@ pub enum MaxTopicSize {
     /// the server deletes the oldest sealed segments to make room for new
     /// messages.
     ///
-    /// `bytes` must be greater than zero and less than `u64::MAX`: those two
-    /// values are reserved on the wire for `ServerDefault` and `Unlimited`
-    /// respectively, so a `Custom` size at either boundary would be
-    /// indistinguishable from one of the other variants and is treated as
-    /// such by the server.
+    /// `bytes` must be greater than zero and less than the maximum value of
+    /// an unsigned 64-bit integer: those two values are reserved on the wire
+    /// for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
+    /// at either boundary raises `ValueError` when passed to
+    /// `create_topic`/`update_topic`.
     Custom { bytes: u64 },
     /// Do not cap the topic size; it may grow without bound.
     Unlimited(),
@@ -123,13 +124,22 @@ impl From<RustMaxTopicSize> for MaxTopicSize {
     }
 }
 
-impl From<&MaxTopicSize> for RustMaxTopicSize {
-    fn from(max_size: &MaxTopicSize) -> Self {
-        match max_size {
+impl TryFrom<&MaxTopicSize> for RustMaxTopicSize {
+    type Error = PyErr;
+
+    fn try_from(max_size: &MaxTopicSize) -> PyResult<Self> {
+        Ok(match max_size {
             MaxTopicSize::ServerDefault() => RustMaxTopicSize::ServerDefault,
-            MaxTopicSize::Custom { bytes } => RustMaxTopicSize::Custom(IggyByteSize::from(*bytes)),
+            MaxTopicSize::Custom { bytes } => {
+                if *bytes == 0 || *bytes == u64::MAX {
+                    return Err(PyValueError::new_err(
+                        "bytes must be greater than zero and less than u64::MAX".to_string(),
+                    ));
+                }
+                RustMaxTopicSize::Custom(IggyByteSize::from(*bytes))
+            }
             MaxTopicSize::Unlimited() => RustMaxTopicSize::Unlimited,
-        }
+        })
     }
 }
 

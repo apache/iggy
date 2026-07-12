@@ -367,7 +367,9 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+        Returns Ok(()) on successful topic creation, raises ValueError for an
+        invalid `message_expiry` or `max_topic_size`, or a PyRuntimeError on
+        other failures.
         """
     def get_topic(
         self,
@@ -422,7 +424,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -712,11 +715,11 @@ class MaxTopicSize:
         the server deletes the oldest sealed segments to make room for new
         messages.
 
-        `bytes` must be greater than zero and less than `u64::MAX`: those two
-        values are reserved on the wire for `ServerDefault` and `Unlimited`
-        respectively, so a `Custom` size at either boundary would be
-        indistinguishable from one of the other variants and is treated as
-        such by the server.
+        `bytes` must be greater than zero and less than the maximum value of
+        an unsigned 64-bit integer: those two values are reserved on the wire
+        for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
+        at either boundary raises `ValueError` when passed to
+        `create_topic`/`update_topic`.
         """
 
         __match_args__ = ("bytes",)

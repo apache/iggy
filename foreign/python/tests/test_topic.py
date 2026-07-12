@@ -353,6 +353,8 @@ class TestCreateTopic:
             (4563, RuntimeError),
             (-1, OverflowError),
             (2e64, TypeError),
+            (0, ValueError),
+            (2**64 - 1, ValueError),  # u64::MAX is reserved for Unlimited
         ],
     )
     async def test_create_topic_invalid_max_topic_size(

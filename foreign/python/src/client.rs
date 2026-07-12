@@ -170,7 +170,9 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+    /// Returns Ok(()) on successful topic creation, raises ValueError for an
+    /// invalid `message_expiry` or `max_topic_size`, or a PyRuntimeError on
+    /// other failures.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -206,8 +208,10 @@ impl IggyClient {
             .transpose()?
             .unwrap_or(RustIggyExpiry::ServerDefault);
 
-        let max_size =
-            max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
+        let max_size = max_topic_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
@@ -297,7 +301,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
         signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -333,8 +338,10 @@ impl IggyClient {
             .transpose()?
             .unwrap_or(RustIggyExpiry::ServerDefault);
 
-        let max_size =
-            max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
+        let max_size = max_topic_size
+            .map(RustMaxTopicSize::try_from)
+            .transpose()?
+            .unwrap_or(RustMaxTopicSize::ServerDefault);
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
