@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod consumer_group;
 mod hello_world;
 #[cfg(feature = "vsr")]
 mod mcp_parity;
