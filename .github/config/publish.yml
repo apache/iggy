@@ -96,9 +96,14 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/connectors/runtime/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # Image ships only the runtime binary; plugin .so files are not bundled.
+    # The fat image bundles the runtime plus every connector plugin, so any
+    # change under core/connectors/ must refresh :edge. crates: keeps
+    # sensitivity to shared workspace deps in the runtime's closure (e.g.
+    # iggy_common); paths: covers all plugin crates without a hardcoded
+    # per-plugin list, so a newly added connector is gated automatically.
     gate:
       crates: [iggy-connectors]
+      paths: [core/connectors]
 
   web-ui:
     tag_pattern: "^web-ui-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
