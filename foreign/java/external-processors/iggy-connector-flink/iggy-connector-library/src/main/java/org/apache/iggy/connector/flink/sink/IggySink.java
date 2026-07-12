@@ -22,12 +22,14 @@ package org.apache.iggy.connector.flink.sink;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.serialization.SerializationSchema;
 
 import java.io.IOException;
 import java.io.Serializable;
+import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Duration;
 
@@ -106,46 +108,42 @@ public class IggySink<T> implements Sink<T>, Serializable {
 
     @Override
     public SinkWriter<T> createWriter(WriterInitContext context) throws IOException {
-        IggyHttpClient httpClient = createHttpClient();
+        IggyTcpClient tcpClient = createTcpClient();
         return new IggySinkWriter<>(
-                httpClient, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
+                tcpClient, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
     }
 
     /**
-     * Creates an HTTP Iggy client based on connection configuration.
+     * Creates a TCP Iggy client based on connection configuration.
      *
-     * @return configured HTTP Iggy client
+     * @return configured TCP Iggy client
      */
-    private IggyHttpClient createHttpClient() {
+    private IggyTcpClient createTcpClient() {
         try {
-            // Build HTTP URL from server address using URI for proper parsing
             String serverAddress = connectionConfig.getServerAddress();
-
-            // Parse server address to extract host
-            java.net.URI uri = serverAddress.contains("://")
-                    ? new java.net.URI(serverAddress)
-                    : new java.net.URI("tcp://" + serverAddress);
+            URI uri = serverAddress.contains("://") ? new URI(serverAddress) : new URI("tcp://" + serverAddress);
 
             String host = uri.getHost();
             if (host == null) {
                 throw new IllegalArgumentException("Cannot extract host from: " + serverAddress);
             }
+            int port = uri.getPort() >= 0 ? uri.getPort() : 8090;
 
-            // Build HTTP URL with port 3000 (Iggy HTTP API default port)
-            String httpUrl = "http://" + host + ":3000";
-
-            // Create HTTP client
-            IggyHttpClient httpClient = new IggyHttpClient(httpUrl);
-
-            // Login
-            httpClient.users().login(connectionConfig.getUsername(), connectionConfig.getPassword());
-
-            return httpClient;
+            return IggyTcpClient.builder()
+                    .host(host)
+                    .port(port)
+                    .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
+                    .connectionTimeout(connectionConfig.getConnectionTimeout())
+                    .requestTimeout(connectionConfig.getRequestTimeout())
+                    .retryPolicy(RetryPolicy.fixedDelay(
+                            connectionConfig.getMaxRetries(), connectionConfig.getRetryBackoff()))
+                    .tls(connectionConfig.isEnableTls())
+                    .buildAndLogin();
 
         } catch (URISyntaxException e) {
             throw new RuntimeException("Invalid server address format: " + connectionConfig.getServerAddress(), e);
         } catch (RuntimeException e) {
-            throw new RuntimeException("Failed to create HTTP Iggy client", e);
+            throw new RuntimeException("Failed to create TCP Iggy client", e);
         }
     }
 

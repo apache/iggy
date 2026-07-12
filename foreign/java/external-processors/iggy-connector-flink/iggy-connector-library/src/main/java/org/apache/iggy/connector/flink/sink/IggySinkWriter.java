@@ -21,7 +21,7 @@ package org.apache.iggy.connector.flink.sink;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.connector.error.ConnectorException;
 import org.apache.iggy.connector.serialization.SerializationSchema;
 import org.apache.iggy.identifier.StreamId;
@@ -49,7 +49,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
 
     private static final Logger log = LoggerFactory.getLogger(IggySinkWriter.class);
 
-    private final IggyHttpClient httpClient;
+    private final IggyTcpClient tcpClient;
     private final String streamId;
     private final String topicId;
     private final SerializationSchema<T> serializer;
@@ -73,7 +73,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
     /**
      * Creates a new sink writer.
      *
-     * @param httpClient           the HTTP Iggy client
+     * @param tcpClient            the TCP Iggy client
      * @param streamId             the stream identifier
      * @param topicId              the topic identifier
      * @param serializer           the serialization schema
@@ -82,15 +82,15 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
      * @param partitioningStrategy the partitioning strategy
      */
     public IggySinkWriter(
-            IggyHttpClient httpClient,
+            IggyTcpClient tcpClient,
             String streamId,
             String topicId,
             SerializationSchema<T> serializer,
             int batchSize,
             Duration flushInterval,
             PartitioningStrategy partitioningStrategy) {
-        if (httpClient == null) {
-            throw new IllegalArgumentException("httpClient cannot be null");
+        if (tcpClient == null) {
+            throw new IllegalArgumentException("tcpClient cannot be null");
         }
         if (StringUtils.isBlank(streamId)) {
             throw new IllegalArgumentException("streamId cannot be null or empty");
@@ -108,7 +108,7 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             throw new IllegalArgumentException("flushInterval must be positive");
         }
 
-        this.httpClient = httpClient;
+        this.tcpClient = tcpClient;
         this.streamId = streamId;
         this.topicId = topicId;
         this.serializer = serializer;
@@ -158,12 +158,11 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
             // Determine partitioning
             Partitioning partitioning = determinePartitioning();
 
-            // Send messages to Iggy via HTTP
             StreamId stream = parseStreamId(streamId);
             TopicId topic = parseTopicId(topicId);
 
             log.debug("IggySinkWriter: Sending {} messages with partitioning={}", messages.size(), partitioning);
-            httpClient.messages().sendMessages(stream, topic, partitioning, messages);
+            tcpClient.messages().sendMessages(stream, topic, partitioning, messages);
 
             totalWritten += buffer.size();
             log.debug("IggySinkWriter: Successfully sent {} messages. Total written: {}", buffer.size(), totalWritten);
@@ -180,9 +179,25 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
 
     @Override
     public void close() throws Exception {
-        // Flush any remaining buffered records
-        flush(true);
-        // Note: HTTP client doesn't have close() method - connections managed by Java HttpClient pool
+        Exception flushException = null;
+        try {
+            flush(true);
+        } catch (Exception e) {
+            flushException = e;
+        }
+
+        try {
+            tcpClient.close();
+        } catch (RuntimeException e) {
+            if (flushException == null) {
+                throw e;
+            }
+            flushException.addSuppressed(e);
+        }
+
+        if (flushException != null) {
+            throw flushException;
+        }
     }
 
     /**
