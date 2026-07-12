@@ -59,15 +59,17 @@ impl From<RustIggyExpiry> for IggyExpiry {
     }
 }
 
-impl From<&IggyExpiry> for RustIggyExpiry {
-    fn from(expiry: &IggyExpiry) -> Self {
-        match expiry {
+impl TryFrom<&IggyExpiry> for RustIggyExpiry {
+    type Error = PyErr;
+
+    fn try_from(expiry: &IggyExpiry) -> PyResult<Self> {
+        Ok(match expiry {
             IggyExpiry::ServerDefault() => RustIggyExpiry::ServerDefault,
             IggyExpiry::ExpireDuration { duration } => {
-                RustIggyExpiry::ExpireDuration(py_delta_to_iggy_duration(duration))
+                RustIggyExpiry::ExpireDuration(py_delta_to_iggy_duration(duration)?)
             }
             IggyExpiry::NeverExpire() => RustIggyExpiry::NeverExpire,
-        }
+        })
     }
 }
 

@@ -16,8 +16,8 @@
 // under the License.
 
 use iggy::prelude::{
-    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyExpiry as RustIggyExpiry,
-    IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
+    AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
+    IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
@@ -201,7 +201,10 @@ impl IggyClient {
             None => CompressionAlgorithm::default(),
         };
 
-        let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
+        let expiry = message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
 
         let max_size =
             max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
@@ -325,7 +328,10 @@ impl IggyClient {
             None => CompressionAlgorithm::default(),
         };
 
-        let expiry = message_expiry.map_or(RustIggyExpiry::ServerDefault, RustIggyExpiry::from);
+        let expiry = message_expiry
+            .map(RustIggyExpiry::try_from)
+            .transpose()?
+            .unwrap_or(RustIggyExpiry::ServerDefault);
 
         let max_size =
             max_topic_size.map_or(RustMaxTopicSize::ServerDefault, RustMaxTopicSize::from);
@@ -670,16 +676,16 @@ impl IggyClient {
             builder = builder.batch_length(batch_length)
         };
         if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(auto_commit.into())
+            builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
         };
         if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval))
+            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
         } else {
             builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder =
-                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval))
+                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval)?)
         }
         if init_retries.is_some() && init_retry_interval.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -695,7 +701,7 @@ impl IggyClient {
         {
             builder = builder.init_retries(
                 init_retries,
-                py_delta_to_iggy_duration(&init_retry_interval),
+                py_delta_to_iggy_duration(&init_retry_interval)?,
             );
         }
         if allow_replay {

@@ -270,6 +270,24 @@ class TestCreateTopic:
             assert topic.message_expiry.duration == message_expiry.duration
 
     @pytest.mark.asyncio
+    async def test_create_topic_rejects_negative_message_expiry(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test create_topic rejects a negative ExpireDuration timedelta."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+
+        with pytest.raises(ValueError):
+            await iggy_client.create_topic(
+                stream=stream_name,
+                name=topic_name,
+                partitions_count=1,
+                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+            )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "invalid_message_expiry", [1, "1s", object(), timedelta(seconds=1)]
     )
