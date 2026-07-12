@@ -34,6 +34,36 @@ from apache_iggy import SendMessage as Message
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
 
+async def _create_consumer_group_with_numeric_ids(
+    iggy_client: IggyClient,
+    unique_name,
+    group_name: str,
+) -> tuple[int, int, int]:
+    stream_name = unique_name()
+    topic_name = unique_name()
+
+    await iggy_client.create_stream(stream_name)
+    stream = await iggy_client.get_stream(stream_name)
+    assert stream is not None
+    assert isinstance(stream.id, int)
+
+    await iggy_client.create_topic(
+        stream=stream.id,
+        name=topic_name,
+        partitions_count=1,
+    )
+    topic = await iggy_client.get_topic(stream.id, topic_name)
+    assert topic is not None
+    assert isinstance(topic.id, int)
+
+    await iggy_client.create_consumer_group(stream.id, topic.id, group_name)
+    group = await iggy_client.get_consumer_group(stream.id, topic.id, group_name)
+    assert group is not None
+    assert isinstance(group.id, int)
+
+    return stream.id, topic.id, group.id
+
+
 class TestCreateConsumerGroup:
     """Test consumer group creation via create_consumer_group."""
 
@@ -492,35 +522,18 @@ class TestDeleteConsumerGroup:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test delete_consumer_group accepts numeric stream, topic, and group ids."""
-        stream_name = unique_name()
-        topic_name = unique_name()
         group_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        stream = await iggy_client.get_stream(stream_name)
-        assert stream is not None
-        stream_id = stream.id
-        assert isinstance(stream_id, int)
-
-        await iggy_client.create_topic(
-            stream=stream_id,
-            name=topic_name,
-            partitions_count=1,
+        stream_id, topic_id, group_id = await _create_consumer_group_with_numeric_ids(
+            iggy_client,
+            unique_name,
+            group_name,
         )
-        topic = await iggy_client.get_topic(stream_id, topic_name)
-        assert topic is not None
-        topic_id = topic.id
-        assert isinstance(topic_id, int)
 
-        await iggy_client.create_consumer_group(stream_id, topic_id, group_name)
-        group = await iggy_client.get_consumer_group(stream_id, topic_id, group_name)
-        assert group is not None
-        assert isinstance(group.id, int)
-
-        await iggy_client.delete_consumer_group(stream_id, topic_id, group.id)
+        await iggy_client.delete_consumer_group(stream_id, topic_id, group_id)
 
         assert (
-            await iggy_client.get_consumer_group(stream_id, topic_id, group.id) is None
+            await iggy_client.get_consumer_group(stream_id, topic_id, group_id) is None
         )
 
     @pytest.mark.asyncio
@@ -538,7 +551,7 @@ class TestDeleteConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.delete_consumer_group(
                 stream_name,
                 topic_name,
@@ -546,49 +559,39 @@ class TestDeleteConsumerGroup:
             )
 
     @pytest.mark.asyncio
-    async def test_delete_consumer_group_twice_fails_second_time(
+    async def test_delete_consumer_group_removes_live_member(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test deleting an already-deleted group raises on the second call."""
-        stream_name = unique_name()
-        topic_name = unique_name()
+        """Test deleting a consumer group also removes its live member."""
         group_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1,
+        stream_id, topic_id, group_id = await _create_consumer_group_with_numeric_ids(
+            iggy_client,
+            unique_name,
+            group_name,
         )
-        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_id, topic_id, group_id)
 
-        await iggy_client.delete_consumer_group(stream_name, topic_name, group_name)
-        with pytest.raises(RuntimeError):
-            await iggy_client.delete_consumer_group(stream_name, topic_name, group_name)
+        group = await iggy_client.get_consumer_group(
+            stream_id,
+            topic_id,
+            group_id,
+        )
+        assert group is not None
+        assert group.members_count == 1
+        assert len(group.members) == 1
 
-    @pytest.mark.asyncio
-    async def test_delete_consumer_group_requires_connection_and_auth(
-        self, unique_name
-    ):
-        """Test delete_consumer_group fails before connecting and before login."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
+        await iggy_client.delete_consumer_group(stream_id, topic_id, group_id)
 
-        client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
-            await client.delete_consumer_group(
-                unique_name(),
-                unique_name(),
-                unique_name(),
+        assert (
+            await iggy_client.get_consumer_group(
+                stream_id,
+                topic_id,
+                group_id,
             )
-
-        await client.connect()
-        with pytest.raises(RuntimeError):
-            await client.delete_consumer_group(
-                unique_name(),
-                unique_name(),
-                unique_name(),
-            )
+            is None
+        )
+        assert await iggy_client.get_consumer_groups(stream_id, topic_id) == []
 
 
 class TestJoinConsumerGroup:
@@ -632,40 +635,23 @@ class TestJoinConsumerGroup:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test join_consumer_group accepts numeric stream, topic, and group ids."""
-        stream_name = unique_name()
-        topic_name = unique_name()
         group_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        stream = await iggy_client.get_stream(stream_name)
-        assert stream is not None
-        stream_id = stream.id
-        assert isinstance(stream_id, int)
-
-        await iggy_client.create_topic(
-            stream=stream_id,
-            name=topic_name,
-            partitions_count=1,
+        stream_id, topic_id, group_id = await _create_consumer_group_with_numeric_ids(
+            iggy_client,
+            unique_name,
+            group_name,
         )
-        topic = await iggy_client.get_topic(stream_id, topic_name)
-        assert topic is not None
-        topic_id = topic.id
-        assert isinstance(topic_id, int)
 
-        await iggy_client.create_consumer_group(stream_id, topic_id, group_name)
-        group = await iggy_client.get_consumer_group(stream_id, topic_id, group_name)
-        assert group is not None
-        assert isinstance(group.id, int)
-
-        await iggy_client.join_consumer_group(stream_id, topic_id, group.id)
+        await iggy_client.join_consumer_group(stream_id, topic_id, group_id)
 
         joined_group = await iggy_client.get_consumer_group(
             stream_id,
             topic_id,
-            group.id,
+            group_id,
         )
         assert joined_group is not None
-        assert joined_group.id == group.id
+        assert joined_group.id == group_id
         assert joined_group.name == group_name
         assert joined_group.partitions_count == 1
         assert joined_group.members_count == 1
@@ -688,32 +674,10 @@ class TestJoinConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.join_consumer_group(
                 stream_name,
                 topic_name,
-                unique_name(),
-            )
-
-    @pytest.mark.asyncio
-    async def test_join_consumer_group_requires_connection_and_auth(self, unique_name):
-        """Test join_consumer_group fails before connecting and before login."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
-
-        client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
-            await client.join_consumer_group(
-                unique_name(),
-                unique_name(),
-                unique_name(),
-            )
-
-        await client.connect()
-        with pytest.raises(RuntimeError):
-            await client.join_consumer_group(
-                unique_name(),
-                unique_name(),
                 unique_name(),
             )
 
@@ -757,37 +721,24 @@ class TestLeaveConsumerGroup:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test leave_consumer_group accepts numeric stream, topic, and group ids."""
-        stream_name = unique_name()
-        topic_name = unique_name()
         group_name = unique_name()
 
-        await iggy_client.create_stream(stream_name)
-        stream = await iggy_client.get_stream(stream_name)
-        assert stream is not None
-        stream_id = stream.id
-        assert isinstance(stream_id, int)
-
-        await iggy_client.create_topic(
-            stream=stream_id,
-            name=topic_name,
-            partitions_count=1,
+        stream_id, topic_id, group_id = await _create_consumer_group_with_numeric_ids(
+            iggy_client,
+            unique_name,
+            group_name,
         )
-        topic = await iggy_client.get_topic(stream_id, topic_name)
-        assert topic is not None
-        topic_id = topic.id
-        assert isinstance(topic_id, int)
+        await iggy_client.join_consumer_group(stream_id, topic_id, group_id)
 
-        await iggy_client.create_consumer_group(stream_id, topic_id, group_name)
-        group = await iggy_client.get_consumer_group(stream_id, topic_id, group_name)
-        assert group is not None
-        assert isinstance(group.id, int)
-        await iggy_client.join_consumer_group(stream_id, topic_id, group.id)
+        await iggy_client.leave_consumer_group(stream_id, topic_id, group_id)
 
-        await iggy_client.leave_consumer_group(stream_id, topic_id, group.id)
-
-        left_group = await iggy_client.get_consumer_group(stream_id, topic_id, group.id)
+        left_group = await iggy_client.get_consumer_group(
+            stream_id,
+            topic_id,
+            group_id,
+        )
         assert left_group is not None
-        assert left_group.id == group.id
+        assert left_group.id == group_id
         assert left_group.name == group_name
         assert left_group.partitions_count == 1
         assert left_group.members_count == 0
@@ -812,7 +763,10 @@ class TestLeaveConsumerGroup:
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
 
         await iggy_client.leave_consumer_group(stream_name, topic_name, group_name)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(
+            RuntimeError,
+            match="Consumer group member with client ID:",
+        ):
             await iggy_client.leave_consumer_group(stream_name, topic_name, group_name)
 
     @pytest.mark.asyncio
@@ -830,34 +784,40 @@ class TestLeaveConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
             await iggy_client.leave_consumer_group(
                 stream_name,
                 topic_name,
                 unique_name(),
             )
 
-    @pytest.mark.asyncio
-    async def test_leave_consumer_group_requires_connection_and_auth(self, unique_name):
-        """Test leave_consumer_group fails before connecting and before login."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
 
-        client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
-            await client.leave_consumer_group(
-                unique_name(),
-                unique_name(),
-                unique_name(),
-            )
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "delete_consumer_group",
+        "join_consumer_group",
+        "leave_consumer_group",
+    ],
+)
+@pytest.mark.asyncio
+async def test_consumer_group_lifecycle_requires_connection_and_auth(
+    method_name, unique_name
+):
+    """Test lifecycle methods fail before connecting and before login."""
+    host, port = get_server_config()
+    wait_for_server(host, port)
 
-        await client.connect()
-        with pytest.raises(RuntimeError):
-            await client.leave_consumer_group(
-                unique_name(),
-                unique_name(),
-                unique_name(),
-            )
+    client = IggyClient(f"{host}:{port}")
+    method = getattr(client, method_name)
+    identifiers = (unique_name(), unique_name(), unique_name())
+
+    with pytest.raises(RuntimeError, match="Disconnected"):
+        await method(*identifiers)
+
+    await client.connect()
+    with pytest.raises(RuntimeError, match="Unauthenticated"):
+        await method(*identifiers)
 
 
 class TestConsumerGroup:

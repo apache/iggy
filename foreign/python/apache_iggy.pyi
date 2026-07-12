@@ -537,7 +537,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is deleted.
 
         Raises:
-            PyValueError: If an identifier is invalid.
+            PyValueError: If a string identifier is invalid.
             PyRuntimeError: If the request fails.
         """
     def join_consumer_group(
@@ -549,6 +549,9 @@ class IggyClient:
         r"""
         Join a consumer group for a stream and topic.
 
+        This method only registers the current client as a group member. To consume messages
+        as a group, use `consumer_group()`, which enables auto-join by default.
+
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
@@ -558,8 +561,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the client joins the consumer group.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def leave_consumer_group(
         self,
@@ -578,9 +581,14 @@ class IggyClient:
         Returns:
             An awaitable that resolves to `None` when the client leaves the consumer group.
 
+        Note:
+            Consumers created from this client for the same group share one server-side
+            membership. Leaving revokes that membership. Consumers with auto-join enabled
+            rejoin on their next poll.
+
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails, including `FeatureUnavailable` on HTTP transport.
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def send_messages(
         self,
