@@ -763,7 +763,7 @@ class TestConsumerGroup:
         async def take(message: ReceiveMessage) -> None:
             headers = message.user_headers()
             assert headers is not None
-            received_headers.append(headers.to_plain())
+            received_headers.append(headers.to_scalar_dict())
             shutdown_event.set()
 
         async def send() -> None:
@@ -864,7 +864,7 @@ class TestConsumerGroup:
 
         headers = message.user_headers()
         assert headers is not None
-        assert headers.to_plain() == expected_headers
+        assert headers.to_scalar_dict() == expected_headers
 
     @pytest.mark.asyncio
     async def test_iter_messages_with_first_reads_existing_messages(

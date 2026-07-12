@@ -73,16 +73,25 @@ Demonstrates fundamental client connection, authentication, batch message sendin
 
 ### Message Headers
 
-Shows how to attach and read Python SDK user headers with `str`, `bytes`, `bool`, `int`, and `float` values:
+Shows how to attach and read Python SDK user headers with `str`, `bytes`, `bool`, `int`, and `float` values. Two variants share their logic through `message-headers/common.py`:
+
+- `plain-headers/` uses the convenient `dict[str, str | bytes | bool | int | float]` form; the SDK infers a wire type for each value.
+- `typed-headers/` uses explicit `HeaderKey`/`HeaderValue` for full control over the wire type.
+
+Both are consumed identically, since plain headers are stored as typed headers on the wire.
 
 ```bash
 # Using uv
-uv run message-headers/producer.py
-uv run message-headers/consumer.py
+uv run message-headers/plain-headers/producer.py
+uv run message-headers/plain-headers/consumer.py
+uv run message-headers/typed-headers/producer.py
+uv run message-headers/typed-headers/consumer.py
 
 # Without using uv
-python message-headers/producer.py
-python message-headers/consumer.py
+python message-headers/plain-headers/producer.py
+python message-headers/plain-headers/consumer.py
+python message-headers/typed-headers/producer.py
+python message-headers/typed-headers/consumer.py
 ```
 
 ## TLS Examples

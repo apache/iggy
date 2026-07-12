@@ -150,9 +150,20 @@ impl HeaderValue {
     }
 }
 
-impl HeaderKey {
-    fn to_rust(&self, py: Python<'_>) -> PyResult<RustHeaderKey> {
-        match self {
+/// Borrows a typed Python [`HeaderKey`] together with the GIL token so it can
+/// be converted into its Rust representation (the `Raw` variant needs the token
+/// to read its `PyBytes` payload).
+struct PyHeaderKeyRef<'py, 'value> {
+    py: Python<'py>,
+    value: &'value HeaderKey,
+}
+
+impl TryFrom<PyHeaderKeyRef<'_, '_>> for RustHeaderKey {
+    type Error = PyErr;
+
+    fn try_from(key: PyHeaderKeyRef<'_, '_>) -> PyResult<Self> {
+        let PyHeaderKeyRef { py, value } = key;
+        match value {
             HeaderKey::Raw { value } => {
                 RustHeaderKey::try_from(value.extract::<Vec<u8>>(py)?).map_err(to_value_error)
             }
@@ -174,8 +185,21 @@ impl HeaderKey {
             HeaderKey::Float64 { value } => Ok((*value).into()),
         }
     }
+}
 
-    fn from_rust<'a>(py: Python<'a>, value: &RustHeaderKey) -> PyResult<Bound<'a, Self>> {
+/// Borrows a Rust [`RustHeaderKey`] together with the GIL token so it can be
+/// converted into a typed Python [`HeaderKey`] (the `Raw` variant needs the
+/// token to allocate its `PyBytes` payload).
+struct RustHeaderKeyRef<'py, 'value> {
+    py: Python<'py>,
+    value: &'value RustHeaderKey,
+}
+
+impl<'py> TryFrom<RustHeaderKeyRef<'py, '_>> for Bound<'py, HeaderKey> {
+    type Error = PyErr;
+
+    fn try_from(key: RustHeaderKeyRef<'py, '_>) -> PyResult<Self> {
+        let RustHeaderKeyRef { py, value } = key;
         let key = match value.kind() {
             HeaderKind::Raw => HeaderKey::Raw {
                 value: PyBytes::new(py, value.as_raw().map_err(to_value_error)?).unbind(),
@@ -225,7 +249,9 @@ impl HeaderKey {
         };
         key.into_pyobject(py)
     }
+}
 
+impl HeaderKey {
     fn identity(&self, py: Python<'_>) -> PyResult<HeaderIdentity> {
         match self {
             HeaderKey::Raw { value } => Ok(HeaderIdentity::raw(value.extract::<Vec<u8>>(py)?)),
@@ -270,9 +296,20 @@ impl HeaderKey {
     }
 }
 
-impl HeaderValue {
-    fn to_rust(&self, py: Python<'_>) -> PyResult<RustHeaderValue> {
-        match self {
+/// Borrows a typed Python [`HeaderValue`] together with the GIL token so it can
+/// be converted into its Rust representation (the `Raw` variant needs the token
+/// to read its `PyBytes` payload).
+struct PyHeaderValueRef<'py, 'value> {
+    py: Python<'py>,
+    value: &'value HeaderValue,
+}
+
+impl TryFrom<PyHeaderValueRef<'_, '_>> for RustHeaderValue {
+    type Error = PyErr;
+
+    fn try_from(value: PyHeaderValueRef<'_, '_>) -> PyResult<Self> {
+        let PyHeaderValueRef { py, value } = value;
+        match value {
             HeaderValue::Raw { value } => {
                 RustHeaderValue::try_from(value.extract::<Vec<u8>>(py)?).map_err(to_value_error)
             }
@@ -294,8 +331,21 @@ impl HeaderValue {
             HeaderValue::Float64 { value } => Ok((*value).into()),
         }
     }
+}
 
-    fn from_rust<'a>(py: Python<'a>, value: &RustHeaderValue) -> PyResult<Bound<'a, Self>> {
+/// Borrows a Rust [`RustHeaderValue`] together with the GIL token so it can be
+/// converted into a typed Python [`HeaderValue`] (the `Raw` variant needs the
+/// token to allocate its `PyBytes` payload).
+struct RustHeaderValueRef<'py, 'value> {
+    py: Python<'py>,
+    value: &'value RustHeaderValue,
+}
+
+impl<'py> TryFrom<RustHeaderValueRef<'py, '_>> for Bound<'py, HeaderValue> {
+    type Error = PyErr;
+
+    fn try_from(value: RustHeaderValueRef<'py, '_>) -> PyResult<Self> {
+        let RustHeaderValueRef { py, value } = value;
         let value = match value.kind() {
             HeaderKind::Raw => HeaderValue::Raw {
                 value: PyBytes::new(py, value.as_raw().map_err(to_value_error)?).unbind(),
@@ -345,7 +395,9 @@ impl HeaderValue {
         };
         value.into_pyobject(py)
     }
+}
 
+impl HeaderValue {
     fn identity(&self, py: Python<'_>) -> PyResult<HeaderIdentity> {
         match self {
             HeaderValue::Raw { value } => Ok(HeaderIdentity::raw(value.extract::<Vec<u8>>(py)?)),
@@ -522,7 +574,11 @@ pub(crate) fn py_user_headers_to_rust(
     for (key, value) in headers.iter() {
         let key = py_header_key_to_rust(py, &key)?;
         let value = py_header_value_to_rust(py, &value)?;
-        rust_headers.insert(key, value);
+        if rust_headers.insert(key, value).is_some() {
+            return Err(PyValueError::new_err(
+                "Duplicate user header key: each header key must be unique",
+            ));
+        }
     }
     Ok(rust_headers)
 }
@@ -533,12 +589,12 @@ pub(crate) fn rust_user_headers_to_py<'a>(
 ) -> PyResult<Bound<'a, UserHeaders>> {
     // Always expose the explicitly typed dict[HeaderKey, HeaderValue] so that
     // no wire-type information is silently dropped. Callers who prefer the
-    // convenient plain form opt in through `UserHeaders.to_plain`.
+    // convenient plain form opt in through `UserHeaders.to_scalar_dict`.
     let result = Bound::new(py, UserHeaders)?;
     let mapping = result.as_any();
     for (key, value) in headers {
-        let key = HeaderKey::from_rust(py, &key)?;
-        let value = HeaderValue::from_rust(py, &value)?;
+        let key = Bound::<HeaderKey>::try_from(RustHeaderKeyRef { py, value: &key })?;
+        let value = Bound::<HeaderValue>::try_from(RustHeaderValueRef { py, value: &value })?;
         mapping.set_item(key, value)?;
     }
     Ok(result)
@@ -547,7 +603,7 @@ pub(crate) fn rust_user_headers_to_py<'a>(
 /// User headers dictionary returned by `ReceiveMessage.user_headers`.
 ///
 /// This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
-/// operations work) that additionally exposes `to_plain` for the convenient
+/// operations work) that additionally exposes `to_scalar_dict` for the convenient
 /// scalar form.
 #[gen_stub_pyclass]
 #[pyclass(extends=PyDict)]
@@ -556,7 +612,7 @@ pub struct UserHeaders;
 #[gen_stub_pymethods]
 #[pymethods]
 impl UserHeaders {
-    /// Wraps a mapping so its entries gain the `to_plain` helper.
+    /// Wraps a mapping so its entries gain the `to_scalar_dict` helper.
     ///
     /// Accepts a dict whose keys and values can each independently be
     /// `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
@@ -580,7 +636,7 @@ impl UserHeaders {
     #[gen_stub(override_return_type(
         type_repr = "dict[str | bytes | bool | int | float, str | bytes | bool | int | float]"
     ))]
-    pub fn to_plain<'a>(slf: &Bound<'a, Self>) -> PyResult<Bound<'a, PyDict>> {
+    pub fn to_scalar_dict<'a>(slf: &Bound<'a, Self>) -> PyResult<Bound<'a, PyDict>> {
         let py = slf.py();
         let dict = slf.as_any().cast::<PyDict>()?;
         let headers = py_user_headers_to_rust(py, dict)?;
@@ -591,7 +647,10 @@ impl UserHeaders {
 fn py_header_key_to_rust(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<RustHeaderKey> {
     // A typed `HeaderKey` already carries an explicit wire type.
     if let Ok(header_key) = key.extract::<PyRef<'_, HeaderKey>>() {
-        return header_key.to_rust(py);
+        return RustHeaderKey::try_from(PyHeaderKeyRef {
+            py,
+            value: &header_key,
+        });
     }
 
     // Otherwise best-effort convert the plain Python scalar.
@@ -603,7 +662,10 @@ fn py_header_key_to_rust(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Rus
 fn py_header_value_to_rust(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<RustHeaderValue> {
     // A typed `HeaderValue` already carries an explicit wire type.
     if let Ok(header_value) = value.extract::<PyRef<'_, HeaderValue>>() {
-        return header_value.to_rust(py);
+        return RustHeaderValue::try_from(PyHeaderValueRef {
+            py,
+            value: &header_value,
+        });
     }
 
     // Otherwise best-effort convert the plain Python scalar.

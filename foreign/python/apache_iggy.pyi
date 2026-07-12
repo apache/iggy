@@ -1165,21 +1165,21 @@ class UserHeaders(dict):
     User headers dictionary returned by `ReceiveMessage.user_headers`.
 
     This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
-    operations work) that additionally exposes `to_plain` for the convenient
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
     scalar form.
     """
     def __new__(
         cls, mapping: dict[typing.Any, typing.Any] | None = None
     ) -> UserHeaders:
         r"""
-        Wraps a mapping so its entries gain the `to_plain` helper.
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
 
         Accepts a dict whose keys and values can each independently be
         `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
         int | float`). The inherited `dict` initializer copies the provided
         mapping.
         """
-    def to_plain(
+    def to_scalar_dict(
         self,
     ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
         r"""
