@@ -210,7 +210,7 @@ class TestMessageOperations:
             HeaderKey.String("attempt"): HeaderValue.UnsignedInt8(3),
             HeaderKey.String("score"): HeaderValue.Float64(0.99),
         }
-        assert typed_headers.to_plain() == user_headers
+        assert typed_headers.to_scalar_dict() == user_headers
         assert isinstance(message.origin_timestamp(), int)
         assert message.origin_timestamp() > 0
 
@@ -302,7 +302,7 @@ class TestMessageOperations:
             HeaderKey.String("exact-float"): HeaderValue.Float32(1.25),
             HeaderKey.String("wide-float"): HeaderValue.Float64(0.1),
         }
-        assert headers.to_plain() == plain_headers
+        assert headers.to_scalar_dict() == plain_headers
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -333,6 +333,23 @@ class TestMessageOperations:
         """Test invalid user header input raises ValueError."""
         with pytest.raises(ValueError, match=error):
             Message("payload", user_headers=headers)
+
+    def test_duplicate_user_header_keys_are_rejected(self):
+        """Test a message with duplicate user header keys is rejected."""
+        with pytest.raises(ValueError, match="Duplicate user header key"):
+            Message(
+                "payload",
+                user_headers={
+                    HeaderKey.String("dup"): HeaderValue.String("first"),
+                    "dup": "second",
+                },
+            )
+
+    def test_user_headers_over_100k_bytes_are_rejected(self):
+        """Test user headers exceeding the 100 KB limit are rejected."""
+        oversized_headers = {f"key-{index:05d}": "v" * 255 for index in range(1000)}
+        with pytest.raises(ValueError, match="Too big headers payload"):
+            Message("payload", user_headers=oversized_headers)
 
     def test_explicit_float32_out_of_range_is_rejected(self):
         """Test an explicit Float32 whose value overflows f32 is rejected."""
@@ -392,7 +409,7 @@ class TestMessageOperations:
         )
 
         with caplog.at_level(logging.WARNING, logger="apache_iggy"):
-            plain = headers.to_plain()
+            plain = headers.to_scalar_dict()
 
         assert plain == {
             "content-type": "application/json",
@@ -409,7 +426,7 @@ class TestMessageOperations:
     def test_plain_user_headers_accepts_plain_dict(self):
         """Test the plain dictionary form passes through unchanged."""
         headers = {"content-type": "application/json", "attempt": 3}
-        assert UserHeaders(headers).to_plain() == headers
+        assert UserHeaders(headers).to_scalar_dict() == headers
 
     def test_plain_user_headers_preserve_non_string_keys(self, caplog):
         """Test non-string typed keys convert back to their scalar Python type."""
@@ -418,7 +435,7 @@ class TestMessageOperations:
         )
 
         with caplog.at_level(logging.WARNING, logger="apache_iggy"):
-            plain = headers.to_plain()
+            plain = headers.to_scalar_dict()
 
         assert plain == {7: "order-id"}
         assert caplog.records == []
