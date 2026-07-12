@@ -664,10 +664,11 @@ class IggyExpiry:
 
         `duration` must be greater than zero: a zero-length `timedelta` is
         indistinguishable on the wire from `ServerDefault` and is treated as
-        such by the server. The upper bound is whatever a `datetime.timedelta`
-        can represent that also fits in a `u64` microsecond count (about
-        584,942 years); in practice the server-configured maximum is reached
-        long before that.
+        such by the server. A negative `timedelta` raises `ValueError` when
+        this value is passed to `create_topic`/`update_topic`. The upper
+        bound is whatever a `datetime.timedelta` can represent that also fits
+        in a `u64` microsecond count (about 584,942 years); in practice the
+        server-configured maximum is reached long before that.
         """
 
         __match_args__ = ("duration",)
