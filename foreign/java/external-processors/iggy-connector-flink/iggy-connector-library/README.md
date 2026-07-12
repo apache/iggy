@@ -54,6 +54,39 @@ dependencies {
 }
 ```
 
+### TCP Connection
+
+The Flink source and sink use Iggy's native TCP transport. Configure both with
+the same `IggyConnectionConfig`:
+
+```java
+IggyConnectionConfig connectionConfig = IggyConnectionConfig.builder()
+        .serverAddress("localhost:8090")
+        .username("iggy")
+        .password("iggy")
+        .connectionTimeout(Duration.ofSeconds(30))
+        .requestTimeout(Duration.ofSeconds(30))
+        .maxRetries(3)
+        .retryBackoff(Duration.ofMillis(100))
+        .enableTls(false)
+        .build();
+```
+
+The server address accepts the following formats:
+
+- `host`, using the default TCP port `8090`
+- `host:port`
+- `tcp://host:port`
+- bracketed IPv6, such as `tcp://[::1]:8090`
+
+Only TCP endpoints are accepted. HTTP URLs and addresses containing user info,
+paths, queries, or fragments are rejected during client creation. When TLS is
+enabled, the connector still uses the configured TCP endpoint.
+
+The sink uses the blocking TCP client because Flink's `SinkWriter` flush API is
+synchronous. Closing the writer flushes pending messages before closing the TCP
+connection.
+
 ### Building from Source
 
 ```bash
