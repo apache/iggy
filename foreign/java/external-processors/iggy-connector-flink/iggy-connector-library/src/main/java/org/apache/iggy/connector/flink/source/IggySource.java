@@ -29,6 +29,7 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.config.OffsetConfig;
+import org.apache.iggy.connector.config.TcpEndpoint;
 import org.apache.iggy.consumergroup.Consumer;
 
 import java.io.Serializable;
@@ -154,23 +155,12 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
      */
     private AsyncIggyTcpClient createAsyncIggyClient() {
         try {
-            // Parse host and port from server address
-            String serverAddress = connectionConfig.getServerAddress();
-            String host;
-            int port = 8090; // Default TCP port
-
-            if (serverAddress.contains(":")) {
-                String[] parts = serverAddress.split(":");
-                host = parts[0];
-                port = Integer.parseInt(parts[1]);
-            } else {
-                host = serverAddress;
-            }
+            TcpEndpoint endpoint = TcpEndpoint.parse(connectionConfig.getServerAddress());
 
             // Create async TCP client using builder pattern with auto connect and login
             return AsyncIggyTcpClient.builder()
-                    .host(host)
-                    .port(port)
+                    .host(endpoint.host())
+                    .port(endpoint.port())
                     .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
                     .connectionPoolSize(4)
                     .buildAndLogin()

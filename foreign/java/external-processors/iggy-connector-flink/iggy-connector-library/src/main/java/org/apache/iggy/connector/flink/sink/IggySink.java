@@ -25,31 +25,32 @@ import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
+import org.apache.iggy.connector.config.TcpEndpoint;
 import org.apache.iggy.connector.serialization.SerializationSchema;
 
 import java.io.IOException;
 import java.io.Serializable;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.time.Duration;
 
 /**
  * Flink Sink implementation for writing to Iggy streams.
  * Implements the Flink Sink V2 API for integration with DataStream API.
  *
- * <p>Example usage:
+ * <p>
+ * Example usage:
+ *
  * <pre>{@code
  * events.sinkTo(
- *     IggySink.<Event>builder()
- *         .setConnectionConfig(connectionConfig)
- *         .setStreamId("my-stream")
- *         .setTopicId("my-topic")
- *         .setSerializer(new JsonSerializationSchema<>())
- *         .setBatchSize(100)
- *         .setFlushInterval(Duration.ofSeconds(5))
- *         .withBalancedPartitioning()
- *         .build()
- * ).name("Iggy Sink");
+ *         IggySink.<Event>builder()
+ *                 .setConnectionConfig(connectionConfig)
+ *                 .setStreamId("my-stream")
+ *                 .setTopicId("my-topic")
+ *                 .setSerializer(new JsonSerializationSchema<>())
+ *                 .setBatchSize(100)
+ *                 .setFlushInterval(Duration.ofSeconds(5))
+ *                 .withBalancedPartitioning()
+ *                 .build())
+ *         .name("Iggy Sink");
  * }</pre>
  *
  * @param <T> the type of records to write
@@ -70,12 +71,12 @@ public class IggySink<T> implements Sink<T>, Serializable {
      * Creates a new Iggy sink.
      * Use {@link #builder()} to construct instances.
      *
-     * @param connectionConfig the connection configuration
-     * @param streamId the stream identifier
-     * @param topicId the topic identifier
-     * @param serializer the serialization schema
-     * @param batchSize the batch size for buffering
-     * @param flushInterval the maximum flush interval
+     * @param connectionConfig     the connection configuration
+     * @param streamId             the stream identifier
+     * @param topicId              the topic identifier
+     * @param serializer           the serialization schema
+     * @param batchSize            the batch size for buffering
+     * @param flushInterval        the maximum flush interval
      * @param partitioningStrategy the partitioning strategy
      */
     public IggySink(
@@ -120,18 +121,11 @@ public class IggySink<T> implements Sink<T>, Serializable {
      */
     private IggyTcpClient createTcpClient() {
         try {
-            String serverAddress = connectionConfig.getServerAddress();
-            URI uri = serverAddress.contains("://") ? new URI(serverAddress) : new URI("tcp://" + serverAddress);
-
-            String host = uri.getHost();
-            if (host == null) {
-                throw new IllegalArgumentException("Cannot extract host from: " + serverAddress);
-            }
-            int port = uri.getPort() >= 0 ? uri.getPort() : 8090;
+            TcpEndpoint endpoint = TcpEndpoint.parse(connectionConfig.getServerAddress());
 
             return IggyTcpClient.builder()
-                    .host(host)
-                    .port(port)
+                    .host(endpoint.host())
+                    .port(endpoint.port())
                     .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
                     .connectionTimeout(connectionConfig.getConnectionTimeout())
                     .requestTimeout(connectionConfig.getRequestTimeout())
@@ -139,9 +133,6 @@ public class IggySink<T> implements Sink<T>, Serializable {
                             connectionConfig.getMaxRetries(), connectionConfig.getRetryBackoff()))
                     .tls(connectionConfig.isEnableTls())
                     .buildAndLogin();
-
-        } catch (URISyntaxException e) {
-            throw new RuntimeException("Invalid server address format: " + connectionConfig.getServerAddress(), e);
         } catch (RuntimeException e) {
             throw new RuntimeException("Failed to create TCP Iggy client", e);
         }

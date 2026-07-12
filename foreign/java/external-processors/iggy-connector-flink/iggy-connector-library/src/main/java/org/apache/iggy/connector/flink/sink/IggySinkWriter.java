@@ -179,10 +179,10 @@ public class IggySinkWriter<T> implements SinkWriter<T> {
 
     @Override
     public void close() throws Exception {
-        Exception flushException = null;
+        IOException flushException = null;
         try {
             flush(true);
-        } catch (Exception e) {
+        } catch (IOException e) {
             flushException = e;
         }
 
