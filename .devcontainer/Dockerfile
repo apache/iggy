@@ -21,21 +21,28 @@ ARG RUST_VERSION=1.96
 FROM rust:${RUST_VERSION}-slim-trixie
 
 # Build + runtime dependencies mirror the production Dockerfile builder
-# stage (native TLS, hwloc topology, udev) plus the Node.js toolchain the
-# web UI build requires. git/curl/sudo/pkg-config round out the dev shell.
+# stage (native TLS, hwloc topology, udev). git/curl/gnupg/sudo/pkg-config
+# round out the dev shell.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
     git \
+    gnupg \
     pkg-config \
     libssl-dev \
     libhwloc-dev \
     libudev-dev \
     liblzma5 \
-    nodejs \
-    npm \
     sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin Node.js to the major version CI uses to build the web UI
+# (.github/workflows/_build_rust_artifacts.yml). NodeSource ships nodejs
+# with a bundled npm, so Debian's unversioned packages are not used.
+ARG NODE_VERSION=22
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-fetch the pinned toolchain components (rustfmt, clippy) so the first

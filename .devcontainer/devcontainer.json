@@ -1,5 +1,10 @@
 {
   "name": "Apache Iggy",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
   "build": {
     "dockerfile": "Dockerfile",
     "context": "..",
@@ -11,12 +16,18 @@
   "remoteUser": "vscode",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/iggy,type=bind,consistency=cached",
   "workspaceFolder": "/workspaces/iggy",
-  "runArgs": ["--init"],
+  "runArgs": [
+    "--init",
+    "--security-opt", "seccomp=unconfined",
+    "--ulimit", "memlock=-1:-1",
+    "--cap-add=SYS_NICE"
+  ],
   "mounts": [
     "type=volume,source=iggy-cargo-registry,target=/usr/local/cargo/registry",
     "type=volume,source=iggy-target,target=/workspaces/iggy/target"
   ],
   "containerEnv": {
+    "CARGO_BUILD_JOBS": "4",
     "IGGY_HTTP_ADDRESS": "0.0.0.0:3000",
     "IGGY_QUIC_ADDRESS": "0.0.0.0:8080",
     "IGGY_TCP_ADDRESS": "0.0.0.0:8090",
@@ -41,8 +52,10 @@
         "ms-azuretools.vscode-docker"
       ],
       "settings": {
-        "rust-analyzer.check.command": "clippy",
-        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.cargo.buildScripts.enable": true,
+        "rust-analyzer.procMacro.enable": true,
+        "rust-analyzer.numThreads": 4,
+        "rust-analyzer.cargo.extraEnv": { "CARGO_BUILD_JOBS": "4" },
         "editor.formatOnSave": true,
         "[rust]": {
           "editor.defaultFormatter": "rust-lang.rust-analyzer"
