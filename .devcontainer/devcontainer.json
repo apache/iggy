@@ -1,0 +1,53 @@
+{
+  "name": "Apache Iggy",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      "RUST_VERSION": "1.96"
+    }
+  },
+  "features": {},
+  "remoteUser": "vscode",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/iggy,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/iggy",
+  "runArgs": ["--init"],
+  "mounts": [
+    "type=volume,source=iggy-cargo-registry,target=/usr/local/cargo/registry",
+    "type=volume,source=iggy-target,target=/workspaces/iggy/target"
+  ],
+  "containerEnv": {
+    "IGGY_HTTP_ADDRESS": "0.0.0.0:3000",
+    "IGGY_QUIC_ADDRESS": "0.0.0.0:8080",
+    "IGGY_TCP_ADDRESS": "0.0.0.0:8090",
+    "IGGY_WEBSOCKET_ADDRESS": "0.0.0.0:8092"
+  },
+  "forwardPorts": [3000, 3050, 8080, 8090, 8092],
+  "portsAttributes": {
+    "3000": { "label": "HTTP (REST)" },
+    "3050": { "label": "Web UI (vite dev)" },
+    "8080": { "label": "QUIC" },
+    "8090": { "label": "TCP (binary)" },
+    "8092": { "label": "WebSocket" }
+  },
+  "postCreateCommand": "sudo chown -R vscode:vscode target /usr/local/cargo/registry 2>/dev/null; rustup show && npm --prefix web ci",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb",
+        "svelte.svelte-vscode",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.cargo.features": "all",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  }
+}
