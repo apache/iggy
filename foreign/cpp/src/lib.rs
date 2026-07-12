@@ -500,6 +500,7 @@ mod ffi {
         fn update_permissions(
             self: &Client,
             user_id: Identifier,
+            has_permissions: bool,
             permissions: Permissions,
         ) -> Result<()>;
         fn change_password(

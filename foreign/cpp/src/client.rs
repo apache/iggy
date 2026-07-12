@@ -1087,12 +1087,16 @@ impl Client {
     pub fn update_permissions(
         &self,
         user_id: ffi::Identifier,
+        has_permissions: bool,
         permissions: ffi::Permissions,
     ) -> Result<(), String> {
         let rust_user_id = RustIdentifier::try_from(user_id).map_err(|error| {
             format!("Could not update permissions: invalid user identifier: {error}")
         })?;
-        let rust_permissions = Some(RustPermissions::from(permissions));
+        let rust_permissions = has_permissions
+            .then(|| RustPermissions::try_from(permissions))
+            .transpose()
+            .map_err(|error| format!("Could not update permissions: {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner

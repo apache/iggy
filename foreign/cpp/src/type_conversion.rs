@@ -258,22 +258,23 @@ impl From<ffi::TopicPermissions> for RustTopicPermissions {
     }
 }
 
-impl From<ffi::StreamPermissions> for RustStreamPermissions {
-    fn from(permissions: ffi::StreamPermissions) -> Self {
-        let topics = if permissions.topics.is_empty() {
-            None
-        } else {
-            Some(BTreeMap::from_iter(permissions.topics.into_iter().map(
-                |entry| {
-                    (
-                        entry.topic_id as usize,
-                        RustTopicPermissions::from(entry.permissions),
-                    )
-                },
-            )))
-        };
+impl TryFrom<ffi::StreamPermissions> for RustStreamPermissions {
+    type Error = String;
 
-        RustStreamPermissions {
+    fn try_from(permissions: ffi::StreamPermissions) -> Result<Self, Self::Error> {
+        let mut topics = BTreeMap::new();
+        for entry in permissions.topics {
+            let topic_id = entry.topic_id as usize;
+            if topics
+                .insert(topic_id, RustTopicPermissions::from(entry.permissions))
+                .is_some()
+            {
+                return Err(format!("duplicate topic permission ID: {topic_id}"));
+            }
+        }
+        let topics = (!topics.is_empty()).then_some(topics);
+
+        Ok(RustStreamPermissions {
             manage_stream: permissions.manage_stream,
             read_stream: permissions.read_stream,
             manage_topics: permissions.manage_topics,
@@ -281,29 +282,28 @@ impl From<ffi::StreamPermissions> for RustStreamPermissions {
             poll_messages: permissions.poll_messages,
             send_messages: permissions.send_messages,
             topics,
-        }
+        })
     }
 }
 
-impl From<ffi::Permissions> for RustPermissions {
-    fn from(permissions: ffi::Permissions) -> Self {
-        let streams = if permissions.streams.is_empty() {
-            None
-        } else {
-            Some(BTreeMap::from_iter(permissions.streams.into_iter().map(
-                |entry| {
-                    (
-                        entry.stream_id as usize,
-                        RustStreamPermissions::from(entry.permissions),
-                    )
-                },
-            )))
-        };
+impl TryFrom<ffi::Permissions> for RustPermissions {
+    type Error = String;
 
-        RustPermissions {
+    fn try_from(permissions: ffi::Permissions) -> Result<Self, Self::Error> {
+        let mut streams = BTreeMap::new();
+        for entry in permissions.streams {
+            let stream_id = entry.stream_id as usize;
+            let stream_permissions = RustStreamPermissions::try_from(entry.permissions)?;
+            if streams.insert(stream_id, stream_permissions).is_some() {
+                return Err(format!("duplicate stream permission ID: {stream_id}"));
+            }
+        }
+        let streams = (!streams.is_empty()).then_some(streams);
+
+        Ok(RustPermissions {
             global: RustGlobalPermissions::from(permissions.global),
             streams,
-        }
+        })
     }
 }
 
