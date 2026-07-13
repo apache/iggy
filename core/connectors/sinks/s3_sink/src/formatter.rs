@@ -308,6 +308,29 @@ mod tests {
     }
 
     #[test]
+    fn json_lines_with_bson_payload_preserves_document() {
+        let payload = Payload::Bson(bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "nested": {
+                "active": true
+            }
+        });
+        let msg = make_message(10, payload);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let bytes = format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines)
+            .expect("BSON payload should format as JSON Lines");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("formatted message should be valid JSON");
+
+        assert_eq!(value["payload"]["name"], "iggy");
+        assert_eq!(value["payload"]["count"], 42);
+        assert_eq!(value["payload"]["nested"]["active"], true);
+    }
+
+    #[test]
     fn json_lines_with_headers() {
         let payload = make_json_payload(r#"{"data":1}"#);
         let mut msg = make_message(5, payload);

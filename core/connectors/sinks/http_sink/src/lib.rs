@@ -1524,6 +1524,26 @@ mod tests {
     }
 
     #[test]
+    fn given_bson_payload_should_convert_to_json_document() {
+        let sink = given_sink_with_defaults();
+        let payload = Payload::Bson(bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "nested": {
+                "active": true
+            }
+        });
+
+        let result = sink
+            .payload_to_json(payload)
+            .expect("BSON document should convert to JSON");
+
+        assert_eq!(result["name"], "iggy");
+        assert_eq!(result["count"], 42);
+        assert_eq!(result["nested"]["active"], true);
+    }
+
+    #[test]
     fn given_text_payload_should_convert_to_string_value() {
         let sink = given_sink_with_defaults();
         let result = sink
