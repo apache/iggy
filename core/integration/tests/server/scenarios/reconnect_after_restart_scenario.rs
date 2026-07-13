@@ -558,7 +558,9 @@ pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
     let survivors = poll_from_zero_until(&client, 10, Duration::from_secs(30)).await;
     assert_eq!(
         survivors,
-        (0..10).map(|i| format!("pre-outage-{i}")).collect::<Vec<_>>(),
+        (0..10)
+            .map(|i| format!("pre-outage-{i}"))
+            .collect::<Vec<_>>(),
         "flushed messages must survive a full-cluster restart"
     );
 
