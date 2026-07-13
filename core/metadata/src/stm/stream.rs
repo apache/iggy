@@ -23,7 +23,7 @@ use crate::stm::consumer_group::{
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, PurgeStreamResult,
-    PurgeTopicResult, UpdateStreamResult, UpdateTopicResult,
+    PurgeTopicResult, TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
@@ -542,27 +542,29 @@ impl WireDecode for TruncatePartitionRequest {
 impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        // Internal op (no client result enum): a missing parent / partition is
-        // an idempotent no-op, like the other reconciler-fed internal ops.
+        // The committed form of a client `DeleteSegments`: an unresolvable
+        // target commits as a rejection, keeping the client's request
+        // sequence contiguous (`request == committed + 1`) while surfacing
+        // the typed error an empty ack would swallow.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
             let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
             let Some(stream) = state.items.get_mut(stream_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
             let Some(topic) = stream.topics.get_mut(topic_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
             let Some(partition) = topic
                 .partitions
                 .iter_mut()
                 .find(|partition| partition.id == self.partition_id as usize)
             else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::PartitionNotFound);
             };
             // Monotonic: a stale or duplicate replay never rewinds the watermark.
             if self.up_to_offset > partition.deleted_up_to_offset {

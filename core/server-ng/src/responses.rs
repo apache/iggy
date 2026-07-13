@@ -77,7 +77,7 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{Identifier, IggyError, IggyTimestamp, MaxTopicSize};
+use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
@@ -87,7 +87,8 @@ use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
+use sysinfo::System as SysinfoSystem;
+use system_stats::SystemProbe;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -540,12 +541,23 @@ fn build_cluster_metadata_response(
     roster: &ClusterRoster,
     shard: &Rc<ServerNgShard>,
 ) -> ClusterMetadataResponse {
+    // Shard 0 reads its live consensus; delegated shards use the view shard 0
+    // publishes into the roster, so leader marking works on every shard.
     let primary_index = shard
         .plane
         .metadata()
         .consensus
         .as_ref()
-        .map(|consensus| consensus.primary_index(consensus.view()));
+        .and_then(|consensus| {
+            let primary_index = consensus.primary_index(consensus.view());
+            // A restarted replica that ceded the primaryship its stale view
+            // assigns it must not advertise itself as leader: clients would
+            // pin to a node that never heartbeats. Report "no leader" until
+            // the election resolves the role.
+            (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
+                .then_some(primary_index)
+        })
+        .or_else(|| roster.current_primary_index());
     let metadata = roster.cluster_metadata(primary_index);
     ClusterMetadataResponse {
         name: metadata.name,
@@ -716,50 +728,32 @@ impl HostIdentity {
 static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 
 fn probe_system_stats() -> SystemStats {
-    let process_id = std::process::id();
     let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
-    SYSINFO.with_borrow_mut(|slot| {
-        let sys = slot.get_or_insert_with(SysinfoSystem::new_all);
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
+    let probe = SYSINFO.with_borrow_mut(|slot| {
+        let sys = slot.get_or_insert_with(SysinfoSystem::new);
+        SystemProbe::capture(sys)
+    });
 
-        let mut stats = SystemStats {
-            process_id,
-            cpu_usage: 0.0,
-            total_cpu_usage: sys.global_cpu_usage(),
-            memory_usage: 0,
-            total_memory: sys.total_memory(),
-            available_memory: sys.available_memory(),
-            run_time: 0,
-            start_time: 0,
-            read_bytes: 0,
-            written_bytes: 0,
-            threads_count: 0,
-            hostname: host.hostname.clone(),
-            os_name: host.os_name.clone(),
-            os_version: host.os_version.clone(),
-            kernel_version: host.kernel_version.clone(),
-        };
-
-        if let Some(process) = sys.process(Pid::from_u32(process_id)) {
-            stats.cpu_usage = process.cpu_usage();
-            stats.memory_usage = process.memory();
-            // sysinfo reports whole seconds; the wire fields are micros (the
-            // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
-            // micro-based).
-            stats.run_time = process.run_time().saturating_mul(1_000_000);
-            stats.start_time = process.start_time().saturating_mul(1_000_000);
-            let disk_usage = process.disk_usage();
-            stats.read_bytes = disk_usage.total_read_bytes;
-            stats.written_bytes = disk_usage.total_written_bytes;
-            stats.threads_count = process
-                .tasks()
-                .map_or(0, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX));
-        }
-
-        stats
-    })
+    SystemStats {
+        process_id: probe.process_id,
+        cpu_usage: probe.cpu_usage,
+        total_cpu_usage: probe.total_cpu_usage,
+        memory_usage: probe.memory_usage,
+        total_memory: probe.total_memory,
+        available_memory: probe.available_memory,
+        // sysinfo reports whole seconds; the wire fields are micros (the
+        // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
+        // micro-based).
+        run_time: probe.run_time_secs.saturating_mul(1_000_000),
+        start_time: probe.start_time_secs.saturating_mul(1_000_000),
+        read_bytes: probe.read_bytes,
+        written_bytes: probe.written_bytes,
+        threads_count: probe.threads_count,
+        hostname: host.hostname.clone(),
+        os_name: host.os_name.clone(),
+        os_version: host.os_version.clone(),
+        kernel_version: host.kernel_version.clone(),
+    }
 }
 
 fn build_get_stream_response(
@@ -1296,6 +1290,7 @@ pub(crate) fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
     fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
     // Body head: [partition_id:4][current_offset:8][count:4]. `count` sits at
     // COUNT_OFFSET and is backpatched once the walk below knows it.
@@ -1363,20 +1358,56 @@ pub(crate) fn build_polled_messages_body(
             body.extend_from_slice(&offset.to_le_bytes());
             body.extend_from_slice(&timestamp.to_le_bytes());
             body.extend_from_slice(&origin_timestamp.to_le_bytes());
-            body.extend_from_slice(
-                &u32::try_from(user_headers_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(
-                &u32::try_from(payload_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(&0u64.to_le_bytes()); // reserved
-            // Stored sections are already in legacy order
-            // (`[payload][user_headers]`): copy through contiguously.
-            body.extend_from_slice(&stream[sections_start..sections_end]);
+            if let Some(encryptor) = encryptor {
+                // At-rest encryption: stored sections are ciphertext (encrypted
+                // once at ingestion, replicated verbatim); this reply is the
+                // single decrypt point, so lengths are rewritten to the
+                // plaintext sizes. The stored per-message checksum still covers
+                // the ciphertext and is passed through untouched (the SDK does
+                // not re-validate it against the reply layout).
+                let payload_end = sections_start + payload_length;
+                let payload = encryptor
+                    .decrypt(&stream[sections_start..payload_end])
+                    .map_err(|_| IggyError::CannotDecryptData)?;
+                let user_headers = if user_headers_length > 0 {
+                    Some(
+                        encryptor
+                            .decrypt(&stream[payload_end..sections_end])
+                            .map_err(|_| IggyError::CannotDecryptData)?,
+                    )
+                } else {
+                    None
+                };
+                let user_headers_bytes: &[u8] = user_headers.as_deref().unwrap_or_default();
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_bytes.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                body.extend_from_slice(&payload);
+                body.extend_from_slice(user_headers_bytes);
+            } else {
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                // Stored sections are already in legacy order
+                // (`[payload][user_headers]`): copy through contiguously.
+                body.extend_from_slice(&stream[sections_start..sections_end]);
+            }
 
             count += 1;
             cursor = sections_end;

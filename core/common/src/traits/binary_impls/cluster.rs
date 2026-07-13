@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::cluster_metadata_from_wire;
 use crate::{BinaryClient, ClusterClient, ClusterMetadata, IggyError};
 use iggy_binary_protocol::codec::WireEncode;
@@ -26,7 +25,6 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetada
 #[async_trait::async_trait]
 impl<B: BinaryClient> ClusterClient for B {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-        fail_if_not_authenticated(self).await?;
         let response = self
             .send_raw_with_response(
                 GET_CLUSTER_METADATA_CODE,

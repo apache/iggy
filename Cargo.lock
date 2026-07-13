@@ -6588,7 +6588,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.10.1-edge.2"
+version = "0.10.2-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6751,6 +6751,7 @@ dependencies = [
  "serde_yaml_ng",
  "strum 0.28.0",
  "sysinfo 0.39.5",
+ "system_stats",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -6797,7 +6798,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.1-edge.2"
+version = "0.10.2-edge.1"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6809,7 +6810,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.10.1-edge.2"
+version = "0.10.2-edge.1"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -11685,7 +11686,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.1-edge.1"
+version = "0.8.2-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -11698,7 +11699,6 @@ dependencies = [
  "clap",
  "compio",
  "configs",
- "cpu_allocation",
  "ctrlc",
  "cyper",
  "cyper-axum",
@@ -11737,8 +11737,10 @@ dependencies = [
  "socket2 0.6.4",
  "strum 0.28.0",
  "sysinfo 0.39.5",
+ "system_stats",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tower-http 0.7.0",
  "tracing",
@@ -11808,6 +11810,7 @@ dependencies = [
  "secrecy",
  "send_wrapper",
  "serde",
+ "serde_json",
  "server_common",
  "shard",
  "shard_allocator",
@@ -11815,6 +11818,7 @@ dependencies = [
  "socket2 0.6.4",
  "strum 0.28.0",
  "sysinfo 0.39.5",
+ "system_stats",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -12755,6 +12759,15 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "system_stats"
+version = "0.1.0"
+dependencies = [
+ "cpu_allocation",
+ "sysinfo 0.39.5",
+ "tempfile",
 ]
 
 [[package]]

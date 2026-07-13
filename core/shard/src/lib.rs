@@ -27,8 +27,8 @@ pub use config::CoordinatorConfig;
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind, Sequencer,
-    VsrAction, VsrConsensus,
+    CommitOutcome, Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
+    PlaneKind, Sequencer, VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
@@ -278,8 +278,16 @@ pub enum PartitionReadReply {
     Ack,
     /// Reply to [`PartitionRead::ResolveSegmentDeleteOffset`]: the resolved
     /// truncation offset, or `None` when the partition has no sealed segments
-    /// to delete.
-    SegmentDeleteOffset { up_to_offset: Option<u64> },
+    /// to delete. `lagging` means this replica has not converged on the
+    /// replicated log (follower, mid-view-change, or `commit_min` behind
+    /// `commit_max`): a `None` offset is then transient rather than a settled
+    /// no-op, since sealed segments may exist that this replica has not
+    /// learned about. A converged replica's committed-but-unflushed resident
+    /// tail does NOT make the no-op transient.
+    SegmentDeleteOffset {
+        up_to_offset: Option<u64>,
+        lagging: bool,
+    },
     /// The owning shard has no materialised partition for the namespace
     /// (unknown, tombstoned, or mid-reconcile). Callers surface an error
     /// instead of an empty result.
@@ -1718,6 +1726,12 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StreamsFrontend
+            + StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = metadata::stm::result::ApplyReply,
+                Error = iggy_common::IggyError,
+            >,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -1727,9 +1741,21 @@ where
         {
             let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            // `dispatch_vsr_actions` deliberately no-ops `CommitJournal` (it
+            // needs the plane); without this the ops a StartView marks
+            // committed stay journaled-but-unapplied forever, because the
+            // follow-up heartbeats see commit_max already advanced and skip
+            // their own commit_journal.
+            if actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::CommitJournal))
+            {
+                planes.0.commit_journal().await;
+            }
             return;
         }
 
+        let config = planes.1.0.config();
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
             header.namespace,
@@ -1743,6 +1769,12 @@ where
         let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
         dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
         dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        if actions
+            .iter()
+            .any(|action| matches!(action, VsrAction::CommitJournal))
+        {
+            partition.commit_journal(config).await;
+        }
     }
 
     #[allow(clippy::future_not_send)]
@@ -1768,8 +1800,12 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.namespace() == header.namespace
         {
-            if consensus.handle_commit(&header) {
-                planes.0.commit_journal().await;
+            match consensus.handle_commit(&header) {
+                CommitOutcome::Advanced => planes.0.commit_journal().await,
+                CommitOutcome::RespondStartView => {
+                    respond_start_view::<B, _, MJ>(consensus).await;
+                }
+                CommitOutcome::Accepted => {}
             }
             return;
         }
@@ -1785,8 +1821,12 @@ where
             return;
         };
         let consensus = partition.consensus();
-        if consensus.handle_commit(&header) {
-            partition.commit_journal(config).await;
+        match consensus.handle_commit(&header) {
+            CommitOutcome::Advanced => partition.commit_journal(config).await,
+            CommitOutcome::RespondStartView => {
+                respond_start_view::<B, _, MJ>(consensus).await;
+            }
+            CommitOutcome::Accepted => {}
         }
     }
 
@@ -1825,6 +1865,34 @@ where
         }
     }
 
+    /// Flush every owned partition's committed journal prefix to segment
+    /// storage. Pump-shutdown counterpart of the commit-time persist gate:
+    /// a graceful stop must not lose committed messages still resident in
+    /// the in-memory journal (mirrors the legacy pump's final flush).
+    #[allow(clippy::future_not_send)]
+    pub async fn flush_partitions(&self)
+    where
+        B: MessageBus,
+    {
+        let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            if let Err(error) = partition
+                .flush_committed_messages(partitions.config())
+                .await
+            {
+                tracing::warn!(
+                    namespace_raw = namespace.inner(),
+                    %error,
+                    "failed to flush partition journal on shutdown"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::future_not_send)]
     pub async fn tick_metadata(&self)
     where
@@ -1857,6 +1925,36 @@ where
         // `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
     }
+}
+
+/// Broadcast a `StartView` for the current view, answering a replica that
+/// still heartbeats an older view (see `CommitOutcome::RespondStartView`).
+#[allow(clippy::future_not_send)]
+async fn respond_start_view<B, P, J>(consensus: &VsrConsensus<B, P>)
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    <J as JournalHandle>::Target: Journal<
+            <J as JournalHandle>::Storage,
+            Entry = Message<PrepareHeader>,
+            Header = PrepareHeader,
+        >,
+{
+    tracing::info!(
+        view = consensus.view(),
+        op = consensus.sequencer().current_sequence(),
+        commit = consensus.commit_max(),
+        namespace = consensus.namespace(),
+        "answering stale-view heartbeat with StartView"
+    );
+    let action = VsrAction::SendStartView {
+        view: consensus.view(),
+        op: consensus.sequencer().current_sequence(),
+        commit: consensus.commit_max(),
+        namespace: consensus.namespace(),
+    };
+    dispatch_vsr_actions::<B, P, J>(consensus, None, &[action]).await;
 }
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate

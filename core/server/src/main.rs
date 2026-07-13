@@ -57,6 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use system_stats::capture_allowed_cpus;
 use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";
@@ -116,6 +117,9 @@ fn print_ascii_art(text: &str) {
 
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
+    // Before shard threads pin themselves: a pinned capture sees one core.
+    capture_allowed_cpus();
+
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

@@ -95,7 +95,11 @@ pub async fn run(harness: &mut TestHarness) {
         .await
         .unwrap();
 
-    // Explicitly flush to disk, then wait for message_saver to persist
+    // Explicitly flush to disk, then wait for message_saver to persist.
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // its graceful shutdown flushes the committed journal, which this
+    // scenario's restart exercises instead.
+    #[cfg(not(feature = "vsr"))]
     setup_client
         .flush_unsaved_buffer(
             &stream_id, &topic_id, 0, true, // fsync
