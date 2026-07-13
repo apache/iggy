@@ -6946,6 +6946,7 @@ version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "bytes",
  "humantime",
  "iggy_connector_sdk",
@@ -7122,6 +7123,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "byte-unit",
  "chrono",
  "dashmap",
@@ -7192,6 +7194,7 @@ version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "bytes",
  "iggy_common",
  "iggy_connector_sdk",

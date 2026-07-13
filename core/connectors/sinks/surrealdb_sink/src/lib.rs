@@ -1627,6 +1627,27 @@ mod tests {
     }
 
     #[test]
+    fn given_auto_payload_bson_should_store_document_bytes_as_base64() {
+        let bson_document = bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "active": true
+        };
+        let expected_bytes = bson_document
+            .to_vec()
+            .expect("BSON document should serialize");
+
+        let document = build_auto_payload_document(Payload::Bson(bson_document))
+            .expect("BSON payload should build");
+
+        assert_eq!(document.encoding, ENCODING_BASE64);
+        assert_eq!(
+            document.value,
+            Value::String(general_purpose::STANDARD.encode(expected_bytes))
+        );
+    }
+
+    #[test]
     fn given_json_payload_format_should_parse_raw_json() {
         let payload = Payload::Raw(br#"{"count":3}"#.to_vec());
         let document = build_json_payload_document(payload).expect("Failed to build payload");
