@@ -82,15 +82,4 @@ public sealed class MessageResponse
             _userHeadersInitialized = false;
         }
     }
-
-    internal void ParseUserHeaders()
-    {
-        if (!_userHeadersInitialized)
-        {
-            _userHeaders = _rawUserHeaders is { Length: > 0 }
-                ? BinaryMapper.TryMapHeaders(_rawUserHeaders)
-                : null;
-            _userHeadersInitialized = true;
-        }
-    }
 }

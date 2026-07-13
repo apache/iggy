@@ -55,7 +55,7 @@ public sealed class ReceivedMessage<T>
     public uint PartitionId { get; init; }
 
     /// <summary>
-    ///     The status of the message (Success, DecryptionFailed, DeserializationFailed).
+    ///     The status of the message (Success, DeserializationFailed).
     /// </summary>
     public MessageStatus Status { get; init; } = MessageStatus.Success;
 
@@ -86,7 +86,7 @@ public class ReceivedMessage
     public uint PartitionId { get; init; }
 
     /// <summary>
-    ///     The status of the message (Success, DecryptionFailed, DeserializationFailed)
+    ///     The status of the message (Success, DeserializationFailed)
     /// </summary>
     public MessageStatus Status { get; init; } = MessageStatus.Success;
 
