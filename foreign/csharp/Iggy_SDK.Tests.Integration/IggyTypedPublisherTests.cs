@@ -27,6 +27,7 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Publishers;
+using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -244,19 +245,24 @@ public class IggyTypedPublisherTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendAsync_WithEncryptor_Should_RoundTrip_Decrypted(Protocol protocol)
     {
-        var client = await Client(protocol);
-        var stream = await CreateTestStream(client, protocol);
         var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
 
-        IggyPublisher<string> publisher
-            = BuildTypedPublisher(client, stream, new Utf8StringSerializer(), encryptor: encryptor);
+        // Encryption is configured on the client. The publisher uses an encrypting client; a plain client polls
+        // to prove the wire bytes are ciphertext, then decrypts manually.
+        var encryptingClient = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient(encryptor: encryptor)
+            : await Fixture.CreateHttpClient(encryptor: encryptor);
+        var plainClient = await Client(protocol);
+        var stream = await CreateTestStream(plainClient, protocol);
+
+        IggyPublisher<string> publisher = BuildTypedPublisher(encryptingClient, stream, new Utf8StringSerializer());
         await publisher.InitAsync();
 
         await publisher.SendAsync("secret-payload");
 
-        var message = (await Poll(client, stream, 1)).ShouldHaveSingleItem();
+        var message = (await Poll(plainClient, stream, 1)).ShouldHaveSingleItem();
         Encoding.UTF8.GetString(message.Payload).ShouldNotBe("secret-payload");
-        Encoding.UTF8.GetString(encryptor.Decrypt(message.Payload)).ShouldBe("secret-payload");
+        Encoding.UTF8.GetString(encryptor.DecryptToArray(message.Payload)).ShouldBe("secret-payload");
 
         await publisher.DisposeAsync();
     }
@@ -293,7 +299,7 @@ public class IggyTypedPublisherTests
 
     // Base fluent methods return the non-generic builder, so apply them as statements to keep the typed Build().
     private static IggyPublisher<T> BuildTypedPublisher<T>(IIggyClient client, TestStreamInfo stream,
-        ISerializer<T> serializer, bool background = false, IMessageEncryptor? encryptor = null)
+        ISerializer<T> serializer, bool background = false)
     {
         IggyPublisherBuilder<T> builder = IggyPublisherBuilder<T>.Create(client, Identifier.String(stream.StreamId),
             Identifier.String(stream.TopicId), serializer);
@@ -301,11 +307,6 @@ public class IggyTypedPublisherTests
         if (background)
         {
             builder.WithBackgroundSending(true, 1000, 10, TimeSpan.FromMilliseconds(50));
-        }
-
-        if (encryptor != null)
-        {
-            builder.WithEncryptor(encryptor);
         }
 
         return builder.Build();

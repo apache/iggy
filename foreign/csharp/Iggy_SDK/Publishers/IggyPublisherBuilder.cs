@@ -33,6 +33,8 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
+    private IMessageEncryptor? _encryptor;
+
     internal Func<PublisherErrorEventArgs, Task>? OnBackgroundError { get; set; }
     internal Func<MessageBatchFailedEventArgs, Task>? OnMessageBatchFailed { get; set; }
 
@@ -161,7 +163,10 @@ public class IggyPublisherBuilder
     /// <param name="topicPartitionsCount">The number of partitions for the topic. Default is 1.</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages in the topic. Default is None.</param>
     /// <param name="replicationFactor">The replication factor for the topic. Null means server default.</param>
-    /// <param name="messageExpiry">The message expiry time. TimeSpan.Zero uses the server default, TimeSpan.MaxValue never expires. Default is TimeSpan.Zero.</param>
+    /// <param name="messageExpiry">
+    ///     The message expiry time. TimeSpan.Zero uses the server default, TimeSpan.MaxValue never
+    ///     expires. Default is TimeSpan.Zero.
+    /// </param>
     /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 for unlimited). Default is 0.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
@@ -180,13 +185,18 @@ public class IggyPublisherBuilder
     }
 
     /// <summary>
-    ///     Configures message encryption using the specified encryptor.
+    ///     Configures message encryption on the client this builder creates. Encryption is a client-level concern:
+    ///     the encryptor encrypts on send and decrypts on poll for the whole connection. Only valid when the
+    ///     builder creates its own client; when an external client is supplied, configure the encryptor on that
+    ///     client via <see cref="Configuration.IggyClientConfigurator.MessageEncryptor" /> instead.
+    ///     The caller owns the encryptor and must dispose it after the publisher is disposed; the builder never
+    ///     disposes it (the same instance may be shared across clients).
     /// </summary>
-    /// <param name="encryptor">The message encryptor to use for encrypting message payloads.</param>
+    /// <param name="encryptor">The message encryptor to use.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithEncryptor(IMessageEncryptor encryptor)
     {
-        Config.MessageEncryptor = encryptor;
+        _encryptor = encryptor;
 
         return this;
     }
@@ -242,7 +252,10 @@ public class IggyPublisherBuilder
     ///     When enabled, messages are queued and sent in batches for improved throughput.
     /// </summary>
     /// <param name="enabled">Whether background sending is enabled. Default is true.</param>
-    /// <param name="queueCapacity">The maximum number of queued send calls; each send occupies one slot regardless of how many messages its batch contains. Default is 10,000.</param>
+    /// <param name="queueCapacity">
+    ///     The maximum number of queued send calls; each send occupies one slot regardless of how many
+    ///     messages its batch contains. Default is 10,000.
+    /// </param>
     /// <param name="batchSize">The number of messages to send in each batch. Default is 100.</param>
     /// <param name="flushInterval">The interval at which to flush pending messages. Default is 100ms.</param>
     /// <param name="disposalTimeout">
@@ -292,7 +305,8 @@ public class IggyPublisherBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
-                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
+                MessageEncryptor = _encryptor
             });
         }
 
@@ -341,6 +355,13 @@ public class IggyPublisherBuilder
             if (IggyClient == null)
             {
                 throw new InvalidOperationException("IggyClient must be provided when CreateIggyClient is false.");
+            }
+
+            if (_encryptor != null)
+            {
+                throw new InvalidOperationException(
+                    "WithEncryptor is only valid when the builder creates its own client. " +
+                    "Configure IggyClientConfigurator.MessageEncryptor on the supplied client instead.");
             }
         }
 
