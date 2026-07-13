@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Encryption;
+
 namespace Apache.Iggy.IggyClient;
 
 /// <summary>
@@ -25,6 +27,13 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
     IIggySystem, IIggyPartition, IIggySegment, IIggyUsers, IIggyPersonalAccessToken, IDisposable
 {
+    /// <summary>
+    ///     The message encryptor configured on this client, or null when encryption is disabled. When set, the client
+    ///     encrypts on send and decrypts on poll for the whole connection. Defaults to null so existing
+    ///     implementations keep compiling.
+    /// </summary>
+    IMessageEncryptor? MessageEncryptor => null;
+
     /// <summary>
     ///     Subscribes to connection state change events.
     /// </summary>
