@@ -101,6 +101,11 @@ pub const PIPELINE_REQUEST_QUEUE_MAX: usize = 64;
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
+/// Unanswered `RequestStartView` probes tolerated before a recovering
+/// replica gives up waiting for a settled primary and falls back to an
+/// election (a full-cluster restart leaves nobody able to answer).
+pub const PROBE_ATTEMPTS_MAX: u32 = 5;
+
 /// Maximum number of clients tracked in the clients table.
 /// When exceeded, the client with the oldest committed request is evicted.
 pub const CLIENTS_TABLE_MAX: usize = 8192;
@@ -702,6 +707,9 @@ where
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
+    /// Consecutive unanswered `RequestStartView` probes while Recovering;
+    /// at [`PROBE_ATTEMPTS_MAX`] the replica falls back to an election.
+    probe_attempts: Cell<u32>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -770,6 +778,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX)),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
+            probe_attempts: Cell::new(0),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
@@ -1204,24 +1213,49 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             //   backstop burns a fresh cluster-wide election. The would-be
             //   primary of the view skips the probe (it concludes the view
             //   itself or escalates).
-            let probing = match self.status.get() {
-                Status::Recovering => true,
-                Status::ViewChange => self.primary_index(self.view.get()) != self.replica,
-                Status::Normal => false,
-            };
-            if probing {
-                self.timeouts
-                    .borrow_mut()
-                    .reset(TimeoutKind::RequestStartViewMessage);
-                actions.push(VsrAction::SendRequestStartView {
-                    namespace: self.namespace,
-                });
-            } else {
-                // Stale arm (e.g. went Normal without passing an exit that
-                // stops it): silence it instead of refiring every tick.
-                self.timeouts
-                    .borrow_mut()
-                    .stop(TimeoutKind::RequestStartViewMessage);
+            match self.status.get() {
+                Status::Recovering => {
+                    // A probe answered by nobody, repeatedly, means nobody is
+                    // settled -- the whole cluster restarted together and
+                    // every group sits quorum-invisible waiting for a primary
+                    // that cannot exist. Fall back to an election: recovered
+                    // WALs compete on (log_view, op) in the DVC exchange, so
+                    // the best surviving log leads; a group whose members all
+                    // rejoined journal-less elects on equal terms and stands
+                    // on its recovered durable state. Any still-live settled
+                    // primary answers well before the fallback fires.
+                    let attempts = self.probe_attempts.get() + 1;
+                    self.probe_attempts.set(attempts);
+                    if attempts >= PROBE_ATTEMPTS_MAX {
+                        self.finish_view_probe();
+                        actions.extend(
+                            self.start_election(plane, ViewChangeReason::ViewProbeUnanswered),
+                        );
+                    } else {
+                        self.timeouts
+                            .borrow_mut()
+                            .reset(TimeoutKind::RequestStartViewMessage);
+                        actions.push(VsrAction::SendRequestStartView {
+                            namespace: self.namespace,
+                        });
+                    }
+                }
+                Status::ViewChange if self.primary_index(self.view.get()) != self.replica => {
+                    self.timeouts
+                        .borrow_mut()
+                        .reset(TimeoutKind::RequestStartViewMessage);
+                    actions.push(VsrAction::SendRequestStartView {
+                        namespace: self.namespace,
+                    });
+                }
+                _ => {
+                    // Stale arm (e.g. went Normal without passing an exit
+                    // that stops it): silence it instead of refiring every
+                    // tick.
+                    self.timeouts
+                        .borrow_mut()
+                        .stop(TimeoutKind::RequestStartViewMessage);
+                }
             }
             timeouts = self.timeouts.borrow_mut();
         }
@@ -1818,6 +1852,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "beginning view probe"
         );
         self.status.set(Status::Recovering);
+        self.probe_attempts.set(0);
         {
             let mut timeouts = self.timeouts.borrow_mut();
             timeouts.stop(TimeoutKind::Prepare);
@@ -1895,6 +1930,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     fn finish_view_probe(&self) {
+        self.probe_attempts.set(0);
         self.timeouts
             .borrow_mut()
             .stop(TimeoutKind::RequestStartViewMessage);

@@ -507,3 +507,102 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         "BUG: consumer skipped to offset {first_offset}, expected messages in range 10-14"
     );
 }
+
+/// Full-cluster restart: every node stops before any comes back, so no
+/// settled primary survives to answer the rejoin probes. The replicas must
+/// give up probing (`ViewChangeReason::ViewProbeUnanswered`), elect among
+/// their recovered logs, and serve the durable data across the outage. The
+/// caller's server config must flush eagerly (`messages_required_to_save=1`
+/// + fsync): with every journal dying at once, only flushed bytes survive.
+pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
+    let setup_client = harness
+        .root_client()
+        .await
+        .expect("Failed to create setup client");
+
+    setup_client
+        .create_stream(STREAM_NAME)
+        .await
+        .expect("Failed to create stream");
+    setup_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("Failed to create topic");
+    send_messages(&setup_client, "pre-outage", 10).await;
+    drop(setup_client);
+    // Let the backups' commit walk flush the tail: the send ack proves quorum
+    // COMMIT, but each replica flushes on its own walk (driven by the commit
+    // heartbeat), and the partition journal does not survive the process. A
+    // kill racing the last heartbeat leaves the newest message durable only
+    // on the old primary -- the known journal-durability caveat, not what
+    // this scenario tests.
+    sleep(Duration::from_secs(2)).await;
+
+    harness
+        .restart_cluster()
+        .await
+        .expect("Failed to restart the whole cluster");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to reconnect after full-cluster restart");
+    let survivors = poll_from_zero_until(&client, 10, Duration::from_secs(30)).await;
+    assert_eq!(
+        survivors,
+        (0..10).map(|i| format!("pre-outage-{i}")).collect::<Vec<_>>(),
+        "flushed messages must survive a full-cluster restart"
+    );
+
+    send_messages(&client, "post-outage", 10).await;
+    let all = poll_from_zero_until(&client, 20, Duration::from_secs(30)).await;
+    assert_eq!(all.len(), 20, "the reformed cluster must accept new writes");
+    assert_eq!(all[10], "post-outage-0");
+    assert_eq!(all[19], "post-outage-9");
+}
+
+/// Polls from offset 0 until `expected` messages arrive or the deadline
+/// passes, returning their payloads. The cluster may still be mid-election
+/// right after a restart, so a single poll is not a fair snapshot.
+async fn poll_from_zero_until(
+    client: &IggyClient,
+    expected: u32,
+    deadline: Duration,
+) -> Vec<String> {
+    let started = std::time::Instant::now();
+    loop {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                expected * 2,
+                false,
+            )
+            .await;
+        if let Ok(polled) = &polled
+            && polled.messages.len() >= expected as usize
+        {
+            return polled
+                .messages
+                .iter()
+                .map(|message| String::from_utf8_lossy(&message.payload).to_string())
+                .collect();
+        }
+        if started.elapsed() > deadline {
+            let got = polled.map(|p| p.messages.len()).unwrap_or(0);
+            panic!("expected {expected} messages after full-cluster restart, got {got}");
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}

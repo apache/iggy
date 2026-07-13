@@ -107,6 +107,18 @@ async fn single_message_restart_offset_zero(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_single_message_offset_zero_restart(harness).await;
 }
 
+// Full-cluster restart is vsr-only by construction: it exercises the rejoin
+// probe's election fallback across all replicas, which a single-process
+// legacy server has no equivalent of (plain restart covers it there).
+#[cfg(feature = "vsr")]
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn full_cluster_restart_recovers_and_serves(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_full_cluster_restart(harness).await;
+}
+
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true

@@ -61,6 +61,10 @@ pub enum ViewChangeReason {
     /// peers elect without waiting for its heartbeats to stop arriving
     /// (they already have).
     PrimaryProbedView,
+    /// A recovering replica's `RequestStartView` probes all went unanswered:
+    /// nobody in the cluster is settled (full-cluster restart), so waiting
+    /// for a primary is futile -- elect instead.
+    ViewProbeUnanswered,
     ViewChangeStatusTimeout,
     ReceivedStartViewChange,
     ReceivedDoViewChange,
@@ -72,6 +76,7 @@ impl ViewChangeReason {
         match self {
             Self::NormalHeartbeatTimeout => "normal_heartbeat_timeout",
             Self::PrimaryProbedView => "primary_probed_view",
+            Self::ViewProbeUnanswered => "view_probe_unanswered",
             Self::ViewChangeStatusTimeout => "view_change_status_timeout",
             Self::ReceivedStartViewChange => "received_start_view_change",
             Self::ReceivedDoViewChange => "received_do_view_change",
