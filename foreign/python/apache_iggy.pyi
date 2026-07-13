@@ -33,6 +33,7 @@ __all__ = [
     "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
+    "IggyError",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
@@ -40,6 +41,23 @@ __all__ = [
     "Topic",
     "TopicDetails",
 ]
+
+
+class IggyError(Exception):
+    r"""Structured error for all Iggy-specific failures.
+
+    Attributes:
+        code (int): Numeric error code matching the Rust ``IggyError`` discriminant.
+        name (str): Stable ``snake_case`` identifier for the error variant.
+        message (str): Human-readable error text.
+    """
+
+    code: int
+    name: str
+    message: str
+
+    def __init__(self, code: int, name: str, message: str) -> None: ...
+    def __str__(self) -> str: ...
 
 class AutoCommit:
     r"""

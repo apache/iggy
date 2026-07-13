@@ -17,6 +17,7 @@
 
 pub mod client;
 mod consumer;
+pub mod error;
 mod identifier;
 mod receive_message;
 mod send_message;
@@ -28,6 +29,7 @@ use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
+use error::PyIggyError;
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
 use send_message::SendMessage;
@@ -37,6 +39,7 @@ use topic::{Topic, TopicDetails};
 /// A Python module implemented in Rust.
 #[pymodule]
 fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("IggyError", _py.get_type::<PyIggyError>())?;
     m.add_class::<SendMessage>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;
