@@ -106,6 +106,7 @@ bench-runner = { path = "core/bench/runner" }
 bit-set = "0.10.0"
 blake3 = "1.8.5"
 bon = "3.9.3"
+bson = { version = "3.1.0", features = ["serde", "serde_json-1"] }
 byte-unit = { version = "5.2.3", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bytes = "1.12.0"

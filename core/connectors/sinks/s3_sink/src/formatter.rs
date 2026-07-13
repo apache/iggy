@@ -99,7 +99,7 @@ fn format_json_message(
         } else {
             None
         },
-        payload: payload_to_json_value(&message.payload),
+        payload: payload_to_json_value(&message.payload)?,
     };
 
     serde_json::to_vec(&msg).map_err(|e| {
@@ -164,8 +164,8 @@ fn serialize_headers(
     Value::Object(obj)
 }
 
-fn payload_to_json_value(payload: &Payload) -> Value {
-    match payload {
+fn payload_to_json_value(payload: &Payload) -> Result<Value, Error> {
+    let value = match payload {
         Payload::Json(value) => owned_value_to_serde_json(value),
         Payload::Text(text) => Value::String(text.clone()),
         Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
@@ -175,7 +175,11 @@ fn payload_to_json_value(payload: &Payload) -> Value {
         Payload::Proto(text) => Value::String(text.clone()),
         Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
         Payload::Avro(bytes) => Value::String(base64_encode(bytes)),
-    }
+        Payload::Bson(value) => serde_json::to_value(value).map_err(|error| {
+            Error::CannotStoreData(format!("Failed to serialize BSON payload: {error}"))
+        })?,
+    };
+    Ok(value)
 }
 
 fn base64_encode(bytes: &[u8]) -> String {

@@ -355,6 +355,7 @@ impl StreamEncoder for AvroStreamEncoder {
             Payload::Avro(data) => Ok(data),
             Payload::Proto(text) => self.encode_text_to_avro(text),
             Payload::FlatBuffer(data) => self.encode_raw_to_avro(data),
+            Payload::Bson(_) => Err(Error::InvalidPayloadType),
         }
     }
 }

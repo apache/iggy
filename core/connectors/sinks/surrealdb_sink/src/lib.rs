@@ -899,7 +899,7 @@ fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Erro
             value: Value::String(text),
             encoding: ENCODING_TEXT,
         }),
-        Payload::Raw(_) | Payload::FlatBuffer(_) | Payload::Avro(_) => {
+        Payload::Raw(_) | Payload::FlatBuffer(_) | Payload::Avro(_) | Payload::Bson(_) => {
             build_base64_payload_document(payload)
         }
     }
