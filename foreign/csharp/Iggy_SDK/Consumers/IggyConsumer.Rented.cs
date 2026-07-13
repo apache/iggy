@@ -19,9 +19,7 @@ using System.Runtime.CompilerServices;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Mappers;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -99,7 +97,7 @@ public partial class IggyConsumer
 
     /// <summary>
     ///     Polls a rented batch from the server and publishes it via <see cref="PublishRentedAsync" />.
-    ///     Handles decryption, offset tracking, and auto-commit logic. Rental lifetime is managed via
+    ///     Handles offset tracking and auto-commit logic. Rental lifetime is managed via
     ///     <see cref="RentedBatchHandle" /> shared by every produced message.
     /// </summary>
     protected async Task PollRentedMessagesAsync(CancellationToken ct)
@@ -109,6 +107,8 @@ public partial class IggyConsumer
             LogConsumerGroupNotJoinedYetSkippingPolling();
             return;
         }
+
+        ThrowIfAutoCommitWithEncryptor();
 
         await _pollingSemaphore.WaitAsync(ct);
 
@@ -150,46 +150,11 @@ public partial class IggyConsumer
                     continue;
                 }
 
-                var processedMessage = message;
-                var status = MessageStatus.Success;
-                Exception? error = null;
-
-                // TODO: fix encryption allocations by moving it to IggyClient
-                if (_config.MessageEncryptor != null)
-                {
-                    try
-                    {
-                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload.Span);
-
-                        Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
-                        if (!message.RawUserHeaders.IsEmpty)
-                        {
-                            var decryptedHeaderBytes =
-                                _config.MessageEncryptor.Decrypt(message.RawUserHeaders.Span);
-                            decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
-                        }
-
-                        processedMessage = new RentedMessageResponse
-                        {
-                            Header = message.Header,
-                            Payload = decryptedPayload,
-                            RawUserHeaders = ReadOnlyMemory<byte>.Empty,
-                            UserHeaders = decryptedHeaders
-                        };
-                    }
-                    catch (Exception ex)
-                    {
-                        LogFailedToDecryptMessage(ex, message.Header.Offset);
-                        status = MessageStatus.DecryptionFailed;
-                        error = ex;
-                    }
-                }
-
                 currentOffset = message.Header.Offset;
                 batchHandle.Acquire();
                 try
                 {
-                    await PublishRentedAsync(batchHandle, processedMessage, partitionId, status, error, ct);
+                    await PublishRentedAsync(batchHandle, message, partitionId, MessageStatus.Success, null, ct);
                 }
                 catch
                 {
@@ -226,6 +191,17 @@ public partial class IggyConsumer
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (MessageDecryptionException ex)
+        {
+            LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
+            throw;
+        }
+        catch (MalformedResponseException)
+        {
+            // Non-transient poison: rethrow so the generic catch below does not swallow it and re-poll forever.
+            // Base InvalidResponseException (server error status, possibly transient) falls through to retry.
             throw;
         }
         catch (Exception ex)

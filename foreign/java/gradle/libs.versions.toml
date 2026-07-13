@@ -20,7 +20,7 @@
 flink = "2.3.0"
 
 # Pinot
-pinot = "1.5.0"
+pinot = "1.5.1"
 
 # Jackson
 jackson = "3.2.0"
@@ -53,7 +53,7 @@ picocli = "4.7.7"
 
 # Build plugins
 spotless = "8.8.0"
-shadow = "9.4.3"
+shadow = "9.5.0"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"
 

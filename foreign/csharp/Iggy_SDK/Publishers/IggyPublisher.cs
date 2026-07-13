@@ -115,9 +115,9 @@ public partial class IggyPublisher : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Subscribe to background error events. A queued message whose serializer or encryptor throws at flush
-    ///     time is dropped and surfaced here, carrying the original values in
-    ///     <see cref="PublisherErrorEventArgs.DroppedValues" />; transport failures are reported via
+    ///     Subscribe to background error events. A queued message whose serializer throws at flush time is dropped
+    ///     and surfaced here, carrying the original values in
+    ///     <see cref="PublisherErrorEventArgs.DroppedValues" />; transport and encryption failures are reported via
     ///     <see cref="SubscribeOnMessageBatchFailed" /> instead.
     /// </summary>
     /// <param name="handler">The handler to invoke on background errors</param>
@@ -136,9 +136,9 @@ public partial class IggyPublisher : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Subscribe to message batch failed events, raised when a batch fails to send over the transport (after
-    ///     retries, if enabled) with a snapshot of the failed messages for inspection or re-send. Serializer and
-    ///     encryptor drops are reported via <see cref="SubscribeOnBackgroundError" /> instead.
+    ///     Subscribe to message batch failed events, raised when a batch fails to send over the transport or to
+    ///     encrypt (after retries, if enabled) with a snapshot of the failed messages for inspection or re-send.
+    ///     Serializer drops are reported via <see cref="SubscribeOnBackgroundError" /> instead.
     /// </summary>
     /// <param name="handler">The handler to invoke on message batch failures</param>
     public void SubscribeOnMessageBatchFailed(Func<MessageBatchFailedEventArgs, Task> handler)
@@ -268,10 +268,9 @@ public partial class IggyPublisher : IAsyncDisposable
     ///     Otherwise, messages are sent immediately.
     /// </summary>
     /// <remarks>
-    ///     When an encryptor is configured, each message's payload (and user headers) are encrypted IN PLACE:
-    ///     the caller's <see cref="Message" /> instances come back with ciphertext payloads and
-    ///     <see cref="Message.Encrypted" /> set. Already-marked messages are skipped, so a re-send cannot
-    ///     double-encrypt. Copy the messages first if the plaintext instances must stay usable.
+    ///     When the client is configured with an encryptor, payloads (and user headers) are encrypted at the wire
+    ///     boundary while the outgoing buffer is serialized: the caller's <see cref="Message" /> instances are never
+    ///     mutated and keep their plaintext. A retry re-encrypts from the plaintext with a fresh nonce.
     ///     <para>
     ///         With background sending enabled this overload queues the message references (not a payload copy),
     ///         so a payload backed by caller-owned pooled memory must stay valid until
@@ -294,11 +293,6 @@ public partial class IggyPublisher : IAsyncDisposable
         if (messages.Count == 0)
         {
             return;
-        }
-
-        if (Config.MessageEncryptor != null)
-        {
-            PublisherEncryption.EncryptAll(messages, Config.MessageEncryptor);
         }
 
         if (Config.EnableBackgroundSending && BackgroundProcessor != null)
@@ -338,23 +332,6 @@ public partial class IggyPublisher : IAsyncDisposable
         if (messages.Count == 0)
         {
             batch.Dispose();
-            return;
-        }
-
-        // Encryption replaces each payload with a fresh array, so the rented buffer can be released right after
-        // (and must be released even when the encryptor throws mid-batch).
-        if (Config.MessageEncryptor != null)
-        {
-            try
-            {
-                PublisherEncryption.EncryptAll(messages, Config.MessageEncryptor);
-            }
-            finally
-            {
-                batch.Dispose();
-            }
-
-            await SendReadyAsync(messages, null, ct);
             return;
         }
 
