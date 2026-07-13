@@ -658,6 +658,8 @@ impl IggyConsumer {
         let last_consumed_offset = self.last_consumed_offsets.clone();
         let allow_replay = self.allow_replay;
         let is_consumer_group = self.is_consumer_group;
+        let auto_join_consumer_group = self.auto_join_consumer_group;
+        let create_consumer_group_if_not_exists = self.create_consumer_group_if_not_exists;
         let joined_consumer_group = self.joined_consumer_group.clone();
 
         async move {
@@ -782,6 +784,33 @@ impl IggyConsumer {
 
             let error = polled_messages.unwrap_err();
             error!("Failed to poll messages: {error}");
+
+            if is_consumer_group
+                && auto_join_consumer_group
+                && matches!(&error, IggyError::ConsumerGroupMemberNotFound(..))
+            {
+                joined_consumer_group.store(false, ORDERING);
+                let consumer_name = consumer.id.as_string();
+                info!(
+                    "Consumer group membership was revoked for consumer: {consumer_name}, stream: {stream_id}, topic: {topic_id}. Rejoining..."
+                );
+                if let Err(error) = Self::initialize_consumer_group(
+                    client,
+                    create_consumer_group_if_not_exists,
+                    stream_id,
+                    topic_id,
+                    consumer,
+                    &consumer_name,
+                    joined_consumer_group.clone(),
+                )
+                .await
+                {
+                    // Allow the next poll to retry rejoining
+                    joined_consumer_group.store(true, ORDERING);
+                    return Err(error);
+                }
+                return Ok(PolledMessages::empty());
+            }
 
             // Handle connection/auth errors - disable polling until event task re-enables
             // it after reconnection and rejoin complete
