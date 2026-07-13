@@ -35,6 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
@@ -124,6 +126,9 @@ pub struct IggyConsumer {
     buffered_messages: VecDeque<IggyMessage>,
     encryptor: Option<Arc<EncryptorKind>>,
     store_offset_sender: flume::Sender<(u32, u64)>,
+    store_offset_task: Option<JoinHandle<()>>,
+    background_commit_task: Option<JoinHandle<()>>,
+    background_commit_notify: Arc<Notify>,
     store_offset_after_each_message: bool,
     store_offset_after_all_messages: bool,
     store_after_every_nth_message: u64,
@@ -133,6 +138,7 @@ pub struct IggyConsumer {
     init_retries: Option<u32>,
     init_retry_interval: IggyDuration,
     allow_replay: bool,
+    offset_drain_timeout: IggyDuration,
 }
 
 impl IggyConsumer {
@@ -155,6 +161,7 @@ impl IggyConsumer {
         init_retries: Option<u32>,
         init_retry_interval: IggyDuration,
         allow_replay: bool,
+        offset_drain_timeout: IggyDuration,
     ) -> Self {
         let (store_offset_sender, _) = flume::unbounded();
         Self {
@@ -187,6 +194,9 @@ impl IggyConsumer {
             buffered_messages: VecDeque::new(),
             encryptor,
             store_offset_sender,
+            store_offset_task: None,
+            background_commit_task: None,
+            background_commit_notify: Arc::new(Notify::new()),
             store_offset_after_each_message: matches!(
                 auto_commit,
                 AutoCommit::When(AutoCommitWhen::ConsumingEachMessage)
@@ -210,6 +220,7 @@ impl IggyConsumer {
             init_retries,
             init_retry_interval,
             allow_replay,
+            offset_drain_timeout,
         }
     }
 
@@ -372,9 +383,11 @@ impl IggyConsumer {
         self.init_consumer_group().await?;
 
         match self.auto_commit {
-            AutoCommit::Interval(interval) => self.store_offsets_in_background(interval),
-            AutoCommit::IntervalOrWhen(interval, _) => self.store_offsets_in_background(interval),
-            AutoCommit::IntervalOrAfter(interval, _) => self.store_offsets_in_background(interval),
+            AutoCommit::Interval(interval)
+            | AutoCommit::IntervalOrWhen(interval, _)
+            | AutoCommit::IntervalOrAfter(interval, _) => {
+                self.background_commit_task = Some(self.store_offsets_in_background(interval));
+            }
             _ => {}
         }
 
@@ -386,7 +399,7 @@ impl IggyConsumer {
         let (store_offset_sender, store_offset_receiver) = flume::unbounded();
         self.store_offset_sender = store_offset_sender;
 
-        tokio::spawn(async move {
+        self.store_offset_task = Some(tokio::spawn(async move {
             while let Ok((partition_id, offset)) = store_offset_receiver.recv_async().await {
                 trace!(
                     "Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}"
@@ -403,7 +416,7 @@ impl IggyConsumer {
                 )
                 .await
             }
-        });
+        }));
 
         self.initialized = true;
         info!(
@@ -463,7 +476,7 @@ impl IggyConsumer {
         Ok(())
     }
 
-    fn store_offsets_in_background(&self, interval: IggyDuration) {
+    fn store_offsets_in_background(&self, interval: IggyDuration) -> JoinHandle<()> {
         let client = self.client.clone();
         let consumer = self.consumer.clone();
         let stream_id = self.stream_id.clone();
@@ -471,9 +484,20 @@ impl IggyConsumer {
         let last_consumed_offsets = self.last_consumed_offsets.clone();
         let last_stored_offsets = self.last_stored_offsets.clone();
         let shutdown = self.shutdown.clone();
+        let notify = self.background_commit_notify.clone();
         tokio::spawn(async move {
             loop {
-                sleep(interval.get_duration()).await;
+                tokio::select! {
+                    _ = sleep(interval.get_duration()) => {}
+                    _ = notify.notified() => {}
+                }
+                // Checked before storing: `shutdown` already ran its own final
+                // flush as a group member, so a store past that point would
+                // hit a group we've since left.
+                if shutdown.load(ORDERING) {
+                    trace!("Shutdown signal received, stopping background offset storage");
+                    break;
+                }
                 for entry in last_consumed_offsets.iter() {
                     let partition_id = *entry.key();
                     let consumed_offset = entry.load(ORDERING);
@@ -489,12 +513,8 @@ impl IggyConsumer {
                     )
                     .await;
                 }
-                if shutdown.load(ORDERING) {
-                    trace!("Shutdown signal received, stopping background offset storage");
-                    break;
-                }
             }
-        });
+        })
     }
 
     pub(crate) fn send_store_offset(&self, partition_id: u32, offset: u64) {
@@ -1110,6 +1130,41 @@ impl IggyConsumer {
 
         info!("Shutting down consumer: {}...", self.consumer_name);
 
+        // Drain the background commit tasks while still a group member,
+        // before leaving below — otherwise a store they send afterward hits
+        // a group we've already left.
+        self.background_commit_notify.notify_one();
+        if let Some(mut task) = self.background_commit_task.take()
+            && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
+                .await
+                .is_err()
+        {
+            // Still running past the bound: abort it rather than leaving it
+            // detached, so it can't send a stale store after we leave below.
+            task.abort();
+            warn!(
+                "Timed out waiting for the background offset-commit task to stop for consumer: {}, aborted",
+                self.consumer_name
+            );
+        }
+
+        let (closed_sender, _) = flume::bounded(0);
+        drop(std::mem::replace(
+            &mut self.store_offset_sender,
+            closed_sender,
+        ));
+        if let Some(mut task) = self.store_offset_task.take()
+            && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            warn!(
+                "Timed out draining pending consumer offset stores for consumer: {}, aborted",
+                self.consumer_name
+            );
+        }
+
         for entry in self.last_consumed_offsets.iter() {
             let partition_id = *entry.key();
             let consumed_offset = entry.load(ORDERING);
@@ -1147,6 +1202,9 @@ impl IggyConsumer {
             );
 
             let client = self.client.read().await;
+            // Cleared either way: this consumer is torn down regardless of
+            // whether the broker confirmed the leave.
+            self.joined_consumer_group.store(false, ORDERING);
             if let Err(error) = client
                 .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
                 .await
@@ -1155,8 +1213,6 @@ impl IggyConsumer {
                     "Failed to leave consumer group: {group_id} for stream: {}, topic: {}. {error}",
                     self.stream_id, self.topic_id
                 );
-            } else {
-                self.joined_consumer_group.store(false, ORDERING);
             }
         }
 
@@ -1168,6 +1224,7 @@ impl IggyConsumer {
 impl Drop for IggyConsumer {
     fn drop(&mut self) {
         self.shutdown.store(true, ORDERING);
+        self.background_commit_notify.notify_one();
         trace!(
             "Consumer {} has been dropped, shutdown signal sent",
             self.consumer_name
