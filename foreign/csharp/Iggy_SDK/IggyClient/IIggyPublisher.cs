@@ -35,6 +35,11 @@ public interface IIggyPublisher
     ///     - PartitionId: Messages are sent to a specific partition.
     ///     - MessagesKey: Partition is selected based on a key value, ensuring all messages with the same key go to the same
     ///     partition.
+    ///     <para>
+    ///         When the client is configured with an encryptor, each <see cref="Message" /> payload (and user
+    ///         headers) is encrypted at the wire boundary while the outgoing buffer is serialized; the caller's
+    ///         instances are never mutated and keep their plaintext.
+    ///     </para>
     /// </remarks>
     /// <param name="streamId">The stream identifier (numeric ID or name).</param>
     /// <param name="topicId">The topic identifier (numeric ID or name).</param>
