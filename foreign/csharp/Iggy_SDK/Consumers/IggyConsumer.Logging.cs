@@ -89,8 +89,8 @@ public partial class IggyConsumer
 
     [LoggerMessage(EventId = 402,
         Level = LogLevel.Error,
-        Message = "Failed to decrypt message with offset {Offset}")]
-    private partial void LogFailedToDecryptMessage(Exception exception, ulong offset);
+        Message = "Failed to decrypt message at offset {Offset}, partition ID {PartitionId}")]
+    private partial void LogFailedToDecryptMessage(Exception exception, ulong offset, uint partitionId);
 
     [LoggerMessage(EventId = 403,
         Level = LogLevel.Error,

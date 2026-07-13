@@ -18,16 +18,14 @@
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     Exception thrown when the response from the server is invalid. Covers server-rejected commands
-///     (error status responses), which may be transient; see <see cref="MalformedResponseException" /> for
-///     unparsable frames the consumer treats as non-retryable poison.
+///     Thrown when a server response frame cannot be parsed (e.g. a negative length field). Unlike its base
+///     <see cref="InvalidResponseException" />, which also covers server-rejected commands that may succeed on
+///     retry, a malformed frame is non-transient poison: the consumer re-throws it out of the receive
+///     enumerator instead of retrying the poll forever.
 /// </summary>
-public class InvalidResponseException : Exception
+public sealed class MalformedResponseException : InvalidResponseException
 {
-    /// <summary>
-    ///     Initializes a new instance of the <see cref="InvalidResponseException" /> class.
-    /// </summary>
-    internal InvalidResponseException(string message) : base(message)
+    internal MalformedResponseException(string message) : base(message)
     {
     }
 }
