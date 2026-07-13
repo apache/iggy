@@ -34,7 +34,9 @@ use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use configs::server_ng::ServerNgConfig;
-use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
+use consensus::{
+    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+};
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
@@ -44,7 +46,7 @@ use iggy_common::defaults::{
     DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
     MIN_USERNAME_LENGTH,
 };
-use iggy_common::{IggyByteSize, PartitionStats, variadic};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
@@ -547,6 +549,7 @@ fn validate_sharding_runtime_knobs(
 /// Panics if [`shard_mesh_channels`] returns an inbox slot already
 /// consumed - a bootstrap programming error that would only fire if this
 /// function were called twice with the same inboxes.
+#[allow(clippy::too_many_lines)]
 pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
@@ -592,6 +595,9 @@ pub fn bootstrap(
 
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)> =
         Vec::with_capacity(shards_count);
+    // Shared metadata-group view: written by shard 0's publisher task, read by
+    // every shard's cluster-metadata roster so leader marking works off-shard.
+    let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
@@ -621,6 +627,7 @@ pub fn bootstrap(
             }
         };
 
+        let metadata_view_for_shard = Arc::clone(&metadata_view);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerNgError> {
@@ -636,6 +643,7 @@ pub fn bootstrap(
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
+                    metadata_view_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -694,6 +702,7 @@ fn run_shard_thread(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -730,6 +739,7 @@ fn run_shard_thread(
             metadata_handoff,
             barrier,
             owner_table,
+            metadata_view,
         ))
         .await
     });
@@ -756,6 +766,7 @@ async fn shard_main(
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -790,9 +801,14 @@ async fn shard_main(
     let data_dir = Path::new(&config.system.path);
     let (mux_stm, owner_state) = match metadata_handoff {
         MetadataHandoff::Owner { bundle_tx } => {
-            let recovered = recover::<ServerNgMuxStateMachine>(data_dir)
-                .await
-                .map_err(ServerNgError::MetadataRecovery)?;
+            // Root is created locally at boot (never journaled), so replay
+            // must start from the same baseline or every WAL-created user
+            // shifts one slab id and root is lost after the first restart.
+            let recovered = recover::<ServerNgMuxStateMachine>(data_dir, |mux_stm| {
+                ensure_default_root_user(mux_stm);
+            })
+            .await
+            .map_err(ServerNgError::MetadataRecovery)?;
             validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
             ensure_default_root_user(&recovered.mux_stm);
             // The factory bundle hands every peer a read handle over the
@@ -826,6 +842,7 @@ async fn shard_main(
                     recovered.journal,
                     recovered.snapshot,
                     recovered.last_applied_op,
+                    recovered.last_journaled_op,
                 )),
             )
         }
@@ -845,12 +862,14 @@ async fn shard_main(
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
     let (metadata_consensus, journal_for_metadata, snapshot_for_metadata) =
-        if let Some((journal, snapshot, last_applied_op)) = owner_state {
-            let restored_op = last_applied_op
-                .unwrap_or_else(|| snapshot.as_ref().map_or(0, IggySnapshot::sequence_number));
+        if let Some((journal, snapshot, last_applied_op, last_journaled_op)) = owner_state {
+            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
+            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
             let consensus = restore_metadata_consensus(
                 &journal,
                 restored_op,
+                commit_watermark,
                 topology.cluster_id,
                 topology.self_replica_id,
                 topology.replica_count,
@@ -885,8 +904,38 @@ async fn shard_main(
         senders,
         inbox,
         shard_metrics,
+        Arc::clone(&metadata_view),
     )
     .await?;
+
+    // Shard 0 owns the metadata consensus; publish its view so every shard's
+    // cluster-metadata read (and the SDK's leader discovery) marks the live
+    // primary. Detached: dies with this shard's runtime at process exit.
+    if shard_id == 0 {
+        let publisher_shard = Rc::clone(&shard);
+        let publisher_view = Arc::clone(&metadata_view);
+        compio::runtime::spawn(async move {
+            loop {
+                if let Some(consensus) = publisher_shard.plane.metadata().consensus.as_ref() {
+                    // While this replica declines its recovered view's
+                    // primaryship, that view must not reach the roster: the
+                    // delegated shards would compute a leader that never
+                    // heartbeats. Publish "unknown" until the election
+                    // resolves the role.
+                    let published = if consensus.has_ceded_primaryship()
+                        && consensus.primary_index(consensus.view()) == consensus.replica()
+                    {
+                        crate::cluster_meta::METADATA_VIEW_UNKNOWN
+                    } else {
+                        u64::from(consensus.view())
+                    };
+                    publisher_view.store(published, Ordering::Relaxed);
+                }
+                compio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .detach();
+    }
 
     info!(
         shard = shard_id,
@@ -1300,7 +1349,11 @@ fn spawn_shutdown_watchdog(
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
 /// the real topology. `self_*` back only the cluster-disabled self-synthesis;
 /// the HTTP port is read from config since HTTP binds outside this topology.
-fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> ClusterRoster {
+fn build_cluster_roster(
+    config: &ServerNgConfig,
+    topology: &TcpTopology,
+    metadata_view: Arc<AtomicU64>,
+) -> ClusterRoster {
     let http_port = if config.http.enabled {
         parse_socket_addr("http.address", &config.http.address)
             .ok()
@@ -1320,6 +1373,7 @@ fn build_cluster_roster(config: &ServerNgConfig, topology: &TcpTopology) -> Clus
             websocket: topology.ws_listen_addr.map(|addr| addr.port()),
             tcp_replica: None,
         },
+        metadata_view,
     }
 }
 
@@ -1334,6 +1388,7 @@ async fn build_shard_for_thread(
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerNgShard>, Rc<RefCell<SessionManager>>), ServerNgError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
@@ -1359,6 +1414,16 @@ async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
+    // At-rest encryption: built once per shard from the shared config; the
+    // ingestion path encrypts on the primary and the poll reply decrypts.
+    // A bad key fails the boot rather than silently serving plaintext.
+    let encryptor = if config.system.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+            .map_err(|error| ServerNgError::Iggy(Box::new(error)))?;
+        Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
+    } else {
+        None
+    };
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
@@ -1369,6 +1434,7 @@ async fn build_shard_for_thread(
                 .size_of_messages_required_to_save,
             enforce_fsync: config.system.partition.enforce_fsync,
             segment_size: config.system.segment.size,
+            encryptor,
         },
         owned_partitions_capacity,
     );
@@ -1445,7 +1511,11 @@ async fn build_shard_for_thread(
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
     sessions
         .borrow_mut()
-        .set_cluster_roster(Rc::new(build_cluster_roster(config, topology)));
+        .set_cluster_roster(Rc::new(build_cluster_roster(
+            config,
+            topology,
+            metadata_view,
+        )));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
     let on_client_request = make_deferred_client_request_handler(
         &bus,
@@ -1489,6 +1559,7 @@ async fn build_shard_for_thread(
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
+    commit_watermark: u64,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -1511,36 +1582,78 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    consensus.init();
+    // On a RESTART in a cluster (a non-empty WAL proves a prior life), rejoin
+    // as a backup: resuming primaryship from the WAL's (stale) view races the
+    // peers' election and can split leadership across planes -- the partition
+    // groups always rejoin as backups (no WAL), so a metadata-primary resume
+    // here leaves metadata led by this node while the partitions elect a
+    // peer, and clients (which follow the roster's single leader) then write
+    // to a partition backup. The WAL still restores state below; only the
+    // role is ceded. A FRESH boot (empty WAL) keeps the plain init: the
+    // cluster needs its view-0 primary to exist, and a single-replica
+    // cluster has no peer to defer to.
+    if replica_count > 1 && restored_op > 0 {
+        consensus.init_as_backup();
+    } else {
+        consensus.init();
+    }
     consensus.sequencer().set_sequence(restored_op);
-    // TODO(hubcio): clustered bootstrap does not persist a durable
-    // (view, commit_op) watermark, so we collapse commit_min/commit_max to
-    // `restored_op` (= last journaled op). VSR consequence: on a view
-    // change after partial recovery, a replica that came back with a
-    // commit_max below the cluster's true commit_min will accept stale
-    // prepares as new and overwrite already-committed log entries
-    // (split-brain on the committed prefix).
+    // The commit point is restored from the WAL's embedded watermark (each
+    // journaled prepare carries the primary's commit at send time), NOT from
+    // the journal head: journaled does not imply committed, and claiming
+    // commit for the un-quorum'd tail both risks split-brain on a later view
+    // change and starves the tail of re-replication (it would live in no
+    // pipeline). The suffix `(commit_watermark, restored_op]` is re-pipelined
+    // below when this replica is the recovered view's primary.
     //
-    // Fix direction: persist (view, commit_op) on the journal-header path
-    // (`core/journal/src/prepare_journal.rs` PrepareHeader already carries
-    // `view`; extend with `commit_op` or add a sidecar watermark file
-    // updated on every commit), seed `restore_commit_state(min, max)`
-    // from durable state on recovery, and refuse boot if the gap exceeds
-    // a configurable threshold. Tracked under the "durable
-    // PartitionJournal + durable (view, commit_op) watermark" milestone
-    // named in the multi-shard wiring commit body.
-    //
-    // Reproducible in `core/simulator` once it grows a restart-from-disk
-    // path: today `SimNetwork::enable_process` only un-disables links
-    // without replaying `SimJournal` + `SimSnapshot` through
-    // `restore_metadata_consensus`, so the flatten cannot trip. Add a
-    // crash-restart-replay primitive in the sim, then write a scenario
-    // that commits an op on the primary, crashes the primary mid-
-    // replicate-ack, triggers a view change, and asserts the recovered
-    // replica refuses to re-accept the committed prepare.
-    consensus.restore_commit_state(restored_op, restored_op);
+    // TODO(hubcio): the watermark is a lower bound (the last entry stamps
+    // the commit point as of its send). Persisting an explicit (view,
+    // commit_op) watermark on the commit path would tighten recovery and
+    // allow refusing boot on an excessive gap; a backup that recovered a
+    // LONGER tail than the cluster's primary still needs uncommitted-suffix
+    // truncation when conflicting ops arrive (message repair milestone).
+    consensus.restore_commit_state(commit_watermark, commit_watermark);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
+    }
+
+    // The WAL's tail past the watermark is prepared-but-not-provably-committed
+    // state. Until the cluster confirms it (re-pipelined below on a resumed
+    // primary; via StartView adoption + the local commit walk on a rejoined
+    // backup), serving reads would show pre-restart state that clients already
+    // saw acked -- gate them on the barrier regardless of role. If the suffix
+    // never committed cluster-wide, the barrier times out on the read path and
+    // serving resumes (`await_recovery_barrier`).
+    if commit_watermark < restored_op {
+        consensus.set_recovery_barrier(restored_op);
+    }
+
+    // Re-pipeline the prepared-but-uncommitted suffix so the primary's
+    // retransmit machinery re-replicates it and quorum can (re-)commit it.
+    // A backup's suffix stays journal-only: the primary's traffic either
+    // confirms it (re-forward + re-ack path) or supersedes it.
+    if consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
+        && commit_watermark < restored_op
+    {
+        info!(
+            commit_watermark,
+            restored_op, "re-pipelining recovered uncommitted metadata suffix"
+        );
+        let mut pipeline = consensus.pipeline().borrow_mut();
+        #[allow(clippy::cast_possible_truncation)]
+        for op in (commit_watermark + 1)..=restored_op {
+            let Some(header) = journal.header(op as usize) else {
+                warn!(
+                    op,
+                    "recovered journal suffix has a gap; stopping re-pipeline"
+                );
+                break;
+            };
+            let mut entry = PipelineEntry::new(*header);
+            entry.add_ack(self_replica_id);
+            pipeline.push(entry);
+        }
     }
 
     consensus
@@ -1568,7 +1681,18 @@ async fn load_partition(
         bus,
         LocalPipeline::new(),
     );
-    consensus.init();
+    // A recovered partition lost its consensus state with the process: the
+    // partition journal is in-memory and segments carry no op numbers, so
+    // this replica cannot know the group's (op, commit). In a cluster it must
+    // not boot as the view-0 primary heartbeating `commit_min = 0`; join as a
+    // backup and let a peer that kept its journal win the election and repair
+    // this replica through `StartView`. Single-replica groups have no peer to
+    // defer to, so they keep the plain init.
+    if replica_count > 1 {
+        consensus.init_recovering();
+    } else {
+        consensus.init();
+    }
 
     let recovered_segments =
         load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)

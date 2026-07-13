@@ -39,6 +39,7 @@ use std::{
     env,
     sync::{Arc, atomic::AtomicU32},
 };
+use system_stats::capture_allowed_cpus;
 use tracing::{error, info};
 
 mod api;
@@ -114,6 +115,7 @@ fn print_ascii_art(text: &str) {
 
 #[tokio::main]
 async fn main() -> Result<(), RuntimeError> {
+    capture_allowed_cpus();
     Args::parse();
     print_ascii_art("Iggy Connectors");
 

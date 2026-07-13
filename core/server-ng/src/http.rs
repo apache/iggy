@@ -17,15 +17,16 @@
 
 //! Shard-0 HTTP/REST listener. This root binds the listener and assembles the
 //! router; the rest is split across submodules: the `state` bridge and axum
-//! `State`, the bearer `extractor` and `jwt` issuer, the route `handlers`, the
-//! `reads` gates, the `submit` write paths, `wire` request mapping,
-//! partition-write `admission`, committed-reply `reply` decoding, the rejection
-//! `error` types, and per-credential `session` state.
+//! `State`, the bearer `extractor`, the `jwt` issuer and its `jwks` resolver,
+//! the route `handlers`, the `reads` gates, the `submit` write paths, `wire`
+//! request mapping, partition-write `admission`, committed-reply `reply`
+//! decoding, the rejection `error` types, and per-credential `session` state.
 
 mod admission;
 mod error;
 mod extractor;
 mod handlers;
+mod jwks;
 mod jwt;
 mod reads;
 mod reply;
@@ -36,19 +37,25 @@ mod wire;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::middleware::{Next, from_fn};
 use axum::routing::{delete, get, post, put};
 use configs::cluster::{ClusterConfig, TransportPorts};
-use configs::http::HttpConfig;
+use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::server_ng::NgSystemConfig;
+use iggy_common::IggyError;
 use message_bus::client_listener;
 use send_wrapper::SendWrapper;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info};
 
 use crate::bootstrap::ServerNgShard;
@@ -77,7 +84,8 @@ use crate::server_error::ServerNgError;
 /// # Errors
 ///
 /// Returns [`ServerNgError`] if the JWT manager cannot be built from
-/// `http_config.jwt` or the listener cannot bind to `addr`.
+/// `http_config.jwt`, the `[http.cors]` config is invalid, or the listener
+/// cannot bind to `addr`.
 pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
@@ -87,6 +95,13 @@ pub async fn start(
     self_ports: TransportPorts,
 ) -> Result<(), ServerNgError> {
     let jwt = JwtManager::build(&http_config.jwt)?;
+    // Validated before bind so a bad [http.cors] fails boot before the socket
+    // opens and the "started" log prints.
+    let cors = http_config
+        .cors
+        .enabled
+        .then(|| configure_cors(&http_config.cors))
+        .transpose()?;
     let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
     info!(address = %bound_addr, "server-ng HTTP listener started");
 
@@ -107,6 +122,10 @@ pub async fn start(
                 http: Some(bound_addr.port()),
                 ..self_ports
             },
+            // The HTTP listener is shard-0-only, where the live consensus
+            // handle supplies the leader; the published-view fallback is
+            // never consulted here.
+            metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
         in_flight_writes: Cell::new(0),
     }));
@@ -114,7 +133,7 @@ pub async fn start(
     // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
     let max_request_size =
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
-    let router = router(state, max_request_size);
+    let router = router(state, max_request_size, cors);
 
     let shutdown = shard.bus.token();
     let handle = compio::runtime::spawn(async move {
@@ -142,11 +161,19 @@ const PING_PATH: &str = "/ping";
 /// it), exactly like the legacy server: it bounds the per-request term of the
 /// admission math - what one body may cost in bytes and decode CPU - while
 /// the in-flight caps bound the multiplier.
-fn router(state: HttpState, max_request_size: usize) -> Router {
+///
+/// `cors`, present only when `[http.cors]` is enabled, is applied as the
+/// outermost layer. This node authenticates per route (the `Authenticated` /
+/// `Identity` extractors), so a preflight `OPTIONS` - which carries no
+/// `Authorization` header and matches none of the method routes - would 401 or
+/// 405 if it reached the router; the outermost `CorsLayer` answers it first
+/// instead, and stamps the CORS response headers over every reply, including
+/// the inner layer's `x-iggy-view`.
+fn router(state: HttpState, max_request_size: usize, cors: Option<CorsLayer>) -> Router {
     // Cloned for the response layer so `X-Iggy-View` reads the live view per
     // response; the original `state` is moved into `with_state` below.
     let view_source = state.clone();
-    Router::new()
+    let router = Router::new()
         .route(PING_PATH, get(ping))
         .route("/users/login", post(login_user))
         .route("/users/refresh-token", post(refresh_token))
@@ -235,5 +262,302 @@ fn router(state: HttpState, max_request_size: usize) -> Router {
                     insert_view_header(&view_source, response)
                 }
             }
-        }))
+        }));
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+/// Build the [`CorsLayer`] from `[http.cors]`, porting the legacy server's
+/// mapping: an empty origin list yields the tower-http default, a leading `*`
+/// allows any origin (later entries are ignored), and anything else is an
+/// explicit allow-list. Entries are trimmed and blank ones dropped, so a
+/// placeholder like `[""]` maps to "none" rather than a parse error. Methods,
+/// allowed headers, and exposed headers map the same way; any unparsable value
+/// fails the build.
+///
+/// Combinations tower-http would reject by panicking (a `*` origin past the
+/// first position, or `allow_credentials` with a wildcard origin, header, or
+/// exposed-header list) are rejected here as configuration errors instead.
+///
+/// # Errors
+///
+/// Returns [`IggyError::InvalidConfiguration`] if an origin or header value is
+/// not a valid header token, a method is not one of the standard HTTP verbs,
+/// `*` appears past the first origin, or `allow_credentials` is combined with
+/// a wildcard origin, header, or exposed-header list.
+fn configure_cors(config: &HttpCorsConfig) -> Result<CorsLayer, IggyError> {
+    let wildcard_origin = config
+        .allowed_origins
+        .first()
+        .is_some_and(|origin| origin.trim() == "*");
+    let allowed_origins = match config.allowed_origins.as_slice() {
+        [] => AllowOrigin::default(),
+        _ if wildcard_origin => AllowOrigin::any(),
+        // `AllowOrigin::list` panics on a wildcard entry, so past the first
+        // position `*` is a config mistake, not "any origin".
+        origins if origins.iter().any(|origin| origin.trim() == "*") => {
+            error!("invalid CORS allowed_origins: \"*\" is honored only as the first entry");
+            return Err(IggyError::InvalidConfiguration);
+        }
+        origins => AllowOrigin::list(parse_cors_values::<HeaderValue>(origins, "origin")?),
+    };
+    let allowed_headers = parse_cors_values::<HeaderName>(&config.allowed_headers, "header")?;
+    let exposed_headers =
+        parse_cors_values::<HeaderName>(&config.exposed_headers, "exposed header")?;
+    let allowed_methods = parse_cors_methods(&config.allowed_methods)?;
+
+    // tower-http rejects credentials combined with any wildcard by panicking
+    // once the layer is applied to the router; catch those combinations here
+    // so they fail as configuration errors instead.
+    if config.allow_credentials {
+        let wildcard_field = if wildcard_origin {
+            Some("allowed_origins")
+        } else if is_wildcard_header_list(&allowed_headers) {
+            Some("allowed_headers")
+        } else if is_wildcard_header_list(&exposed_headers) {
+            Some("exposed_headers")
+        } else {
+            None
+        };
+        if let Some(field) = wildcard_field {
+            error!(
+                "invalid CORS config: allow_credentials cannot be combined with wildcard {field}"
+            );
+            return Err(IggyError::InvalidConfiguration);
+        }
+    }
+
+    Ok(CorsLayer::new()
+        .allow_methods(allowed_methods)
+        .allow_origin(allowed_origins)
+        .allow_headers(allowed_headers)
+        .expose_headers(exposed_headers)
+        .allow_credentials(config.allow_credentials)
+        .allow_private_network(config.allow_private_network))
+}
+
+/// Parse a CORS string list into header values or names, trimming entries and
+/// skipping blank ones so a placeholder like `[""]` yields an empty set.
+/// `label` names the field in the diagnostic log for an unparsable entry.
+fn parse_cors_values<T>(values: &[String], label: &str) -> Result<Vec<T>, IggyError>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<T>().map_err(|error| {
+                error!(%value, %error, "invalid CORS {label}");
+                IggyError::InvalidConfiguration
+            })
+        })
+        .collect()
+}
+
+/// Map the configured method names onto the standard HTTP verbs, trimming
+/// entries and skipping blank ones. A name outside the standard set is rejected
+/// (rather than accepted as a custom method token) so a typo fails the config
+/// loudly.
+fn parse_cors_methods(methods: &[String]) -> Result<Vec<Method>, IggyError> {
+    methods
+        .iter()
+        .map(|method| method.trim())
+        .filter(|method| !method.is_empty())
+        .map(|method| match method.to_uppercase().as_str() {
+            "GET" => Ok(Method::GET),
+            "POST" => Ok(Method::POST),
+            "PUT" => Ok(Method::PUT),
+            "DELETE" => Ok(Method::DELETE),
+            "HEAD" => Ok(Method::HEAD),
+            "OPTIONS" => Ok(Method::OPTIONS),
+            "CONNECT" => Ok(Method::CONNECT),
+            "PATCH" => Ok(Method::PATCH),
+            "TRACE" => Ok(Method::TRACE),
+            other => {
+                error!(method = %other, "invalid CORS method");
+                Err(IggyError::InvalidConfiguration)
+            }
+        })
+        .collect()
+}
+
+/// The exact shape tower-http treats as a wildcard header set: a lone `*`.
+/// (`["*", "x"]` joins to the literal value `*,x`, which is not a wildcard.)
+fn is_wildcard_header_list(headers: &[HeaderName]) -> bool {
+    matches!(headers, [only] if only.as_str() == "*")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cors_config() -> HttpCorsConfig {
+        HttpCorsConfig {
+            enabled: true,
+            allowed_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            allowed_origins: vec!["*".to_owned()],
+            allowed_headers: vec!["content-type".to_owned(), "authorization".to_owned()],
+            exposed_headers: vec!["x-iggy-view".to_owned()],
+            allow_credentials: false,
+            allow_private_network: false,
+        }
+    }
+
+    #[test]
+    fn configure_cors_accepts_wildcard_origin() {
+        assert!(configure_cors(&cors_config()).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_accepts_explicit_origins() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec![
+                "http://localhost:3000".to_owned(),
+                "https://app.example.com".to_owned(),
+            ],
+            ..cors_config()
+        };
+        assert!(configure_cors(&config).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_accepts_credentials_with_explicit_origin() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allow_credentials: true,
+            ..cors_config()
+        };
+        assert!(configure_cors(&config).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_skips_blank_entries() {
+        // The shipped placeholder shape: a single empty string must map to an
+        // empty set, not a parse error.
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            exposed_headers: vec![String::new()],
+            ..cors_config()
+        };
+        assert!(configure_cors(&config).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_accepts_wildcard_headers_without_credentials() {
+        let config = HttpCorsConfig {
+            allowed_headers: vec!["*".to_owned()],
+            exposed_headers: vec!["*".to_owned()],
+            ..cors_config()
+        };
+        assert!(configure_cors(&config).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_trims_entries() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec![" https://app.example.com ".to_owned()],
+            allowed_headers: vec![" content-type ".to_owned()],
+            allowed_methods: vec![" get ".to_owned()],
+            ..cors_config()
+        };
+        assert!(configure_cors(&config).is_ok());
+    }
+
+    #[test]
+    fn configure_cors_rejects_wildcard_origin_after_first() {
+        // tower-http's `AllowOrigin::list` panics on a wildcard entry; the
+        // guard must turn it into a clean config error.
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["https://app.example.com".to_owned(), "*".to_owned()],
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_credentials_with_wildcard_origin() {
+        // tower-http's `ensure_usable_cors_rules` panics on this combination
+        // when the layer is applied; the guard must turn it into a clean
+        // config error.
+        let config = HttpCorsConfig {
+            allow_credentials: true,
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_credentials_with_wildcard_headers() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            allowed_headers: vec!["*".to_owned()],
+            allow_credentials: true,
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_credentials_with_wildcard_exposed_headers() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            exposed_headers: vec!["*".to_owned()],
+            allow_credentials: true,
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_invalid_origin() {
+        let config = HttpCorsConfig {
+            allowed_origins: vec!["http://bad\norigin".to_owned()],
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_invalid_header() {
+        let config = HttpCorsConfig {
+            allowed_headers: vec!["invalid header".to_owned()],
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
+
+    #[test]
+    fn configure_cors_rejects_unknown_method() {
+        let config = HttpCorsConfig {
+            allowed_methods: vec!["FOOBAR".to_owned()],
+            ..cors_config()
+        };
+        assert!(matches!(
+            configure_cors(&config),
+            Err(IggyError::InvalidConfiguration)
+        ));
+    }
 }

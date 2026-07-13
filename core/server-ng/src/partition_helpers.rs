@@ -41,7 +41,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::error;
+use tracing::{error, warn};
 
 /// Validate that a namespace fits within the static caps declared in
 /// `config.extra.namespace`.
@@ -172,10 +172,9 @@ pub async fn create_partition_file_hierarchy(
 ///
 /// # Errors
 ///
-/// Returns [`ServerNgError::RecoveredConsumerOffsetOutOfBounds`] when a
-/// stored offset exceeds `current_offset`, or
-/// [`ServerNgError::ConsumerOffsetsLoad`] when the on-disk files exist
-/// but fail to decode.
+/// Returns [`ServerNgError::ConsumerOffsetsLoad`] when the on-disk files
+/// exist but fail to decode. A stored offset ahead of `current_offset` is
+/// clamped (with a warning), not an error.
 pub fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerNgConfig,
@@ -207,15 +206,20 @@ pub fn configure_consumer_offsets(
         for offset in loaded_consumer_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer",
-                    consumer_id: offset.consumer_id as usize,
-                    offset: recovered_offset,
+                // A crash can persist an offset ahead of the flushed data
+                // (offsets are stored eagerly, messages flush later). Clamp to
+                // the recovered head so the consumer resumes instead of being
+                // stuck polling past the log; mirrors the legacy contract.
+                warn!(
+                    consumer_id = offset.consumer_id,
+                    recovered_offset,
                     current_offset,
                     stream_id,
                     topic_id,
                     partition_id,
-                });
+                    "recovered consumer offset ahead of partition data; clamping"
+                );
+                offset.offset.store(current_offset, Ordering::Relaxed);
             }
             guard.insert(offset.consumer_id as usize, offset);
         }
@@ -233,15 +237,16 @@ pub fn configure_consumer_offsets(
         for (group_id, offset) in loaded_group_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer group",
-                    consumer_id: group_id.0,
-                    offset: recovered_offset,
+                warn!(
+                    consumer_group_id = group_id.0,
+                    recovered_offset,
                     current_offset,
                     stream_id,
                     topic_id,
                     partition_id,
-                });
+                    "recovered consumer group offset ahead of partition data; clamping"
+                );
+                offset.offset.store(current_offset, Ordering::Relaxed);
             }
             guard.insert(group_id, offset);
         }
