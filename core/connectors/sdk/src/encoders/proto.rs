@@ -374,6 +374,7 @@ impl ProtoStreamEncoder {
                 "avro_size": data.len(),
                 "data": general_purpose::STANDARD.encode(&data)
             }),
+            Payload::Bson(_) => return Err(Error::InvalidPayloadType),
         };
 
         if let simd_json::OwnedValue::Object(json_map) = json_value {
@@ -635,6 +636,7 @@ impl ProtoStreamEncoder {
                 ),
                 data,
             ),
+            Payload::Bson(_) => return Err(Error::InvalidPayloadType),
         };
 
         let any = Any {
@@ -655,6 +657,7 @@ impl ProtoStreamEncoder {
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(data) => Ok(data),
             Payload::Avro(data) => Ok(data),
+            Payload::Bson(_) => Err(Error::InvalidPayloadType),
         }
     }
 
