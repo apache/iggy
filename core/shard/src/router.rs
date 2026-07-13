@@ -71,6 +71,22 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             let h = *m.header();
             (h.operation(), h.namespace, m.into_generic())
         }
+        MessageBag::RequestStartView(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestPrepares(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RepairPrepare(m) => {
+            let h = *m.header();
+            (h.0.operation, h.0.namespace, m.into_generic())
+        }
+        MessageBag::RepairRangeReply(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
     }
 }
 

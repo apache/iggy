@@ -207,6 +207,21 @@ impl Default for PartitionOffsets {
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
 /// `SegmentConfig` (`core/server/src/configs/system.rs`).
+/// One in-flight journal-repair stream for a partition group.
+#[derive(Debug, Clone, Copy)]
+pub struct RepairSession {
+    /// Fences stale repair frames from an earlier attempt.
+    pub nonce: u128,
+    /// Last op the stream is expected to serve (the frontier at request time).
+    pub to_op: u64,
+    /// Commit floor learned from `RangeEvicted { retained_from }`:
+    /// `retained_from - 1`. `None` until (unless) the serving peer reports a
+    /// truncated prefix.
+    pub floor: Option<u64>,
+    /// The peer serving this stream (re-request target on stall).
+    pub peer: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct PartitionsConfig {
     /// Flush journal to disk when it accumulates this many messages.

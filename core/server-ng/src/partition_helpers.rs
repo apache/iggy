@@ -451,6 +451,17 @@ pub async fn build_partition_fresh(
     let partition_id = namespace.partition_id();
 
     validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
+    // Sampled BEFORE the hierarchy create: a pre-existing partition directory
+    // is the marker of a prior life (the .log inside may legitimately be
+    // empty -- committed-but-unflushed data dies with the journal), while a
+    // genuinely fresh create finds nothing.
+    let restarted = replica_count > 1
+        && std::fs::metadata(
+            config
+                .system
+                .get_partition_path(stream_id, topic_id, partition_id),
+        )
+        .is_ok();
     create_partition_file_hierarchy(stream_id, topic_id, partition_id, config)
         .await
         .map_err(|source| {
@@ -472,7 +483,21 @@ pub async fn build_partition_fresh(
         bus,
         LocalPipeline::new(),
     );
-    consensus.init();
+    // A partition directory that already holds segment bytes is a RESTART
+    // materialization, not a fresh create: this replica's group state died
+    // with the process, so claiming view-0 primaryship would heartbeat
+    // commit_min=0 at peers that hold the committed log (racing their
+    // election). Join as a quorum-invisible backup and probe for the
+    // current view instead; journal repair re-materializes the data from a
+    // peer, byte-identical by the deterministic-roll/replicated-ciphertext
+    // design. A truly fresh create keeps the plain init: every group needs
+    // its view-0 primary to exist.
+    if restarted {
+        consensus.init_as_backup();
+        let _boot_probe = consensus.begin_view_probe();
+    } else {
+        consensus.init();
+    }
 
     let mut partition = IggyPartition::new(stats, consensus);
     partition.set_partition_dir(config.system.get_partition_path(

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(feature = "vsr"))]
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
@@ -100,7 +99,6 @@ pub async fn run_producer(harness: &mut TestHarness) {
     );
 }
 
-#[cfg(not(feature = "vsr"))]
 pub async fn run_consumer(harness: &mut TestHarness) {
     let setup_client = harness
         .root_client()
@@ -211,7 +209,6 @@ fn create_client(harness: &TestHarness) -> IggyClient {
         .expect("Failed to create client from connection string")
 }
 
-#[cfg(not(feature = "vsr"))]
 async fn send_messages(client: &IggyClient, prefix: &str, count: u32) {
     for i in 0..count {
         let msg = IggyMessage::from_str(&format!("{prefix}-{i}")).unwrap();
@@ -227,7 +224,6 @@ async fn send_messages(client: &IggyClient, prefix: &str, count: u32) {
     }
 }
 
-#[cfg(not(feature = "vsr"))]
 /// Consumes up to `expected` messages, returning their payloads in order.
 async fn consume_messages_validated(
     consumer: &mut IggyConsumer,

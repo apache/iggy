@@ -18,7 +18,8 @@
 use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, StartViewChangeHeader,
     StartViewHeader,
 };
 use smallvec::SmallVec;
@@ -500,6 +501,17 @@ pub enum MessageBag {
     DoViewChange(Message<DoViewChangeHeader>),
     StartView(Message<StartViewHeader>),
     Commit(Message<CommitHeader>),
+    RequestStartView(Message<RequestStartViewHeader>),
+    RequestPrepares(Message<RequestPreparesHeader>),
+    /// A journaled prepare re-sent verbatim for repair (command byte
+    /// distinguishes it from a live `Prepare`: repair bypasses the view
+    /// fence and never acks). Stays typed as `RepairPrepare` through every
+    /// parse -- the router round-trips frames through generic bytes, so a
+    /// parse-time byte restore would surface as a live `Prepare` on the
+    /// second pass and die on the view fence.
+    RepairPrepare(Message<RepairPrepareHeader>),
+    /// `RepairDone` / `RangeEvicted` (one layout, two commands).
+    RepairRangeReply(Message<RepairRangeReplyHeader>),
 }
 
 impl MessageBag {
@@ -513,6 +525,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().command,
             Self::StartView(message) => message.header().command,
             Self::Commit(message) => message.header().command,
+            Self::RequestStartView(message) => message.header().command,
+            Self::RequestPrepares(message) => message.header().command,
+            Self::RepairPrepare(message) => message.header().command(),
+            Self::RepairRangeReply(message) => message.header().command,
         }
     }
 
@@ -526,6 +542,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().size(),
             Self::StartView(message) => message.header().size(),
             Self::Commit(message) => message.header().size(),
+            Self::RequestStartView(message) => message.header().size(),
+            Self::RequestPrepares(message) => message.header().size(),
+            Self::RepairPrepare(message) => message.header().size(),
+            Self::RepairRangeReply(message) => message.header().size(),
         }
     }
 
@@ -539,6 +559,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().operation(),
             Self::StartView(message) => message.header().operation(),
             Self::Commit(message) => message.header().operation(),
+            Self::RequestStartView(message) => message.header().operation(),
+            Self::RequestPrepares(message) => message.header().operation(),
+            Self::RepairPrepare(message) => message.header().operation(),
+            Self::RepairRangeReply(message) => message.header().operation(),
         }
     }
 }
@@ -568,6 +592,22 @@ where
             )),
             Command2::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
             Command2::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
+            Command2::RequestStartView => Ok(Self::RequestStartView(
+                value.try_into_typed::<RequestStartViewHeader>()?,
+            )),
+            Command2::RequestPrepares => Ok(Self::RequestPrepares(
+                value.try_into_typed::<RequestPreparesHeader>()?,
+            )),
+            // A repaired prepare is a stored PrepareHeader frame whose command
+            // byte was rewritten; typed validation would reject the byte, so
+            // parse through the generic backing and trust the prepare-shaped
+            // layout the way the journal that produced it did.
+            Command2::RepairPrepare => Ok(Self::RepairPrepare(
+                value.try_into_typed::<RepairPrepareHeader>()?,
+            )),
+            Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
+                value.try_into_typed::<RepairRangeReplyHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {

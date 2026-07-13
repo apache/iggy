@@ -40,8 +40,8 @@ mod cli;
 mod cluster;
 mod config_provider;
 mod connectors;
-// Runs under vsr. The remaining per-module gap (`verify_after_server_restart`)
-// is gated inside the module with the reason (replica state transfer).
+// Runs under vsr; the one gap (`verify_after_server_restart`) is gated inside
+// the module: its rejoin window exceeds journal retention (state transfer).
 mod data_integrity;
 mod mcp;
 mod sdk;

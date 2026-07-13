@@ -24,7 +24,7 @@ use server_common::{
 use std::io;
 use std::{
     cell::UnsafeCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
 };
 use tracing::warn;
 
@@ -169,7 +169,18 @@ where
     timestamp_to_op: UnsafeCell<BTreeMap<(u64, u64), u64>>,
     headers: UnsafeCell<Vec<PrepareHeader>>,
     inner: UnsafeCell<JournalInner<S>>,
+    /// Ring of recently evicted committed entries, keyed by op, retained so
+    /// this replica can serve journal repair for rejoin windows after the
+    /// entries left the resident journal at flush. Bounded by
+    /// [`EVICTED_RING_CAPACITY`]; requests older than the ring answer
+    /// `RangeEvicted` honestly.
+    evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
 }
+
+/// How many evicted entries each partition retains for repair. Sized to
+/// cover a few seconds of traffic around a node restart; anything older is
+/// bulk-sync (phase 3) territory.
+pub const EVICTED_RING_CAPACITY: usize = 4096;
 
 impl<S> Default for PartitionJournal<S>
 where
@@ -184,6 +195,7 @@ where
             inner: UnsafeCell::new(JournalInner {
                 storage: S::default(),
             }),
+            evicted_ring: UnsafeCell::new(VecDeque::new()),
         }
     }
 }
@@ -249,6 +261,36 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
+    /// Entry bytes for `op`, from the resident journal or the evicted ring.
+    /// `None` when the op predates the ring (bulk-sync territory) or was
+    /// never journaled here.
+    pub fn repair_entry(&self, op: u64) -> Option<JournalBuffer> {
+        {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            if let Some(&storage_offset) = op_to_storage_offset.get(&op) {
+                let inner = unsafe { &*self.inner.get() };
+                return Some(inner.storage.read_at_sync(storage_offset));
+            }
+        }
+        let ring = unsafe { &*self.evicted_ring.get() };
+        ring.iter()
+            .find(|(ring_op, _)| *ring_op == op)
+            .map(|(_, entry)| entry.clone())
+    }
+
+    /// Oldest op this journal can still serve for repair (ring front, else
+    /// resident head), or `None` when it holds nothing at all.
+    pub fn repair_retained_from(&self) -> Option<u64> {
+        {
+            let ring = unsafe { &*self.evicted_ring.get() };
+            if let Some((op, _)) = ring.front() {
+                return Some(*op);
+            }
+        }
+        let headers = unsafe { &*self.headers.get() };
+        headers.first().map(|header| header.op)
+    }
+
     /// Synchronous resident-range poll read. Never awaits (mem storage reads
     /// are pure memory copies), so a partition borrow held across it cannot span
     /// a scheduler yield. The poll path uses this; the disk tier, which does
@@ -368,6 +410,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let inner = unsafe { &*self.inner.get() };
             inner.storage.drain()
         };
+        // Ops are positional against `headers` until the clear below; capture
+        // the evicted prefix's ops first so the ring stays op-addressable.
+        let evicted_ops: Vec<u64> = {
+            let headers = unsafe { &*self.headers.get() };
+            headers.iter().take(count).map(|header| header.op).collect()
+        };
 
         {
             let headers = unsafe { &mut *self.headers.get() };
@@ -380,7 +428,20 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             timestamp_to_op.clear();
         }
 
-        let retained: Vec<JournalBuffer> = all_entries.into_iter().skip(count).collect();
+        let mut all_entries = all_entries.into_iter();
+        {
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            for op in evicted_ops {
+                let Some(entry) = all_entries.next() else {
+                    break;
+                };
+                ring.push_back((op, entry));
+                if ring.len() > EVICTED_RING_CAPACITY {
+                    ring.pop_front();
+                }
+            }
+        }
+        let retained: Vec<JournalBuffer> = all_entries.collect();
         let mut result = Vec::with_capacity(retained.len());
         for entry in retained {
             let meta = self
@@ -490,6 +551,7 @@ where
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
+            evicted_ring: UnsafeCell::new(VecDeque::new()),
         }
     }
 

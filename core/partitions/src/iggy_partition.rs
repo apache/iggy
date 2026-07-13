@@ -26,6 +26,7 @@ use crate::poll_plan::{
     ResidentTailSnapshot,
 };
 use crate::segment::Segment;
+use crate::types::RepairSession;
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -42,7 +43,9 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader, WireDecode, WireIdentifier};
+use iggy_binary_protocol::{
+    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireIdentifier,
+};
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
@@ -51,8 +54,8 @@ use iggy_common::{
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
-    Message, SegmentStorage,
-    iobuf::Frozen,
+    MESSAGE_ALIGN, Message, SegmentStorage,
+    iobuf::{Frozen, Owned},
     send_messages2::{
         convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
     },
@@ -106,6 +109,16 @@ where
     /// `None` only for in-memory (simulated) partitions.
     partition_dir: Option<String>,
     consumer_offset_enforce_fsync: bool,
+    /// In-flight journal repair:
+    /// set when the recovery handshake finds this replica behind the group's
+    /// commit frontier, cleared when `RepairDone` completes the walk.
+    pub repair: Option<RepairSession>,
+    /// Highest message offset recovered from segments at boot (`None` when
+    /// the partition booted empty). Repaired batches at or below this line
+    /// are already persisted and counted; the flush and commit paths skip
+    /// re-persisting / re-counting them. Immutable after boot, so live
+    /// traffic (always above it) is never affected.
+    pub recovered_durable_offset: Option<u64>,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
@@ -229,6 +242,8 @@ where
             consumer_group_offsets_path: None,
             partition_dir: None,
             consumer_offset_enforce_fsync: false,
+            repair: None,
+            recovered_durable_offset: None,
             pending_consumer_offset_commits: HashMap::new(),
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
@@ -339,10 +354,16 @@ where
         // fails (e.g. disk full, fd exhausted) the pending entry must remain
         // stageable for retry on the next apply. Removing first would strand
         // the op - not on disk AND not in memory.
-        let pending = *self
-            .pending_consumer_offset_commits
-            .get(&op)
-            .ok_or(IggyError::InvalidCommand)?;
+        let pending = match self.pending_consumer_offset_commits.get(&op) {
+            Some(pending) => *pending,
+            // A view change clears the staged table (uncommitted ops may be
+            // superseded by the new view's log), and suffixes adopted via
+            // DoViewChange/StartView or journal repair never pass the live
+            // staging path at all. The journal entry IS the new view's
+            // authoritative content for this op, so re-derive the commit
+            // from it instead of wedging the commit walk.
+            None => self.restage_consumer_offset_from_journal(op)?,
+        };
         // Persist to the on-disk offset table first so a crash after the
         // in-memory apply cannot observe a readable offset that was not
         // durably stored; the in-memory update is idempotent on replay
@@ -1876,6 +1897,17 @@ where
                     if message_count == 0 {
                         continue;
                     }
+                    // A repaired batch at or below the boot-time recovered
+                    // durable offset is already IN the segments this replica
+                    // recovered; persisting it again would append duplicate
+                    // bytes past the segment end. Evict it without writing.
+                    // Live traffic always sits above the (immutable) line.
+                    let batch_end = batch.header.base_offset + u64::from(message_count) - 1;
+                    if let Some(durable) = self.recovered_durable_offset
+                        && batch_end <= durable
+                    {
+                        continue;
+                    }
 
                     if flush_index.is_none() {
                         // Record only; the in-mem cache insert is deferred until the
@@ -2202,15 +2234,24 @@ where
                 }
 
                 if let Some(batch_stats) = committed_visible_offsets.get(&prepare_header.op) {
-                    self.offset.store(batch_stats.end_offset, Ordering::Release);
-                    self.stats.set_current_offset(batch_stats.end_offset);
-                    // Advance the aggregate stats with the visible offset. Disk
-                    // persistence is threshold-gated in `commit_messages`, which
-                    // must not also touch these counters or committed messages
-                    // would be double-counted once they flush.
-                    self.stats
-                        .increment_messages_count(u64::from(batch_stats.message_count));
-                    self.stats.increment_size_bytes(batch_stats.size_bytes);
+                    // A repaired batch at or below the boot-time recovered
+                    // durable offset was already counted (and persisted)
+                    // before the restart; skip it. Live traffic always sits
+                    // above the (immutable) line.
+                    if self
+                        .recovered_durable_offset
+                        .is_none_or(|durable| batch_stats.end_offset > durable)
+                    {
+                        self.offset.store(batch_stats.end_offset, Ordering::Release);
+                        self.stats.set_current_offset(batch_stats.end_offset);
+                        // Advance the aggregate stats with the visible offset. Disk
+                        // persistence is threshold-gated in `commit_messages`, which
+                        // must not also touch these counters or committed messages
+                        // would be double-counted once they flush.
+                        self.stats
+                            .increment_messages_count(u64::from(batch_stats.message_count));
+                        self.stats.increment_size_bytes(batch_stats.size_bytes);
+                    }
                 }
                 !*failed_commit
             }
@@ -2295,6 +2336,43 @@ where
                 .with_operation(header.operation)
                 .with_error(send_error.to_string()),
             );
+        }
+    }
+
+    fn restage_consumer_offset_from_journal(
+        &self,
+        op: u64,
+    ) -> Result<PendingConsumerOffsetCommit, IggyError> {
+        let entry = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(op)
+            .ok_or(IggyError::InvalidCommand)?;
+        // Deep copy: the journal buffer is shared and `Message::try_from`
+        // wants an `Owned`; this path only runs on the post-view-change
+        // fallback, never per-commit.
+        let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(entry.as_slice());
+        let message = Message::<GenericHeader>::try_from(owned)
+            .map_err(|_| IggyError::InvalidCommand)?
+            .try_into_typed::<PrepareHeader>()
+            .map_err(|_| IggyError::InvalidCommand)?;
+        let header = *message.header();
+        let (kind, consumer_id, offset, _ack) =
+            Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
+        match header.operation {
+            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                let offset = offset.ok_or(IggyError::InvalidCommand)?;
+                Ok(if is_auto_commit_client(header.client) {
+                    PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
+                } else {
+                    PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
+                })
+            }
+            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                Ok(PendingConsumerOffsetCommit::delete(kind, consumer_id))
+            }
+            _ => Err(IggyError::InvalidCommand),
         }
     }
 
@@ -2934,6 +3012,119 @@ where
     #[must_use]
     pub fn nth_oldest_sealed_end_offset(&self, count: u32) -> Option<u64> {
         nth_oldest_sealed_end(self.log.segments(), count)
+    }
+
+    /// Ingest one repaired prepare: journal + stage it exactly like a live
+    /// replicated op, minus the view fence, the gap check, and the ack (the
+    /// op is already committed cluster-wide; there is nobody to ack to). The
+    /// commit walk runs at `RepairDone`, after the floor is known.
+    pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
+        let header = *message.header();
+        let Some(session) = &self.repair else {
+            return;
+        };
+        if header.op <= self.consensus().commit_min() || header.op > session.to_op {
+            return;
+        }
+        if self.log.journal().inner.header_by_op(header.op).is_some() {
+            return;
+        }
+        let applied = if header.operation == Operation::SendMessages {
+            self.append_repaired_send_messages(message).await
+        } else {
+            self.apply_replicated_operation(message).await
+        };
+        if let Err(error) = applied {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                op = header.op,
+                %error,
+                "failed to journal repaired prepare"
+            );
+            return;
+        }
+        let consensus = self.consensus();
+        if header.op > consensus.sequencer().current_sequence() {
+            consensus.sequencer().set_sequence(header.op);
+        }
+        consensus.set_last_prepare_checksum(header.checksum);
+    }
+
+    /// Conclude a repair stream: settle the commit floor at the serving
+    /// peer's eviction point (everything below it is represented by this
+    /// replica's recovered segments + offset files) and walk the repaired
+    /// window through the normal commit path.
+    pub async fn complete_repair(&mut self, config: &PartitionsConfig) {
+        let Some(session) = self.repair.take() else {
+            return;
+        };
+        if let Some(floor) = session.floor {
+            let commit_min = self.consensus().commit_min();
+            if floor > commit_min {
+                self.consensus().set_commit_floor(floor);
+            }
+        }
+        self.commit_journal(config).await;
+    }
+
+    /// Journal a repaired `SendMessages` prepare, preserving its embedded
+    /// batch stamps. A stored prepare was stamped by `append_messages` on
+    /// the serving replica BEFORE it was journaled, so its `base_offset` /
+    /// `base_timestamp` / `batch_checksum` are the canonical values every
+    /// replica agreed on. Re-stamping from this replica's dirty counter
+    /// (what the live path does) mints a second copy of the window at
+    /// fresh offsets whenever recovered segments already hold the
+    /// originals: the counter sits at the recovered durable END, not at
+    /// the op's position in history.
+    async fn append_repaired_send_messages(
+        &mut self,
+        message: Message<PrepareHeader>,
+    ) -> Result<(), IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let (base_offset, base_timestamp, total_size, message_count) = {
+            let batch =
+                decode_prepare_slice(message.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+            (
+                batch.header.base_offset,
+                batch.header.base_timestamp,
+                batch.header.total_size() as u64,
+                batch.message_count(),
+            )
+        };
+        if message_count == 0 {
+            return Ok(());
+        }
+        let last_offset = base_offset + u64::from(message_count) - 1;
+
+        self.should_increment_offset = true;
+        let dirty = self.dirty_offset.load(Ordering::Relaxed);
+        self.dirty_offset
+            .store(dirty.max(last_offset), Ordering::Relaxed);
+
+        let segment_index = self.log.segments().len() - 1;
+        let current_position = self.log.segments()[segment_index].current_position;
+        self.log.segments_mut()[segment_index].current_position = current_position
+            .checked_add(total_size)
+            .ok_or(IggyError::CannotAppendMessage)?;
+
+        let journal = self.log.journal_mut();
+        journal.info.messages_count += message_count;
+        journal.info.size += IggyByteSize::from(total_size);
+        journal.info.current_offset = last_offset;
+        if journal.info.first_timestamp == 0 {
+            journal.info.first_timestamp = base_timestamp;
+        }
+        journal.info.end_timestamp = base_timestamp;
+        journal.info.max_timestamp = journal.info.max_timestamp.max(base_timestamp);
+        journal
+            .inner
+            .append(message.into_frozen())
+            .await
+            .map_err(|_| IggyError::CannotAppendMessage)
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {

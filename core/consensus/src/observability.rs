@@ -56,6 +56,11 @@ impl ReplicaRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewChangeReason {
     NormalHeartbeatTimeout,
+    /// The current view's primary sent a `RequestStartView` probe: it
+    /// cannot lead (restarted, or abandoned the view mid-view-change), so
+    /// peers elect without waiting for its heartbeats to stop arriving
+    /// (they already have).
+    PrimaryProbedView,
     ViewChangeStatusTimeout,
     ReceivedStartViewChange,
     ReceivedDoViewChange,
@@ -66,6 +71,7 @@ impl ViewChangeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NormalHeartbeatTimeout => "normal_heartbeat_timeout",
+            Self::PrimaryProbedView => "primary_probed_view",
             Self::ViewChangeStatusTimeout => "view_change_status_timeout",
             Self::ReceivedStartViewChange => "received_start_view_change",
             Self::ReceivedDoViewChange => "received_do_view_change",
@@ -111,6 +117,7 @@ impl IgnoreReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlActionKind {
+    SendRequestStartView,
     SendStartViewChange,
     SendDoViewChange,
     SendStartView,
@@ -125,6 +132,7 @@ impl ControlActionKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SendRequestStartView => "send_request_start_view",
             Self::SendStartViewChange => "send_start_view_change",
             Self::SendDoViewChange => "send_do_view_change",
             Self::SendStartView => "send_start_view",
@@ -308,6 +316,13 @@ impl ControlActionLogEvent {
     #[must_use]
     pub const fn from_vsr_action(replica: ReplicaLogContext, action: &VsrAction) -> Self {
         match *action {
+            VsrAction::SendRequestStartView { .. } => Self {
+                replica,
+                action: ControlActionKind::SendRequestStartView,
+                target_replica: None,
+                op: None,
+                commit: None,
+            },
             VsrAction::SendStartViewChange { .. } => Self {
                 replica,
                 action: ControlActionKind::SendStartViewChange,

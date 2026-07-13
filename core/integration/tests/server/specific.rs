@@ -72,18 +72,12 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_producer(harness).await;
 }
 
-// vsr-gated on the rejoin-window state-transfer gap: the consumer's polls
-// auto-commit offsets, so an offset op in flight at the kill commits on the
-// surviving quorum and the restarted replica can never fetch it -- when the
-// commit frontier crosses the gap it correctly suicides ("replica is
-// divergent"). Racy (the window is only sometimes non-empty), so it flakes
-// rather than fails deterministically. The producer variant stays un-gated:
-// its sends are acked before the kill, leaving an empty window. QUIC has an
-// additional SDK gap (post-reconnect consumer polls return nothing; no
-// mid-connection failover), so it stays gated even once state transfer lands
-// unless that is fixed first.
-#[cfg(not(feature = "vsr"))]
-#[iggy_harness(
+// QUIC stays vsr-gated on an SDK gap: after the restart the QUIC client
+// redirects to the new leader, reconnects, and signs in, but the long-lived
+// consumer's polls then return nothing for the whole window -- the
+// post-reconnect request path wedges (QUIC also lacks the TCP client's
+// mid-connection failover). TCP and WebSocket run.
+#[cfg_attr(not(feature = "vsr"), iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
         tcp.socket.override_defaults = true,
@@ -91,7 +85,16 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
-)]
+))]
+#[cfg_attr(feature = "vsr", iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+))]
 async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_consumer(harness).await;
 }

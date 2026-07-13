@@ -49,9 +49,8 @@ mod general;
 mod message_cleanup;
 mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
-// `should_delete_segments_without_consumers` runs fully (both restart
-// variants) under server-ng; the consumer-variant restart cells are vsr-gated
-// on replica state transfer (reasons on the gates inside).
+// The full restart matrix (consumer variants included) runs under server-ng:
+// a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;
 mod specific;

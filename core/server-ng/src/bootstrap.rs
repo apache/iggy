@@ -894,7 +894,10 @@ async fn shard_main(
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
-    let (shard, sessions) = build_shard_for_thread(
+    // Heap-pin like `shard_main` above: the builder future carries the whole
+    // shard construction state machine and outgrew clippy's `large_futures`
+    // cap; one allocation per shard startup.
+    let (shard, sessions) = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -905,7 +908,7 @@ async fn shard_main(
         inbox,
         shard_metrics,
         Arc::clone(&metadata_view),
-    )
+    ))
     .await?;
 
     // Shard 0 owns the metadata consensus; publish its view so every shard's
@@ -1582,18 +1585,20 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    // On a RESTART in a cluster (a non-empty WAL proves a prior life), rejoin
-    // as a backup: resuming primaryship from the WAL's (stale) view races the
-    // peers' election and can split leadership across planes -- the partition
-    // groups always rejoin as backups (no WAL), so a metadata-primary resume
-    // here leaves metadata led by this node while the partitions elect a
-    // peer, and clients (which follow the roster's single leader) then write
-    // to a partition backup. The WAL still restores state below; only the
-    // role is ceded. A FRESH boot (empty WAL) keeps the plain init: the
-    // cluster needs its view-0 primary to exist, and a single-replica
-    // cluster has no peer to defer to.
+    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
+    // rejoin as a quorum-invisible backup and probe for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // the replica adopts it as a backup, and journal repair fills any WAL
+    // gap. A probing replica never resumes primaryship -- if this replica
+    // IS the current primary-by-index, its probe makes the backups elect
+    // past it.
+    // The probe re-broadcasts on its timeout, so it needs no live mesh at
+    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
+    // needs its view-0 primary to exist, and a single-replica cluster has
+    // no peer to ask.
     if replica_count > 1 && restored_op > 0 {
         consensus.init_as_backup();
+        let _boot_probe = consensus.begin_view_probe();
     } else {
         consensus.init();
     }
@@ -1683,13 +1688,16 @@ async fn load_partition(
     );
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
-    // this replica cannot know the group's (op, commit). In a cluster it must
-    // not boot as the view-0 primary heartbeating `commit_min = 0`; join as a
-    // backup and let a peer that kept its journal win the election and repair
-    // this replica through `StartView`. Single-replica groups have no peer to
-    // defer to, so they keep the plain init.
+    // this replica cannot know the group's (op, commit). In a cluster it
+    // boots as a quorum-invisible backup and probes for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // journal repair fills the rejoin window, and the commit floor settles
+    // at the serving peer's retention point. The probe re-broadcasts on its
+    // timeout, so it needs no live mesh at boot. Single-replica groups
+    // have no peer to ask and keep the plain init.
     if replica_count > 1 {
-        consensus.init_recovering();
+        consensus.init_as_backup();
+        let _boot_probe = consensus.begin_view_probe();
     } else {
         consensus.init();
     }
@@ -1733,6 +1741,14 @@ async fn load_partition(
         .max()
         .unwrap_or(0);
     partition.created_at = partition_metadata.created_at;
+    if partition
+        .log
+        .segments()
+        .iter()
+        .any(|segment| segment.size > IggyByteSize::default())
+    {
+        partition.recovered_durable_offset = Some(current_offset);
+    }
     partition.offset.store(current_offset, Ordering::Release);
     partition
         .dirty_offset

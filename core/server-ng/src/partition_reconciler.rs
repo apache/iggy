@@ -243,6 +243,11 @@ struct PassCounters {
     /// Consumer-group offsets reclaimed for groups deleted while their topic
     /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
     cg_offsets_purged: usize,
+    /// Committed delete watermarks not yet fully enforced on local segments.
+    /// Counted so the pass does not arm the fast-skip: the pump can be
+    /// blocked by a consumer barrier or by a rejoin whose offsets land via
+    /// journal repair, and neither unblocking bumps `Streams::revision`.
+    trims_pending: usize,
 }
 
 impl PassCounters {
@@ -254,6 +259,7 @@ impl PassCounters {
             + self.backoff_skipped
             + self.stale
             + self.cg_offsets_purged
+            + self.trims_pending
     }
 }
 
@@ -294,7 +300,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
-    reconcile_segment_truncations(ctx);
+    reconcile_segment_truncations(ctx, &mut counters);
     reconcile_partition_purges(ctx);
 
     let local_set: AHashSet<IggyNamespace> =
@@ -771,8 +777,14 @@ fn shards_table_contains(ctx: &ReconcilerCtx, ns: IggyNamespace) -> bool {
 /// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
 /// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
 /// so a redundant pass triggered by an unrelated revision bump is harmless.
-fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
-    let namespaces: Vec<_> = ctx.shard.plane.partitions().namespaces().copied().collect();
+/// A watermark whose enforcement is still incomplete (first local segment
+/// starts below it) counts as pending work: the pump may be blocked by a
+/// consumer barrier or by a rejoin whose offsets arrive via journal repair,
+/// and neither unblocking bumps `Streams::revision`, so the pass must keep
+/// the reconciler ticking until the layout converges.
+fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
     let streams = ctx.shard.plane.metadata().mux_stm.streams();
     for namespace in namespaces {
         let watermark = streams.partition_delete_watermark(
@@ -780,8 +792,16 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
             namespace.topic_id(),
             namespace.partition_id(),
         );
-        if watermark > 0 {
-            ctx.shard.request_truncate_partition(namespace, watermark);
+        if watermark == 0 {
+            continue;
+        }
+        ctx.shard.request_truncate_partition(namespace, watermark);
+        let trimmed = partitions
+            .get_by_ns(&namespace)
+            .and_then(|partition| partition.log.segments().first())
+            .is_none_or(|first| first.start_offset >= watermark);
+        if !trimmed {
+            counters.trims_pending += 1;
         }
     }
 }
