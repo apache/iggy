@@ -388,7 +388,9 @@ impl AvroStreamEncoder {
                 _ => Err(conversion_error()),
             },
             AvroSchema::Float => match value {
-                Bson::Double(value) => Ok(AvroValue::Float(*value as f32)),
+                Bson::Double(value) => Self::checked_f64_to_f32(*value)
+                    .map(AvroValue::Float)
+                    .ok_or_else(conversion_error),
                 _ => Err(conversion_error()),
             },
             AvroSchema::Double => match value {
@@ -472,6 +474,19 @@ impl AvroStreamEncoder {
         }
     }
 
+    fn checked_f64_to_f32(value: f64) -> Option<f32> {
+        if !value.is_finite() || !(f64::from(f32::MIN)..=f64::from(f32::MAX)).contains(&value) {
+            return None;
+        }
+
+        let converted = value as f32;
+        if value != 0.0 && converted == 0.0 {
+            return None;
+        }
+
+        Some(converted)
+    }
+
     fn serde_json_to_avro_value(
         value: serde_json::Value,
         schema: &apache_avro::Schema,
@@ -541,7 +556,13 @@ impl AvroStreamEncoder {
                 let v = n.as_f64().ok_or_else(|| {
                     Error::Serialization(format!("Cannot convert JSON number to Avro Float: {n}"))
                 })?;
-                Ok(AvroValue::Float(v as f32))
+                Self::checked_f64_to_f32(v)
+                    .map(AvroValue::Float)
+                    .ok_or_else(|| {
+                        Error::Serialization(format!(
+                            "JSON number {v} out of range for Avro Float (f32)"
+                        ))
+                    })
             }
             (serde_json::Value::Number(n), AvroSchema::Double) => {
                 let v = n.as_f64().ok_or_else(|| {
@@ -903,6 +924,81 @@ mod tests {
         assert!(matches!(
             error,
             Error::Serialization(message) if message.contains("$.age")
+        ));
+    }
+
+    #[test]
+    fn encode_should_reject_bson_double_not_representable_as_avro_float() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "Measurement",
+            "fields": [
+                {"name": "value", "type": "float"}
+            ]
+        }"#;
+        let encoder = AvroStreamEncoder::new(AvroEncoderConfig {
+            schema_json: Some(schema_json.to_string()),
+            ..AvroEncoderConfig::default()
+        });
+        let invalid_values = [
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MIN_POSITIVE,
+        ];
+
+        for value in invalid_values {
+            let error = encoder
+                .encode(Payload::Bson(bson::doc! {"value": value}))
+                .expect_err("unrepresentable BSON double should be rejected");
+
+            assert!(matches!(
+                error,
+                Error::Serialization(message) if message.contains("$.value")
+            ));
+        }
+    }
+
+    #[test]
+    fn encode_should_accept_bson_double_at_avro_float_boundary() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "Measurement",
+            "fields": [
+                {"name": "value", "type": "float"}
+            ]
+        }"#;
+        let encoder = AvroStreamEncoder::new(AvroEncoderConfig {
+            schema_json: Some(schema_json.to_string()),
+            ..AvroEncoderConfig::default()
+        });
+
+        let encoded = encoder
+            .encode(Payload::Bson(bson::doc! {"value": f64::from(f32::MAX)}))
+            .expect("BSON double at the f32 boundary should encode");
+        let AvroValue::Record(fields) = decode_avro_datum(&encoder, &encoded) else {
+            panic!("decoded Avro value should be a record");
+        };
+
+        assert_eq!(fields[0].1, AvroValue::Float(f32::MAX));
+    }
+
+    #[test]
+    fn encode_should_reject_json_number_out_of_avro_float_range() {
+        let encoder = AvroStreamEncoder::new(AvroEncoderConfig {
+            schema_json: Some(r#"{"type": "float"}"#.to_string()),
+            ..AvroEncoderConfig::default()
+        });
+
+        let error = encoder
+            .encode(Payload::Json(simd_json::json!(f64::MAX)))
+            .expect_err("JSON number outside the f32 range should be rejected");
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("out of range for Avro Float")
         ));
     }
 
