@@ -33,6 +33,7 @@ members = [
     "core/configs_derive",
     "core/connectors/runtime",
     "core/connectors/sdk",
+    "core/connectors/sinks/clickhouse_sink",
     "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
@@ -192,10 +193,10 @@ hwlocality = "1.0.0-alpha.12"
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.10.2-edge.1" }
+iggy = { path = "core/sdk", version = "0.10.3-edge.1" }
 iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.2-edge.1" }
-iggy_common = { path = "core/common", version = "0.10.2-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.3-edge.1" }
+iggy_common = { path = "core/common", version = "0.10.3-edge.1" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }

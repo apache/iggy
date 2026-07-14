@@ -567,6 +567,10 @@ impl IggyProducer {
         }
     }
 
+    /// Flushes buffered messages in `background` mode before returning. A
+    /// `direct`-mode producer has nothing to flush. Dropping the producer
+    /// instead of calling this silently discards unflushed `background`
+    /// messages.
     pub async fn shutdown(self) {
         if let Some(dispatcher) = self.dispatcher {
             dispatcher.shutdown().await;

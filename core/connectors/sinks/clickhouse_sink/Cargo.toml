@@ -16,30 +16,33 @@
 # under the License.
 
 [package]
-name = "iggy_binary_protocol"
-version = "0.10.3-edge.1"
-description = "Wire protocol types and codec for the Iggy binary protocol. Shared between server and SDK."
+name = "iggy_connector_clickhouse_sink"
+version = "0.1.0"
+description = "Iggy ClickHouse sink connector for streaming messages into ClickHouse"
 edition = "2024"
-rust-version.workspace = true
 license = "Apache-2.0"
-keywords = ["iggy", "messaging", "streaming"]
+keywords = ["iggy", "messaging", "streaming", "clickhouse", "sink"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "README.md"
+readme = "../../README.md"
+
+[lib]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
-bytemuck = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
-enumset = { workspace = true }
+iggy_connector_sdk = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
 secrecy = { workspace = true }
-thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-aligned-vec = { workspace = true }
-
-[lints.clippy]
-enum_glob_use = "deny"
-nursery = "warn"
-pedantic = "deny"
+toml = { workspace = true }
