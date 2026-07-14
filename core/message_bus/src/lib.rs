@@ -561,6 +561,84 @@ pub trait MessageBus {
     /// so a new impl cannot silently drop detached handles by omission; a
     /// stub that spawns nothing implements it as a no-op.
     fn track_background(&self, handle: JoinHandle<()>);
+
+    /// Timer used by shard-side loops (the message pump's consensus tick).
+    ///
+    /// Provided default is the wall-clock compio timer, which panics
+    /// outside a compio runtime: loud by design, so a non-compio host
+    /// that forgot to override cannot silently hang. The simulator
+    /// overrides this with a virtual-time sleep so the pump's timing is
+    /// a pure function of the simulation seed. Routed through the bus
+    /// because the bus is the one dependency the shard already injects
+    /// per environment; a separate clock generic would thread a second
+    /// seam through every shard constructor for the same effect.
+    ///
+    /// Returned unboxed as an opaque `impl Future` (RPITIT), matching
+    /// [`Self::send_to_client`] and [`Self::send_to_replica`]. The pump
+    /// keeps this future in a pinned, re-armed slot (see `run_message_pump`
+    /// in `core/shard/src/router.rs`); an opaque type stores there just as
+    /// a concrete one does. Unboxed matters because `select_biased!` polls
+    /// the tick arm on every frame (~1M/s/shard): a `Box<dyn Future>` would
+    /// cost a vtable-dispatched poll each time and lose inlining of the
+    /// timer poll, which dwarfs the once-per-tick allocation a box adds.
+    ///
+    /// # Contract for overrides
+    ///
+    /// The pump's re-arm slot relies on two behaviours the default and the
+    /// simulator override both honour; a third implementor must preserve
+    /// them or silently skew tick cadence or leak timers:
+    /// - Deadline anchored at creation, not first poll. The future is built
+    ///   once and polled many times, so the interval counts from when
+    ///   `sleep` returns.
+    /// - Drop cancels the timer. The pump replaces the slot on each fire and
+    ///   drops it on stop, so a leaked timer would wake a dead task or
+    ///   accumulate.
+    ///
+    /// This is also the one method here with a provided default, unlike the
+    /// setters above that require an explicit opt-in. Deliberate: the
+    /// default fails loud (compio panics outside its runtime) instead of
+    /// silently no-opping, so a bus that forgets to override cannot hang
+    /// undetected.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        compio::time::sleep(duration)
+    }
+
+    /// Spawn a detached background task on the ambient runtime.
+    ///
+    /// The default spawns onto the compio runtime and detaches (fire and
+    /// forget); the shell's off-pump poll IO, client-request drains, and
+    /// metadata submits use it. Like [`Self::sleep`], the default fails
+    /// loud outside a compio runtime rather than silently no-opping. The
+    /// simulator overrides this to stage the future on its deterministic
+    /// executor, so those tasks are scheduled and replayed by seed instead
+    /// of escaping to a real runtime: task code cannot spawn on the sim
+    /// executor directly, since that needs `&mut` it can never hold.
+    ///
+    /// Detached by contract: the join handle is dropped, so a caller that
+    /// must observe completion arranges its own signalling. All current
+    /// call sites are fire-and-forget.
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        compio::runtime::spawn(future).detach();
+    }
+
+    /// Real (wall) time in microseconds since the Unix epoch.
+    ///
+    /// The default reads the system clock, which is the correct production
+    /// source, so unlike [`Self::sleep`]/[`Self::spawn`] this default is a
+    /// real implementation rather than a fail-loud stub. It lives on the bus
+    /// for the same reason [`Self::sleep`] does: a shard-side handler that
+    /// needs real time (the login path gates PAT expiry on it, and that
+    /// accept/reject folds into the reply) must read a clock the environment
+    /// injects, or it diverges on replay. The simulator overrides this with
+    /// its seed-derived virtual clock.
+    ///
+    /// Distinct from the consensus prepare-timestamp clock
+    /// (`VsrConsensus::clock_realtime_micros`), which exists only on the
+    /// metadata owner (shard 0); this seam is present on every shard, so a
+    /// request handled on any entry shard still reads deterministic time.
+    fn realtime_micros(&self) -> u64 {
+        iggy_common::IggyTimestamp::now().as_micros()
+    }
 }
 
 /// Production message bus backed by real TCP connections.
@@ -1210,6 +1288,23 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
 
     fn track_background(&self, handle: JoinHandle<()>) {
         (**self).track_background(handle);
+    }
+
+    // Forward the defaulted methods too. Without this, a `Rc`-wrapped bus that
+    // overrides `sleep`/`spawn`/`realtime_micros` (the simulator's virtual timer,
+    // spawn queue, and virtual clock) would be silently reverted to the defaults
+    // through the wrapper. No-op for production, whose `IggyMessageBus` uses those
+    // defaults anyway.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
+        (**self).sleep(duration)
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        (**self).spawn(future);
+    }
+
+    fn realtime_micros(&self) -> u64 {
+        (**self).realtime_micros()
     }
 }
 

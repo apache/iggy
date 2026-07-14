@@ -213,7 +213,10 @@ pub async fn run_reconciler(
 
     loop {
         let sleep = compio::time::sleep(periodic);
-        futures::select! {
+        // Biased for the same reason as the shard pump: unbiased `select!`
+        // polls arms in process-random order, which a deterministic
+        // simulator cannot seed. Listed order is the intended priority.
+        futures::select_biased! {
             _ = stop_rx.recv().fuse() => break,
             recv = wake_rx.recv().fuse() => {
                 if recv.is_err() {

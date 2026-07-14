@@ -24,6 +24,7 @@ use crate::{
     dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
 };
 use bit_set::BitSet;
+use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
@@ -35,6 +36,45 @@ use server_common::Message;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
+
+/// Injected time source for primary-stamped prepare timestamps.
+///
+/// The consensus core never reads the wall clock directly,
+/// so a deterministic host (the simulator) can substitute virtual time
+/// and make prepare timestamps a pure function of the seed.
+/// of the seed. Production defaults to [`IggySystemClock`] through
+/// [`VsrConsensus::new`]; only tests and the simulator construct one
+/// explicitly via [`VsrConsensus::with_clock`].
+///
+/// The clock is type-erased behind `Rc<dyn Clock>` deliberately, to avoid
+/// threading a clock generic through every `VsrConsensus<B, P>` call site. The
+/// one vtable dispatch it costs per stamp is negligible next to the WAL append
+/// each prepare already performs.
+#[derive(Clone)]
+pub struct ConsensusClock(Rc<dyn Clock<Realtime = IggyTimestamp>>);
+
+impl ConsensusClock {
+    #[must_use]
+    pub fn new(clock: Rc<dyn Clock<Realtime = IggyTimestamp>>) -> Self {
+        Self(clock)
+    }
+
+    #[must_use]
+    pub fn system() -> Self {
+        Self(Rc::new(IggySystemClock))
+    }
+
+    fn realtime(&self) -> IggyTimestamp {
+        self.0.realtime()
+    }
+}
+
+impl std::fmt::Debug for ConsensusClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsensusClock")
+    }
+}
 
 pub trait Sequencer {
     type Sequence;
@@ -728,6 +768,10 @@ where
     /// Monotonic timestamp from the most recent accepted commit heartbeat.
     /// Old/replayed commit messages with a lower timestamp are ignored.
     heartbeat_timestamp: Cell<u64>,
+
+    /// Time source for [`Self::next_monotonic_timestamp`]; see
+    /// [`ConsensusClock`].
+    clock: ConsensusClock,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -741,6 +785,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         namespace: u64,
         message_bus: B,
         pipeline: P,
+    ) -> Self {
+        Self::with_clock(
+            cluster,
+            replica,
+            replica_count,
+            namespace,
+            message_bus,
+            pipeline,
+            ConsensusClock::system(),
+        )
+    }
+
+    /// [`Self::new`] with an explicit time source. Simulator and clock
+    /// tests only; production wiring stays on the system-clock default.
+    ///
+    /// # Panics
+    /// - If `replica >= replica_count`.
+    /// - If `replica_count < 1`.
+    pub fn with_clock(
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        namespace: u64,
+        message_bus: B,
+        pipeline: P,
+        clock: ConsensusClock,
     ) -> Self {
         assert!(
             replica < replica_count,
@@ -787,6 +857,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_timestamp: Cell::new(0),
+            clock,
         }
     }
 
@@ -1014,6 +1085,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // past a sibling prepare pipelined during the append await.
         self.sequencer.set_sequence(header.op);
         self.set_last_prepare_checksum(header.checksum);
+        self.observe_prepare_timestamp(header.timestamp);
 
         emit_sim_event(
             SimEventKind::PrepareQueued,
@@ -1085,18 +1157,64 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.last_prepare_checksum.set(checksum);
     }
 
-    /// Returns a primary-stamped prepare timestamp that is strictly greater
-    /// than every previously-stamped value on this primary.
+    /// Primary-stamped prepare timestamp, strictly greater than every value
+    /// this primary has stamped or observed (see
+    /// [`Self::observe_prepare_timestamp`]). Monotonicity guards `created_at`
+    /// ordering against an NTP step backwards.
     ///
-    /// Without monotonicity, an NTP step backwards could produce
-    /// `prepare[N+1].timestamp < prepare[N].timestamp`, breaking
-    /// `created_at` ordering invariants in deterministic state.
+    /// Lower bound only. The upper bound (clamping the read to a Marzullo
+    /// interval over a peer-clock quorum, and abdicating if the primary cannot
+    /// synchronize) is not enforced: Iggy has no peer-clock sync, so a runaway
+    /// primary clock can stamp a far-future value. Backups lift their floor to it on observe,
+    /// before commit, so even a view-change-truncated prepare poisons
+    /// `created_at` cluster-wide and survives view changes. Consensus safety is
+    /// unaffected (all replicas agree on the value); only wall-clock-derived
+    /// semantics (retention, PAT expiry) skew. An upper bound is unenforceable
+    /// at observe time (a backup clamping by its local clock would diverge from
+    /// peers); the only sound site is mint, pending the unbuilt peer-clock
+    /// subsystem.
     pub fn next_monotonic_timestamp(&self) -> u64 {
-        let now = IggyTimestamp::now().as_micros();
+        let now = self.clock.realtime().as_micros();
         let prev = self.last_timestamp.get();
         let next = now.max(prev.saturating_add(1));
+        // Strict monotonicity, except at prev == u64::MAX (saturating add
+        // sticks, stamp repeats): reachable only via a malformed peer stamp
+        // (none rejected yet) or year ~586_524. Debug-only; release never panics.
+        debug_assert!(
+            next > prev,
+            "prepare timestamp not strictly monotonic (prev at u64::MAX?): prev={prev} next={next}"
+        );
         self.last_timestamp.set(next);
         next
+    }
+
+    /// Read-only clock read (microseconds since the Unix epoch). Unlike
+    /// [`Self::next_monotonic_timestamp`] it does not advance the floor:
+    /// snapshots stamp `created_at` from the same seed-derived clock so a
+    /// replayed seed reproduces identical bytes, without consuming the
+    /// monotonic sequence.
+    #[must_use]
+    pub fn clock_realtime_micros(&self) -> u64 {
+        self.clock.realtime().as_micros()
+    }
+
+    /// Lift the monotonic floor to a prepare timestamp observed from the log:
+    /// backups per replicated prepare, recovery for the restored head, pipeline
+    /// rebuilds per entry. Without it the floor is per-primary in-memory state,
+    /// so a new primary whose clock lags its predecessor would stamp below
+    /// committed entries after a view change. Monotone max-merge: idempotent,
+    /// order-independent.
+    ///
+    /// Observed at append (in `on_replicate`), before commit, so a truncated
+    /// prepare still raises the floor: the cluster-wide `created_at` blast
+    /// radius noted on [`Self::next_monotonic_timestamp`]. Deliberate: observing
+    /// at assignment is the conservative floor, and the runaway-clock fix is the
+    /// upper peer-clock (Marzullo) window, not narrowing this to the commit
+    /// path. Revisit only together.
+    pub fn observe_prepare_timestamp(&self, timestamp: u64) {
+        if timestamp > self.last_timestamp.get() {
+            self.last_timestamp.set(timestamp);
+        }
     }
 
     #[must_use]
@@ -2397,7 +2515,8 @@ where
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
-        // Primary stamps wall-clock once at prepare-build; the value is
+        // Primary stamps the injected clock once at prepare-build (wall time
+        // in production, virtual under the simulator); the value is
         // replicated to every backup so apply() reads the same timestamp
         // across the cluster (deterministic state-machine apply). Monotonic
         // wrapper guards against NTP rewinds; see
@@ -2739,5 +2858,106 @@ mod pipeline_entry_tests {
         let header = PrepareHeader::default();
         let mut entry = PipelineEntry::new(header);
         assert!(entry.take_reply_sender().is_none());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_clamp_tests {
+    //! Pin the monotonic-floor contract: a new primary must never stamp a
+    //! prepare below timestamps already in the replicated log, even when its
+    //! wall clock lags the predecessor's.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
+
+    /// Clock frozen at a fixed instant, standing in for a lagging wall
+    /// clock on a freshly elected primary.
+    struct FixedClock(u64);
+
+    impl clock::Clock for FixedClock {
+        type Realtime = IggyTimestamp;
+
+        fn realtime(&self) -> Self::Realtime {
+            IggyTimestamp::from(self.0)
+        }
+    }
+
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+    }
+
+    #[test]
+    fn observed_log_timestamp_floors_new_primary_stamps() {
+        let lagging_clock = ConsensusClock::new(Rc::new(FixedClock(1_000)));
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            1,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            lagging_clock,
+        );
+
+        // Predecessor primary (fast wall clock) committed up to T=50_000;
+        // this replica ingests that head via replication / rebuild.
+        consensus.observe_prepare_timestamp(50_000);
+
+        let stamped = consensus.next_monotonic_timestamp();
+        assert!(
+            stamped > 50_000,
+            "stamp {stamped} regressed below the observed log head"
+        );
+
+        // Own stamps stay strictly monotonic on top of the lifted floor.
+        let second = consensus.next_monotonic_timestamp();
+        assert!(second > stamped);
+
+        // Observing an OLDER timestamp never rewinds the floor.
+        consensus.observe_prepare_timestamp(10);
+        assert!(consensus.next_monotonic_timestamp() > second);
+    }
+
+    #[test]
+    fn wall_clock_ahead_of_log_still_wins() {
+        let leading_clock = ConsensusClock::new(Rc::new(FixedClock(100_000)));
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            1,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            leading_clock,
+        );
+        consensus.observe_prepare_timestamp(50_000);
+        assert_eq!(
+            consensus.next_monotonic_timestamp(),
+            100_000,
+            "a clock ahead of the log must stamp real time, not floor + 1"
+        );
     }
 }

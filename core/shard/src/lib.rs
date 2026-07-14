@@ -23,13 +23,17 @@ mod router;
 pub mod shards_table;
 
 pub use config::CoordinatorConfig;
+pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(any(test, feature = "simulator"))]
 use consensus::LocalPipeline;
 use consensus::{
-    CommitOutcome, Consensus, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
-    PlaneKind, Sequencer, VsrAction, VsrConsensus,
+    CommitOutcome, Consensus, ConsensusClock, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline,
+    Plane, PlaneKind, Sequencer, VsrAction, VsrConsensus,
 };
+#[cfg(any(test, feature = "simulator"))]
+use crossfire::AsyncRxTrait;
+use futures::FutureExt;
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
@@ -54,6 +58,7 @@ use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::rc::Rc;
 #[cfg(any(test, feature = "simulator"))]
 use std::sync::Arc;
@@ -82,6 +87,11 @@ where
     pub self_replica_id: u8,
     pub replica_count: u8,
     pub bus: B,
+    /// Time source handed to every partition consensus group built from
+    /// this config (`init_partition`, simulator-only). Production groups
+    /// are built by `partition_helpers::build_partition_fresh` on the
+    /// system-clock default instead.
+    pub clock: ConsensusClock,
 }
 
 /// Replica id + count bundle.
@@ -110,12 +120,25 @@ where
     B: MessageBus,
 {
     #[must_use]
-    pub const fn new(cluster_id: u128, topology: ReplicaTopology, bus: B) -> Self {
+    pub fn new(cluster_id: u128, topology: ReplicaTopology, bus: B) -> Self {
+        Self::with_clock(cluster_id, topology, bus, ConsensusClock::system())
+    }
+
+    /// [`Self::new`] with an explicit time source for the partition
+    /// consensus groups; the simulator passes its virtual clock here.
+    #[must_use]
+    pub const fn with_clock(
+        cluster_id: u128,
+        topology: ReplicaTopology,
+        bus: B,
+        clock: ConsensusClock,
+    ) -> Self {
         Self {
             cluster_id,
             self_replica_id: topology.self_replica_id,
             replica_count: topology.replica_count,
             bus,
+            clock,
         }
     }
 }
@@ -312,6 +335,26 @@ pub type PartitionReadHandler =
 /// walks from client retries. Must stay below the SDK's 30s request
 /// deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Race `future` against a bus timer: `Some` if it finishes within `budget`,
+/// `None` if the timer fires first. Uses [`MessageBus::sleep`] (virtual under
+/// the simulator, wall-clock in production) rather than `compio::time::timeout`,
+/// which panics outside a compio runtime and so cannot run under the
+/// deterministic executor.
+#[allow(clippy::future_not_send)]
+async fn bus_timeout<B, F>(bus: &B, budget: std::time::Duration, future: F) -> Option<F::Output>
+where
+    B: MessageBus,
+    F: Future,
+{
+    let future = future.fuse();
+    let timer = bus.sleep(budget).fuse();
+    futures::pin_mut!(future, timer);
+    futures::select_biased! {
+        output = future => Some(output),
+        () = timer => None,
+    }
+}
 
 /// Create a bounded inter-shard channel whose sender is tagged with the
 /// owning shard.
@@ -788,6 +831,19 @@ where
     B: MessageBus + 'static,
     T: ShardsTable,
 {
+    /// Depth of this shard's inbound frame queue.
+    ///
+    /// Diagnostic accessor for the simulator's lost-wake tripwire: at
+    /// executor quiescence a live pump must have drained its inbox, so a
+    /// non-zero depth means a frame reached the channel without waking the
+    /// pump. Gated to test/simulator builds (sole caller is the sim), matching
+    /// the sibling `ShardMetrics::frame_drops_value`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn inbox_len(&self) -> usize {
+        self.inbox.len()
+    }
+
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
@@ -919,38 +975,35 @@ where
 
         let mut clients = Vec::new();
         let mut received = 0usize;
-        // One deadline across the whole gather: each `recv` waits only the
-        // remaining budget, so total wall time is bounded by
-        // LIST_CLIENTS_GATHER_TIMEOUT (not expected * timeout), while the
+        // One deadline across the whole gather, timed on the injected clock
+        // (virtual under the simulator, wall-clock in production) via a single
+        // `bus.sleep` raced against collecting every reply. Reading
+        // `Instant::now` for the budget instead would desync the deterministic
+        // executor, whose schedule must be a pure function of the seed; the
+        // bus sleep is the clock the rest of the pump already times against.
+        // Total time stays bounded by LIST_CLIENTS_GATHER_TIMEOUT and the
         // partial results gathered so far are still returned on expiry.
-        let deadline = std::time::Instant::now() + LIST_CLIENTS_GATHER_TIMEOUT;
-        while received < expected {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!(
-                    shard = self.id,
-                    received,
-                    expected,
-                    "list_all_clients: gather budget exhausted; returning partial result"
-                );
-                break;
-            }
-            match compio::time::timeout(remaining, reply_rx.recv()).await {
-                Ok(Ok(batch)) => {
-                    clients.extend(batch);
-                    received += 1;
-                }
-                Ok(Err(_)) => break, // all reply senders dropped
-                Err(_) => {
-                    tracing::warn!(
-                        shard = self.id,
-                        received,
-                        expected,
-                        "list_all_clients: gather timed out; returning partial result"
-                    );
-                    break;
+        let gather = async {
+            while received < expected {
+                match reply_rx.recv().await {
+                    Ok(batch) => {
+                        clients.extend(batch);
+                        received += 1;
+                    }
+                    Err(_) => break, // all reply senders dropped
                 }
             }
+        };
+        if bus_timeout(&self.bus, LIST_CLIENTS_GATHER_TIMEOUT, gather)
+            .await
+            .is_none()
+        {
+            tracing::warn!(
+                shard = self.id,
+                received,
+                expected,
+                "list_all_clients: gather timed out; returning partial result"
+            );
         }
         clients
     }
@@ -992,9 +1045,9 @@ where
             );
             return None;
         }
-        match compio::time::timeout(PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
-            Ok(Ok(reply)) => Some(reply),
-            Ok(Err(_)) => {
+        match bus_timeout(&self.bus, PARTITION_READ_TIMEOUT, reply_rx.recv()).await {
+            Some(Ok(reply)) => Some(reply),
+            Some(Err(_)) => {
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -1002,7 +1055,7 @@ where
                 );
                 None
             }
-            Err(_) => {
+            None => {
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -1596,13 +1649,14 @@ where
             return;
         }
 
-        let consensus = VsrConsensus::new(
+        let consensus = VsrConsensus::with_clock(
             self.partition_consensus.cluster_id,
             self.partition_consensus.self_replica_id,
             self.partition_consensus.replica_count,
             namespace.inner(),
             self.partition_consensus.bus.clone(),
             LocalPipeline::new(),
+            self.partition_consensus.clock.clone(),
         );
         consensus.init();
 
@@ -2901,6 +2955,10 @@ async fn dispatch_vsr_actions<B, P, J>(
                             gap_at = Some(op);
                             return None;
                         };
+                        // New-primary path: lift the monotonic timestamp
+                        // floor to the rebuilt log so post-view-change
+                        // prepares cannot stamp below committed ones.
+                        consensus.observe_prepare_timestamp(header.timestamp);
                         let mut entry = consensus::PipelineEntry::new(*header);
                         entry.add_ack(self_id);
                         Some(entry)
@@ -3063,6 +3121,10 @@ async fn dispatch_partition_journal_actions<B, P>(
                             gap_at = Some(op);
                             return None;
                         };
+                        // New-primary path: lift the monotonic timestamp
+                        // floor to the rebuilt log so post-view-change
+                        // prepares cannot stamp below committed ones.
+                        consensus.observe_prepare_timestamp(header.timestamp);
                         let mut entry = consensus::PipelineEntry::new(header);
                         entry.add_ack(self_id);
                         Some(entry)

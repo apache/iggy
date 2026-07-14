@@ -23,12 +23,13 @@
 //! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
 //! resolvers.
 
-use crate::bootstrap::ServerNgShard;
+use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::{BufMut, Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
@@ -78,6 +79,7 @@ use iggy_binary_protocol::{
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
@@ -94,11 +96,17 @@ use system_stats::SystemProbe;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
-pub(crate) fn build_get_personal_access_tokens_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-) -> GetPersonalAccessTokensResponse {
+) -> GetPersonalAccessTokensResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     // PATs are per-user; list the requesting connection's own tokens, resolved
     // from this shard's `SessionManager` (like `get_me`) then read out of the
     // replicated Users STM.
@@ -124,11 +132,17 @@ pub(crate) fn build_get_personal_access_tokens_response(
     })
 }
 
-pub(crate) fn build_get_me_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_get_me_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-) -> ClientDetailsResponse {
+) -> ClientDetailsResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let mut client = sessions
         .borrow()
         .client_record(transport_client_id)
@@ -192,10 +206,16 @@ pub(crate) fn build_get_me_response(
 /// `consumer_groups_count` is resolved from the connection's bound VSR client
 /// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
 /// transport id). Connections that never bound (pre-register) count 0.
-pub(crate) fn connected_client_to_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn connected_client_to_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     info: &ConnectedClientInfo,
-) -> ClientResponse {
+) -> ClientResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let consumer_groups_count = info.vsr_client_id.map_or(0, |vsr_client_id| {
         #[allow(clippy::cast_possible_truncation)]
         let count = shard
@@ -223,14 +243,20 @@ pub(crate) fn connected_client_to_response(
 /// touch the offset of a partition it currently owns. `Ok` for individual
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
 /// stale client re-syncs instead of corrupting the shared group offset.
-fn fence_group_offset(
-    shard: &Rc<ServerNgShard>,
+fn fence_group_offset<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
     client_id: u128,
-) -> Result<(), IggyError> {
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     if consumer.kind != KIND_CONSUMER_GROUP {
         return Ok(());
     }
@@ -260,14 +286,20 @@ fn fence_group_offset(
 
 /// Fence a consumer-group offset op then resolve its target partition
 /// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
-fn fence_and_resolve_offset_namespace(
-    shard: &Rc<ServerNgShard>,
+fn fence_and_resolve_offset_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
     client_id: u128,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     fence_group_offset(
         shard,
         consumer,
@@ -279,12 +311,18 @@ fn fence_and_resolve_offset_namespace(
     resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
-pub(crate) fn resolve_partition_request_namespace(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn resolve_partition_request_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     operation: Operation,
     body: &[u8],
     client_id: u128,
-) -> Result<u64, IggyError> {
+) -> Result<u64, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let namespace = match operation {
         Operation::SendMessages => {
             if body.len() < 4 {
@@ -365,10 +403,16 @@ pub(crate) fn resolve_partition_request_namespace(
     Ok(namespace.inner())
 }
 
-fn resolve_send_messages_namespace(
-    shard: &Rc<ServerNgShard>,
+fn resolve_send_messages_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     header: &SendMessagesHeader,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let partition_id = match &header.partitioning {
         WirePartitioning::PartitionId(partition_id) => *partition_id,
         WirePartitioning::Balanced => shard
@@ -394,12 +438,18 @@ fn resolve_send_messages_namespace(
     )
 }
 
-pub(crate) fn resolve_partition_namespace(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn resolve_partition_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
     shard
         .plane
@@ -413,13 +463,19 @@ pub(crate) fn resolve_partition_namespace(
 /// `user_id` is the authenticated caller, used only by the identity-scoped
 /// reads (currently the PAT list); every other arm ignores it. Authorization
 /// stays with the per-transport gates that run before this builder.
-pub(crate) fn build_non_replicated_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_non_replicated_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
     roster: &ClusterRoster,
-) -> Result<NonReplicatedResponse, IggyError> {
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard).to_bytes(),
@@ -537,10 +593,16 @@ pub(crate) fn build_non_replicated_response(
 /// The leader marking comes from this shard's consensus view; a shard without
 /// consensus (any shard but 0) still serves the full roster, only with no node
 /// marked leader.
-fn build_cluster_metadata_response(
+fn build_cluster_metadata_response<B, MJ, S>(
     roster: &ClusterRoster,
-    shard: &Rc<ServerNgShard>,
-) -> ClusterMetadataResponse {
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> ClusterMetadataResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     // Shard 0 reads its live consensus; delegated shards use the view shard 0
     // publishes into the roster, so leader marking works on every shard.
     let primary_index = shard
@@ -578,7 +640,15 @@ fn build_cluster_metadata_response(
     }
 }
 
-fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
+fn build_stats_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<StatsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let (
         streams_count,
         topics_count,
@@ -756,10 +826,16 @@ fn probe_system_stats() -> SystemStats {
     }
 }
 
-fn build_get_stream_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_stream_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
-) -> Result<Option<GetStreamResponse>, IggyError> {
+) -> Result<Option<GetStreamResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
@@ -783,7 +859,15 @@ fn build_get_stream_response(
     })
 }
 
-fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsResponse, IggyError> {
+fn build_get_streams_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<GetStreamsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         streams
             .items
@@ -804,7 +888,15 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
     })
 }
 
-fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersResponse, IggyError> {
+fn build_get_users_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<GetUsersResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.users().read(|users| {
         users
             .items
@@ -815,10 +907,16 @@ fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersRespons
     })
 }
 
-fn build_get_user_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_user_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     user_id: &WireIdentifier,
-) -> Result<Option<UserDetailsResponse>, IggyError> {
+) -> Result<Option<UserDetailsResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.users().read(|users| {
         let resolved = match user_id {
             WireIdentifier::Numeric(id) => {
@@ -858,11 +956,17 @@ fn personal_access_tokens_response(
     Ok(GetPersonalAccessTokensResponse { tokens })
 }
 
-fn build_get_topic_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_topic_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
-) -> Result<Option<GetTopicResponse>, IggyError> {
+) -> Result<Option<GetTopicResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
@@ -891,10 +995,16 @@ fn build_get_topic_response(
     })
 }
 
-fn build_get_topics_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_topics_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
-) -> Result<GetTopicsResponse, IggyError> {
+) -> Result<GetTopicsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
     let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
@@ -916,11 +1026,17 @@ fn build_get_topics_response(
 /// Reject a consumer-group read whose parent stream/topic is absent with the
 /// legacy typed error naming the level that missed; the group itself missing
 /// stays the shared not-found reply (empty over TCP, 404 over HTTP).
-fn ensure_topic_exists(
-    shard: &Rc<ServerNgShard>,
+fn ensure_topic_exists<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
-) -> Result<(), IggyError> {
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
             resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
@@ -1280,7 +1396,13 @@ pub(crate) fn build_reply_with_body(
     reply
 }
 
-pub(crate) fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
+pub(crate) fn current_metadata_commit<B, MJ, S>(shard: &Rc<ShellShard<B, MJ, S>>) -> u64
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard
         .plane
         .metadata()
