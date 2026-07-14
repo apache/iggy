@@ -45,6 +45,7 @@ func newTestClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 		conn:   clientConn,
 		state:  iggcon.StateConnected,
 		logger: slog.New(slog.DiscardHandler),
+		events: newEventBroadcaster(),
 	}
 	t.Cleanup(func() {
 		err := clientConn.Close()

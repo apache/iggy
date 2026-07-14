@@ -51,6 +51,7 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 		}
 		return c.LoginUser(ctx, username, password)
 	}
+	c.events.publish(iggcon.DiagnosticEventSignedIn)
 	return identity, nil
 }
 
@@ -75,12 +76,16 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 		}
 		return c.LoginWithPersonalAccessToken(ctx, token)
 	}
+	c.events.publish(iggcon.DiagnosticEventSignedIn)
 	return identity, nil
 }
 
 func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
-	_, err := c.do(ctx, &command.LogoutUser{})
-	return err
+	if _, err := c.do(ctx, &command.LogoutUser{}); err != nil {
+		return err
+	}
+	c.events.publish(iggcon.DiagnosticEventSignedOut)
+	return nil
 }
 
 func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, error) {
@@ -116,6 +121,8 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 		return false, nil
 	}
 	c.mtx.Unlock()
+
+	c.events.publish(iggcon.DiagnosticEventRedirected)
 
 	if err = c.disconnect(); err != nil {
 		return false, err
