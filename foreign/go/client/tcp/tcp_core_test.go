@@ -272,3 +272,60 @@ func TestNewIggyTcpClient_StoresProvidedLogger(t *testing.T) {
 		t.Errorf("expected logger output to contain 'source=tcp', got: %q", output)
 	}
 }
+
+var errCloseFailed = errors.New("close failed")
+
+// failingCloseConn is a connection whose Close always fails, standing in for a
+// socket whose teardown reports an error the client cannot act on.
+type failingCloseConn struct {
+	net.Conn
+	closes int
+}
+
+func (f *failingCloseConn) Close() error {
+	f.closes++
+	return errCloseFailed
+}
+
+func TestShutdown_FailedCloseStillCompletesTeardown(t *testing.T) {
+	c, _ := newTestClient(t)
+	conn := &failingCloseConn{Conn: c.conn}
+	c.conn = conn
+
+	if err := c.shutdown(); !errors.Is(err, errCloseFailed) {
+		t.Fatalf("got %v, want %v", err, errCloseFailed)
+	}
+	if c.state != iggcon.StateShutdown {
+		t.Errorf("expected state %v, got %v", iggcon.StateShutdown, c.state)
+	}
+	if c.conn != nil {
+		t.Error("expected the closed connection to be dropped")
+	}
+
+	if err := c.shutdown(); err != nil {
+		t.Errorf("expected the second shutdown to be a no-op, got %v", err)
+	}
+	if conn.closes != 1 {
+		t.Errorf("expected the connection to be closed once, got %d", conn.closes)
+	}
+}
+
+func TestDisconnect_ShutdownClientIsNotResurrected(t *testing.T) {
+	c, _ := newTestClient(t)
+
+	if err := c.shutdown(); err != nil {
+		t.Fatalf("unexpected shutdown error: %v", err)
+	}
+	if err := c.disconnect(); err != nil {
+		t.Fatalf("unexpected disconnect error: %v", err)
+	}
+
+	if c.state != iggcon.StateShutdown {
+		t.Errorf("expected state to stay %v, got %v", iggcon.StateShutdown, c.state)
+	}
+
+	_, err := c.sendWireAndFetchResponse(context.Background(), emptyWireReq)
+	if !errors.Is(err, ierror.ErrClientShutdown) {
+		t.Errorf("got %v, want %v", err, ierror.ErrClientShutdown)
+	}
+}
