@@ -15,15 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
 use base64::{Engine as Base64Engine, engine::general_purpose};
+use bson::Bson;
 use iggy_common::IggyTimestamp;
 use prost::Message;
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, FieldDescriptor, Kind, MapKey, MessageDescriptor,
+    Value as ProtoValue,
+};
 use prost_types::Any;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
 use tracing::{error, info};
+
+use crate::{Error, Payload, Schema, StreamEncoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtoEncoderConfig {
@@ -76,6 +83,7 @@ impl Default for ProtoFormatOptions {
 pub struct ProtoStreamEncoder {
     config: ProtoEncoderConfig,
     message_descriptor: Option<prost_types::DescriptorProto>,
+    dynamic_message_descriptor: Option<MessageDescriptor>,
     file_descriptor_set: Option<prost_types::FileDescriptorSet>,
 }
 
@@ -88,6 +96,7 @@ impl ProtoStreamEncoder {
         let mut encoder = Self {
             config,
             message_descriptor: None,
+            dynamic_message_descriptor: None,
             file_descriptor_set: None,
         };
 
@@ -168,17 +177,7 @@ impl ProtoStreamEncoder {
                     "Successfully compiled proto schema with {} files",
                     file_descriptor_set.file.len()
                 );
-
-                if let Some(message_type) = &self.config.message_type {
-                    self.message_descriptor =
-                        self.find_message_descriptor_by_name(&file_descriptor_set, message_type)?;
-                    info!(
-                        "Found message descriptor for encoding type: {}",
-                        message_type
-                    );
-                }
-
-                self.file_descriptor_set = Some(file_descriptor_set);
+                self.cache_descriptors(file_descriptor_set)?;
                 Ok(())
             }
             Err(e) => {
@@ -262,19 +261,37 @@ impl ProtoStreamEncoder {
         let file_descriptor_set = prost_types::FileDescriptorSet::decode(descriptor_bytes)
             .map_err(|_| Error::InvalidProtobufPayload)?;
 
-        if let Some(message_type) = &self.config.message_type {
+        self.cache_descriptors(file_descriptor_set)
+    }
+
+    fn cache_descriptors(
+        &mut self,
+        file_descriptor_set: prost_types::FileDescriptorSet,
+    ) -> Result<(), Error> {
+        let descriptor_pool = DescriptorPool::from_file_descriptor_set(file_descriptor_set.clone())
+            .map_err(|error| {
+                Error::InvalidConfigValue(format!(
+                    "Failed to build Protobuf descriptor pool: {error}"
+                ))
+            })?;
+        let message_type = self.config.message_type.clone();
+
+        if let Some(message_type) = message_type {
             self.message_descriptor =
-                self.find_message_descriptor_by_name(&file_descriptor_set, message_type)?;
+                self.find_message_descriptor_by_name(&file_descriptor_set, &message_type)?;
+            self.dynamic_message_descriptor = descriptor_pool.get_message_by_name(&message_type);
             if self.message_descriptor.is_some() {
                 info!(
                     "Found message descriptor for encoding type: {}",
                     message_type
                 );
             }
+        } else {
+            self.message_descriptor = None;
+            self.dynamic_message_descriptor = None;
         }
 
         self.file_descriptor_set = Some(file_descriptor_set);
-
         Ok(())
     }
 
@@ -310,6 +327,271 @@ impl ProtoStreamEncoder {
         } else {
             Ok(payload)
         }
+    }
+
+    fn normalize_bson_payload(payload: Payload) -> Result<Payload, Error> {
+        let Payload::Bson(document) = payload else {
+            return Ok(payload);
+        };
+
+        let json_value = Bson::Document(document).into_relaxed_extjson();
+        let mut json_bytes = serde_json::to_vec(&json_value).map_err(|error| {
+            error!("Failed to serialize BSON document as JSON: {error}");
+            Error::InvalidBsonPayload
+        })?;
+        let json_value = simd_json::to_owned_value(&mut json_bytes).map_err(|error| {
+            error!("Failed to normalize BSON document as JSON: {error}");
+            Error::InvalidBsonPayload
+        })?;
+
+        Ok(Payload::Json(json_value))
+    }
+
+    fn encode_bson_with_descriptor(
+        &self,
+        document: &bson::Document,
+        descriptor: &MessageDescriptor,
+    ) -> Result<Vec<u8>, Error> {
+        let message = Self::bson_document_to_dynamic_message(
+            document,
+            descriptor,
+            self.config.field_mappings.as_ref(),
+            "$",
+        )?;
+        Ok(message.encode_to_vec())
+    }
+
+    fn bson_document_to_dynamic_message(
+        document: &bson::Document,
+        descriptor: &MessageDescriptor,
+        field_mappings: Option<&HashMap<String, String>>,
+        path: &str,
+    ) -> Result<DynamicMessage, Error> {
+        let mut message = DynamicMessage::new(descriptor.clone());
+        let mut populated_oneofs = HashSet::new();
+
+        for field in descriptor.fields() {
+            let source_name = field_mappings
+                .and_then(|mappings| mappings.get(field.name()))
+                .map(String::as_str)
+                .unwrap_or_else(|| field.name());
+            let value = document.get(source_name).or_else(|| {
+                (source_name == field.name())
+                    .then(|| document.get(field.json_name()))
+                    .flatten()
+            });
+            let field_path = format!("{path}.{}", field.name());
+            let Some(value) = value else {
+                if field.is_required() {
+                    return Err(Error::Serialization(format!(
+                        "Missing BSON field `{field_path}` required by Protobuf descriptor"
+                    )));
+                }
+                continue;
+            };
+
+            if matches!(value, Bson::Null) {
+                if field.is_required() {
+                    return Err(Self::bson_protobuf_conversion_error(
+                        value,
+                        &field,
+                        &field_path,
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(oneof) = field.containing_oneof()
+                && !populated_oneofs.insert(oneof.name().to_string())
+            {
+                return Err(Error::Serialization(format!(
+                    "Multiple BSON fields populate Protobuf oneof `{}` at `{path}`",
+                    oneof.name()
+                )));
+            }
+
+            let proto_value = Self::bson_to_dynamic_value(value, &field, &field_path)?;
+            message
+                .try_set_field(&field, proto_value)
+                .map_err(|_| Self::bson_protobuf_conversion_error(value, &field, &field_path))?;
+        }
+
+        Ok(message)
+    }
+
+    fn bson_to_dynamic_value(
+        value: &Bson,
+        field: &FieldDescriptor,
+        path: &str,
+    ) -> Result<ProtoValue, Error> {
+        if field.is_list() {
+            let Bson::Array(items) = value else {
+                return Err(Self::bson_protobuf_conversion_error(value, field, path));
+            };
+            let kind = field.kind();
+            let values = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    Self::bson_to_dynamic_scalar(item, &kind, &format!("{path}[{index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(ProtoValue::List(values));
+        }
+
+        if field.is_map() {
+            let Bson::Document(document) = value else {
+                return Err(Self::bson_protobuf_conversion_error(value, field, path));
+            };
+            let Kind::Message(map_entry) = field.kind() else {
+                return Err(Self::bson_protobuf_conversion_error(value, field, path));
+            };
+            let key_field = map_entry.map_entry_key_field();
+            let value_field = map_entry.map_entry_value_field();
+            let value_kind = value_field.kind();
+            let values = document
+                .iter()
+                .map(|(key, value)| {
+                    let entry_path = format!("{path}.{key}");
+                    let key = Self::bson_to_map_key(key, &key_field.kind(), &entry_path)?;
+                    let value = Self::bson_to_dynamic_scalar(value, &value_kind, &entry_path)?;
+                    Ok((key, value))
+                })
+                .collect::<Result<HashMap<_, _>, Error>>()?;
+            return Ok(ProtoValue::Map(values));
+        }
+
+        Self::bson_to_dynamic_scalar(value, &field.kind(), path)
+    }
+
+    fn bson_to_dynamic_scalar(value: &Bson, kind: &Kind, path: &str) -> Result<ProtoValue, Error> {
+        let conversion_error = || Self::bson_protobuf_kind_error(value, kind, path);
+        let converted = match kind {
+            Kind::Bool => match value {
+                Bson::Boolean(value) => ProtoValue::Bool(*value),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => match value {
+                Bson::Int32(value) => ProtoValue::I32(*value),
+                Bson::Int64(value) => {
+                    ProtoValue::I32(i32::try_from(*value).map_err(|_| conversion_error())?)
+                }
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => match value {
+                Bson::Int32(value) => ProtoValue::I64(i64::from(*value)),
+                Bson::Int64(value) => ProtoValue::I64(*value),
+                Bson::DateTime(value) => ProtoValue::I64(value.timestamp_millis()),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Uint32 | Kind::Fixed32 => match value {
+                Bson::Int32(value) => {
+                    ProtoValue::U32(u32::try_from(*value).map_err(|_| conversion_error())?)
+                }
+                Bson::Int64(value) => {
+                    ProtoValue::U32(u32::try_from(*value).map_err(|_| conversion_error())?)
+                }
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Uint64 | Kind::Fixed64 => match value {
+                Bson::Int32(value) => {
+                    ProtoValue::U64(u64::try_from(*value).map_err(|_| conversion_error())?)
+                }
+                Bson::Int64(value) => {
+                    ProtoValue::U64(u64::try_from(*value).map_err(|_| conversion_error())?)
+                }
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Float => {
+                let value = match value {
+                    Bson::Double(value) => *value,
+                    Bson::Int32(value) => f64::from(*value),
+                    Bson::Int64(value) => *value as f64,
+                    _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+                };
+                ProtoValue::F32(Self::checked_f64_to_f32(value).ok_or_else(|| {
+                    Error::Serialization(format!(
+                        "BSON number at `{path}` is out of range for Protobuf float"
+                    ))
+                })?)
+            }
+            Kind::Double => match value {
+                Bson::Double(value) if value.is_finite() => ProtoValue::F64(*value),
+                Bson::Int32(value) => ProtoValue::F64(f64::from(*value)),
+                Bson::Int64(value) => ProtoValue::F64(*value as f64),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::String => match value {
+                Bson::String(value) | Bson::Symbol(value) => ProtoValue::String(value.clone()),
+                Bson::ObjectId(value) => ProtoValue::String(value.to_hex()),
+                Bson::Decimal128(value) => ProtoValue::String(value.to_string()),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Bytes => match value {
+                Bson::Binary(value) => ProtoValue::Bytes(value.bytes.clone().into()),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+            Kind::Enum(descriptor) => {
+                let number = match value {
+                    Bson::String(value) | Bson::Symbol(value) => descriptor
+                        .get_value_by_name(value)
+                        .map(|value| value.number())
+                        .ok_or_else(&conversion_error)?,
+                    Bson::Int32(value) => *value,
+                    Bson::Int64(value) => i32::try_from(*value).map_err(|_| conversion_error())?,
+                    _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+                };
+                ProtoValue::EnumNumber(number)
+            }
+            Kind::Message(descriptor) => match value {
+                Bson::Document(document) => ProtoValue::Message(
+                    Self::bson_document_to_dynamic_message(document, descriptor, None, path)?,
+                ),
+                _ => return Err(Self::bson_protobuf_kind_error(value, kind, path)),
+            },
+        };
+
+        Ok(converted)
+    }
+
+    fn bson_to_map_key(key: &str, kind: &Kind, path: &str) -> Result<MapKey, Error> {
+        let invalid_key = || {
+            Error::Serialization(format!(
+                "BSON document key `{key}` at `{path}` cannot be converted to Protobuf map key `{kind:?}`"
+            ))
+        };
+
+        match kind {
+            Kind::Bool => key.parse().map(MapKey::Bool).map_err(|_| invalid_key()),
+            Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
+                key.parse().map(MapKey::I32).map_err(|_| invalid_key())
+            }
+            Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => {
+                key.parse().map(MapKey::I64).map_err(|_| invalid_key())
+            }
+            Kind::Uint32 | Kind::Fixed32 => key.parse().map(MapKey::U32).map_err(|_| invalid_key()),
+            Kind::Uint64 | Kind::Fixed64 => key.parse().map(MapKey::U64).map_err(|_| invalid_key()),
+            Kind::String => Ok(MapKey::String(key.to_string())),
+            _ => Err(invalid_key()),
+        }
+    }
+
+    fn checked_f64_to_f32(value: f64) -> Option<f32> {
+        if !value.is_finite() || !(f64::from(f32::MIN)..=f64::from(f32::MAX)).contains(&value) {
+            return None;
+        }
+        let converted = value as f32;
+        (value == 0.0 || converted != 0.0).then_some(converted)
+    }
+
+    fn bson_protobuf_conversion_error(value: &Bson, field: &FieldDescriptor, path: &str) -> Error {
+        Self::bson_protobuf_kind_error(value, &field.kind(), path)
+    }
+
+    fn bson_protobuf_kind_error(value: &Bson, kind: &Kind, path: &str) -> Error {
+        Error::Serialization(format!(
+            "BSON value `{value:?}` at `{path}` cannot be converted to Protobuf type `{kind:?}`"
+        ))
     }
 
     fn encode_with_schema(&self, payload: Payload) -> Result<Vec<u8>, Error> {
@@ -715,7 +997,17 @@ impl StreamEncoder for ProtoStreamEncoder {
     }
 
     fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
-        let transformed_payload = self.apply_field_transformations(payload)?;
+        let payload = match payload {
+            Payload::Bson(document) => {
+                if let Some(descriptor) = &self.dynamic_message_descriptor {
+                    return self.encode_bson_with_descriptor(&document, descriptor);
+                }
+                Payload::Bson(document)
+            }
+            other => other,
+        };
+        let normalized_payload = Self::normalize_bson_payload(payload)?;
+        let transformed_payload = self.apply_field_transformations(normalized_payload)?;
 
         self.encode_with_schema(transformed_payload)
     }
@@ -729,9 +1021,171 @@ impl Default for ProtoStreamEncoder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+
+    use prost_types::{
+        DescriptorProto, EnumDescriptorProto, EnumValueDescriptorProto, FieldDescriptorProto,
+        FileDescriptorProto, FileDescriptorSet, MessageOptions, OneofDescriptorProto,
+        field_descriptor_proto::{Label, Type},
+    };
+
+    use super::*;
+
+    fn test_field(
+        name: &str,
+        number: i32,
+        label: Label,
+        r#type: Type,
+        type_name: Option<&str>,
+    ) -> FieldDescriptorProto {
+        FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(label as i32),
+            r#type: Some(r#type as i32),
+            type_name: type_name.map(str::to_string),
+            ..FieldDescriptorProto::default()
+        }
+    }
+
+    fn test_descriptor_set() -> Vec<u8> {
+        FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("user.proto".to_string()),
+                package: Some("test".to_string()),
+                message_type: vec![DescriptorProto {
+                    name: Some("User".to_string()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("id".to_string()),
+                            number: Some(1),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Int32 as i32),
+                            ..FieldDescriptorProto::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("name".to_string()),
+                            number: Some(2),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::String as i32),
+                            ..FieldDescriptorProto::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("active".to_string()),
+                            number: Some(3),
+                            label: Some(Label::Optional as i32),
+                            r#type: Some(Type::Bool as i32),
+                            ..FieldDescriptorProto::default()
+                        },
+                    ],
+                    ..DescriptorProto::default()
+                }],
+                ..FileDescriptorProto::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn recursive_test_descriptor_set() -> Vec<u8> {
+        let address = DescriptorProto {
+            name: Some("Address".to_string()),
+            field: vec![test_field("city", 1, Label::Optional, Type::String, None)],
+            ..DescriptorProto::default()
+        };
+        let labels_entry = DescriptorProto {
+            name: Some("LabelsEntry".to_string()),
+            field: vec![
+                test_field("key", 1, Label::Optional, Type::String, None),
+                test_field("value", 2, Label::Optional, Type::Int32, None),
+            ],
+            options: Some(MessageOptions {
+                map_entry: Some(true),
+                ..MessageOptions::default()
+            }),
+            ..DescriptorProto::default()
+        };
+        let mut email = test_field("email", 7, Label::Optional, Type::String, None);
+        email.oneof_index = Some(0);
+        let mut phone = test_field("phone", 8, Label::Optional, Type::String, None);
+        phone.oneof_index = Some(0);
+        let user = DescriptorProto {
+            name: Some("RecursiveUser".to_string()),
+            field: vec![
+                test_field("id", 1, Label::Optional, Type::Int32, None),
+                test_field(
+                    "address",
+                    2,
+                    Label::Optional,
+                    Type::Message,
+                    Some(".test.Address"),
+                ),
+                test_field("scores", 3, Label::Repeated, Type::Int64, None),
+                test_field(
+                    "labels",
+                    4,
+                    Label::Repeated,
+                    Type::Message,
+                    Some(".test.LabelsEntry"),
+                ),
+                test_field(
+                    "status",
+                    5,
+                    Label::Optional,
+                    Type::Enum,
+                    Some(".test.Status"),
+                ),
+                test_field("avatar", 6, Label::Optional, Type::Bytes, None),
+                email,
+                phone,
+                test_field("created_at", 9, Label::Optional, Type::Int64, None),
+                test_field("object_id", 10, Label::Optional, Type::String, None),
+                test_field("ratio", 11, Label::Optional, Type::Float, None),
+            ],
+            oneof_decl: vec![OneofDescriptorProto {
+                name: Some("contact".to_string()),
+                ..OneofDescriptorProto::default()
+            }],
+            ..DescriptorProto::default()
+        };
+        let status = EnumDescriptorProto {
+            name: Some("Status".to_string()),
+            value: vec![
+                EnumValueDescriptorProto {
+                    name: Some("UNKNOWN".to_string()),
+                    number: Some(0),
+                    ..EnumValueDescriptorProto::default()
+                },
+                EnumValueDescriptorProto {
+                    name: Some("ACTIVE".to_string()),
+                    number: Some(1),
+                    ..EnumValueDescriptorProto::default()
+                },
+            ],
+            ..EnumDescriptorProto::default()
+        };
+
+        FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("recursive_user.proto".to_string()),
+                package: Some("test".to_string()),
+                message_type: vec![address, labels_entry, user],
+                enum_type: vec![status],
+                syntax: Some("proto3".to_string()),
+                ..FileDescriptorProto::default()
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    fn recursive_test_encoder() -> ProtoStreamEncoder {
+        ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+            message_type: Some("test.RecursiveUser".to_string()),
+            use_any_wrapper: false,
+            descriptor_set: Some(recursive_test_descriptor_set()),
+            ..ProtoEncoderConfig::default()
+        })
+    }
 
     #[test]
     fn encode_should_succeed_given_json_payload_with_any_wrapper() {
@@ -755,6 +1209,228 @@ mod tests {
         let any = decoded_any.unwrap();
         assert!(any.type_url.contains("google.protobuf.StringValue"));
         assert!(!any.value.is_empty());
+    }
+
+    #[test]
+    fn encode_should_encode_bson_document_with_descriptor() {
+        let encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+            message_type: Some("test.User".to_string()),
+            use_any_wrapper: false,
+            field_mappings: Some(HashMap::from([("id".to_string(), "user_id".to_string())])),
+            descriptor_set: Some(test_descriptor_set()),
+            ..ProtoEncoderConfig::default()
+        });
+
+        let encoded = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "user_id": 123,
+                "name": "Alice",
+                "active": true
+            }))
+            .expect("BSON document should encode using the Protobuf descriptor");
+
+        assert_eq!(
+            encoded,
+            vec![
+                0x08, 0x7b, 0x12, 0x05, b'A', b'l', b'i', b'c', b'e', 0x18, 0x01
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_should_recursively_encode_bson_with_descriptor() {
+        let descriptor_set = recursive_test_descriptor_set();
+        let encoder = recursive_test_encoder();
+        let object_id = bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011")
+            .expect("object ID fixture should be valid");
+
+        let encoded = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "id": 7,
+                "address": {"city": "Paris"},
+                "scores": [10_i64, 20_i64],
+                "labels": {"priority": 3},
+                "status": "ACTIVE",
+                "avatar": bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Generic,
+                    bytes: vec![1, 2, 3]
+                },
+                "email": "alice@example.com",
+                "created_at": bson::DateTime::from_millis(1_700_000_000_000),
+                "object_id": object_id,
+                "ratio": 1.5
+            }))
+            .expect("nested BSON document should encode using reflection");
+
+        let pool = DescriptorPool::decode(descriptor_set.as_slice())
+            .expect("descriptor fixture should be valid");
+        let descriptor = pool
+            .get_message_by_name("test.RecursiveUser")
+            .expect("message descriptor should exist");
+        let decoded = DynamicMessage::decode(descriptor, encoded.as_slice())
+            .expect("encoded bytes should decode as the target message");
+
+        assert_eq!(
+            decoded
+                .get_field_by_name("id")
+                .expect("id should exist")
+                .as_ref(),
+            &ProtoValue::I32(7)
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("scores")
+                .expect("scores should exist")
+                .as_ref(),
+            &ProtoValue::List(vec![ProtoValue::I64(10), ProtoValue::I64(20)])
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("status")
+                .expect("status should exist")
+                .as_ref(),
+            &ProtoValue::EnumNumber(1)
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("avatar")
+                .expect("avatar should exist")
+                .as_ref(),
+            &ProtoValue::Bytes(vec![1, 2, 3].into())
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("created_at")
+                .expect("created_at should exist")
+                .as_ref(),
+            &ProtoValue::I64(1_700_000_000_000)
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("object_id")
+                .expect("object_id should exist")
+                .as_ref(),
+            &ProtoValue::String("507f1f77bcf86cd799439011".to_string())
+        );
+        assert_eq!(
+            decoded
+                .get_field_by_name("ratio")
+                .expect("ratio should exist")
+                .as_ref(),
+            &ProtoValue::F32(1.5)
+        );
+
+        let address = decoded
+            .get_field_by_name("address")
+            .expect("address should exist");
+        let ProtoValue::Message(address) = address.as_ref() else {
+            panic!("address should be a nested message");
+        };
+        assert_eq!(
+            address
+                .get_field_by_name("city")
+                .expect("city should exist")
+                .as_ref(),
+            &ProtoValue::String("Paris".to_string())
+        );
+
+        let labels = decoded
+            .get_field_by_name("labels")
+            .expect("labels should exist");
+        let ProtoValue::Map(labels) = labels.as_ref() else {
+            panic!("labels should be a map");
+        };
+        assert_eq!(
+            labels.get(&MapKey::String("priority".to_string())),
+            Some(&ProtoValue::I32(3))
+        );
+    }
+
+    #[test]
+    fn encode_should_reject_multiple_bson_fields_for_oneof() {
+        let encoder = recursive_test_encoder();
+
+        let error = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "email": "alice@example.com",
+                "phone": "+123456789"
+            }))
+            .expect_err("multiple oneof fields should be rejected");
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("oneof `contact`")
+        ));
+    }
+
+    #[test]
+    fn encode_should_report_nested_bson_protobuf_field_path() {
+        let encoder = recursive_test_encoder();
+
+        let error = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "address": {"city": 123}
+            }))
+            .expect_err("nested type mismatch should be rejected");
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("$.address.city")
+        ));
+    }
+
+    #[test]
+    fn encode_should_reject_bson_number_outside_protobuf_field_range() {
+        let encoder = recursive_test_encoder();
+
+        let error = encoder
+            .encode(Payload::Bson(bson::doc! {"id": i64::MAX}))
+            .expect_err("int64 outside the Protobuf int32 range should be rejected");
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("$.id")
+        ));
+    }
+
+    #[test]
+    fn encode_should_wrap_bson_document_as_json_in_any() {
+        let encoder = ProtoStreamEncoder::default();
+
+        let encoded = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "id": 123,
+                "name": "Alice"
+            }))
+            .expect("BSON document should encode using the Any wrapper");
+        let any = Any::decode(encoded.as_slice()).expect("encoded payload should be Protobuf Any");
+        let mut json_bytes = any.value;
+        let json = simd_json::to_owned_value(&mut json_bytes)
+            .expect("Any value should contain normalized BSON JSON");
+
+        assert!(any.type_url.contains("google.protobuf.StringValue"));
+        assert_eq!(json["id"], 123);
+        assert_eq!(json["name"], "Alice");
+    }
+
+    #[test]
+    fn encode_should_serialize_bson_document_as_json_without_any() {
+        let encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+            use_any_wrapper: false,
+            ..ProtoEncoderConfig::default()
+        });
+
+        let mut encoded = encoder
+            .encode(Payload::Bson(bson::doc! {
+                "id": 123,
+                "name": "Alice"
+            }))
+            .expect("BSON document should encode using the raw fallback");
+        let json = simd_json::to_owned_value(&mut encoded)
+            .expect("raw fallback should contain normalized BSON JSON");
+
+        assert_eq!(json["id"], 123);
+        assert_eq!(json["name"], "Alice");
     }
 
     #[test]

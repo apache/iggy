@@ -7156,6 +7156,7 @@ dependencies = [
  "iggy_common",
  "postcard",
  "prost",
+ "prost-reflect",
  "prost-types",
  "protox",
  "protox-parse",

@@ -50,6 +50,7 @@ iggy = { workspace = true }
 iggy_common = { workspace = true }
 postcard = { workspace = true }
 prost = { workspace = true }
+prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 protox = { workspace = true }
 protox-parse = { workspace = true }
