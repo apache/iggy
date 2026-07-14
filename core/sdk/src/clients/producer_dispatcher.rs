@@ -176,6 +176,9 @@ impl ProducerDispatcher {
             .await
     }
 
+    /// Flushes each shard's buffer and stops its worker. Dropping the
+    /// dispatcher instead of calling this silently discards any buffered,
+    /// not-yet-sent messages.
     pub async fn shutdown(mut self) {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
