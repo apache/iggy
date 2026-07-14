@@ -148,6 +148,7 @@ ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.9.0", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.9.0" }
+cyper-core = { version = "0.9.0", default-features = false }
 darling = "0.23"
 dashmap = "6.2.1"
 deltalake = { version = "0.32.4", features = ["azure", "gcs", "s3"] }
@@ -190,6 +191,8 @@ http = "1.4.2"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.12"
+hyper = "1.10.1"
+hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
