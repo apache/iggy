@@ -263,7 +263,11 @@ impl AvroStreamEncoder {
 
                 for field in &record_schema.fields {
                     let field_path = format!("{path}.{}", field.name);
-                    let field_value = document.get(&field.name).unwrap_or(&Bson::Null);
+                    let field_value = document.get(&field.name).ok_or_else(|| {
+                        Error::Serialization(format!(
+                            "Missing BSON field `{field_path}` required by Avro schema"
+                        ))
+                    })?;
                     record.push((
                         field.name.clone(),
                         Self::bson_to_avro_value(
@@ -900,6 +904,55 @@ mod tests {
             error,
             Error::Serialization(message) if message.contains("$.age")
         ));
+    }
+
+    #[test]
+    fn encode_should_reject_missing_nullable_bson_field() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "User",
+            "fields": [
+                {"name": "nickname", "type": ["null", "string"]}
+            ]
+        }"#;
+        let encoder = AvroStreamEncoder::new(AvroEncoderConfig {
+            schema_json: Some(schema_json.to_string()),
+            ..AvroEncoderConfig::default()
+        });
+
+        let error = encoder
+            .encode(Payload::Bson(bson::Document::new()))
+            .expect_err("missing BSON field should not be treated as null");
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message)
+                if message.contains("Missing BSON field") && message.contains("$.nickname")
+        ));
+    }
+
+    #[test]
+    fn encode_should_accept_explicit_null_for_nullable_bson_field() {
+        let schema_json = r#"{
+            "type": "record",
+            "name": "User",
+            "fields": [
+                {"name": "nickname", "type": ["null", "string"]}
+            ]
+        }"#;
+        let encoder = AvroStreamEncoder::new(AvroEncoderConfig {
+            schema_json: Some(schema_json.to_string()),
+            ..AvroEncoderConfig::default()
+        });
+
+        let encoded = encoder
+            .encode(Payload::Bson(bson::doc! {"nickname": Bson::Null}))
+            .expect("explicit BSON null should match a nullable Avro field");
+        let AvroValue::Record(fields) = decode_avro_datum(&encoder, &encoded) else {
+            panic!("decoded Avro value should be a record");
+        };
+
+        assert_eq!(fields[0].1, AvroValue::Union(0, Box::new(AvroValue::Null)));
     }
 
     #[test]
