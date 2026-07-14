@@ -7,7 +7,7 @@
   },
   "build": {
     "dockerfile": "Dockerfile",
-    "context": "..",
+    "context": ".."
   },
   "features": {
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
