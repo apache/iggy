@@ -552,7 +552,7 @@ pub(crate) async fn setup_sink_consumers(
 #[allow(clippy::too_many_arguments)]
 async fn process_messages(
     plugin_id: u32,
-    messages_metadata: MessagesMetadata,
+    mut messages_metadata: MessagesMetadata,
     topic_metadata: &TopicMetadata,
     messages: Vec<IggyMessage>,
     consume: &ConsumeCallback,
@@ -603,6 +603,7 @@ async fn process_messages(
     let decode_elapsed = decode_start.elapsed();
 
     let mut messages = Vec::with_capacity(decoded.len());
+    let mut output_schema = None;
     for message in decoded {
         let mut current_message = Some(message);
         for transform in transforms.iter() {
@@ -673,6 +674,7 @@ async fn process_messages(
             continue;
         };
 
+        let payload_schema = message.payload.schema();
         let Ok(payload) = message.payload.try_into_vec() else {
             error!(
                 "Failed to get message payload for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
@@ -695,6 +697,15 @@ async fn process_messages(
             None => vec![],
         };
 
+        if output_schema.is_some_and(|schema| schema != payload_schema) {
+            error!(
+                "Transformed payload schema {payload_schema} does not match the other messages in the batch for message with ID: {id}, offset: {offset}, sink connector with ID: {plugin_id}"
+            );
+            error_count += 1;
+            continue;
+        }
+        output_schema = Some(payload_schema);
+
         messages.push(RawMessage {
             id,
             offset,
@@ -712,6 +723,8 @@ async fn process_messages(
     }
 
     let processed_count = messages.len();
+    let output_schema = output_schema.unwrap_or(messages_metadata.schema);
+    messages_metadata.schema = output_schema;
 
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
         error!(
@@ -728,7 +741,7 @@ async fn process_messages(
     })?;
 
     let messages = postcard::to_allocvec(&RawMessages {
-        schema: decoder.schema(),
+        schema: output_schema,
         messages,
     })
     .map_err(|error| {
@@ -759,4 +772,120 @@ struct SinkBatchTiming {
     processed_count: usize,
     decode_elapsed: Duration,
     ffi_elapsed: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use iggy_connector_sdk::{Error, Payload, transforms::TransformType};
+
+    use super::*;
+
+    static CAPTURED_BATCH: Mutex<Option<CapturedBatch>> = Mutex::new(None);
+
+    struct CapturedBatch {
+        metadata_schema: Schema,
+        batch_schema: Schema,
+        payloads: Vec<Vec<u8>>,
+    }
+
+    struct RawToText;
+
+    impl Transform for RawToText {
+        fn r#type(&self) -> TransformType {
+            TransformType::ProtoConvert
+        }
+
+        fn transform(
+            &self,
+            _metadata: &TopicMetadata,
+            message: DecodedMessage,
+        ) -> Result<Option<DecodedMessage>, Error> {
+            let Payload::Raw(payload) = message.payload else {
+                return Ok(Some(message));
+            };
+            let text = String::from_utf8(payload).map_err(|_| Error::InvalidTextPayload)?;
+            Ok(Some(DecodedMessage {
+                payload: Payload::Text(text),
+                ..message
+            }))
+        }
+    }
+
+    extern "C" fn capture_schemas(
+        _plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        messages_meta_ptr: *const u8,
+        messages_meta_len: usize,
+        messages_ptr: *const u8,
+        messages_len: usize,
+    ) -> i32 {
+        unsafe {
+            let messages_metadata = postcard::from_bytes::<MessagesMetadata>(
+                std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len),
+            )
+            .expect("messages metadata should deserialize");
+            let raw_messages = postcard::from_bytes::<RawMessages>(std::slice::from_raw_parts(
+                messages_ptr,
+                messages_len,
+            ))
+            .expect("raw messages should deserialize");
+            *CAPTURED_BATCH.lock().expect("capture lock should succeed") = Some(CapturedBatch {
+                metadata_schema: messages_metadata.schema,
+                batch_schema: raw_messages.schema,
+                payloads: raw_messages
+                    .messages
+                    .into_iter()
+                    .map(|message| message.payload)
+                    .collect(),
+            });
+        }
+        0
+    }
+
+    #[tokio::test]
+    async fn given_transform_changes_schema_when_crossing_ffi_should_use_output_schema() {
+        let metrics = Arc::new(Metrics::init());
+        let labels = SinkLabels::new("schema-aware");
+        let decoder: Arc<dyn StreamDecoder> = Schema::Raw.decoder();
+        let transforms: Vec<Arc<dyn Transform>> = vec![Arc::new(RawToText)];
+        let consume: ConsumeCallback = capture_schemas;
+        let message = IggyMessage::builder()
+            .payload("transformed".into())
+            .build()
+            .expect("message should build");
+
+        let timing = process_messages(
+            1,
+            MessagesMetadata {
+                partition_id: 1,
+                current_offset: 0,
+                schema: Schema::Raw,
+            },
+            &TopicMetadata {
+                stream: "stream".to_string(),
+                topic: "topic".to_string(),
+            },
+            vec![message],
+            &consume,
+            &transforms,
+            &decoder,
+            &metrics,
+            &labels,
+        )
+        .await
+        .expect("message processing should succeed");
+
+        let captured = CAPTURED_BATCH
+            .lock()
+            .expect("capture lock should succeed")
+            .take()
+            .expect("FFI callback should capture schemas");
+        assert_eq!(timing.processed_count, 1);
+        assert_eq!(captured.metadata_schema, Schema::Text);
+        assert_eq!(captured.batch_schema, Schema::Text);
+        assert_eq!(captured.payloads, vec![b"transformed".to_vec()]);
+    }
 }

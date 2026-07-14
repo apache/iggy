@@ -145,6 +145,17 @@ pub enum Payload {
 }
 
 impl Payload {
+    pub const fn schema(&self) -> Schema {
+        match self {
+            Self::Json(_) => Schema::Json,
+            Self::Raw(_) => Schema::Raw,
+            Self::Text(_) => Schema::Text,
+            Self::Proto(_) => Schema::Proto,
+            Self::FlatBuffer(_) => Schema::FlatBuffer,
+            Self::Avro(_) => Schema::Avro,
+        }
+    }
+
     /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
