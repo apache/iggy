@@ -23,7 +23,7 @@ use server_common::{
 };
 use std::io;
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap, VecDeque},
 };
 use tracing::warn;
@@ -175,12 +175,22 @@ where
     /// [`EVICTED_RING_CAPACITY`]; requests older than the ring answer
     /// `RangeEvicted` honestly.
     evicted_ring: UnsafeCell<VecDeque<(u64, JournalBuffer)>>,
+    /// Running byte total of the buffers held by `evicted_ring`.
+    evicted_ring_bytes: Cell<u64>,
+    /// Single-replica groups have nobody to repair; retaining evicted
+    /// entries for them is pure memory waste.
+    repair_retention: Cell<bool>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
 /// cover a few seconds of traffic around a node restart; anything older is
 /// bulk-sync (phase 3) territory.
 pub const EVICTED_RING_CAPACITY: usize = 4096;
+
+/// Byte ceiling for the evicted ring: the entry cap alone lets each
+/// partition pin up to 4096 full-sized batches, which is unbounded in byte
+/// terms across many partitions. Whichever cap trips first evicts.
+pub const EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
 
 impl<S> Default for PartitionJournal<S>
 where
@@ -196,6 +206,8 @@ where
                 storage: S::default(),
             }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring_bytes: Cell::new(0),
+            repair_retention: Cell::new(true),
         }
     }
 }
@@ -264,6 +276,22 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
     /// `None` when the op predates the ring (bulk-sync territory) or was
     /// never journaled here.
+    /// Disable repair retention (single-replica groups: nobody to repair).
+    pub fn set_repair_retention(&self, enabled: bool) {
+        self.repair_retention.set(enabled);
+        if !enabled {
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            ring.clear();
+            self.evicted_ring_bytes.set(0);
+        }
+    }
+
+    /// Resident (un-evicted) entry count; diagnostics only.
+    pub fn resident_count(&self) -> usize {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.len()
+    }
+
     pub fn repair_entry(&self, op: u64) -> Option<JournalBuffer> {
         {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
@@ -429,15 +457,31 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         }
 
         let mut all_entries = all_entries.into_iter();
-        {
+        if self.repair_retention.get() {
             let ring = unsafe { &mut *self.evicted_ring.get() };
+            let mut ring_bytes = self.evicted_ring_bytes.get();
             for op in evicted_ops {
                 let Some(entry) = all_entries.next() else {
                     break;
                 };
+                ring_bytes += entry.len() as u64;
                 ring.push_back((op, entry));
-                if ring.len() > EVICTED_RING_CAPACITY {
-                    ring.pop_front();
+                while ring.len() > EVICTED_RING_CAPACITY
+                    || (ring_bytes > EVICTED_RING_BYTES_MAX && ring.len() > 1)
+                {
+                    if let Some((_, dropped)) = ring.pop_front() {
+                        ring_bytes -= dropped.len() as u64;
+                    }
+                }
+            }
+            self.evicted_ring_bytes.set(ring_bytes);
+        } else {
+            // Consume without retaining: the iterator itself must still
+            // advance past the evicted prefix so the retained tail below is
+            // aligned.
+            for _ in &evicted_ops {
+                if all_entries.next().is_none() {
+                    break;
                 }
             }
         }
@@ -552,6 +596,8 @@ where
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
             evicted_ring: UnsafeCell::new(VecDeque::new()),
+            evicted_ring_bytes: Cell::new(0),
+            repair_retention: Cell::new(true),
         }
     }
 
@@ -567,18 +613,19 @@ where
     /// backup, so this is a single linear scan: drop ops below `from_op`, take
     /// while contiguous, stop at the first gap or past `commit_max`.
     pub fn committed_headers_from(&self, from_op: u64, commit_max: u64) -> Vec<PrepareHeader> {
-        let headers = unsafe { &*self.headers.get() };
+        // Walk by OP, not by append position: after a rejoin the journal
+        // interleaves live tail ops (which arrive while repair is still
+        // streaming) with repaired window ops, so append order is no longer
+        // op-ascending and a positional sequential scan would break at the
+        // first interleave boundary forever.
         let mut result = Vec::new();
-        let mut expected = from_op;
-        for header in headers {
-            if header.op < from_op {
-                continue;
-            }
-            if header.op != expected || header.op > commit_max {
+        let mut op = from_op;
+        while op <= commit_max {
+            let Some(header) = self.header_by_op(op) else {
                 break;
-            }
-            result.push(*header);
-            expected += 1;
+            };
+            result.push(header);
+            op += 1;
         }
         result
     }

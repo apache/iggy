@@ -1598,7 +1598,7 @@ fn restore_metadata_consensus(
     // no peer to ask.
     if replica_count > 1 && restored_op > 0 {
         consensus.init_as_backup();
-        let _boot_probe = consensus.begin_view_probe();
+        consensus.begin_view_probe();
     } else {
         consensus.init();
     }
@@ -1697,7 +1697,7 @@ async fn load_partition(
     // have no peer to ask and keep the plain init.
     if replica_count > 1 {
         consensus.init_as_backup();
-        let _boot_probe = consensus.begin_view_probe();
+        consensus.begin_view_probe();
     } else {
         consensus.init();
     }

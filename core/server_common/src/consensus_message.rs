@@ -226,7 +226,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -262,7 +262,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -651,6 +651,50 @@ mod tests {
                 .copy_from_slice(&0xCAFE_u128.to_le_bytes());
         }
         o
+    }
+
+    // MessageBag round-trip for the probe + repair command family. Locks
+    // RangeEvicted delivery in particular: RepairDone and RangeEvicted share
+    // one header layout and BOTH must survive the typed parse -- a strict
+    // command match in `try_into_typed` silently dropped every RangeEvicted
+    // frame and with it the whole commit-floor path.
+    #[test]
+    fn probe_and_repair_commands_round_trip_into_bag() {
+        for command in [
+            Command2::RequestStartView,
+            Command2::RequestPrepares,
+            Command2::RepairPrepare,
+            Command2::RepairDone,
+            Command2::RangeEvicted,
+        ] {
+            let mut owned = header_bytes(command, 256);
+            if command == Command2::RequestPrepares {
+                // validate() demands a non-empty 1-based range.
+                const FROM_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, from_op);
+                const TO_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, to_op);
+                let buf = owned.as_mut_slice();
+                buf[FROM_OP_OFF..FROM_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+                buf[TO_OP_OFF..TO_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+            }
+            let generic = Message::<GenericHeader>::try_from(owned)
+                .unwrap_or_else(|e| panic!("{command:?} failed generic framing: {e}"));
+            let bag = MessageBag::try_from(generic)
+                .unwrap_or_else(|e| panic!("{command:?} failed bag parse: {e}"));
+            let routed = matches!(
+                (&bag, command),
+                (MessageBag::RequestStartView(_), Command2::RequestStartView)
+                    | (MessageBag::RequestPrepares(_), Command2::RequestPrepares)
+                    | (MessageBag::RepairPrepare(_), Command2::RepairPrepare)
+                    | (
+                        MessageBag::RepairRangeReply(_),
+                        Command2::RepairDone | Command2::RangeEvicted
+                    )
+            );
+            assert!(routed, "{command:?} parsed into the wrong bag variant");
+            assert_eq!(bag.command(), command, "original command byte must survive");
+        }
     }
 
     // Construction via Message::new (zeroed)

@@ -608,3 +608,107 @@ async fn poll_from_zero_until(
         sleep(Duration::from_millis(250)).await;
     }
 }
+
+/// Rejoin with a window larger than the peers' evicted ring
+/// (`EVICTED_RING_CAPACITY` = 4096 entries): the serving peer answers
+/// `RangeEvicted` for the front of the range and the commit floor must
+/// settle at its retention point, with the rejoiner's recovered segments
+/// standing in below it. This is the only scenario that exercises
+/// `RangeEvicted` delivery and the floor end to end -- everything else
+/// fits inside the ring. The node-0 disk-growth assert is the proof the
+/// floor engaged: without it the commit walk gap-stops below the frontier
+/// and no post-restart batch ever flushes on the rejoiner.
+pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
+    const RING_OVERFLOW_OPS: u32 = 4300;
+    const POST_RESTART_OPS: u32 = 50;
+
+    let setup_client = harness
+        .root_client()
+        .await
+        .expect("Failed to create setup client");
+    setup_client
+        .create_stream(STREAM_NAME)
+        .await
+        .expect("Failed to create stream");
+    setup_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("Failed to create topic");
+    send_messages(&setup_client, "ring", RING_OVERFLOW_OPS).await;
+    drop(setup_client);
+    // Let the backups' commit walks flush; the rejoin window must start
+    // from durable segments, not from a racing in-memory tail.
+    sleep(Duration::from_secs(2)).await;
+
+    let partition_path = format!(
+        "{}/streams/0/topics/0/partitions/0",
+        harness.server().data_path().display()
+    );
+    let durable_before = partition_log_bytes(&partition_path);
+    assert!(
+        durable_before > 0,
+        "pre-restart flush must have landed on node 0"
+    );
+
+    harness
+        .restart_server()
+        .await
+        .expect("Failed to restart node 0");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to reconnect after restart");
+    let polled = poll_from_zero_until(&client, RING_OVERFLOW_OPS, Duration::from_secs(60)).await;
+    assert_eq!(
+        polled.len(),
+        RING_OVERFLOW_OPS as usize,
+        "all pre-restart messages must survive the over-ring rejoin"
+    );
+
+    send_messages(&client, "post", POST_RESTART_OPS).await;
+    let all = poll_from_zero_until(
+        &client,
+        RING_OVERFLOW_OPS + POST_RESTART_OPS,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(all.len(), (RING_OVERFLOW_OPS + POST_RESTART_OPS) as usize);
+
+    // The rejoiner's commit walk must cross the floor: post-restart batches
+    // flush on node 0 only if commit_min advanced through the repaired
+    // window, so local disk growth is the floor-path proof.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if partition_log_bytes(&partition_path) > durable_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 0 never flushed past its recovered durable end: the \
+             commit walk is gap-stopped (floor path did not engage)"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Sum of the `.log` segment file sizes under a partition directory.
+fn partition_log_bytes(partition_path: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(partition_path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}

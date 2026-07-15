@@ -119,6 +119,18 @@ async fn full_cluster_restart_recovers_and_serves(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_full_cluster_restart(harness).await;
 }
 
+// vsr-only: exercises `RangeEvicted` + the commit floor, which only exist
+// on the replicated plane (the rejoin window exceeds the peers' evicted
+// ring, so journal repair alone cannot cover it).
+#[cfg(feature = "vsr")]
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn rejoin_window_exceeding_evicted_ring(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_ring_overflow_rejoin(harness).await;
+}
+
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true

@@ -203,10 +203,14 @@ impl Default for PartitionOffsets {
     }
 }
 
-/// Configuration for partition operations.
+/// Ticks of a stalled repair stream tolerated before a re-request.
 ///
-/// Mirrors the relevant fields from the server's `PartitionConfig` and
-/// `SegmentConfig` (`core/server/src/configs/system.rs`).
+/// Partition group ticks are ~10ms, so ~1s. Repair frames are
+/// fire-and-forget over a lossy bus; a session with no retry wedges
+/// forever on a single dropped frame. The remaining window is re-requested
+/// from the serving peer.
+pub const REPAIR_RETRY_TICKS: u32 = 100;
+
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {
@@ -220,8 +224,22 @@ pub struct RepairSession {
     pub floor: Option<u64>,
     /// The peer serving this stream (re-request target on stall).
     pub peer: u8,
+    /// Lowest `base_offset` among the repaired `SendMessages` batches:
+    /// where the served window begins in offset space. Compared against the
+    /// boot-recovered durable end when a commit floor arrives -- a window
+    /// starting above `recovered_durable_offset + 1` means ops below the
+    /// floor are neither locally durable nor repaired (state-transfer
+    /// territory), and the floor must be refused.
+    pub first_batch_offset: Option<u64>,
+    /// Ticks since the stream last made progress; at
+    /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
+    pub idle_ticks: u32,
 }
 
+/// Configuration for partition operations.
+///
+/// Mirrors the relevant fields from the server's `PartitionConfig` and
+/// `SegmentConfig` (`core/server/src/configs/system.rs`).
 #[derive(Debug, Clone)]
 pub struct PartitionsConfig {
     /// Flush journal to disk when it accumulates this many messages.

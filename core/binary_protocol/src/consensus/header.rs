@@ -70,6 +70,14 @@ pub fn read_size_field(header: &[u8]) -> Option<u32> {
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
+    /// Whether a frame carrying `command` may be typed as this header.
+    /// Defaults to an exact match; a header that serves several commands
+    /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
+    #[must_use]
+    fn accepts(command: Command2) -> bool {
+        command == Self::COMMAND
+    }
+
     /// # Errors
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -1215,6 +1223,12 @@ const _: () = {
 
 impl ConsensusHeader for RepairRangeReplyHeader {
     const COMMAND: Command2 = Command2::RepairDone;
+    // One layout, two commands: `RepairDone` terminates a stream,
+    // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
+    // rejects `RangeEvicted` frames before `validate` ever sees them.
+    fn accepts(command: Command2) -> bool {
+        command == Command2::RepairDone || command == Command2::RangeEvicted
+    }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }

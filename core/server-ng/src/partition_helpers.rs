@@ -494,7 +494,7 @@ pub async fn build_partition_fresh(
     // its view-0 primary to exist.
     if restarted {
         consensus.init_as_backup();
-        let _boot_probe = consensus.begin_view_probe();
+        consensus.begin_view_probe();
     } else {
         consensus.init();
     }

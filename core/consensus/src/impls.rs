@@ -580,7 +580,9 @@ pub enum VsrAction {
     },
     /// Broadcast a `RequestStartView` probe (recovering replica asking for
     /// the current view's `StartView`; only that view's primary answers).
-    SendRequestStartView { namespace: u64 },
+    /// Stamped with the prober's view so peers can fence stale duplicates
+    /// out of the probed-primary election path.
+    SendRequestStartView { view: u32, namespace: u64 },
     /// Send `StartView` to all backups (as new primary).
     SendStartView {
         view: u32,
@@ -1236,6 +1238,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                             .borrow_mut()
                             .reset(TimeoutKind::RequestStartViewMessage);
                         actions.push(VsrAction::SendRequestStartView {
+                            view: self.view.get(),
                             namespace: self.namespace,
                         });
                     }
@@ -1245,6 +1248,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                         .borrow_mut()
                         .reset(TimeoutKind::RequestStartViewMessage);
                     actions.push(VsrAction::SendRequestStartView {
+                        view: self.view.get(),
                         namespace: self.namespace,
                     });
                 }
@@ -1845,7 +1849,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// election's `StartView` adopts this replica first). The replica sits
     /// in `Status::Recovering` meanwhile: it acks nothing, votes in no
     /// election, and initiates nothing.
-    pub fn begin_view_probe(&self) -> Vec<VsrAction> {
+    /// Returns nothing: the first probe rides the
+    /// `RequestStartViewMessage` timeout (~1s after boot), by which point
+    /// the replica mesh -- absent entirely at the boot-time call sites --
+    /// has formed. Emitting an action here implied a send that never
+    /// happened.
+    pub fn begin_view_probe(&self) {
         tracing::info!(
             replica = self.replica,
             namespace_raw = self.namespace,
@@ -1853,16 +1862,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         self.status.set(Status::Recovering);
         self.probe_attempts.set(0);
-        {
-            let mut timeouts = self.timeouts.borrow_mut();
-            timeouts.stop(TimeoutKind::Prepare);
-            timeouts.stop(TimeoutKind::CommitMessage);
-            timeouts.stop(TimeoutKind::NormalHeartbeat);
-            timeouts.start(TimeoutKind::RequestStartViewMessage);
-        }
-        vec![VsrAction::SendRequestStartView {
-            namespace: self.namespace,
-        }]
+        let mut timeouts = self.timeouts.borrow_mut();
+        timeouts.stop(TimeoutKind::Prepare);
+        timeouts.stop(TimeoutKind::CommitMessage);
+        timeouts.stop(TimeoutKind::NormalHeartbeat);
+        timeouts.start(TimeoutKind::RequestStartViewMessage);
     }
 
     /// Peer side of the probe (sent by a Recovering replica at boot, or by
@@ -1893,7 +1897,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
         if self.primary_index(self.view.get()) == header.replica {
-            return self.start_election(plane, ViewChangeReason::PrimaryProbedView);
+            // Probes are re-broadcast on a timer, so delayed duplicates are
+            // the normal case, and `primary_index` is view % replica_count:
+            // a stale probe from replica R re-matches every replica_count
+            // views. Only a probe stamped with the CURRENT view proves the
+            // current primary is the one probing; anything else falls
+            // through (a backup answers nothing, and the true primary of a
+            // newer view answers with its StartView).
+            if header.view == self.view.get() {
+                return self.start_election(plane, ViewChangeReason::PrimaryProbedView);
+            }
+            return Vec::new();
         }
         if !self.is_primary() || self.ceded_primaryship.get() {
             return Vec::new();

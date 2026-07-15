@@ -665,11 +665,24 @@ impl ShardFrame {
     }
 }
 
+/// Prepares served per `RequestPrepares` round. The per-peer bus queues
+/// are bounded (`peer_queue_capacity`, 256 by default) and overrun frames
+/// drop silently, so an unbounded burst loses its own tail; the receiver
+/// pulls the window chunk by chunk instead (each walked `RepairDone`
+/// immediately requests the next chunk while progress holds).
+const REPAIR_CHUNK_MAX: u64 = 128;
+
 /// One in-flight metadata journal-repair stream (shard 0 only).
 #[derive(Debug, Clone, Copy)]
 struct MetadataRepairSession {
     nonce: u128,
     to_op: u64,
+    /// Re-request target on stall.
+    peer: u8,
+    /// Ticks since the stream last made progress; at
+    /// [`partitions::REPAIR_RETRY_TICKS`] the remaining window is
+    /// re-requested from `peer`.
+    idle_ticks: u32,
 }
 
 pub struct IggyShard<B, MJ, S, M, T = ()>
@@ -1783,7 +1796,12 @@ where
                 let nonce = iggy_common::random_id::get_uuid();
                 let to_op = consensus.commit_max();
                 let from_op = consensus.commit_min() + 1;
-                *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession { nonce, to_op });
+                *self.metadata_repair.borrow_mut() = Some(MetadataRepairSession {
+                    nonce,
+                    to_op,
+                    peer: header.replica,
+                    idle_ticks: 0,
+                });
                 tracing::info!(
                     shard = self.id,
                     from_op,
@@ -1842,6 +1860,8 @@ where
                 to_op,
                 floor: None,
                 peer: header.replica,
+                first_batch_offset: None,
+                idle_ticks: 0,
             });
             self.send_request_prepares(
                 cluster,
@@ -1984,7 +2004,34 @@ where
             while from_op <= to_op && journal.header(from_op as usize).is_none() {
                 from_op += 1;
             }
-            if from_op > header.from_op && from_op <= to_op {
+            if from_op > to_op {
+                // Nothing in the requested range is retained. Answer the
+                // eviction honestly: a bare `RepairDone(to_op)` here would
+                // claim full coverage while serving zero prepares, and the
+                // requester would clear its session and gap-stop silently.
+                self.send_repair_range_reply(
+                    cluster,
+                    self_id,
+                    target,
+                    Command2::RangeEvicted,
+                    header.nonce,
+                    from_op,
+                    header.namespace,
+                )
+                .await;
+                self.send_repair_range_reply(
+                    cluster,
+                    self_id,
+                    target,
+                    Command2::RepairDone,
+                    header.nonce,
+                    header.from_op.saturating_sub(1),
+                    header.namespace,
+                )
+                .await;
+                return;
+            }
+            if from_op > header.from_op {
                 self.send_repair_range_reply(
                     cluster,
                     self_id,
@@ -1996,8 +2043,9 @@ where
                 )
                 .await;
             }
+            let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
             let mut served_through = from_op.saturating_sub(1);
-            for op in from_op..=to_op {
+            for op in from_op..=chunk_end {
                 #[allow(clippy::cast_possible_truncation)]
                 let Some(entry_header) = journal.header(op as usize).map(|h| *h) else {
                     break;
@@ -2005,8 +2053,12 @@ where
                 let Some(entry) = journal.entry(&entry_header).await else {
                     break;
                 };
-                self.send_repair_prepare(target, entry.into_generic().into_frozen())
-                    .await;
+                if !self
+                    .send_repair_prepare(target, entry.into_generic().into_frozen())
+                    .await
+                {
+                    break;
+                }
                 served_through = op;
             }
             self.send_repair_range_reply(
@@ -2051,12 +2103,15 @@ where
             .await;
             from_op = retained_from;
         }
+        let chunk_end = to_op.min(from_op.saturating_add(REPAIR_CHUNK_MAX - 1));
         let mut served_through = from_op.saturating_sub(1);
-        for op in from_op..=to_op {
+        for op in from_op..=chunk_end {
             let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
                 break;
             };
-            self.send_repair_prepare(target, entry).await;
+            if !self.send_repair_prepare(target, entry).await {
+                break;
+            }
             served_through = op;
         }
         self.send_repair_range_reply(
@@ -2069,6 +2124,15 @@ where
             header.namespace,
         )
         .await;
+        tracing::info!(
+            shard = self.id,
+            namespace_raw = header.namespace,
+            target,
+            from_op = header.from_op,
+            to_op,
+            served_through,
+            "served partition repair range"
+        );
     }
 
     /// Ingest one repaired prepare. Metadata journals it into the WAL (the
@@ -2085,6 +2149,12 @@ where
                 Header = PrepareHeader,
             >,
     {
+        tracing::debug!(
+            shard = self.id,
+            op = msg.header().0.op,
+            namespace_raw = msg.header().0.namespace,
+            "repair prepare received"
+        );
         // Convert to a live-prepare frame exactly once, here at the apply
         // site (the frame must stay `RepairPrepare` up to this point: the
         // router round-trips bags through generic bytes, and a live-Prepare
@@ -2124,8 +2194,17 @@ where
                 );
                 return;
             }
-            if header.op > consensus.sequencer().current_sequence() {
-                consensus.sequencer().set_sequence(header.op);
+            // Contiguous-frontier advance, mirroring
+            // `apply_repaired_prepare`: DVC advertises the sequencer, so a
+            // hole below a repaired op must stall the advance rather than
+            // mint an election candidate with an unwalkable log.
+            let mut frontier = consensus.sequencer().current_sequence();
+            #[allow(clippy::cast_possible_truncation)]
+            while journal.header((frontier + 1) as usize).is_some() {
+                frontier += 1;
+            }
+            if frontier > consensus.sequencer().current_sequence() {
+                consensus.sequencer().set_sequence(frontier);
             }
             consensus.set_last_prepare_checksum(header.checksum);
             return;
@@ -2143,7 +2222,7 @@ where
     /// Repair stream terminator: `RangeEvicted` settles the partition commit
     /// floor candidate; `RepairDone` runs the commit walk over the repaired
     /// window and closes the session.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn on_repair_range_reply(&self, msg: &Message<RepairRangeReplyHeader>)
     where
         B: MessageBus,
@@ -2174,14 +2253,39 @@ where
             }
             match header.command {
                 Command2::RepairDone => {
-                    *self.metadata_repair.borrow_mut() = None;
+                    let before = consensus.commit_min();
                     planes.0.commit_journal().await;
+                    // Completion is decided by the LOCAL walk, not the
+                    // peer's served-through claim: repair frames ride a
+                    // lossy best-effort bus, so a fully-served stream can
+                    // still arrive with holes. Anything short keeps the
+                    // session armed; while the walk is making progress the
+                    // next chunk is pulled immediately (the window is served
+                    // in `REPAIR_CHUNK_MAX` slices), and a stalled one is
+                    // left to the retry timer.
+                    let commit_min = consensus.commit_min();
+                    let done = commit_min >= session.to_op;
                     tracing::info!(
                         shard = self.id,
                         through_op = header.op,
-                        commit_min = consensus.commit_min(),
-                        "metadata journal repair complete"
+                        commit_min,
+                        done,
+                        "metadata journal repair walked"
                     );
+                    if done {
+                        *self.metadata_repair.borrow_mut() = None;
+                    } else if commit_min > before {
+                        self.send_request_prepares(
+                            consensus.cluster(),
+                            consensus.replica(),
+                            session.peer,
+                            session.nonce,
+                            commit_min + 1,
+                            session.to_op,
+                            header.namespace,
+                        )
+                        .await;
+                    }
                 }
                 Command2::RangeEvicted => {
                     // The metadata WAL retains everything above the snapshot
@@ -2221,13 +2325,41 @@ where
                 }
             }
             Command2::RepairDone => {
+                // `complete_repair` walks the window and clears the session
+                // only when the LOCAL commit frontier reached the requested
+                // op (the peer's served-through claim proves nothing about
+                // delivery on a lossy bus). While the walk makes progress
+                // the next chunk is pulled immediately; a stalled window is
+                // left to the retry timer.
+                let before = partition.consensus().commit_min();
                 partition.complete_repair(&config).await;
-                tracing::info!(
-                    shard = self.id,
-                    namespace_raw = header.namespace,
-                    through_op = header.op,
-                    "partition journal repair complete"
-                );
+                if partition.repair.is_none() {
+                    tracing::info!(
+                        shard = self.id,
+                        namespace_raw = header.namespace,
+                        through_op = header.op,
+                        "partition journal repair complete"
+                    );
+                } else {
+                    let commit_min = partition.consensus().commit_min();
+                    let next = partition.repair.as_ref().and_then(|live| {
+                        (commit_min > before).then_some((live.peer, live.nonce, live.to_op))
+                    });
+                    let cluster = partition.consensus().cluster();
+                    let self_id = partition.consensus().replica();
+                    if let Some((peer, nonce, to_op)) = next {
+                        self.send_request_prepares(
+                            cluster,
+                            self_id,
+                            peer,
+                            nonce,
+                            commit_min + 1,
+                            to_op,
+                            header.namespace,
+                        )
+                        .await;
+                    }
+                }
             }
             _ => {}
         }
@@ -2262,18 +2394,36 @@ where
                 h.namespace = namespace;
                 h.size = size_of::<RequestPreparesHeader>() as u32;
             });
-        let _ = self
+        if self
             .bus
             .send_to_replica(target, msg.into_generic().into_frozen())
-            .await;
+            .await
+            .is_err()
+        {
+            // The stall retry re-requests; without this line a dead peer
+            // channel makes repair look like a silent server-side refusal.
+            tracing::warn!(
+                shard = self.id,
+                target,
+                from_op,
+                to_op,
+                namespace_raw = namespace,
+                "request-prepares send failed; stall retry will re-request"
+            );
+        }
     }
 
     /// Send a stored prepare (raw journal bytes) as a `RepairPrepare` frame:
     /// the command byte is rewritten on an owned copy, because a verbatim
     /// `Prepare` would hit the live view fence on the receiver while
     /// `RepairPrepare` routes to the fence-free repair ingest.
+    /// Returns whether the frame was handed to the bus: `send_to_replica`
+    /// is a non-blocking try-send, so under a queue-full burst op N can be
+    /// dropped while N+1 lands. Callers must not advance their
+    /// served-through watermark past a failed send, or the terminating
+    /// `RepairDone` reports ops that were never delivered.
     #[allow(clippy::future_not_send)]
-    async fn send_repair_prepare(&self, target: u8, entry: Frozen<MESSAGE_ALIGN>)
+    async fn send_repair_prepare(&self, target: u8, entry: Frozen<MESSAGE_ALIGN>) -> bool
     where
         B: MessageBus,
     {
@@ -2286,12 +2436,12 @@ where
                 shard = self.id,
                 "repair prepare bytes failed message framing"
             );
-            return;
+            return false;
         };
-        let _ = self
-            .bus
+        self.bus
             .send_to_replica(target, message.into_frozen())
-            .await;
+            .await
+            .is_ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2356,6 +2506,61 @@ where
             let actions = consensus.tick(PlaneKind::Partitions);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             dispatch_partition_journal_actions(consensus, partition, &actions).await;
+
+            // Stall retry: repair frames are fire-and-forget, so a lost
+            // frame (or a peer that went silent mid-stream) would leave the
+            // session armed forever with commit_min pinned below commit_max.
+            // Re-request the remaining window from the serving peer; the
+            // ingest path skips duplicates, so overlap is harmless.
+            let stalled = {
+                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                    continue;
+                };
+                let consensus_normal = partition.consensus().is_normal();
+                let commit_min = partition.consensus().commit_min();
+                let cluster = partition.consensus().cluster();
+                let self_id = partition.consensus().replica();
+                partition.repair.as_mut().and_then(|session| {
+                    if !consensus_normal {
+                        return None;
+                    }
+                    session.idle_ticks += 1;
+                    if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                        return None;
+                    }
+                    session.idle_ticks = 0;
+                    Some((
+                        session.peer,
+                        session.nonce,
+                        commit_min + 1,
+                        session.to_op,
+                        cluster,
+                        self_id,
+                    ))
+                })
+            };
+            if let Some((peer, nonce, from_op, to_op, cluster, self_id)) = stalled
+                && from_op <= to_op
+            {
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    from_op,
+                    to_op,
+                    peer,
+                    "partition repair stalled; re-requesting remaining window"
+                );
+                self.send_request_prepares(
+                    cluster,
+                    self_id,
+                    peer,
+                    nonce,
+                    from_op,
+                    to_op,
+                    namespace.inner(),
+                )
+                .await;
+            }
         }
     }
 
@@ -2418,6 +2623,45 @@ where
         // forever (commit_min stuck below commit_max). See
         // `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
+
+        // Stall retry, mirroring `tick_partitions`: a lost repair frame must
+        // not wedge the session forever.
+        let stalled = {
+            let mut session = self.metadata_repair.borrow_mut();
+            session.as_mut().and_then(|session| {
+                if !consensus.is_normal() {
+                    return None;
+                }
+                session.idle_ticks += 1;
+                if session.idle_ticks < partitions::REPAIR_RETRY_TICKS {
+                    return None;
+                }
+                session.idle_ticks = 0;
+                Some((session.peer, session.nonce, session.to_op))
+            })
+        };
+        if let Some((peer, nonce, to_op)) = stalled {
+            let from_op = consensus.commit_min() + 1;
+            if from_op <= to_op {
+                tracing::info!(
+                    shard = self.id,
+                    from_op,
+                    to_op,
+                    peer,
+                    "metadata repair stalled; re-requesting remaining window"
+                );
+                self.send_request_prepares(
+                    consensus.cluster(),
+                    consensus.replica(),
+                    peer,
+                    nonce,
+                    from_op,
+                    to_op,
+                    consensus.namespace(),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -2548,13 +2792,14 @@ async fn dispatch_vsr_actions<B, P, J>(
                     });
                 send(*target, msg.into_generic().into_frozen()).await;
             }
-            VsrAction::SendRequestStartView { namespace } => {
+            VsrAction::SendRequestStartView { view, namespace } => {
                 let msg =
                     Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
                         .transmute_header(|_, h: &mut RequestStartViewHeader| {
                             h.command = Command2::RequestStartView;
                             h.cluster = cluster;
                             h.replica = self_id;
+                            h.view = *view;
                             h.namespace = *namespace;
                             h.size = size_of::<RequestStartViewHeader>() as u32;
                         });

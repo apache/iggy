@@ -225,7 +225,8 @@ where
 {
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
-        Self {
+        let single_replica = consensus.replica_count() == 1;
+        let partition = Self {
             consensus,
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
@@ -248,7 +249,11 @@ where
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
+        };
+        if single_replica {
+            partition.log.journal().inner.set_repair_retention(false);
         }
+        partition
     }
 
     #[must_use]
@@ -3026,11 +3031,29 @@ where
         if header.op <= self.consensus().commit_min() || header.op > session.to_op {
             return;
         }
+        // Any in-window frame proves the stream is alive; only silence
+        // should age the stall counter.
+        if let Some(session) = self.repair.as_mut() {
+            session.idle_ticks = 0;
+        }
         if self.log.journal().inner.header_by_op(header.op).is_some() {
             return;
         }
         let applied = if header.operation == Operation::SendMessages {
-            self.append_repaired_send_messages(message).await
+            match self.append_repaired_send_messages(message).await {
+                Ok(base_offset) => {
+                    if let (Some(base_offset), Some(session)) = (base_offset, self.repair.as_mut())
+                    {
+                        session.first_batch_offset = Some(
+                            session
+                                .first_batch_offset
+                                .map_or(base_offset, |first| first.min(base_offset)),
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         } else {
             self.apply_replicated_operation(message).await
         };
@@ -3045,9 +3068,26 @@ where
             );
             return;
         }
+        // Advance the sequencer only along the CONTIGUOUS journaled
+        // frontier. DVC advertises `op = sequencer.current_sequence()` and
+        // elections pick the max, so bumping straight to a repaired op that
+        // sits above an unfilled hole would let this replica win a view it
+        // cannot walk. A dropped frame stalls the frontier here; the stall
+        // retry refills the hole and the next apply resumes the advance
+        // (walking over ops that were journaled out of order meanwhile).
+        let mut frontier = self.consensus().sequencer().current_sequence();
+        while self
+            .log
+            .journal()
+            .inner
+            .header_by_op(frontier + 1)
+            .is_some()
+        {
+            frontier += 1;
+        }
         let consensus = self.consensus();
-        if header.op > consensus.sequencer().current_sequence() {
-            consensus.sequencer().set_sequence(header.op);
+        if frontier > consensus.sequencer().current_sequence() {
+            consensus.sequencer().set_sequence(frontier);
         }
         consensus.set_last_prepare_checksum(header.checksum);
     }
@@ -3057,16 +3097,72 @@ where
     /// replica's recovered segments + offset files) and walk the repaired
     /// window through the normal commit path.
     pub async fn complete_repair(&mut self, config: &PartitionsConfig) {
-        let Some(session) = self.repair.take() else {
+        let Some(session) = self.repair else {
             return;
         };
         if let Some(floor) = session.floor {
+            // A peer may have evicted past this replica's commit frontier;
+            // an unclamped floor would drive commit_min above commit_max and
+            // panic the next advance.
+            let floor = floor.min(self.consensus().commit_max());
+            // The floor claims "recovered durable state stands in below me".
+            // Verify it: the served window must connect to the recovered
+            // segments. A window starting above the durable end means ops
+            // below the floor are neither locally durable nor repaired --
+            // that gap is state-transfer territory, and accepting the floor
+            // would silently serve a holed log. Refuse and stay gap-stopped:
+            // a visible stall beats invisible loss.
+            let durable_end = self.recovered_durable_offset;
+            let connected = match (session.first_batch_offset, durable_end) {
+                (Some(first), Some(durable)) => first <= durable.saturating_add(1),
+                (Some(first), None) => first == 0,
+                // Offsets-only window: nothing to reconcile against segments;
+                // the consumer-offset table on disk stands in below the floor.
+                (None, _) => true,
+            };
+            if !connected {
+                tracing::error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace().inner(),
+                    floor,
+                    first_batch_offset = ?session.first_batch_offset,
+                    recovered_durable_offset = ?durable_end,
+                    "refusing commit floor: repaired window does not connect \
+                     to recovered durable state (needs state transfer)"
+                );
+                self.commit_journal(config).await;
+                return;
+            }
             let commit_min = self.consensus().commit_min();
             if floor > commit_min {
                 self.consensus().set_commit_floor(floor);
             }
         }
+        let before = self.consensus().commit_min();
         self.commit_journal(config).await;
+        let commit_min = self.consensus().commit_min();
+        // Completion is decided HERE, not by the peer's served-through
+        // claim: repair frames ride a lossy best-effort bus, so a stream
+        // the peer fully served can still arrive with holes. Only a walk
+        // that reached the requested frontier closes the session; anything
+        // less keeps it armed and the stall retry re-requests the remains
+        // (`commit_min + 1..`), converging over rounds.
+        let done = commit_min >= session.to_op;
+        if done {
+            self.repair = None;
+        }
+        tracing::info!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = self.namespace().inner(),
+            commit_min_before = before,
+            commit_min_after = commit_min,
+            commit_max = self.consensus().commit_max(),
+            to_op = session.to_op,
+            done,
+            "repair window commit walk finished"
+        );
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -3081,7 +3177,7 @@ where
     async fn append_repaired_send_messages(
         &mut self,
         message: Message<PrepareHeader>,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Option<u64>, IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -3096,7 +3192,7 @@ where
             )
         };
         if message_count == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let last_offset = base_offset + u64::from(message_count) - 1;
 
@@ -3124,7 +3220,8 @@ where
             .inner
             .append(message.into_frozen())
             .await
-            .map_err(|_| IggyError::CannotAppendMessage)
+            .map_err(|_| IggyError::CannotAppendMessage)?;
+        Ok(Some(base_offset))
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
