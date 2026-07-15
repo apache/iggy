@@ -17,19 +17,6 @@
 
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library", "cc_test")
 
-COMMON_COPTS = [
-    "-Wall",
-    "-Wpedantic",
-    "-Werror",
-    "-Wextra",
-] + select({
-    "@platforms//os:windows": ["/utf-8"],
-    "//conditions:default": [
-        "-finput-charset=UTF-8",
-        "-fexec-charset=UTF-8",
-    ],
-})
-
 genrule(
     name = "cargo_build",
     srcs = glob(["src/**/*.rs"]) + [
@@ -41,11 +28,6 @@ genrule(
         "include/lib.rs.h",
         "cxxbridge/rust/cxx.h",
         "cxxbridge/sources/lib.rs.cc",
-    ],
-    tools = [
-        "@rs_host_tools//:cargo",
-        "@rs_host_tools//:rustc",
-        "@rs_host_tools//:rust_toolchain",
     ],
     cmd = """
         set -euo pipefail
@@ -99,6 +81,11 @@ genrule(
         cp "$$CC_SRC" "$$OUT_CC"
     """,
     local = 1,
+    tools = [
+        "@rs_host_tools//:cargo",
+        "@rs_host_tools//:rust_toolchain",
+        "@rs_host_tools//:rustc",
+    ],
 )
 
 cc_import(
@@ -108,52 +95,77 @@ cc_import(
 
 cc_library(
     name = "iggy-cpp",
-    srcs = glob([
-        "src/*.cpp",
-    ], allow_empty = True) + [
+    srcs = glob(
+        [
+            "src/*.cpp",
+        ],
+        allow_empty = True,
+    ) + [
         ":cxxbridge/sources/lib.rs.cc",
     ],
     hdrs = [
         "include/iggy.hpp",
-        ":include/lib.rs.h",
         ":cxxbridge/rust/cxx.h",
+        ":include/lib.rs.h",
     ],
+    copts = [
+        "-Wall",
+        "-Wpedantic",
+        "-Werror",
+        "-Wextra",
+    ] + select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     includes = [
         "cxxbridge",
         "include",
     ],
-    copts = COMMON_COPTS,
     linkopts = [
         "-ldl",
         "-lpthread",
     ] + select({
         "@platforms//os:macos": [
-            "-framework", "CoreFoundation",
-            "-framework", "Security",
+            "-framework",
+            "CoreFoundation",
+            "-framework",
+            "Security",
         ],
         "//conditions:default": [],
     }),
+    visibility = ["//visibility:public"],
     deps = [
         ":iggy_cpp_static",
     ],
-    visibility = ["//visibility:public"],
 )
 
 cc_binary(
     name = "bdd_wire_server",
+    testonly = True,
     srcs = [
         "tests/bdd/background_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
         "tests/bdd/world.hpp",
     ],
-    copts = COMMON_COPTS + [
+    copts = [
+        "-finput-charset=UTF-8",
+        "-fexec-charset=UTF-8",
+        "-Wall",
+        "-Wpedantic",
+        "-Werror",
+        "-Wextra",
         "-g3",
         "-O0",
         "-fno-omit-frame-pointer",
         "-DDEBUG",
     ],
+    includes = [
+        "tests/bdd",
+    ],
     linkopts = ["-g"],
-    testonly = True,
     deps = [
         ":iggy-cpp",
         "@cucumber-cpp//:cucumber-cpp",
@@ -164,11 +176,20 @@ cc_binary(
 cc_test(
     name = "unit",
     srcs = glob([
-        "tests/*/unit_tests.cpp",
-    ]) + [
-        "tests/unit_tests.cpp",
-    ],
-    copts = COMMON_COPTS,
+        "tests/unit/*.cpp",
+    ]),
+    copts = [
+        "-Wall",
+        "-Wpedantic",
+        "-Werror",
+        "-Wextra",
+    ] + select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
@@ -176,13 +197,24 @@ cc_test(
 )
 
 cc_test(
-    name = "low-level-e2e",
+    name = "e2e",
     srcs = glob([
-        "tests/**/low_level_e2e.cpp",
+        "tests/e2e/*.cpp",
     ]) + [
-        "tests/common/test_helpers.hpp",
+        "tests/e2e/test_helpers.hpp",
     ],
-    copts = COMMON_COPTS,
+    copts = [
+        "-Wall",
+        "-Wpedantic",
+        "-Werror",
+        "-Wextra",
+    ] + select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     tags = [
         "e2e",
     ],
