@@ -433,10 +433,18 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 
 // invalidateConnLocked closes the connection and marks it as disconnected
 func (c *IggyTcpClient) invalidateConnLocked() {
-	if c.conn != nil {
-		_ = c.conn.Close()
-	}
+	_ = c.closeConnLocked()
 	c.state = iggcon.StateDisconnected
+}
+
+// closeConnLocked closes and drops the current connection.
+func (c *IggyTcpClient) closeConnLocked() error {
+	if c.conn == nil {
+		return nil
+	}
+	err := c.conn.Close()
+	c.conn = nil
+	return err
 }
 
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
@@ -610,22 +618,17 @@ func (c *IggyTcpClient) disconnect() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateDisconnected {
+	if c.state == iggcon.StateDisconnected || c.state == iggcon.StateShutdown {
 		return nil
 	}
 
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
 	c.state = iggcon.StateDisconnected
-
-	if c.conn != nil {
-		if err := c.conn.Close(); err != nil {
-			return err
-		}
-	}
+	err := c.closeConnLocked()
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
 	// TODO event pushing logic
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) shutdown() error {
@@ -638,16 +641,12 @@ func (c *IggyTcpClient) shutdown() error {
 
 	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
 
-	if c.conn != nil {
-		if err := c.conn.Close(); err != nil {
-			return err
-		}
-	}
-
+	err := c.closeConnLocked()
 	c.state = iggcon.StateShutdown
+
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
 	// TODO push shutdown event
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) Close() error {

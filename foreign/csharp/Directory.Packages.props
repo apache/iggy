@@ -35,8 +35,8 @@
         <PackageVersion Include="Moq" Version="4.20.72" />
         <PackageVersion Include="Reqnroll.xunit.v3" Version="3.3.4" />
         <PackageVersion Include="Shouldly" Version="4.3.0" />
-        <PackageVersion Include="Testcontainers" Version="4.12.0" />
-        <PackageVersion Include="TUnit" Version="1.57.0" />
+        <PackageVersion Include="Testcontainers" Version="4.13.0" />
+        <PackageVersion Include="TUnit" Version="1.58.0" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
