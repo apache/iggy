@@ -31,6 +31,7 @@ use crate::ConfigurationError;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
 use server_common::sharding::IggyNamespace;
+use tracing::warn;
 
 impl Validatable<ConfigurationError> for ServerNgConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -105,6 +106,17 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // A zero duration encodes to wire value 0, the same value the wire uses
+        // for ServerDefault, so it would silently collide with that sentinel.
+        if let IggyExpiry::ExpireDuration(duration) = self.system.topic.message_expiry
+            && duration.as_micros() == 0
+        {
+            eprintln!(
+                "system.topic.message_expiry is a zero duration, which collides with the server-default sentinel on the wire; use \"none\" to never expire or a positive duration"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
         {
@@ -131,8 +143,98 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate quic config")
         })?;
 
+        reject_unsupported_and_warn_inert(self)?;
+
         Ok(())
     }
+}
+
+/// server-ng parses the whole legacy config surface but does not yet honor
+/// every knob. Make the still-inert ones loud at boot: reject the unsupported
+/// features (all off by default, so only a deliberate opt-in trips this) and
+/// warn once for tuning knobs server-ng silently ignores. Warnings fire only
+/// when a knob deviates from its [`ServerNgConfig::default`] baseline, so a
+/// pristine config.toml boots without noise. Baseline caveat: only the tcp/quic
+/// fork sections take that default from the ng config.toml. The reused legacy
+/// sections (`system.*`, `consumer_group.*`, `message_saver.*`) take theirs from
+/// the legacy server config.toml; those match ng's shipped values today but are
+/// not schema-locked, so editing such a knob in the ng config.toml could surface
+/// a spurious warn. The guard test below pins the compared knobs against drift.
+fn reject_unsupported_and_warn_inert(config: &ServerNgConfig) -> Result<(), ConfigurationError> {
+    if config.system.message_deduplication.enabled {
+        eprintln!("system.message_deduplication.enabled is not supported in server-ng");
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+    if config.system.segment.archive_expired {
+        eprintln!("system.segment.archive_expired is not supported in server-ng");
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+    if config.system.recovery.recreate_missing_state {
+        eprintln!("system.recovery.recreate_missing_state is not supported in server-ng");
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+
+    let defaults = ServerNgConfig::default();
+
+    if config.tcp.socket.override_defaults {
+        warn!("tcp.socket tuning is set but not applied in server-ng");
+    }
+    if config.quic.socket.override_defaults {
+        warn!("quic.socket tuning is set but not applied in server-ng");
+    }
+    if config.tcp.ipv6 {
+        warn!(
+            "tcp.ipv6 is ignored in server-ng; IPv4 vs IPv6 is decided by the tcp.address string"
+        );
+    }
+    if config.tcp.socket_migration != defaults.tcp.socket_migration {
+        warn!("tcp.socket_migration is not implemented in server-ng");
+    }
+    if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
+        warn!("system.segment.cache_indexes is not applied in server-ng");
+    }
+    if config.system.logging.sysinfo_print_interval
+        != defaults.system.logging.sysinfo_print_interval
+    {
+        warn!("system.logging.sysinfo_print_interval is not applied in server-ng");
+    }
+    if config.system.backup.path != defaults.system.backup.path
+        || config.system.backup.compatibility.path != defaults.system.backup.compatibility.path
+    {
+        warn!("backup is not supported in server-ng");
+    }
+    // default_algorithm deviation is already warned by the delegated legacy
+    // CompressionConfig::validate; only allow_override needs a signal here.
+    if config.system.compression.allow_override != defaults.system.compression.allow_override {
+        warn!(
+            "system.compression.allow_override is inert in server-ng; live compression is per-topic from the request"
+        );
+    }
+    if config.system.state.enforce_fsync != defaults.system.state.enforce_fsync
+        || config.system.state.max_file_operation_retries
+            != defaults.system.state.max_file_operation_retries
+        || config.system.state.retry_delay != defaults.system.state.retry_delay
+    {
+        warn!(
+            "system.state tuning (enforce_fsync, max_file_operation_retries, retry_delay) is not applied in server-ng"
+        );
+    }
+    if config.consumer_group.rebalancing_check_interval
+        != defaults.consumer_group.rebalancing_check_interval
+    {
+        warn!(
+            "consumer_group.rebalancing_check_interval is not applied in server-ng; rebalancing cadence uses system.sharding.reconcile_periodic_interval"
+        );
+    }
+    if config.message_saver.interval != defaults.message_saver.interval
+        || config.message_saver.enforce_fsync != defaults.message_saver.enforce_fsync
+    {
+        warn!(
+            "periodic message_saver is not implemented in server-ng; only shutdown-flush is active"
+        );
+    }
+
+    Ok(())
 }
 
 impl Validatable<ConfigurationError> for ExtraConfig {
@@ -152,5 +254,123 @@ impl Validatable<ConfigurationError> for NamespaceConfig {
                 ConfigurationError::InvalidConfigurationValue
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
+
+    const DEFAULT_CONFIG: &str = include_str!("../../../server-ng/config.toml");
+
+    /// Deep-merge a partial override over the shipped default, mirroring the
+    /// file-over-embedded layering the runtime loader performs.
+    fn config_with_override(override_toml: &str) -> ServerNgConfig {
+        Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .merge(Toml::string(override_toml))
+            .extract()
+            .expect("config deserializes")
+    }
+
+    #[test]
+    fn given_shipped_default_config_when_validating_should_pass() {
+        let config: ServerNgConfig = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .extract()
+            .expect("default config deserializes");
+        config
+            .validate()
+            .expect("pristine server-ng config must validate");
+    }
+
+    #[test]
+    fn given_message_deduplication_enabled_when_validating_should_reject() {
+        let config = config_with_override("[system.message_deduplication]\nenabled = true\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_web_ui_enabled_when_validating_should_pass() {
+        let config = config_with_override("[http]\nweb_ui = true\n");
+        config
+            .validate()
+            .expect("web_ui is now served by server-ng and must validate");
+    }
+
+    #[test]
+    fn given_archive_expired_enabled_when_validating_should_reject() {
+        let config = config_with_override("[system.segment]\narchive_expired = true\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_recreate_missing_state_enabled_when_validating_should_reject() {
+        let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_message_expiry_when_validating_should_reject() {
+        let config = config_with_override("[system.topic]\nmessage_expiry = \"0s\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    /// The warn-helper baseline is [`ServerNgConfig::default`], but the reused
+    /// legacy sections source that default from the legacy server config.toml,
+    /// not this NG file. Pin the knobs the helper compares so any drift between
+    /// the two config.toml files fails here instead of as a spurious boot warn.
+    #[test]
+    fn given_shipped_ng_config_when_compared_to_default_should_match_warned_knobs() {
+        let shipped: ServerNgConfig = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .extract()
+            .expect("default config deserializes");
+        let defaults = ServerNgConfig::default();
+
+        assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
+        assert_eq!(
+            shipped.system.segment.cache_indexes,
+            defaults.system.segment.cache_indexes
+        );
+        assert_eq!(
+            shipped.system.logging.sysinfo_print_interval,
+            defaults.system.logging.sysinfo_print_interval
+        );
+        assert_eq!(shipped.system.backup.path, defaults.system.backup.path);
+        assert_eq!(
+            shipped.system.backup.compatibility.path,
+            defaults.system.backup.compatibility.path
+        );
+        assert_eq!(
+            shipped.system.compression.allow_override,
+            defaults.system.compression.allow_override
+        );
+        assert_eq!(
+            shipped.system.state.enforce_fsync,
+            defaults.system.state.enforce_fsync
+        );
+        assert_eq!(
+            shipped.system.state.max_file_operation_retries,
+            defaults.system.state.max_file_operation_retries
+        );
+        assert_eq!(
+            shipped.system.state.retry_delay,
+            defaults.system.state.retry_delay
+        );
+        assert_eq!(
+            shipped.consumer_group.rebalancing_check_interval,
+            defaults.consumer_group.rebalancing_check_interval
+        );
+        assert_eq!(
+            shipped.message_saver.interval,
+            defaults.message_saver.interval
+        );
+        assert_eq!(
+            shipped.message_saver.enforce_fsync,
+            defaults.message_saver.enforce_fsync
+        );
     }
 }

@@ -133,7 +133,7 @@ pub async fn start(
     // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
     let max_request_size =
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
-    let router = router(state, max_request_size, cors);
+    let router = router(state, max_request_size, cors, http_config.web_ui);
 
     let shutdown = shard.bus.token();
     let handle = compio::runtime::spawn(async move {
@@ -169,7 +169,12 @@ const PING_PATH: &str = "/ping";
 /// 405 if it reached the router; the outermost `CorsLayer` answers it first
 /// instead, and stamps the CORS response headers over every reply, including
 /// the inner layer's `x-iggy-view`.
-fn router(state: HttpState, max_request_size: usize, cors: Option<CorsLayer>) -> Router {
+fn router(
+    state: HttpState,
+    max_request_size: usize,
+    cors: Option<CorsLayer>,
+    web_ui: bool,
+) -> Router {
     // Cloned for the response layer so `X-Iggy-View` reads the live view per
     // response; the original `state` is moved into `with_state` below.
     let view_source = state.clone();
@@ -263,10 +268,42 @@ fn router(state: HttpState, max_request_size: usize, cors: Option<CorsLayer>) ->
                 }
             }
         }));
-    match cors {
+    let router = match cors {
         Some(cors) => router.layer(cors),
         None => router,
+    };
+
+    merge_web_ui(router, web_ui)
+}
+
+/// Merge the unauthenticated `/ui` static-asset surface when `web_ui` is set.
+///
+/// The caller merges this outermost - after `with_state`, the body limit, the
+/// view-header layer, and CORS - mirroring the legacy server. Staying past the
+/// view-header layer also keeps the cluster-internal view number off these
+/// unauthenticated responses, the same anon-leak gate `/ping` gets above.
+///
+/// Without the `iggy-web` feature the assets are not compiled in, so an enabled
+/// flag only warns instead of serving.
+fn merge_web_ui(router: Router, web_ui: bool) -> Router {
+    #[cfg(feature = "iggy-web")]
+    let router = if web_ui {
+        info!("Web UI enabled at /ui");
+        router.merge(crate::web::router())
+    } else {
+        router
+    };
+
+    #[cfg(not(feature = "iggy-web"))]
+    if web_ui {
+        tracing::warn!(
+            "Web UI is enabled in configuration (http.web_ui = true) but the server \
+             was not compiled with 'iggy-web' feature. The Web UI will not be available. \
+             To enable it, rebuild the server with: cargo build --features iggy-web"
+        );
     }
+
+    router
 }
 
 /// Build the [`CorsLayer`] from `[http.cors]`, porting the legacy server's
