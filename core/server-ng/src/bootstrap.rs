@@ -804,9 +804,13 @@ async fn shard_main(
             // Root is created locally at boot (never journaled), so replay
             // must start from the same baseline or every WAL-created user
             // shifts one slab id and root is lost after the first restart.
-            let recovered = recover::<ServerNgMuxStateMachine>(data_dir, |mux_stm| {
-                ensure_default_root_user(mux_stm);
-            })
+            let recovered = recover::<ServerNgMuxStateMachine>(
+                data_dir,
+                topology.replica_count == 1,
+                |mux_stm| {
+                    ensure_default_root_user(mux_stm);
+                },
+            )
             .await
             .map_err(ServerNgError::MetadataRecovery)?;
             validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
@@ -984,10 +988,15 @@ async fn shard_main(
     // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
-    let pump_handle = compio::runtime::spawn(async move {
+    // Owned and awaited by shard_main at exit, NOT `track_background`: the
+    // background drain runs inside `bus.shutdown()`, which the Ctrl-C path
+    // never drives (the watchdog stands down when the token fires), so a
+    // tracked pump would be cancelled by runtime teardown mid final-flush
+    // and every graceful shutdown would silently drop the committed journal
+    // tail that had not hit a flush threshold yet.
+    let mut pump_handle = Some(compio::runtime::spawn(async move {
         pump_shard.run_message_pump(stop_rx).await;
-    });
-    bus.track_background(pump_handle);
+    }));
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
         Rc::clone(&shard),
@@ -1138,6 +1147,7 @@ async fn shard_main(
             if let Some(tx) = &segment_cleaner_stop {
                 let _ = tx.try_send(());
             }
+            await_pump_drain(pump_handle.take(), config, shard_id).await;
             return Err(error);
         }
     }
@@ -1155,8 +1165,35 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
+    await_pump_drain(pump_handle.take(), config, shard_id).await;
+
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
+}
+
+/// Await the message pump's completion before the shard returns: its
+/// post-loop work includes the final flush of every committed journal to
+/// segment storage, and returning first drops the compio runtime, which
+/// cancels that flush at its next await point.
+async fn await_pump_drain(
+    pump_handle: Option<compio::runtime::JoinHandle<()>>,
+    config: &ServerNgConfig,
+    shard_id: u16,
+) {
+    let Some(pump_handle) = pump_handle else {
+        return;
+    };
+    let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
+    if compio::time::timeout(drain_budget, pump_handle)
+        .await
+        .is_err()
+    {
+        warn!(
+            shard = shard_id,
+            "message pump did not drain within the shutdown budget; \
+             committed journal tail may not have flushed"
+        );
+    }
 }
 
 /// Block until shard 0 broadcasts the metadata factory bundle, or the
@@ -1603,6 +1640,18 @@ fn restore_metadata_consensus(
         consensus.init();
     }
     consensus.sequencer().set_sequence(restored_op);
+    // A SOLO replica's durable journal head IS its commit point: quorum is
+    // 1-of-1, so an entry commits the instant it is durable, and the acks
+    // the cluster ceremony below would wait on cannot topologically exist.
+    // The embedded watermark is structurally one op stale (the commit point
+    // is only ever written down inside the NEXT entry), so trusting it solo
+    // manufactures an "uncommitted" suffix that provably committed and
+    // wedges the recovery barrier forever.
+    let commit_watermark = if replica_count == 1 {
+        restored_op
+    } else {
+        commit_watermark
+    };
     // The commit point is restored from the WAL's embedded watermark (each
     // journaled prepare carries the primary's commit at send time), NOT from
     // the journal head: journaled does not imply committed, and claiming
@@ -1782,16 +1831,27 @@ async fn hydrate_partition_log(
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
-        if let (Some(messages_reader), Some(index_reader)) = (
+        if let (
+            Some(messages_reader),
+            Some(index_reader),
+            Some(storage_messages_writer),
+            Some(storage_index_writer),
+        ) = (
             storage.messages_reader.as_ref(),
             storage.index_reader.as_ref(),
+            storage.messages_writer.as_ref(),
+            storage.index_writer.as_ref(),
         ) {
             let index_path = index_reader.path();
-            let index_size = std::fs::metadata(&index_path).map_or(0, |metadata| metadata.len());
+            // Share the storage's size counters: the readers bound reads by
+            // these atomics, so a writer with a private counter persists bytes
+            // the readers never learn about.
+            let messages_size_counter = storage_messages_writer.size_counter();
+            let index_size_counter = storage_index_writer.size_counter();
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),
-                    Rc::new(AtomicU64::new(u64::from(messages_reader.file_size()))),
+                    messages_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )
@@ -1811,7 +1871,7 @@ async fn hydrate_partition_log(
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
                 IggyIndexWriter::new(
                     &index_path,
-                    Rc::new(AtomicU64::new(index_size)),
+                    index_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )

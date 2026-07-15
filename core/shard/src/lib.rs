@@ -2575,6 +2575,11 @@ where
     {
         let partitions = self.plane.partitions();
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        tracing::info!(
+            shard = self.id,
+            partitions = namespaces.len(),
+            "shutdown flush: draining committed journals to segment storage"
+        );
         for namespace in namespaces {
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 continue;

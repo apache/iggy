@@ -40,7 +40,7 @@ use server_common::sharding::IggyNamespace;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tracing::{error, warn};
 
 /// Validate that a namespace fits within the static caps declared in
@@ -365,13 +365,25 @@ pub async fn ensure_initial_segment(
         );
         source
     })?;
+    // Share the storage's size counters so reads observe persisted bytes;
+    // a writer with a private counter grows the file invisibly to readers.
+    let messages_size_counter = storage
+        .messages_writer
+        .as_ref()
+        .map(|writer| writer.size_counter())
+        .unwrap_or_default();
+    let index_size_counter = storage
+        .index_writer
+        .as_ref()
+        .map(|writer| writer.size_counter())
+        .unwrap_or_default();
     partition.log.add_persisted_segment(
         Segment::new(0, config.system.segment.size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
                 &messages_path,
-                Rc::new(AtomicU64::new(0)),
+                messages_size_counter,
                 config.system.partition.enforce_fsync,
                 false,
             )
@@ -391,7 +403,7 @@ pub async fn ensure_initial_segment(
         Some(Rc::new(
             IggyIndexWriter::new(
                 &index_path,
-                Rc::new(AtomicU64::new(0)),
+                index_size_counter,
                 config.system.partition.enforce_fsync,
                 false,
             )

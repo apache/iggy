@@ -1808,6 +1808,13 @@ where
 
         let journal_info = self.log.journal().info;
         if journal_info.messages_count == 0 {
+            if force {
+                tracing::info!(
+                    target: "iggy.partitions.diag",
+                    namespace_raw = self.namespace().inner(),
+                    "forced flush: journal counts zero messages, nothing to persist"
+                );
+            }
             return Ok(());
         }
 
@@ -1841,6 +1848,15 @@ where
         let commit_max = self.consensus.commit_max();
         let committed_entries = self.log.journal().inner.committed_prefix(commit_max);
         if committed_entries.is_empty() {
+            if force {
+                tracing::info!(
+                    target: "iggy.partitions.diag",
+                    namespace_raw = self.namespace().inner(),
+                    commit_max,
+                    journal_messages = journal_info.messages_count,
+                    "forced flush: no committed entries resident"
+                );
+            }
             return Ok(());
         }
         // Persist the prefix in segment-sized chunks: a segment seals exactly
@@ -1885,6 +1901,13 @@ where
                     // Consumer-offset ops are journaled in the same prefix but carry
                     // no segment bytes; they were applied when staged, so skip them.
                     if peek_operation(&entry) != Operation::SendMessages {
+                        if force {
+                            tracing::info!(
+                                target: "iggy.partitions.diag",
+                                operation = ?peek_operation(&entry),
+                                "forced flush: skipping non-send entry"
+                            );
+                        }
                         continue;
                     }
                     // A resident committed SendMessages entry decoded once at append
@@ -1892,8 +1915,10 @@ where
                     // bytes, so it must decode again here. Guard the invariant for a
                     // future disk read-back path that could make decode fallible.
                     let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
-                        debug_assert!(
-                            false,
+                        tracing::error!(
+                            target: "iggy.partitions.diag",
+                            namespace_raw = self.namespace().inner(),
+                            entry_len = entry.as_slice().len(),
                             "resident committed SendMessages entry failed to decode"
                         );
                         continue;
@@ -2637,15 +2662,15 @@ where
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
         );
+        let index_size_bytes = storage
+            .index_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
+            .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(std::sync::atomic::AtomicU64::new(0)),
-                config.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
 
         let old_storage = &mut self.log.storages_mut()[old_segment_index];
@@ -2881,15 +2906,15 @@ where
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
         );
+        let index_size_bytes = storage
+            .index_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
+            .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(std::sync::atomic::AtomicU64::new(0)),
-                config.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -2957,6 +2982,11 @@ where
         self.offset.store(start_offset, Ordering::Release);
         self.dirty_offset.store(start_offset, Ordering::Relaxed);
         self.should_increment_offset = false;
+        // The boot-time durable line marks recovered bytes that must not be
+        // re-persisted, but the purge just deleted those bytes and offsets
+        // restart at 0. Keeping it would make every post-purge batch at or
+        // below the old line evict silently without ever reaching a segment.
+        self.recovered_durable_offset = None;
 
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
         // file paths before deleting so the map guard is not held across an
