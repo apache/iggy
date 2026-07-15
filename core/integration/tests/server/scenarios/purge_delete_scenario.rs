@@ -297,15 +297,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     )
     .await;
 
-    // --- Error cases ---
-    //
-    // Legacy rejects a delete on an unknown target. server-ng acks it without
-    // committing anything (best-effort space management), which gaps the VSR
-    // request sequence: the next metadata op hits the `request == committed + 1`
-    // preflight, gets dropped, and the SDK read-timeout replay panics
-    // (`register_request_id already called`). Skipped under vsr until
-    // unresolvable targets are rejected (or committed as no-ops) at admission.
-    #[cfg(not(feature = "vsr"))]
+    // --- Error cases: deletes on unknown targets must be rejected ---
     {
         assert!(
             client
