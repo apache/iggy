@@ -48,7 +48,8 @@ cargo run --bin iggy-server -- --with-default-root-credentials --fresh
 # Using uv:
 uv sync --all-extras
 uv run maturin develop
-uv run pytest tests/ -v # Run tests (requires iggy-server running)
+uv run pytest tests/ -v # Run all tests (for release versions, requires iggy-server running)
+uv run --no-sync pytest tests/ -v # Run tests without syncing (for development, implicit uv run's syncing overwrites the installations made by maturin develop)
 
 # Using pip:
 python3 -m venv .venv

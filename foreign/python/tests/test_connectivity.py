@@ -54,89 +54,89 @@ class TestConnectivity:
     @pytest.mark.parametrize(
         (
             "invalid_value",
-            "expected_error_name",
-            "expected_error_code",
-            "expected_error_message",
+            "expected_iggy_error_name",
+            "expected_iggy_error_code",
+            "expected_iggy_error_message",
         ),
         [
-            ("", "InvalidConnectionString", 8000, "Invalid connection string"),
+            ("", "invalid_connection_string", 8000, "Invalid connection string"),
             (
                 "bad address",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "http://{host}:{port}",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "tcp://iggy:iggy@{host}:{port}",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
-            ("{host}:", "InvalidConnectionString", 8000, "Invalid connection string"),
-            (":{port}", "InvalidConnectionString", 8000, "Invalid connection string"),
+            ("{host}:", "invalid_connection_string", 8000, "Invalid connection string"),
+            (":{port}", "invalid_connection_string", 8000, "Invalid connection string"),
             (
                 "{host}:not-a-port",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "{host}:70000",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:not-a-port",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:-1",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:70000",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:bad:format@{host}:{port}",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
-                "InvalidConnectionString",
+                "invalid_connection_string",
                 8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+quic://iggy:iggy@127.0.0.1:8080",
-                "CannotCreateEndpoint",
+                "cannot_create_endpoint",
                 305,
                 "Cannot create endpoint",
             ),
@@ -145,27 +145,22 @@ class TestConnectivity:
     def test_invalid_connection_string(
         self,
         invalid_value: str,
-        expected_error_name: str,
-        expected_error_code: int,
-        expected_error_message: str,
+        expected_iggy_error_name: str,
+        expected_iggy_error_code: int,
+        expected_iggy_error_message: str,
     ):
         """Test malformed server addresses and connection strings are rejected."""
         host, port = get_server_config()
         value = invalid_value.format(host=host, port=port)
 
-        with pytest.raises(IggyError) as excinfo_new:
-            IggyClient(value)
-
-        assert excinfo_new.value.code == expected_error_code
-        assert excinfo_new.value.name == expected_error_name
-        assert excinfo_new.value.message == expected_error_message
-
         with pytest.raises(IggyError) as excinfo_from_connection_string:
             IggyClient.from_connection_string(value)
 
-        assert excinfo_from_connection_string.value.code == expected_error_code
-        assert excinfo_from_connection_string.value.name == expected_error_name
-        assert excinfo_from_connection_string.value.message == expected_error_message
+        assert excinfo_from_connection_string.value.name == expected_iggy_error_name
+        assert excinfo_from_connection_string.value.code == expected_iggy_error_code
+        assert (
+            excinfo_from_connection_string.value.message == expected_iggy_error_message
+        )
 
     @pytest.mark.asyncio
     async def test_repeated_connect_does_not_error(self):
@@ -188,19 +183,46 @@ class TestConnectivity:
         await wait_for_ping(client)
 
     @pytest.mark.parametrize(
-        ("username", "password", "expected_exception"),
+        (
+            "username",
+            "password",
+            "expected_exception",
+            "expected_iggy_error_name",
+            "expected_iggy_error_code",
+            "expected_error_message",
+        ),
         [
-            ("invalid-user", "iggy", RuntimeError),
-            ("iggy", "invalid-password", RuntimeError),
-            ("", "iggy", RuntimeError),
-            ("iggy", "", RuntimeError),
-            (None, "iggy", TypeError),
-            ("iggy", None, TypeError),
+            (
+                "invalid-user",
+                "iggy",
+                IggyError,
+                "invalid_credentials",
+                42,
+                "Invalid credentials",
+            ),
+            (
+                "iggy",
+                "invalid-password",
+                IggyError,
+                "invalid_credentials",
+                42,
+                "Invalid credentials",
+            ),
+            ("", "iggy", IggyError, "invalid_username", 43, "Invalid username"),
+            ("iggy", "", IggyError, "invalid_password", 44, "Invalid password"),
+            (None, "iggy", TypeError, None, None, "'None' is not an instance of 'str'"),
+            ("iggy", None, TypeError, None, None, "'None' is not an instance of 'str'"),
         ],
     )
     @pytest.mark.asyncio
     async def test_login_with_invalid_credentials_fails(
-        self, username, password, expected_exception
+        self,
+        username: str,
+        password: str,
+        expected_exception: type[Exception],
+        expected_iggy_error_name: str,
+        expected_iggy_error_code: int,
+        expected_error_message: str,
     ):
         """Test login rejects invalid credentials and invalid argument values."""
         host, port = get_server_config()
@@ -210,9 +232,16 @@ class TestConnectivity:
         await client.connect()
         await wait_for_ping(client)
 
-        with pytest.raises(expected_exception):
+        with pytest.raises(expected_exception) as exc_info:
             result = client.login_user(username, password)
             await result
+
+        if expected_exception is IggyError:
+            assert exc_info.value.name == expected_iggy_error_name
+            assert exc_info.value.code == expected_iggy_error_code
+            assert exc_info.value.message == expected_error_message
+        else:
+            assert exc_info.value.args[0] == expected_error_message
 
     @pytest.mark.asyncio
     async def test_relogin_with_invalid_credentials_fails(self):
@@ -225,8 +254,12 @@ class TestConnectivity:
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await client.login_user("iggy", "invalid-password")
+
+        assert exc_info.value.name == "invalid_credentials"
+        assert exc_info.value.code == 42
+        assert exc_info.value.message == "Invalid credentials"
 
     @pytest.mark.asyncio
     async def test_relogin_with_same_valid_credentials_does_not_error(self):

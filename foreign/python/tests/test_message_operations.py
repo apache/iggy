@@ -20,7 +20,7 @@ import uuid
 
 import pytest
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import IggyClient, IggyError, PollingStrategy
 from apache_iggy import SendMessage as Message
 
 
@@ -146,8 +146,12 @@ class TestMessageOperations:
     )
     async def test_empty_payload_is_rejected(self, payload):
         """Test empty string and bytes payloads are rejected."""
-        with pytest.raises(ValueError, match="Invalid message payload length"):
+        with pytest.raises(IggyError) as exc_info:
             Message(payload)
+
+        assert exc_info.value.name == "invalid_message_payload_length"
+        assert exc_info.value.code == 4025
+        assert exc_info.value.message == "Invalid message payload length"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -361,7 +365,7 @@ class TestMessageOperations:
             messages=[Message(message) for message in test_messages],
         )
 
-        with pytest.raises(RuntimeError, match="Invalid messages count"):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
@@ -370,6 +374,10 @@ class TestMessageOperations:
                 count=0,
                 auto_commit=False,
             )
+
+        assert exc_info.value.name == "invalid_messages_count"
+        assert exc_info.value.code == 4009
+        assert exc_info.value.message == "Invalid messages count"
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_invalid_partition_id_raises(
@@ -392,13 +400,7 @@ class TestMessageOperations:
             messages=[Message(f"Partition test - {unique_name()}")],
         )
 
-        with pytest.raises(
-            RuntimeError,
-            match=(
-                r"Partition with ID: 0 for topic with ID: 0 "
-                r"for stream with ID: 0 was not found\."
-            ),
-        ):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
@@ -407,6 +409,10 @@ class TestMessageOperations:
                 count=1,
                 auto_commit=False,
             )
+
+        assert exc_info.value.name == "partition_not_found"
+        assert exc_info.value.code == 3007
+        assert exc_info.value.message.startswith("Partition with ID:")
 
     @pytest.mark.asyncio
     async def test_polling_strategy_last_with_count_one_returns_last_message(
