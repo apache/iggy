@@ -29,21 +29,41 @@ use crate::harness::config::{IpAddrKind, TestServerConfig};
 use crate::harness::error::TestBinaryError;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashSet;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
-/// Ports already handed out by any reservation in this process.
+/// Ports this process must not hand out: either it reserved them, or it saw
+/// another process holding the cross-process lock (see [`PORT_LOCKS`]).
 ///
-/// The reservation sockets set `SO_REUSEPORT` so the server can later bind the
-/// same port the reserver held. But `SO_REUSEPORT` also lets the kernel assign
-/// the *same* ephemeral port to two `bind(0)` calls from different threads, so
-/// under a multi-threaded test run two clusters can reserve the same port and
-/// the second server aborts on the cluster config's port-conflict validator.
-/// Tracking every handed-out port and rebinding on collision makes reservations
-/// unique across the whole process. Ports are claimed for the process lifetime
-/// (never returned to the pool): a release frees the socket so the server can
-/// bind, but re-handing the number out could still collide with that server.
+/// `SO_REUSEPORT` (needed so the server can later bind the port the reserver
+/// held) also lets the kernel hand the *same* ephemeral port to two `bind(0)`
+/// calls, so two reservations can land on one port. This set rejects the
+/// duplicate within a process; [`PORT_LOCKS`] extends the guarantee across the
+/// concurrent test processes. Entries are never removed: a release frees the
+/// socket so the server can bind, but re-handing the number out could still
+/// collide with that server, and a number seen held elsewhere stays off-limits
+/// (the ephemeral range dwarfs what one test consumes).
 static RESERVED_PORTS: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+
+/// Advisory file locks held for the process lifetime, one per reserved port.
+///
+/// `RESERVED_PORTS` dedups only within a process, but `nextest` runs each test
+/// in its own process and they reserve ports concurrently. An exclusive `flock`
+/// on a per-port file in a shared temp dir makes a claim visible to every other
+/// test process: one that `bind(0)`s onto the same ephemeral port fails the lock
+/// and rebinds. The lock is kept past the socket release (see
+/// [`ReservedPort::release`]) so it also covers the window between releasing the
+/// reservation socket and the server binding the port. The OS drops the locks on
+/// process exit, so a crash never leaks a claim.
+///
+/// One file descriptor is held per reserved port for the process lifetime. That
+/// is bounded because `nextest` gives each test its own short-lived process (a
+/// test reserves at most a few dozen ports); a single-process run of the whole
+/// suite would instead accumulate them, so this reserver assumes the per-test
+/// process model.
+static PORT_LOCKS: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 /// Bind retries before giving up. The ephemeral range dwarfs the ports a single
 /// test run consumes, so a fresh port is found almost immediately; the cap only
@@ -59,10 +79,55 @@ fn claim_port(port: u16) -> bool {
         .insert(port)
 }
 
-/// A socket bound to a specific port, held to prevent reuse until released.
+/// Shared directory holding the per-port advisory lock files, created once.
+fn port_lock_dir() -> &'static PathBuf {
+    static PORT_LOCK_DIR: OnceLock<PathBuf> = OnceLock::new();
+    PORT_LOCK_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("iggy-test-port-locks");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+/// Outcome of trying to take a port's cross-process advisory lock.
+enum PortClaim {
+    /// Exclusive lock held; keep the file alive while the port is in use.
+    Locked(File),
+    /// Another test process holds the port; the caller must rebind.
+    Contended,
+    /// The lock directory is unusable (cannot create/open/lock the file), so no
+    /// cross-process coordination is available. The caller keeps the port and
+    /// degrades to the in-process guard alone rather than failing the run.
+    Unsupported,
+}
+
+/// Try to take an exclusive cross-process lock on `port`.
+fn lock_port(port: u16) -> PortClaim {
+    let path = port_lock_dir().join(format!("{port}.lock"));
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    else {
+        return PortClaim::Unsupported;
+    };
+    match file.try_lock() {
+        Ok(()) => PortClaim::Locked(file),
+        Err(TryLockError::WouldBlock) => PortClaim::Contended,
+        Err(TryLockError::Error(_)) => PortClaim::Unsupported,
+    }
+}
+
+/// A socket bound to a specific port, held to prevent reuse until released,
+/// plus the cross-process advisory lock on that port (see [`PORT_LOCKS`]), or
+/// `None` when the lock directory is unusable and only the in-process guard
+/// applies.
 struct ReservedPort {
     socket: Socket,
     addr: SocketAddr,
+    lock: Option<File>,
 }
 
 impl ReservedPort {
@@ -136,9 +201,30 @@ impl ReservedPort {
                 })?;
 
             // SO_REUSEPORT lets the kernel reuse a port another reservation
-            // already holds; rebind (dropping this socket) until the claim wins.
+            // already holds; rebind (dropping this socket) until the claim wins
+            // both in-process and across the concurrent test processes.
             if claim_port(addr.port()) {
-                return Ok(Self { socket, addr });
+                match lock_port(addr.port()) {
+                    PortClaim::Locked(lock) => {
+                        return Ok(Self {
+                            socket,
+                            addr,
+                            lock: Some(lock),
+                        });
+                    }
+                    // Lock infra unavailable: keep the in-process claim and run
+                    // without the cross-process guard rather than fail the run.
+                    PortClaim::Unsupported => {
+                        return Ok(Self {
+                            socket,
+                            addr,
+                            lock: None,
+                        });
+                    }
+                    // Held by another process; the number stays claimed (so we
+                    // do not retry it) and we rebind to a different port.
+                    PortClaim::Contended => {}
+                }
             }
         }
 
@@ -152,7 +238,18 @@ impl ReservedPort {
     }
 
     fn release(self) {
-        drop(self.socket);
+        // Drop the reservation socket so the server can bind the port, but move
+        // the advisory lock (when held) into the process-wide registry so it
+        // outlives the socket and keeps concurrent test processes off the port
+        // until the server has bound it.
+        let Self { socket, lock, .. } = self;
+        if let Some(lock) = lock {
+            PORT_LOCKS
+                .lock()
+                .expect("port-locks mutex poisoned")
+                .push(lock);
+        }
+        drop(socket);
     }
 }
 

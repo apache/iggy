@@ -633,6 +633,9 @@ pub fn bootstrap(
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
     warm_dummy_password_hash();
+    // The sync GetStats read path has no access to server config, so capture
+    // the data directory here for its disk-usage reporting.
+    crate::responses::init_stats_data_path(config.system.get_system_path().into());
     let (assignments, total_shards) = resolve_shard_assignments(&config.system.sharding)?;
     let shards_count = assignments.len();
 

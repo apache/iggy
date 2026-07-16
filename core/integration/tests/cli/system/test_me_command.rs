@@ -100,7 +100,18 @@ impl IggyCmdTestCase for TestMeCmd {
                     .stderr(diff("Error: CommandError(Iggy command line tool error\n\nCaused by:\n    Missing iggy server credentials)\n"));
             }
             Scenario::FailureDueToSessionTimeout(server_address) => {
+                #[cfg(not(feature = "vsr"))]
                 command_state.failure().stderr(diff(format!("Error: CommandError(Login session expired for Iggy server: {server_address}, please login again or use other authentication method)\n")));
+                // server-ng maps an expired/invalid stored session to a generic
+                // login-with-token failure rather than the legacy "session
+                // expired" message.
+                #[cfg(feature = "vsr")]
+                {
+                    let _ = server_address;
+                    command_state.failure().stderr(diff(
+                        "Error: CommandError(Problem with server login with token)\n",
+                    ));
+                }
             }
         }
     }
