@@ -17,8 +17,8 @@
 
 //! Regression tests for PR #3519 review findings (atharvalade, Jul 2026).
 //!
-//! These encode Kafka-client-correct behavior. Several fail until the
-//! corresponding protocol/server fixes land.
+//! Each test encodes Kafka-client-correct behavior for a specific review finding and
+//! guards against regressions now that the corresponding protocol/server fixes have landed.
 
 #[path = "common/scope.rs"]
 mod scope;

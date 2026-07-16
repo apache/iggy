@@ -35,7 +35,7 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
-use fixtures::load_fixture_body;
+use fixtures::load_fixture_body_or_skip;
 use scope::{SCOPED_API_KEYS, default_broker};
 use tcp::build_metadata_legacy_request;
 use wire::build_metadata_flexible_request_v10;
@@ -305,7 +305,9 @@ fn unsupported_api_keys_return_error_only() {
 #[test]
 fn supported_produce_versions_accept_valid_fixture() {
     for version in 3i16..=9 {
-        let body = load_fixture_body(0, "Produce", version);
+        let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
+            continue;
+        };
         let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         assert!(!resp.is_empty(), "Produce v{version} response empty");
@@ -315,7 +317,9 @@ fn supported_produce_versions_accept_valid_fixture() {
 #[test]
 fn supported_fetch_versions_accept_valid_fixture() {
     for version in 4i16..=12 {
-        let body = load_fixture_body(1, "Fetch", version);
+        let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
+            continue;
+        };
         let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         assert!(!resp.is_empty(), "Fetch v{version} response empty");

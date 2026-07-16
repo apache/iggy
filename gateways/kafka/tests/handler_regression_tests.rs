@@ -28,7 +28,7 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
-use fixtures::{fixture_exists, load_fixture_body};
+use fixtures::load_fixture_body_or_skip;
 use scope::{SCOPED_API_KEYS, default_broker};
 
 #[test]
@@ -48,10 +48,9 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
         }
 
         for version in min_ver..=max_ver {
-            if !fixture_exists(api_key, name, version) {
+            let Some(body) = load_fixture_body_or_skip(api_key, name, version) else {
                 continue;
-            }
-            let body = load_fixture_body(api_key, name, version);
+            };
             let resp = handle_request(api_key, version, body, &default_broker())
                 .expect("test request has acks != 0 and expects a response");
             assert!(
@@ -65,10 +64,9 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
 #[test]
 fn produce_stub_response_has_zero_error_per_partition() {
     for version in 3i16..=9 {
-        if !fixture_exists(0, "Produce", version) {
+        let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
             continue;
-        }
-        let body = load_fixture_body(0, "Produce", version);
+        };
         let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 9;
@@ -90,10 +88,9 @@ fn produce_stub_response_has_zero_error_per_partition() {
 #[test]
 fn fetch_stub_response_has_zero_partition_error() {
     for version in 4i16..=12 {
-        if !fixture_exists(1, "Fetch", version) {
+        let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
             continue;
-        }
-        let body = load_fixture_body(1, "Fetch", version);
+        };
         let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 12;
@@ -126,10 +123,9 @@ fn fetch_stub_response_has_zero_partition_error() {
 #[test]
 fn list_offsets_stub_response_has_zero_error() {
     for version in 1i16..=6 {
-        if !fixture_exists(2, "ListOffsets", version) {
+        let Some(body) = load_fixture_body_or_skip(2, "ListOffsets", version) else {
             continue;
-        }
-        let body = load_fixture_body(2, "ListOffsets", version);
+        };
         let resp = handle_request(API_KEY_LIST_OFFSETS, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 6;
@@ -154,10 +150,9 @@ fn list_offsets_stub_response_has_zero_error() {
 #[test]
 fn create_topics_stub_response_has_zero_error() {
     for version in 2i16..=5 {
-        if !fixture_exists(19, "CreateTopics", version) {
+        let Some(body) = load_fixture_body_or_skip(19, "CreateTopics", version) else {
             continue;
-        }
-        let body = load_fixture_body(19, "CreateTopics", version);
+        };
         let resp = handle_request(API_KEY_CREATE_TOPICS, version, body, &default_broker())
             .expect("test request has acks != 0 and expects a response");
         let flexible = version >= 5;

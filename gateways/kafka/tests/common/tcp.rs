@@ -71,8 +71,27 @@ pub fn parse_response_payload(api_key: i16, api_version: i16, payload: Bytes) ->
     (correlation_id, body)
 }
 
+/// Generous ceiling for the "default" response read. A server regression that drops a
+/// response then becomes a bounded test failure instead of an indefinite hang.
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read one length-prefixed response frame from the stream.
+///
+/// Bounded by [`DEFAULT_RESPONSE_TIMEOUT`] so a dropped response fails fast instead of hanging.
 pub async fn read_response_frame(stream: &mut TcpStream, max_size: usize) -> Bytes {
+    time::timeout(
+        DEFAULT_RESPONSE_TIMEOUT,
+        read_response_frame_raw(stream, max_size),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no response frame within {DEFAULT_RESPONSE_TIMEOUT:?} (server dropped the response?)"
+        )
+    })
+}
+
+async fn read_response_frame_raw(stream: &mut TcpStream, max_size: usize) -> Bytes {
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)
@@ -119,7 +138,7 @@ pub async fn read_response_frame_with_timeout(
     max_size: usize,
     timeout: Duration,
 ) -> Option<Bytes> {
-    time::timeout(timeout, read_response_frame(stream, max_size))
+    time::timeout(timeout, read_response_frame_raw(stream, max_size))
         .await
         .ok()
 }
@@ -134,12 +153,27 @@ pub fn concat_frames(frames: &[Bytes]) -> Bytes {
     out.freeze()
 }
 
-/// Read one byte or return `None` on EOF / timeout.
-pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -> Option<u8> {
+/// Outcome of a single-byte read, used by connection-close assertions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRead {
+    /// A byte was read from the stream.
+    Byte(u8),
+    /// The server closed the connection (clean EOF or reset).
+    Closed,
+    /// No byte arrived within the timeout; the connection is still open.
+    Timeout,
+}
+
+/// Read one byte, distinguishing a server-side close from an idle timeout so that
+/// "server must close the connection" tests can assert [`ByteRead::Closed`] explicitly
+/// instead of passing on a mere stall.
+pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -> ByteRead {
     let mut buf = [0u8; 1];
-    match time::timeout(timeout, stream.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Some(buf[0]),
-        _ => None,
+    match time::timeout(timeout, stream.read(&mut buf)).await {
+        // 0 bytes = clean EOF; a reset / broken pipe is still a closed connection here.
+        Ok(Ok(0) | Err(_)) => ByteRead::Closed,
+        Ok(Ok(_)) => ByteRead::Byte(buf[0]),
+        Err(_) => ByteRead::Timeout,
     }
 }
 

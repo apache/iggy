@@ -49,19 +49,30 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/kafka-tool/kafka_messages")
 }
 
-/// Load a kafka-tool `.bin` file and return just the request body bytes.
-fn load_body(api_key: i16, api_name: &str, version: i16) -> Bytes {
+/// Load a kafka-tool `.bin` file and return just the request body bytes, or `None`
+/// (after a standardized skip note) when the gitignored fixture is absent, so a fresh
+/// clone skips rather than panicking.
+fn load_body(api_key: i16, api_name: &str, version: i16) -> Option<Bytes> {
     let filename = format!("{api_key:03}_{api_name}_v{version}.bin");
     let path = fixtures_dir().join(&filename);
-    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {filename}: {e}"));
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!(
+            "skipping {filename}: wire fixture missing — generate with \
+             `gateways/kafka/scripts/ci-wire-fixtures.sh generate` (or the kafka-tool \
+             `generate` subcommand)"
+        );
+        return None;
+    };
 
     let frame = Bytes::copy_from_slice(&data[4..]);
     let hdr_ver = request_header_version(api_key, version);
     let mut decoder = Decoder::new(frame);
     RequestHeader::decode_from(&mut decoder, hdr_ver).expect("fixture request header must decode");
-    decoder
-        .read_bytes(decoder.remaining())
-        .expect("fixture request body must decode")
+    Some(
+        decoder
+            .read_bytes(decoder.remaining())
+            .expect("fixture request body must decode"),
+    )
 }
 
 // ── Produce (API key 0) ───────────────────────────────────────────────────────
@@ -69,7 +80,9 @@ fn load_body(api_key: i16, api_name: &str, version: i16) -> Bytes {
 #[test]
 fn produce_all_supported_versions_decode() {
     for version in 3i16..=9 {
-        let body = load_body(0, "Produce", version);
+        let Some(body) = load_body(0, "Produce", version) else {
+            continue;
+        };
         let req = decode_produce_request(version, body)
             .into_request()
             .unwrap_or_else(|e| panic!("Produce v{version} decode failed: {e}"));
@@ -103,7 +116,9 @@ fn produce_all_supported_versions_decode() {
 #[test]
 fn produce_response_encodes_for_all_supported_versions() {
     for version in 3i16..=9 {
-        let body = load_body(0, "Produce", version);
+        let Some(body) = load_body(0, "Produce", version) else {
+            continue;
+        };
         let req = decode_produce_request(version, body)
             .into_request()
             .unwrap_or_else(|e| panic!("Produce v{version} decode failed: {e}"));
@@ -118,7 +133,9 @@ fn produce_response_encodes_for_all_supported_versions() {
 #[test]
 fn produce_response_v3_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(0, "Produce", 3);
+    let Some(body) = load_body(0, "Produce", 3) else {
+        return;
+    };
     let req = decode_produce_request(3, body).into_request().unwrap();
     let resp = encode_produce_response(3, &req);
 
@@ -145,7 +162,9 @@ fn produce_response_v3_roundtrip() {
 #[test]
 fn produce_response_v8_includes_record_errors() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(0, "Produce", 8);
+    let Some(body) = load_body(0, "Produce", 8) else {
+        return;
+    };
     let req = decode_produce_request(8, body).into_request().unwrap();
     let resp = encode_produce_response(8, &req);
 
@@ -184,7 +203,9 @@ fn produce_v9_flexible_empty_topics_decode() {
 #[test]
 fn fetch_all_supported_versions_decode() {
     for version in 4i16..=12 {
-        let body = load_body(1, "Fetch", version);
+        let Some(body) = load_body(1, "Fetch", version) else {
+            continue;
+        };
         let req = decode_fetch_request(version, body)
             .unwrap_or_else(|e| panic!("Fetch v{version} decode failed: {e}"));
 
@@ -217,7 +238,9 @@ fn fetch_all_supported_versions_decode() {
 #[test]
 fn fetch_response_encodes_for_all_supported_versions() {
     for version in 4i16..=12 {
-        let body = load_body(1, "Fetch", version);
+        let Some(body) = load_body(1, "Fetch", version) else {
+            continue;
+        };
         let req = decode_fetch_request(version, body)
             .unwrap_or_else(|e| panic!("Fetch v{version} decode failed: {e}"));
         let resp = encode_fetch_response(version, &req);
@@ -231,7 +254,9 @@ fn fetch_response_encodes_for_all_supported_versions() {
 #[test]
 fn fetch_response_v7_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(1, "Fetch", 7);
+    let Some(body) = load_body(1, "Fetch", 7) else {
+        return;
+    };
     let req = decode_fetch_request(7, body).unwrap();
     let resp = encode_fetch_response(7, &req);
 
@@ -280,7 +305,9 @@ fn fetch_v12_decodes_forgotten_topics_and_rack_id_sections() {
 #[test]
 fn list_offsets_all_supported_versions_decode() {
     for version in 1i16..=6 {
-        let body = load_body(2, "ListOffsets", version);
+        let Some(body) = load_body(2, "ListOffsets", version) else {
+            continue;
+        };
         let req = decode_list_offsets_request(version, body)
             .unwrap_or_else(|e| panic!("ListOffsets v{version} decode failed: {e}"));
 
@@ -330,7 +357,9 @@ fn list_offsets_v6_decodes_flexible_leader_epoch_branch() {
 #[test]
 fn list_offsets_response_encodes_for_all_supported_versions() {
     for version in 1i16..=6 {
-        let body = load_body(2, "ListOffsets", version);
+        let Some(body) = load_body(2, "ListOffsets", version) else {
+            continue;
+        };
         let req = decode_list_offsets_request(version, body)
             .unwrap_or_else(|e| panic!("ListOffsets v{version} decode failed: {e}"));
         let resp = encode_list_offsets_response(version, &req);
@@ -344,7 +373,9 @@ fn list_offsets_response_encodes_for_all_supported_versions() {
 #[test]
 fn list_offsets_response_v1_no_leader_epoch() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(2, "ListOffsets", 1);
+    let Some(body) = load_body(2, "ListOffsets", 1) else {
+        return;
+    };
     let req = decode_list_offsets_request(1, body).unwrap();
     let resp = encode_list_offsets_response(1, &req);
 
@@ -371,7 +402,9 @@ fn list_offsets_response_v1_no_leader_epoch() {
 #[test]
 fn list_offsets_response_v4_has_leader_epoch() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(2, "ListOffsets", 4);
+    let Some(body) = load_body(2, "ListOffsets", 4) else {
+        return;
+    };
     let req = decode_list_offsets_request(4, body).unwrap();
     let resp = encode_list_offsets_response(4, &req);
 
@@ -397,7 +430,9 @@ fn list_offsets_response_v4_has_leader_epoch() {
 #[test]
 fn create_topics_all_supported_versions_decode() {
     for version in 2i16..=5 {
-        let body = load_body(19, "CreateTopics", version);
+        let Some(body) = load_body(19, "CreateTopics", version) else {
+            continue;
+        };
         let req = decode_create_topics_request(version, body)
             .unwrap_or_else(|e| panic!("CreateTopics v{version} decode failed: {e}"));
 
@@ -458,7 +493,9 @@ fn create_topics_v5_decodes_flexible_assignments_and_configs() {
 #[test]
 fn create_topics_response_encodes_for_all_supported_versions() {
     for version in 2i16..=5 {
-        let body = load_body(19, "CreateTopics", version);
+        let Some(body) = load_body(19, "CreateTopics", version) else {
+            continue;
+        };
         let req = decode_create_topics_request(version, body)
             .unwrap_or_else(|e| panic!("CreateTopics v{version} decode failed: {e}"));
         let resp = encode_create_topics_response(version, &req);
@@ -472,7 +509,9 @@ fn create_topics_response_encodes_for_all_supported_versions() {
 #[test]
 fn create_topics_response_v2_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(19, "CreateTopics", 2);
+    let Some(body) = load_body(19, "CreateTopics", 2) else {
+        return;
+    };
     let req = decode_create_topics_request(2, body).unwrap();
     let topic_name = req.topics[0].name.clone();
     let resp = encode_create_topics_response(2, &req);
@@ -493,7 +532,9 @@ fn create_topics_response_v2_roundtrip() {
 #[test]
 fn create_topics_response_v5_roundtrip() {
     use iggy_gateway_kafka::protocol::codec::Decoder;
-    let body = load_body(19, "CreateTopics", 5);
+    let Some(body) = load_body(19, "CreateTopics", 5) else {
+        return;
+    };
     let req = decode_create_topics_request(5, body).unwrap();
     let resp = encode_create_topics_response(5, &req);
 

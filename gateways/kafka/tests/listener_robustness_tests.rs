@@ -37,7 +37,7 @@ use iggy_gateway_kafka::protocol::codec::Decoder;
 
 use server::{spawn_test_server, spawn_test_server_with_config};
 use tcp::{
-    build_request_frame, concat_frames, parse_response_payload, read_byte_with_timeout,
+    ByteRead, build_request_frame, concat_frames, parse_response_payload, read_byte_with_timeout,
     read_response_frame, read_response_frame_with_timeout,
 };
 
@@ -126,16 +126,26 @@ async fn e2e_frame_exceeding_max_frame_size_closes_connection() {
     frame.resize(4 + 200, 0);
     stream.write_all(&frame).await.expect("oversized frame");
 
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
-    assert!(
-        byte.is_none(),
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
         "oversized frame should close connection (EOF)"
     );
 }
 
 #[tokio::test]
 async fn e2e_truncated_frame_body_closes_connection() {
-    let (addr, _shutdown) = spawn_test_server().await;
+    // A truncated in-flight body closes only once the server's read_timeout elapses, so use a
+    // short read_timeout and wait longer than it to observe a genuine close, not a mere stall.
+    let (addr, _shutdown) = spawn_test_server_with_config(ServerConfig {
+        bind_addr: String::new(),
+        advertised_host: None,
+        advertised_port: None,
+        max_frame_size: 8 * 1024 * 1024,
+        read_timeout: Duration::from_secs(1),
+        write_timeout: Duration::from_secs(5),
+    })
+    .await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let full = build_request_frame(API_KEY_API_VERSIONS, 1, 66, Some("trunc-test"), &[]);
@@ -147,8 +157,11 @@ async fn e2e_truncated_frame_body_closes_connection() {
         .await
         .expect("half body");
 
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(3)).await;
-    assert!(byte.is_none(), "truncated body should close connection");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(3)).await,
+        ByteRead::Closed,
+        "truncated body should close connection after read_timeout"
+    );
 }
 
 #[tokio::test]
@@ -214,8 +227,11 @@ async fn e2e_zero_frame_length_closes_connection() {
         .write_all(&0i32.to_be_bytes())
         .await
         .expect("zero len");
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
-    assert!(byte.is_none(), "zero frame length must close connection");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "zero frame length must close connection"
+    );
 }
 
 #[tokio::test]
@@ -227,9 +243,9 @@ async fn e2e_negative_frame_length_closes_connection() {
         .write_all(&(-5_i32).to_be_bytes())
         .await
         .expect("negative len");
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
-    assert!(
-        byte.is_none(),
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
         "negative frame length must close connection"
     );
 }
@@ -315,9 +331,9 @@ async fn e2e_frame_payload_shorter_than_kafka_header_closes_connection() {
     frame.extend_from_slice(&[0x00, 0x12, 0x00, 0x01]);
     stream.write_all(&frame).await.expect("short payload");
 
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
-    assert!(
-        byte.is_none(),
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
         "payload shorter than 8-byte Kafka header must close connection"
     );
 }

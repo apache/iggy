@@ -37,7 +37,7 @@ mod tcp;
 #[path = "common/wire.rs"]
 mod wire;
 
-use tcp::{build_request_frame, read_byte_with_timeout, read_response_frame};
+use tcp::{ByteRead, build_request_frame, read_byte_with_timeout, read_response_frame};
 
 // ── Produce version branches ──────────────────────────────────────────────────
 
@@ -420,9 +420,9 @@ async fn e2e_frame_shorter_than_kafka_header_returns_buffer_underflow() {
     frame.extend_from_slice(&[0x00, 0x12, 0x00, 0x01, 0x00, 0x00, 0x00]);
     stream.write_all(&frame).await.expect("short header write");
 
-    let byte = read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await;
-    assert!(
-        byte.is_none(),
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
         "frame payload shorter than 8-byte Kafka header must close connection"
     );
 }

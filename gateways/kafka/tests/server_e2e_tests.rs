@@ -33,7 +33,7 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
-use fixtures::load_fixture_body;
+use fixtures::load_fixture_body_or_skip;
 use server::spawn_test_server;
 use tcp::{build_request_frame, parse_response_payload, read_response_frame, round_trip};
 
@@ -74,7 +74,9 @@ async fn e2e_metadata_v0_returns_stub_broker() {
 #[tokio::test]
 async fn e2e_produce_v3_round_trip_with_fixture() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let body = load_fixture_body(0, "Produce", 3);
+    let Some(body) = load_fixture_body_or_skip(0, "Produce", 3) else {
+        return;
+    };
     let (corr, resp_body) = round_trip(addr, API_KEY_PRODUCE, 3, 88, &body).await;
     assert_eq!(corr, 88);
     assert!(!resp_body.is_empty());
