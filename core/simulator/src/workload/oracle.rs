@@ -180,7 +180,7 @@ pub fn assert_converged(sim: &Simulator, workload: &Workload) {
         let Some(leader) = metadata_leader(sim, &live) else {
             panic!("no metadata leader live at quiesce (seed={seed:#x})");
         };
-        let committed = read_committed_metadata(&sim.replicas[leader]).workload_owned();
+        let committed = read_committed_metadata(&sim.replicas[leader].shards[0]).workload_owned();
         assert_eq!(
             shadow_metadata(&workload.shadow),
             committed,
@@ -194,7 +194,7 @@ pub fn assert_converged(sim: &Simulator, workload: &Workload) {
 /// authoritative holder of the committed metadata log.
 fn metadata_leader(sim: &Simulator, live: &[usize]) -> Option<usize> {
     live.iter().copied().find(|&replica_idx| {
-        sim.replicas[replica_idx]
+        sim.replicas[replica_idx].shards[0]
             .plane
             .metadata()
             .consensus

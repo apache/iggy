@@ -1520,6 +1520,7 @@ where
             if is_backup {
                 consensus.sequencer().set_sequence(header.op);
                 consensus.set_last_prepare_checksum(header.checksum);
+                consensus.observe_prepare_timestamp(header.timestamp);
             }
             if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
                 emit_partition_diag(

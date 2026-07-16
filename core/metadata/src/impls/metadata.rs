@@ -88,7 +88,7 @@ pub struct IggySnapshot {
 #[allow(unused)]
 impl IggySnapshot {
     #[must_use]
-    pub fn new(sequence_number: u64) -> Self {
+    pub const fn new(sequence_number: u64) -> Self {
         Self {
             snapshot: MetadataSnapshot::new(sequence_number),
         }
@@ -167,11 +167,12 @@ impl Snapshot for IggySnapshot {
     type Timestamp = u64;
     type Inner = MetadataSnapshot;
 
-    fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, SnapshotError>
+    fn create<T>(stm: &T, sequence_number: u64, created_at: u64) -> Result<Self, SnapshotError>
     where
         T: FillSnapshot<MetadataSnapshot>,
     {
         let mut snapshot = MetadataSnapshot::new(sequence_number);
+        snapshot.created_at = created_at;
 
         stm.fill_snapshot(&mut snapshot)?;
 
@@ -201,7 +202,7 @@ impl Snapshot for IggySnapshot {
 /// Owns the data directory path and the snapshot creation function.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
-    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
 }
 
 impl<M> SnapshotCoordinator<M> {
@@ -212,7 +213,7 @@ impl<M> SnapshotCoordinator<M> {
     #[must_use]
     pub fn new(
         data_dir: std::path::PathBuf,
-        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+        create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
     ) -> Self {
         Self {
             data_dir,
@@ -231,11 +232,12 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         last_op: u64,
+        created_at: u64,
     ) -> Result<(), SnapshotError>
     where
         J: JournalHandle,
     {
-        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let snapshot = (self.create_snapshot)(stm, last_op, created_at)?;
         let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
         snapshot.persist(&path)?;
 
@@ -260,6 +262,7 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         commit_op: u64,
+        created_at: u64,
     ) -> Result<bool, SnapshotError>
     where
         J: JournalHandle,
@@ -270,7 +273,7 @@ impl<M> SnapshotCoordinator<M> {
             .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
 
         if needs_checkpoint {
-            self.checkpoint(stm, journal, commit_op).await?;
+            self.checkpoint(stm, journal, commit_op, created_at).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -733,6 +736,7 @@ where
         if is_backup {
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
+            consensus.observe_prepare_timestamp(header.timestamp);
         }
 
         // After successful journal write, send prepare_ok to primary.
@@ -1705,8 +1709,12 @@ where
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        // Stamp created_at from the injected consensus clock (seed-derived
+        // under the simulator), not the wall clock, so replayed snapshots are
+        // byte-identical.
+        let created_at = consensus.clock_realtime_micros();
         match coordinator
-            .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+            .checkpoint_if_needed(&self.mux_stm, journal, snap_op, created_at)
             .await
         {
             Ok(true) => {
@@ -2282,8 +2290,9 @@ where
     let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
         .expect("prepare header bytes should be valid");
     // Match `Project::project` (core/consensus/src/impls.rs): the primary
-    // stamps wall-clock once here so every replica's `StateHandler::apply`
-    // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
+    // stamps the injected clock once here (wall time in production, virtual
+    // under the simulator) so every replica's `StateHandler::apply` reads the
+    // same `created_at`. A `0` stamp would persist a 1970-01-01
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions

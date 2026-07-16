@@ -33,7 +33,7 @@ use crate::session_manager::SessionManager;
 use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
-use configs::server_ng::ServerNgConfig;
+use configs::server_ng::{NgSystemConfig, ServerNgConfig};
 use consensus::{
     LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
 };
@@ -41,21 +41,21 @@ use consensus::{
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
-use iggy_binary_protocol::Operation;
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
     DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
     MIN_USERNAME_LENGTH,
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
-use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
+use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener};
+use message_bus::replica::listener::{self as replica_listener, MessageHandler};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
@@ -63,8 +63,8 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus,
-    MAX_INFLIGHT_REPLICA_HANDSHAKES, ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
+    MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -78,6 +78,7 @@ use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
+use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::crypto;
 use server_common::executor::create_shard_executor;
@@ -87,9 +88,9 @@ use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig,
-    Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
-    shard_mesh_channels,
+    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
+    PartitionConsensusConfig, PartitionReadHandler, Receiver as ShardReceiver, ShardFrame,
+    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
 };
 use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
@@ -122,15 +123,92 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
     IggySnapshot,
     ServerNgMuxStateMachine,
 >;
-pub type ServerNgShard = IggyShard<
-    Rc<IggyMessageBus>,
-    PrepareJournal,
-    IggySnapshot,
-    ServerNgMuxStateMachine,
-    PapayaShardsTable,
->;
 
-pub(crate) type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
+/// The shard type the dispatch layer is generic over.
+///
+/// `B`/`MJ`/`S` are free; the metadata state machine (`M`) and shards table
+/// (`T`) are pinned, being identical in production and the simulator.
+/// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
+/// own `B`/`MJ`/`S`.
+pub type ShellShard<B, MJ, S> = IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable>;
+
+/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
+pub type ShellShardHandle<B, MJ, S> = Rc<RefCell<Option<Weak<ShellShard<B, MJ, S>>>>>;
+
+/// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
+/// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
+pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
+impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
+
+/// The five dispatch handlers a shard is built with, plus the
+/// [`SessionManager`] the request-plane pair shares.
+///
+/// Both production ([`build_shard_for_thread`]) and the simulator's shell
+/// mode construct these through [`wire_shell_handlers`], so the request
+/// plane is wired one way. The simulator's shell-off fast path uses
+/// [`ShellHandlers::noop`] instead.
+pub struct ShellHandlers {
+    pub on_replica_message: MessageHandler,
+    pub on_client_request: RequestHandler,
+    pub on_metadata_submit: MetadataSubmitHandler,
+    pub on_list_clients: ListClientsHandler,
+    pub on_partition_read: PartitionReadHandler,
+    /// Bound by the client-request handler, read by the get-clients
+    /// handler; the caller keeps it to reach locally-homed sessions.
+    pub sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl ShellHandlers {
+    /// Inert handlers for the shell-off fast path: every callback is a
+    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
+    /// hand-written no-op closures, so a caller can keep one destructure
+    /// site across both toggle states.
+    #[must_use]
+    pub fn noop() -> Self {
+        Self {
+            on_replica_message: Rc::new(|_, _| {}),
+            on_client_request: Rc::new(|_, _| {}),
+            on_metadata_submit: Rc::new(|_| {}),
+            on_list_clients: Rc::new(|_| {}),
+            on_partition_read: Rc::new(|_, _, _| {}),
+            sessions: Rc::new(RefCell::new(SessionManager::new())),
+        }
+    }
+}
+
+/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
+///
+/// They share one fresh [`SessionManager`]. The caller must set the weak
+/// self-reference in `shard_handle` once the shard is built, so the
+/// handlers can upgrade it per frame.
+pub fn wire_shell_handlers<B, MJ, S>(
+    bus: &B,
+    shard_handle: &ShellShardHandle<B, MJ, S>,
+    system_config: Arc<NgSystemConfig>,
+) -> ShellHandlers
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    ShellHandlers {
+        on_replica_message: make_deferred_replica_message_handler(shard_handle),
+        on_client_request: make_deferred_client_request_handler(
+            bus,
+            shard_handle,
+            &sessions,
+            system_config,
+        ),
+        on_metadata_submit: make_metadata_submit_handler(shard_handle),
+        on_list_clients: make_list_clients_handler(&sessions),
+        on_partition_read: make_partition_read_handler(shard_handle),
+        sessions,
+    }
+}
+
+pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -1545,11 +1623,18 @@ async fn build_shard_for_thread(
     }
 
     let shard_handle = Rc::new(RefCell::new(None));
-    // One per-shard SessionManager, shared by the client-request handler
-    // (binds sessions) and the get_clients handler (reads them). Created
-    // here so both wirings reference the same instance. It also carries this
-    // shard's cluster roster for the pre-auth GetClusterMetadata read.
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    // Same wiring path as the simulator's shell mode: one per-shard
+    // SessionManager shared by the client-request handler (binds sessions)
+    // and the get_clients handler (reads them). It also carries this shard's
+    // cluster roster for the pre-auth GetClusterMetadata read.
+    let ShellHandlers {
+        on_replica_message,
+        on_client_request,
+        on_metadata_submit,
+        on_list_clients,
+        on_partition_read,
+        sessions,
+    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -1557,16 +1642,6 @@ async fn build_shard_for_thread(
             topology,
             metadata_view,
         )));
-    let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(
-        &bus,
-        &shard_handle,
-        &sessions,
-        Arc::clone(&config.system),
-    );
-    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
-    let on_list_clients = make_list_clients_handler(&sessions);
-    let on_partition_read = make_partition_read_handler(&shard_handle);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -1670,6 +1745,7 @@ fn restore_metadata_consensus(
     consensus.restore_commit_state(commit_watermark, commit_watermark);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
+        consensus.observe_prepare_timestamp(header.timestamp);
     }
 
     // The WAL's tail past the watermark is prepared-but-not-provably-committed
@@ -1751,6 +1827,14 @@ async fn load_partition(
     } else {
         consensus.init();
     }
+
+    // No prepare-timestamp floor is restored here: the partition consensus
+    // journal is non-durable today, so there is no persisted head to observe
+    // (unlike `restore_metadata_consensus`, which observes its restored head).
+    // When PartitionJournal becomes durable (the milestone named in the
+    // multi-shard wiring commit body), observe the restored head and the max
+    // recovered message timestamp here, or an NTP rewind across a restart could
+    // regress persisted `base_timestamp`.
 
     let recovered_segments =
         load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
