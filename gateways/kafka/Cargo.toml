@@ -34,7 +34,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes = { workspace = true }
-socket2 = "0.6.4"
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",

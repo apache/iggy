@@ -42,6 +42,22 @@ pub fn load_fixture_body(api_key: i16, api_name: &str, version: i16) -> Bytes {
     extract_body_from_framed_message(api_key, version, &data)
 }
 
+/// Standardized note emitted when a gitignored wire fixture is absent, pointing at the
+/// generation script so a fresh clone knows how to produce it.
+pub const FIXTURE_SKIP_HINT: &str = "generate with `gateways/kafka/scripts/ci-wire-fixtures.sh generate` (or the kafka-tool `generate` subcommand)";
+
+/// Load a fixture body, or return `None` after printing a standardized skip note when the
+/// fixture is missing. Unifies the missing-fixture policy across suites: every suite skips
+/// explicitly instead of panicking or silently passing with zero assertions.
+pub fn load_fixture_body_or_skip(api_key: i16, api_name: &str, version: i16) -> Option<Bytes> {
+    if fixture_exists(api_key, api_name, version) {
+        Some(load_fixture_body(api_key, api_name, version))
+    } else {
+        eprintln!("skipping {api_key:03}_{api_name}_v{version}.bin: {FIXTURE_SKIP_HINT}");
+        None
+    }
+}
+
 /// Strip the 4-byte length prefix and Kafka request header from a framed message.
 pub fn extract_body_from_framed_message(api_key: i16, api_version: i16, data: &[u8]) -> Bytes {
     let frame = Bytes::copy_from_slice(&data[4..]);
