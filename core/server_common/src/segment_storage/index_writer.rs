@@ -124,6 +124,10 @@ impl IndexWriter {
         Ok(())
     }
 
+    pub fn size_counter(&self) -> Rc<AtomicU64> {
+        self.index_size_bytes.clone()
+    }
+
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
             .sync_all()

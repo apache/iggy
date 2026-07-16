@@ -31,7 +31,7 @@ use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use tracing::warn;
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
@@ -81,7 +81,17 @@ where
     /// access would be UB under cooperative `.await` interleaving.
     partitions: UnsafeCell<Vec<IggyPartition<B>>>,
     /// Same single-pump invariant as `partitions`.
-    namespace_to_local: UnsafeCell<HashMap<IggyNamespace, LocalIdx>>,
+    ///
+    /// `BTreeMap`, not `HashMap`: iteration order via [`Self::namespaces`] must
+    /// be a deterministic function of the key set. The shard pump fans out over
+    /// it (`tick_partitions`, `process_loopback`), and the simulator hashes that
+    /// fan-out order into its schedule; `HashMap`'s per-process `RandomState`
+    /// would make the order, and the hash, non-reproducible across runs.
+    ///
+    /// Perf: this makes `get_by_ns` O(log n) rather than O(1). Not expected to
+    /// bite, but revisit for high-partition-count shards if it shows up in
+    /// profiling.
+    namespace_to_local: UnsafeCell<BTreeMap<IggyNamespace, LocalIdx>>,
     /// Tombstone gate: reconciler sets it synchronously before awaiting
     /// disk delete; pump clears on `ConfirmRemove`. Pump's `Plane::on_*`
     /// short-circuits frames hitting a tombstoned namespace.
@@ -112,7 +122,7 @@ where
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::new()),
-            namespace_to_local: UnsafeCell::new(HashMap::new()),
+            namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -125,7 +135,8 @@ where
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::with_capacity(capacity)),
-            namespace_to_local: UnsafeCell::new(HashMap::with_capacity(capacity)),
+            // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
+            namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
@@ -143,13 +154,13 @@ where
         unsafe { &*self.partitions.get() }
     }
 
-    fn namespace_map(&self) -> &HashMap<IggyNamespace, LocalIdx> {
+    fn namespace_map(&self) -> &BTreeMap<IggyNamespace, LocalIdx> {
         // SAFETY: shared read, same borrow rule as `partitions` above.
         unsafe { &*self.namespace_to_local.get() }
     }
 
     #[allow(clippy::mut_from_ref)]
-    fn namespace_map_mut(&self) -> &mut HashMap<IggyNamespace, LocalIdx> {
+    fn namespace_map_mut(&self) -> &mut BTreeMap<IggyNamespace, LocalIdx> {
         // SAFETY: `&mut` is sound because map mutation runs only on the pump
         // task, the sole mutator; single-threadedness alone is not enough.
         unsafe { &mut *self.namespace_to_local.get() }
@@ -259,6 +270,26 @@ where
         #[cfg(debug_assertions)]
         let _guard = BorrowGuard::new(&self.borrow_active);
         Some(f(partition))
+    }
+
+    /// TEST / SIMULATOR ONLY, DELIBERATELY UNSOUND. Acquire a
+    /// [`Self::with_partition`]-style borrow and hold it across `suspend.await`
+    /// -- the exact borrow-across-`.await` anti-pattern PR #3557 closed and
+    /// which `with_partition`'s `FnOnce` bound structurally forbids.
+    ///
+    /// Exists only so the simulator's deterministic dispatch shell can prove
+    /// its detector for that async-concurrency class: parked here (borrow
+    /// live), a concurrent [`Self::insert`] / [`Self::remove`] on a sibling
+    /// task trips the debug borrow tripwire, exactly as a real reconcile
+    /// reallocating the vec under a stale read would. The `simulator` feature
+    /// / `cfg(test)` gate excludes it from every production build.
+    #[cfg(any(test, feature = "simulator"))]
+    pub async fn hold_borrow_across_await(&self, suspend: impl std::future::Future<Output = ()>) {
+        // The guard IS the borrow the tripwire counts; holding it across the
+        // await models a partition reference outliving a suspension point.
+        #[cfg(debug_assertions)]
+        let _guard = BorrowGuard::new(&self.borrow_active);
+        suspend.await;
     }
 
     /// Get mutable partition by namespace directly. Tombstone-gated like

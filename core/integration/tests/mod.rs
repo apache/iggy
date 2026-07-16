@@ -30,8 +30,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-// Drives the `iggy` CLI binary against a running server. Untriaged for vsr:
-// nobody has assessed which of its ~170 cases work against server-ng.
+// Drives the `iggy` CLI binary against a running server. Probed against
+// server-ng 2026-07-15: ~109/170 pass; the ~42 failures + hangs cluster in
+// `context` (12), `system` (7), `message` (6), `stream` (5) plus scattered
+// others -- needs a dedicated triage pass before un-gating.
 #[cfg(not(feature = "vsr"))]
 mod cli;
 // A single `#[ignore]`d multi-node ping matrix stub; none of its cells run in
@@ -40,8 +42,8 @@ mod cli;
 mod cluster;
 mod config_provider;
 mod connectors;
-// Runs under vsr. The remaining per-module gap (`verify_after_server_restart`)
-// is gated inside the module with the reason (replica state transfer).
+// Runs under vsr; the one gap (`verify_after_server_restart`) is gated inside
+// the module: its rejoin window exceeds journal retention (state transfer).
 mod data_integrity;
 mod mcp;
 mod sdk;

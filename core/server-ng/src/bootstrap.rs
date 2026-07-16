@@ -33,7 +33,7 @@ use crate::session_manager::SessionManager;
 use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
-use configs::server_ng::ServerNgConfig;
+use configs::server_ng::{NgSystemConfig, ServerNgConfig};
 use consensus::{
     LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
 };
@@ -41,21 +41,21 @@ use consensus::{
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
-use iggy_binary_protocol::Operation;
+use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::defaults::{
     DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
     MIN_USERNAME_LENGTH,
 };
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
-use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
+use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener};
+use message_bus::replica::listener::{self as replica_listener, MessageHandler};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
@@ -63,8 +63,8 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus,
-    MAX_INFLIGHT_REPLICA_HANDSHAKES, ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
+    MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -78,6 +78,7 @@ use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
+use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::crypto;
 use server_common::executor::create_shard_executor;
@@ -87,9 +88,9 @@ use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig,
-    Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
-    shard_mesh_channels,
+    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
+    PartitionConsensusConfig, PartitionReadHandler, Receiver as ShardReceiver, ShardFrame,
+    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
 };
 use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
@@ -122,15 +123,92 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
     IggySnapshot,
     ServerNgMuxStateMachine,
 >;
-pub type ServerNgShard = IggyShard<
-    Rc<IggyMessageBus>,
-    PrepareJournal,
-    IggySnapshot,
-    ServerNgMuxStateMachine,
-    PapayaShardsTable,
->;
 
-pub(crate) type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
+/// The shard type the dispatch layer is generic over.
+///
+/// `B`/`MJ`/`S` are free; the metadata state machine (`M`) and shards table
+/// (`T`) are pinned, being identical in production and the simulator.
+/// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
+/// own `B`/`MJ`/`S`.
+pub type ShellShard<B, MJ, S> = IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable>;
+
+/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
+pub type ShellShardHandle<B, MJ, S> = Rc<RefCell<Option<Weak<ShellShard<B, MJ, S>>>>>;
+
+/// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
+/// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
+pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
+impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
+
+/// The five dispatch handlers a shard is built with, plus the
+/// [`SessionManager`] the request-plane pair shares.
+///
+/// Both production ([`build_shard_for_thread`]) and the simulator's shell
+/// mode construct these through [`wire_shell_handlers`], so the request
+/// plane is wired one way. The simulator's shell-off fast path uses
+/// [`ShellHandlers::noop`] instead.
+pub struct ShellHandlers {
+    pub on_replica_message: MessageHandler,
+    pub on_client_request: RequestHandler,
+    pub on_metadata_submit: MetadataSubmitHandler,
+    pub on_list_clients: ListClientsHandler,
+    pub on_partition_read: PartitionReadHandler,
+    /// Bound by the client-request handler, read by the get-clients
+    /// handler; the caller keeps it to reach locally-homed sessions.
+    pub sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl ShellHandlers {
+    /// Inert handlers for the shell-off fast path: every callback is a
+    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
+    /// hand-written no-op closures, so a caller can keep one destructure
+    /// site across both toggle states.
+    #[must_use]
+    pub fn noop() -> Self {
+        Self {
+            on_replica_message: Rc::new(|_, _| {}),
+            on_client_request: Rc::new(|_, _| {}),
+            on_metadata_submit: Rc::new(|_| {}),
+            on_list_clients: Rc::new(|_| {}),
+            on_partition_read: Rc::new(|_, _, _| {}),
+            sessions: Rc::new(RefCell::new(SessionManager::new())),
+        }
+    }
+}
+
+/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
+///
+/// They share one fresh [`SessionManager`]. The caller must set the weak
+/// self-reference in `shard_handle` once the shard is built, so the
+/// handlers can upgrade it per frame.
+pub fn wire_shell_handlers<B, MJ, S>(
+    bus: &B,
+    shard_handle: &ShellShardHandle<B, MJ, S>,
+    system_config: Arc<NgSystemConfig>,
+) -> ShellHandlers
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    ShellHandlers {
+        on_replica_message: make_deferred_replica_message_handler(shard_handle),
+        on_client_request: make_deferred_client_request_handler(
+            bus,
+            shard_handle,
+            &sessions,
+            system_config,
+        ),
+        on_metadata_submit: make_metadata_submit_handler(shard_handle),
+        on_list_clients: make_list_clients_handler(&sessions),
+        on_partition_read: make_partition_read_handler(shard_handle),
+        sessions,
+    }
+}
+
+pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -804,9 +882,13 @@ async fn shard_main(
             // Root is created locally at boot (never journaled), so replay
             // must start from the same baseline or every WAL-created user
             // shifts one slab id and root is lost after the first restart.
-            let recovered = recover::<ServerNgMuxStateMachine>(data_dir, |mux_stm| {
-                ensure_default_root_user(mux_stm);
-            })
+            let recovered = recover::<ServerNgMuxStateMachine>(
+                data_dir,
+                topology.replica_count == 1,
+                |mux_stm| {
+                    ensure_default_root_user(mux_stm);
+                },
+            )
             .await
             .map_err(ServerNgError::MetadataRecovery)?;
             validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
@@ -886,15 +968,19 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
-    // Shard 0's copy resolves the `MaxTopicSize::ServerDefault` sentinel at
-    // admission; every shard's copy backs the same resolution in responses.
+    // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
+    // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
+    metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
-    let (shard, sessions) = build_shard_for_thread(
+    // Heap-pin like `shard_main` above: the builder future carries the whole
+    // shard construction state machine and outgrew clippy's `large_futures`
+    // cap; one allocation per shard startup.
+    let (shard, sessions) = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -905,7 +991,7 @@ async fn shard_main(
         inbox,
         shard_metrics,
         Arc::clone(&metadata_view),
-    )
+    ))
     .await?;
 
     // Shard 0 owns the metadata consensus; publish its view so every shard's
@@ -981,10 +1067,15 @@ async fn shard_main(
     // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
-    let pump_handle = compio::runtime::spawn(async move {
+    // Owned and awaited by shard_main at exit, NOT `track_background`: the
+    // background drain runs inside `bus.shutdown()`, which the Ctrl-C path
+    // never drives (the watchdog stands down when the token fires), so a
+    // tracked pump would be cancelled by runtime teardown mid final-flush
+    // and every graceful shutdown would silently drop the committed journal
+    // tail that had not hit a flush threshold yet.
+    let mut pump_handle = Some(compio::runtime::spawn(async move {
         pump_shard.run_message_pump(stop_rx).await;
-    });
-    bus.track_background(pump_handle);
+    }));
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
         Rc::clone(&shard),
@@ -1135,6 +1226,7 @@ async fn shard_main(
             if let Some(tx) = &segment_cleaner_stop {
                 let _ = tx.try_send(());
             }
+            await_pump_drain(pump_handle.take(), config, shard_id).await;
             return Err(error);
         }
     }
@@ -1152,8 +1244,35 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
+    await_pump_drain(pump_handle.take(), config, shard_id).await;
+
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
+}
+
+/// Await the message pump's completion before the shard returns: its
+/// post-loop work includes the final flush of every committed journal to
+/// segment storage, and returning first drops the compio runtime, which
+/// cancels that flush at its next await point.
+async fn await_pump_drain(
+    pump_handle: Option<compio::runtime::JoinHandle<()>>,
+    config: &ServerNgConfig,
+    shard_id: u16,
+) {
+    let Some(pump_handle) = pump_handle else {
+        return;
+    };
+    let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
+    if compio::time::timeout(drain_budget, pump_handle)
+        .await
+        .is_err()
+    {
+        warn!(
+            shard = shard_id,
+            "message pump did not drain within the shutdown budget; \
+             committed journal tail may not have flushed"
+        );
+    }
 }
 
 /// Block until shard 0 broadcasts the metadata factory bundle, or the
@@ -1504,11 +1623,18 @@ async fn build_shard_for_thread(
     }
 
     let shard_handle = Rc::new(RefCell::new(None));
-    // One per-shard SessionManager, shared by the client-request handler
-    // (binds sessions) and the get_clients handler (reads them). Created
-    // here so both wirings reference the same instance. It also carries this
-    // shard's cluster roster for the pre-auth GetClusterMetadata read.
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    // Same wiring path as the simulator's shell mode: one per-shard
+    // SessionManager shared by the client-request handler (binds sessions)
+    // and the get_clients handler (reads them). It also carries this shard's
+    // cluster roster for the pre-auth GetClusterMetadata read.
+    let ShellHandlers {
+        on_replica_message,
+        on_client_request,
+        on_metadata_submit,
+        on_list_clients,
+        on_partition_read,
+        sessions,
+    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
@@ -1516,16 +1642,6 @@ async fn build_shard_for_thread(
             topology,
             metadata_view,
         )));
-    let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(
-        &bus,
-        &shard_handle,
-        &sessions,
-        Arc::clone(&config.system),
-    );
-    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
-    let on_list_clients = make_list_clients_handler(&sessions);
-    let on_partition_read = make_partition_read_handler(&shard_handle);
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -1582,22 +1698,36 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    // On a RESTART in a cluster (a non-empty WAL proves a prior life), rejoin
-    // as a backup: resuming primaryship from the WAL's (stale) view races the
-    // peers' election and can split leadership across planes -- the partition
-    // groups always rejoin as backups (no WAL), so a metadata-primary resume
-    // here leaves metadata led by this node while the partitions elect a
-    // peer, and clients (which follow the roster's single leader) then write
-    // to a partition backup. The WAL still restores state below; only the
-    // role is ceded. A FRESH boot (empty WAL) keeps the plain init: the
-    // cluster needs its view-0 primary to exist, and a single-replica
-    // cluster has no peer to defer to.
+    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
+    // rejoin as a quorum-invisible backup and probe for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // the replica adopts it as a backup, and journal repair fills any WAL
+    // gap. A probing replica never resumes primaryship -- if this replica
+    // IS the current primary-by-index, its probe makes the backups elect
+    // past it.
+    // The probe re-broadcasts on its timeout, so it needs no live mesh at
+    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
+    // needs its view-0 primary to exist, and a single-replica cluster has
+    // no peer to ask.
     if replica_count > 1 && restored_op > 0 {
         consensus.init_as_backup();
+        consensus.begin_view_probe();
     } else {
         consensus.init();
     }
     consensus.sequencer().set_sequence(restored_op);
+    // A SOLO replica's durable journal head IS its commit point: quorum is
+    // 1-of-1, so an entry commits the instant it is durable, and the acks
+    // the cluster ceremony below would wait on cannot topologically exist.
+    // The embedded watermark is structurally one op stale (the commit point
+    // is only ever written down inside the NEXT entry), so trusting it solo
+    // manufactures an "uncommitted" suffix that provably committed and
+    // wedges the recovery barrier forever.
+    let commit_watermark = if replica_count == 1 {
+        restored_op
+    } else {
+        commit_watermark
+    };
     // The commit point is restored from the WAL's embedded watermark (each
     // journaled prepare carries the primary's commit at send time), NOT from
     // the journal head: journaled does not imply committed, and claiming
@@ -1615,6 +1745,7 @@ fn restore_metadata_consensus(
     consensus.restore_commit_state(commit_watermark, commit_watermark);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
+        consensus.observe_prepare_timestamp(header.timestamp);
     }
 
     // The WAL's tail past the watermark is prepared-but-not-provably-committed
@@ -1683,16 +1814,27 @@ async fn load_partition(
     );
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
-    // this replica cannot know the group's (op, commit). In a cluster it must
-    // not boot as the view-0 primary heartbeating `commit_min = 0`; join as a
-    // backup and let a peer that kept its journal win the election and repair
-    // this replica through `StartView`. Single-replica groups have no peer to
-    // defer to, so they keep the plain init.
+    // this replica cannot know the group's (op, commit). In a cluster it
+    // boots as a quorum-invisible backup and probes for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // journal repair fills the rejoin window, and the commit floor settles
+    // at the serving peer's retention point. The probe re-broadcasts on its
+    // timeout, so it needs no live mesh at boot. Single-replica groups
+    // have no peer to ask and keep the plain init.
     if replica_count > 1 {
-        consensus.init_recovering();
+        consensus.init_as_backup();
+        consensus.begin_view_probe();
     } else {
         consensus.init();
     }
+
+    // No prepare-timestamp floor is restored here: the partition consensus
+    // journal is non-durable today, so there is no persisted head to observe
+    // (unlike `restore_metadata_consensus`, which observes its restored head).
+    // When PartitionJournal becomes durable (the milestone named in the
+    // multi-shard wiring commit body), observe the restored head and the max
+    // recovered message timestamp here, or an NTP rewind across a restart could
+    // regress persisted `base_timestamp`.
 
     let recovered_segments =
         load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
@@ -1733,6 +1875,14 @@ async fn load_partition(
         .max()
         .unwrap_or(0);
     partition.created_at = partition_metadata.created_at;
+    if partition
+        .log
+        .segments()
+        .iter()
+        .any(|segment| segment.size > IggyByteSize::default())
+    {
+        partition.recovered_durable_offset = Some(current_offset);
+    }
     partition.offset.store(current_offset, Ordering::Release);
     partition
         .dirty_offset
@@ -1766,16 +1916,27 @@ async fn hydrate_partition_log(
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
-        if let (Some(messages_reader), Some(index_reader)) = (
+        if let (
+            Some(messages_reader),
+            Some(index_reader),
+            Some(storage_messages_writer),
+            Some(storage_index_writer),
+        ) = (
             storage.messages_reader.as_ref(),
             storage.index_reader.as_ref(),
+            storage.messages_writer.as_ref(),
+            storage.index_writer.as_ref(),
         ) {
             let index_path = index_reader.path();
-            let index_size = std::fs::metadata(&index_path).map_or(0, |metadata| metadata.len());
+            // Share the storage's size counters: the readers bound reads by
+            // these atomics, so a writer with a private counter persists bytes
+            // the readers never learn about.
+            let messages_size_counter = storage_messages_writer.size_counter();
+            let index_size_counter = storage_index_writer.size_counter();
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),
-                    Rc::new(AtomicU64::new(u64::from(messages_reader.file_size()))),
+                    messages_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )
@@ -1795,7 +1956,7 @@ async fn hydrate_partition_log(
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
                 IggyIndexWriter::new(
                     &index_path,
-                    Rc::new(AtomicU64::new(index_size)),
+                    index_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )

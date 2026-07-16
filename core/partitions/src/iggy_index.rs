@@ -81,6 +81,12 @@ impl IggyIndexCache {
         buffer
     }
 
+    /// Entry at or below `offset`, or `None` when every cached entry sits
+    /// above it. The cache is a sparse hint that may not cover the segment
+    /// from its first byte (a recovered segment's cache starts empty and only
+    /// gains entries for batches flushed after boot), so a below-range query
+    /// must fall back to the segment start rather than the first cached
+    /// entry, which would skip everything persisted before it.
     #[must_use]
     pub fn offset_lower_bound(&self, offset: u64) -> Option<&IggyIndex> {
         match self
@@ -88,11 +94,13 @@ impl IggyIndexCache {
             .binary_search_by_key(&offset, |entry| entry.offset)
         {
             Ok(idx) => self.entries.get(idx),
-            Err(0) => self.entries.first(),
+            Err(0) => None,
             Err(idx) => self.entries.get(idx - 1),
         }
     }
 
+    /// Entry at or below `timestamp`; `None` semantics match
+    /// [`Self::offset_lower_bound`].
     #[must_use]
     pub fn timestamp_lower_bound(&self, timestamp: u64) -> Option<&IggyIndex> {
         match self
@@ -100,7 +108,7 @@ impl IggyIndexCache {
             .binary_search_by_key(&timestamp, |entry| entry.timestamp)
         {
             Ok(idx) => self.entries.get(idx),
-            Err(0) => self.entries.first(),
+            Err(0) => None,
             Err(idx) => self.entries.get(idx - 1),
         }
     }
@@ -130,10 +138,7 @@ mod tests {
             cache.offset_lower_bound(20),
             Some(&IggyIndex::new(20, 200, 2))
         );
-        assert_eq!(
-            cache.offset_lower_bound(5),
-            Some(&IggyIndex::new(10, 100, 1))
-        );
+        assert_eq!(cache.offset_lower_bound(5), None);
         assert_eq!(
             cache.offset_lower_bound(35),
             Some(&IggyIndex::new(30, 300, 3))
@@ -152,10 +157,7 @@ mod tests {
             cache.timestamp_lower_bound(200),
             Some(&IggyIndex::new(20, 200, 2))
         );
-        assert_eq!(
-            cache.timestamp_lower_bound(50),
-            Some(&IggyIndex::new(10, 100, 1))
-        );
+        assert_eq!(cache.timestamp_lower_bound(50), None);
         assert_eq!(
             cache.timestamp_lower_bound(350),
             Some(&IggyIndex::new(30, 300, 3))

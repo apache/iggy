@@ -33,6 +33,7 @@ mod reply;
 mod session;
 mod state;
 mod submit;
+mod tls;
 mod wire;
 
 use std::cell::{Cell, RefCell};
@@ -76,7 +77,9 @@ use crate::http::state::{HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerNgError;
 
 /// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
-/// background task on shard 0's compio runtime.
+/// background task on shard 0's compio runtime. Serves HTTPS when
+/// `http.tls.enabled` (a TLS accept pump feeds handshaken streams to the
+/// serve loop, see [`mod@tls`]), plain HTTP otherwise.
 ///
 /// The caller gates this to shard 0 and to `http.enabled`; the listener stops
 /// when the bus shutdown token fires.
@@ -84,8 +87,8 @@ use crate::server_error::ServerNgError;
 /// # Errors
 ///
 /// Returns [`ServerNgError`] if the JWT manager cannot be built from
-/// `http_config.jwt`, the `[http.cors]` config is invalid, or the listener
-/// cannot bind to `addr`.
+/// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
+/// credentials cannot be loaded, or the listener cannot bind to `addr`.
 pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
@@ -103,7 +106,6 @@ pub async fn start(
         .then(|| configure_cors(&http_config.cors))
         .transpose()?;
     let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
-    info!(address = %bound_addr, "server-ng HTTP listener started");
 
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
@@ -133,18 +135,29 @@ pub async fn start(
     // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
     let max_request_size =
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
-    let router = router(state, max_request_size, cors);
+    let router = router(state, max_request_size, cors, http_config.web_ui);
 
-    let shutdown = shard.bus.token();
-    let handle = compio::runtime::spawn(async move {
-        if let Err(error) = cyper_axum::serve(listener, router)
-            .with_graceful_shutdown(async move { shutdown.wait().await })
-            .await
-        {
-            error!(%error, "server-ng HTTP listener terminated with error");
-        }
-    });
-    shard.bus.track_background(handle);
+    if http_config.tls.enabled {
+        let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
+        let (connections, pump) =
+            tls::spawn_accept_pump(listener, server_config, shard.bus.token());
+        shard.bus.track_background(pump);
+        info!(address = %bound_addr, "server-ng HTTPS listener started");
+        let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));
+        shard.bus.track_background(handle);
+    } else {
+        info!(address = %bound_addr, "server-ng HTTP listener started");
+        let shutdown = shard.bus.token();
+        let handle = compio::runtime::spawn(async move {
+            if let Err(error) = cyper_axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.wait().await })
+                .await
+            {
+                error!(%error, "server-ng HTTP listener terminated with error");
+            }
+        });
+        shard.bus.track_background(handle);
+    }
 
     Ok(())
 }
@@ -169,7 +182,12 @@ const PING_PATH: &str = "/ping";
 /// 405 if it reached the router; the outermost `CorsLayer` answers it first
 /// instead, and stamps the CORS response headers over every reply, including
 /// the inner layer's `x-iggy-view`.
-fn router(state: HttpState, max_request_size: usize, cors: Option<CorsLayer>) -> Router {
+fn router(
+    state: HttpState,
+    max_request_size: usize,
+    cors: Option<CorsLayer>,
+    web_ui: bool,
+) -> Router {
     // Cloned for the response layer so `X-Iggy-View` reads the live view per
     // response; the original `state` is moved into `with_state` below.
     let view_source = state.clone();
@@ -263,10 +281,42 @@ fn router(state: HttpState, max_request_size: usize, cors: Option<CorsLayer>) ->
                 }
             }
         }));
-    match cors {
+    let router = match cors {
         Some(cors) => router.layer(cors),
         None => router,
+    };
+
+    merge_web_ui(router, web_ui)
+}
+
+/// Merge the unauthenticated `/ui` static-asset surface when `web_ui` is set.
+///
+/// The caller merges this outermost - after `with_state`, the body limit, the
+/// view-header layer, and CORS - mirroring the legacy server. Staying past the
+/// view-header layer also keeps the cluster-internal view number off these
+/// unauthenticated responses, the same anon-leak gate `/ping` gets above.
+///
+/// Without the `iggy-web` feature the assets are not compiled in, so an enabled
+/// flag only warns instead of serving.
+fn merge_web_ui(router: Router, web_ui: bool) -> Router {
+    #[cfg(feature = "iggy-web")]
+    let router = if web_ui {
+        info!("Web UI enabled at /ui");
+        router.merge(crate::web::router())
+    } else {
+        router
+    };
+
+    #[cfg(not(feature = "iggy-web"))]
+    if web_ui {
+        tracing::warn!(
+            "Web UI is enabled in configuration (http.web_ui = true) but the server \
+             was not compiled with 'iggy-web' feature. The Web UI will not be available. \
+             To enable it, rebuild the server with: cargo build --features iggy-web"
+        );
     }
+
+    router
 }
 
 /// Build the [`CorsLayer`] from `[http.cors]`, porting the legacy server's

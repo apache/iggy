@@ -108,6 +108,7 @@ crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
+cyper-core = { workspace = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
 err_trail = { workspace = true }
@@ -117,6 +118,8 @@ fs2 = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }

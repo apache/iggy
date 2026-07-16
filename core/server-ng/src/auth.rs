@@ -21,19 +21,21 @@
 //! `Register` proposal on the metadata owner; also builds the terminal
 //! login-failure replies.
 
-use crate::bootstrap::ServerNgShard;
+use crate::bootstrap::{ShellBus, ShellShard};
 use crate::dispatch::submit_register_on_owner;
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_empty_reply, build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use consensus::{MetadataHandle, build_result_rejection_reply};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::{ClientVersionInfo, RequestHeader};
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken, UserStatus};
-use message_bus::MessageBus;
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
+use server_common::Message;
 use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -57,11 +59,17 @@ pub(crate) fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-pub(crate) fn verify_login_credentials(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn verify_login_credentials<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     username: &str,
     password: &str,
-) -> Result<u32, LoginRegisterError> {
+) -> Result<u32, LoginRegisterError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     // Same bounds the legacy server enforces before any lookup or hashing;
     // also keeps arbitrary-length input out of the password hash. Collapsed
     // to InvalidCredentials on purpose (legacy: InvalidUsername /
@@ -97,10 +105,16 @@ pub(crate) fn verify_login_credentials(
     })
 }
 
-pub(crate) fn verify_pat_credentials(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn verify_pat_credentials<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     token: &str,
-) -> Result<u32, LoginRegisterError> {
+) -> Result<u32, LoginRegisterError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
 }
 
@@ -108,12 +122,25 @@ pub(crate) fn verify_pat_credentials(
 /// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
 /// per-token VSR session table on this expiry for lazy eviction; the wire and
 /// login paths only need the user id and go through [`verify_pat_credentials`].
-pub(crate) fn verify_pat_credentials_with_expiry(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     token: &str,
-) -> Result<(u32, u64), LoginRegisterError> {
+) -> Result<(u32, u64), LoginRegisterError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let token_hash = PersonalAccessToken::hash_token(token);
-    let now = IggyTimestamp::now();
+    // PAT expiry gates the login accept/reject, and that outcome folds into
+    // the reply, so read the environment-injected bus clock (seed-derived
+    // under the simulator), not the wall clock, or a replayed login diverges.
+    // The two sibling wall-clock reads in `dispatch` stay direct because both
+    // are off the reply path (diagnostic-only). The bus seam exists on every
+    // shard, so this holds even when login lands on an entry shard that does
+    // not own the metadata consensus.
+    let now = IggyTimestamp::from(shard.bus.realtime_micros());
     shard.plane.metadata().mux_stm.users().read(|users| {
         let Some((user_id, token_name)) =
             users.personal_access_token_index.get(token_hash.as_str())
@@ -146,15 +173,21 @@ pub(crate) fn verify_pat_credentials_with_expiry(
 }
 
 #[allow(clippy::future_not_send)]
-pub(crate) async fn complete_login_register(
-    shard: &Rc<ServerNgShard>,
+pub(crate) async fn complete_login_register<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     vsr_client_id: u128,
     request_header: &RequestHeader,
     user_id: u32,
     client_version: &ClientVersionInfo,
-) -> Result<(), LoginRegisterError> {
+) -> Result<(), LoginRegisterError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let sdk_info = ClientSdkInfo {
         sdk_name: client_version.sdk_name.as_str().to_owned(),
         sdk_version: client_version.sdk_version.as_str().to_owned(),
@@ -245,12 +278,17 @@ pub(crate) async fn complete_login_register(
 /// the client wait for a timeout. (TODO: ship a typed `Eviction` frame once
 /// the SDK eviction decoder lands on every transport.)
 #[allow(clippy::future_not_send)]
-pub(crate) async fn surface_login_failure(
-    shard: &Rc<ServerNgShard>,
+pub(crate) async fn surface_login_failure<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
     error: &LoginRegisterError,
-) {
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     if error.is_terminal() {
         send_login_failure_reply(shard, transport_client_id, request_header).await;
     } else {
@@ -268,11 +306,16 @@ pub(crate) async fn surface_login_failure(
 /// same login on the same connection. Only call for transient errors -- see
 /// [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
-async fn send_login_transient_reply(
-    shard: &Rc<ServerNgShard>,
+async fn send_login_transient_reply<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
-) {
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let commit = current_metadata_commit(shard);
     // `TransientNotAccepted`: a login/register replay is safe under any
     // session (a duplicate register mints a fresh session and the server
@@ -300,11 +343,16 @@ async fn send_login_transient_reply(
 /// fast instead of hanging until the socket read timeout. Only call for
 /// terminal errors -- see [`surface_login_failure`].
 #[allow(clippy::future_not_send)]
-pub(crate) async fn send_login_failure_reply(
-    shard: &Rc<ServerNgShard>,
+pub(crate) async fn send_login_failure_reply<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     transport_client_id: u128,
     request_header: &RequestHeader,
-) {
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let commit = current_metadata_commit(shard);
     let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
     if let Err(error) = shard
