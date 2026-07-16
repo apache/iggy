@@ -3146,9 +3146,15 @@ where
             let connected = match (session.first_batch_offset, durable_end) {
                 (Some(first), Some(durable)) => first <= durable.saturating_add(1),
                 (Some(first), None) => first == 0,
-                // Offsets-only window: nothing to reconcile against segments;
-                // the consumer-offset table on disk stands in below the floor.
-                (None, _) => true,
+                // No repaired batch arrived, so there is no offset anchor to
+                // verify the floor's continuum claim against. `None` is only
+                // safe when the served window itself proves it carried no
+                // messages: every op in `(floor, to_op]` journaled and none
+                // of them `SendMessages`. Anything less -- dropped frames, or
+                // a fully evicted window -- is indistinguishable from a
+                // message range below the floor that this replica does not
+                // durably own, and accepting it would serve a holed log.
+                (None, _) => self.repaired_window_is_offsets_only(floor, session.to_op),
             };
             if !connected {
                 tracing::error!(
@@ -3193,6 +3199,25 @@ where
             done,
             "repair window commit walk finished"
         );
+    }
+
+    /// Whether the served repair window `(floor, to_op]` arrived complete and
+    /// holds no `SendMessages` op. Only then may a commit floor be accepted
+    /// without a batch anchor: the window demonstrably moved no messages, so
+    /// the consumer-offset table on disk stands in below the floor. An empty
+    /// window (`floor >= to_op`) carries no evidence at all and never
+    /// qualifies.
+    fn repaired_window_is_offsets_only(&self, floor: u64, to_op: u64) -> bool {
+        if floor >= to_op {
+            return false;
+        }
+        ((floor + 1)..=to_op).all(|op| {
+            self.log
+                .journal()
+                .inner
+                .header_by_op(op)
+                .is_some_and(|header| header.operation != Operation::SendMessages)
+        })
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -3970,6 +3995,124 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn repair_config() -> PartitionsConfig {
+        PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            enforce_fsync: false,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            encryptor: None,
+        }
+    }
+
+    fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+        RepairSession {
+            nonce: 1,
+            to_op,
+            floor: Some(floor),
+            peer: 0,
+            first_batch_offset,
+            idle_ticks: 0,
+        }
+    }
+
+    async fn journal_prepare(
+        partition: &IggyPartition<IggyMessageBus>,
+        op: u64,
+        operation: Operation,
+    ) {
+        let size = std::mem::size_of::<PrepareHeader>();
+        let prepare = Message::<PrepareHeader>::new(size).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command2::Prepare;
+                header.op = op;
+                header.operation = operation;
+                header.size = u32::try_from(size).expect("prepare header size fits in u32");
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(
+            partition.repair.is_some(),
+            "session must stay armed for retry"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_offsets_only_should_accept_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        // Any non-SendMessages operation exercises the offsets-only arm; the
+        // commit walk no-ops operations it does not recognize, so the test
+        // needs no on-disk offset directories.
+        for op in 6..=8 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert!(partition.consensus().commit_min() >= 5);
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_holds_message_op_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        journal_prepare(&partition, 6, Operation::SendMessages).await;
+        for op in 7..=8 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_fully_evicted_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        partition.repair = Some(armed_session(8, 8, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_some());
+    }
+
+    #[compio::test]
+    async fn given_repaired_batch_above_durable_end_when_floor_arrives_should_refuse_commit_floor()
+    {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        // No recovered segments (durable end None) and the served window's
+        // first batch starts at offset 3: ops below the floor are neither
+        // locally durable nor repaired.
+        partition.repair = Some(armed_session(8, 5, Some(3)));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
     }
 }
 
