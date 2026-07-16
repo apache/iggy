@@ -124,6 +124,16 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        if self.http.enabled
+            && self.http.tls.enabled
+            && (self.http.tls.cert_file.is_empty() || self.http.tls.key_file.is_empty())
+        {
+            eprintln!(
+                "http.tls.enabled=true requires non-empty http.tls.cert_file and http.tls.key_file"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if topic_size < self.system.segment.size.as_bytes_u64() {
             eprintln!(
                 "system.topic.max_size ({} B) must be >= system.segment.size ({} B)",
@@ -372,5 +382,28 @@ mod tests {
             shipped.message_saver.enforce_fsync,
             defaults.message_saver.enforce_fsync
         );
+    }
+
+    // http.enabled needs a non-ServerDefault JWT expiry to clear the sibling
+    // check above; ServerNgConfig::default() already satisfies that.
+    fn https_config(cert_file: &str, key_file: &str) -> ServerNgConfig {
+        let mut cfg = ServerNgConfig::default();
+        cfg.http.enabled = true;
+        cfg.http.tls.enabled = true;
+        cfg.http.tls.cert_file = cert_file.to_string();
+        cfg.http.tls.key_file = key_file.to_string();
+        cfg
+    }
+
+    #[test]
+    fn validate_rejects_tls_enabled_with_empty_cert_file() {
+        let cfg = https_config("", "key.pem");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_enabled_with_both_files_set() {
+        let cfg = https_config("cert.pem", "key.pem");
+        assert!(cfg.validate().is_ok());
     }
 }

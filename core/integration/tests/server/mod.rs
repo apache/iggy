@@ -37,6 +37,10 @@ mod http_vsr;
 // bodies); the RBAC matrix lives in permissions_scenario.
 #[cfg(feature = "vsr")]
 mod http_rbac;
+// End-to-end HTTPS: server-ng serves the REST listener over TLS and negotiates
+// HTTP/2 via ALPN.
+#[cfg(feature = "vsr")]
+mod http_tls;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 #[cfg(feature = "vsr")]
 mod cluster_metadata_vsr;
