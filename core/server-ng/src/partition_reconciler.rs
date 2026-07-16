@@ -45,10 +45,38 @@
 //! every `create_topic`.
 //!
 //! TODO: block VSR-ification of `topics.rs` / `partitions.rs`
-//! `binary_impls` on a materialization barrier (cross-shard
-//! `MaterializedAck` from each assigned shard back to shard 0; shard 0
-//! holds the reply in `client_table` until all acks arrive). Sync-block
-//! alternative was deferred.
+//! `binary_impls` on a materialization barrier. Two changes, both
+//! required together (one without the other does not close the race):
+//!
+//! 1. **Owner becomes the sole writer of its own `shards_table` row.**
+//!    Today any non-owning shard's reconciler independently seeds an
+//!    `InsertRouted` row the moment it observes committed metadata (see
+//!    the bullet above) -- a pure hash computation, no coordination with
+//!    the owner. That is fine for routing (`calculate_shard_assignment`
+//!    is a static function of the namespace, identical on every shard,
+//!    no placement decision to propagate) but it means a row can exist
+//!    before the owner's own `build_partition_fresh` has finished.
+//!    Non-owning shards must stop writing this row ahead of the owner.
+//! 2. **Owner pushes the row to every other shard once materialised**,
+//!    instead of each shard independently guessing it. Cheap: this is a
+//!    same-node, cross-shard-core message (the existing `ReconcileOp`
+//!    inter-shard channel already carries `InsertOwned`/`ConfirmRemove`;
+//!    extend it with a push variant), not a network round trip to
+//!    another replica.
+//!
+//! With both in place, `shards_table.shard_for(ns).is_some()` on ANY
+//! shard implies the owner has already materialised the partition, so
+//! `dispatch::wait_for_partition_routable`'s second-phase `partition_read`
+//! probe (the owner-readiness check a router-side reader currently has to
+//! do by hand, since the table alone can't be trusted) becomes
+//! unnecessary; a single `shards_table` poll is a sufficient barrier for
+//! both server-ng-shard routing AND the pump/client reply. The heavier
+//! "shard 0 holds the client reply until every assigned shard acks"
+//! design was the original idea here; this is a smaller, cheaper
+//! alternative scoped to the local (same-node) table-visibility problem
+//! only, not the reply-timing one -- the create-topic reply can still
+//! ship on metadata commit as it does today, since the retry loop that
+//! consumes `shards_table` is what actually needs the invariant.
 
 use crate::bootstrap::ServerNgShard;
 use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
