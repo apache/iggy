@@ -391,6 +391,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// server config at bootstrap ([`Self::set_default_max_topic_size`]);
     /// defaults to unlimited, matching the shipped server config.
     default_max_topic_size: Cell<u64>,
+    /// Resolved micros value for `IggyExpiry::ServerDefault` (`0` on the wire).
+    /// Same admission-time sentinel resolution as [`Self::default_max_topic_size`];
+    /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
+    /// Defaults to never-expire, matching the shipped server config.
+    default_message_expiry: Cell<u64>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -422,6 +427,7 @@ where
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
+            default_message_expiry: Cell::new(u64::MAX),
         }
     }
 }
@@ -445,6 +451,19 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     #[must_use]
     pub const fn default_max_topic_size(&self) -> u64 {
         self.default_max_topic_size.get()
+    }
+
+    /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
+    /// Server-ng bootstrap calls this with `system.topic.message_expiry` on every
+    /// shard (responses read it too); only shard 0's copy feeds admission.
+    pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
+        self.default_message_expiry.set(message_expiry_micros);
+    }
+
+    /// Resolved micros value for `IggyExpiry::ServerDefault`.
+    #[must_use]
+    pub const fn default_message_expiry(&self) -> u64 {
+        self.default_message_expiry.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -1775,6 +1794,9 @@ where
                 if request.max_topic_size == 0 {
                     request.max_topic_size = self.default_max_topic_size.get();
                 }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1836,9 +1858,17 @@ where
             Operation::UpdateTopic => {
                 let mut request = WireUpdateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
+                // Same `ServerDefault` resolution as `CreateTopic` above; rebuild
+                // the prepare only if a sentinel actually needs stamping, else
+                // project the untouched buffer zero-copy.
+                let needs_rewrite = request.max_topic_size == 0 || request.message_expiry == 0;
                 if request.max_topic_size == 0 {
-                    // Same `ServerDefault` resolution as `CreateTopic` above.
                     request.max_topic_size = self.default_max_topic_size.get();
+                }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
+                if needs_rewrite {
                     let body = request.to_bytes();
                     return Ok(build_prepare_message(
                         consensus,
@@ -2614,6 +2644,38 @@ mod tests {
             prepare.header().user_id,
             ACTING_USER,
             "prepare must carry the ClientTable identity, not the wire value"
+        );
+    }
+
+    #[test]
+    fn prepare_request_stamps_create_topic_message_expiry_default() {
+        // A `CreateTopic` carrying the `ServerDefault` sentinel (0) must be
+        // rewritten at primary admission to the configured default, so the
+        // replicated prepare -- and thus every replica's commit -- holds a
+        // concrete expiry. Mirrors the `max_topic_size` sentinel resolution.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        const CONFIGURED_EXPIRY_MICROS: u64 = 7_200_000_000;
+        let plane = metadata_plane();
+        plane.set_default_message_expiry(CONFIGURED_EXPIRY_MICROS);
+        plane.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // `create_topic_request` builds the body with `message_expiry == 0`.
+        let prepare = plane
+            .prepare_request(create_topic_request(CLIENT, ACTING_USER))
+            .expect("CreateTopic is client-allowed");
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        let persisted = PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode");
+        assert_eq!(
+            persisted.request.message_expiry, CONFIGURED_EXPIRY_MICROS,
+            "ServerDefault expiry must be stamped to the configured default at admission"
         );
     }
 }

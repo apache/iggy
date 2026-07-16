@@ -890,9 +890,10 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
-    // Shard 0's copy resolves the `MaxTopicSize::ServerDefault` sentinel at
-    // admission; every shard's copy backs the same resolution in responses.
+    // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
+    // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
+    metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.

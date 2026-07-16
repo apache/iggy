@@ -77,7 +77,7 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp, MaxTopicSize};
+use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
@@ -761,6 +761,7 @@ fn build_get_stream_response(
     stream_id: &WireIdentifier,
 ) -> Result<Option<GetStreamResponse>, IggyError> {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -774,7 +775,9 @@ fn build_get_stream_response(
             topics: stream
                 .topics
                 .iter()
-                .map(|(_, topic)| topic_header(topic, default_max_topic_size))
+                .map(|(_, topic)| {
+                    topic_header(topic, default_max_topic_size, default_message_expiry)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
@@ -861,6 +864,7 @@ fn build_get_topic_response(
     topic_id: &WireIdentifier,
 ) -> Result<Option<GetTopicResponse>, IggyError> {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -877,7 +881,7 @@ fn build_get_topic_response(
             .get(topic_id)
             .ok_or(IggyError::InvalidIdentifier)?;
         Ok(Some(GetTopicResponse {
-            topic: topic_header(topic, default_max_topic_size)?,
+            topic: topic_header(topic, default_max_topic_size, default_message_expiry)?,
             partitions: topic
                 .partitions
                 .iter()
@@ -892,6 +896,7 @@ fn build_get_topics_response(
     stream_id: &WireIdentifier,
 ) -> Result<GetTopicsResponse, IggyError> {
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
             resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
@@ -902,7 +907,7 @@ fn build_get_topics_response(
         stream
             .topics
             .iter()
-            .map(|(_, topic)| topic_header(topic, default_max_topic_size))
+            .map(|(_, topic)| topic_header(topic, default_max_topic_size, default_message_expiry))
             .collect::<Result<Vec<_>, _>>()
             .map(|topics| GetTopicsResponse { topics })
     })
@@ -1004,15 +1009,31 @@ fn resolve_max_topic_size(max_topic_size: MaxTopicSize, default_bytes: u64) -> u
     }
 }
 
+/// Resolve a topic's stored [`IggyExpiry`] to the wire micros value, mapping the
+/// `ServerDefault` sentinel to this node's configured default. Mirrors
+/// [`resolve_max_topic_size`]: replicated apply stores the sentinel verbatim so
+/// commit stays config-independent across a cluster, and the per-node default is
+/// applied here on read. Primary admission stamps the same default before
+/// replication, so this only bites topics whose stored expiry predates that
+/// stamping (older snapshot / WAL data). Explicit durations and never-expire pass
+/// through.
+fn resolve_message_expiry(message_expiry: IggyExpiry, default_micros: u64) -> u64 {
+    match message_expiry {
+        IggyExpiry::ServerDefault => default_micros,
+        resolved => u64::from(resolved),
+    }
+}
+
 fn topic_header(
     topic: &metadata::stm::stream::Topic,
     default_max_topic_size: u64,
+    default_message_expiry: u64,
 ) -> Result<StreamTopicHeader, IggyError> {
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
         partitions_count: usize_to_u32(topic.partitions.len())?,
-        message_expiry: u64::from(topic.message_expiry),
+        message_expiry: resolve_message_expiry(topic.message_expiry, default_message_expiry),
         compression_algorithm: topic.compression_algorithm.as_code(),
         max_topic_size: resolve_max_topic_size(topic.max_topic_size, default_max_topic_size),
         replication_factor: topic.replication_factor,
@@ -1549,19 +1570,22 @@ mod tests {
     }
 
     #[test]
-    fn topic_header_resolves_server_default_and_passes_explicit_sizes_through() {
-        use iggy_common::{CompressionAlgorithm, IggyExpiry, StreamStats, TopicStats};
+    fn topic_header_resolves_server_default_and_passes_explicit_values_through() {
+        use iggy_common::{
+            CompressionAlgorithm, IggyDuration, IggyExpiry, StreamStats, TopicStats,
+        };
         use std::sync::atomic::AtomicUsize;
 
         const NODE_DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+        const EXPIRY_DEFAULT_MICROS: u64 = 3_600_000_000;
 
         let parent = Arc::new(StreamStats::default());
-        let topic_with = |max_topic_size| metadata::stm::stream::Topic {
+        let topic_with = |max_topic_size, message_expiry| metadata::stm::stream::Topic {
             id: 0,
             name: Arc::from("topic"),
             created_at: IggyTimestamp::from(1u64),
             replication_factor: 1,
-            message_expiry: IggyExpiry::NeverExpire,
+            message_expiry,
             compression_algorithm: CompressionAlgorithm::None,
             max_topic_size,
             stats: Arc::new(TopicStats::new(parent.clone())),
@@ -1573,17 +1597,36 @@ mod tests {
         };
 
         // ServerDefault (0 on the wire) resolves to this node's configured
-        // default, not the raw 0 the pre-fix read path echoed.
-        let resolved = topic_header(&topic_with(MaxTopicSize::ServerDefault), NODE_DEFAULT)
-            .expect("topic header builds");
+        // default for both size and expiry, not the raw 0 the pre-fix read path
+        // echoed.
+        let resolved = topic_header(
+            &topic_with(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(resolved.max_topic_size, NODE_DEFAULT);
+        assert_eq!(resolved.message_expiry, EXPIRY_DEFAULT_MICROS);
 
-        // Explicit sizes round-trip unchanged, independent of the node default.
-        let custom = topic_header(&topic_with(MaxTopicSize::from(1024u64)), NODE_DEFAULT)
-            .expect("topic header builds");
+        // Explicit values round-trip unchanged, independent of the node default.
+        let custom = topic_header(
+            &topic_with(
+                MaxTopicSize::from(1024u64),
+                IggyExpiry::ExpireDuration(IggyDuration::from(5_000_000u64)),
+            ),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(custom.max_topic_size, 1024);
-        let unlimited = topic_header(&topic_with(MaxTopicSize::Unlimited), NODE_DEFAULT)
-            .expect("topic header builds");
+        assert_eq!(custom.message_expiry, 5_000_000);
+        let unlimited = topic_header(
+            &topic_with(MaxTopicSize::Unlimited, IggyExpiry::NeverExpire),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(unlimited.max_topic_size, u64::MAX);
+        assert_eq!(unlimited.message_expiry, u64::MAX);
     }
 }
