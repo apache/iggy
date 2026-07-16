@@ -25,7 +25,7 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, ConsumerGroup as RustConsumerGroup,
     ConsumerGroupDetails as RustConsumerGroupDetails,
     ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
-    IggyError, ReceivedMessage,
+    IggyError as RustIggyError, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::{PyDelta, PyDeltaAccess};
@@ -41,6 +41,7 @@ use tokio::task::JoinHandle;
 
 use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
+use crate::error::IggyError as PyIggyError;
 
 /// A Python class representing the Iggy consumer.
 /// It wraps the RustIggyConsumer and provides asynchronous functionality
@@ -110,7 +111,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                .map_err(|e| PyIggyError::new_err_from_rust(e))
         })
     }
 
@@ -131,7 +132,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                .map_err(|e| PyIggyError::new_err_from_rust(e))
         })
     }
 
@@ -167,7 +168,7 @@ impl IggyConsumer {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume: JoinHandle<PyResult<Result<(), IggyError>>> =
+            let handle_consume: JoinHandle<PyResult<Result<(), RustIggyError>>> =
                 get_runtime().spawn(scope(task_locals, async move {
                     let task_locals =
                         Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
@@ -212,7 +213,7 @@ impl IggyConsumer {
 
             consume_result
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -365,9 +366,8 @@ impl ReceiveMessageIterator {
                         inner: m.message,
                         partition_id: m.partition_id,
                     })
-                    .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                    })?)
+                    .map_err(|e| PyIggyError::new_err_from_rust(e))?
+                )
             } else {
                 Err(PyStopAsyncIteration::new_err("No more messages"))
             }
@@ -385,7 +385,7 @@ struct PyCallbackConsumer {
 }
 
 impl MessageConsumer for PyCallbackConsumer {
-    async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
+    async fn consume(&self, received: ReceivedMessage) -> Result<(), RustIggyError> {
         let callback = self.callback.clone();
         let task_locals = self.task_locals.clone().lock_owned().await;
         let task_locals = task_locals.clone();
@@ -402,10 +402,10 @@ impl MessageConsumer for PyCallbackConsumer {
                 })
             }))
             .await
-            .map_err(|_| IggyError::CannotReadMessage)?
-            .map_err(|_| IggyError::CannotReadMessage)?
+            .map_err(|_| RustIggyError::CannotReadMessage)?
+            .map_err(|_| RustIggyError::CannotReadMessage)?
             .await
-            .map_err(|_| IggyError::CannotReadMessage)?;
+            .map_err(|_| RustIggyError::CannotReadMessage)?;
         Ok(())
     }
 }

@@ -18,11 +18,10 @@
 use std::str::FromStr;
 
 use iggy::prelude::{IdKind, Identifier};
-use pyo3::{
-    exceptions::{PyRuntimeError, PyValueError},
-    prelude::*,
-};
+use pyo3::prelude::*;
 use pyo3_stub_gen::impl_stub_type;
+
+use crate::error::IggyError as PyIggyError;
 
 #[derive(FromPyObject, IntoPyObject)]
 pub(crate) enum PyIdentifier {
@@ -39,10 +38,10 @@ impl TryFrom<PyIdentifier> for Identifier {
     fn try_from(py_identifier: PyIdentifier) -> Result<Self, Self::Error> {
         match py_identifier {
             PyIdentifier::String(s) => {
-                Identifier::from_str(&s).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
+                Identifier::from_str(&s).map_err(|e| PyIggyError::new_err_from_rust(e))
             }
             PyIdentifier::Int(i) => {
-                Identifier::numeric(i).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
+                Identifier::numeric(i).map_err(|e| PyIggyError::new_err_from_rust(e))
             }
         }
     }
@@ -56,11 +55,11 @@ impl TryFrom<&Identifier> for PyIdentifier {
             IdKind::String => val
                 .get_string_value()
                 .map(PyIdentifier::String)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
+                .map_err(|e| PyIggyError::new_err_from_rust(e)),
             IdKind::Numeric => val
                 .get_u32_value()
                 .map(PyIdentifier::Int)
-                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string())),
+                .map_err(|e| PyIggyError::new_err_from_rust(e)),
         }
     }
 }

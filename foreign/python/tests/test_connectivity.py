@@ -15,9 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, IggyError
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -51,45 +52,120 @@ class TestConnectivity:
         await wait_for_ping(client, timeout=5, interval=1)
 
     @pytest.mark.parametrize(
-        ("invalid_value", "expected_error"),
+        (
+            "invalid_value",
+            "expected_error_name",
+            "expected_error_code",
+            "expected_error_message",
+        ),
         [
-            ("", "Invalid connection string"),
-            ("bad address", "Invalid connection string"),
-            ("http://{host}:{port}", "Invalid connection string"),
-            ("tcp://iggy:iggy@{host}:{port}", "Invalid connection string"),
-            ("{host}:", "Invalid connection string"),
-            (":{port}", "Invalid connection string"),
-            ("{host}:not-a-port", "Invalid connection string"),
-            ("{host}:70000", "Invalid connection string"),
-            ("iggy+tcp://", "Invalid connection string"),
-            ("iggy+tcp://iggy:iggy@", "Invalid connection string"),
+            ("", "InvalidConnectionString", 8000, "Invalid connection string"),
             (
-                "iggy+tcp://iggy:iggy@{host}:not-a-port",
+                "bad address",
+                "InvalidConnectionString",
+                8000,
                 "Invalid connection string",
             ),
-            ("iggy+tcp://iggy:iggy@{host}:-1", "Invalid connection string"),
-            ("iggy+tcp://iggy:iggy@{host}:70000", "Invalid connection string"),
+            (
+                "http://{host}:{port}",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "tcp://iggy:iggy@{host}:{port}",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            ("{host}:", "InvalidConnectionString", 8000, "Invalid connection string"),
+            (":{port}", "InvalidConnectionString", 8000, "Invalid connection string"),
+            (
+                "{host}:not-a-port",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "{host}:70000",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "iggy+tcp://",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "iggy+tcp://iggy:iggy@",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "iggy+tcp://iggy:iggy@{host}:not-a-port",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "iggy+tcp://iggy:iggy@{host}:-1",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
+            (
+                "iggy+tcp://iggy:iggy@{host}:70000",
+                "InvalidConnectionString",
+                8000,
+                "Invalid connection string",
+            ),
             (
                 "iggy+tcp://iggy:bad:format@{host}:{port}",
+                "InvalidConnectionString",
+                8000,
                 "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
+                "InvalidConnectionString",
+                8000,
                 "Invalid connection string",
             ),
-            ("iggy+quic://iggy:iggy@127.0.0.1:8080", "Cannot create endpoint"),
+            (
+                "iggy+quic://iggy:iggy@127.0.0.1:8080",
+                "CannotCreateEndpoint",
+                305,
+                "Cannot create endpoint",
+            ),
         ],
     )
-    def test_invalid_connection_string(self, invalid_value: str, expected_error: str):
+    def test_invalid_connection_string(
+        self,
+        invalid_value: str,
+        expected_error_name: str,
+        expected_error_code: int,
+        expected_error_message: str,
+    ):
         """Test malformed server addresses and connection strings are rejected."""
         host, port = get_server_config()
         value = invalid_value.format(host=host, port=port)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as excinfo_new:
             IggyClient(value)
 
-        with pytest.raises(RuntimeError, match=expected_error):
+        assert excinfo_new.value.code == expected_error_code
+        assert excinfo_new.value.name == expected_error_name
+        assert excinfo_new.value.message == expected_error_message
+
+        with pytest.raises(IggyError) as excinfo_from_connection_string:
             IggyClient.from_connection_string(value)
+
+        assert excinfo_from_connection_string.value.code == expected_error_code
+        assert excinfo_from_connection_string.value.name == expected_error_name
+        assert excinfo_from_connection_string.value.message == expected_error_message
 
     @pytest.mark.asyncio
     async def test_repeated_connect_does_not_error(self):

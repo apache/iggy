@@ -32,6 +32,7 @@ use crate::consumer::{
     AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
     IggyConsumer, py_delta_to_iggy_duration,
 };
+use crate::error::IggyError as PyIggyError;
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
@@ -63,7 +64,7 @@ impl IggyClient {
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e| PyIggyError::new_err_from_rust(e))?;
         Ok(IggyClient {
             inner: Arc::new(client),
         })
@@ -80,7 +81,7 @@ impl IggyClient {
         connection_string: String,
     ) -> PyResult<Self> {
         let client = RustIggyClient::from_connection_string(&connection_string)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            .map_err(|e| PyIggyError::new_err_from_rust(e))?;
         Ok(Self {
             inner: Arc::new(client),
         })
@@ -96,7 +97,7 @@ impl IggyClient {
             inner
                 .ping()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+                .map_err(|e| PyIggyError::new_err_from_rust(e))
         })
     }
 
@@ -114,7 +115,7 @@ impl IggyClient {
             inner
                 .login_user(&username, &password)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -128,7 +129,7 @@ impl IggyClient {
             inner
                 .connect()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -143,7 +144,7 @@ impl IggyClient {
             inner
                 .create_stream(&name)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -163,7 +164,7 @@ impl IggyClient {
             let stream = inner
                 .get_stream(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(stream.map(StreamDetails::from))
         })
     }
@@ -219,7 +220,7 @@ impl IggyClient {
                     max_size,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -241,7 +242,7 @@ impl IggyClient {
             let topic = inner
                 .get_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(topic.map(TopicDetails::from))
         })
     }
@@ -269,7 +270,7 @@ impl IggyClient {
             let topics = inner
                 .get_topics(&stream_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(topics.into_iter().map(Topic::from).collect::<Vec<_>>())
         })
     }
@@ -374,7 +375,7 @@ impl IggyClient {
             inner
                 .delete_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -405,7 +406,7 @@ impl IggyClient {
             inner
                 .purge_topic(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -439,7 +440,7 @@ impl IggyClient {
             inner
                 .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -475,7 +476,7 @@ impl IggyClient {
             let group = inner
                 .get_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(group.map(PyConsumerGroupDetails::from))
         })
     }
@@ -507,7 +508,7 @@ impl IggyClient {
             let groups = inner
                 .get_consumer_groups(&stream_id, &topic_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(groups
                 .into_iter()
                 .map(PyConsumerGroup::from)
@@ -547,7 +548,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(())
         })
     }
@@ -585,7 +586,7 @@ impl IggyClient {
                     auto_commit,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             let messages = polled_messages
                 .messages
                 .into_iter()
@@ -646,7 +647,7 @@ impl IggyClient {
         let mut builder = self
             .inner
             .consumer_group(name, stream, topic)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map_err(|e| PyIggyError::new_err_from_rust(e))?
             .without_encryptor()
             .partition(partition_id);
 
@@ -704,7 +705,7 @@ impl IggyClient {
             consumer
                 .init()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
             })
