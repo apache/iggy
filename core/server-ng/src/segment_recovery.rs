@@ -106,8 +106,8 @@ pub async fn load_persisted_segments(
         // would strand undecodable garbage inside the readable range. Zeroed
         // sizes make the next append overwrite the torn bytes instead.
         let (start_timestamp, end_timestamp, end_offset, effective_messages_size) =
-            if let Some((start_timestamp, end_timestamp, end_offset)) = bounds {
-                (start_timestamp, end_timestamp, end_offset, messages_size)
+            if let Some((start_timestamp, end_timestamp, end_offset, walked_size)) = bounds {
+                (start_timestamp, end_timestamp, end_offset, walked_size)
             } else {
                 if messages_size > 0 {
                     warn!(
@@ -227,7 +227,7 @@ async fn recover_segment_bounds(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<Option<(u64, u64, u64)>, ServerNgError> {
+) -> Result<Option<(u64, u64, u64, u64)>, ServerNgError> {
     let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
         error!(
             stream_id,
@@ -264,17 +264,36 @@ async fn recover_segment_bounds(
 
     match (first, last) {
         (Some(first), Some(last)) => {
-            let last_batch_extent = read_batch_extent(messages_path, last.position, messages_size)
-                .ok_or(ServerNgError::RecoveredSegmentSizeDivergence {
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    start_offset,
-                    end_offset: last.offset,
-                    messages_size_bytes: messages_size,
-                    indexed_size_bytes: last.position,
-                })?;
-            if last_batch_extent > messages_size {
+            // The sparse index holds ONE entry per flushed chunk, pointing
+            // at the chunk's FIRST batch -- `last.offset` is where the last
+            // chunk STARTS, not where the segment ends (a whole journal
+            // flushed as one chunk indexes only its first offset). Walk the
+            // batch chain from that position to the file end to recover the
+            // true end offset; a header that no longer decodes marks a torn
+            // tail, which truncates the readable range to the last whole
+            // batch so the next append overwrites the torn bytes.
+            let mut position = last.position;
+            let mut end_offset = last.offset;
+            let mut end_timestamp = last.timestamp;
+            let mut walked_any = false;
+            while position < messages_size {
+                let Some(header) = read_batch_header(messages_path, position, messages_size) else {
+                    break;
+                };
+                let extent = position.saturating_add(header.total_size() as u64);
+                if extent > messages_size {
+                    break;
+                }
+                if header.message_count > 0 {
+                    end_offset = header
+                        .base_offset
+                        .saturating_add(u64::from(header.message_count) - 1);
+                    end_timestamp = header.base_timestamp;
+                }
+                walked_any = true;
+                position = extent;
+            }
+            if !walked_any {
                 return Err(ServerNgError::RecoveredSegmentSizeDivergence {
                     stream_id,
                     topic_id,
@@ -282,25 +301,28 @@ async fn recover_segment_bounds(
                     start_offset,
                     end_offset: last.offset,
                     messages_size_bytes: messages_size,
-                    indexed_size_bytes: last_batch_extent,
+                    indexed_size_bytes: last.position,
                 });
             }
-            Ok(Some((first.timestamp, last.timestamp, last.offset)))
+            Ok(Some((first.timestamp, end_timestamp, end_offset, position)))
         }
         _ => Ok(None),
     }
 }
 
-/// End byte of the batch whose command header sits at `position` in the
-/// messages file, or `None` when the header itself does not fit / decode
-/// (`position` past the file, header truncated, or garbage bytes).
-fn read_batch_extent(messages_path: &str, position: u64, messages_size: u64) -> Option<u64> {
+/// The batch command header at `position` in the messages file, or `None`
+/// when the header does not fit / decode (`position` past the file, header
+/// truncated, or garbage bytes).
+fn read_batch_header(
+    messages_path: &str,
+    position: u64,
+    messages_size: u64,
+) -> Option<SendMessages2Header> {
     if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
         return None;
     }
     let file = fs::File::open(messages_path).ok()?;
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
     file.read_exact_at(&mut header_bytes, position).ok()?;
-    let header = SendMessages2Header::decode(&header_bytes).ok()?;
-    position.checked_add(header.total_size() as u64)
+    SendMessages2Header::decode(&header_bytes).ok()
 }

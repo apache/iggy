@@ -16,7 +16,6 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Microsoft.Extensions.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -129,12 +128,6 @@ public class IggyPublisherConfig
     ///     Required when <see cref="CreateTopic" /> is true.
     /// </summary>
     public string? TopicName { get; set; }
-
-    /// <summary>
-    ///     Gets or sets the message encryptor for encrypting message payloads.
-    ///     When set, all message payloads will be encrypted before sending.
-    /// </summary>
-    public IMessageEncryptor? MessageEncryptor { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the logger factory for diagnostic logging.

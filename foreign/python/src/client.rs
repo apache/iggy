@@ -513,6 +513,119 @@ impl IggyClient {
         })
     }
 
+    /// Delete a consumer group for a stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the consumer group is deleted.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Join a consumer group for a stream and topic.
+    ///
+    /// This method only registers the current client as a group member. To consume messages
+    /// as a group, use `consumer_group()`, which enables auto-join by default.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the client joins the consumer group.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn join_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .join_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Leave a consumer group for a stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the client leaves the consumer group.
+    ///
+    /// Note:
+    ///     Consumers created from this client for the same group share one server-side
+    ///     membership. Leaving revokes that membership. Consumers with auto-join enabled
+    ///     rejoin on their next poll.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn leave_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .leave_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Sends a list of messages to the specified topic.
     /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]

@@ -23,6 +23,14 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[features]
+# Simulator/test-only, additive: adds the deterministic `crypto::hash_with_fixed_salt`
+# helper so a replayed simulation seed reproduces identical replicated user
+# metadata. `crypto::hash_password` stays OS-random regardless of this feature,
+# so cargo feature unification into a co-built server cannot alter production
+# password hashing. No production caller.
+simulator = []
+
 [dependencies]
 aligned-vec = { workspace = true }
 argon2 = { workspace = true }

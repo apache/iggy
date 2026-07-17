@@ -126,11 +126,24 @@ decoding_secret = ""
 # `false` means the secret is in plain text.
 use_base64_secret = false
 
-# Trusted issuers for A2A (Application-to-Application) authentication
-[[http.jwt.trusted_issuers]]
-issuer = "test-issuer"
-jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
-audience = "iggy.apache.org"
+# Trusted issuers for A2A (Application-to-Application) authentication. Opt-in:
+# with none configured the listener accepts only self-issued HS256 tokens.
+# `issuer`, `audience` and `jwks_url` are required per entry; `user_id` is
+# optional but defaults to 0 (root), which is rejected - set it to the non-zero
+# iggy user every token from that issuer is remapped onto.
+#
+# Operational note: enabling an issuer opens an outbound JWKS fetch that is
+# reachable before a token's signature is verified - a token naming this issuer
+# with an unknown key id can trigger a fetch to `jwks_url`. The target is fixed
+# (not attacker-chosen); concurrent misses coalesce onto one fetch and repeats
+# are rate-limited to at most one outbound request per issuer per short window,
+# so an unknown-key-id flood cannot amplify. The same window bounds how quickly a
+# freshly rotated signing key is picked up.
+# [[http.jwt.trusted_issuers]]
+# issuer = "test-issuer"
+# jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
+# audience = "iggy.apache.org"
+# user_id = 1
 
 # Metrics configuration for HTTP.
 [http.metrics]
@@ -592,6 +605,14 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 #     + "numa:auto": Use all available numa node, cores
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
 cpu_allocation = "numa:auto"
+# Whether shard threads are pinned to dedicated CPU cores (default: true).
+# Pinned cores are drawn from the process's allowed CPU set (affinity/cpuset
+# mask), so the server cooperates with systemd `AllowedCPUs=` and container
+# cpusets. Set to false when the server shares cores with other workloads
+# (e.g. a multi-tenant host slicing CPU via cgroup quotas): unpinned shards
+# let the kernel scheduler place threads freely instead of piling every
+# process onto the same low-numbered cores.
+pin_cores = true
 
 [websocket]
 enabled = true

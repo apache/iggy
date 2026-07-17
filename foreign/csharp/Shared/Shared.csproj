@@ -26,10 +26,12 @@
         <Nullable>enable</Nullable>
         <AssemblyName>Apache.Iggy.Shared</AssemblyName>
         <RootNamespace>Apache.Iggy.Shared</RootNamespace>
+        <!-- Test-support and example shared types only; never published to NuGet. -->
+        <IsPackable>false</IsPackable>
     </PropertyGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj"/>
     </ItemGroup>
 
 </Project>

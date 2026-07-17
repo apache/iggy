@@ -23,9 +23,13 @@ use args::Args;
 use clap::Parser;
 use server_ng::bootstrap::{bootstrap, load_config};
 use server_ng::server_error::ServerNgError;
+use system_stats::capture_allowed_cpus;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
+    // Before shard threads pin themselves: a pinned capture sees one core.
+    capture_allowed_cpus();
+
     let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {

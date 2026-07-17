@@ -20,7 +20,7 @@
 flink = "2.3.0"
 
 # Pinot
-pinot = "1.5.0"
+pinot = "1.5.1"
 
 # Jackson
 jackson = "3.2.0"
@@ -30,19 +30,19 @@ jackson2 = "2.22.0"
 commons-lang3 = "3.20.0"
 
 # HTTP Client
-httpclient5 = "5.6.1"
+httpclient5 = "5.6.2"
 
 # Logging
 slf4j = "2.0.18"
-logback = "1.5.35"
+logback = "1.5.37"
 
 # Testing
-junit = "6.1.0"
+junit = "6.1.1"
 assertj = "3.27.7"
 testcontainers = "2.0.5"
 
 # Netty
-netty = "4.2.15.Final"
+netty = "4.2.16.Final"
 
 # Spotbugs
 spotbugs = "4.10.2"
@@ -52,8 +52,8 @@ typesafe-config = "1.4.9"
 picocli = "4.7.7"
 
 # Build plugins
-spotless = "8.7.0"
-shadow = "9.4.2"
+spotless = "8.8.0"
+shadow = "9.5.1"
 checkstyle = "12.3.1"
 jacoco = "0.8.15"
 

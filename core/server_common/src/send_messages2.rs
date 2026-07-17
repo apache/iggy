@@ -20,7 +20,7 @@ use crate::iobuf::Owned;
 use crate::sharding::IggyNamespace;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::{PrepareHeader, RequestHeader};
-use iggy_common::{INDEX_SIZE, IggyError, random_id};
+use iggy_common::{EncryptorKind, INDEX_SIZE, IggyError, random_id};
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
 
@@ -530,6 +530,65 @@ impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
 }
 
 pub(crate) type FrozenBatchHeader = crate::iobuf::Frozen<MESSAGE_ALIGN>;
+
+/// Re-encode a canonical `SendMessages2` request with every message's payload
+/// and user headers encrypted, per-message checksums and lengths recomputed,
+/// and the batch header (length + checksum) restamped.
+///
+/// Runs ONCE, on the primary at ingestion (after [`convert_request_message`]
+/// canonicalized the wire form), so the ciphertext is what replicates: every
+/// replica journals and persists identical bytes, and the poll path decrypts
+/// uniformly regardless of which replica or tier served the fragment.
+///
+/// # Errors
+///
+/// [`IggyError::InvalidCommand`] on an undecodable batch; encryption errors
+/// propagate from the encryptor.
+pub fn encrypt_batch_request(
+    message: Message<RequestHeader>,
+    encryptor: &EncryptorKind,
+) -> Result<Message<RequestHeader>, IggyError> {
+    let request_header = *message.header();
+    let total_size = request_header.size as usize;
+    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
+    let batch = decode_batch_slice(body)?;
+
+    let mut blob = BytesMut::with_capacity(batch.blob().len() * 2);
+    for view in batch.iter() {
+        let encrypted_payload = encryptor.encrypt(view.payload)?;
+        let encrypted_user_headers = if view.user_headers.is_empty() {
+            None
+        } else {
+            Some(encryptor.encrypt(view.user_headers)?)
+        };
+        let user_headers: &[u8] = encrypted_user_headers.as_deref().unwrap_or_default();
+        let payload_length =
+            u32::try_from(encrypted_payload.len()).map_err(|_| IggyError::InvalidCommand)?;
+        let user_headers_length =
+            u32::try_from(user_headers.len()).map_err(|_| IggyError::InvalidCommand)?;
+
+        let mut header = [0u8; MESSAGE_HEADER_SIZE];
+        header[8..24].copy_from_slice(&view.header.id.to_le_bytes());
+        header[24..28].copy_from_slice(&view.header.offset_delta.to_le_bytes());
+        header[28..32].copy_from_slice(&view.header.timestamp_delta.to_le_bytes());
+        header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
+        header[36..40].copy_from_slice(&payload_length.to_le_bytes());
+        let checksum = calculate_checksum_parts(&header[8..], &encrypted_payload, user_headers);
+        header[0..8].copy_from_slice(&checksum.to_le_bytes());
+
+        blob.extend_from_slice(&header);
+        blob.extend_from_slice(&encrypted_payload);
+        blob.extend_from_slice(user_headers);
+    }
+
+    let blob = blob.freeze();
+    let mut header = batch.header;
+    header.batch_length =
+        u64::try_from(COMMAND_HEADER_SIZE + blob.len()).map_err(|_| IggyError::InvalidCommand)?;
+    header.batch_checksum = calculate_batch_checksum(&header, &blob);
+
+    SendMessages2Owned { header, blob }.encode_request(request_header)
+}
 
 pub fn convert_request_message(
     namespace: IggyNamespace,

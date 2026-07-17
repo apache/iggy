@@ -40,6 +40,7 @@ pub struct IggyConsumerBuilder {
     init_retries: Option<u32>,
     init_retry_interval: IggyDuration,
     allow_replay: bool,
+    offset_drain_timeout: IggyDuration,
 }
 
 impl IggyConsumerBuilder {
@@ -75,6 +76,7 @@ impl IggyConsumerBuilder {
             init_retries: None,
             init_retry_interval: IggyDuration::ONE_SECOND,
             allow_replay: false,
+            offset_drain_timeout: IggyDuration::new_from_secs(5),
         }
     }
 
@@ -215,6 +217,15 @@ impl IggyConsumerBuilder {
         }
     }
 
+    /// Sets how long `shutdown()` waits for the background auto-commit tasks to
+    /// drain before leaving the consumer group. 5 seconds by default.
+    pub fn offset_drain_timeout(self, timeout: IggyDuration) -> Self {
+        Self {
+            offset_drain_timeout: timeout,
+            ..self
+        }
+    }
+
     /// Builds the consumer.
     ///
     /// Note: After building the consumer, `init()` must be invoked before producing messages.
@@ -237,6 +248,7 @@ impl IggyConsumerBuilder {
             self.init_retries,
             self.init_retry_interval,
             self.allow_replay,
+            self.offset_drain_timeout,
         )
     }
 }

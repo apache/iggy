@@ -383,9 +383,16 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
         && consensus.is_normal()
         && !consensus.is_syncing()
         && consensus.commit_min() == consensus.commit_max()
+        // Recovery re-pipelines the WAL's prepared-but-uncommitted suffix;
+        // those ops were acked to clients before the restart, so admitting
+        // new requests (a login is a Register write) before the suffix
+        // re-commits would serve state that rolls back committed history.
+        // Held transient until the retransmit path re-earns quorum.
+        && consensus.commit_max() >= consensus.recovery_barrier()
 }
 
 /// Build + best-effort send `Eviction`. `SendError` dropped: eviction is

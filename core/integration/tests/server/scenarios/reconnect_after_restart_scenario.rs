@@ -507,3 +507,208 @@ pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
         "BUG: consumer skipped to offset {first_offset}, expected messages in range 10-14"
     );
 }
+
+/// Full-cluster restart: every node stops before any comes back, so no
+/// settled primary survives to answer the rejoin probes. The replicas must
+/// give up probing (`ViewChangeReason::ViewProbeUnanswered`), elect among
+/// their recovered logs, and serve the durable data across the outage. The
+/// caller's server config must flush eagerly (`messages_required_to_save=1`
+/// + fsync): with every journal dying at once, only flushed bytes survive.
+pub async fn run_full_cluster_restart(harness: &mut TestHarness) {
+    let setup_client = harness
+        .root_client()
+        .await
+        .expect("Failed to create setup client");
+
+    setup_client
+        .create_stream(STREAM_NAME)
+        .await
+        .expect("Failed to create stream");
+    setup_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("Failed to create topic");
+    send_messages(&setup_client, "pre-outage", 10).await;
+    drop(setup_client);
+    // Let the backups' commit walk flush the tail: the send ack proves quorum
+    // COMMIT, but each replica flushes on its own walk (driven by the commit
+    // heartbeat), and the partition journal does not survive the process. A
+    // kill racing the last heartbeat leaves the newest message durable only
+    // on the old primary -- the known journal-durability caveat, not what
+    // this scenario tests.
+    sleep(Duration::from_secs(2)).await;
+
+    harness
+        .restart_cluster()
+        .await
+        .expect("Failed to restart the whole cluster");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to reconnect after full-cluster restart");
+    let survivors = poll_from_zero_until(&client, 10, Duration::from_secs(30)).await;
+    assert_eq!(
+        survivors,
+        (0..10)
+            .map(|i| format!("pre-outage-{i}"))
+            .collect::<Vec<_>>(),
+        "flushed messages must survive a full-cluster restart"
+    );
+
+    send_messages(&client, "post-outage", 10).await;
+    let all = poll_from_zero_until(&client, 20, Duration::from_secs(30)).await;
+    assert_eq!(all.len(), 20, "the reformed cluster must accept new writes");
+    assert_eq!(all[10], "post-outage-0");
+    assert_eq!(all[19], "post-outage-9");
+}
+
+/// Polls from offset 0 until `expected` messages arrive or the deadline
+/// passes, returning their payloads. The cluster may still be mid-election
+/// right after a restart, so a single poll is not a fair snapshot.
+async fn poll_from_zero_until(
+    client: &IggyClient,
+    expected: u32,
+    deadline: Duration,
+) -> Vec<String> {
+    let started = std::time::Instant::now();
+    loop {
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                expected * 2,
+                false,
+            )
+            .await;
+        if let Ok(polled) = &polled
+            && polled.messages.len() >= expected as usize
+        {
+            return polled
+                .messages
+                .iter()
+                .map(|message| String::from_utf8_lossy(&message.payload).to_string())
+                .collect();
+        }
+        if started.elapsed() > deadline {
+            let got = polled.map(|p| p.messages.len()).unwrap_or(0);
+            panic!("expected {expected} messages after full-cluster restart, got {got}");
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Rejoin with a window larger than the peers' evicted ring
+/// (`EVICTED_RING_CAPACITY` = 4096 entries): the serving peer answers
+/// `RangeEvicted` for the front of the range and the commit floor must
+/// settle at its retention point, with the rejoiner's recovered segments
+/// standing in below it. This is the only scenario that exercises
+/// `RangeEvicted` delivery and the floor end to end -- everything else
+/// fits inside the ring. The node-0 disk-growth assert is the proof the
+/// floor engaged: without it the commit walk gap-stops below the frontier
+/// and no post-restart batch ever flushes on the rejoiner.
+pub async fn run_ring_overflow_rejoin(harness: &mut TestHarness) {
+    const RING_OVERFLOW_OPS: u32 = 4300;
+    const POST_RESTART_OPS: u32 = 50;
+
+    let setup_client = harness
+        .root_client()
+        .await
+        .expect("Failed to create setup client");
+    setup_client
+        .create_stream(STREAM_NAME)
+        .await
+        .expect("Failed to create stream");
+    setup_client
+        .create_topic(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            TOPIC_NAME,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("Failed to create topic");
+    send_messages(&setup_client, "ring", RING_OVERFLOW_OPS).await;
+    drop(setup_client);
+    // Let the backups' commit walks flush; the rejoin window must start
+    // from durable segments, not from a racing in-memory tail.
+    sleep(Duration::from_secs(2)).await;
+
+    let partition_path = format!(
+        "{}/streams/0/topics/0/partitions/0",
+        harness.server().data_path().display()
+    );
+    let durable_before = partition_log_bytes(&partition_path);
+    assert!(
+        durable_before > 0,
+        "pre-restart flush must have landed on node 0"
+    );
+
+    harness
+        .restart_server()
+        .await
+        .expect("Failed to restart node 0");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to reconnect after restart");
+    let polled = poll_from_zero_until(&client, RING_OVERFLOW_OPS, Duration::from_secs(60)).await;
+    assert_eq!(
+        polled.len(),
+        RING_OVERFLOW_OPS as usize,
+        "all pre-restart messages must survive the over-ring rejoin"
+    );
+
+    send_messages(&client, "post", POST_RESTART_OPS).await;
+    let all = poll_from_zero_until(
+        &client,
+        RING_OVERFLOW_OPS + POST_RESTART_OPS,
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(all.len(), (RING_OVERFLOW_OPS + POST_RESTART_OPS) as usize);
+
+    // The rejoiner's commit walk must cross the floor: post-restart batches
+    // flush on node 0 only if commit_min advanced through the repaired
+    // window, so local disk growth is the floor-path proof.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if partition_log_bytes(&partition_path) > durable_before {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node 0 never flushed past its recovered durable end: the \
+             commit walk is gap-stopped (floor path did not engage)"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Sum of the `.log` segment file sizes under a partition directory.
+fn partition_log_bytes(partition_path: &str) -> u64 {
+    let Ok(entries) = std::fs::read_dir(partition_path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}

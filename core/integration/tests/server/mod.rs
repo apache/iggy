@@ -15,16 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// a2a_jwt exercises trusted-issuer (JWKS) tokens; server-ng's HTTP JWT
-// verifier has no trusted-issuer path.
-#[cfg(not(feature = "vsr"))]
+// a2a_jwt exercises trusted-issuer (JWKS) tokens; both the legacy verifier and
+// server-ng's ported trusted-issuer path verify them.
 mod a2a_jwt;
-// Polling-based consumer-group scenarios are not implemented under vsr yet.
-#[cfg(not(feature = "vsr"))]
 mod cg;
-// The ported round-robin membership join scenario runs against server-ng.
-#[cfg(feature = "vsr")]
-mod cg_vsr;
 // Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
 #[cfg(feature = "vsr")]
 mod flush_vsr;
@@ -43,6 +37,10 @@ mod http_vsr;
 // bodies); the RBAC matrix lives in permissions_scenario.
 #[cfg(feature = "vsr")]
 mod http_rbac;
+// End-to-end HTTPS: server-ng serves the REST listener over TLS and negotiates
+// HTTP/2 via ALPN.
+#[cfg(feature = "vsr")]
+mod http_tls;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 #[cfg(feature = "vsr")]
 mod cluster_metadata_vsr;
@@ -55,9 +53,8 @@ mod general;
 mod message_cleanup;
 mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
-// `should_delete_segments_without_consumers` is framing-agnostic + async-aware
-// and runs fully (both restart variants) under server-ng; the consumer-group
-// variants stay legacy-shaped or vsr-gated (cg polling has its own vsr gaps).
+// The full restart matrix (consumer variants included) runs under server-ng:
+// a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;
 mod specific;

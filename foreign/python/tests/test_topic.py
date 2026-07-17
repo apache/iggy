@@ -638,7 +638,7 @@ class TestGetTopics:
         # Reverse-alphabetical names so that id-ascending (creation) order
         # and name order disagree, proving the list isn't accidentally
         # name-sorted.
-        topic_names = [f"{unique_name()}-{i}" for i in range(topic_count, 0, -1)]
+        topic_names = [unique_name() for _ in range(topic_count, 0, -1)]
 
         await iggy_client.create_stream(stream_name)
         for name in topic_names:
