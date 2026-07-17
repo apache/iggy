@@ -31,8 +31,8 @@ use iggy_common::{
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
-    HeaderKey as RustHeaderKey, HeaderKind as RustHeaderKind, HeaderValue as RustHeaderValue,
-    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, Permissions as RustPermissions,
+    Stats as RustStats, StreamPermissions as RustStreamPermissions,
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
 };
 use std::collections::BTreeMap;
@@ -485,275 +485,116 @@ impl TryFrom<ffi::HeaderEntry> for RustHeaderEntry {
 
     fn try_from(entry: ffi::HeaderEntry) -> Result<Self, Self::Error> {
         Ok(RustHeaderEntry {
-            key: {
-                let kind = RustHeaderKind::from_code(entry.key.kind)
-                    .map_err(|error| format!("Could not convert header field: {error}"))?;
-
-                match kind {
-                    RustHeaderKind::Raw => RustHeaderKey::try_from(entry.key.value)
-                        .map_err(|error| format!("Could not convert header field: {error}"))?,
-                    RustHeaderKind::String => {
-                        let value = String::from_utf8(entry.key.value).map_err(|_| {
-                            "Could not convert header field: invalid UTF-8 string".to_string()
-                        })?;
-                        RustHeaderKey::try_from(value)
-                            .map_err(|error| format!("Could not convert header field: {error}"))?
-                    }
-                    RustHeaderKind::Bool => match entry.key.value.as_slice() {
-                        [0] => RustHeaderKey::from(false),
-                        [1] => RustHeaderKey::from(true),
-                        _ => {
-                            return Err(
-                                "Could not convert header field: bool values must encode as 0 or 1"
-                                    .to_string(),
-                            );
-                        }
-                    },
-                    RustHeaderKind::Int8 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(i8::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int16 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(i16::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int32 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(i32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int64 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(i64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int128 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(i128::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint8 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(u8::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint16 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(u16::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint32 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(u32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint64 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(u64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint128 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(u128::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Float32 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(f32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Float64 => match entry.key.value.try_into() {
-                        Ok(bytes) => RustHeaderKey::from(f64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                }
-            },
-            value: {
-                let kind = RustHeaderKind::from_code(entry.value.kind)
-                    .map_err(|error| format!("Could not convert header field: {error}"))?;
-
-                match kind {
-                    RustHeaderKind::Raw => RustHeaderValue::try_from(entry.value.value)
-                        .map_err(|error| format!("Could not convert header field: {error}"))?,
-                    RustHeaderKind::String => {
-                        let value = String::from_utf8(entry.value.value).map_err(|_| {
-                            "Could not convert header field: invalid UTF-8 string".to_string()
-                        })?;
-                        RustHeaderValue::try_from(value)
-                            .map_err(|error| format!("Could not convert header field: {error}"))?
-                    }
-                    RustHeaderKind::Bool => match entry.value.value.as_slice() {
-                        [0] => RustHeaderValue::from(false),
-                        [1] => RustHeaderValue::from(true),
-                        _ => {
-                            return Err(
-                                "Could not convert header field: bool values must encode as 0 or 1"
-                                    .to_string(),
-                            );
-                        }
-                    },
-                    RustHeaderKind::Int8 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(i8::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int16 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(i16::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int32 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(i32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int64 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(i64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Int128 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(i128::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint8 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(u8::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint16 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(u16::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint32 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(u32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint64 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(u64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Uint128 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(u128::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Float32 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(f32::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                    RustHeaderKind::Float64 => match entry.value.value.try_into() {
-                        Ok(bytes) => RustHeaderValue::from(f64::from_le_bytes(bytes)),
-                        Err(value) => {
-                            return Err(format!(
-                                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
-                                value.len()
-                            ));
-                        }
-                    },
-                }
-            },
+            key: decode_field(entry.key.kind, entry.key.value)?,
+            value: decode_field(entry.value.kind, entry.value.value)?,
         })
+    }
+}
+
+fn decode_field<T>(kind: u8, value: Vec<u8>) -> Result<RustHeaderField<T>, String> {
+    let kind = RustHeaderKind::from_code(kind)
+        .map_err(|error| format!("Could not convert header field: {error}"))?;
+
+    match kind {
+        RustHeaderKind::Raw => RustHeaderField::try_from(value)
+            .map_err(|error| format!("Could not convert header field: {error}")),
+        RustHeaderKind::String => {
+            let value = String::from_utf8(value)
+                .map_err(|_| "Could not convert header field: invalid UTF-8 string".to_string())?;
+            RustHeaderField::try_from(value)
+                .map_err(|error| format!("Could not convert header field: {error}"))
+        }
+        RustHeaderKind::Bool => match value.as_slice() {
+            [0] => Ok(RustHeaderField::from(false)),
+            [1] => Ok(RustHeaderField::from(true)),
+            _ => {
+                Err("Could not convert header field: bool values must encode as 0 or 1".to_string())
+            }
+        },
+        RustHeaderKind::Int8 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i8::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int16 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i16::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int128 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i128::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint8 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u8::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint16 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u16::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint128 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u128::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Float32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(f32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Float64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(f64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
     }
 }
 
