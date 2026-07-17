@@ -442,6 +442,9 @@ impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
         let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
         let user_headers = match message.user_headers {
             Some(raw_headers) => {
+                // Keep polling forward-compatible with future header kinds. Unlike the Rust SDK's
+                // typed decoder, this structural decoder preserves unknown kinds and values whose
+                // lengths do not match their fixed-width kind.
                 let wire_headers = WireUserHeaders::from_bytes(raw_headers).map_err(|error| {
                     format!("Could not convert polled message user headers: {error}")
                 })?;
