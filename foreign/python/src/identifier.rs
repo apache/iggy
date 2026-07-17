@@ -38,10 +38,10 @@ impl TryFrom<PyIdentifier> for Identifier {
     fn try_from(py_identifier: PyIdentifier) -> Result<Self, Self::Error> {
         match py_identifier {
             PyIdentifier::String(s) => {
-                Identifier::from_str(&s).map_err(|e| PyIggyError::new_err_from_rust(e))
+                Identifier::from_str(&s).map_err(PyIggyError::new_err_from_rust)
             }
             PyIdentifier::Int(i) => {
-                Identifier::numeric(i).map_err(|e| PyIggyError::new_err_from_rust(e))
+                Identifier::numeric(i).map_err(PyIggyError::new_err_from_rust)
             }
         }
     }
@@ -55,11 +55,11 @@ impl TryFrom<&Identifier> for PyIdentifier {
             IdKind::String => val
                 .get_string_value()
                 .map(PyIdentifier::String)
-                .map_err(|e| PyIggyError::new_err_from_rust(e)),
+                .map_err(PyIggyError::new_err_from_rust),
             IdKind::Numeric => val
                 .get_u32_value()
                 .map(PyIdentifier::Int)
-                .map_err(|e| PyIggyError::new_err_from_rust(e)),
+                .map_err(PyIggyError::new_err_from_rust),
         }
     }
 }

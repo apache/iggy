@@ -39,9 +39,9 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+use crate::error::IggyError as PyIggyError;
 use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
-use crate::error::IggyError as PyIggyError;
 
 /// A Python class representing the Iggy consumer.
 /// It wraps the RustIggyConsumer and provides asynchronous functionality
@@ -111,7 +111,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|e| PyIggyError::new_err_from_rust(e))
+                .map_err(PyIggyError::new_err_from_rust)
         })
     }
 
@@ -132,7 +132,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|e| PyIggyError::new_err_from_rust(e))
+                .map_err(PyIggyError::new_err_from_rust)
         })
     }
 
@@ -168,8 +168,8 @@ impl IggyConsumer {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume: JoinHandle<PyResult<Result<(), RustIggyError>>> =
-                get_runtime().spawn(scope(task_locals, async move {
+            let handle_consume: JoinHandle<PyResult<Result<(), RustIggyError>>> = get_runtime()
+                .spawn(scope(task_locals, async move {
                     let task_locals =
                         Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
                     let consumer = PyCallbackConsumer {
@@ -213,7 +213,7 @@ impl IggyConsumer {
 
             consume_result
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
-                .map_err(|e| PyIggyError::new_err_from_rust(e))?;
+                .map_err(PyIggyError::new_err_from_rust)?;
             Ok(())
         })
     }
@@ -366,8 +366,7 @@ impl ReceiveMessageIterator {
                         inner: m.message,
                         partition_id: m.partition_id,
                     })
-                    .map_err(|e| PyIggyError::new_err_from_rust(e))?
-                )
+                    .map_err(PyIggyError::new_err_from_rust)?)
             } else {
                 Err(PyStopAsyncIteration::new_err("No more messages"))
             }

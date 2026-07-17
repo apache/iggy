@@ -641,6 +641,10 @@ class IggyConsumer:
 
 @typing.final
 class IggyError(builtins.Exception):
+    r"""
+    A Python class representing the Rust's IggyError.
+    Allows transparent representation of Iggy-specific errors.
+    """
     @property
     def code(self) -> builtins.int: ...
     @property
