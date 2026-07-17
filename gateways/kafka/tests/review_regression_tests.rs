@@ -63,7 +63,7 @@ fn produce_acks_zero_malformed_body_decode_carries_acks() {
         other => panic!("expected decode error with acks=0, got {other:?}"),
     }
     assert!(
-        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_none(),
+        handle_request(API_KEY_PRODUCE, 3, body, &default_broker()).is_no_response(),
         "handler must not respond when acks=0 even if decode fails after acks"
     );
 }
@@ -156,7 +156,7 @@ fn parse_list_offsets_v0_partition(d: &mut Decoder) {
 #[test]
 fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
     let body = handle_request(API_KEY_LIST_OFFSETS, 0, Bytes::new(), &default_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i32().unwrap(), 1, "topics array length");
@@ -180,7 +180,7 @@ fn list_offsets_v0_unsupported_version_is_parseable_by_v0_clients() {
 fn list_offsets_v0_unsupported_version_carries_error_code_in_partition() {
     let request_body = build_list_offsets_v0_request_with_topic_t();
     let body = handle_request(API_KEY_LIST_OFFSETS, 0, request_body, &default_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i32().unwrap(), 1);
@@ -255,41 +255,17 @@ async fn e2e_list_offsets_v0_unsupported_version_no_trailing_bytes() {
 // ── Metadata topic name echo (review: must not hardcode "unknown-topic") ────
 
 #[test]
-fn metadata_v10_unsupported_decodes_client_body_not_clamped_version() {
-    let body = handle_request(
-        API_KEY_METADATA,
-        10,
-        build_metadata_flexible_request_v10(&["payments"]),
-        &default_broker(),
-    )
-    .expect("test request has acks != 0 and expects a response");
-
-    let mut d = Decoder::new(body);
-    d.read_i32().unwrap(); // throttle_time_ms
-    let broker_count = usize::try_from(d.read_varint().unwrap())
-        .unwrap()
-        .saturating_sub(1);
-    for _ in 0..broker_count {
-        d.read_i32().unwrap();
-        d.read_compact_nullable_string().unwrap();
-        d.read_i32().unwrap();
-        d.read_compact_nullable_string().unwrap();
-        d.read_tagged_fields().unwrap();
-    }
-    d.read_compact_nullable_string().unwrap();
-    d.read_i32().unwrap();
-    assert_eq!(
-        usize::try_from(d.read_varint().unwrap())
-            .unwrap()
-            .saturating_sub(1),
-        1
-    );
-    assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    assert_eq!(
-        d.read_compact_nullable_string()
-            .unwrap()
-            .expect("topic name"),
-        "payments"
+fn metadata_v10_unsupported_closes_connection() {
+    // Clamped v9 encoding cannot be parsed by a v10 client; close instead of lying on the wire.
+    assert!(
+        handle_request(
+            API_KEY_METADATA,
+            10,
+            build_metadata_flexible_request_v10(&["payments"]),
+            &default_broker(),
+        )
+        .is_close(),
+        "Metadata v10 must close rather than return a clamped unsupported-version body"
     );
 }
 
@@ -317,7 +293,7 @@ fn metadata_v1_echoes_requested_topic_name_in_response() {
     let topic = "orders";
     let request = build_metadata_legacy_request(&[topic]);
     let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let names = read_metadata_v1_topics(&mut d, 1);
@@ -330,7 +306,7 @@ fn metadata_v1_unknown_topic_returns_error_with_requested_name() {
     let topic = "orders";
     let request = build_metadata_legacy_request(&[topic]);
     let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let _brokers_count = d.read_i32().unwrap();

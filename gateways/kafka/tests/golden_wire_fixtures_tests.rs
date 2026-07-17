@@ -26,7 +26,7 @@ use iggy_gateway_kafka::protocol::codec::Encoder;
 fn golden_apiversions_v1_response_fixture() {
     let broker = BrokerAdvertise::default();
     let actual = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &broker)
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
 
     // error_code=0, api_count=6
     // key 0  (Produce)      min=0  max=9 (KAFKA-18659 advertise min=0)
@@ -60,7 +60,7 @@ fn golden_metadata_v0_single_topic_response_fixture() {
     let req_bytes = request.freeze();
 
     let actual = handle_request(API_KEY_METADATA, 0, req_bytes, &BrokerAdvertise::default())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
 
     // Metadata v0 layout: brokers[], topics[]  (no controller_id — added in v1)
     // brokers[1]: node_id=1, host=127.0.0.1, port=9093

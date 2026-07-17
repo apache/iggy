@@ -49,6 +49,58 @@ const MAX_SUPPORTED_METADATA_VERSION: i16 = 9;
 /// Sentinel for `topic_authorized_operations` / `cluster_authorized_operations` when ACLs are not supported.
 const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 
+/// Result of handling one Kafka request body.
+#[derive(Debug)]
+pub enum HandleOutcome {
+    /// Write this response body (with a response header).
+    Respond(Bytes),
+    /// Produce with `acks=0`: write nothing, keep the connection open.
+    NoResponse,
+    /// Client cannot parse an error at this request wire version; close the TCP connection.
+    Close,
+}
+
+impl HandleOutcome {
+    /// Collapse to `Some(body)` for a normal response, or `None` for [`HandleOutcome::NoResponse`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`HandleOutcome::Close`] — match on `Close` explicitly, or use
+    /// [`Self::expect_response`] in tests that require a body.
+    #[must_use]
+    pub fn into_optional_response(self) -> Option<Bytes> {
+        match self {
+            Self::Respond(body) => Some(body),
+            Self::NoResponse => None,
+            Self::Close => panic!("HandleOutcome::Close has no response body"),
+        }
+    }
+
+    /// Return the response body, or panic with `msg` if the outcome is not [`Self::Respond`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the outcome is [`Self::NoResponse`] or [`Self::Close`].
+    #[must_use]
+    pub fn expect_response(self, msg: &str) -> Bytes {
+        match self {
+            Self::Respond(body) => body,
+            Self::NoResponse => panic!("{msg}: got NoResponse"),
+            Self::Close => panic!("{msg}: got Close"),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_no_response(&self) -> bool {
+        matches!(self, Self::NoResponse)
+    }
+
+    #[must_use]
+    pub const fn is_close(&self) -> bool {
+        matches!(self, Self::Close)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerAdvertise {
     pub host: String,
@@ -109,25 +161,24 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
-/// Handles one decoded request frame and returns the response to write back,
-/// or `None` when the wire protocol forbids a response (Produce with `acks=0`).
+/// Handles one decoded request frame and returns how the connection should proceed.
 pub fn handle_request(
     api_key: i16,
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
-) -> Option<Bytes> {
+) -> HandleOutcome {
     if api_key == API_KEY_PRODUCE {
         return handle_produce_request(api_version, body);
     }
-    Some(handle_other_request(api_key, api_version, body, broker))
+    handle_other_request(api_key, api_version, body, broker)
 }
 
 /// Produce is the only request the wire protocol allows to go unanswered
-/// (`acks=0`), so it gets its own `Option`-returning path.
-fn handle_produce_request(api_version: i16, body: Bytes) -> Option<Bytes> {
+/// (`acks=0`), so it gets its own path that may return [`HandleOutcome::NoResponse`].
+fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
     if !is_supported_version(API_KEY_PRODUCE, api_version) {
-        return Some(encode_produce_error_response(
+        return HandleOutcome::Respond(encode_produce_error_response(
             api_version,
             ERROR_UNSUPPORTED_VERSION,
         ));
@@ -135,8 +186,10 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> Option<Bytes> {
     match decode_produce_request(api_version, body) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
-        ProduceDecodeResult::Ok(req) if req.acks == 0 => None,
-        ProduceDecodeResult::Ok(req) => Some(encode_produce_response(api_version, &req)),
+        ProduceDecodeResult::Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
+        ProduceDecodeResult::Ok(req) => {
+            HandleOutcome::Respond(encode_produce_response(api_version, &req))
+        }
         ProduceDecodeResult::Err {
             acks: Some(0),
             error,
@@ -145,11 +198,11 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> Option<Bytes> {
                 "Failed to decode Produce request with acks=0 (no response): {:?}",
                 error
             );
-            None
+            HandleOutcome::NoResponse
         }
         ProduceDecodeResult::Err { error, .. } => {
             tracing::warn!("Failed to decode Produce request: {:?}", error);
-            Some(encode_produce_error_response(
+            HandleOutcome::Respond(encode_produce_error_response(
                 api_version,
                 ERROR_INVALID_REQUEST,
             ))
@@ -162,71 +215,99 @@ fn handle_other_request(
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
-) -> Bytes {
+) -> HandleOutcome {
     match api_key {
         API_KEY_API_VERSIONS => {
             if is_supported_version(api_key, api_version) {
-                encode_api_versions_response(api_version, ERROR_NONE)
+                HandleOutcome::Respond(encode_api_versions_response(api_version, ERROR_NONE))
             } else {
                 // KIP-511: reply with v0 when the requested version is not understood.
-                encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION)
+                HandleOutcome::Respond(encode_api_versions_response(0, ERROR_UNSUPPORTED_VERSION))
             }
         }
         API_KEY_METADATA => {
             if is_supported_version(api_key, api_version) {
-                encode_metadata_response(api_version, api_version, body, broker, ERROR_NONE)
-            } else {
-                let response_version = api_version.clamp(0, MAX_SUPPORTED_METADATA_VERSION);
-                // Decode at the client's wire version; encode at the highest version we implement.
-                encode_metadata_response(
-                    response_version,
+                HandleOutcome::Respond(encode_metadata_response(
+                    api_version,
                     api_version,
                     body,
                     broker,
-                    ERROR_UNSUPPORTED_VERSION,
-                )
+                    ERROR_NONE,
+                ))
+            } else {
+                // Clamping the response to MAX_SUPPORTED_METADATA_VERSION leaves a body the
+                // client parses at its own (unsupported) version, so UNSUPPORTED_VERSION never
+                // survives. Clients that skip ApiVersions get a naked close instead.
+                tracing::warn!(
+                    api_version,
+                    max_supported = MAX_SUPPORTED_METADATA_VERSION,
+                    "Metadata version unsupported; closing connection"
+                );
+                HandleOutcome::Close
             }
         }
         API_KEY_FETCH => {
             if is_supported_version(api_key, api_version) {
                 match decode_fetch_request(api_version, body) {
-                    Ok(req) => encode_fetch_response(api_version, &req),
+                    Ok(req) => HandleOutcome::Respond(encode_fetch_response(api_version, &req)),
                     Err(e) => {
                         tracing::warn!("Failed to decode Fetch request: {:?}", e);
-                        encode_fetch_error_response(api_version, ERROR_INVALID_REQUEST)
+                        HandleOutcome::Respond(encode_fetch_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_fetch_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                HandleOutcome::Respond(encode_fetch_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
         API_KEY_LIST_OFFSETS => {
             if is_supported_version(api_key, api_version) {
                 match decode_list_offsets_request(api_version, body) {
-                    Ok(req) => encode_list_offsets_response(api_version, &req),
+                    Ok(req) => {
+                        HandleOutcome::Respond(encode_list_offsets_response(api_version, &req))
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to decode ListOffsets request: {:?}", e);
-                        encode_list_offsets_error_response(api_version, ERROR_INVALID_REQUEST)
+                        HandleOutcome::Respond(encode_list_offsets_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_list_offsets_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                HandleOutcome::Respond(encode_list_offsets_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
         API_KEY_CREATE_TOPICS => {
             if is_supported_version(api_key, api_version) {
                 match decode_create_topics_request(api_version, body) {
-                    Ok(req) => encode_create_topics_response(api_version, &req),
+                    Ok(req) => {
+                        HandleOutcome::Respond(encode_create_topics_response(api_version, &req))
+                    }
                     Err(e) => {
                         tracing::warn!("Failed to decode CreateTopics request: {:?}", e);
-                        encode_create_topics_error_response(api_version, ERROR_INVALID_REQUEST)
+                        HandleOutcome::Respond(encode_create_topics_error_response(
+                            api_version,
+                            ERROR_INVALID_REQUEST,
+                        ))
                     }
                 }
             } else {
-                encode_create_topics_error_response(api_version, ERROR_UNSUPPORTED_VERSION)
+                HandleOutcome::Respond(encode_create_topics_error_response(
+                    api_version,
+                    ERROR_UNSUPPORTED_VERSION,
+                ))
             }
         }
-        _ => encode_error_only_response(ERROR_UNSUPPORTED_VERSION),
+        _ => HandleOutcome::Respond(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
     }
 }
 

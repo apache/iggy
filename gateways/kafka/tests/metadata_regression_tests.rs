@@ -82,7 +82,7 @@ fn metadata_corrupt_partial_body_returns_zero_topics() {
         Bytes::from_static(&[0x00, 0x00]),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _ = read_broker_legacy(&mut d);
     assert_eq!(d.read_i32().unwrap(), 0);
@@ -97,7 +97,7 @@ fn metadata_v0_empty_topics_stub_broker() {
         metadata_request_legacy(0),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let (host, port) = read_broker_legacy(&mut d);
     assert_eq!(host, "127.0.0.1");
@@ -113,7 +113,7 @@ fn metadata_v0_three_topics_each_unknown() {
         metadata_request_legacy(3),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _ = read_broker_legacy(&mut d);
     assert_eq!(d.read_i32().unwrap(), 3);
@@ -135,7 +135,7 @@ fn metadata_v1_includes_controller_id() {
         metadata_request_legacy(0),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     // Metadata v1 has no throttle_time_ms (added in v3).
     let _ = read_broker_legacy(&mut d);
@@ -152,7 +152,7 @@ fn metadata_v2_includes_cluster_id_field() {
         metadata_request_legacy(0),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _ = read_broker_legacy(&mut d);
     let _rack = d.read_nullable_string().unwrap();
@@ -170,7 +170,7 @@ fn metadata_all_legacy_versions_produce_valid_response() {
             metadata_request_legacy(1),
             &default_broker(),
         )
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
         let mut d = Decoder::new(body);
         if version >= 3 {
             let _throttle = d.read_i32().unwrap();
@@ -198,7 +198,7 @@ fn metadata_v9_flexible_encoding() {
         metadata_request_flexible(2),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _throttle = d.read_i32().unwrap();
     let (host, port) = read_broker_flexible(&mut d);
@@ -235,7 +235,7 @@ fn metadata_v8_includes_authorized_operations_legacy() {
         metadata_request_legacy(1),
         &default_broker(),
     )
-    .expect("test request has acks != 0 and expects a response");
+    .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let _throttle = d.read_i32().unwrap();
     let _ = read_broker_legacy(&mut d);
@@ -259,7 +259,7 @@ fn metadata_uses_custom_broker_advertise() {
         port: 29093,
     };
     let body = handle_request(API_KEY_METADATA, 0, metadata_request_legacy(0), &broker)
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     let (host, port) = read_broker_legacy(&mut d);
     assert_eq!(host, "10.0.0.42");

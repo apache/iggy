@@ -29,8 +29,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    BrokerAdvertise, DEFAULT_KAFKA_PORT, ERROR_INVALID_REQUEST, encode_error_only_response,
-    handle_request,
+    BrokerAdvertise, DEFAULT_KAFKA_PORT, ERROR_INVALID_REQUEST, HandleOutcome,
+    encode_error_only_response, handle_request,
 };
 use crate::protocol::codec::Decoder;
 use crate::protocol::header::{
@@ -287,23 +287,33 @@ async fn handle_connection(
         );
 
         let body = decoder.read_bytes(decoder.remaining())?;
-        let Some(body_response) = handle_request(req.api_key, req.api_version, body, &broker)
-        else {
-            // Produce with acks=0: the wire protocol forbids a response.
-            continue;
-        };
-
-        let resp_header = ResponseHeader {
-            correlation_id: req.correlation_id,
-        };
-        send_response(
-            &mut stream,
-            &resp_header,
-            resp_hdr_ver,
-            &body_response,
-            config.write_timeout,
-        )
-        .await?;
+        match handle_request(req.api_key, req.api_version, body, &broker) {
+            HandleOutcome::NoResponse => {
+                // Produce with acks=0: the wire protocol forbids a response.
+            }
+            HandleOutcome::Close => {
+                warn!(
+                    %peer,
+                    api_key = req.api_key,
+                    api_version = req.api_version,
+                    "closing connection: no parseable error response for this request version"
+                );
+                return Ok(());
+            }
+            HandleOutcome::Respond(body_response) => {
+                let resp_header = ResponseHeader {
+                    correlation_id: req.correlation_id,
+                };
+                send_response(
+                    &mut stream,
+                    &resp_header,
+                    resp_hdr_ver,
+                    &body_response,
+                    config.write_timeout,
+                )
+                .await?;
+            }
+        }
     }
 }
 

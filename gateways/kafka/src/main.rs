@@ -52,11 +52,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = &mut server_task => {
             return Ok(result??);
         }
-        _ = signal::ctrl_c() => {
+        () = shutdown_signal() => {
             let _ = tx.send(());
         }
     }
 
     server_task.await??;
     Ok(())
+}
+
+/// Wait for Ctrl-C (SIGINT) or, on Unix, SIGTERM (`docker stop`).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }

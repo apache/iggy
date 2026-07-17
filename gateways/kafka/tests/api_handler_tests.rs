@@ -37,7 +37,7 @@ use wire::build_metadata_flexible_request_v10;
 #[test]
 fn api_versions_v1_response_non_flexible_format() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &test_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -62,7 +62,7 @@ fn api_versions_v1_response_non_flexible_format() {
 #[test]
 fn api_versions_v3_response_flexible_format() {
     let body = handle_request(API_KEY_API_VERSIONS, 3, Bytes::new(), &test_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     assert_eq!(d.read_i16().unwrap(), 0); // error_code
@@ -93,7 +93,7 @@ fn api_versions_v3_response_flexible_format() {
 #[test]
 fn metadata_response_has_broker_array_and_topic_array() {
     let body = handle_request(API_KEY_METADATA, 0, Bytes::new(), &test_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
     let broker_count = d.read_i32().unwrap();
@@ -110,42 +110,17 @@ fn metadata_response_has_broker_array_and_topic_array() {
 }
 
 #[test]
-fn unsupported_version_returns_protocol_error() {
-    // v99 client sends a well-formed v10+ flexible body (topic_id + name) requesting "orders".
-    // Response encodes at v9 (highest supported); request decodes at client version 99.
-    let body = handle_request(
-        API_KEY_METADATA,
-        99,
-        build_metadata_flexible_request_v10(&["orders"]),
-        &test_broker(),
-    )
-    .expect("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    // v9 flexible response layout:
-    d.read_i32().unwrap(); // throttle_time_ms (v3+)
-    let broker_count = usize::try_from(d.read_varint().unwrap())
-        .unwrap()
-        .saturating_sub(1);
-    for _ in 0..broker_count {
-        d.read_i32().unwrap(); // node_id
-        d.read_compact_nullable_string().unwrap(); // host
-        d.read_i32().unwrap(); // port
-        d.read_compact_nullable_string().unwrap(); // rack
-        d.read_tagged_fields().unwrap();
-    }
-    d.read_compact_nullable_string().unwrap(); // cluster_id (v2+)
-    d.read_i32().unwrap(); // controller_id (v1+)
-    let topic_count = usize::try_from(d.read_varint().unwrap())
-        .unwrap()
-        .saturating_sub(1);
-    assert_eq!(topic_count, 1);
-    let topic_error = d.read_i16().unwrap();
-    assert_eq!(topic_error, ERROR_UNSUPPORTED_VERSION);
-    let topic_name = d.read_compact_nullable_string().unwrap();
-    assert_eq!(
-        topic_name,
-        Some("orders".to_string()),
-        "metadata must echo the requested topic name even on an unsupported-version reply"
+fn unsupported_metadata_version_closes_connection() {
+    // Above max: a clamped v9 body is unparseable to a v99 client, so Close is the honest contract.
+    assert!(
+        handle_request(
+            API_KEY_METADATA,
+            99,
+            build_metadata_flexible_request_v10(&["orders"]),
+            &test_broker(),
+        )
+        .is_close(),
+        "Metadata above supported max must close rather than return a clamped body"
     );
 }
 
@@ -154,7 +129,7 @@ fn unsupported_version_returns_protocol_error() {
 #[test]
 fn unknown_api_key_returns_error_only_payload() {
     let body = handle_request(999, 0, Bytes::new(), &test_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 }
@@ -170,7 +145,7 @@ fn version_support_table_is_applied() {
 #[test]
 fn apiversions_unsupported_version_uses_v0_encoding_without_throttle() {
     let body = handle_request(API_KEY_API_VERSIONS, 99, Bytes::new(), &test_broker())
-        .expect("test request has acks != 0 and expects a response");
+        .expect_response("test request has acks != 0 and expects a response");
     // v0: error_code(2) + api_keys i32 count(4) + 6 entries × 6 bytes = 42 — no throttle_time_ms.
     assert_eq!(body.len(), 42);
     let mut d = Decoder::new(body);
@@ -188,7 +163,7 @@ fn produce_malformed_body_with_acks_one_returns_invalid_request() {
         0x00, 0x00, 0x00, 0x01, // one topic
     ]);
     let response = handle_request(API_KEY_PRODUCE, 3, body, &test_broker())
-        .expect("acks=1 malformed produce should get error response");
+        .expect_response("acks=1 malformed produce should get error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
@@ -209,7 +184,7 @@ fn fetch_malformed_body_returns_invalid_request() {
         ]),
         &test_broker(),
     )
-    .expect("fetch must return error response");
+    .expect_response("fetch must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
@@ -228,7 +203,7 @@ fn list_offsets_malformed_body_returns_invalid_request() {
         ]),
         &test_broker(),
     )
-    .expect("list offsets must return error response");
+    .expect_response("list offsets must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.read_varint().unwrap(), 2);
@@ -252,7 +227,7 @@ fn create_topics_malformed_body_returns_invalid_request() {
         ]),
         &test_broker(),
     )
-    .expect("create topics must return error response");
+    .expect_response("create topics must return error response");
     let mut d = Decoder::new(response);
     assert_eq!(d.read_i32().unwrap(), 0);
     assert_eq!(d.read_varint().unwrap(), 2);
@@ -274,7 +249,7 @@ fn metadata_null_topic_name_yields_zero_topics() {
         ]),
         &test_broker(),
     )
-    .expect("metadata request should still return response");
+    .expect_response("metadata request should still return response");
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i32().unwrap(), 1);
     d.read_i32().unwrap();
