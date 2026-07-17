@@ -339,6 +339,92 @@ class IggyClient:
         Logs in the user with the given credentials.
         Returns `Ok(())` on success, or a PyRuntimeError on failure.
         """
+    def get_user(
+        self, user_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[UserInfoDetails | None]:
+        r"""
+        Get the info about a specific user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `UserInfoDetails` if the user exists,
+            or `None` otherwise.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
+        r"""
+        Get the info about all the users.
+
+        Returns:
+            An awaitable that resolves to `list[UserInfo]`.
+
+        Raises:
+            PyRuntimeError: If the request fails.
+        """
+    def create_user(
+        self,
+        username: builtins.str,
+        password: builtins.str,
+        status: UserStatus | None = None,
+    ) -> collections.abc.Awaitable[UserInfoDetails]:
+        r"""
+        Create a new user.
+
+        The user is created without permissions.
+
+        Args:
+            username: Username as `str`.
+            password: Password as `str`.
+            status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+
+        Returns:
+            An awaitable that resolves to the created `UserInfoDetails`.
+
+        Raises:
+            PyRuntimeError: If an argument is invalid or the request fails.
+        """
+    def update_user(
+        self,
+        user_id: builtins.str | builtins.int,
+        username: builtins.str | None = None,
+        status: UserStatus | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Update a user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            username: New username as `str | None`; unchanged when `None`.
+            status: New status as `UserStatus | None`; unchanged when `None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the user is updated.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
+    def delete_user(
+        self, user_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+
+        Returns:
+            An awaitable that resolves to `None` when the user is deleted.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
