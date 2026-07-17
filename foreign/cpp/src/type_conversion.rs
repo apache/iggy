@@ -480,21 +480,6 @@ impl From<RustIggyMessage> for ffi::IggyMessagePolled {
     }
 }
 
-impl From<RustHeaderEntry> for ffi::HeaderEntry {
-    fn from(entry: RustHeaderEntry) -> Self {
-        ffi::HeaderEntry {
-            key: ffi::HeaderField {
-                kind: entry.key.kind().as_code(),
-                value: entry.key.as_bytes().to_vec(),
-            },
-            value: ffi::HeaderField {
-                kind: entry.value.kind().as_code(),
-                value: entry.value.as_bytes().to_vec(),
-            },
-        }
-    }
-}
-
 impl TryFrom<ffi::HeaderEntry> for RustHeaderEntry {
     type Error = String;
 
