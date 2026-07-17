@@ -111,7 +111,7 @@ fn metadata_response_has_broker_array_and_topic_array() {
 
 #[test]
 fn unsupported_metadata_version_closes_connection() {
-    // Above max: a clamped v9 body is unparseable to a v99 client, so Close is the honest contract.
+    // Above max: a clamped v9 body is unparsable to a v99 client, so Close is the honest contract.
     assert!(
         handle_request(
             API_KEY_METADATA,

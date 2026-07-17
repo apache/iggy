@@ -209,7 +209,7 @@ async fn each_scoped_api_above_max_version_e2e_keeps_connection() {
             .await
             .unwrap_or_else(|_| panic!("write {name} v{above}"));
         if api_key == API_KEY_METADATA {
-            // Unsupported Metadata closes: clamped bodies are unparseable at the client version.
+            // Unsupported Metadata closes: clamped bodies are unparsable at the client version.
             assert_eq!(
                 tcp::read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
                 tcp::ByteRead::Closed,
