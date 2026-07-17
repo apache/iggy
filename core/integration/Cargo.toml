@@ -81,7 +81,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
-socket2 = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }

@@ -44,7 +44,7 @@ pub struct ConnectorsRuntimeHandle {
     iggy_address: Option<SocketAddr>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
-    port_reserver: Option<SinglePortReserver>,
+    _port_reserver: SinglePortReserver,
 }
 
 impl std::fmt::Debug for ConnectorsRuntimeHandle {
@@ -127,7 +127,7 @@ impl ConnectorsRuntimeHandle {
             iggy_address: None,
             stdout_path: None,
             stderr_path: None,
-            port_reserver: Some(reserver),
+            _port_reserver: reserver,
         }
     }
 }
@@ -243,16 +243,6 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        // Release port reservation just before health-checking. The reservation
-        // holds the port while the child process initializes, preventing another
-        // process from claiming it. By the time we reach here the child has had
-        // enough time to bind (or will bind within the first few health-check
-        // retries). This matches the server handle pattern where the reservation
-        // is held until the process has bound.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         let http_address = self.http_url();
         let client = reqwest::Client::new();
 
@@ -283,6 +273,9 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
 
 impl Drop for ConnectorsRuntimeHandle {
     fn drop(&mut self) {
+        // Reap the child before `_port_reserver` drops: `Child::drop` detaches
+        // without waiting, so the freed slot could be reused while this runtime
+        // still holds its ports.
         let _ = self.stop();
         common::dump_logs_on_panic("Iggy connectors", &self.stdout_path, &self.stderr_path);
     }
