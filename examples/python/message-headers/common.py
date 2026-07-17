@@ -20,10 +20,9 @@ import asyncio
 import json
 import secrets
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
 from apache_iggy import (
     HeaderKey,
@@ -86,23 +85,24 @@ def generate_orders() -> Iterator[Order]:
     order_id = 0
     while True:
         order_id += 1
+        group_id = (order_id + 2) // 3
         match order_id % 3:
-            case 0:
+            case 1:
                 payload = {
-                    "orderId": f"order-{order_id}",
+                    "orderId": f"order-{group_id}",
                     "customerId": f"customer-{secrets.randbelow(100)}",
                     "amount": secrets.randbelow(10000) + 1,
                 }
                 yield Order(OrderType.CREATED, json.dumps(payload))
-            case 1:
+            case 2:
                 payload = {
-                    "orderId": f"order-{order_id // 3}",
+                    "orderId": f"order-{group_id}",
                     "timestamp": int(time.time() * 1000),
                 }
                 yield Order(OrderType.CONFIRMED, json.dumps(payload))
             case _:
                 payload = {
-                    "orderId": f"order-{order_id // 3}",
+                    "orderId": f"order-{group_id}",
                     "reason": "Insufficient balance",
                 }
                 yield Order(OrderType.REJECTED, json.dumps(payload))
@@ -234,7 +234,7 @@ def log_order(message_type: OrderType | None, payload: object) -> None:
             logger.warning(f"Received unknown message type: {message_type}")
 
 
-def format_headers(headers: Mapping[Any, Any]) -> dict[str, str]:
+def format_headers(headers: dict) -> dict[str, str]:
     formatted: dict[str, str] = {}
     for key, value in headers.items():
         formatted_key = repr(key) if isinstance(key, HeaderKey) else str(key)

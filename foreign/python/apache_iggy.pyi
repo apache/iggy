@@ -1263,7 +1263,7 @@ class SendMessage:
     def __new__(
         cls,
         data: builtins.str | bytes,
-        user_headers: dict[typing.Any, typing.Any] | None = None,
+        user_headers: dict | None = None,
         id: builtins.int | None = None,
     ) -> SendMessage:
         r"""
@@ -1399,6 +1399,7 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
 class UserHeaders(dict):
     r"""
     User headers dictionary returned by `ReceiveMessage.user_headers`.
@@ -1407,9 +1408,7 @@ class UserHeaders(dict):
     operations work) that additionally exposes `to_scalar_dict` for the convenient
     scalar form.
     """
-    def __new__(
-        cls, mapping: dict[typing.Any, typing.Any] | None = None
-    ) -> UserHeaders:
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
         r"""
         Wraps a mapping so its entries gain the `to_scalar_dict` helper.
 
@@ -1424,7 +1423,7 @@ class UserHeaders(dict):
         r"""
         Converts these headers into the convenient plain dictionary form.
 
-        Every header kind maps losslessly onto a Python scalar, so this never
-        loses information; it only returns an error if a stored field cannot be
-        decoded.
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
         """

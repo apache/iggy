@@ -16,9 +16,7 @@
 # under the License.
 
 import asyncio
-import logging
 import uuid
-from typing import TypeAlias
 
 import pytest
 
@@ -30,11 +28,6 @@ from apache_iggy import (
     UserHeaders,
 )
 from apache_iggy import SendMessage as Message
-
-HTTP_CREATED = 201
-JsonValue: TypeAlias = (
-    None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-)
 
 
 class TestMessageOperations:
@@ -222,10 +215,8 @@ class TestMessageOperations:
         stream_name = unique_name()
         topic_name = unique_name()
         partition_id = 0
-        typed_key = HeaderKey.UnsignedInt128(42)
-        typed_value = HeaderValue.UnsignedInt128(2**96)
         user_headers: dict[HeaderKey, HeaderValue] = {
-            typed_key: typed_value,
+            HeaderKey.UnsignedInt128(42): HeaderValue.UnsignedInt128(2**96),
             HeaderKey.String("float32"): HeaderValue.Float32(1.25),
         }
 
@@ -238,7 +229,7 @@ class TestMessageOperations:
             stream=stream_name,
             topic=topic_name,
             partitioning=partition_id,
-            messages=[Message("typed headers", user_headers=user_headers)],
+            messages=[Message("typed headers", user_headers=user_headers)],  # pyright: ignore[reportArgumentType]
         )
 
         polled_messages = await iggy_client.poll_messages(
@@ -391,7 +382,7 @@ class TestMessageOperations:
             },
         )
 
-    def test_plain_user_headers_convert_every_kind_losslessly(self, caplog):
+    def test_plain_user_headers_convert_every_kind_losslessly(self):
         """Test every header kind converts to a plain scalar without logging."""
         headers = UserHeaders(
             {
@@ -408,8 +399,7 @@ class TestMessageOperations:
             }
         )
 
-        with caplog.at_level(logging.WARNING, logger="apache_iggy"):
-            plain = headers.to_scalar_dict()
+        plain = headers.to_scalar_dict()
 
         assert plain == {
             "content-type": "application/json",
@@ -421,24 +411,32 @@ class TestMessageOperations:
             "ratio": 1.25,
             "score": 0.5,
         }
-        assert caplog.records == []
 
     def test_plain_user_headers_accepts_plain_dict(self):
         """Test the plain dictionary form passes through unchanged."""
         headers = {"content-type": "application/json", "attempt": 3}
         assert UserHeaders(headers).to_scalar_dict() == headers
 
-    def test_plain_user_headers_preserve_non_string_keys(self, caplog):
+    def test_plain_user_headers_preserve_non_string_keys(self):
         """Test non-string typed keys convert back to their scalar Python type."""
         headers = UserHeaders(
             {HeaderKey.UnsignedInt32(7): HeaderValue.String("order-id")}
         )
 
-        with caplog.at_level(logging.WARNING, logger="apache_iggy"):
-            plain = headers.to_scalar_dict()
+        plain = headers.to_scalar_dict()
 
         assert plain == {7: "order-id"}
-        assert caplog.records == []
+
+    def test_to_scalar_dict_raises_on_colliding_keys(self):
+        """Test that typed keys mapping to the same plain scalar raise an error."""
+        headers = UserHeaders(
+            {
+                HeaderKey.UnsignedInt8(1): HeaderValue.String("first"),
+                HeaderKey.UnsignedInt16(1): HeaderValue.String("second"),
+            }
+        )
+        with pytest.raises(ValueError, match="Distinct typed header keys"):
+            headers.to_scalar_dict()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

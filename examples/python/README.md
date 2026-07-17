@@ -78,7 +78,7 @@ Shows how to attach and read Python SDK user headers with `str`, `bytes`, `bool`
 - `plain-headers/` uses the convenient `dict[str, str | bytes | bool | int | float]` form; the SDK infers a wire type for each value.
 - `typed-headers/` uses explicit `HeaderKey`/`HeaderValue` for full control over the wire type.
 
-Both are consumed identically, since plain headers are stored as typed headers on the wire.
+Both producers store typed headers on the wire. The plain consumer converts them to Python scalars, while the typed consumer preserves and inspects the explicit header kinds.
 
 ```bash
 # Using uv

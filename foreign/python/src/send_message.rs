@@ -66,8 +66,9 @@ impl SendMessage {
     pub fn new(
         py: Python,
         data: PyMessagePayload,
-        #[gen_stub(override_type(type_repr = "dict[typing.Any, typing.Any] | None"))]
-        user_headers: Option<&Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "dict | None"))] user_headers: Option<
+            &Bound<'_, PyAny>,
+        >,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] id: Option<u128>,
     ) -> PyResult<Self> {
         let payload = match data {

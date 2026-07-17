@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use iggy::prelude::{
     HeaderField, HeaderKey as RustHeaderKey, HeaderKind, HeaderValue as RustHeaderValue,
 };
+use pyo3::PyClass;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
@@ -248,6 +249,55 @@ impl<'py> TryFrom<RustHeaderKeyRef<'py, '_>> for Bound<'py, HeaderKey> {
             },
         };
         key.into_pyobject(py)
+    }
+}
+
+trait ToPlainScalar {
+    fn to_plain_scalar<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>;
+}
+
+macro_rules! impl_to_plain_scalar {
+    ($ty:ty) => {
+        impl ToPlainScalar for $ty {
+            fn to_plain_scalar<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+                match self {
+                    Self::Raw { value } => Ok(value.bind(py).clone().into_any()),
+                    Self::String { value } => Ok(value.clone().into_pyobject(py)?.into_any()),
+                    Self::Bool { value } => Ok((*value).into_pyobject(py)?.to_owned().into_any()),
+                    Self::Int8 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::Int16 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::Int32 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::Int64 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::Int128 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::UnsignedInt8 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::UnsignedInt16 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::UnsignedInt32 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::UnsignedInt64 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::UnsignedInt128 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                    Self::Float32 { value } => Ok(f64::from(*value).into_pyobject(py)?.into_any()),
+                    Self::Float64 { value } => Ok((*value).into_pyobject(py)?.into_any()),
+                }
+            }
+        }
+    };
+}
+
+impl_to_plain_scalar!(HeaderKey);
+impl_to_plain_scalar!(HeaderValue);
+
+/// Borrows a typed header ([`HeaderKey`] or [`HeaderValue`]) together with the
+/// GIL token for direct conversion to a plain Python scalar.
+struct HeaderToPlainRef<'py, 'value, T: ToPlainScalar> {
+    py: Python<'py>,
+    value: &'value T,
+}
+
+impl<'py, T: ToPlainScalar> TryFrom<HeaderToPlainRef<'py, '_, T>> for Bound<'py, PyAny> {
+    type Error = PyErr;
+
+    fn try_from(inner: HeaderToPlainRef<'py, '_, T>) -> PyResult<Self> {
+        let HeaderToPlainRef { py, value } = inner;
+        value.to_plain_scalar(py)
     }
 }
 
@@ -621,8 +671,7 @@ impl UserHeaders {
     #[new]
     #[pyo3(signature = (mapping=None))]
     pub fn new(
-        #[gen_stub(override_type(type_repr = "dict[typing.Any, typing.Any] | None"))]
-        mapping: Option<&Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "dict | None"))] mapping: Option<&Bound<'_, PyAny>>,
     ) -> Self {
         let _ = mapping;
         UserHeaders
@@ -630,18 +679,41 @@ impl UserHeaders {
 
     /// Converts these headers into the convenient plain dictionary form.
     ///
-    /// Every header kind maps losslessly onto a Python scalar, so this never
-    /// loses information; it only returns an error if a stored field cannot be
-    /// decoded.
+    /// Returns an error if two distinct typed keys map to the same plain
+    /// Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+    /// become `int(1)`), or if a stored field cannot be decoded.
     #[gen_stub(override_return_type(
         type_repr = "dict[str | bytes | bool | int | float, str | bytes | bool | int | float]"
     ))]
     pub fn to_scalar_dict<'a>(slf: &Bound<'a, Self>) -> PyResult<Bound<'a, PyDict>> {
         let py = slf.py();
         let dict = slf.as_any().cast::<PyDict>()?;
-        let headers = py_user_headers_to_rust(py, dict)?;
-        rust_user_headers_to_plain_py(py, headers)
+        let result = PyDict::new(py);
+        for (key, value) in dict.iter() {
+            let plain_key = py_any_to_plain::<HeaderKey>(py, &key)?;
+            let plain_value = py_any_to_plain::<HeaderValue>(py, &value)?;
+            if result.contains(&plain_key)? {
+                return Err(PyValueError::new_err(
+                    "Distinct typed header keys produce the same plain Python scalar; this conversion is lossy and cannot proceed",
+                ));
+            }
+            result.set_item(plain_key, plain_value)?;
+        }
+        Ok(result)
     }
+}
+
+fn py_any_to_plain<'py, T: ToPlainScalar + PyClass>(
+    py: Python<'py>,
+    any: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(header) = any.extract::<PyRef<'_, T>>() {
+        return Bound::<PyAny>::try_from(HeaderToPlainRef {
+            py,
+            value: &*header,
+        });
+    }
+    Ok(any.clone())
 }
 
 fn py_header_key_to_rust(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<RustHeaderKey> {
@@ -761,100 +833,6 @@ fn checked_float32<T>(value: f32) -> PyResult<HeaderField<T>> {
         ));
     }
     Ok(value.into())
-}
-
-fn rust_user_headers_to_plain_py<'a>(
-    py: Python<'a>,
-    headers: RustUserHeaders,
-) -> PyResult<Bound<'a, PyDict>> {
-    // Every header kind maps losslessly onto a Python scalar, so the conversion
-    // is direct and only surfaces genuine decode errors.
-    let result = PyDict::new(py);
-    for (key, value) in headers {
-        let key = header_field_to_plain_py(py, &key)?;
-        let value = header_field_to_plain_py(py, &value)?;
-        result.set_item(key, value)?;
-    }
-    Ok(result)
-}
-
-fn header_field_to_plain_py<'a, T>(
-    py: Python<'a>,
-    field: &HeaderField<T>,
-) -> PyResult<Bound<'a, PyAny>> {
-    let plain = match field.kind() {
-        HeaderKind::Raw => PyBytes::new(py, field.as_raw().map_err(to_value_error)?).into_any(),
-        HeaderKind::String => field
-            .as_str()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Bool => field
-            .as_bool()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .to_owned()
-            .into_any(),
-        HeaderKind::Int8 => field
-            .as_int8()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Int16 => field
-            .as_int16()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Int32 => field
-            .as_int32()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Int64 => field
-            .as_int64()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Int128 => field
-            .as_int128()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Uint8 => field
-            .as_uint8()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Uint16 => field
-            .as_uint16()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Uint32 => field
-            .as_uint32()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Uint64 => field
-            .as_uint64()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Uint128 => field
-            .as_uint128()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Float32 => f64::from(field.as_float32().map_err(to_value_error)?)
-            .into_pyobject(py)?
-            .into_any(),
-        HeaderKind::Float64 => field
-            .as_float64()
-            .map_err(to_value_error)?
-            .into_pyobject(py)?
-            .into_any(),
-    };
-    Ok(plain)
 }
 
 fn header_key_richcmp<'py>(
