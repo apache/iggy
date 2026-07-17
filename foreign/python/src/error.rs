@@ -22,6 +22,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 /// A Python class representing the Rust's IggyError.
 /// Allows transparent representation of Iggy-specific errors.
+/// You can find all available error codes and names in IggyError enum, which lives in core/common/src/error/iggy_error.rs.
 #[gen_stub_pyclass]
 #[pyclass(skip_from_py_object, extends=PyException)]
 #[derive(Clone, Debug)]

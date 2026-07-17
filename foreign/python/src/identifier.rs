@@ -40,9 +40,7 @@ impl TryFrom<PyIdentifier> for Identifier {
             PyIdentifier::String(s) => {
                 Identifier::from_str(&s).map_err(PyIggyError::new_err_from_rust)
             }
-            PyIdentifier::Int(i) => {
-                Identifier::numeric(i).map_err(PyIggyError::new_err_from_rust)
-            }
+            PyIdentifier::Int(i) => Identifier::numeric(i).map_err(PyIggyError::new_err_from_rust),
         }
     }
 }

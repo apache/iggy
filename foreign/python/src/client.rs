@@ -94,10 +94,7 @@ impl IggyClient {
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner
-                .ping()
-                .await
-                .map_err(PyIggyError::new_err_from_rust)
+            inner.ping().await.map_err(PyIggyError::new_err_from_rust)
         })
     }
 
