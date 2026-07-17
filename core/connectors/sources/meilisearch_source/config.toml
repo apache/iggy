@@ -36,6 +36,7 @@ url = "http://localhost:7700"
 index = "iggy_messages"
 query = ""
 # filter = "category = alpha"
+# Nested array filters require JSON connector configuration. See README.md.
 batch_size = 100
 polling_interval = "5s"
 include_metadata = true

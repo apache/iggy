@@ -103,9 +103,16 @@ impl From<MeilisearchSourceConfig> for ResolvedMeilisearchSourceConfig {
         let include_metadata = config.include_metadata.unwrap_or(DEFAULT_INCLUDE_METADATA);
         let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
-        let max_retry_delay =
+        let mut retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let mut max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        if retry_delay > max_retry_delay {
+            warn!(
+                "Meilisearch source retry_delay ({:?}) exceeds max_retry_delay ({:?}). Swapping values.",
+                retry_delay, max_retry_delay
+            );
+            std::mem::swap(&mut retry_delay, &mut max_retry_delay);
+        }
         let max_open_retries = config.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES);
 
         Self {
@@ -817,6 +824,18 @@ mod tests {
             filter_expression(config.filter.as_ref()).unwrap(),
             Some("status = active".to_string())
         );
+    }
+
+    #[test]
+    fn given_retry_delay_exceeds_max_retry_delay_should_swap_values() {
+        let mut config = config();
+        config.retry_delay = Some("10s".to_string());
+        config.max_retry_delay = Some("1s".to_string());
+
+        let source = MeilisearchSource::new(1, config, None);
+
+        assert_eq!(source.config.retry_delay, Duration::from_secs(1));
+        assert_eq!(source.config.max_retry_delay, Duration::from_secs(10));
     }
 
     #[test]
