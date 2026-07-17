@@ -30,9 +30,8 @@ use consensus::{
     build_reply_message_with, build_result_rejection_reply, emit_sim_event,
     fence_old_prepare_by_commit, is_caught_up_primary,
     panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
-    register_preflight,
-    replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
-    send_prepare_ok as send_prepare_ok_common,
+    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -2817,12 +2816,10 @@ mod tests {
         const ACTING_USER: u32 = 7;
 
         let dir = tempfile::tempdir().unwrap();
-        let journal = journal::prepare_journal::PrepareJournal::open(
-            &dir.path().join("journal.wal"),
-            0,
-        )
-        .await
-        .unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
         let consensus = VsrConsensus::new(
             1,
             0,
@@ -2833,7 +2830,13 @@ mod tests {
         );
         consensus.init();
         let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
-            IggyMetadata::new(Some(consensus), Some(journal), None, TestMux::default(), None);
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
         let consensus = md.consensus.as_ref().unwrap();
 
         md.client_table.borrow_mut().commit_register(
