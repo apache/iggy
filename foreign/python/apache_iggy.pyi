@@ -22,6 +22,7 @@ import asyncio
 import builtins
 import collections.abc
 import datetime
+import enum
 import typing
 
 __all__ = [
@@ -39,6 +40,9 @@ __all__ = [
     "StreamDetails",
     "Topic",
     "TopicDetails",
+    "UserInfo",
+    "UserInfoDetails",
+    "UserStatus",
 ]
 
 class AutoCommit:
@@ -862,3 +866,64 @@ class TopicDetails:
         r"""
         Replication factor for the topic.
         """
+
+@typing.final
+class UserInfo:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the user.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the user was created, in microseconds since the Unix epoch.
+        """
+    @property
+    def status(self) -> UserStatus:
+        r"""
+        The status of the user.
+        """
+    @property
+    def username(self) -> builtins.str:
+        r"""
+        The username of the user.
+        """
+
+@typing.final
+class UserInfoDetails:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the user.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the user was created, in microseconds since the Unix epoch.
+        """
+    @property
+    def status(self) -> UserStatus:
+        r"""
+        The status of the user.
+        """
+    @property
+    def username(self) -> builtins.str:
+        r"""
+        The username of the user.
+        """
+
+@typing.final
+class UserStatus(enum.Enum):
+    r"""
+    The status of a user account.
+    """
+
+    Active = ...
+    r"""
+    The user account is active and can be used.
+    """
+    Inactive = ...
+    r"""
+    The user account is inactive and cannot be used.
+    """
