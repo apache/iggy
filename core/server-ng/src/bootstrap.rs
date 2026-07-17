@@ -15,37 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::auth::warm_dummy_password_hash;
+use crate::cluster_meta::ClusterRoster;
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
     make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
     make_partition_read_handler,
 };
+use crate::http;
 use crate::partition_helpers::{
     configure_consumer_offsets, ensure_initial_segment, validate_namespace_bounds,
 };
+use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerNgError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::session_manager::SessionManager;
-use configs::server_ng::ServerNgConfig;
-use configs::sharding::{
+use configs::ng_sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
-use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
+use configs::server_ng::{NgSystemConfig, ServerNgConfig};
+use consensus::{
+    LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer, VsrConsensus,
+};
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
-use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PartitionStats, TopicStats, variadic};
-use journal::Journal;
+use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_common::defaults::{
+    DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
+    MIN_USERNAME_LENGTH,
+};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
 use journal::prepare_journal::PrepareJournal;
+use journal::{Journal, JournalHandle};
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener};
+use message_bus::replica::listener::{self as replica_listener, MessageHandler};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
@@ -53,38 +63,36 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, DialedReplicaFn, IggyMessageBus, MAX_INFLIGHT_REPLICA_HANDSHAKES,
-    ReplicaOwnerTable, connector,
+    AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
+    MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
+    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
+use server_common::Message;
 use server_common::bootstrap::create_directories;
+use server_common::crypto;
 use server_common::executor::create_shard_executor;
+use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-// TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
-use server::log::logger::Logging;
-use server::shard_allocator::{ShardAllocator, ShardInfo};
-use server::streaming::users::user::User as LegacyUser;
-use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig,
-    Receiver as ShardReceiver, ShardFrame, ShardIdentity, TaggedSender, channel,
-    shard_mesh_channels,
+    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
+    PartitionConsensusConfig, PartitionReadHandler, Receiver as ShardReceiver, ShardFrame,
+    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
 };
+use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -98,13 +106,16 @@ use tracing::{error, info, warn};
 
 const SHARD_REPLICA_ID: u8 = 0;
 
-type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
+pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
+pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
+
+type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
 
 /// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
 /// state. Shard 0 mints one after `recover()` and broadcasts a clone to
 /// every peer shard; each peer rebuilds a reader-mode
 /// [`ServerNgMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerNgMetadataBundle = <variadic!(Users, Streams, ConsumerGroups) as WithFactory>::Bundle;
+type ServerNgMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 
 pub(crate) type ServerNgMetadata = IggyMetadata<
     VsrConsensus<Rc<IggyMessageBus>>,
@@ -112,15 +123,92 @@ pub(crate) type ServerNgMetadata = IggyMetadata<
     IggySnapshot,
     ServerNgMuxStateMachine,
 >;
-pub type ServerNgShard = IggyShard<
-    Rc<IggyMessageBus>,
-    PrepareJournal,
-    IggySnapshot,
-    ServerNgMuxStateMachine,
-    PapayaShardsTable,
->;
 
-pub(crate) type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
+/// The shard type the dispatch layer is generic over.
+///
+/// `B`/`MJ`/`S` are free; the metadata state machine (`M`) and shards table
+/// (`T`) are pinned, being identical in production and the simulator.
+/// Production instantiates it as [`ServerNgShard`]; the simulator supplies its
+/// own `B`/`MJ`/`S`.
+pub type ShellShard<B, MJ, S> = IggyShard<B, MJ, S, ServerNgMuxStateMachine, PapayaShardsTable>;
+
+/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
+pub type ShellShardHandle<B, MJ, S> = Rc<RefCell<Option<Weak<ShellShard<B, MJ, S>>>>>;
+
+/// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
+/// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
+pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
+impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
+
+/// The five dispatch handlers a shard is built with, plus the
+/// [`SessionManager`] the request-plane pair shares.
+///
+/// Both production ([`build_shard_for_thread`]) and the simulator's shell
+/// mode construct these through [`wire_shell_handlers`], so the request
+/// plane is wired one way. The simulator's shell-off fast path uses
+/// [`ShellHandlers::noop`] instead.
+pub struct ShellHandlers {
+    pub on_replica_message: MessageHandler,
+    pub on_client_request: RequestHandler,
+    pub on_metadata_submit: MetadataSubmitHandler,
+    pub on_list_clients: ListClientsHandler,
+    pub on_partition_read: PartitionReadHandler,
+    /// Bound by the client-request handler, read by the get-clients
+    /// handler; the caller keeps it to reach locally-homed sessions.
+    pub sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl ShellHandlers {
+    /// Inert handlers for the shell-off fast path: every callback is a
+    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
+    /// hand-written no-op closures, so a caller can keep one destructure
+    /// site across both toggle states.
+    #[must_use]
+    pub fn noop() -> Self {
+        Self {
+            on_replica_message: Rc::new(|_, _| {}),
+            on_client_request: Rc::new(|_, _| {}),
+            on_metadata_submit: Rc::new(|_| {}),
+            on_list_clients: Rc::new(|_| {}),
+            on_partition_read: Rc::new(|_, _, _| {}),
+            sessions: Rc::new(RefCell::new(SessionManager::new())),
+        }
+    }
+}
+
+/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
+///
+/// They share one fresh [`SessionManager`]. The caller must set the weak
+/// self-reference in `shard_handle` once the shard is built, so the
+/// handlers can upgrade it per frame.
+pub fn wire_shell_handlers<B, MJ, S>(
+    bus: &B,
+    shard_handle: &ShellShardHandle<B, MJ, S>,
+    system_config: Arc<NgSystemConfig>,
+) -> ShellHandlers
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    ShellHandlers {
+        on_replica_message: make_deferred_replica_message_handler(shard_handle),
+        on_client_request: make_deferred_client_request_handler(
+            bus,
+            shard_handle,
+            &sessions,
+            system_config,
+        ),
+        on_metadata_submit: make_metadata_submit_handler(shard_handle),
+        on_list_clients: make_list_clients_handler(&sessions),
+        on_partition_read: make_partition_read_handler(shard_handle),
+        sessions,
+    }
+}
+
+pub type ServerNgShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -172,6 +260,10 @@ impl ShardHandles {
     /// does not need to read the trace log to discover late-failing shards.
     pub fn join_all(self) -> Result<(), ServerNgError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
+        // Shards run thread-per-core with compio's blocking fallback pool
+        // disabled, so an io_uring opcode the kernel lacks aborts every shard
+        // with the same panic. Surface the actionable diagnostic once.
+        let mut io_uring_diagnostic_shown = false;
         for (shard_id, handle) in self.shard_threads {
             match handle.join() {
                 Ok(Ok(())) => {
@@ -187,6 +279,13 @@ impl ShardHandles {
                 Err(panic_payload) => {
                     let message = panic_payload_to_string(&*panic_payload);
                     error!(shard_id, message = %message, "shard thread panicked");
+                    if !io_uring_diagnostic_shown
+                        && message
+                            .contains(server_common::diagnostics::ASYNCIFY_POOL_DISABLED_PANIC_MSG)
+                    {
+                        server_common::diagnostics::print_incomplete_io_uring_ops_info();
+                        io_uring_diagnostic_shown = true;
+                    }
                     failures.push(ShardJoinFailure {
                         shard_id,
                         kind: ShardJoinFailureKind::Panic { message },
@@ -326,9 +425,10 @@ impl Drop for ShutdownOnDrop {
 /// `ReadHandleFactory`s) and pushes one clone per peer onto `bundle_tx`.
 /// Every other shard receives the bundle and rebuilds a reader-mode
 /// `MuxStateMachine` on its own runtime - no WAL access, no replay, no
-/// `RecoverySync` two-phase fence. Phase 2 of the old handshake was
-/// only there to keep peer scans away from shard 0's torn-tail repair;
-/// with no peer scan that race is structurally gone.
+/// `RecoverySync` two-phase fence. The old phase-2 WAL fence is gone
+/// because peers no longer scan the WAL. They do still scan live shared
+/// metadata to load their on-disk partitions, so a separate listener
+/// fence is still required - see [`BootstrapBarrier`].
 ///
 /// The channel is bounded to the peer count so shard 0's `send` never
 /// blocks beyond a peer drain. A peer that dies before recv drops its
@@ -341,6 +441,33 @@ enum MetadataHandoff {
     },
     Waiter {
         bundle_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<ServerNgMetadataBundle>>,
+    },
+}
+
+/// Reverse handshake to [`MetadataHandoff`]: gates shard 0's client
+/// listeners until every peer has loaded its on-disk partitions.
+///
+/// Peers build their owned-partition set from live shared metadata and
+/// load each segment from disk in `build_shard_for_thread`. If shard 0
+/// opened listeners the instant `broadcast_metadata_bundle` returned
+/// (peers have only *received* the bundle, not *loaded* partitions), a
+/// client could create a partition before a peer's load scan finished.
+/// That freshly committed partition would surface in the peer's scan
+/// with no segment dir on disk yet, and `load_partition`'s `walk_dir`
+/// would fail with `CannotReadPartitions`, aborting the whole node. A
+/// partition created after boot must take the runtime reconciler path
+/// (which creates its dir), never the bootstrap load path.
+///
+/// Shard 0 (`Owner`) drains one signal per peer before binding
+/// listeners; each peer (`Waiter`) sends one once its load completes.
+/// The cross-thread shutdown flag drives both sides out of their poll
+/// loop if any shard dies mid-boot.
+enum BootstrapBarrier {
+    Owner {
+        ready_rx: crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    },
+    Waiter {
+        ready_tx: crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
     },
 }
 
@@ -363,6 +490,7 @@ struct LocalClientAcceptFns {
     ws: AcceptedWsClientFn,
     quic: AcceptedQuicClientFn,
     tcp_tls: AcceptedTlsClientFn,
+    wss: AcceptedWssClientFn,
 }
 
 #[derive(Default)]
@@ -395,12 +523,41 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     logging
         .late_init(
             config.system.get_system_path(),
-            &config.system.logging,
-            &config.telemetry,
+            &LoggingSettings::from(&config.system.logging),
+            &TelemetrySettings::from(&config.telemetry),
         )
         .map_err(ServerNgError::Logging)?;
 
     Ok(config)
+}
+
+/// Resolve the operator's `cpu_allocation` into concrete shard
+/// assignments plus the checked `u16` shard count.
+///
+/// Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
+/// (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
+/// configured with `u16::MAX` shards would mint a shard id that
+/// collides with the sentinel and an owner-table lookup could never
+/// tell that shard apart from an unowned slot. Reject at boot so the
+/// invariant is held by the type system, not by hoping the operator
+/// never configures 65535 cores worth of shards.
+fn resolve_shard_assignments(
+    sharding: &configs::ng_sharding::ShardingConfig,
+) -> Result<(Vec<ShardInfo>, u16), ServerNgError> {
+    let allocator = ShardAllocator::new(&sharding.cpu_allocation, sharding.pin_cores)
+        .map_err(ServerNgError::ShardAllocator)?;
+    let assignments = allocator
+        .to_shard_assignments()
+        .map_err(ServerNgError::ShardAllocator)?;
+    if assignments.is_empty() {
+        return Err(ServerNgError::ShardsCountZero);
+    }
+    match u16::try_from(assignments.len()) {
+        Ok(count) if count < message_bus::OWNER_NONE => Ok((assignments, count)),
+        _ => Err(ServerNgError::ShardsCountOverflow {
+            count: assignments.len(),
+        }),
+    }
 }
 
 /// Re-validate the runtime sharding knobs that the per-shard runtime
@@ -409,7 +566,7 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
 /// usage) cannot OOM at boot or wedge process exit with an out-of-range
 /// value.
 fn validate_sharding_runtime_knobs(
-    sharding: &configs::sharding::ShardingConfig,
+    sharding: &configs::ng_sharding::ShardingConfig,
 ) -> Result<(), ServerNgError> {
     let inbox_capacity = sharding.inbox_capacity;
     if inbox_capacity == 0 || inbox_capacity > INBOX_CAPACITY_MAX {
@@ -470,34 +627,17 @@ fn validate_sharding_runtime_knobs(
 /// Panics if [`shard_mesh_channels`] returns an inbox slot already
 /// consumed - a bootstrap programming error that would only fire if this
 /// function were called twice with the same inboxes.
+#[allow(clippy::too_many_lines)]
 pub fn bootstrap(
     config: ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<ShardHandles, ServerNgError> {
-    let allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)
-        .map_err(ServerNgError::ShardAllocator)?;
-    let assignments = allocator
-        .to_shard_assignments()
-        .map_err(ServerNgError::ShardAllocator)?;
+    warm_dummy_password_hash();
+    // The sync GetStats read path has no access to server config, so capture
+    // the data directory here for its disk-usage reporting.
+    crate::responses::init_stats_data_path(config.system.get_system_path().into());
+    let (assignments, total_shards) = resolve_shard_assignments(&config.system.sharding)?;
     let shards_count = assignments.len();
-    if shards_count == 0 {
-        return Err(ServerNgError::ShardsCountZero);
-    }
-    // Shard ids index `ReplicaOwnerTable` slots as `u16`. `OWNER_NONE`
-    // (`u16::MAX`) is reserved as the empty-slot sentinel, so a server
-    // configured with `u16::MAX` shards would mint a shard id that
-    // collides with the sentinel and an owner-table lookup could never
-    // tell that shard apart from an unowned slot. Reject at boot so the
-    // invariant is held by the type system above this line, not by hoping
-    // the operator never configures 65535 cores worth of shards.
-    let total_shards = match u16::try_from(shards_count) {
-        Ok(count) if count < message_bus::OWNER_NONE => count,
-        _ => {
-            return Err(ServerNgError::ShardsCountOverflow {
-                count: shards_count,
-            });
-        }
-    };
 
     // Re-check the full valid range, not just the zero floor: a caller
     // that built the config without running `ShardingConfig::validate`
@@ -528,8 +668,17 @@ pub fn bootstrap(
     let (metadata_bundle_tx, metadata_bundle_rx) =
         crossfire::mpmc::bounded_async::<ServerNgMetadataBundle>(metadata_peers);
 
+    // Reverse barrier (see `BootstrapBarrier`): every peer sends one
+    // signal once it finishes loading its on-disk partitions; shard 0
+    // drains them all before binding listeners. Bounded to the peer
+    // count so a sender never blocks (each peer sends exactly once).
+    let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(metadata_peers);
+
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerNgError>>)> =
         Vec::with_capacity(shards_count);
+    // Shared metadata-group view: written by shard 0's publisher task, read by
+    // every shard's cluster-metadata roster so leader marking works off-shard.
+    let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
@@ -549,7 +698,17 @@ pub fn bootstrap(
                 bundle_rx: metadata_bundle_rx.clone(),
             }
         };
+        let barrier_for_shard = if shard_id == 0 {
+            BootstrapBarrier::Owner {
+                ready_rx: ready_rx.clone(),
+            }
+        } else {
+            BootstrapBarrier::Waiter {
+                ready_tx: ready_tx.clone(),
+            }
+        };
 
+        let metadata_view_for_shard = Arc::clone(&metadata_view);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerNgError> {
@@ -563,7 +722,9 @@ pub fn bootstrap(
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
+                    barrier_for_shard,
                     owner_table_for_shard,
+                    metadata_view_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -578,6 +739,8 @@ pub fn bootstrap(
                 // would hang until the shutdown watchdog kicks the bus.
                 drop(metadata_bundle_tx);
                 drop(metadata_bundle_rx);
+                drop(ready_tx);
+                drop(ready_rx);
                 join_partial_shard_survivors(shard_threads);
                 return Err(ServerNgError::ShardSpawnFailed { shard_id, source });
             }
@@ -591,6 +754,8 @@ pub fn bootstrap(
     // disconnects.
     drop(metadata_bundle_tx);
     drop(metadata_bundle_rx);
+    drop(ready_tx);
+    drop(ready_rx);
 
     info!(
         shards_count,
@@ -616,7 +781,9 @@ fn run_shard_thread(
     config: Arc<ServerNgConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -651,7 +818,9 @@ fn run_shard_thread(
             &config,
             shutdown_flag,
             metadata_handoff,
+            barrier,
             owner_table,
+            metadata_view,
         ))
         .await
     });
@@ -676,7 +845,9 @@ async fn shard_main(
     config: &ServerNgConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
+    barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(), ServerNgError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -711,9 +882,18 @@ async fn shard_main(
     let data_dir = Path::new(&config.system.path);
     let (mux_stm, owner_state) = match metadata_handoff {
         MetadataHandoff::Owner { bundle_tx } => {
-            let recovered = recover::<ServerNgMuxStateMachine>(data_dir)
-                .await
-                .map_err(ServerNgError::MetadataRecovery)?;
+            // Root is created locally at boot (never journaled), so replay
+            // must start from the same baseline or every WAL-created user
+            // shifts one slab id and root is lost after the first restart.
+            let recovered = recover::<ServerNgMuxStateMachine>(
+                data_dir,
+                topology.replica_count == 1,
+                |mux_stm| {
+                    ensure_default_root_user(mux_stm);
+                },
+            )
+            .await
+            .map_err(ServerNgError::MetadataRecovery)?;
             validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
             ensure_default_root_user(&recovered.mux_stm);
             // The factory bundle hands every peer a read handle over the
@@ -747,6 +927,7 @@ async fn shard_main(
                     recovered.journal,
                     recovered.snapshot,
                     recovered.last_applied_op,
+                    recovered.last_journaled_op,
                 )),
             )
         }
@@ -766,12 +947,14 @@ async fn shard_main(
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
     // so peer shards have no caller that reads `journal` or `snapshot`.
     let (metadata_consensus, journal_for_metadata, snapshot_for_metadata) =
-        if let Some((journal, snapshot, last_applied_op)) = owner_state {
-            let restored_op = last_applied_op
-                .unwrap_or_else(|| snapshot.as_ref().map_or(0, IggySnapshot::sequence_number));
+        if let Some((journal, snapshot, last_applied_op, last_journaled_op)) = owner_state {
+            let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+            let commit_watermark = last_applied_op.unwrap_or(snapshot_floor);
+            let restored_op = last_journaled_op.unwrap_or(snapshot_floor);
             let consensus = restore_metadata_consensus(
                 &journal,
                 restored_op,
+                commit_watermark,
                 topology.cluster_id,
                 topology.self_replica_id,
                 topology.replica_count,
@@ -788,12 +971,19 @@ async fn shard_main(
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
+    // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
+    // message expiry) at admission; every shard's copy backs the same resolution in responses.
+    metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
+    metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
-    let (shard, sessions) = build_shard_for_thread(
+    // Heap-pin like `shard_main` above: the builder future carries the whole
+    // shard construction state machine and outgrew clippy's `large_futures`
+    // cap; one allocation per shard startup.
+    let (shard, sessions) = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -803,8 +993,38 @@ async fn shard_main(
         senders,
         inbox,
         shard_metrics,
-    )
+        Arc::clone(&metadata_view),
+    ))
     .await?;
+
+    // Shard 0 owns the metadata consensus; publish its view so every shard's
+    // cluster-metadata read (and the SDK's leader discovery) marks the live
+    // primary. Detached: dies with this shard's runtime at process exit.
+    if shard_id == 0 {
+        let publisher_shard = Rc::clone(&shard);
+        let publisher_view = Arc::clone(&metadata_view);
+        compio::runtime::spawn(async move {
+            loop {
+                if let Some(consensus) = publisher_shard.plane.metadata().consensus.as_ref() {
+                    // While this replica declines its recovered view's
+                    // primaryship, that view must not reach the roster: the
+                    // delegated shards would compute a leader that never
+                    // heartbeats. Publish "unknown" until the election
+                    // resolves the role.
+                    let published = if consensus.has_ceded_primaryship()
+                        && consensus.primary_index(consensus.view()) == consensus.replica()
+                    {
+                        crate::cluster_meta::METADATA_VIEW_UNKNOWN
+                    } else {
+                        u64::from(consensus.view())
+                    };
+                    publisher_view.store(published, Ordering::Relaxed);
+                }
+                compio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .detach();
+    }
 
     info!(
         shard = shard_id,
@@ -845,12 +1065,20 @@ async fn shard_main(
         drop(metrics_for_notifier);
     }
 
+    // The pump task also drives the consensus timer tick (heartbeats, prepare
+    // retransmit, view-change timeouts) as a select! arm, serialized with frame
+    // processing - see `run_message_pump`.
     let (stop_tx, stop_rx) = channel(1);
     let pump_shard = Rc::clone(&shard);
-    let pump_handle = compio::runtime::spawn(async move {
+    // Owned and awaited by shard_main at exit, NOT `track_background`: the
+    // background drain runs inside `bus.shutdown()`, which the Ctrl-C path
+    // never drives (the watchdog stands down when the token fires), so a
+    // tracked pump would be cancelled by runtime teardown mid final-flush
+    // and every graceful shutdown would silently drop the committed journal
+    // tail that had not hit a flush threshold yet.
+    let mut pump_handle = Some(compio::runtime::spawn(async move {
         pump_shard.run_message_pump(stop_rx).await;
-    });
-    bus.track_background(pump_handle);
+    }));
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
         Rc::clone(&shard),
@@ -879,27 +1107,23 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Consensus timer driver: heartbeats, prepare retransmit, and
-    // view-change timeouts only advance when `VsrConsensus::tick` runs
-    // ("call this periodically, e.g. every 10ms"). The simulator steps it
-    // explicitly; production drives it here. Without this, a prepare lost
-    // to a transient replica-link blip is never retransmitted and its
-    // client request hangs until the SDK read timeout.
-    let (consensus_tick_stop_tx, consensus_tick_stop_rx) = channel::<()>(1);
-    let tick_shard = Rc::clone(&shard);
-    let consensus_tick_handle = compio::runtime::spawn(async move {
-        const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        loop {
-            if consensus_tick_stop_rx.try_recv().is_ok() {
-                break;
-            }
-            tick_shard.tick_metadata().await;
-            tick_shard.tick_partitions().await;
-            compio::time::sleep(CONSENSUS_TICK_INTERVAL).await;
-        }
-    });
-    bus.track_background(consensus_tick_handle);
-
+    // Per-shard heartbeat verifier: evicts connections that stop pinging,
+    // releasing their consumer-group membership. Gated on config so a
+    // deployment without heartbeats never reaps live sessions.
+    let heartbeat_stop_tx = if config.heartbeat.enabled {
+        let (hb_stop_tx, hb_stop_rx) = channel::<()>(1);
+        let hb_shard = Rc::clone(&shard);
+        let hb_sessions = Rc::clone(&sessions);
+        let hb_interval = config.heartbeat.interval.get_duration();
+        let hb_handle = compio::runtime::spawn(async move {
+            crate::dispatch::run_heartbeat_verifier(hb_shard, hb_sessions, hb_interval, hb_stop_rx)
+                .await;
+        });
+        bus.track_background(hb_handle);
+        Some(hb_stop_tx)
+    } else {
+        None
+    };
     // Expired-PAT cleaner: shard 0 only (it owns the metadata consensus
     // group) and only when enabled. Each pass no-ops unless this node is
     // the caught-up metadata primary, so the delete is proposed once and
@@ -922,22 +1146,64 @@ async fn shard_main(
         None
     };
 
+    // Segment cleaner: runs on every shard (each replica trims its own log,
+    // primary and backup alike). Local and unreplicated; gated by the shared
+    // data-maintenance config.
+    let segment_cleaner_stop = if config.data_maintenance.messages.cleaner_enabled {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.data_maintenance.messages.interval.get_duration();
+        let cleaner_handle = compio::runtime::spawn(async move {
+            crate::segment_cleaner::run_segment_cleaner(cleaner_shard, stop_rx, interval).await;
+        });
+        bus.track_background(cleaner_handle);
+        Some(stop_tx)
+    } else {
+        None
+    };
+
+    // Listener fence (see `BootstrapBarrier`). Peers still scan live
+    // shared metadata and load their on-disk partitions in
+    // `build_shard_for_thread`; the factory-bundle handoff only proves
+    // they *received* the bundle, not that they finished loading. Shard
+    // 0 must not accept client traffic until every peer's load scan is
+    // done, otherwise a partition created by the first client surfaces
+    // in a still-running scan with no segment dir on disk and aborts the
+    // node with `CannotReadPartitions`. By this point every shard has
+    // also spawned its pump + reconciler, so a partition created after
+    // the fence takes the runtime reconciler path on its owning shard.
+    match barrier {
+        BootstrapBarrier::Owner { ready_rx } => {
+            await_bootstrap_complete(
+                &ready_rx,
+                usize::from(total_shards.saturating_sub(1)),
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+        BootstrapBarrier::Waiter { ready_tx } => {
+            signal_bootstrap_complete(
+                shard_id,
+                &ready_tx,
+                &shutdown_flag_for_handoff,
+                poll_interval,
+            )
+            .await?;
+        }
+    }
+
     // Listeners (replica + every client transport) bind on shard 0 only.
     // Shard 0's coordinator round-robins inbound TCP/WS connections to
     // peer shards via fd-transfer. QUIC and TCP-TLS clients terminate
     // locally on shard 0 (their per-connection state is non-portable -
     // see `LifecycleFrame::ClientWsConnectionSetup` rustdoc).
-    //
-    // No phase-2 listener fence is needed: peer shards no longer scan
-    // the WAL, so a shard-0 append accepted mid-boot cannot race a
-    // peer's `truncate_or_fail`. The factory-bundle handoff has already
-    // installed reader-mode `MuxStateMachine`s on every peer by the
-    // time shard 0 returns from `broadcast_metadata_bundle`.
     if shard_id == 0 {
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        let on_client_request = make_client_request_handler(&shard, &sessions);
+        let on_client_request =
+            make_client_request_handler(&shard, &sessions, Arc::clone(&config.system));
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
         let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
@@ -954,10 +1220,16 @@ async fn shard_main(
         {
             let _ = stop_tx.try_send(());
             let _ = reconcile_stop_tx.try_send(());
-            let _ = consensus_tick_stop_tx.try_send(());
+            if let Some(tx) = &heartbeat_stop_tx {
+                let _ = tx.try_send(());
+            }
             if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
                 let _ = cleaner_stop_tx.try_send(());
             }
+            if let Some(tx) = &segment_cleaner_stop {
+                let _ = tx.try_send(());
+            }
+            await_pump_drain(pump_handle.take(), config, shard_id).await;
             return Err(error);
         }
     }
@@ -965,13 +1237,45 @@ async fn shard_main(
     bus.token().wait().await;
     let _ = stop_tx.try_send(());
     let _ = reconcile_stop_tx.try_send(());
-    let _ = consensus_tick_stop_tx.try_send(());
+    if let Some(tx) = &heartbeat_stop_tx {
+        let _ = tx.try_send(());
+    }
     if let Some(cleaner_stop_tx) = &pat_cleaner_stop {
         let _ = cleaner_stop_tx.try_send(());
     }
+    if let Some(tx) = &segment_cleaner_stop {
+        let _ = tx.try_send(());
+    }
+
+    await_pump_drain(pump_handle.take(), config, shard_id).await;
 
     info!(shard = shard_id, "server-ng shard exited cleanly");
     Ok(())
+}
+
+/// Await the message pump's completion before the shard returns: its
+/// post-loop work includes the final flush of every committed journal to
+/// segment storage, and returning first drops the compio runtime, which
+/// cancels that flush at its next await point.
+async fn await_pump_drain(
+    pump_handle: Option<compio::runtime::JoinHandle<()>>,
+    config: &ServerNgConfig,
+    shard_id: u16,
+) {
+    let Some(pump_handle) = pump_handle else {
+        return;
+    };
+    let drain_budget = config.system.sharding.shutdown_drain_timeout.get_duration();
+    if compio::time::timeout(drain_budget, pump_handle)
+        .await
+        .is_err()
+    {
+        warn!(
+            shard = shard_id,
+            "message pump did not drain within the shutdown budget; \
+             committed journal tail may not have flushed"
+        );
+    }
 }
 
 /// Block until shard 0 broadcasts the metadata factory bundle, or the
@@ -1057,6 +1361,70 @@ async fn broadcast_metadata_bundle(
     Ok(())
 }
 
+/// Peer side of [`BootstrapBarrier`]: tell shard 0 this shard finished
+/// loading its on-disk partitions. Mirrors [`broadcast_metadata_bundle`]'s
+/// `try_send`-or-shutdown poll loop so a sibling failure (which flips the
+/// shutdown flag) drives this out instead of stranding it on a full
+/// channel. The channel is sized to the peer count and each peer sends
+/// exactly once, so `Full` is not expected; the branch only keeps the
+/// loop interruptible.
+async fn signal_bootstrap_complete(
+    shard_id: u16,
+    ready_tx: &crossfire::MAsyncTx<crossfire::mpmc::Array<u16>>,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut pending = shard_id;
+    loop {
+        match ready_tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(crossfire::TrySendError::Disconnected(_)) => {
+                // Shard 0 dropped its `ready_rx` before draining (it
+                // aborted before binding listeners). Propagate so this
+                // shard short-circuits; the shutdown flag flips via the
+                // normal teardown path.
+                return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+            }
+            Err(crossfire::TrySendError::Full(returned)) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::MetadataHandoffAborted { shard_id });
+                }
+                pending = returned;
+                compio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+/// Owner side of [`BootstrapBarrier`]: drain one ready signal per peer
+/// before shard 0 binds listeners. Polls the shutdown flag so a peer that
+/// dies mid-load (flipping the flag) aborts the wait instead of hanging on
+/// a signal that will never arrive. A single shard (`peers == 0`) returns
+/// immediately.
+async fn await_bootstrap_complete(
+    ready_rx: &crossfire::MAsyncRx<crossfire::mpmc::Array<u16>>,
+    peers: usize,
+    shutdown_flag: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) -> Result<(), ServerNgError> {
+    let mut remaining = peers;
+    while remaining > 0 {
+        match ready_rx.try_recv() {
+            Ok(_shard_id) => remaining -= 1,
+            Err(crossfire::TryRecvError::Disconnected) => {
+                return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+            }
+            Err(crossfire::TryRecvError::Empty) => {
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    return Err(ServerNgError::ShardBootstrapBarrierAborted { remaining });
+                }
+                compio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Spawn a per-shard polling task that watches the cross-thread shutdown
 /// flag and triggers this shard's bus shutdown on transition. The flag
 /// is the only Send signal we have; the bus' shutdown machinery is
@@ -1099,6 +1467,38 @@ fn spawn_shutdown_watchdog(
     watchdog.detach();
 }
 
+/// Copy the configured cluster roster plus this node's own client ports into
+/// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
+/// the real topology. `self_*` back only the cluster-disabled self-synthesis;
+/// the HTTP port is read from config since HTTP binds outside this topology.
+fn build_cluster_roster(
+    config: &ServerNgConfig,
+    topology: &TcpTopology,
+    metadata_view: Arc<AtomicU64>,
+) -> ClusterRoster {
+    let http_port = if config.http.enabled {
+        parse_socket_addr("http.address", &config.http.address)
+            .ok()
+            .map(|addr| addr.port())
+    } else {
+        None
+    };
+    ClusterRoster {
+        enabled: config.cluster.enabled,
+        name: config.cluster.name.clone(),
+        nodes: config.cluster.nodes.clone(),
+        self_ip: topology.client_listen_addr.ip().to_string(),
+        self_ports: configs::cluster::TransportPorts {
+            tcp: Some(topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            http: http_port,
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            tcp_replica: None,
+        },
+        metadata_view,
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_shard_for_thread(
     shard_id: u16,
@@ -1110,6 +1510,7 @@ async fn build_shard_for_thread(
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
+    metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerNgShard>, Rc<RefCell<SessionManager>>), ServerNgError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
@@ -1135,6 +1536,16 @@ async fn build_shard_for_thread(
     let owned_partitions_capacity = total_partitions
         .div_ceil(usize::from(total_shards).max(1))
         .saturating_mul(2);
+    // At-rest encryption: built once per shard from the shared config; the
+    // ingestion path encrypts on the primary and the poll reply decrypts.
+    // A bad key fails the boot rather than silently serving plaintext.
+    let encryptor = if config.system.encryption.enabled {
+        let aes = Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
+            .map_err(|error| ServerNgError::Iggy(Box::new(error)))?;
+        Some(Arc::new(EncryptorKind::Aes256Gcm(aes)))
+    } else {
+        None
+    };
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
@@ -1145,6 +1556,7 @@ async fn build_shard_for_thread(
                 .size_of_messages_required_to_save,
             enforce_fsync: config.system.partition.enforce_fsync,
             segment_size: config.system.segment.size,
+            encryptor,
         },
         owned_partitions_capacity,
     );
@@ -1164,7 +1576,15 @@ async fn build_shard_for_thread(
                     let owning_shard =
                         calculate_shard_assignment(&namespace, u32::from(total_shards));
                     if owning_shard == shard_id {
-                        owned.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
+                        // Shared per-partition stats from the registry: the
+                        // same `Arc` backs every shard's `get_topic` reply.
+                        let stats = inner.stats_registry.partition(
+                            stream.id,
+                            topic_id,
+                            partition.id,
+                            topic.stats.clone(),
+                        );
+                        owned.push((stream.id, topic_id, stats, partition.clone()));
                     } else {
                         shards_table.insert(
                             namespace,
@@ -1184,13 +1604,13 @@ async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, topic_stats, partition_metadata) in owned {
+    for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
         validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = load_partition(
             config,
             namespace,
-            topic_stats,
+            partition_stats,
             &partition_metadata,
             topology.cluster_id,
             topology.self_replica_id,
@@ -1206,15 +1626,25 @@ async fn build_shard_for_thread(
     }
 
     let shard_handle = Rc::new(RefCell::new(None));
-    // One per-shard SessionManager, shared by the client-request handler
-    // (binds sessions) and the get_clients handler (reads them). Created
-    // here so both wirings reference the same instance.
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle, &sessions);
-    let on_metadata_submit = make_metadata_submit_handler(&shard_handle);
-    let on_list_clients = make_list_clients_handler(&sessions);
-    let on_partition_read = make_partition_read_handler(&shard_handle);
+    // Same wiring path as the simulator's shell mode: one per-shard
+    // SessionManager shared by the client-request handler (binds sessions)
+    // and the get_clients handler (reads them). It also carries this shard's
+    // cluster roster for the pre-auth GetClusterMetadata read.
+    let ShellHandlers {
+        on_replica_message,
+        on_client_request,
+        on_metadata_submit,
+        on_list_clients,
+        on_partition_read,
+        sessions,
+    } = wire_shell_handlers(&bus, &shard_handle, Arc::clone(&config.system));
+    sessions
+        .borrow_mut()
+        .set_cluster_roster(Rc::new(build_cluster_roster(
+            config,
+            topology,
+            metadata_view,
+        )));
     let shard_name = format!("server-ng-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -1248,6 +1678,7 @@ async fn build_shard_for_thread(
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
+    commit_watermark: u64,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -1270,36 +1701,93 @@ fn restore_metadata_consensus(
         consensus.set_view(header.view);
     }
 
-    consensus.init();
+    // On a RESTART in a cluster (a non-empty WAL proves a prior life),
+    // rejoin as a quorum-invisible backup and probe for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // the replica adopts it as a backup, and journal repair fills any WAL
+    // gap. A probing replica never resumes primaryship -- if this replica
+    // IS the current primary-by-index, its probe makes the backups elect
+    // past it.
+    // The probe re-broadcasts on its timeout, so it needs no live mesh at
+    // boot. A FRESH boot (empty WAL) keeps the plain init: the cluster
+    // needs its view-0 primary to exist, and a single-replica cluster has
+    // no peer to ask.
+    if replica_count > 1 && restored_op > 0 {
+        consensus.init_as_backup();
+        consensus.begin_view_probe();
+    } else {
+        consensus.init();
+    }
     consensus.sequencer().set_sequence(restored_op);
-    // TODO(hubcio): clustered bootstrap does not persist a durable
-    // (view, commit_op) watermark, so we collapse commit_min/commit_max to
-    // `restored_op` (= last journaled op). VSR consequence: on a view
-    // change after partial recovery, a replica that came back with a
-    // commit_max below the cluster's true commit_min will accept stale
-    // prepares as new and overwrite already-committed log entries
-    // (split-brain on the committed prefix).
+    // A SOLO replica's durable journal head IS its commit point: quorum is
+    // 1-of-1, so an entry commits the instant it is durable, and the acks
+    // the cluster ceremony below would wait on cannot topologically exist.
+    // The embedded watermark is structurally one op stale (the commit point
+    // is only ever written down inside the NEXT entry), so trusting it solo
+    // manufactures an "uncommitted" suffix that provably committed and
+    // wedges the recovery barrier forever.
+    let commit_watermark = if replica_count == 1 {
+        restored_op
+    } else {
+        commit_watermark
+    };
+    // The commit point is restored from the WAL's embedded watermark (each
+    // journaled prepare carries the primary's commit at send time), NOT from
+    // the journal head: journaled does not imply committed, and claiming
+    // commit for the un-quorum'd tail both risks split-brain on a later view
+    // change and starves the tail of re-replication (it would live in no
+    // pipeline). The suffix `(commit_watermark, restored_op]` is re-pipelined
+    // below when this replica is the recovered view's primary.
     //
-    // Fix direction: persist (view, commit_op) on the journal-header path
-    // (`core/journal/src/prepare_journal.rs` PrepareHeader already carries
-    // `view`; extend with `commit_op` or add a sidecar watermark file
-    // updated on every commit), seed `restore_commit_state(min, max)`
-    // from durable state on recovery, and refuse boot if the gap exceeds
-    // a configurable threshold. Tracked under the "durable
-    // PartitionJournal + durable (view, commit_op) watermark" milestone
-    // named in the multi-shard wiring commit body.
-    //
-    // Reproducible in `core/simulator` once it grows a restart-from-disk
-    // path: today `SimNetwork::enable_process` only un-disables links
-    // without replaying `SimJournal` + `SimSnapshot` through
-    // `restore_metadata_consensus`, so the flatten cannot trip. Add a
-    // crash-restart-replay primitive in the sim, then write a scenario
-    // that commits an op on the primary, crashes the primary mid-
-    // replicate-ack, triggers a view change, and asserts the recovered
-    // replica refuses to re-accept the committed prepare.
-    consensus.restore_commit_state(restored_op, restored_op);
+    // TODO(hubcio): the watermark is a lower bound (the last entry stamps
+    // the commit point as of its send). Persisting an explicit (view,
+    // commit_op) watermark on the commit path would tighten recovery and
+    // allow refusing boot on an excessive gap; a backup that recovered a
+    // LONGER tail than the cluster's primary still needs uncommitted-suffix
+    // truncation when conflicting ops arrive (message repair milestone).
+    consensus.restore_commit_state(commit_watermark, commit_watermark);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
+        consensus.observe_prepare_timestamp(header.timestamp);
+    }
+
+    // The WAL's tail past the watermark is prepared-but-not-provably-committed
+    // state. Until the cluster confirms it (re-pipelined below on a resumed
+    // primary; via StartView adoption + the local commit walk on a rejoined
+    // backup), serving reads would show pre-restart state that clients already
+    // saw acked -- gate them on the barrier regardless of role. If the suffix
+    // never committed cluster-wide, the barrier times out on the read path and
+    // serving resumes (`await_recovery_barrier`).
+    if commit_watermark < restored_op {
+        consensus.set_recovery_barrier(restored_op);
+    }
+
+    // Re-pipeline the prepared-but-uncommitted suffix so the primary's
+    // retransmit machinery re-replicates it and quorum can (re-)commit it.
+    // A backup's suffix stays journal-only: the primary's traffic either
+    // confirms it (re-forward + re-ack path) or supersedes it.
+    if consensus.is_primary()
+        && !consensus.has_ceded_primaryship()
+        && commit_watermark < restored_op
+    {
+        info!(
+            commit_watermark,
+            restored_op, "re-pipelining recovered uncommitted metadata suffix"
+        );
+        let mut pipeline = consensus.pipeline().borrow_mut();
+        #[allow(clippy::cast_possible_truncation)]
+        for op in (commit_watermark + 1)..=restored_op {
+            let Some(header) = journal.header(op as usize) else {
+                warn!(
+                    op,
+                    "recovered journal suffix has a gap; stopping re-pipeline"
+                );
+                break;
+            };
+            let mut entry = PipelineEntry::new(*header);
+            entry.add_ack(self_replica_id);
+            pipeline.push(entry);
+        }
     }
 
     consensus
@@ -1309,7 +1797,7 @@ fn restore_metadata_consensus(
 async fn load_partition(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
-    topic_stats: Arc<TopicStats>,
+    stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
     cluster_id: u128,
     self_replica_id: u8,
@@ -1319,7 +1807,6 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
@@ -1328,31 +1815,43 @@ async fn load_partition(
         bus,
         LocalPipeline::new(),
     );
-    consensus.init();
+    // A recovered partition lost its consensus state with the process: the
+    // partition journal is in-memory and segments carry no op numbers, so
+    // this replica cannot know the group's (op, commit). In a cluster it
+    // boots as a quorum-invisible backup and probes for the current view
+    // (`RequestStartView`): the view's primary answers with a `StartView`,
+    // journal repair fills the rejoin window, and the commit floor settles
+    // at the serving peer's retention point. The probe re-broadcasts on its
+    // timeout, so it needs no live mesh at boot. Single-replica groups
+    // have no peer to ask and keep the plain init.
+    if replica_count > 1 {
+        consensus.init_as_backup();
+        consensus.begin_view_probe();
+    } else {
+        consensus.init();
+    }
 
-    // TODO: decouple the loading logic from the `server` crate and load directly
-    // into the new `partitions` log/runtime types.
-    let loaded_log = server::bootstrap::load_segments(
-        &config.system,
-        stream_id,
-        topic_id,
-        partition_id,
-        config
-            .system
-            .get_partition_path(stream_id, topic_id, partition_id),
-        stats.clone(),
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to load partition log during server-ng bootstrap"
-        );
-        source
-    })?;
+    // No prepare-timestamp floor is restored here: the partition consensus
+    // journal is non-durable today, so there is no persisted head to observe
+    // (unlike `restore_metadata_consensus`, which observes its restored head).
+    // When PartitionJournal becomes durable (the milestone named in the
+    // multi-shard wiring commit body), observe the restored head and the max
+    // recovered message timestamp here, or an NTP rewind across a restart could
+    // regress persisted `base_timestamp`.
+
+    let recovered_segments =
+        load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    error = %source,
+                    "failed to load partition log during server-ng bootstrap"
+                );
+                source
+            })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition.set_partition_dir(config.system.get_partition_path(
@@ -1366,7 +1865,7 @@ async fn load_partition(
         stream_id,
         topic_id,
         partition_id,
-        loaded_log,
+        recovered_segments,
     )
     .await?;
 
@@ -1379,6 +1878,14 @@ async fn load_partition(
         .max()
         .unwrap_or(0);
     partition.created_at = partition_metadata.created_at;
+    if partition
+        .log
+        .segments()
+        .iter()
+        .any(|segment| segment.size > IggyByteSize::default())
+    {
+        partition.recovered_durable_offset = Some(current_offset);
+    }
     partition.offset.store(current_offset, Ordering::Release);
     partition
         .dirty_offset
@@ -1402,57 +1909,37 @@ async fn hydrate_partition_log(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-    loaded_log: server::streaming::partitions::log::SegmentedLog<
-        server::streaming::partitions::journal::MemoryMessageJournal,
-    >,
+    recovered_segments: Vec<RecoveredSegment>,
 ) -> Result<(), ServerNgError> {
-    // TODO: decouple the loading logic from the `server` crate. This currently
-    // adapts the old server segmented log into the new `partitions` log.
-    for (segment_index, (segment, storage)) in loaded_log
-        .segments()
-        .iter()
-        .zip(loaded_log.storages().iter().cloned())
-        .enumerate()
-    {
-        validate_recovered_segment(
-            stream_id,
-            topic_id,
-            partition_id,
-            segment,
-            &storage,
-            loaded_log
-                .indexes()
-                .get(segment_index)
-                .and_then(|indexes| indexes.as_ref()),
-        )?;
-        let max_timestamp = match loaded_log
-            .indexes()
-            .get(segment_index)
-            .and_then(|indexes| indexes.as_ref())
-        {
-            Some(indexes) => indexes_max_timestamp(indexes),
-            None => load_segment_max_timestamp(&storage, stream_id, topic_id, partition_id).await?,
-        };
-        partition.log.add_persisted_segment(
-            convert_segment(segment, max_timestamp),
-            storage,
-            None,
-            None,
-        );
+    for RecoveredSegment { segment, storage } in recovered_segments {
+        partition
+            .log
+            .add_persisted_segment(segment, storage, None, None);
     }
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
         let storage = &partition.log.storages()[active_index];
-        if let (Some(messages_reader), Some(index_reader)) = (
+        if let (
+            Some(messages_reader),
+            Some(index_reader),
+            Some(storage_messages_writer),
+            Some(storage_index_writer),
+        ) = (
             storage.messages_reader.as_ref(),
             storage.index_reader.as_ref(),
+            storage.messages_writer.as_ref(),
+            storage.index_writer.as_ref(),
         ) {
             let index_path = index_reader.path();
-            let index_size = std::fs::metadata(&index_path).map_or(0, |metadata| metadata.len());
+            // Share the storage's size counters: the readers bound reads by
+            // these atomics, so a writer with a private counter persists bytes
+            // the readers never learn about.
+            let messages_size_counter = storage_messages_writer.size_counter();
+            let index_size_counter = storage_index_writer.size_counter();
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),
-                    Rc::new(AtomicU64::new(u64::from(messages_reader.file_size()))),
+                    messages_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )
@@ -1472,7 +1959,7 @@ async fn hydrate_partition_log(
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
                 IggyIndexWriter::new(
                     &index_path,
-                    Rc::new(AtomicU64::new(index_size)),
+                    index_size_counter,
                     config.system.partition.enforce_fsync,
                     true,
                 )
@@ -1493,85 +1980,6 @@ async fn hydrate_partition_log(
     }
 
     Ok(())
-}
-
-fn validate_recovered_segment(
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-    segment: &iggy_common::Segment,
-    storage: &server_common::SegmentStorage,
-    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
-) -> Result<(), ServerNgError> {
-    let messages_size_bytes = storage
-        .messages_reader
-        .as_ref()
-        .map_or(0, |reader| u64::from(reader.file_size()));
-    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
-    if messages_size_bytes == indexed_size_bytes {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredSegmentSizeDivergence {
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        messages_size_bytes,
-        indexed_size_bytes,
-    })
-}
-
-fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
-    Segment {
-        sealed: segment.sealed,
-        start_timestamp: segment.start_timestamp,
-        end_timestamp: segment.end_timestamp,
-        max_timestamp,
-        current_position: u64::from(segment.current_position),
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        size: segment.size,
-        max_size: segment.max_size,
-    }
-}
-
-fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) -> u64 {
-    let mut max_timestamp = 0;
-    for index in 0..indexes.count() {
-        if let Some(index_view) = indexes.get(index) {
-            max_timestamp = max_timestamp.max(index_view.timestamp());
-        }
-    }
-
-    max_timestamp
-}
-
-async fn load_segment_max_timestamp(
-    storage: &server_common::SegmentStorage,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<u64, ServerNgError> {
-    let Some(index_reader) = storage.index_reader.as_ref() else {
-        return Ok(0);
-    };
-
-    let indexes = index_reader
-        .load_all_indexes_from_disk()
-        .await
-        .map_err(|source| {
-            error!(
-                stream_id,
-                topic_id,
-                partition_id,
-                error = %source,
-                "failed to load segment indexes while recovering max timestamp"
-            );
-            source
-        })?;
-    Ok(indexes_max_timestamp(&indexes))
 }
 
 fn resolve_tcp_topology(
@@ -1744,7 +2152,7 @@ async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
-        return start_via_replica_io(
+        start_via_replica_io(
             shard,
             config,
             topology,
@@ -1752,20 +2160,50 @@ async fn start_tcp_runtime(
             dialed_replica,
             accepted_clients,
         )
-        .await;
+        .await?;
+    } else {
+        start_manual_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            dialed_replica,
+            accepted_clients,
+        )
+        .await?;
     }
 
-    start_manual_runtime(
-        shard,
-        config,
-        topology,
-        accepted_replica,
-        dialed_replica,
-        accepted_clients,
-    )
-    .await
+    // HTTP is served over TCP but sits outside the replica_io / manual client
+    // reactor, so it binds independently. Shard-0 gating comes from the sole
+    // caller of this function.
+    if config.http.enabled {
+        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+        let self_ports = configs::cluster::TransportPorts {
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
+            quic: topology.quic_listen_addr.map(|addr| addr.port()),
+            websocket: topology.ws_listen_addr.map(|addr| addr.port()),
+            ..Default::default()
+        };
+        http::start(
+            shard,
+            http_addr,
+            &config.http,
+            &config.cluster,
+            Arc::clone(&config.system),
+            self_ports,
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 async fn start_via_replica_io(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
@@ -1787,34 +2225,46 @@ async fn start_via_replica_io(
         .is_some()
         .then(|| load_tcp_tls_server_credentials(config))
         .transpose()?;
+    // `websocket.tls.enabled` upgrades the websocket address to a WSS
+    // listener; the plain-WS listener must NOT also bind it (one port, one
+    // handshake kind -- a plain upgrade parser fed a TLS ClientHello rejects
+    // every connection with an httparse error).
+    let wss_enabled = config.websocket.tls.enabled;
+    let ws_listen_addr = (!wss_enabled).then_some(topology.ws_listen_addr).flatten();
+    let wss_listen_addr = wss_enabled.then_some(topology.ws_listen_addr).flatten();
+    let wss_credentials = wss_listen_addr
+        .is_some()
+        .then(|| load_wss_server_credentials(config))
+        .transpose()?;
 
     let LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     } = accepted_clients;
 
     let bound = replica_io::start_on_shard_zero(
         &shard.bus,
         replica_addr,
         topology.client_listen_addr,
-        topology.ws_listen_addr,
+        ws_listen_addr,
         topology.quic_listen_addr,
         quic_credentials,
         topology.tcp_tls_listen_addr,
         tcp_tls_credentials,
-        None,
-        None,
+        wss_listen_addr,
+        wss_credentials,
         topology.self_replica_id,
         topology.peers.clone(),
         accepted_replica,
         dialed_replica,
         tcp,
-        topology.ws_listen_addr.map(|_| ws),
+        ws_listen_addr.map(|_| ws),
         topology.quic_listen_addr.map(|_| quic),
         topology.tcp_tls_listen_addr.map(|_| tcp_tls),
-        None,
+        wss_listen_addr.map(|_| wss),
         shard.bus.config().reconnect_period,
     )
     .await
@@ -1838,7 +2288,8 @@ async fn start_via_replica_io(
         config.cluster.enabled.then_some(bound.replica),
         bound.tcp_tls,
         bound.quic,
-        bound.ws,
+        // The WSS listener occupies the configured websocket address slot.
+        bound.wss.or(bound.ws),
     )
     .await?;
     if config.cluster.enabled {
@@ -1947,10 +2398,58 @@ fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
         return;
     }
 
-    let LegacyUser {
-        username, password, ..
-    } = server::bootstrap::create_root_user();
-    mux_stm.users().ensure_root_user(&username, &password);
+    let (username, password_hash) = create_root_credentials();
+    mux_stm.users().ensure_root_user(&username, &password_hash);
+}
+
+/// Resolve the root user credentials from `IGGY_ROOT_USERNAME` /
+/// `IGGY_ROOT_PASSWORD`, falling back to the default username with a
+/// generated password (printed to stdout, mirroring the legacy server).
+///
+/// Returns `(username, password_hash)`; the plaintext password never
+/// leaves this function.
+fn create_root_credentials() -> (String, String) {
+    let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
+    let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
+    assert_eq!(
+        username.is_ok(),
+        password.is_ok(),
+        "When providing the custom root user credentials, both username and password must be set."
+    );
+    if username.is_ok() && password.is_ok() {
+        info!("Using the custom root user credentials.");
+    } else {
+        info!("Using the default root user credentials...");
+        username = Ok(DEFAULT_ROOT_USERNAME.to_string());
+        let generated_password = crypto::generate_secret(20..40);
+        println!("Generated root user password: {generated_password}");
+        password = Ok(generated_password);
+    }
+
+    let username = username.expect("Root username is not set.");
+    let password = password.expect("Root password is not set.");
+    assert!(
+        !username.is_empty() && !password.is_empty(),
+        "Root user credentials cannot be empty."
+    );
+    assert!(
+        username.len() >= MIN_USERNAME_LENGTH,
+        "Root username is too short."
+    );
+    assert!(
+        username.len() <= MAX_USERNAME_LENGTH,
+        "Root username is too long."
+    );
+    assert!(
+        password.len() >= MIN_PASSWORD_LENGTH,
+        "Root password is too short."
+    );
+    assert!(
+        password.len() <= MAX_PASSWORD_LENGTH,
+        "Root password is too long."
+    );
+
+    (username, crypto::hash_password(&password))
 }
 
 fn validate_cluster_root_bootstrap(
@@ -2038,6 +2537,9 @@ fn make_replica_delegation_fns(
 /// locally on shard 0 because their per-connection state is not portable
 /// across shards (`compio_quic` endpoint binds one UDP socket; rustls TLS
 /// state ties to the post-handshake reactor).
+// ws/wss bindings intentionally mirror the transport names (same convention as
+// `replica_io::start_on_shard_zero`).
+#[allow(clippy::similar_names)]
 fn make_shard_zero_client_accept_fns(
     coord: Rc<shard::coordinator::ShardZeroCoordinator>,
     bus: &Rc<IggyMessageBus>,
@@ -2045,7 +2547,9 @@ fn make_shard_zero_client_accept_fns(
 ) -> LocalClientAcceptFns {
     let quic_bus = Rc::clone(bus);
     let tcp_tls_bus = Rc::clone(bus);
+    let wss_bus = Rc::clone(bus);
     let quic_request = on_request.clone();
+    let wss_request = on_request.clone();
     let tcp_tls_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
@@ -2072,7 +2576,7 @@ fn make_shard_zero_client_accept_fns(
         installer::install_client_quic(&quic_bus, meta, accepted, quic_request.clone());
     });
 
-    let tcp_tls_coord = coord;
+    let tcp_tls_coord = Rc::clone(&coord);
     let tcp_tls = Rc::new(move |stream, tls_config| {
         let Some(meta) =
             client_meta_from_stream(&stream, &tcp_tls_coord, ClientTransportKind::TcpTls)
@@ -2088,11 +2592,24 @@ fn make_shard_zero_client_accept_fns(
         );
     });
 
+    // WSS terminates locally on shard 0 like TCP-TLS (rustls state is not
+    // serialisable across the delegate path), minting ids through the same
+    // coordinator counter.
+    let wss_coord = coord;
+    let wss = Rc::new(move |stream, tls_config| {
+        let Some(meta) = client_meta_from_stream(&stream, &wss_coord, ClientTransportKind::Wss)
+        else {
+            return;
+        };
+        installer::install_client_wss(&wss_bus, meta, stream, tls_config, wss_request.clone());
+    });
+
     LocalClientAcceptFns {
         tcp,
         ws,
         quic,
         tcp_tls,
+        wss,
     }
 }
 
@@ -2148,18 +2665,7 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
-        let token = shard.bus.token();
-        let accepted_ws = accepted_clients.ws.clone();
-        let ws_handle = compio::runtime::spawn(async move {
-            client_listener::ws::run(listener, token, accepted_ws).await;
-        });
-        shard.bus.track_background(ws_handle);
-        bound.ws = Some(bound_addr);
+        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -2347,6 +2853,62 @@ fn load_tcp_tls_server_credentials(
     load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
         ServerNgError::ListenerCredentials {
             transport: "tcp.tls",
+            source,
+        }
+    })
+}
+
+/// Bind the websocket client listener on `ws_addr`: WSS when
+/// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
+/// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
+/// connection with an httparse error), plain WS otherwise.
+async fn start_websocket_listener(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerNgConfig,
+    ws_addr: SocketAddr,
+    accepted_clients: &LocalClientAcceptFns,
+) -> Result<SocketAddr, ServerNgError> {
+    if config.websocket.tls.enabled {
+        let credentials = load_wss_server_credentials(config)?;
+        let (listener, tls_config, bound_addr) = client_listener::wss::bind(ws_addr, credentials)
+            .map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind WSS listener");
+            source
+        })?;
+        let token = shard.bus.token();
+        let accepted_wss = accepted_clients.wss.clone();
+        let wss_handle = compio::runtime::spawn(async move {
+            client_listener::wss::run(listener, tls_config, token, accepted_wss).await;
+        });
+        shard.bus.track_background(wss_handle);
+        Ok(bound_addr)
+    } else {
+        let (listener, bound_addr) =
+            client_listener::ws::bind(ws_addr).await.map_err(|source| {
+                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+                source
+            })?;
+        let token = shard.bus.token();
+        let accepted_ws = accepted_clients.ws.clone();
+        let ws_handle = compio::runtime::spawn(async move {
+            client_listener::ws::run(listener, token, accepted_ws).await;
+        });
+        shard.bus.track_background(ws_handle);
+        Ok(bound_addr)
+    }
+}
+
+fn load_wss_server_credentials(
+    config: &ServerNgConfig,
+) -> Result<TlsServerCredentials, ServerNgError> {
+    let tls = &config.websocket.tls;
+    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+        return Ok(self_signed_for_loopback());
+    }
+
+    load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
+        ServerNgError::ListenerCredentials {
+            transport: "websocket.tls",
             source,
         }
     })
@@ -2611,6 +3173,84 @@ mod tests {
         assert!(
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 1 }),
             "expected MetadataHandoffAborted on shutdown, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_returns_immediately_for_single_shard() {
+        // A single-shard server has no peers to wait on; the owner barrier
+        // must not block when `peers == 0`.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        await_bootstrap_complete(&ready_rx, 0, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("single-shard server must not block on the barrier");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_drains_every_peer_signal() {
+        // Two peers report load-complete; shard 0 drains both, then proceeds
+        // to bind listeners.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(2);
+        let flag = Arc::new(AtomicBool::new(false));
+        signal_bootstrap_complete(1, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 1 must signal load-complete");
+        signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("peer 2 must signal load-complete");
+        await_bootstrap_complete(&ready_rx, 2, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect("owner must drain both peer signals");
+    }
+
+    #[compio::test]
+    async fn await_bootstrap_complete_aborts_on_shutdown_flag() {
+        use compio::runtime::ResumeUnwind;
+
+        // `_ready_tx` is held so the channel is not disconnected: the owner
+        // must exit via the shutdown flag, not a dropped sender.
+        let (_ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let owner = compio::runtime::spawn({
+            let flag = Arc::clone(&flag);
+            async move { await_bootstrap_complete(&ready_rx, 1, &flag, TEST_POLL_INTERVAL).await }
+        });
+
+        // The peer never signals, but a sibling failure flips the flag; the
+        // owner must abort instead of hanging before listeners.
+        compio::time::sleep(TEST_POLL_INTERVAL / 2).await;
+        flag.store(true, Ordering::Relaxed);
+
+        let err = owner
+            .await
+            .resume_unwind()
+            .expect("owner task was cancelled")
+            .expect_err("shutdown flag must abort the barrier wait");
+        assert!(
+            matches!(
+                err,
+                ServerNgError::ShardBootstrapBarrierAborted { remaining: 1 }
+            ),
+            "expected ShardBootstrapBarrierAborted, got {err:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn signal_bootstrap_complete_aborts_when_owner_drops_rx() {
+        // Shard 0 aborted before draining and dropped its receiver; a peer's
+        // signal must surface the disconnect instead of stranding.
+        let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(1);
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(ready_rx);
+
+        let err = signal_bootstrap_complete(2, &ready_tx, &flag, TEST_POLL_INTERVAL)
+            .await
+            .expect_err("dropped rx must surface as an abort");
+        assert!(
+            matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 2 }),
+            "expected MetadataHandoffAborted, got {err:?}"
         );
     }
 }

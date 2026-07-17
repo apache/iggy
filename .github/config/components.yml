@@ -44,6 +44,22 @@ components:
     tasks:
       - "verify-publish"
 
+  # MSRV gate for the four crates we ship to crates.io. Compile-checks them
+  # against the workspace `rust-version` so the published MSRV stays honest.
+  # Source-scoped (not just Cargo.toml) because an MSRV break usually comes
+  # from a crate using an API newer than the floor.
+  rust-msrv:
+    depends_on:
+      - "rust-workspace" # Cargo.lock / toolchain bumps can shift the floor
+      - "ci-infrastructure" # action.yml edits should re-run the check
+    paths:
+      - "core/sdk/**"
+      - "core/common/**"
+      - "core/binary_protocol/**"
+      - "core/cli/**"
+    tasks:
+      - "check-msrv"
+
   # CI/CD infrastructure changes that require full regression
   ci-infrastructure:
     paths:
@@ -368,6 +384,18 @@ components:
       - "bdd/java/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-java"]
+
+  bdd-cpp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"
+      - "sdk-cpp"
+      - "bdd-infrastructure"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/cpp/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-cpp"]
 
   examples-rust:
     depends_on:

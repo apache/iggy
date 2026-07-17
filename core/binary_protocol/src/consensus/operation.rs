@@ -45,6 +45,22 @@ pub enum Operation {
     // Internal metadata operations (journal / replica-only)
     CreateTopicWithAssignments = 64,
     CreatePartitionsWithAssignments = 65,
+    /// Server-originated: drop a disconnected client from every consumer group
+    /// it joined and rebalance. Applied as a deterministic side-effect of the
+    /// `Logout` commit (not its own client command), so it has no wire code.
+    RemoveConsumerGroupMember = 66,
+
+    /// Reconciler-originated: complete a pending cooperative revocation, moving
+    /// a drained partition to its target member. Submitted through metadata
+    /// consensus by the partition reconciler; no client wire code.
+    CompleteConsumerGroupRevocation = 67,
+
+    /// Server-originated: set a partition's delete watermark (the offset below
+    /// which sealed segments are removed). The dispatch handler resolves a
+    /// client `DeleteSegments` count to a concrete offset on the owning shard
+    /// and submits this through metadata consensus, so every replica applies
+    /// the same offset deterministically. No client wire code.
+    TruncatePartition = 68,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -57,9 +73,10 @@ pub enum Operation {
     PurgeTopic = 135,
     CreatePartitions = 136,
     DeletePartitions = 137,
-    // TODO: DeleteSegments is a partition operation (is_partition() == true) but its
-    // discriminant sits in the metadata range (128-147). Should be moved to 163 once
-    // iggy_common's Operation enum is removed and wire compat is no longer a concern.
+    // Client op handled specially: the dispatch layer resolves the requested
+    // segment count to an offset on the owning shard and replicates a
+    // `TruncatePartition` through metadata, so `DeleteSegments` itself is
+    // neither a metadata nor a partition consensus op (see `is_partition`).
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
     DeleteConsumerGroup = 140,
@@ -70,12 +87,13 @@ pub enum Operation {
     UpdatePermissions = 145,
     CreatePersonalAccessToken = 146,
     DeletePersonalAccessToken = 147,
+    JoinConsumerGroup = 148,
+    LeaveConsumerGroup = 149,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    // 163 is reserved for the planned DeleteSegments move (see TODO above).
     StoreConsumerOffset2 = 164,
     DeleteConsumerOffset2 = 165,
 }
@@ -121,6 +139,8 @@ impl Operation {
                 | Self::UpdatePermissions
                 | Self::CreatePersonalAccessToken
                 | Self::DeletePersonalAccessToken
+                | Self::JoinConsumerGroup
+                | Self::LeaveConsumerGroup
         )
     }
 
@@ -135,11 +155,34 @@ impl Operation {
         )
     }
 
+    /// Whether a committed/rejected reply for this operation carries the
+    /// result section (`[count: u32]` then `count` x `{index, result}`) ahead
+    /// of the payload. This is the single source of truth the encode sites
+    /// (`ApplyReply::write_reply_body`, the partition plane's
+    /// `committed_reply_body`, `build_result_rejection_reply` callers) and the
+    /// SDK decode carve-out (`split_metadata_result`) must agree on; a drifted
+    /// site decodes a rejection as `Ok` or misreads a payload as the count.
+    /// Metadata ops are all result-framed; on the partition plane only the
+    /// consumer-offset ops are (they reject with typed errors at admission).
+    /// `Register` is result-framed only when non-empty -- that nuance stays in
+    /// the SDK, the one place that sees Register replies.
+    #[must_use]
+    pub const fn is_result_framed(&self) -> bool {
+        self.is_metadata()
+            || matches!(
+                self,
+                Self::StoreConsumerOffset
+                    | Self::StoreConsumerOffset2
+                    | Self::DeleteConsumerOffset
+                    | Self::DeleteConsumerOffset2
+            )
+    }
+
     /// Data-plane operations routed to the shard owning the partition.
     #[must_use]
     #[inline]
     pub const fn is_partition(&self) -> bool {
-        matches!(self, Self::DeleteSegments) || (*self as u8) >= Self::PARTITION_START
+        (*self as u8) >= Self::PARTITION_START
     }
 
     /// Operations clients are allowed to send directly.
@@ -160,7 +203,10 @@ impl Operation {
             | Self::Logout
             | Self::NonReplicated
             | Self::CreateTopicWithAssignments
-            | Self::CreatePartitionsWithAssignments => None,
+            | Self::CreatePartitionsWithAssignments
+            | Self::RemoveConsumerGroupMember
+            | Self::CompleteConsumerGroupRevocation
+            | Self::TruncatePartition => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -181,6 +227,8 @@ impl Operation {
             | Self::UpdatePermissions
             | Self::CreatePersonalAccessToken
             | Self::DeletePersonalAccessToken
+            | Self::JoinConsumerGroup
+            | Self::LeaveConsumerGroup
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset
@@ -231,6 +279,8 @@ mod tests {
             Operation::UpdatePermissions,
             Operation::CreatePersonalAccessToken,
             Operation::DeletePersonalAccessToken,
+            Operation::JoinConsumerGroup,
+            Operation::LeaveConsumerGroup,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
@@ -296,7 +346,11 @@ mod tests {
         assert!(Operation::CreateStream.is_client_allowed());
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
-        assert!(Operation::DeleteSegments.is_partition());
+        assert!(!Operation::DeleteSegments.is_partition());
+        assert!(!Operation::DeleteSegments.is_metadata());
+        assert!(Operation::TruncatePartition.is_internal());
+        assert!(Operation::TruncatePartition.is_metadata());
+        assert!(!Operation::TruncatePartition.is_client_allowed());
         assert!(Operation::DeleteConsumerOffset.is_partition());
         assert!(Operation::StoreConsumerOffset2.is_partition());
         assert!(Operation::DeleteConsumerOffset2.is_partition());

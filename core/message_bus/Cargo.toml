@@ -32,6 +32,7 @@ publish = false
 ahash = { workspace = true }
 async-channel = { workspace = true }
 blake3 = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 compio-quic = { workspace = true }

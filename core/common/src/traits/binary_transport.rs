@@ -18,6 +18,8 @@
 use crate::{ClientState, DiagnosticEvent, IggyDuration, IggyError};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "vsr")]
+use std::sync::Arc;
 
 #[async_trait]
 pub trait BinaryTransport {
@@ -28,6 +30,12 @@ pub trait BinaryTransport {
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
     fn get_heartbeat_interval(&self) -> IggyDuration;
+
+    /// Per-transport consumer-group + partitioning cache used to resolve
+    /// partitioning client-side under VSR (the broker never picks a
+    /// partition). Shared via `Arc` so a refresh task can hold it.
+    #[cfg(feature = "vsr")]
+    fn consumer_group_state(&self) -> Arc<crate::ConsumerGroupClientState>;
 }
 
 /// Sealed marker. Downstream crates cannot implement
@@ -47,6 +55,10 @@ mod vsr_session_sealed {
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
+    /// SDK crate version sent in the login-register version prefix.
+    /// Implemented by the transports so the value is the SDK crate's own
+    /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
+    fn sdk_version(&self) -> &'static str;
 }
 
 #[cfg(feature = "vsr")]

@@ -16,17 +16,12 @@
 // under the License.
 
 use crate::server::scenarios::{message_size_scenario, single_message_per_batch_scenario};
-#[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{reconnect_after_restart_scenario, restart_offset_skip_scenario};
-#[cfg(not(feature = "vsr"))]
 use crate::server::scenarios::{
     segment_rotation_race_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = TcpTlsGenerated,
     server(tls = generated)
@@ -36,9 +31,6 @@ async fn tcp_tls_scenario_should_be_valid(harness: &TestHarness) {
     tcp_tls_scenario::run(&client).await;
 }
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = TcpTlsSelfSigned,
     server(tls = self_signed)
@@ -48,9 +40,6 @@ async fn tcp_tls_self_signed_scenario_should_be_valid(harness: &TestHarness) {
     tcp_tls_scenario::run(&client).await;
 }
 
-// TLS listeners are not wired in server-ng's message bus (handshake fails
-// with BadSignature / eof and the SDK retries forever).
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = WebSocketTlsGenerated,
     server(websocket_tls = generated)
@@ -70,7 +59,6 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
     single_message_per_batch_scenario::run(harness, 5).await;
 }
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
@@ -84,8 +72,12 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_producer(harness).await;
 }
 
-#[cfg(not(feature = "vsr"))]
-#[iggy_harness(
+// QUIC stays vsr-gated on an SDK gap: after the restart the QUIC client
+// redirects to the new leader, reconnects, and signs in, but the long-lived
+// consumer's polls then return nothing for the whole window -- the
+// post-reconnect request path wedges (QUIC also lacks the TCP client's
+// mid-connection failover). TCP and WebSocket run.
+#[cfg_attr(not(feature = "vsr"), iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
         tcp.socket.override_defaults = true,
@@ -93,12 +85,20 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
-)]
+))]
+#[cfg_attr(feature = "vsr", iggy_harness(
+    test_client_transport = [Tcp, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+))]
 async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_consumer(harness).await;
 }
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -107,7 +107,30 @@ async fn single_message_restart_offset_zero(harness: &mut TestHarness) {
     reconnect_after_restart_scenario::run_single_message_offset_zero_restart(harness).await;
 }
 
-#[cfg(not(feature = "vsr"))]
+// Full-cluster restart is vsr-only by construction: it exercises the rejoin
+// probe's election fallback across all replicas, which a single-process
+// legacy server has no equivalent of (plain restart covers it there).
+#[cfg(feature = "vsr")]
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn full_cluster_restart_recovers_and_serves(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_full_cluster_restart(harness).await;
+}
+
+// vsr-only: exercises `RangeEvicted` + the commit floor, which only exist
+// on the replicated plane (the rejoin window exceeds the peers' evicted
+// ring, so journal repair alone cannot cover it).
+#[cfg(feature = "vsr")]
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn rejoin_window_exceeding_evicted_ring(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_ring_overflow_rejoin(harness).await;
+}
+
 #[iggy_harness(server(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = true
@@ -124,7 +147,6 @@ async fn consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
 /// Config: high messages_required_to_save so post-restart messages accumulate in
 /// the journal (exposing the base_offset=0 bug). message_saver flushes pre-restart
 /// data before the restart.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     partition.messages_required_to_save = "10000",
     partition.enforce_fsync = false,
@@ -149,10 +171,8 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 /// Test configuration:
 /// - 8 producers total (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 /// - All producers write to the same partition for maximum lock contention
-// Concurrency race test over all four transports (vsr has no HTTP) and
-// trips the metadata-plane consensus races; skip with the other
-// concurrent tests until those races are fixed.
-#[cfg(not(feature = "vsr"))]
+// Concurrency race test: under vsr it runs over the three VSR transports
+// (TCP/QUIC/WebSocket -- HTTP/REST carries no VSR framing), legacy runs all four.
 #[iggy_harness(server(
     segment.size = "512B",
     message_saver.interval = "1s",

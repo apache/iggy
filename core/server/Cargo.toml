@@ -17,13 +17,10 @@
 
 [package]
 name = "server"
-version = "0.8.1-edge.1"
+version = "0.8.2-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-
-[package.metadata.cargo-udeps.ignore]
-normal = ["tracing-appender"]
 
 [package.metadata.cargo-machete]
 ignored = ["vergen-git2"]
@@ -42,7 +39,6 @@ systemd = ["dep:sd-notify"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
-argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
@@ -72,17 +68,10 @@ left-right = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-opentelemetry-semantic-conventions = { workspace = true }
-opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
 prometheus-client = { workspace = true }
-rand = { workspace = true }
 ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
-rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
@@ -92,26 +81,20 @@ send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 server_common = { workspace = true }
+shard_allocator = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
+system_stats = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
-tracing-appender = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
-
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-hwlocality = { workspace = true }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
 vergen-git2 = { workspace = true }

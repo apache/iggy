@@ -54,6 +54,23 @@ const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
+/// Bound on how long a single QUIC request waits for its response, mirroring the
+/// TCP client's `RESPONSE_READ_TIMEOUT`. A replicated request that the server
+/// cannot commit transiently is answered with silence - the server expects the
+/// SDK read-timeout to drive a replay. `RecvStream::read_to_end` on an
+/// unanswered bidi stream otherwise blocks until the QUIC idle timeout (which
+/// can be minutes), parking that request and, because the connection is held
+/// under lock per send, every later request on the client.
+const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Backoff before replaying a request the server answered with an explicit
+/// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
+/// view-change cancel). Unlike a silent timeout, this reply arrives promptly, so
+/// a short pause keeps the replay from spinning while the primary catches up.
+/// Bounded overall by `RESPONSE_READ_TIMEOUT`.
+#[cfg(feature = "vsr")]
+const NOT_READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
 /// QUIC client for interacting with the Iggy API.
 #[derive(Debug)]
 pub struct QuicClient {
@@ -71,6 +88,8 @@ pub struct QuicClient {
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
+    #[cfg(feature = "vsr")]
+    consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
 unsafe impl Send for QuicClient {}
@@ -142,7 +161,13 @@ impl BinaryTransport for QuicClient {
         }
 
         #[cfg(feature = "vsr")]
-        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
+            // Without auto-login a reconnect cannot re-establish the session, so
+            // non-login requests are not recovered here - their transient replay
+            // happens on the live connection inside `send_raw`. Login/register
+            // is the exception: the server stays deliberately silent on a
+            // transient register failure and relies on the client replaying via
+            // a reconnect with a fresh session.
             return Err(error);
         }
 
@@ -169,6 +194,11 @@ impl BinaryTransport for QuicClient {
 
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
+    }
+
+    #[cfg(feature = "vsr")]
+    fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
+        Arc::clone(&self.consumer_group_state)
     }
 }
 
@@ -201,6 +231,10 @@ impl iggy_common::VsrSessionControl for QuicClient {
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
+    }
+
+    fn sdk_version(&self) -> &'static str {
+        crate::SDK_VERSION
     }
 }
 
@@ -272,6 +306,8 @@ impl QuicClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
+            #[cfg(feature = "vsr")]
+            consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
 
@@ -289,10 +325,14 @@ impl QuicClient {
     async fn handle_response(
         recv: &mut RecvStream,
         response_buffer_size: usize,
+        read_timeout: Duration,
     ) -> Result<Bytes, IggyError> {
-        let buffer = recv
-            .read_to_end(response_buffer_size)
+        let buffer = tokio::time::timeout(read_timeout, recv.read_to_end(response_buffer_size))
             .await
+            .map_err(|_| {
+                error!("Timed out after {read_timeout:?} waiting for QUIC response");
+                IggyError::Disconnected
+            })?
             .map_err(|error| {
                 error!("Failed to read response data: {error}");
                 IggyError::QuicError
@@ -462,6 +502,19 @@ impl QuicClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
+                    // Leadership still matters without auto-login: the caller
+                    // signs in manually, and a login against a non-leader
+                    // replays for its whole read timeout. `GetClusterMetadata`
+                    // is sessionless and pre-auth on server-ng, so the check
+                    // works on the unauthenticated connection. vsr-only: the
+                    // legacy server auth-gates cluster metadata, so this check
+                    // would bounce `Unauthenticated` into the reconnect path
+                    // and recurse back into `connect`.
+                    #[cfg(feature = "vsr")]
+                    {
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
@@ -469,6 +522,15 @@ impl QuicClient {
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
+                    } else if self.handle_leader_redirection().await? {
+                        // Check leadership BEFORE signing in: register/login are
+                        // consensus ops a backup answers with
+                        // `TransientNotCommitted`, so signing in against a
+                        // non-leader replays for the whole read timeout instead
+                        // of failing over. `GetClusterMetadata` is sessionless
+                        // and pre-auth, so it works on the unauthenticated
+                        // connection.
+                        true
                     } else {
                         info!(
                             "{NAME} client: {} is signing in...",
@@ -647,73 +709,127 @@ impl QuicClient {
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
-            if let Some(connection) = connection.as_ref() {
-                #[cfg(feature = "vsr")]
+            let Some(connection) = connection.as_ref() else {
+                error!("Cannot send data. Client is not connected.");
+                return Err(IggyError::NotConnected);
+            };
+
+            #[cfg(feature = "vsr")]
+            {
                 let (request_header, request_size) = {
                     let mut consensus_session = consensus_session
                         .lock()
                         .expect("consensus session mutex poisoned");
                     crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
-                #[cfg(not(feature = "vsr"))]
+                trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
+                // Same-connection transient resend, gated on the EXPLICIT
+                // `TransientNotCommitted` frame only. The server answers every
+                // transient submit with that frame (it is pre-commit by
+                // construction, so replaying the SAME request header on a fresh
+                // bidi cannot double-commit), and it no longer abandons a bidi
+                // whose op is still committing. Silence therefore is NOT a
+                // retry signal: partition ops share one request id and have no
+                // reply cache, so resending a silently-unanswered request whose
+                // first attempt was buffered and later commits would commit it
+                // twice (duplicate `SendMessages`, or a succeeded delete coming
+                // back as terminal `ConsumerOffsetNotFound`). A silent deadline
+                // expiry surfaces `Disconnected` and takes the
+                // reconnect path in `send_raw_with_response`, same as TCP.
+                let header_bytes = bytemuck::bytes_of(&request_header);
+                let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                loop {
+                    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
+                        error!("Failed to open a bidirectional stream: {error}");
+                        IggyError::QuicError
+                    })?;
+                    send.write_all(header_bytes).await.map_err(|error| {
+                        error!("Failed to write VSR request header: {error}");
+                        IggyError::QuicError
+                    })?;
+                    if !payload.is_empty() {
+                        send.write_all(&payload).await.map_err(|error| {
+                            error!("Failed to write VSR request payload: {error}");
+                            IggyError::QuicError
+                        })?;
+                    }
+                    send.finish().map_err(|error| {
+                        error!("Failed to finish VSR request stream: {error}");
+                        IggyError::QuicError
+                    })?;
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(IggyError::Disconnected);
+                    }
+                    match QuicClient::handle_response(
+                        &mut recv,
+                        response_buffer_size as usize,
+                        remaining,
+                    )
+                    .await
+                    {
+                        Ok(reply) => return Ok(reply),
+                        // `TransientNotCommitted` = the server replied with an
+                        // explicit retry frame because it could not commit yet
+                        // (not-caught-up / in-flight / pipeline-full /
+                        // view-change cancel). Nothing committed, so replaying
+                        // the same request id on a fresh bidi is safe; the
+                        // session stays intact so no reconnect/relogin is
+                        // needed (login replays idempotently too). Anything
+                        // else - including a silent read timeout - is
+                        // terminal here and handled by the caller.
+                        Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
+                            if tokio::time::Instant::now() < deadline =>
+                        {
+                            // The explicit frame returns promptly (no read
+                            // timeout elapsed), so pace the replay.
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                            warn!(
+                                "QUIC request code {code} not committed (transient); resending on a new stream"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
+            #[cfg(not(feature = "vsr"))]
+            {
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                 let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                     error!("Failed to open a bidirectional stream: {error}");
                     IggyError::QuicError
                 })?;
                 trace!("Sending a QUIC request with code: {code}");
-                #[cfg(feature = "vsr")]
-                trace!(
-                    "Sending a QUIC VSR request of size {} with code: {code}",
-                    request_size
-                );
-                #[cfg(feature = "vsr")]
-                send.write_all(bytemuck::bytes_of(&request_header))
-                    .await
-                    .map_err(|error| {
-                        error!("Failed to write VSR request header: {error}");
-                        IggyError::QuicError
-                    })?;
-                #[cfg(feature = "vsr")]
-                if !payload.is_empty() {
-                    send.write_all(&payload).await.map_err(|error| {
-                        error!("Failed to write VSR request payload: {error}");
-                        IggyError::QuicError
-                    })?;
-                }
-                #[cfg(feature = "vsr")]
-                send.finish().map_err(|error| {
-                    error!("Failed to finish VSR request stream: {error}");
-                    IggyError::QuicError
-                })?;
-                #[cfg(not(feature = "vsr"))]
                 send.write_all(&(payload_length as u32).to_le_bytes())
                     .await
                     .map_err(|error| {
                         error!("Failed to write payload length: {error}");
                         IggyError::QuicError
                     })?;
-                #[cfg(not(feature = "vsr"))]
                 send.write_all(&code.to_le_bytes()).await.map_err(|error| {
                     error!("Failed to write payload code: {error}");
                     IggyError::QuicError
                 })?;
-                #[cfg(not(feature = "vsr"))]
                 send.write_all(&payload).await.map_err(|error| {
                     error!("Failed to write payload: {error}");
                     IggyError::QuicError
                 })?;
-                #[cfg(not(feature = "vsr"))]
                 send.finish().map_err(|error| {
                     error!("Failed to finish sending data: {error}");
                     IggyError::QuicError
                 })?;
                 trace!("Sent a QUIC request with code: {code}, waiting for a response...");
-                return QuicClient::handle_response(&mut recv, response_buffer_size as usize).await;
+                QuicClient::handle_response(
+                    &mut recv,
+                    response_buffer_size as usize,
+                    RESPONSE_READ_TIMEOUT,
+                )
+                .await
             }
-
-            error!("Cannot send data. Client is not connected.");
-            Err(IggyError::NotConnected)
         })
         .await
         .map_err(|e| {

@@ -32,7 +32,7 @@ async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
 }
 
 #[cfg(feature = "vsr")]
-#[iggy_harness(test_client_transport = [Tcp, WebSocket])]
+#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 async fn given_authenticated_client_when_sending_raw_request_should_round_trip(
     harness: &TestHarness,
 ) {

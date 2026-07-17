@@ -27,10 +27,7 @@
 # or stability of the code, it does indicate that the project has yet to be
 # fully endorsed by the ASF.
 
-ARG RUST_VERSION=1.96
-FROM rust:${RUST_VERSION}
-
-FROM gradle:9.5.1-jdk17
+FROM gradle:9.6.1-jdk17
 
 WORKDIR /workspace
 COPY . .

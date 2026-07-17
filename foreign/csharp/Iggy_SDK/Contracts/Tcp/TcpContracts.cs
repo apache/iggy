@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -385,8 +387,8 @@ internal static class TcpContracts
         bytes[position + 18] = autoCommit ? (byte)1 : (byte)0;
     }
 
-    internal static void CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
-        Partitioning partitioning, ReadOnlySpan<Message> messages)
+    internal static int CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
+        Partitioning partitioning, ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor = null)
     {
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length + 2 + partitioning.Length + 4;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[..4], metadataLength);
@@ -401,49 +403,110 @@ internal static class TcpContracts
         position += 16 * messages.Length;
 
         var msgSize = 0;
-        foreach (var message in messages)
+
+        // One scratch buffer reused across the batch (grown on demand); holds plaintext headers, so it is
+        // returned cleared on every path, including a mid-batch throw from the encryptor or header serialization.
+        byte[]? headerScratch = null;
+        try
         {
-            ReadOnlyMemory<byte> rawHeaders = message.RawUserHeaders;
-            var headersLength = rawHeaders.IsEmpty ? HeadersByteLength(message.UserHeaders) : rawHeaders.Length;
-            var payloadLength = message.Payload.Length;
-            var header = message.Header;
-
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], 0); // checksum is server-computed
-            BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], header.Id);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], header.Offset);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)],
-                DateTimeOffsetUtils.ToUnixTimeMicroSeconds(header.Timestamp));
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)],
-                header.OriginTimestamp);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersLength);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], payloadLength);
-            // Reserved must be zero on the wire; the server rejects non-zero values.
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 56)..(position + 64)], 0);
-
-            message.Payload.Span.CopyTo(bytes[(position + 64)..(position + 64 + payloadLength)]);
-            if (headersLength > 0)
+            foreach (var message in messages)
             {
-                var headersStart = position + 64 + payloadLength;
-                Span<byte> headersDestination = bytes[headersStart..(headersStart + headersLength)];
-                if (rawHeaders.IsEmpty)
+                var header = message.Header;
+                var payloadStart = position + 64;
+
+                int payloadLength;
+                if (encryptor is null)
                 {
-                    WriteHeadersTo(headersDestination, message.UserHeaders!);
+                    payloadLength = message.Payload.Length;
+                    message.Payload.Span.CopyTo(bytes[payloadStart..(payloadStart + payloadLength)]);
                 }
                 else
                 {
-                    rawHeaders.Span.CopyTo(headersDestination);
+                    // Bound the destination to this message's reserved share of the buffer so an encryptor that
+                    // overruns its GetMaxEncryptedLength contract fails fast here instead of corrupting the batch.
+                    Span<byte> payloadDestination =
+                        bytes.Slice(payloadStart, encryptor.GetMaxEncryptedLength(message.Payload.Length));
+                    payloadLength = encryptor.Encrypt(message.Payload.Span, payloadDestination);
                 }
+
+                ReadOnlyMemory<byte> rawHeaders = message.RawUserHeaders;
+                var plainHeadersLength =
+                    rawHeaders.IsEmpty ? HeadersByteLength(message.UserHeaders) : rawHeaders.Length;
+                var headersStart = payloadStart + payloadLength;
+                var headersLength = 0;
+                if (plainHeadersLength > 0)
+                {
+                    if (encryptor is null)
+                    {
+                        headersLength = plainHeadersLength;
+                        Span<byte> headersDestination = bytes[headersStart..(headersStart + headersLength)];
+                        if (rawHeaders.IsEmpty)
+                        {
+                            WriteHeadersTo(headersDestination, message.UserHeaders!);
+                        }
+                        else
+                        {
+                            rawHeaders.Span.CopyTo(headersDestination);
+                        }
+                    }
+                    else
+                    {
+                        Span<byte> headersDestination =
+                            bytes.Slice(headersStart, encryptor.GetMaxEncryptedLength(plainHeadersLength));
+                        if (rawHeaders.IsEmpty)
+                        {
+                            if (headerScratch is null || headerScratch.Length < plainHeadersLength)
+                            {
+                                if (headerScratch is not null)
+                                {
+                                    ArrayPool<byte>.Shared.Return(headerScratch, true);
+                                }
+
+                                headerScratch = ArrayPool<byte>.Shared.Rent(plainHeadersLength);
+                            }
+
+                            WriteHeadersTo(headerScratch.AsSpan(0, plainHeadersLength), message.UserHeaders!);
+                            headersLength = encryptor.Encrypt(headerScratch.AsSpan(0, plainHeadersLength),
+                                headersDestination);
+                        }
+                        else
+                        {
+                            headersLength = encryptor.Encrypt(rawHeaders.Span, headersDestination);
+                        }
+                    }
+                }
+
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], 0);
+                BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], header.Id);
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], header.Offset);
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)],
+                    DateTimeOffsetUtils.ToUnixTimeMicroSeconds(header.Timestamp));
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)],
+                    header.OriginTimestamp);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersLength);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], payloadLength);
+                // Reserved must be zero on the wire; the server rejects non-zero values.
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 56)..(position + 64)], 0);
+
+                position += 64 + payloadLength + headersLength;
+
+                msgSize += 64 + payloadLength + headersLength;
+
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[indexPosition..(indexPosition + 4)], 0);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
+                BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
+                indexPosition += 16;
             }
-
-            position += 64 + payloadLength + headersLength;
-
-            msgSize += 64 + payloadLength + headersLength;
-
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[indexPosition..(indexPosition + 4)], 0);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
-            BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
-            indexPosition += 16;
         }
+        finally
+        {
+            if (headerScratch is not null)
+            {
+                ArrayPool<byte>.Shared.Return(headerScratch, true);
+            }
+        }
+
+        return position;
     }
 
     internal static int HeadersByteLength(Dictionary<HeaderKey, HeaderValue>? headers)

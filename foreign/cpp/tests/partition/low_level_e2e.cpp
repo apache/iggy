@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -61,6 +60,10 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsBeforeLoginThrows) {
     ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
                  std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
+                 std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
                  std::exception);
 }
@@ -355,6 +358,10 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeLoginThrows) {
     ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
                  std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
+                 std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
                  std::exception);
 }

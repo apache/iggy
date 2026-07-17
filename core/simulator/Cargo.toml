@@ -25,6 +25,9 @@ publish = false
 [dependencies]
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+clap = { workspace = true }
+clock = { workspace = true }
+configs = { workspace = true }
 consensus = { path = "../consensus" }
 enumset = { workspace = true }
 futures = { workspace = true }
@@ -33,11 +36,15 @@ iggy_common = { path = "../common" }
 indexmap = { workspace = true }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }
-metadata = { path = "../metadata" }
-partitions = { path = "../partitions" }
+metadata = { path = "../metadata", features = ["simulator"] }
+partitions = { path = "../partitions", features = ["simulator"] }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
-server_common = { path = "../server_common" }
+secrecy = { workspace = true }
+# `default-features = false` drops the mimalloc global allocator and the
+# web-embed feature; the sim only needs the dispatch/bootstrap library.
+server-ng = { path = "../server-ng", default-features = false }
+server_common = { path = "../server_common", features = ["simulator"] }
 shard = { path = "../shard", features = ["simulator"] }
 strum = { workspace = true }
 tracing = { workspace = true }

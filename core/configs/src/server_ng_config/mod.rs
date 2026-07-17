@@ -32,6 +32,7 @@ pub mod displays;
 pub mod message_bus;
 pub mod quic;
 pub mod server_ng;
+pub mod sharding;
 pub mod tcp;
 pub mod validators;
 pub mod websocket;

@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `UpdateUser` op. Existing username from shadow plus a fresh new name.
+//! `UpdateUser` op. Targets `Ok` (rename live user to fresh name) or
+//! `UserNotFound` (fabricated user). `UsernameAlreadyExists` not targeted.
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -26,22 +27,19 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::UpdateUserResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub user: String,
     pub new_username: Option<String>,
     pub status: Option<u8>,
-    /// Current password from shadow; carried through `Effect::RenameUser`
-    /// so the shadow re-keys `passwords` under `new_username`.
+    /// Current password from shadow; carried via `Effect::RenameUser` so the
+    /// shadow re-keys `passwords` under `new_username`.
     pub current_password: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -50,16 +48,27 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => {
+        Outcome::Ok => {
             let user = shadow.pick_user_name(prng)?;
             let current_password = shadow.password_for(&user)?.to_string();
-            let new_username = Some(shadow.fresh_name("user"));
             Some(Input {
                 user,
-                new_username,
+                new_username: Some(shadow.fresh_name("user")),
                 status: Some(1),
                 current_password,
             })
+        }
+        Outcome::UserNotFound => Some(Input {
+            user: shadow.fabricate_absent_name("user"),
+            new_username: Some(shadow.fresh_name("user")),
+            status: Some(1),
+            current_password: String::new(),
+        }),
+        Outcome::UsernameAlreadyExists => {
+            unreachable!("update_user does not target UsernameAlreadyExists")
+        }
+        Outcome::InvalidUsername => {
+            unreachable!("update_user does not target InvalidUsername")
         }
     }
 }
@@ -69,23 +78,28 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.update_user(&input.user, input.new_username.as_deref(), input.status)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => {
-            input
-                .new_username
-                .as_ref()
-                .map_or(Effect::None, |new| Effect::RenameUser {
-                    old: input.user.clone(),
-                    new: new.clone(),
-                    password: input.current_password.clone(),
-                })
+        Outcome::Ok => input
+            .new_username
+            .as_ref()
+            .map_or(Effect::None, |new| Effect::RenameUser {
+                old: input.user.clone(),
+                new: new.clone(),
+                password: input.current_password.clone(),
+            }),
+        Outcome::UserNotFound | Outcome::UsernameAlreadyExists | Outcome::InvalidUsername => {
+            Effect::None
         }
     }
 }

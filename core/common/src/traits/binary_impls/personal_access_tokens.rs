@@ -21,6 +21,8 @@ use crate::{
     BinaryClient, ClientState, DiagnosticEvent, IdentityInfo, IggyError, PersonalAccessTokenClient,
     PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::MAX_WIRE_NAME_LENGTH;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 #[cfg(feature = "vsr")]
@@ -103,13 +105,20 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
     ) -> Result<IdentityInfo, IggyError> {
         #[cfg(feature = "vsr")]
         {
+            super::logout_before_relogin(self).await?;
+            // Same bounds the non-vsr branch gets from `WireName::new(token)`;
+            // the request stores a `SecretString`, so enforce them here to keep
+            // the u8 length prefix consistent with the realized bytes.
+            if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
+                return Err(IggyError::InvalidFormat);
+            }
             let response = match self
                 .send_raw_with_response(
                     LOGIN_REGISTER_WITH_PAT_CODE,
                     LoginRegisterWithPatRequest {
+                        version_info: super::rust_sdk_version_info(self.sdk_version())?,
                         token: SecretString::from(token.to_string()),
-                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                        client_context: Some(String::new()),
+                        client_context: None,
                     }
                     .to_bytes(),
                 )
@@ -132,6 +141,11 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
                 self.reset_vsr_session().await?;
                 return Err(error);
             }
+            tracing::debug!(
+                server_version = %wire_resp.server_version,
+                server_protocol_version = wire_resp.server_protocol_version,
+                "authenticated against iggy server"
+            );
             self.set_state(ClientState::Authenticated).await;
             self.publish_event(DiagnosticEvent::SignedIn).await;
             return Ok(IdentityInfo {

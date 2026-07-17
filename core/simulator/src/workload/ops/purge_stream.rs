@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `PurgeStream` op. Live stream name picked from shadow.
+//! `PurgeStream` op. Targets `Ok` (live stream) or `StreamNotFound`
+//! (fabricated, never-created name).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -26,17 +27,14 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::PurgeStreamResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub stream: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::StreamNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -45,7 +43,10 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => shadow.pick_stream_name(prng).map(|stream| Input { stream }),
+        Outcome::Ok => shadow.pick_stream_name(prng).map(|stream| Input { stream }),
+        Outcome::StreamNotFound => Some(Input {
+            stream: shadow.fabricate_absent_name("stream"),
+        }),
     }
 }
 
@@ -54,19 +55,20 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.purge_stream(&input.stream)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
-pub const fn predicted_effect(_input: &Input, outcome: Outcome) -> Effect {
-    match outcome {
-        // Purge clears messages; stream stays live.
-        //
-        // TODO: zero `shadow.sends_committed` for partitions under
-        // this stream. Blocked on a name→ns reverse index; needed
-        // once `store_consumer_offset.rs` clamps against post-purge.
-        Outcome::Success => Effect::None,
-    }
+pub const fn predicted_effect(_input: &Input, _outcome: Outcome) -> Effect {
+    // Purge clears messages but leaves the stream live, so shadow structure is
+    // unchanged. Per-namespace message counts not modeled yet: zeroing
+    // `shadow.sends_committed` needs a name->ns reverse index, itself needed
+    // once `store_consumer_offset` clamps against post-purge offsets.
+    Effect::None
 }

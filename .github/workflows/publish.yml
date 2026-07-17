@@ -136,7 +136,7 @@ jobs:
       has_targets: ${{ steps.check.outputs.has_targets }}
       is_workflow_call: ${{ steps.detect.outputs.is_workflow_call }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
 
@@ -246,7 +246,7 @@ jobs:
     # policy contract intact. Composite action is shared with
     # .github/workflows/_common.yml.
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
       - uses: ./.github/actions/utils/validate-third-party-licenses
@@ -276,7 +276,7 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
 
@@ -443,7 +443,7 @@ jobs:
           echo "✅ Downloaded latest copy script from master"
 
       - name: Checkout at commit
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
           # check-tags only runs `git ls-remote --tags` against origin,
@@ -757,7 +757,7 @@ jobs:
           echo "✅ Downloaded latest copy script from master"
 
       - name: Checkout at commit
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
@@ -851,7 +851,7 @@ jobs:
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
           # create-git-tag's shallow-safe fallback at action.yml:86-96
@@ -941,7 +941,7 @@ jobs:
           path: ${{ runner.temp }}/digests
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to Docker Hub
         uses: ./.github/actions/utils/docker-login
@@ -1073,7 +1073,7 @@ jobs:
           echo "✅ Downloaded latest copy script from master"
 
       - name: Checkout at commit
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
           # create-git-tag falls back to a shallow fetch when the commit
@@ -1361,7 +1361,7 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
           echo "✅ Downloaded latest copy script from master"
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
         with:
           ref: ${{ needs.validate.outputs.commit }}
 

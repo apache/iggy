@@ -47,6 +47,10 @@ runs:
         cache: "npm"
         cache-dependency-path: ${{ inputs.cache-dependency-path }}
 
+    - name: Pin npm to 11 to match Dependabot lockfile format
+      run: npm install -g npm@11
+      shell: bash
+
     - name: Setup npm cache
       if: inputs.enabled == 'true'
       uses: actions/cache@v5

@@ -16,7 +16,6 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -89,11 +88,6 @@ public class IggyConsumerConfig
     ///     The identifier of the topic to consume from
     /// </summary>
     public Identifier TopicId { get; set; }
-
-    /// <summary>
-    ///     Optional message encryptor for decrypting messages
-    /// </summary>
-    public IMessageEncryptor? MessageEncryptor { get; set; } = null;
 
     /// <summary>
     ///     Optional partition ID to consume from. If null, consumes from all partitions.

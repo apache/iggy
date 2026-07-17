@@ -35,17 +35,17 @@ pub mod configs;
 pub mod diagnostics;
 pub mod http;
 pub mod io;
-pub mod log;
 pub mod metadata;
 pub mod quic;
 pub mod sender;
 pub mod server_error;
 pub mod shard;
-pub mod shard_allocator;
 pub mod state;
 pub mod streaming;
 pub mod tcp;
 pub mod websocket;
+
+pub use server_common::log;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);

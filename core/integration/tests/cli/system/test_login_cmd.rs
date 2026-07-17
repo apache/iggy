@@ -29,6 +29,9 @@ pub enum TestLoginCmdType {
     SuccessWithTimeout(u64),
     AlreadyLoggedIn,
     AlreadyLoggedInWithToken,
+    /// Re-login after the stored session expired: the CLI must recreate the
+    /// session instead of failing on the dead token.
+    RecoverExpiredSession,
 }
 
 #[derive(Debug)]
@@ -76,6 +79,9 @@ impl IggyCmdTestCase for TestLoginCmd {
                     .await;
                 assert!(pat.is_ok());
             }
+            // State is whatever the preceding session-timeout step left behind
+            // (differs per transport), so nothing is asserted up front.
+            TestLoginCmdType::RecoverExpiredSession => {}
         }
     }
 
@@ -93,7 +99,8 @@ impl IggyCmdTestCase for TestLoginCmd {
         match self.login_type {
             TestLoginCmdType::Success
             | TestLoginCmdType::AlreadyLoggedInWithToken
-            | TestLoginCmdType::SuccessWithTimeout(_) => {
+            | TestLoginCmdType::SuccessWithTimeout(_)
+            | TestLoginCmdType::RecoverExpiredSession => {
                 command_state.success().stdout(diff(format!(
                     "Executing login command\nSuccessfully logged into Iggy server {}\n",
                     self.server_address

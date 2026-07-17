@@ -77,6 +77,9 @@ async fn should_block_deletion_until_all_consumers_pass_segment(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
+// The scenario asserts the exact [0, 7, 14, 21] layout only on the legacy path;
+// under vsr it verifies the framing-agnostic purge outcome (offsets cleared,
+// files deleted, partition reset to a single segment at offset 0).
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_purge_topic_and_clear_consumer_offsets(
     harness: &mut TestHarness,

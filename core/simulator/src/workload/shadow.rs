@@ -164,6 +164,14 @@ impl Shadow {
         format!("wl-{prefix}-{index:08x}")
     }
 
+    /// A unique name guaranteed absent from the shadow, hence from the server: it
+    /// draws a brand-new index no op has been issued, so nothing created it. Used
+    /// to target `*NotFound` outcomes. Race-stable even across concurrent clients
+    /// (fresh indices are never reused), so the targeted rejection is deterministic.
+    pub fn fabricate_absent_name(&mut self, prefix: &str) -> String {
+        self.fresh_name(prefix)
+    }
+
     /// Apply a predicted effect. Returns [`SimCommand`]s for the driver
     /// plus an `applied` flag gating `auditor.note_committed`.
     ///

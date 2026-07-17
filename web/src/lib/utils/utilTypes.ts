@@ -16,8 +16,7 @@
 // under the License.
 
 export type NonNegativeInteger<T extends number> = `${T}` extends
-  | `-${string}`
-  | `${string}.${string}`
+  `-${string}` | `${string}.${string}`
   ? never
   : T;
 

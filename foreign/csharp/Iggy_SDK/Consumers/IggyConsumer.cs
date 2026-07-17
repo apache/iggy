@@ -18,13 +18,10 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Mappers;
 using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
@@ -37,7 +34,6 @@ namespace Apache.Iggy.Consumers;
 public partial class IggyConsumer : IAsyncDisposable
 {
     private readonly Channel<ReceivedMessage> _channel;
-    private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
@@ -45,6 +41,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
+    private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private string? _consumerGroupName;
     private int _disposeState;
     private volatile bool _isInitialized;
@@ -211,7 +208,10 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
-    /// <param name="resetLastPolled">When true, also advances the cached last-polled offset for the partition so the next poll resumes past the stored offset.</param>
+    /// <param name="resetLastPolled">
+    ///     When true, also advances the cached last-polled offset for the partition so the next poll
+    ///     resumes past the stored offset.
+    /// </param>
     /// <param name="ct">Cancellation token</param>
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)
@@ -344,8 +344,22 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>
+    ///     Guards the wire-driving auto-commit flag against an encrypting client. The builder enforces this via
+    ///     AutoCommitMode, but AutoCommit and AutoCommitMode are independent config fields and the consumer is
+    ///     constructible without the builder, so the load-bearing check lives here at the poll site.
+    /// </summary>
+    private void ThrowIfAutoCommitWithEncryptor()
+    {
+        if (_config.AutoCommit && _client.MessageEncryptor != null)
+        {
+            throw new InvalidOperationException(
+                "AutoCommit with a message encryptor risks silent message loss: the offset is committed before decryption. Use AutoCommitMode.AfterReceive or AutoCommitMode.Disabled.");
+        }
+    }
+
+    /// <summary>
     ///     Polls messages from the server and writes them to the internal channel.
-    ///     Handles decryption, offset tracking, and auto-commit logic.
+    ///     Handles offset tracking and auto-commit logic.
     ///     Uses semaphore to ensure single concurrent polling operation.
     /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
@@ -355,6 +369,8 @@ public partial class IggyConsumer : IAsyncDisposable
             LogConsumerGroupNotJoinedYetSkippingPolling();
             return;
         }
+
+        ThrowIfAutoCommitWithEncryptor();
 
         await _pollingSemaphore.WaitAsync(ct);
 
@@ -386,45 +402,13 @@ public partial class IggyConsumer : IAsyncDisposable
                     continue;
                 }
 
-                var processedMessage = message;
-                var status = MessageStatus.Success;
-                Exception? error = null;
-
-                if (_config.MessageEncryptor != null)
-                {
-                    try
-                    {
-                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
-
-                        Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
-                        if (message.RawUserHeaders is { Length: > 0 })
-                        {
-                            var decryptedHeaderBytes = _config.MessageEncryptor.Decrypt(message.RawUserHeaders);
-                            decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
-                        }
-
-                        processedMessage = new MessageResponse
-                        {
-                            Header = message.Header,
-                            Payload = decryptedPayload,
-                            UserHeaders = decryptedHeaders
-                        };
-                    }
-                    catch (Exception ex)
-                    {
-                        LogFailedToDecryptMessage(ex, message.Header.Offset);
-                        status = MessageStatus.DecryptionFailed;
-                        error = ex;
-                    }
-                }
-
                 var receivedMessage = new ReceivedMessage
                 {
-                    Message = processedMessage,
-                    CurrentOffset = processedMessage.Header.Offset,
+                    Message = message,
+                    CurrentOffset = message.Header.Offset,
                     PartitionId = (uint)messages.PartitionId,
-                    Status = status,
-                    Error = error
+                    Status = MessageStatus.Success,
+                    Error = null
                 };
 
                 await _channel.Writer.WriteAsync(receivedMessage, ct);
@@ -451,6 +435,17 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
             }
+        }
+        catch (MessageDecryptionException ex)
+        {
+            LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
+            throw;
+        }
+        catch (MalformedResponseException)
+        {
+            // Non-transient poison: rethrow so the generic catch below does not swallow it and re-poll forever.
+            // Base InvalidResponseException (server error status, possibly transient) falls through to retry.
+            throw;
         }
         catch (Exception ex)
         {

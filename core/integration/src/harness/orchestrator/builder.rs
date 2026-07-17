@@ -295,6 +295,17 @@ fn build_servers(
 }
 
 fn default_cluster_node_count() -> usize {
+    // Suite-wide override: run every test that does not pin `cluster_nodes`
+    // against an N-node cluster (e.g. `IGGY_TEST_CLUSTER_NODES=1` probes the
+    // whole vsr suite on a single server-ng node). Explicit attrs win.
+    if let Some(count) = std::env::var("IGGY_TEST_CLUSTER_NODES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count >= 1)
+    {
+        return count;
+    }
+
     #[cfg(feature = "vsr")]
     {
         3
@@ -393,7 +404,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
         assert!(!harness.started);
         assert_eq!(harness.client_configs.len(), 1);
     }
@@ -407,7 +418,7 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
         assert!(harness.mcp().is_some());
     }
 
@@ -452,6 +463,6 @@ mod tests {
             .build()
             .unwrap();
 
-        assert_eq!(harness.servers.len(), 1);
+        assert_eq!(harness.servers.len(), default_cluster_node_count());
     }
 }

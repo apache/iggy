@@ -16,10 +16,9 @@
 // under the License.
 
 use metadata::impls::recovery::RecoveryError;
-// TODO: decouple logging errors from the `server` crate.
-use server::server_error::LogError;
-use server::shard_allocator::ShardingError;
+use server_common::log::LogError;
 use shard::ShardCtorError;
+use shard_allocator::ShardingError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -104,6 +103,11 @@ pub enum ServerNgError {
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
     )]
     MetadataHandoffAborted { shard_id: u16 },
+    #[error(
+        "shard 0 aborted before binding listeners with {remaining} peer shard(s) still loading \
+         their on-disk partitions; a peer most likely failed during bootstrap (shutdown flag set)"
+    )]
+    ShardBootstrapBarrierAborted { remaining: usize },
     #[error("failed to parse {context} socket address '{address}'")]
     SocketAddressParse {
         context: &'static str,
@@ -155,18 +159,6 @@ pub enum ServerNgError {
         path: String,
         #[source]
         source: Box<iggy_common::IggyError>,
-    },
-    #[error(
-        "recovered {consumer_kind} offset {offset} for id {consumer_id} exceeds current_offset {current_offset} in stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    RecoveredConsumerOffsetOutOfBounds {
-        consumer_kind: &'static str,
-        consumer_id: usize,
-        offset: u64,
-        current_offset: u64,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
     },
     #[error(
         "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"

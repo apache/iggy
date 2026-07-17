@@ -19,6 +19,7 @@
 name = "iggy-cli"
 version = "0.13.1-edge.1"
 edition = "2024"
+rust-version.workspace = true
 authors = ["bartosz.ciesla@gmail.com"]
 repository = "https://github.com/apache/iggy"
 homepage = "https://iggy.apache.org"
@@ -50,6 +51,7 @@ login-session = [
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
 ]
+vsr = ["iggy/vsr"]
 
 [dependencies]
 anyhow = { workspace = true }

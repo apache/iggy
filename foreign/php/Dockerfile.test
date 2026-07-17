@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.96-slim-bookworm
+ARG RUST_VERSION=1.96
+FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

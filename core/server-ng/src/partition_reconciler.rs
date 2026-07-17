@@ -45,10 +45,38 @@
 //! every `create_topic`.
 //!
 //! TODO: block VSR-ification of `topics.rs` / `partitions.rs`
-//! `binary_impls` on a materialization barrier (cross-shard
-//! `MaterializedAck` from each assigned shard back to shard 0; shard 0
-//! holds the reply in `client_table` until all acks arrive). Sync-block
-//! alternative was deferred.
+//! `binary_impls` on a materialization barrier. Two changes, both
+//! required together (one without the other does not close the race):
+//!
+//! 1. **Owner becomes the sole writer of its own `shards_table` row.**
+//!    Today any non-owning shard's reconciler independently seeds an
+//!    `InsertRouted` row the moment it observes committed metadata (see
+//!    the bullet above) -- a pure hash computation, no coordination with
+//!    the owner. That is fine for routing (`calculate_shard_assignment`
+//!    is a static function of the namespace, identical on every shard,
+//!    no placement decision to propagate) but it means a row can exist
+//!    before the owner's own `build_partition_fresh` has finished.
+//!    Non-owning shards must stop writing this row ahead of the owner.
+//! 2. **Owner pushes the row to every other shard once materialised**,
+//!    instead of each shard independently guessing it. Cheap: this is a
+//!    same-node, cross-shard-core message (the existing `ReconcileOp`
+//!    inter-shard channel already carries `InsertOwned`/`ConfirmRemove`;
+//!    extend it with a push variant), not a network round trip to
+//!    another replica.
+//!
+//! With both in place, `shards_table.shard_for(ns).is_some()` on ANY
+//! shard implies the owner has already materialised the partition, so
+//! `dispatch::wait_for_partition_routable`'s second-phase `partition_read`
+//! probe (the owner-readiness check a router-side reader currently has to
+//! do by hand, since the table alone can't be trusted) becomes
+//! unnecessary; a single `shards_table` poll is a sufficient barrier for
+//! both server-ng-shard routing AND the pump/client reply. The heavier
+//! "shard 0 holds the client reply until every assigned shard acks"
+//! design was the original idea here; this is a smaller, cheaper
+//! alternative scoped to the local (same-node) table-visibility problem
+//! only, not the reply-timing one -- the create-topic reply can still
+//! ship on metadata commit as it does today, since the retry loop that
+//! consumes `shards_table` is what actually needs the invariant.
 
 use crate::bootstrap::ServerNgShard;
 use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
@@ -56,8 +84,11 @@ use ahash::{AHashMap, AHashSet};
 use configs::server_ng::ServerNgConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
+use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
+use shard::MetadataSubmit;
 use shard::ReconcileOp;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 use shard::{Receiver, Sender};
@@ -65,7 +96,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -210,7 +241,10 @@ pub async fn run_reconciler(
 
     loop {
         let sleep = compio::time::sleep(periodic);
-        futures::select! {
+        // Biased for the same reason as the shard pump: unbiased `select!`
+        // polls arms in process-random order, which a deterministic
+        // simulator cannot seed. Listed order is the intended priority.
+        futures::select_biased! {
             _ = stop_rx.recv().fuse() => break,
             recv = wake_rx.recv().fuse() => {
                 if recv.is_err() {
@@ -237,6 +271,14 @@ struct PassCounters {
     backoff_skipped: usize,
     /// Stale incarnations (slab-key reuse) torn down for rebuild.
     stale: usize,
+    /// Consumer-group offsets reclaimed for groups deleted while their topic
+    /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
+    cg_offsets_purged: usize,
+    /// Committed delete watermarks not yet fully enforced on local segments.
+    /// Counted so the pass does not arm the fast-skip: the pump can be
+    /// blocked by a consumer barrier or by a rejoin whose offsets land via
+    /// journal repair, and neither unblocking bumps `Streams::revision`.
+    trims_pending: usize,
 }
 
 impl PassCounters {
@@ -247,6 +289,8 @@ impl PassCounters {
             + self.removed_routed
             + self.backoff_skipped
             + self.stale
+            + self.cg_offsets_purged
+            + self.trims_pending
     }
 }
 
@@ -257,6 +301,12 @@ impl PassCounters {
 async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let shard_id = ctx.shard.id;
     let revision = current_revision(ctx);
+
+    // Cooperative-revocation completion runs every tick, before the fast-skip:
+    // a timeout fires on wall-clock and a drain on partition-offset state, and
+    // neither bumps `Streams::revision`, so the skip would otherwise starve an
+    // idle group's pending revocations forever. Cheap no-op when none pending.
+    reconcile_pending_revocations(ctx);
 
     // Fast-skip: committed partition set unchanged since the last
     // fully-converged pass and no backoff retry due, so the O(N) diff is
@@ -280,6 +330,9 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
+    reconcile_consumer_group_offsets(ctx, &mut counters).await;
+    reconcile_segment_truncations(ctx, &mut counters);
+    reconcile_partition_purges(ctx);
 
     let local_set: AHashSet<IggyNamespace> =
         ctx.shard.plane.partitions().namespaces().copied().collect();
@@ -404,18 +457,18 @@ async fn reconcile_additions(
             continue;
         }
 
-        // Clone the parent `Arc<TopicStats>` only for namespaces actually
+        // Resolve the shared stats `Arc` only for namespaces actually
         // built, not once per committed partition every pass. A topic that
         // vanished between the target snapshot and this read defers to the
         // next pass.
-        let Some(topic_stats) = fetch_topic_stats(ctx, ns) else {
+        let Some(partition_stats) = fetch_partition_stats(ctx, ns) else {
             continue;
         };
 
         match build_partition_fresh(
             ctx.config.as_ref(),
             ns,
-            topic_stats,
+            partition_stats,
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
@@ -563,10 +616,140 @@ async fn tear_down_owned_partition(
     counters.removed_local += 1;
 }
 
+/// Reclaim consumer-group offsets left behind by a `DeleteConsumerGroup` whose
+/// topic still exists (a topic/stream delete already drops the whole partition
+/// directory, offsets included). For each owned partition, any stored
+/// consumer-group offset whose group id is no longer present in the topic's
+/// committed metadata is removed (in-memory entry + persisted file). Monotonic,
+/// never-reused group ids make this purely reclamation -- a recreated group
+/// gets a fresh id and never reads a dead group's offset -- so it is safe to do
+/// lazily on the reconcile pass rather than synchronously on delete.
+async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+    let live_groups = snapshot_topic_live_groups(ctx);
+    let partitions = ctx.shard.plane.partitions();
+    let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
+    for ns in owned {
+        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
+        // Take the in-memory removes + owned unlink paths under a closure-scoped
+        // borrow that cannot escape into the await below. Holding a raw
+        // `&IggyPartition` across `delete_persisted_offset().await` would let the
+        // pump task realloc the partitions vec underneath us (a UAF).
+        let paths = partitions.with_partition(&ns, |partition| {
+            partition.reclaim_dead_group_offsets(|group_id| {
+                live.is_some_and(|set| set.contains(&group_id))
+            })
+        });
+        let Some(paths) = paths else {
+            continue;
+        };
+        for path in paths {
+            if let Err(err) = delete_persisted_offset(&path).await {
+                warn!(
+                    shard = ctx.shard.id,
+                    ns_raw = ns.inner(),
+                    error = %err,
+                    "reconciler failed to reclaim deleted consumer-group offset"
+                );
+                continue;
+            }
+            counters.cg_offsets_purged += 1;
+        }
+    }
+}
+
+/// Complete cooperative consumer-group revocations whose source member has
+/// drained the partition (`committed >= last_polled`), was never polled, or
+/// timed out. Reads pending revocations from metadata + local partition offset
+/// state, then submits a `CompleteRevocation` op to shard 0 (the metadata
+/// consensus owner). Idempotent + fire-and-forget: a not-yet-completable or
+/// transiently-failed revocation is retried next pass.
+#[allow(clippy::cast_possible_truncation)]
+fn reconcile_pending_revocations(ctx: &ReconcilerCtx) {
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    // O(1) fast-skip before the walk: `consumer_group_pending_revocations`
+    // allocates a vec and walks every stream/topic/group/member, and the
+    // reconciler hits this every tick. `has_pending_revocations` reads the
+    // maintained counter, so the common (nothing-pending) case pays nothing.
+    if !streams.has_pending_revocations() {
+        return;
+    }
+    let pending = streams.consumer_group_pending_revocations();
+    if pending.is_empty() {
+        return;
+    }
+    let partitions = ctx.shard.plane.partitions();
+    let now = IggyTimestamp::now().as_micros();
+    let timeout = ctx.config.consumer_group.rebalancing_timeout.as_micros();
+    for (stream_id, topic_id, group_id, source_client_id, partition_id, created_at) in pending {
+        let ns = IggyNamespace::new(stream_id as usize, topic_id as usize, partition_id as usize);
+        // The partition lives on its owner shard; only that shard's reconciler
+        // can read its offsets. Other shards skip (the owner completes it).
+        let Some(partition) = partitions.get_by_ns(&ns) else {
+            continue;
+        };
+        let key = ConsumerGroupId(group_id as usize);
+        let last_polled = partition
+            .last_polled_offsets
+            .pin()
+            .get(&key)
+            .map(|offset| offset.offset.load(std::sync::atomic::Ordering::Relaxed));
+        let committed = partition
+            .consumer_group_offsets
+            .pin()
+            .get(&key)
+            .map(|offset| offset.offset.load(std::sync::atomic::Ordering::Relaxed));
+        let timed_out = now.saturating_sub(created_at) >= timeout;
+        // None: never polled -> nothing in flight, hand off now. Some(polled):
+        // only safe once the source committed what it was served (or timeout).
+        let completable =
+            last_polled.is_none_or(|polled| committed.is_some_and(|c| c >= polled) || timed_out);
+        if !completable {
+            continue;
+        }
+        let (reply, _rx) = shard::channel::<Option<u64>>(1);
+        ctx.shard
+            .forward_metadata_submit(MetadataSubmit::CompleteRevocation {
+                stream_id,
+                topic_id,
+                group_id,
+                source_client_id,
+                partition_id,
+                reply,
+            });
+    }
+}
+
+/// `(stream_id, topic_id) -> live consumer-group offset keys` from committed
+/// metadata. The partition plane keys a group's offset by the monotonic group
+/// id (the store path is rewritten to it; the read path resolves it), so the
+/// live-set carries those ids too -- otherwise the reconciler would treat every
+/// live offset as orphaned and purge it.
+fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), AHashSet<u64>> {
+    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let mut map: AHashMap<(usize, usize), AHashSet<u64>> = AHashMap::new();
+        for (_, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                if topic.consumer_groups.is_empty() {
+                    continue;
+                }
+                map.insert(
+                    (stream.id, topic_id),
+                    topic
+                        .consumer_groups
+                        .values()
+                        .map(|group| group.id)
+                        .collect(),
+                );
+            }
+        }
+        map
+    })
+}
+
 /// Committed `(namespace, created_revision)` pairs. The epoch lets the
 /// additions pass detect a stale local incarnation after slab-key reuse
 /// without an `Arc<TopicStats>` clone per partition; stats are fetched
-/// lazily in [`fetch_topic_stats`] only for namespaces actually built.
+/// lazily in [`fetch_partition_stats`] only for namespaces actually built.
 fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         // TODO(krishna): O(committed partitions) per non-skipped pass (here +
@@ -599,19 +782,82 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
 
 /// Clone the parent topic's `Arc<TopicStats>` for a single namespace.
 /// `None` if the topic vanished between the target snapshot and this read.
-fn fetch_topic_stats(
+fn fetch_partition_stats(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
-) -> Option<Arc<iggy_common::TopicStats>> {
+) -> Option<Arc<iggy_common::PartitionStats>> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
-        Some(topic.stats.clone())
+        // Get-or-create in the shared registry so the owning shard's counters
+        // are the same `Arc` every shard's `get_topic` reply reads.
+        Some(inner.stats_registry.partition(
+            ns.stream_id(),
+            ns.topic_id(),
+            ns.partition_id(),
+            topic.stats.clone(),
+        ))
     })
 }
 
 fn shards_table_contains(ctx: &ReconcilerCtx, ns: IggyNamespace) -> bool {
     ctx.shard.shards_table().shard_for(ns).is_some()
+}
+
+/// Enforce committed `TruncatePartition` watermarks: for each owned partition
+/// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
+/// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
+/// so a redundant pass triggered by an unrelated revision bump is harmless.
+/// A watermark whose enforcement is still incomplete (first local segment
+/// starts below it) counts as pending work: the pump may be blocked by a
+/// consumer barrier or by a rejoin whose offsets arrive via journal repair,
+/// and neither unblocking bumps `Streams::revision`, so the pass must keep
+/// the reconciler ticking until the layout converges.
+fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let watermark = streams.partition_delete_watermark(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        if watermark == 0 {
+            continue;
+        }
+        ctx.shard.request_truncate_partition(namespace, watermark);
+        let trimmed = partitions
+            .get_by_ns(&namespace)
+            .and_then(|partition| partition.log.segments().first())
+            .is_none_or(|first| first.start_offset >= watermark);
+        if !trimmed {
+            counters.trims_pending += 1;
+        }
+    }
+}
+
+/// Stage a `PurgePartition` reset for every owned partition whose committed
+/// `PurgeTopic` generation is newer than the one the local partition last
+/// applied. The pump re-checks the generation before wiping, so a redundant
+/// pass (e.g. from an unrelated revision bump) is a no-op.
+fn reconcile_partition_purges(ctx: &ReconcilerCtx) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    for namespace in namespaces {
+        let committed = streams.partition_purge_generation(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let applied = partitions
+            .get_by_ns(&namespace)
+            .map_or(0, partitions::IggyPartition::applied_purge_generation);
+        if committed > applied {
+            ctx.shard.request_purge_partition(namespace, committed);
+        }
+    }
 }
 
 pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {
@@ -627,7 +873,7 @@ pub fn install_tick_handler(shard: &Rc<ServerNgShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{FailureCause, FailureRecord, ReconcilerCtx, reconcile_once};
-    use configs::server_ng::ServerNgConfig;
+    use configs::server_ng::{NgSystemConfig, ServerNgConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
     use iggy_binary_protocol::codec::WireEncode;
     use iggy_binary_protocol::primitives::identifier::WireName;
@@ -645,7 +891,6 @@ mod tests {
     use metadata::MuxStateMachine;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
-    use metadata::stm::consumer_group::ConsumerGroups;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use partitions::{IggyPartitions, PartitionsConfig};
@@ -659,7 +904,7 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
-    type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams, ConsumerGroups)>;
+    type TestMux = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
     type TestShard = IggyShard<
         Rc<IggyMessageBus>,
         journal::prepare_journal::PrepareJournal,
@@ -774,15 +1019,69 @@ mod tests {
             .expect("DeleteStream apply succeeds");
     }
 
+    fn seed_create_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        name: &str,
+    ) {
+        use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+        let req = CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            name: WireName::new(name).expect("test group name fits WireName"),
+        };
+        mux.update(build_prepare(op, Operation::CreateConsumerGroup, &req))
+            .expect("CreateConsumerGroup apply succeeds");
+    }
+
+    fn seed_delete_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u32,
+    ) {
+        use iggy_binary_protocol::requests::consumer_groups::DeleteConsumerGroupRequest;
+        let req = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id: WireIdentifier::numeric(group_id),
+        };
+        mux.update(build_prepare(op, Operation::DeleteConsumerGroup, &req))
+            .expect("DeleteConsumerGroup apply succeeds");
+    }
+
+    fn seed_join_consumer_group(
+        mux: &TestMux,
+        op: u64,
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u32,
+        client_id: u128,
+    ) {
+        use metadata::stm::consumer_group::JoinConsumerGroupRequest;
+        let req = JoinConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            topic_id: WireIdentifier::numeric(topic_id),
+            group_id: WireIdentifier::numeric(group_id),
+            client_id,
+            in_flight: Vec::new(),
+        };
+        mux.update(build_prepare(op, Operation::JoinConsumerGroup, &req))
+            .expect("JoinConsumerGroup apply succeeds");
+    }
+
     fn test_config(tmp: &TempDir) -> ServerNgConfig {
         let mut cfg = ServerNgConfig::default();
-        // `SystemConfig` is not `Clone`, so `Arc::make_mut` is out; build a
+        // `NgSystemConfig` is not `Clone`, so `Arc::make_mut` is out; build a
         // fresh value via struct-update syntax and swap the Arc wholesale.
         // Only `path` differs from the default; every other field uses the
         // runtime's defaults.
-        let system = configs::system::SystemConfig {
+        let system = NgSystemConfig {
             path: tmp.path().to_string_lossy().into_owned(),
-            ..configs::system::SystemConfig::default()
+            ..NgSystemConfig::default()
         };
         cfg.system = Arc::new(system);
         cfg
@@ -806,6 +1105,7 @@ mod tests {
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
                 segment_size: config.system.segment.size,
+                encryptor: None,
             },
         );
         let shards_table = PapayaShardsTable::new();
@@ -1436,6 +1736,190 @@ mod tests {
         assert!(
             std::path::Path::new(&partition_root).exists(),
             "defer must not re-drive teardown: the directory must remain"
+        );
+    }
+
+    /// A bare `DeleteConsumerGroup` (topic survives) leaves the group's offsets
+    /// on the partition. The reconciler must reclaim a deleted group's offset
+    /// while leaving a still-live group's offset untouched.
+    #[compio::test]
+    async fn reconcile_reclaims_offsets_of_deleted_consumer_group() {
+        use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-cg");
+        seed_topic(&mux, 2, 0, "topic-cg", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&ns));
+
+        // Two groups: "dead" gets id 1, "live" gets id 2 (per-topic monotonic).
+        let stm = &shard.plane.metadata().mux_stm;
+        seed_create_consumer_group(stm, 3, 0, 0, "dead");
+        seed_create_consumer_group(stm, 4, 0, 0, "live");
+
+        // Offsets are keyed by the monotonic group id (the id the store path is
+        // rewritten to and the read path / live-set resolve), not the name hash.
+        let dead_key: u32 = 1;
+        let live_key: u32 = 2;
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_by_ns(&ns).expect("partition materialised");
+            partition.consumer_group_offsets.pin().insert(
+                ConsumerGroupId(dead_key as usize),
+                ConsumerOffset::new(ConsumerKind::ConsumerGroup, dead_key, 7, String::new()),
+            );
+            partition.consumer_group_offsets.pin().insert(
+                ConsumerGroupId(live_key as usize),
+                ConsumerOffset::new(ConsumerKind::ConsumerGroup, live_key, 9, String::new()),
+            );
+        }
+
+        // Delete the "dead" group (id 1); "live" (id 2) stays.
+        seed_delete_consumer_group(stm, 5, 0, 0, 1);
+        reconcile_pass(&ctx).await;
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&ns)
+            .expect("partition still materialised");
+        let mut ids = partition.consumer_group_offset_ids();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![u64::from(live_key)],
+            "deleted group's offset reclaimed; live group's offset retained"
+        );
+    }
+
+    /// A partition-count change must re-run consumer-group assignment: a new
+    /// partition gets assigned, a removed one is dropped. Pure metadata test --
+    /// the assignment lives in the Streams STM.
+    #[compio::test]
+    async fn create_delete_partitions_reassigns_consumer_group() {
+        use metadata::impls::metadata::StreamsFrontend;
+
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-rp");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-rp",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_create_consumer_group(&mux, 3, 0, 0, "cg");
+        // Single member owns every partition (group id 1, the first in topic).
+        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
+
+        let group = WireIdentifier::numeric(1);
+        let stream = WireIdentifier::numeric(0);
+        let topic = WireIdentifier::numeric(0);
+        let assigned = |mux: &TestMux| -> Vec<u32> {
+            let (_, mut partitions) = mux
+                .streams()
+                .consumer_group_member_assignment(&stream, &topic, &group, 100)
+                .expect("member assignment present");
+            partitions.sort_unstable();
+            partitions
+        };
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1],
+            "joined member owns both partitions"
+        );
+
+        // Add one partition (request-relative id 0 rebases to absolute id 2).
+        mux.update(build_prepare(
+            5,
+            Operation::CreatePartitionsWithAssignments,
+            &CreatePartitionsWithAssignmentsRequest {
+                request: CreatePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                },
+                partitions: vec![assignment(0, 3)],
+            },
+        ))
+        .expect("CreatePartitions apply succeeds");
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1, 2],
+            "added partition must be reassigned to the member"
+        );
+
+        // Remove one partition; the member drops the highest id.
+        mux.update(build_prepare(
+            6,
+            Operation::DeletePartitions,
+            &iggy_binary_protocol::requests::partitions::DeletePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+        ))
+        .expect("DeletePartitions apply succeeds");
+        assert_eq!(
+            assigned(&mux),
+            vec![0, 1],
+            "removed partition must be dropped from the assignment"
+        );
+    }
+
+    /// A disconnect (`remove_consumer_group_member`) drops the client from
+    /// every group it joined and rebalances its partitions onto the survivors.
+    #[compio::test]
+    async fn disconnect_removes_member_from_groups_and_rebalances() {
+        use metadata::impls::metadata::StreamsFrontend;
+
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-dc");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "topic-dc",
+            vec![assignment(0, 1), assignment(1, 2)],
+        );
+        seed_create_consumer_group(&mux, 3, 0, 0, "cg"); // group id 1
+        seed_join_consumer_group(&mux, 4, 0, 0, 1, 100);
+        seed_join_consumer_group(&mux, 5, 0, 0, 1, 200);
+
+        let stream = WireIdentifier::numeric(0);
+        let topic = WireIdentifier::numeric(0);
+        let group = WireIdentifier::numeric(1);
+        let assigned = |client: u128| -> Option<Vec<u32>> {
+            mux.streams()
+                .consumer_group_member_assignment(&stream, &topic, &group, client)
+                .map(|(_, mut partitions)| {
+                    partitions.sort_unstable();
+                    partitions
+                })
+        };
+        // Two members, two partitions: each owns one.
+        assert_eq!(assigned(100).map(|p| p.len()), Some(1));
+        assert_eq!(assigned(200).map(|p| p.len()), Some(1));
+
+        // Client 100 disconnects.
+        mux.streams()
+            .remove_consumer_group_member(100, iggy_common::IggyTimestamp::default());
+
+        assert_eq!(
+            assigned(100),
+            None,
+            "disconnected client must leave the group"
+        );
+        assert_eq!(
+            assigned(200),
+            Some(vec![0, 1]),
+            "survivor must take over the disconnected member's partitions"
         );
     }
 }

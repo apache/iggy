@@ -16,6 +16,7 @@
 // under the License.
 
 mod api;
+mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
@@ -31,7 +32,9 @@ mod quickwit;
 mod random;
 mod random_source_liveness;
 mod runtime;
+mod s3;
 mod stdout;
+mod surrealdb;
 
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
