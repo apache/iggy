@@ -45,6 +45,17 @@ namespace Apache.Iggy.IggyClient.Implementations;
 /// </summary>
 public sealed class TcpMessageStream : IIggyClient
 {
+    private const int InvalidCommandStatus = 3;
+
+    private static readonly HashSet<uint> SessionControlCodes =
+    [
+        CommandCodes.LOGIN_USER_CODE,
+        CommandCodes.LOGOUT_USER_CODE,
+        CommandCodes.LOGIN_REGISTER_CODE,
+        CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+        CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE
+    ];
+
     private readonly IggyClientConfigurator _configuration;
     private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
     private readonly SemaphoreSlim _connectionSemaphore;
@@ -580,6 +591,23 @@ public sealed class TcpMessageStream : IIggyClient
         using IMemoryOwner<byte> result = await SendWithResponseAsync(payload, token);
 
         return result.Memory.Span.ToArray();
+    }
+
+    /// <inheritdoc />
+    public async Task<byte[]> SendRawWithResponseAsync(uint code, byte[] payload, CancellationToken token = default)
+    {
+        if (SessionControlCodes.Contains(code))
+        {
+            throw new IggyInvalidStatusCodeException(InvalidCommandStatus,
+                $"Invalid response status code: {InvalidCommandStatus}");
+        }
+
+        var buffer = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + payload.Length];
+        TcpMessageStreamHelpers.CreatePayload(buffer, payload, (int)code);
+
+        using IMemoryOwner<byte> result = await SendWithResponseAsync(buffer, token);
+
+        return result.Memory.Length <= 1 ? [] : result.Memory.Span.ToArray();
     }
 
     /// <inheritdoc />

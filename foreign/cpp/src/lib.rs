@@ -480,6 +480,7 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
+        fn send_raw_with_response(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
         // Future functions
         fn disconnect(self: &Client) -> Result<()>;

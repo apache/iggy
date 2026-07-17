@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.8.1-dev2"
+version = "0.8.1-dev3"
 edition = "2024"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"

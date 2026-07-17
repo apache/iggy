@@ -24,6 +24,8 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
@@ -43,6 +45,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class BasicMessagingSteps {
@@ -207,6 +210,39 @@ public class BasicMessagingSteps {
 
         String lastPayload = new String(messages.get(messages.size() - 1).payload(), StandardCharsets.UTF_8);
         assertEquals(context.lastSentMessage, lastPayload, "Last message should match sent message");
+    }
+
+    @When("I send a raw command with code {int} and an empty payload")
+    public void sendRawCommand(int code) {
+        try {
+            context.lastRawResponse = getClient().sendRawWithResponse(code, new byte[0]);
+            context.lastRawError = null;
+        } catch (RuntimeException error) {
+            context.lastRawResponse = null;
+            context.lastRawError = error;
+        }
+    }
+
+    @Then("the raw command should succeed with an empty response")
+    public void rawCommandSucceedsWithEmptyResponse() {
+        assertNull(context.lastRawError, "Raw command should succeed");
+        assertNotNull(context.lastRawResponse, "Raw response should be present");
+        assertEquals(0, context.lastRawResponse.length, "Raw response should be empty");
+    }
+
+    @Then("the raw command should succeed with a non-empty response")
+    public void rawCommandSucceedsWithNonEmptyResponse() {
+        assertNull(context.lastRawError, "Raw command should succeed");
+        assertNotNull(context.lastRawResponse, "Raw response should be present");
+        assertTrue(context.lastRawResponse.length > 0, "Raw response should not be empty");
+    }
+
+    @Then("the raw command should fail with an invalid command error")
+    public void rawCommandFailsWithInvalidCommand() {
+        assertNull(context.lastRawResponse, "Raw response should be absent");
+        assertTrue(context.lastRawError instanceof IggyServerException, "Expected an Iggy server error");
+        IggyServerException error = (IggyServerException) context.lastRawError;
+        assertEquals(IggyErrorCode.INVALID_COMMAND, error.getErrorCode());
     }
 
     private IggyBaseClient getClient() {

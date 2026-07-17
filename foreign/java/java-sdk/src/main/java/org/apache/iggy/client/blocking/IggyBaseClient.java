@@ -21,6 +21,18 @@ package org.apache.iggy.client.blocking;
 
 public interface IggyBaseClient {
 
+    /**
+     * Sends a command code and payload and returns the raw response payload.
+     *
+     * <p>Session-control codes are rejected with an invalid-command error. HTTP clients report
+     * that this operation is unsupported.
+     *
+     * @param code the command code
+     * @param payload the command payload
+     * @return the raw response payload
+     */
+    byte[] sendRawWithResponse(int code, byte[] payload);
+
     SystemClient system();
 
     StreamsClient streams();

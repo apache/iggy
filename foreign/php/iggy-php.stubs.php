@@ -217,6 +217,16 @@ namespace Iggy {
          * @return void
          */
         public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): void {}
+
+        /**
+         * Sends a command code with a payload and returns the raw response bytes.
+         * Session-control codes return an invalid-command exception.
+         *
+         * @param int $code
+         * @param string $payload
+         * @return string
+         */
+        public function sendRawWithResponse(int $code, string $payload): string {}
     }
 
     /**

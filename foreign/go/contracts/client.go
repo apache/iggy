@@ -300,4 +300,8 @@ type Client interface {
 	// GetClient get the info about a specific client by unique ID (not to be confused with the user).
 	// Authentication is required, and the permission to read the server info.
 	GetClient(ctx context.Context, clientId uint32) (*ClientInfoDetails, error)
+
+	// SendRawWithResponse sends a command code and payload and returns the raw response body.
+	// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+	SendRawWithResponse(ctx context.Context, code uint32, payload []byte) ([]byte, error)
 }

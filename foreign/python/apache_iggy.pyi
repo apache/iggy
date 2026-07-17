@@ -635,6 +635,25 @@ class IggyClient:
         Creates a new consumer group consumer.
         Returns the consumer or a PyRuntimeError on failure.
         """
+    def send_raw_with_response(
+        self, code: builtins.int, payload: builtins.bytes
+    ) -> collections.abc.Awaitable[bytes]:
+        r"""
+        Send a command code with a payload and return the raw response bytes.
+
+        Session-control codes are rejected client-side. HTTP transport does not
+        support raw binary commands.
+
+        Args:
+            code: Command code as `int`.
+            payload: Request payload as `bytes`.
+
+        Returns:
+            An awaitable that resolves to the raw response `bytes`.
+
+        Raises:
+            PyRuntimeError: If the command cannot be sent or the server returns an error.
+        """
 
 @typing.final
 class IggyConsumer:

@@ -51,6 +51,16 @@ func TestFeatures(t *testing.T) {
 			},
 		})
 	}
+	if feature == "all" || feature == "raw_command" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initRawCommandScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/raw_command.feature"},
+				TestingT: t,
+			},
+		})
+	}
 
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)

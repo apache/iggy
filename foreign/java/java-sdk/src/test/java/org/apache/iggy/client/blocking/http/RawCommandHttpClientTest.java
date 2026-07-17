@@ -17,21 +17,20 @@
  * under the License.
  */
 
-package org.apache.iggy.bdd;
+package org.apache.iggy.client.blocking.http;
 
-import org.apache.iggy.client.blocking.IggyBaseClient;
-import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
+import org.junit.jupiter.api.Test;
 
-class TestContext {
-    IggyBaseClient client;
-    String serverAddr;
-    Long lastStreamId;
-    String lastStreamName;
-    Long lastTopicId;
-    String lastTopicName;
-    Long lastTopicPartitions;
-    PolledMessages lastPolledMessages;
-    String lastSentMessage;
-    byte[] lastRawResponse;
-    RuntimeException lastRawError;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class RawCommandHttpClientTest {
+
+    @Test
+    void shouldRejectRawCommands() {
+        var client = new IggyHttpClient("http://127.0.0.1:3000");
+
+        assertThatThrownBy(() -> client.sendRawWithResponse(1, new byte[0]))
+                .isInstanceOf(IggyOperationNotSupportedException.class);
+    }
 }

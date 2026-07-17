@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod auth;
-pub mod leader_redirection;
-pub mod messages;
-pub mod raw_command;
-pub mod server;
-pub mod streams;
-pub mod topics;
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
+
+use crate::common::global_context::GlobalContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    GlobalContext::run("../../bdd/scenarios/raw_command.feature").await;
+}

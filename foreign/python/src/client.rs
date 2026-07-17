@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use iggy::prelude::{
     Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
 use pyo3::prelude::*;
-use pyo3::types::{PyDelta, PyList, PyType};
+use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -821,6 +822,37 @@ impl IggyClient {
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
             })
+        })
+    }
+
+    /// Send a command code with a payload and return the raw response bytes.
+    ///
+    /// Session-control codes are rejected client-side. HTTP transport does not
+    /// support raw binary commands.
+    ///
+    /// Args:
+    ///     code: Command code as `int`.
+    ///     payload: Request payload as `bytes`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw response `bytes`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the command cannot be sent or the server returns an error.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn send_raw_with_response<'a>(
+        &self,
+        py: Python<'a>,
+        code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let response = inner
+                .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
         })
     }
 }
