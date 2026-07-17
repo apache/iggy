@@ -523,6 +523,8 @@ mod ffi {
             username: String,
             password: String,
             status: u8,
+            has_permissions: bool,
+            permissions: Permissions,
         ) -> Result<UserInfoDetails>;
         fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
         fn update_user(

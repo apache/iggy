@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -178,6 +179,326 @@ TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->logout_user());
     ASSERT_THROW(client->logout_user(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserWithUsernameOutsideLengthBoundsThrows) {
+    RecordProperty("description", "Rejects 2-byte and 51-byte usernames over TCP without creating users.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    const std::string too_short_username(2, 'a');
+    const std::string too_long_username(51, 'a');
+    const std::string usernames[] = {too_short_username, too_long_username};
+
+    ASSERT_EQ(too_short_username.size(), 2u);
+    ASSERT_EQ(too_long_username.size(), 51u);
+    for (const auto &username : usernames) {
+        SCOPED_TRACE(username.size());
+        ASSERT_THROW(client->create_user(username, "secret123", 1, false, iggy::ffi::Permissions{}), std::exception);
+        ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserAcceptsNonAsciiAndNonAlphabeticUsernames) {
+    RecordProperty("description",
+                   "Creates and retrieves usernames containing punctuation, multilingual UTF-8, and emoji over TCP.");
+    iggy::ffi::Client *client     = GetLoggedInClient();
+    const std::string suffix      = GetRandomName(12);
+    const std::string usernames[] = {
+        "!@#_" + suffix, "ユーザー_" + suffix, "用户_" + suffix, "नाम_" + suffix, "사용자_" + suffix, "😀🚀_" + suffix,
+    };
+
+    for (const auto &username : usernames) {
+        SCOPED_TRACE(username);
+        ASSERT_LE(username.size(), 50u);
+
+        iggy::ffi::UserInfoDetails created_user{};
+        iggy::ffi::UserInfoDetails fetched_user{};
+        ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+        ASSERT_NO_THROW({ fetched_user = client->get_user(make_string_identifier(username)); });
+
+        EXPECT_EQ(fetched_user.id, created_user.id);
+        EXPECT_EQ(static_cast<std::string>(created_user.username), username);
+        EXPECT_EQ(static_cast<std::string>(fetched_user.username), username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, GetUserBeforeLoginThrows) {
+    RecordProperty("description", "Rejects user lookup before authentication.");
+    iggy::ffi::Client *client = GetLoggedOutClient();
+
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserByUsernameReturnsRootDetails) {
+    RecordProperty("description", "Returns deterministic root details for a username lookup.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::UserInfoDetails user{};
+    ASSERT_NO_THROW({ user = client->get_user(make_string_identifier("iggy")); });
+
+    EXPECT_EQ(user.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(user.username), "iggy");
+    EXPECT_EQ(user.status, 1u);
+    EXPECT_TRUE(user.has_permissions);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserByNumericIdMatchesUsernameLookup) {
+    RecordProperty("description", "Returns equivalent root details for username and numeric identifiers.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::UserInfoDetails by_username{};
+    iggy::ffi::UserInfoDetails by_id{};
+    ASSERT_NO_THROW({ by_username = client->get_user(make_string_identifier("iggy")); });
+    ASSERT_NO_THROW({ by_id = client->get_user(make_numeric_identifier(0)); });
+
+    EXPECT_EQ(by_id.id, by_username.id);
+    EXPECT_EQ(by_id.status, by_username.status);
+    EXPECT_EQ(static_cast<std::string>(by_id.username), static_cast<std::string>(by_username.username));
+    EXPECT_EQ(by_id.has_permissions, by_username.has_permissions);
+    EXPECT_EQ(by_id.permissions.global.manage_servers, by_username.permissions.global.manage_servers);
+    EXPECT_EQ(by_id.permissions.global.read_servers, by_username.permissions.global.read_servers);
+    EXPECT_EQ(by_id.permissions.global.manage_users, by_username.permissions.global.manage_users);
+    EXPECT_EQ(by_id.permissions.global.read_users, by_username.permissions.global.read_users);
+    EXPECT_EQ(by_id.permissions.global.manage_streams, by_username.permissions.global.manage_streams);
+    EXPECT_EQ(by_id.permissions.global.read_streams, by_username.permissions.global.read_streams);
+    EXPECT_EQ(by_id.permissions.global.manage_topics, by_username.permissions.global.manage_topics);
+    EXPECT_EQ(by_id.permissions.global.read_topics, by_username.permissions.global.read_topics);
+    EXPECT_EQ(by_id.permissions.global.poll_messages, by_username.permissions.global.poll_messages);
+    EXPECT_EQ(by_id.permissions.global.send_messages, by_username.permissions.global.send_messages);
+    EXPECT_EQ(by_id.permissions.streams.size(), by_username.permissions.streams.size());
+}
+
+TEST_F(LowLevelE2E_Client, GetUserWithUnknownIdentifierThrows) {
+    RecordProperty("description", "Rejects lookups for unknown username and numeric identifiers.");
+    iggy::ffi::Client *client      = GetLoggedInClient();
+    const std::string unknown_user = GetRandomName(50);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(unknown_user)), std::exception);
+    ASSERT_THROW(client->get_user(make_numeric_identifier(std::numeric_limits<std::uint32_t>::max())), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersBeforeLoginThrows) {
+    RecordProperty("description", "Rejects listing users before authentication.");
+    iggy::ffi::Client *client = GetLoggedOutClient();
+
+    ASSERT_THROW(client->get_users(), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_users(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserAllowsSelfLookupWithoutReadUsersPermission) {
+    RecordProperty("description", "Allows a user without read_users permission to read its own details.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = false;
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW(
+        { created_user = CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails by_username{};
+    iggy::ffi::UserInfoDetails by_id{};
+    ASSERT_NO_THROW({ by_username = user_client->get_user(make_string_identifier(username)); });
+    ASSERT_NO_THROW({ by_id = user_client->get_user(make_numeric_identifier(created_user.id)); });
+
+    EXPECT_EQ(by_username.id, created_user.id);
+    EXPECT_EQ(by_id.id, created_user.id);
+    EXPECT_EQ(static_cast<std::string>(by_username.username), username);
+    EXPECT_EQ(static_cast<std::string>(by_id.username), username);
+    EXPECT_EQ(by_username.status, 1u);
+    EXPECT_EQ(by_id.status, 1u);
+    EXPECT_TRUE(by_username.has_permissions);
+    EXPECT_TRUE(by_id.has_permissions);
+    EXPECT_FALSE(by_username.permissions.global.read_users);
+    EXPECT_FALSE(by_id.permissions.global.read_users);
+}
+
+TEST_F(LowLevelE2E_Client, UserWithoutReadUsersPermissionCannotQueryOtherUsers) {
+    RecordProperty("description", "Rejects other-user lookup and listing without read_users permission.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = false;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    ASSERT_THROW(user_client->get_user(make_numeric_identifier(0)), std::exception);
+    ASSERT_THROW(user_client->get_users(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ReadUsersPermissionAllowsUserQueries) {
+    RecordProperty("description", "Allows user lookup and listing with only read_users permission.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails root{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ root = user_client->get_user(make_numeric_identifier(0)); });
+    ASSERT_NO_THROW({ users = user_client->get_users(); });
+
+    EXPECT_EQ(root.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(root.username), "iggy");
+    bool found_self = false;
+    for (const auto &user : users) {
+        if (static_cast<std::string>(user.username) == username) {
+            found_self = true;
+        }
+    }
+    EXPECT_TRUE(found_self);
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionImpliesReadUsers) {
+    RecordProperty("description", "Allows user lookup and listing when manage_users is set without read_users.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_users = true;
+    permissions.global.read_users   = false;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails root{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ root = user_client->get_user(make_numeric_identifier(0)); });
+    ASSERT_NO_THROW({ users = user_client->get_users(); });
+
+    EXPECT_EQ(root.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(root.username), "iggy");
+    bool found_self = false;
+    for (const auto &user : users) {
+        if (static_cast<std::string>(user.username) == username) {
+            found_self = true;
+        }
+    }
+    EXPECT_TRUE(found_self);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersContainsCreatedUser) {
+    RecordProperty("description", "Lists a created user with the input username and status.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    bool found_user = false;
+    for (const auto &user : users) {
+        if (user.id == created_user.id) {
+            found_user = true;
+            EXPECT_EQ(static_cast<std::string>(user.username), username);
+            EXPECT_EQ(user.status, 1u);
+        }
+    }
+    EXPECT_TRUE(found_user);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersReturnsAllCreatedUsersOrderedById) {
+    RecordProperty("description", "Returns every created user without pagination, ordered by ID over TCP.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    rust::Vec<iggy::ffi::UserInfo> users_before;
+    ASSERT_NO_THROW({ users_before = client->get_users(); });
+
+    const std::string first_username  = GetRandomName(50);
+    const std::string second_username = GetRandomName(50);
+    const std::string third_username  = GetRandomName(50);
+    iggy::ffi::UserInfoDetails first_user{};
+    iggy::ffi::UserInfoDetails second_user{};
+    iggy::ffi::UserInfoDetails third_user{};
+    ASSERT_NO_THROW({ first_user = CreateUser(client, first_username, "secret123", 1); });
+    ASSERT_NO_THROW({ second_user = CreateUser(client, second_username, "secret123", 1); });
+    ASSERT_NO_THROW({ third_user = CreateUser(client, third_username, "secret123", 1); });
+
+    rust::Vec<iggy::ffi::UserInfo> users_after;
+    ASSERT_NO_THROW({ users_after = client->get_users(); });
+    ASSERT_EQ(users_after.size(), users_before.size() + 3);
+
+    bool found_first  = false;
+    bool found_second = false;
+    bool found_third  = false;
+    for (std::size_t index = 0; index < users_after.size(); ++index) {
+        if (index > 0) {
+            EXPECT_LT(users_after[index - 1].id, users_after[index].id);
+        }
+        const auto &user           = users_after[index];
+        const std::string username = static_cast<std::string>(user.username);
+        if (user.id == first_user.id && username == first_username) {
+            found_first = true;
+        }
+        if (user.id == second_user.id && username == second_username) {
+            found_second = true;
+        }
+        if (user.id == third_user.id && username == third_username) {
+            found_third = true;
+        }
+    }
+    EXPECT_TRUE(found_first);
+    EXPECT_TRUE(found_second);
+    EXPECT_TRUE(found_third);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersMatchesGetUserDetails) {
+    RecordProperty("description", "Returns consistent ID, username, and status from user query APIs.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    iggy::ffi::UserInfoDetails user_details{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ user_details = client->get_user(make_string_identifier(username)); });
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    EXPECT_EQ(user_details.id, created_user.id);
+    EXPECT_EQ(static_cast<std::string>(user_details.username), username);
+    EXPECT_EQ(user_details.status, 1u);
+    bool found_user = false;
+    for (const auto &user : users) {
+        if (user.id == user_details.id) {
+            found_user = true;
+            EXPECT_EQ(static_cast<std::string>(user.username), username);
+            EXPECT_EQ(user.status, 1u);
+        }
+    }
+    EXPECT_TRUE(found_user);
+}
+
+TEST_F(LowLevelE2E_Client, DeletedUserDisappearsFromGetUserAndGetUsers) {
+    RecordProperty("description", "Removes a deleted user from detail and list queries.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+    ASSERT_NO_THROW(client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    for (const auto &user : users) {
+        EXPECT_NE(user.id, created_user.id);
+        EXPECT_NE(static_cast<std::string>(user.username), username);
+    }
 }
 
 TEST_F(LowLevelE2E_Client, ChangePasswordBeforeLoginThrows) {

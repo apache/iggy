@@ -1118,14 +1118,20 @@ impl Client {
         username: String,
         password: String,
         status: u8,
+        has_permissions: bool,
+        permissions: ffi::Permissions,
     ) -> Result<ffi::UserInfoDetails, String> {
         let rust_status = RustUserStatus::from_code(status)
+            .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+        let rust_permissions = has_permissions
+            .then(|| RustPermissions::try_from(permissions))
+            .transpose()
             .map_err(|error| format!("Could not create user '{username}': {error}"))?;
 
         RUNTIME.block_on(async {
             let user = self
                 .inner
-                .create_user(&username, &password, rust_status, None)
+                .create_user(&username, &password, rust_status, rust_permissions)
                 .await
                 .map_err(|error| format!("Could not create user '{username}': {error}"))?;
             Ok(ffi::UserInfoDetails::from(user))
