@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
 
       - name: Get server version
         id: meta
@@ -75,7 +75,7 @@ jobs:
           fi
 
       - name: Create edge pre-release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: edge
           name: edge
@@ -108,7 +108,9 @@ jobs:
             - `iggy_connector_postgres_source`
             - `iggy_connector_quickwit_sink`
             - `iggy_connector_random_source`
+            - `iggy_connector_s3_sink`
             - `iggy_connector_stdout_sink`
+            - `iggy_connector_surrealdb_sink`
 
             ## Downloads
 

@@ -70,6 +70,14 @@ pub fn read_size_field(header: &[u8]) -> Option<u32> {
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
+    /// Whether a frame carrying `command` may be typed as this header.
+    /// Defaults to an exact match; a header that serves several commands
+    /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
+    #[must_use]
+    fn accepts(command: Command2) -> bool {
+        command == Self::COMMAND
+    }
+
     /// # Errors
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -151,7 +159,13 @@ pub struct RequestHeader {
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub session: u64,
-    pub reserved: [u8; 56],
+    /// Acting user id, stamped by the metadata primary at admission for every
+    /// gated client op so the in-apply RBAC gate resolves the same identity on
+    /// every replica; on `Register` it carries the freshly authenticated user.
+    /// The submitter's wire value is never trusted. Zero for `Logout`,
+    /// partition-plane, and server-internal ops.
+    pub user_id: u32,
+    pub reserved: [u8; 52],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -159,7 +173,10 @@ const _: () = {
         offset_of!(RequestHeader, client)
             == offset_of!(RequestHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 56]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
+    );
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 52]>() == HEADER_SIZE);
 };
 
 impl Default for RequestHeader {
@@ -182,7 +199,8 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             namespace: 0,
             session: 0,
-            reserved: [0; 56],
+            user_id: 0,
+            reserved: [0; 52],
         }
     }
 }
@@ -272,7 +290,20 @@ pub struct ReplyHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 32],
+    /// Request-level status: 0 = ok; nonzero = the `IggyError` code for a
+    /// failure decided before commit (e.g. a dispatch-time authorization
+    /// denial, or the partition primary rejecting a consumer-offset op).
+    ///
+    /// Contract: this is nonzero ONLY on a pre-commit denial, and a deny
+    /// reply always carries an EMPTY body. So this header channel and the
+    /// committed per-sub-op results in the metadata result section are mutually
+    /// exclusive by construction: a reply either commits (status 0, result
+    /// section present) or is denied before commit (status set, no body), and a
+    /// consumer never reconciles the two. Carved from `reserved` exactly like
+    /// `user_id` in `RequestHeader` / `PrepareHeader`; no existing field offset
+    /// moves and `validate` does not inspect it.
+    pub status: u32,
+    pub reserved: [u8; 28],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -280,7 +311,10 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ReplyHeader, status) == offset_of!(ReplyHeader, namespace) + size_of::<u64>()
+    );
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -305,7 +339,8 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 32],
+            status: 0,
+            reserved: [0; 28],
         }
     }
 }
@@ -369,6 +404,15 @@ pub enum EvictionReason {
     InvalidToken = 10,
     UserInactive = 11,
     SessionError = 12,
+    /// Client missed heartbeats past the configured threshold; the server
+    /// evicted the session (and dropped it from any consumer groups).
+    StaleClient = 13,
+    /// Client protocol version outside the server's accepted range; the
+    /// header carries `server_protocol_version{,_min}` so the SDK can
+    /// report the exact window.
+    IncompatibleProtocol = 14,
+    /// Login body without a decodable `ClientVersionInfo` prefix.
+    MalformedLogin = 15,
 }
 
 // EvictionHeader - primary -> client (session-terminal, no body)
@@ -390,7 +434,10 @@ pub struct EvictionHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    pub reserved: [u8; 111],
+    /// Accepted protocol window on `IncompatibleProtocol`; zero otherwise.
+    pub server_protocol_version: u32,
+    pub server_protocol_version_min: u32,
+    pub reserved: [u8; 103],
     pub reason: EvictionReason,
 }
 const _: () = {
@@ -399,6 +446,8 @@ const _: () = {
         offset_of!(EvictionHeader, client)
             == offset_of!(EvictionHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
+    assert!(offset_of!(EvictionHeader, server_protocol_version) == 144);
+    assert!(offset_of!(EvictionHeader, server_protocol_version_min) == 148);
     assert!(offset_of!(EvictionHeader, reason) + size_of::<EvictionReason>() == HEADER_SIZE);
 };
 
@@ -411,7 +460,8 @@ impl EvictionHeader {
     /// # Panics (debug)
     /// On `ClientReleaseTooLow`/`ClientReleaseTooHigh`: `release` hardcoded
     /// to 0, those reasons need real bounds. Add `release_min`/`release_max`
-    /// params before emitting them.
+    /// params before emitting them. On `IncompatibleProtocol`: needs the
+    /// accepted protocol window, use [`Self::incompatible_protocol`] instead.
     ///
     /// # Safety
     /// `client` must be non-zero , `validate` rejects zero so SDKs can
@@ -428,9 +478,11 @@ impl EvictionHeader {
         debug_assert!(
             !matches!(
                 reason,
-                EvictionReason::ClientReleaseTooLow | EvictionReason::ClientReleaseTooHigh,
+                EvictionReason::ClientReleaseTooLow
+                    | EvictionReason::ClientReleaseTooHigh
+                    | EvictionReason::IncompatibleProtocol,
             ),
-            "EvictionHeader::new: ClientRelease* needs release_min/release_max",
+            "EvictionHeader::new: ClientRelease*/IncompatibleProtocol need extra fields",
         );
         // Cap from consensus REPLICAS_MAX=32; literal here to avoid
         // wire-proto crate depending on consensus crate.
@@ -449,9 +501,29 @@ impl EvictionHeader {
             replica,
             reserved_frame: [0; 66],
             client,
-            reserved: [0; 111],
+            server_protocol_version: 0,
+            server_protocol_version_min: 0,
+            reserved: [0; 103],
             reason,
         }
+    }
+
+    /// Protocol-version rejection carrying the accepted window so the SDK
+    /// can report `client X, server accepts [min, max]`.
+    #[must_use]
+    pub const fn incompatible_protocol(
+        cluster: u128,
+        view: u32,
+        replica: u8,
+        client: u128,
+        server_protocol_version: u32,
+        server_protocol_version_min: u32,
+    ) -> Self {
+        let mut header = Self::new(cluster, view, replica, client, EvictionReason::NoSession);
+        header.reason = EvictionReason::IncompatibleProtocol;
+        header.server_protocol_version = server_protocol_version;
+        header.server_protocol_version_min = server_protocol_version_min;
+        header
     }
 }
 
@@ -508,6 +580,22 @@ impl ConsensusHeader for EvictionHeader {
                 "eviction: reason must not be Reserved".to_string(),
             ));
         }
+        // Protocol window only travels on IncompatibleProtocol; anywhere
+        // else a nonzero value is smuggling (same rule as reserved bytes).
+        if self.reason == EvictionReason::IncompatibleProtocol {
+            if self.server_protocol_version_min == 0
+                || self.server_protocol_version < self.server_protocol_version_min
+            {
+                return Err(ConsensusError::InvalidField(
+                    "eviction: incompatible-protocol window must satisfy 1 <= min <= max"
+                        .to_string(),
+                ));
+            }
+        } else if self.server_protocol_version != 0 || self.server_protocol_version_min != 0 {
+            return Err(ConsensusError::InvalidField(
+                "eviction: protocol window bytes must be zero".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -538,7 +626,10 @@ pub struct PrepareHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 32],
+    /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
+    /// that field for the stamping contract.
+    pub user_id: u32,
+    pub reserved: [u8; 28],
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -546,7 +637,11 @@ const _: () = {
         offset_of!(PrepareHeader, client)
             == offset_of!(PrepareHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(PrepareHeader, user_id)
+            == offset_of!(PrepareHeader, namespace) + size_of::<u64>()
+    );
+    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -571,7 +666,8 @@ impl Default for PrepareHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 32],
+            user_id: 0,
+            reserved: [0; 28],
         }
     }
 }
@@ -593,6 +689,42 @@ impl ConsensusHeader for PrepareHeader {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::Prepare,
                 found: self.command,
+            });
+        }
+        Ok(())
+    }
+}
+
+// RepairPrepareHeader - repair peer -> recovering replica (journal repair)
+
+/// A stored prepare served for journal repair.
+///
+/// Byte-identical to [`PrepareHeader`] except the command, so the recovering
+/// replica routes it to the fence-free repair ingest instead of live
+/// replication. The newtype keeps the frame typed as `RepairPrepare` across
+/// every parse; converting to a live `Prepare` happens once, at the apply
+/// site.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct RepairPrepareHeader(pub PrepareHeader);
+
+impl ConsensusHeader for RepairPrepareHeader {
+    const COMMAND: Command2 = Command2::RepairPrepare;
+    fn operation(&self) -> Operation {
+        self.0.operation
+    }
+    fn command(&self) -> Command2 {
+        self.0.command
+    }
+    fn size(&self) -> u32 {
+        self.0.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.0.command != Command2::RepairPrepare {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RepairPrepare,
+                found: self.0.command,
             });
         }
         Ok(())
@@ -930,14 +1062,202 @@ impl ConsensusHeader for StartViewHeader {
     }
 }
 
+// RequestStartViewHeader - restarted replica asking for the current view
+
+/// Recovering replica -> all replicas: resend me the current `StartView`.
+///
+/// Header-only; only the current view's primary answers, with a targeted
+/// `StartView` (adoption is fenced by the receiver's view monotonicity and
+/// the sender-is-primary check, so no nonce is needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStartViewHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub namespace: u64,
+    pub reserved: [u8; 120],
+}
+const _: () = {
+    assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStartViewHeader, namespace)
+            == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestStartViewHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestStartViewHeader {
+    const COMMAND: Command2 = Command2::RequestStartView;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStartView {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStartView,
+                found: self.command,
+            });
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField(
+                "release must be 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RequestPreparesHeader - ask a peer for a range of committed prepares
+
+/// Recovering/holed replica -> a Normal peer: request a repair stream.
+///
+/// Sent to the primary first. Asks for the journaled prepares in
+/// `[from_op, to_op]` for `namespace`. Header-only. The peer answers with
+/// `RepairPrepare` frames in op order, terminated by `RepairDone` or
+/// `RangeEvicted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestPreparesHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub from_op: u64,
+    pub to_op: u64,
+    pub namespace: u64,
+    pub reserved: [u8; 88],
+}
+const _: () = {
+    assert!(size_of::<RequestPreparesHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestPreparesHeader, nonce)
+            == offset_of!(RequestPreparesHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestPreparesHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestPreparesHeader {
+    const COMMAND: Command2 = Command2::RequestPrepares;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestPrepares {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestPrepares,
+                found: self.command,
+            });
+        }
+        if self.from_op == 0 || self.from_op > self.to_op {
+            return Err(ConsensusError::InvalidField(
+                "repair range must be non-empty and 1-based".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RepairRangeReplyHeader - RepairDone / RangeEvicted terminators
+
+/// Serving peer -> requester: terminates a repair stream.
+///
+/// As `RepairDone`, `through_op` is the last op served. As `RangeEvicted`,
+/// `retained_from` is the peer's oldest retained op -- everything older must
+/// come from bulk state sync (phase 3). One layout serves both commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RepairRangeReplyHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    /// `RepairDone`: last op served. `RangeEvicted`: oldest retained op.
+    pub op: u64,
+    pub namespace: u64,
+    pub reserved: [u8; 96],
+}
+const _: () = {
+    assert!(size_of::<RepairRangeReplyHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RepairRangeReplyHeader, nonce)
+            == offset_of!(RepairRangeReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RepairRangeReplyHeader, reserved) + size_of::<[u8; 96]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RepairRangeReplyHeader {
+    const COMMAND: Command2 = Command2::RepairDone;
+    // One layout, two commands: `RepairDone` terminates a stream,
+    // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
+    // rejects `RangeEvicted` frames before `validate` ever sees them.
+    fn accepts(command: Command2) -> bool {
+        command == Command2::RepairDone || command == Command2::RangeEvicted
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RepairDone && self.command != Command2::RangeEvicted {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RepairDone,
+                found: self.command,
+            });
+        }
+        Ok(())
+    }
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::{
         Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-        EvictionReason, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
-        RequestHeader, StartViewChangeHeader, StartViewHeader,
+        EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
+        ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -1059,6 +1379,34 @@ mod tests {
         assert!(header.validate().is_ok());
     }
 
+    // `status` is carved from the reserved tail; the SDK reply funnel peeks it
+    // at this offset before any body decode, so a layout drift must trip here.
+    #[test]
+    fn reply_header_status_offset_and_size_pinned() {
+        use std::mem::offset_of;
+        assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
+        assert_eq!(
+            offset_of!(ReplyHeader, status),
+            offset_of!(ReplyHeader, namespace) + size_of::<u64>()
+        );
+        assert_eq!(
+            offset_of!(ReplyHeader, reserved) + size_of::<[u8; 28]>(),
+            HEADER_SIZE
+        );
+    }
+
+    // A nonzero status rides the reserved region, which reply `validate` does
+    // not inspect: a status-bearing reply stays valid so the SDK can peek it.
+    #[test]
+    fn reply_header_nonzero_status_still_validates() {
+        let header = ReplyHeader {
+            command: Command2::Reply,
+            status: 41,
+            ..ReplyHeader::default()
+        };
+        assert!(header.validate().is_ok());
+    }
+
     // Wire-discriminant pin: any change breaks SDK decoders.
     #[test]
     fn eviction_reason_discriminants_pinned() {
@@ -1075,6 +1423,39 @@ mod tests {
         assert_eq!(EvictionReason::InvalidToken as u8, 10);
         assert_eq!(EvictionReason::UserInactive as u8, 11);
         assert_eq!(EvictionReason::SessionError as u8, 12);
+        assert_eq!(EvictionReason::StaleClient as u8, 13);
+        assert_eq!(EvictionReason::IncompatibleProtocol as u8, 14);
+        assert_eq!(EvictionReason::MalformedLogin as u8, 15);
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_accepts_valid_window() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 2, 1);
+        assert!(header.validate().is_ok());
+        assert_eq!(header.reason, EvictionReason::IncompatibleProtocol);
+        assert_eq!(header.server_protocol_version, 2);
+        assert_eq!(header.server_protocol_version_min, 1);
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_rejects_inverted_window() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 1, 2);
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn eviction_incompatible_protocol_rejects_zero_min() {
+        let header = EvictionHeader::incompatible_protocol(0, 0, 0, 0xCAFE, 1, 0);
+        assert!(header.validate().is_err());
+    }
+
+    // Protocol window is IncompatibleProtocol-only; nonzero elsewhere is
+    // smuggling, same rule as the reserved-byte guards.
+    #[test]
+    fn eviction_validate_rejects_window_on_other_reason() {
+        let mut header = EvictionHeader::new(0, 0, 0, 0xCAFE, EvictionReason::NoSession);
+        header.server_protocol_version = 1;
+        assert!(header.validate().is_err());
     }
 
     #[test]

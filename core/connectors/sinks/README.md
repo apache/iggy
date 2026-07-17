@@ -15,7 +15,9 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **meilisearch_sink** | Indexes messages in Meilisearch for full-text search |
 | **postgres_sink** | Stores messages in PostgreSQL database tables with configurable schemas |
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
+| **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
+| **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
 
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
@@ -171,7 +173,6 @@ sink_connector!(StdoutSink);
 At a bare minimum, we need to add the following dependencies to the `Cargo.toml` file to compile the plugin at all:
 
 - dashmap
-- once_cell
 - tracing
 
 Now, let's implement the `Sink` trait for our `StdoutSink` struct.

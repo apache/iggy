@@ -114,7 +114,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         let name = entry.name;
 
         // ================================================================
-        // SKIPPED COMMANDS (10 total)
+        // SKIPPED COMMANDS (11 total)
         // ================================================================
         // No auth required
         if matches!(
@@ -127,8 +127,21 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         ) {
             continue;
         }
-        // Stateful - not supported on HTTP
-        if matches!(code, JOIN_CONSUMER_GROUP_CODE | LEAVE_CONSUMER_GROUP_CODE) {
+        // server-ng serves `GetClusterMetadata` pre-auth so a client can
+        // locate the cluster leader before signing in; the legacy server
+        // still auth-gates it.
+        #[cfg(feature = "vsr")]
+        if code == GET_CLUSTER_METADATA_CODE {
+            continue;
+        }
+        // Stateful - not supported on HTTP. `SYNC_CONSUMER_GROUP` is
+        // SDK-internal (issued during poll partition resolution), with no
+        // top-level client method to invoke unauthenticated here; its auth
+        // gate is exercised through the server-ng dispatch allowlist instead.
+        if matches!(
+            code,
+            JOIN_CONSUMER_GROUP_CODE | LEAVE_CONSUMER_GROUP_CODE | SYNC_CONSUMER_GROUP_CODE
+        ) {
             continue;
         }
         // Special setup required

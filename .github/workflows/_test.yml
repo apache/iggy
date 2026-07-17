@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.0
 
       - name: Skip noop
         if: inputs.component == 'noop'
@@ -77,7 +77,7 @@ jobs:
       # Python SDK
       - name: Set up Docker Buildx for Python
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Run Python SDK task
         if: inputs.component == 'sdk-python'

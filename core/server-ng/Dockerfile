@@ -47,8 +47,11 @@ ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
-    cargo install cargo-zigbuild --version '=0.22.1' --locked && \
-    rustup target add \
+    cargo install cargo-zigbuild --version '=0.22.1' --locked
+
+COPY rust-toolchain.toml rust-toolchain.toml
+
+RUN rustup target add \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \
     x86_64-unknown-linux-gnu \
@@ -71,10 +74,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     esac && \
     if [ "$PROFILE" = "debug" ]; then \
     cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
-      -p server-ng -p iggy-cli; \
+      --features vsr -p server-ng -p iggy-cli; \
     else \
     cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release \
-      -p server-ng -p iggy-cli; \
+      --features vsr -p server-ng -p iggy-cli; \
     fi
 
 COPY . .
@@ -93,11 +96,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     *) echo "Unsupported $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
     if [ "$PROFILE" = "debug" ]; then \
-    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-server-ng --bin iggy && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --features vsr --bin iggy-server-ng --bin iggy && \
     cp /app/target/${RUST_TARGET}/debug/iggy-server-ng /app/iggy-server-ng && \
     cp /app/target/${RUST_TARGET}/debug/iggy /app/iggy; \
     else \
-    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-server-ng --bin iggy --release && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --features vsr --bin iggy-server-ng --bin iggy --release && \
     cp /app/target/${RUST_TARGET}/release/iggy-server-ng /app/iggy-server-ng && \
     cp /app/target/${RUST_TARGET}/release/iggy /app/iggy; \
     fi

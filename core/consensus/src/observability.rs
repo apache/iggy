@@ -56,6 +56,15 @@ impl ReplicaRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewChangeReason {
     NormalHeartbeatTimeout,
+    /// The current view's primary sent a `RequestStartView` probe: it
+    /// cannot lead (restarted, or abandoned the view mid-view-change), so
+    /// peers elect without waiting for its heartbeats to stop arriving
+    /// (they already have).
+    PrimaryProbedView,
+    /// A recovering replica's `RequestStartView` probes all went unanswered:
+    /// nobody in the cluster is settled (full-cluster restart), so waiting
+    /// for a primary is futile -- elect instead.
+    ViewProbeUnanswered,
     ViewChangeStatusTimeout,
     ReceivedStartViewChange,
     ReceivedDoViewChange,
@@ -66,6 +75,8 @@ impl ViewChangeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NormalHeartbeatTimeout => "normal_heartbeat_timeout",
+            Self::PrimaryProbedView => "primary_probed_view",
+            Self::ViewProbeUnanswered => "view_probe_unanswered",
             Self::ViewChangeStatusTimeout => "view_change_status_timeout",
             Self::ReceivedStartViewChange => "received_start_view_change",
             Self::ReceivedDoViewChange => "received_do_view_change",
@@ -111,6 +122,7 @@ impl IgnoreReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlActionKind {
+    SendRequestStartView,
     SendStartViewChange,
     SendDoViewChange,
     SendStartView,
@@ -125,6 +137,7 @@ impl ControlActionKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::SendRequestStartView => "send_request_start_view",
             Self::SendStartViewChange => "send_start_view_change",
             Self::SendDoViewChange => "send_do_view_change",
             Self::SendStartView => "send_start_view",
@@ -308,6 +321,13 @@ impl ControlActionLogEvent {
     #[must_use]
     pub const fn from_vsr_action(replica: ReplicaLogContext, action: &VsrAction) -> Self {
         match *action {
+            VsrAction::SendRequestStartView { .. } => Self {
+                replica,
+                action: ControlActionKind::SendRequestStartView,
+                target_replica: None,
+                op: None,
+                commit: None,
+            },
             VsrAction::SendStartViewChange { .. } => Self {
                 replica,
                 action: ControlActionKind::SendStartViewChange,
@@ -620,6 +640,9 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::Reserved => "reserved",
         Operation::CreateTopicWithAssignments => "create_topic_with_assignments",
         Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
+        Operation::RemoveConsumerGroupMember => "remove_consumer_group_member",
+        Operation::CompleteConsumerGroupRevocation => "complete_consumer_group_revocation",
+        Operation::TruncatePartition => "truncate_partition",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
@@ -633,6 +656,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::DeleteSegments => "delete_segments",
         Operation::CreateConsumerGroup => "create_consumer_group",
         Operation::DeleteConsumerGroup => "delete_consumer_group",
+        Operation::JoinConsumerGroup => "join_consumer_group",
+        Operation::LeaveConsumerGroup => "leave_consumer_group",
         Operation::CreateUser => "create_user",
         Operation::UpdateUser => "update_user",
         Operation::DeleteUser => "delete_user",

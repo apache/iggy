@@ -31,6 +31,8 @@ namespace Apache.Iggy.Consumers;
 /// </summary>
 public class IggyConsumerBuilder
 {
+    private IMessageEncryptor? _encryptor;
+
     internal Func<ConsumerErrorEventArgs, Task>? OnPollingError { get; set; }
     internal IggyConsumerConfig Config { get; set; } = new();
     internal IIggyClient? IggyClient { get; set; }
@@ -107,13 +109,18 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    ///     Sets a message decryptor for the consumer, enabling decryption of incoming messages.
+    ///     Configures message encryption on the client this builder creates. Encryption is a client-level concern:
+    ///     the encryptor decrypts on poll (and encrypts on send) for the whole connection. Only valid when the
+    ///     builder creates its own client; when an external client is supplied, configure the encryptor on that
+    ///     client via <see cref="Configuration.IggyClientConfigurator.MessageEncryptor" /> instead.
+    ///     The caller owns the encryptor and must dispose it after the consumer is disposed; the builder never
+    ///     disposes it (the same instance may be shared across clients).
     /// </summary>
-    /// <param name="decryptor">The decryptor implementation to handle message decryption.</param>
+    /// <param name="encryptor">The message encryptor to use.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithDecryptor(IMessageEncryptor decryptor)
+    public IggyConsumerBuilder WithEncryptor(IMessageEncryptor encryptor)
     {
-        Config.MessageEncryptor = decryptor;
+        _encryptor = encryptor;
 
         return this;
     }
@@ -237,8 +244,9 @@ public class IggyConsumerBuilder
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
-                ReconnectionSettings = Config.ReconnectionSettings ?? new(),
-                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance
+                ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
+                MessageEncryptor = _encryptor
             });
         }
 
@@ -280,9 +288,22 @@ public class IggyConsumerBuilder
         {
             if (IggyClient == null)
             {
-                throw new InvalidOperationException(
-                    "IggyClient must be provided when CreateIggyClient is false.");
+                throw new InvalidOperationException("IggyClient must be provided when CreateIggyClient is false.");
             }
+
+            if (_encryptor != null)
+            {
+                throw new InvalidOperationException(
+                    "WithEncryptor is only valid when the builder creates its own client. " +
+                    "Configure IggyClientConfigurator.MessageEncryptor on the supplied client instead.");
+            }
+        }
+
+        var hasEncryptor = _encryptor != null || IggyClient?.MessageEncryptor != null;
+        if (hasEncryptor && Config.AutoCommitMode == AutoCommitMode.Auto)
+        {
+            throw new InvalidOperationException(
+                "AutoCommitMode.Auto with a message encryptor risks silent message loss: the offset is committed before decryption. Use AutoCommitMode.AfterReceive or AutoCommitMode.Disabled.");
         }
 
         if (Config.ReceiveBufferSize <= 0)
@@ -302,8 +323,7 @@ public class IggyConsumerBuilder
 
         if (Config.BatchSize > int.MaxValue / 2)
         {
-            throw new InvalidOperationException(
-                $"BatchSize must be less than or equal to {int.MaxValue / 2}.");
+            throw new InvalidOperationException($"BatchSize must be less than or equal to {int.MaxValue / 2}.");
         }
 
         if (Config.PollingIntervalMs < 0)

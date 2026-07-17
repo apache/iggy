@@ -15,25 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// a2a_jwt is HTTP-only (JWT against the HTTP transport); vsr has no HTTP.
-#[cfg(not(feature = "vsr"))]
+// a2a_jwt exercises trusted-issuer (JWKS) tokens; both the legacy verifier and
+// server-ng's ported trusted-issuer path verify them.
 mod a2a_jwt;
-// Consumer groups are not implemented under vsr yet.
-#[cfg(not(feature = "vsr"))]
 mod cg;
+// Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
+#[cfg(feature = "vsr")]
+mod flush_vsr;
+// Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no server-ng handler;
+// they must evict typed (MalformedLogin), not stall or reply empty-ok.
+#[cfg(feature = "vsr")]
+mod legacy_login_vsr;
+// Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
+// server-ng suites below.
+#[cfg(feature = "vsr")]
+mod http_client;
+// Raw-HTTP data-plane contract against server-ng's shard-0 listener.
+#[cfg(feature = "vsr")]
+mod http_vsr;
+// Raw-HTTP wire-contract residue against server-ng (status codes + typed error
+// bodies); the RBAC matrix lives in permissions_scenario.
+#[cfg(feature = "vsr")]
+mod http_rbac;
+// End-to-end HTTPS: server-ng serves the REST listener over TLS and negotiates
+// HTTP/2 via ALPN.
+#[cfg(feature = "vsr")]
+mod http_tls;
+// Binary GetClusterMetadata must serve the real roster from a VSR cluster.
+#[cfg(feature = "vsr")]
+mod cluster_metadata_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
-// the harness transport filter); revisit under vsr once basics are green.
-#[cfg(not(feature = "vsr"))]
+// the harness transport filter).
 mod concurrent_addition;
 mod general;
-// Asserts the periodic messages cleaner deletes expired segments from disk;
-// server-ng has no data-maintenance cleaner yet.
-#[cfg(not(feature = "vsr"))]
+// The per-shard segment cleaner deletes expired / oversize segments from disk
+// under both the legacy server and server-ng.
 mod message_cleanup;
 mod message_retrieval;
-// Mixes server restarts, consumer-group barriers, and DeleteSegments
-// maintenance; out of vsr scope for now.
-#[cfg(not(feature = "vsr"))]
+// Server restarts, consumer-group barriers, and DeleteSegments maintenance.
+// The full restart matrix (consumer variants included) runs under server-ng:
+// a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;
 mod specific;

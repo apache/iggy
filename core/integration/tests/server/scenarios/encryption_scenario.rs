@@ -93,6 +93,10 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // the eager-flush envs in `build_server_config` make every committed
+    // batch hit disk instead.
+    #[cfg(not(feature = "vsr"))]
     client
         .flush_unsaved_buffer(
             &Identifier::named(stream_name).unwrap(),
@@ -103,7 +107,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Verify on-disk encryption of headers and payload
     let data_path = harness.server().data_path();
@@ -247,6 +251,10 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
+    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
+    // the eager-flush envs in `build_server_config` make every committed
+    // batch hit disk instead.
+    #[cfg(not(feature = "vsr"))]
     client
         .flush_unsaved_buffer(
             &Identifier::named(stream_name).unwrap(),
@@ -257,7 +265,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .await
         .unwrap();
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let polled = client
         .poll_messages(
@@ -489,6 +497,17 @@ fn encryption_disabled() -> bool {
 
 fn build_server_config(encryption: bool) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
+
+    // server-ng flushes on the journal thresholds (no flush primitive), so
+    // force every committed batch straight to disk for the on-disk asserts.
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
+        "1".to_string(),
+    );
+    extra_envs.insert(
+        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
+        "true".to_string(),
+    );
 
     if encryption {
         extra_envs.insert(

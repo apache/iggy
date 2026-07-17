@@ -30,7 +30,7 @@ readme = "../../README.md"
 publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+ignored = ["dashmap"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -39,7 +39,6 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }

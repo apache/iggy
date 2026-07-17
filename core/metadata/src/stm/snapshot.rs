@@ -18,7 +18,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
-use crate::stm::consumer_group::ConsumerGroupsSnapshot;
 use crate::stm::stream::StreamsSnapshot;
 use crate::stm::user::UsersSnapshot;
 
@@ -115,10 +114,9 @@ pub struct MetadataSnapshot {
     pub sequence_number: u64,
     /// Users state machine snapshot data.
     pub users: Option<UsersSnapshot>,
-    /// Streams state machine snapshot data.
+    /// Streams state machine snapshot data (consumer groups are nested inside
+    /// each topic).
     pub streams: Option<StreamsSnapshot>,
-    /// Consumer groups state machine snapshot data.
-    pub consumer_groups: Option<ConsumerGroupsSnapshot>,
 }
 
 impl Default for MetadataSnapshot {
@@ -130,14 +128,18 @@ impl Default for MetadataSnapshot {
 impl MetadataSnapshot {
     /// Create a new snapshot with the given sequence number.
     #[must_use]
-    pub fn new(sequence_number: u64) -> Self {
+    pub const fn new(sequence_number: u64) -> Self {
         Self {
             version: 1,
-            created_at: iggy_common::IggyTimestamp::now().as_micros(),
+            // Deterministic placeholder. The real creation time is stamped by
+            // `Snapshot::create` from the consensus-injected clock (see
+            // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
+            // seed reproduces identical snapshot bytes; reading the wall clock
+            // here would reintroduce a nondeterministic input.
+            created_at: 0,
             sequence_number,
             users: None,
             streams: None,
-            consumer_groups: None,
         }
     }
 
@@ -181,7 +183,13 @@ pub trait Snapshot: Sized {
     /// # Arguments
     /// * `stm` - The state machine to snapshot
     /// * `sequence_number` - Monotonically increasing snapshot sequence number
-    fn create<T>(stm: &T, sequence_number: Self::SequenceNumber) -> Result<Self, Self::Error>
+    /// * `created_at` - Creation time from the injected clock; must be
+    ///   deterministic under simulation, never a wall-clock read
+    fn create<T>(
+        stm: &T,
+        sequence_number: Self::SequenceNumber,
+        created_at: Self::Timestamp,
+    ) -> Result<Self, Self::Error>
     where
         T: FillSnapshot<Self::Inner>;
 
@@ -309,7 +317,6 @@ mod tests {
         assert_eq!(decoded.sequence_number, 42);
         assert!(decoded.users.is_none());
         assert!(decoded.streams.is_none());
-        assert!(decoded.consumer_groups.is_none());
     }
 
     #[test]
@@ -350,8 +357,11 @@ mod tests {
                                 consensus_group_id: 33,
                                 created_at: ts,
                                 created_revision: 0,
+                                deleted_up_to_offset: 0,
+                                purge_generation: 0,
                             }],
-                            round_robin_counter: 0,
+                            consumer_groups: Vec::new(),
+                            next_consumer_group_id: 1,
                         },
                     )],
                 },
@@ -363,7 +373,6 @@ mod tests {
 
         assert_eq!(decoded.sequence_number, 100);
         assert!(decoded.users.is_none());
-        assert!(decoded.consumer_groups.is_none());
 
         let streams = decoded.streams.as_ref().unwrap();
         assert_eq!(streams.items.len(), 1);

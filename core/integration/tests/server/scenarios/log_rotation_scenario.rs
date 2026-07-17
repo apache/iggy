@@ -21,10 +21,10 @@ use iggy_common::{
     CompressionAlgorithm, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize,
 };
 use integration::harness::{TestHarness, TestServerConfig};
-use once_cell::sync::Lazy;
 use serial_test::parallel;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 use test_case::test_matrix;
 use tokio::fs;
@@ -37,7 +37,7 @@ const OPERATION_LOOP_COUNT: usize = 300;
 const FROM_BYTES_TO_KB: u64 = 1000;
 const IGGY_LOG_BASE_NAME: &str = "iggy-server.log";
 
-static PRINT_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static PRINT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 pub struct LogRotationTestConfig {

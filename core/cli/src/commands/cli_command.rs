@@ -33,5 +33,13 @@ pub trait CliCommand {
     fn connection_required(&self) -> bool {
         true
     }
+    /// Whether explicitly supplied credentials take precedence over a cached
+    /// login-session token. `iggy login` (re)establishes that session, so it
+    /// must authenticate with the provided username/password and can recreate
+    /// the session even after the cached token expired. Every other command
+    /// keeps reusing the cached token so users need not re-enter credentials.
+    fn prefer_explicit_credentials(&self) -> bool {
+        false
+    }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
 }

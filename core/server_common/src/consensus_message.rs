@@ -18,7 +18,8 @@
 use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, StartViewChangeHeader,
     StartViewHeader,
 };
 use smallvec::SmallVec;
@@ -225,7 +226,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -261,7 +262,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -423,6 +424,17 @@ where
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
         header.validate()?;
 
+        // `size` is the whole-frame length and must at least span the header, or
+        // a consumer slicing `[size_of::<H>()..size]` underflows (start > end).
+        // Every consensus header is `HEADER_SIZE`, so this floor also covers a
+        // later `try_into_typed` conversion.
+        if (header.size() as usize) < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
         if bytes.len() < header.size() as usize {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
@@ -459,6 +471,15 @@ where
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
         header.validate()?;
 
+        // See `TryFrom<Owned>`: `size` must at least span the header so a
+        // `[size_of::<H>()..size]` body slice cannot underflow.
+        if (header.size() as usize) < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
         let total_len = fragments.iter().map(Frozen::len).sum::<usize>();
         if total_len < header.size() as usize {
             return Err(ConsensusError::InvalidCommand {
@@ -480,6 +501,17 @@ pub enum MessageBag {
     DoViewChange(Message<DoViewChangeHeader>),
     StartView(Message<StartViewHeader>),
     Commit(Message<CommitHeader>),
+    RequestStartView(Message<RequestStartViewHeader>),
+    RequestPrepares(Message<RequestPreparesHeader>),
+    /// A journaled prepare re-sent verbatim for repair (command byte
+    /// distinguishes it from a live `Prepare`: repair bypasses the view
+    /// fence and never acks). Stays typed as `RepairPrepare` through every
+    /// parse -- the router round-trips frames through generic bytes, so a
+    /// parse-time byte restore would surface as a live `Prepare` on the
+    /// second pass and die on the view fence.
+    RepairPrepare(Message<RepairPrepareHeader>),
+    /// `RepairDone` / `RangeEvicted` (one layout, two commands).
+    RepairRangeReply(Message<RepairRangeReplyHeader>),
 }
 
 impl MessageBag {
@@ -493,6 +525,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().command,
             Self::StartView(message) => message.header().command,
             Self::Commit(message) => message.header().command,
+            Self::RequestStartView(message) => message.header().command,
+            Self::RequestPrepares(message) => message.header().command,
+            Self::RepairPrepare(message) => message.header().command(),
+            Self::RepairRangeReply(message) => message.header().command,
         }
     }
 
@@ -506,6 +542,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().size(),
             Self::StartView(message) => message.header().size(),
             Self::Commit(message) => message.header().size(),
+            Self::RequestStartView(message) => message.header().size(),
+            Self::RequestPrepares(message) => message.header().size(),
+            Self::RepairPrepare(message) => message.header().size(),
+            Self::RepairRangeReply(message) => message.header().size(),
         }
     }
 
@@ -519,6 +559,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().operation(),
             Self::StartView(message) => message.header().operation(),
             Self::Commit(message) => message.header().operation(),
+            Self::RequestStartView(message) => message.header().operation(),
+            Self::RequestPrepares(message) => message.header().operation(),
+            Self::RepairPrepare(message) => message.header().operation(),
+            Self::RepairRangeReply(message) => message.header().operation(),
         }
     }
 }
@@ -548,6 +592,22 @@ where
             )),
             Command2::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
             Command2::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
+            Command2::RequestStartView => Ok(Self::RequestStartView(
+                value.try_into_typed::<RequestStartViewHeader>()?,
+            )),
+            Command2::RequestPrepares => Ok(Self::RequestPrepares(
+                value.try_into_typed::<RequestPreparesHeader>()?,
+            )),
+            // A repaired prepare is a stored PrepareHeader frame whose command
+            // byte was rewritten; typed validation would reject the byte, so
+            // parse through the generic backing and trust the prepare-shaped
+            // layout the way the journal that produced it did.
+            Command2::RepairPrepare => Ok(Self::RepairPrepare(
+                value.try_into_typed::<RepairPrepareHeader>()?,
+            )),
+            Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
+                value.try_into_typed::<RepairRangeReplyHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {
@@ -576,7 +636,11 @@ mod tests {
     const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RequestHeader, session);
 
     fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
-        let mut o = Owned::<MESSAGE_ALIGN>::zeroed(256);
+        header_bytes_sized(command, size, 256)
+    }
+
+    fn header_bytes_sized(command: Command2, size: u32, buffer_len: usize) -> Owned<MESSAGE_ALIGN> {
+        let mut o = Owned::<MESSAGE_ALIGN>::zeroed(buffer_len);
         {
             let buf = o.as_mut_slice();
             buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&size.to_le_bytes());
@@ -587,6 +651,50 @@ mod tests {
                 .copy_from_slice(&0xCAFE_u128.to_le_bytes());
         }
         o
+    }
+
+    // MessageBag round-trip for the probe + repair command family. Locks
+    // RangeEvicted delivery in particular: RepairDone and RangeEvicted share
+    // one header layout and BOTH must survive the typed parse -- a strict
+    // command match in `try_into_typed` silently dropped every RangeEvicted
+    // frame and with it the whole commit-floor path.
+    #[test]
+    fn probe_and_repair_commands_round_trip_into_bag() {
+        for command in [
+            Command2::RequestStartView,
+            Command2::RequestPrepares,
+            Command2::RepairPrepare,
+            Command2::RepairDone,
+            Command2::RangeEvicted,
+        ] {
+            let mut owned = header_bytes(command, 256);
+            if command == Command2::RequestPrepares {
+                // validate() demands a non-empty 1-based range.
+                const FROM_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, from_op);
+                const TO_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, to_op);
+                let buf = owned.as_mut_slice();
+                buf[FROM_OP_OFF..FROM_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+                buf[TO_OP_OFF..TO_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+            }
+            let generic = Message::<GenericHeader>::try_from(owned)
+                .unwrap_or_else(|e| panic!("{command:?} failed generic framing: {e}"));
+            let bag = MessageBag::try_from(generic)
+                .unwrap_or_else(|e| panic!("{command:?} failed bag parse: {e}"));
+            let routed = matches!(
+                (&bag, command),
+                (MessageBag::RequestStartView(_), Command2::RequestStartView)
+                    | (MessageBag::RequestPrepares(_), Command2::RequestPrepares)
+                    | (MessageBag::RepairPrepare(_), Command2::RepairPrepare)
+                    | (
+                        MessageBag::RepairRangeReply(_),
+                        Command2::RepairDone | Command2::RangeEvicted
+                    )
+            );
+            assert!(routed, "{command:?} parsed into the wrong bag variant");
+            assert_eq!(bag.command(), command, "original command byte must survive");
+        }
     }
 
     // Construction via Message::new (zeroed)
@@ -626,6 +734,17 @@ mod tests {
         let owned = header_bytes(Command2::Request, 999);
         // header_bytes already produces a 256-byte buffer; size=999 > 256,
         // so try_from rejects via `bytes.len() < header.size()`.
+        let result = Message::<RequestHeader>::try_from(owned);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn try_from_owned_size_below_header_size_returns_err() {
+        // `size` claims a frame smaller than the header. The buffer is full-size,
+        // so only the construction-time `size` floor rejects it (the
+        // buffer-length check passes). Guards the `[size_of::<H>()..size]`
+        // underflow at every downstream call site.
+        let owned = header_bytes(Command2::Request, size_of::<RequestHeader>() as u32 - 1);
         let result = Message::<RequestHeader>::try_from(owned);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -728,13 +847,17 @@ mod tests {
 
     #[test]
     fn messagebag_dispatch_commit_with_invalid_size_returns_err() {
-        // `CommitHeader::validate` rejects size != 256.
-        let owned = header_bytes(Command2::Commit, 128);
+        // `CommitHeader::validate` rejects size != 256. Use size 300 (> header
+        // size) with a 512-byte buffer so the frame clears generic parse and the
+        // `size` floor, reaching typed dispatch. A size below the header size is
+        // now rejected earlier by the floor (see
+        // `try_from_owned_size_below_header_size_returns_err`).
+        let owned = header_bytes_sized(Command2::Commit, 300, 512);
         let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
         let result = MessageBag::try_from(generic);
         assert!(matches!(
             result,
-            Err(ConsensusError::CommitInvalidSize(128))
+            Err(ConsensusError::CommitInvalidSize(300))
         ));
     }
 
@@ -801,6 +924,17 @@ mod tests {
     #[test]
     fn response_backing_first_fragment_too_short_returns_err() {
         let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
+        let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
+        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn response_backing_size_below_header_size_returns_err() {
+        // First fragment is full-size, but its `size` field claims less than
+        // the header; the floor must reject before any consumer slices a body.
+        let owned = header_bytes(Command2::Reply, size_of::<ReplyHeader>() as u32 - 1);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
         let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);

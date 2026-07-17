@@ -29,7 +29,6 @@
 
 ARG RUST_VERSION=1.96
 ARG ALPINE_VERSION=3.23
-
 # ── from-source path ─────────────────────────────────────────────────────────
 FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-alpine${ALPINE_VERSION} AS chef
 WORKDIR /app
@@ -47,8 +46,11 @@ ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
-    cargo install cargo-zigbuild --version '=0.22.1' --locked && \
-    rustup target add \
+    cargo install cargo-zigbuild --version '=0.22.1' --locked
+
+COPY rust-toolchain.toml rust-toolchain.toml
+
+RUN rustup target add \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \
     x86_64-unknown-linux-gnu \

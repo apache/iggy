@@ -69,6 +69,15 @@ pub async fn run(harness: &TestHarness) {
     // Missing resource behavior tests
     test_missing_resource_behavior(harness, &root_client).await;
 
+    // RBAC surface ported from the raw-HTTP server-ng suite (server::http_rbac),
+    // asserting the exact typed IggyError over every transport.
+    test_consumer_offset_permissions(harness, &root_client).await;
+    test_change_password_reply_path(harness, &root_client).await;
+    test_root_user_is_protected(harness, &root_client).await;
+    test_live_permission_revocation(harness, &root_client).await;
+    test_deleted_user_session_denied(harness, &root_client).await;
+    test_personal_access_token_lifecycle(harness, &root_client).await;
+
     cleanup(&root_client).await;
 }
 
@@ -213,6 +222,18 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
             .await,
         "poll_messages",
     );
+    // Snapshot returns a real archive, never Ok(None), so a denied caller must
+    // get an explicit Unauthorized rather than the enumeration-safe Ok of reads.
+    let snapshot_result = client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await;
+    assert!(
+        matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
+        "snapshot must be rejected as unauthorized without read_servers, got {snapshot_result:?}"
+    );
 
     delete_test_user(root_client, USER).await;
 }
@@ -246,6 +267,13 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("read_servers: get_clients should work");
+    client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await
+        .expect("read_servers: snapshot should work");
 
     // But cannot read users or streams
     assert_unauthorized(client.get_users().await, "read_servers: get_users");
@@ -277,6 +305,13 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("manage_servers: get_clients should work");
+    client
+        .snapshot(
+            SnapshotCompression::Deflated,
+            vec![SystemSnapshotType::Test],
+        )
+        .await
+        .expect("manage_servers: snapshot should work");
 
     delete_test_user(root_client, MANAGE_USER).await;
 }
@@ -2410,8 +2445,372 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
 }
 
 // =============================================================================
+// Test: Consumer-offset ops honor RBAC (ported from server::http_rbac).
+// A no-permission user is denied on the writes (store/delete surface the exact
+// Unauthorized); the GET is an enumeration-safe read the legacy server answers
+// with Ok(None), so it stays on the lenient helper.
+// =============================================================================
+
+async fn test_consumer_offset_permissions(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "offset-no-perms-user";
+    create_test_user(root_client, USER, Some(no_permissions())).await;
+    let client = login_user(harness, USER).await;
+
+    let stream_id = Identifier::named(STREAM_1).unwrap();
+    let topic_id = Identifier::named(TOPIC_1).unwrap();
+    let consumer = Consumer::default();
+
+    assert_error_code(
+        client
+            .store_consumer_offset(&consumer, &stream_id, &topic_id, Some(0), 0)
+            .await,
+        IggyError::Unauthorized,
+        "no perms: store_consumer_offset",
+    );
+    assert_error_code(
+        client
+            .delete_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))
+            .await,
+        IggyError::Unauthorized,
+        "no perms: delete_consumer_offset",
+    );
+    // GET is enumeration-safe: legacy answers Ok(None), server-ng denies typed.
+    assert_unauthorized(
+        client
+            .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))
+            .await,
+        "no perms: get_consumer_offset",
+    );
+
+    delete_test_user(root_client, USER).await;
+}
+
+// =============================================================================
+// Test: Root (user id 0) is business-rule protected even from a manage_users
+// admin: delete -> CannotDeleteUser, re-permission -> CannotChangePermissions.
+// Both fire AFTER the RBAC gate admits the acting admin.
+// =============================================================================
+
+async fn test_root_user_is_protected(harness: &TestHarness, root_client: &IggyClient) {
+    const ADMIN: &str = "root-guard-admin";
+    create_test_user(
+        root_client,
+        ADMIN,
+        Some(Permissions {
+            global: GlobalPermissions {
+                manage_users: true,
+                ..Default::default()
+            },
+            streams: None,
+        }),
+    )
+    .await;
+    let admin = login_user(harness, ADMIN).await;
+    let root_id = Identifier::numeric(0).unwrap();
+
+    assert_error_code(
+        admin.delete_user(&root_id).await,
+        IggyError::CannotDeleteUser(0),
+        "admin delete root",
+    );
+    assert_error_code(
+        admin
+            .update_permissions(&root_id, Some(no_permissions()))
+            .await,
+        IggyError::CannotChangePermissions(0),
+        "admin re-permission root",
+    );
+
+    delete_test_user(root_client, ADMIN).await;
+}
+
+// =============================================================================
+// Test: Live revocation on a single node. Stripping send from a granted user
+// denies the next send immediately (exact Unauthorized) while the retained poll
+// grant still succeeds.
+// =============================================================================
+
+async fn test_live_permission_revocation(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "revocation-user";
+    create_test_user(
+        root_client,
+        USER,
+        Some(Permissions {
+            global: GlobalPermissions {
+                poll_messages: true,
+                send_messages: true,
+                ..Default::default()
+            },
+            streams: None,
+        }),
+    )
+    .await;
+    let client = login_user(harness, USER).await;
+
+    let stream_id = Identifier::named(STREAM_1).unwrap();
+    let topic_id = Identifier::named(TOPIC_1).unwrap();
+
+    let mut msgs = test_messages();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut msgs,
+        )
+        .await
+        .expect("send must work before revocation");
+
+    root_client
+        .update_permissions(
+            &Identifier::named(USER).unwrap(),
+            Some(Permissions {
+                global: GlobalPermissions {
+                    poll_messages: true,
+                    send_messages: false,
+                    ..Default::default()
+                },
+                streams: None,
+            }),
+        )
+        .await
+        .expect("root re-permission (strip send)");
+
+    let mut msgs = test_messages();
+    assert_error_code(
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(0),
+                &mut msgs,
+            )
+            .await,
+        IggyError::Unauthorized,
+        "send must be denied after send is stripped",
+    );
+    client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await
+        .expect("poll must still work (poll grant retained)");
+
+    delete_test_user(root_client, USER).await;
+}
+
+// =============================================================================
+// Test: Deleting a user with a live session denies that session's next read.
+// A read_servers grant makes the pre-delete read a real Ok (get_stats is not
+// enumeration-safe), so the post-delete denial is unambiguous. The binary
+// transports may answer Unauthenticated (session eviction) rather than
+// Unauthorized, so accept either.
+// =============================================================================
+
+async fn test_deleted_user_session_denied(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "deleted-session-user";
+    create_test_user(
+        root_client,
+        USER,
+        Some(Permissions {
+            global: GlobalPermissions {
+                read_servers: true,
+                ..Default::default()
+            },
+            streams: None,
+        }),
+    )
+    .await;
+    let client = login_user(harness, USER).await;
+    client
+        .get_stats()
+        .await
+        .expect("read_servers get_stats must work before deletion");
+
+    root_client
+        .delete_user(&Identifier::named(USER).unwrap())
+        .await
+        .expect("root delete user");
+
+    let result = client.get_stats().await;
+    assert!(
+        matches!(&result, Err(e)
+            if e.as_code() == IggyError::Unauthorized.as_code()
+                || e.as_code() == IggyError::Unauthenticated.as_code()),
+        "deleted user's live session must be denied (Unauthorized or Unauthenticated), got {result:?}"
+    );
+}
+
+// =============================================================================
+// Test: PAT lifecycle over the SDK. A no-permission user self-manages PATs
+// (create/list/delete bypass RBAC); a fresh session authenticating WITH the raw
+// PAT inherits the owner's empty rule set, so a subsequent op is denied; and the
+// listing is caller-scoped (only the caller's own tokens).
+// =============================================================================
+
+async fn test_personal_access_token_lifecycle(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "pat-lifecycle-user";
+    const OTHER: &str = "pat-other-user";
+    create_test_user(root_client, USER, Some(no_permissions())).await;
+    create_test_user(root_client, OTHER, Some(no_permissions())).await;
+    let client = login_user(harness, USER).await;
+    let other = login_user(harness, OTHER).await;
+
+    // Self-scoped create/delete bypass RBAC even with no permissions.
+    client
+        .create_personal_access_token("pat-to-delete", PersonalAccessTokenExpiry::NeverExpire)
+        .await
+        .expect("no perms: create own PAT should work");
+    client
+        .delete_personal_access_token("pat-to-delete")
+        .await
+        .expect("no perms: delete own PAT should work");
+
+    // A PAT resolves to its owner, inheriting the owner's (empty) rules.
+    let raw = client
+        .create_personal_access_token("pat-identity", PersonalAccessTokenExpiry::NeverExpire)
+        .await
+        .expect("no perms: create identity PAT should work");
+    let via_pat = create_client(harness).await;
+    via_pat
+        .login_with_personal_access_token(&raw.token)
+        .await
+        .expect("PAT login should succeed");
+    assert_unauthorized(
+        via_pat.get_streams().await,
+        "PAT-bound session inherits the owner's empty rules",
+    );
+
+    // Listing is caller-scoped: OTHER never sees USER's tokens.
+    other
+        .create_personal_access_token("other-pat", PersonalAccessTokenExpiry::NeverExpire)
+        .await
+        .expect("other: create own PAT should work");
+    let owner_tokens: Vec<String> = client
+        .get_personal_access_tokens()
+        .await
+        .expect("owner PAT list")
+        .into_iter()
+        .map(|token| token.name)
+        .collect();
+    assert_eq!(
+        owner_tokens,
+        vec!["pat-identity".to_string()],
+        "owner must list exactly their own live token"
+    );
+    let other_tokens: Vec<String> = other
+        .get_personal_access_tokens()
+        .await
+        .expect("other PAT list")
+        .into_iter()
+        .map(|token| token.name)
+        .collect();
+    assert_eq!(
+        other_tokens,
+        vec!["other-pat".to_string()],
+        "other must never see the owner's tokens"
+    );
+
+    delete_test_user(root_client, USER).await;
+    delete_test_user(root_client, OTHER).await;
+}
+
+// =============================================================================
+// Test: change-password over the consensus reply path (every transport).
+//
+// A wrong current password returns the typed `InvalidCredentials` and a missing
+// target returns `ResourceNotFound`, and in EVERY case the caller's connection
+// stays usable for the next replicated op. Regression guard: the binary
+// transports used to deny a wrong current password pre-consensus, consuming the
+// client's request id without advancing the replicated `ClientTable`, so the
+// next replicated request hit a `RequestGap` and was silently dropped until the
+// socket timed out. The rejection now commits as a no-op, keeping the sequence
+// contiguous.
+// =============================================================================
+
+async fn test_change_password_reply_path(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "change-password-user";
+    const ADMIN: &str = "change-password-admin";
+    create_test_user(root_client, USER, Some(no_permissions())).await;
+    create_test_user(root_client, ADMIN, Some(manage_users_permissions())).await;
+
+    let user_id = Identifier::named(USER).unwrap();
+    let client = login_user(harness, USER).await;
+
+    // Wrong current password: typed rejection, connection still usable.
+    assert_error_code(
+        client
+            .change_password(&user_id, "wrong-current", "password456")
+            .await,
+        IggyError::InvalidCredentials,
+        "self change with a wrong current password",
+    );
+    client
+        .create_personal_access_token(
+            "change-password-probe-1",
+            PersonalAccessTokenExpiry::NeverExpire,
+        )
+        .await
+        .expect("connection stays usable after a wrong-current rejection");
+
+    // Correct current password: succeeds, session stays live.
+    client
+        .change_password(&user_id, "password123", "password456")
+        .await
+        .expect("self change with the correct current password");
+    client
+        .create_personal_access_token(
+            "change-password-probe-2",
+            PersonalAccessTokenExpiry::NeverExpire,
+        )
+        .await
+        .expect("connection stays usable after a successful self rotation");
+
+    // Admin changing a missing target: typed not-found, connection still usable.
+    let admin = login_user(harness, ADMIN).await;
+    assert_error_code(
+        admin
+            .change_password(
+                &Identifier::named("change-password-ghost").unwrap(),
+                "irrelevant",
+                "password456",
+            )
+            .await,
+        IggyError::ResourceNotFound(String::new()),
+        "admin change for a non-existent target",
+    );
+    admin
+        .create_personal_access_token(
+            "change-password-probe-3",
+            PersonalAccessTokenExpiry::NeverExpire,
+        )
+        .await
+        .expect("connection stays usable after a missing-target rejection");
+
+    delete_test_user(root_client, USER).await;
+    delete_test_user(root_client, ADMIN).await;
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
+
+fn manage_users_permissions() -> Permissions {
+    Permissions {
+        global: GlobalPermissions {
+            manage_users: true,
+            read_users: true,
+            ..GlobalPermissions::default()
+        },
+        streams: None,
+    }
+}
 
 fn test_messages() -> Vec<IggyMessage> {
     vec![
@@ -2447,6 +2846,35 @@ fn assert_unauthorized<T: std::fmt::Debug>(result: Result<T, IggyError>, context
             // All protocols return Ok(None) for unauthorized/not-found to prevent resource enumeration
         }
     }
+}
+
+/// Assert an exact typed `IggyError`. Ported RBAC cases assert the precise code
+/// the server returns, not the enumeration-safe set of [`assert_unauthorized`].
+///
+/// The HTTP SDK reconstructs only 401/403/404 as typed errors and collapses
+/// every other status (notably the 400s carrying `InvalidCredentials`,
+/// `CannotDeleteUser`, and `CannotChangePermissions`) into a generic
+/// `HttpResponseError` wrapping the typed JSON body. Read the exact code back
+/// from that body's `id` so the assertion stays exact over HTTP as well.
+fn assert_error_code<T: std::fmt::Debug>(
+    result: Result<T, IggyError>,
+    expected: IggyError,
+    context: &str,
+) {
+    let expected_code = expected.as_code();
+    match &result {
+        Err(e) if e.as_code() == expected_code => {}
+        Err(IggyError::HttpResponseError(_, body))
+            if http_error_id(body) == Some(expected_code) => {}
+        _ => panic!("{context}: expected error code {expected_code}, got {result:?}"),
+    }
+}
+
+/// The `id` field of an HTTP `ErrorResponse` body is the wire `IggyError` code,
+/// so a status-collapsed `HttpResponseError` can still be matched exactly.
+fn http_error_id(body: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.get("id")?.as_u64().map(|id| id as u32)
 }
 
 fn assert_not_found_or_related<T: std::fmt::Debug>(result: Result<T, IggyError>, context: &str) {

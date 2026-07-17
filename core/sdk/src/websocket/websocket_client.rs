@@ -66,6 +66,14 @@ const NAME: &str = "WebSocket";
 #[cfg(feature = "vsr")]
 const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Backoff before replaying a request the server answered with an explicit
+/// `TransientNotCommitted` frame (not-caught-up / in-flight / pipeline-full /
+/// view-change cancel). The reply arrives promptly, so a short pause keeps the
+/// replay from spinning while the primary catches up. Bounded by
+/// `RESPONSE_READ_TIMEOUT`.
+#[cfg(feature = "vsr")]
+const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[derive(Debug)]
 pub struct WebSocketClient {
     stream: Arc<Mutex<Option<WebSocketStreamKind>>>,
@@ -82,6 +90,8 @@ pub struct WebSocketClient {
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     #[cfg(feature = "vsr")]
     skip_auto_login_once: Mutex<bool>,
+    #[cfg(feature = "vsr")]
+    consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
 impl Default for WebSocketClient {
@@ -186,6 +196,11 @@ impl BinaryTransport for WebSocketClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+
+    #[cfg(feature = "vsr")]
+    fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
+        Arc::clone(&self.consumer_group_state)
+    }
 }
 
 #[cfg(feature = "vsr")]
@@ -218,6 +233,10 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
         Ok(())
     }
+
+    fn sdk_version(&self) -> &'static str {
+        crate::SDK_VERSION
+    }
 }
 
 impl BinaryClient for WebSocketClient {}
@@ -240,6 +259,8 @@ impl WebSocketClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             #[cfg(feature = "vsr")]
             skip_auto_login_once: Mutex::new(false),
+            #[cfg(feature = "vsr")]
+            consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
 
@@ -513,8 +534,30 @@ impl WebSocketClient {
 
     async fn check_and_maybe_redirect(&self) -> Result<bool, IggyError> {
         match &self.config.auto_login {
+            // Leadership still matters without auto-login: the caller signs in
+            // manually, and a login against a non-leader replays for its whole
+            // read timeout. `GetClusterMetadata` is sessionless and pre-auth on
+            // server-ng, so the check works on the unauthenticated connection.
+            // vsr-only: the legacy server auth-gates cluster metadata, so this
+            // check would bounce `Unauthenticated` into the reconnect path and
+            // recurse back into `connect`.
+            #[cfg(feature = "vsr")]
+            AutoLogin::Disabled => self.handle_leader_redirection().await,
+            #[cfg(not(feature = "vsr"))]
             AutoLogin::Disabled => Ok(false),
             AutoLogin::Enabled(_) => {
+                // Check leadership BEFORE signing in: register/login are
+                // consensus ops a backup answers with a transient frame, so
+                // signing in against a non-leader replays for the whole read
+                // timeout instead of failing over. `GetClusterMetadata` is
+                // sessionless and pre-auth on server-ng. vsr-only: the legacy
+                // server auth-gates cluster metadata, so this pre-login check
+                // would bounce `Unauthenticated` into the reconnect path and
+                // recurse back into `connect`.
+                #[cfg(feature = "vsr")]
+                if self.handle_leader_redirection().await? {
+                    return Ok(true);
+                }
                 self.auto_login().await?;
                 self.handle_leader_redirection().await
             }
@@ -658,96 +701,111 @@ impl WebSocketClient {
         }
 
         let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut().ok_or_else(|| {
+        if stream_guard.is_none() {
             trace!("Cannot send data. Client is not connected.");
-            IggyError::NotConnected
-        })?;
-
-        #[cfg(feature = "vsr")]
-        let request = {
-            let mut consensus_session = self
-                .consensus_session
-                .lock()
-                .expect("consensus session mutex poisoned");
-            crate::vsr::encode_contiguous_request(&mut consensus_session, code, &payload)?
-        };
-        #[cfg(not(feature = "vsr"))]
-        let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-        #[cfg(not(feature = "vsr"))]
-        let mut request = BytesMut::with_capacity(4 + REQUEST_INITIAL_BYTES_LENGTH + payload.len());
-        #[cfg(not(feature = "vsr"))]
-        request.put_u32_le(payload_length as u32);
-        #[cfg(not(feature = "vsr"))]
-        request.put_u32_le(code);
-        #[cfg(not(feature = "vsr"))]
-        request.put_slice(&payload);
-
-        trace!(
-            "Sending {NAME} message with code: {}, payload size: {} bytes",
-            code,
-            payload.len()
-        );
-        #[cfg(feature = "vsr")]
-        trace!(
-            "Sending {NAME} VSR request of size {} with code: {code}",
-            request.len()
-        );
-
-        stream.write(&request).await?;
-        stream.flush().await?;
+            return Err(IggyError::NotConnected);
+        }
 
         #[cfg(feature = "vsr")]
         {
-            // Mirror the TCP path: header onto stack, body into its own
-            // buffer, `decode_response_split` slices without concatenation.
-            // Old path did `vec![0; HEADER_SIZE]` + `vec![0; body_size]`
-            // (two zero-fills) + `BytesMut::with_capacity(response_size)` +
-            // two `put_slice` memcopies per reply.
-            // One deadline spans both the header and body reads so a reply
-            // that delivers a header then stalls cannot wait up to 2x the
-            // timeout. On expiry drop the stream: the read runs inline here
-            // (no spawned task to cancel), so without an explicit drop a late
-            // reply would desync framing for the next request.
-            let response_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-            let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-            let header_read =
-                tokio::time::timeout_at(response_deadline, stream.read(&mut response_header)).await;
-            let Ok(header_read) = header_read else {
-                error!(
-                    "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
-                );
-                *stream_guard = None;
-                return Err(IggyError::Disconnected);
+            // Encode the request ONCE: `next_request_id` advances here, so a
+            // transient replay must reuse the same id for the server's dedup.
+            // The connection is lockstep (one request in flight per client), so a
+            // complete reply leaves the stream at a clean frame boundary -- a
+            // `TransientNotCommitted` answer (the server could not commit yet)
+            // lets us resend the SAME request on the SAME connection with no
+            // reconnect and the session intact. Bounded by RESPONSE_READ_TIMEOUT.
+            let request = {
+                let mut consensus_session = self
+                    .consensus_session
+                    .lock()
+                    .expect("consensus session mutex poisoned");
+                crate::vsr::encode_contiguous_request(&mut consensus_session, code, &payload)?
             };
-            header_read?;
+            trace!(
+                "Sending {NAME} VSR request of size {} with code: {code}",
+                request.len()
+            );
+            // One deadline bounds the whole request including transient replays.
+            let retry_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+            loop {
+                let stream = stream_guard.as_mut().ok_or(IggyError::NotConnected)?;
+                stream.write(&request).await?;
+                stream.flush().await?;
 
-            let response_size = crate::vsr::response_size(&response_header)?;
-            let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-            let body = if body_size > 0 {
-                // `WebSocketStreamKind::read` reads into a slice without a
-                // zero-fill prerequisite; we still allocate `body_size` but
-                // skip the header concatenation.
-                let mut body = vec![0u8; body_size];
-                let body_read =
-                    tokio::time::timeout_at(response_deadline, stream.read(&mut body)).await;
-                let Ok(body_read) = body_read else {
+                // One deadline spans both the header and body reads so a reply
+                // that delivers a header then stalls cannot wait up to 2x the
+                // timeout. On expiry drop the stream: the read runs inline here
+                // (no spawned task to cancel), so without an explicit drop a late
+                // reply would desync framing for the next request.
+                let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                let header_read =
+                    tokio::time::timeout_at(retry_deadline, stream.read(&mut response_header))
+                        .await;
+                let Ok(header_read) = header_read else {
                     error!(
-                        "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response body for request with code: {code}"
+                        "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response header for request with code: {code}"
                     );
                     *stream_guard = None;
                     return Err(IggyError::Disconnected);
                 };
-                body_read?;
-                Bytes::from(body)
-            } else {
-                Bytes::new()
-            };
+                header_read?;
 
-            crate::vsr::decode_response_split(&response_header, body)
+                let response_size = crate::vsr::response_size(&response_header)?;
+                let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                let body = if body_size > 0 {
+                    let mut body = vec![0u8; body_size];
+                    let body_read =
+                        tokio::time::timeout_at(retry_deadline, stream.read(&mut body)).await;
+                    let Ok(body_read) = body_read else {
+                        error!(
+                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for {NAME} VSR response body for request with code: {code}"
+                        );
+                        *stream_guard = None;
+                        return Err(IggyError::Disconnected);
+                    };
+                    body_read?;
+                    Bytes::from(body)
+                } else {
+                    Bytes::new()
+                };
+
+                match crate::vsr::decode_response_split(&response_header, body) {
+                    // Server could not commit yet but answered with a complete
+                    // frame; the lockstep stream is in sync, so replay the same
+                    // request id on this connection after a short pause.
+                    Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
+                        if tokio::time::Instant::now() < retry_deadline =>
+                    {
+                        let remaining =
+                            retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+                        tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                    }
+                    other => return other,
+                }
+            }
         }
 
         #[cfg(not(feature = "vsr"))]
         {
+            let stream = stream_guard.as_mut().ok_or_else(|| {
+                trace!("Cannot send data. Client is not connected.");
+                IggyError::NotConnected
+            })?;
+            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+            let mut request =
+                BytesMut::with_capacity(4 + REQUEST_INITIAL_BYTES_LENGTH + payload.len());
+            request.put_u32_le(payload_length as u32);
+            request.put_u32_le(code);
+            request.put_slice(&payload);
+            trace!(
+                "Sending {NAME} message with code: {}, payload size: {} bytes",
+                code,
+                payload.len()
+            );
+            stream.write(&request).await?;
+            stream.flush().await?;
+
             let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
             stream.read(&mut response_initial_buffer).await?;
 

@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `CreatePartitions` op. Live (stream, topic) picked from shadow.
+//! `CreatePartitions` op.
+//!
+//! Targets `Ok` (live topic), `StreamNotFound` (fabricated parent stream), or
+//! `TopicNotFound` (live stream, fabricated topic). `InvalidPartitionsCount`
+//! not targeted. Shadow tracks no partition counts, so every outcome predicts
+//! `Effect::None`.
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -27,6 +32,8 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::CreatePartitionsResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub stream: String,
@@ -34,12 +41,7 @@ pub struct Input {
     pub partitions_count: u32,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::StreamNotFound, Outcome::TopicNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -48,7 +50,7 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => {
+        Outcome::Ok => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             let partitions_count = 1 + prng.random_range(0..4u32);
             Some(Input {
@@ -56,6 +58,29 @@ pub fn sample(
                 topic,
                 partitions_count,
             })
+        }
+        Outcome::StreamNotFound => {
+            let stream = shadow.fabricate_absent_name("stream");
+            let topic = shadow.fabricate_absent_name("topic");
+            let partitions_count = 1 + prng.random_range(0..4u32);
+            Some(Input {
+                stream,
+                topic,
+                partitions_count,
+            })
+        }
+        Outcome::TopicNotFound => {
+            let stream = shadow.pick_stream_name(prng)?;
+            let topic = shadow.fabricate_absent_name("topic");
+            let partitions_count = 1 + prng.random_range(0..4u32);
+            Some(Input {
+                stream,
+                topic,
+                partitions_count,
+            })
+        }
+        Outcome::InvalidPartitionsCount => {
+            unreachable!("create_partitions does not target InvalidPartitionsCount")
         }
     }
 }
@@ -65,15 +90,17 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.create_partitions(&input.stream, &input.topic, input.partitions_count)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
-pub const fn predicted_effect(_input: &Input, outcome: Outcome) -> Effect {
-    match outcome {
-        // Partition count is not yet tracked per topic in shadow.
-        Outcome::Success => Effect::None,
-    }
+pub const fn predicted_effect(_input: &Input, _outcome: Outcome) -> Effect {
+    // Shadow tracks no per-topic partition counts.
+    Effect::None
 }

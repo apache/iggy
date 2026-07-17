@@ -36,7 +36,7 @@ error_set!(
 
     NumaError := {
         #[display("{0}")]
-        Sharding(crate::shard_allocator::ShardingError),
+        Sharding(shard_allocator::ShardingError),
     }
 
     ConfigurationError := {
@@ -66,14 +66,8 @@ error_set!(
     } || IoError || CommonError
 
     LogError := {
-        #[display("Logging filter reload failure")]
-        FilterReloadFailure,
-
-        #[display("Logging stdout reload failure")]
-        StdoutReloadFailure,
-
-        #[display("Logging file reload failure")]
-        FileReloadFailure,
+        #[display("{0}")]
+        Logging(server_common::log::LogError),
     }
 
     CompatError := {

@@ -269,18 +269,36 @@ where
 ///
 /// # Panics
 /// If buffer is not a valid reply.
-#[allow(clippy::cast_possible_truncation)]
 pub fn build_reply_message(
     prepare_header: &PrepareHeader,
     body: &bytes::Bytes,
 ) -> Message<ReplyHeader> {
+    build_reply_message_with(prepare_header, body.len(), |dst| dst.copy_from_slice(body))
+}
+
+/// Builds a reply [`Message`] whose body region is filled in place by `fill`.
+///
+/// Elides the throwaway `Bytes` a caller would otherwise allocate just to have
+/// it copied in here. `fill` is handed the zeroed `body_len`-byte region and
+/// must populate exactly that many bytes. Header fields follow the commit-time
+/// determinism rules of [`build_reply_message`].
+///
+/// # Panics
+/// If buffer is not a valid reply.
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_reply_message_with<F>(
+    prepare_header: &PrepareHeader,
+    body_len: usize,
+    fill: F,
+) -> Message<ReplyHeader>
+where
+    F: FnOnce(&mut [u8]),
+{
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let total_size = header_size + body.len();
+    let total_size = header_size + body_len;
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
-    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
-        .expect("zeroed bytes are valid");
-    *header = ReplyHeader {
+    let header = ReplyHeader {
         checksum: 0,
         checksum_body: 0,
         cluster: prepare_header.cluster,
@@ -305,15 +323,78 @@ pub fn build_reply_message(
         namespace: prepare_header.namespace,
         ..Default::default()
     };
+    // `BytesMut` makes no alignment guarantee, so never cast into it.
+    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    if !body.is_empty() {
-        buffer[header_size..].copy_from_slice(body);
-    }
+    fill(&mut buffer[header_size..]);
 
     // TODO: drop this copy once replies stop round-tripping through `Bytes`
     // and the binary protocol uses `Owned` end-to-end.
     Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
         .expect("reply buffer must contain a valid reply message")
+}
+
+/// Builds a `Reply` carrying only a single-entry result section, no payload:
+/// the generic `[count=1][index=0][result=code]` rejection frame.
+///
+/// Two families of `code` ride this frame. `TransientNotCommitted` marks a
+/// request that could not be committed *right now* (not-caught-up / in-flight
+/// / pipeline-full / view-change cancel); the SDK decodes it and replays the
+/// same `request_id` immediately instead of waiting out its response
+/// read-timeout. Any other code is a TERMINAL rejection (e.g. a committed
+/// metadata rejection like `UserAlreadyExists`) that the SDK surfaces as the
+/// typed error.
+///
+/// Stamped from the request header (no prepare exists for a rejected op).
+/// `commit` is the primary's current commit position and is informational
+/// here: a rejection reply is sent, never cached in the `ClientTable`, so it
+/// is not subject to the `commit_reply` regression order.
+///
+/// # Panics
+/// If the constructed message buffer is not a valid reply.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_result_rejection_reply(
+    request_header: &RequestHeader,
+    commit: u64,
+    code: u32,
+) -> Message<ReplyHeader> {
+    // `[count: u32][index: u32][result: u32]`, the single-entry rejection shape
+    // of `ApplyReply::write_reply_body` (mirrored here to avoid a metadata dep).
+    const RESULT_BODY_LEN: usize = 12;
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + RESULT_BODY_LEN;
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let header = ReplyHeader {
+        cluster: request_header.cluster,
+        size: total_size as u32,
+        view: request_header.view,
+        release: request_header.release,
+        command: Command2::Reply,
+        replica: request_header.replica,
+        request_checksum: request_header.request_checksum,
+        client: request_header.client,
+        // Position-typed like the sibling builders (`build_reply_from_request`
+        // stamps `op: commit` too); inert on this path -- rejections are never
+        // cached -- but keeps the wire field convention for frame inspection.
+        op: commit,
+        commit,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+
+    let body = &mut buffer[header_size..];
+    body[0..4].copy_from_slice(&1u32.to_le_bytes());
+    body[4..8].copy_from_slice(&0u32.to_le_bytes());
+    body[8..12].copy_from_slice(&code.to_le_bytes());
+
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("transient reply buffer must contain a valid reply message")
 }
 
 /// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
@@ -338,9 +419,7 @@ where
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
     let commit = consensus.commit_max();
-    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
-        .expect("zeroed bytes are valid");
-    *header = ReplyHeader {
+    let header = ReplyHeader {
         checksum: 0,
         checksum_body: 0,
         cluster: consensus.cluster(),
@@ -361,6 +440,7 @@ where
         namespace: request_header.namespace,
         ..Default::default()
     };
+    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
     if !body.is_empty() {
         buffer[header_size..].copy_from_slice(&body);
@@ -368,6 +448,37 @@ where
 
     Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
         .expect("reply buffer must contain a valid reply message")
+}
+
+/// Reply that denies a request on the primary before it enters the VSR
+/// pipeline.
+///
+/// The request's frame with an empty body and a nonzero `ReplyHeader.status`
+/// (the request-level error channel the SDK peeks before body decode).
+/// Nothing is prepared or replicated, so backups never see the denied
+/// request; `op` stays 0, the shape reply consumers already read as "nothing
+/// committed".
+///
+/// # Panics
+/// If the constructed message buffer is not valid.
+pub fn build_deny_reply_from_request<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    request_header: &RequestHeader,
+    status: u32,
+) -> Message<ReplyHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let mut reply = build_reply_from_request(consensus, request_header, bytes::Bytes::new());
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let header_bytes = &mut reply.as_mut_slice()[..header_size];
+    let mut header = bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(header_bytes)
+        .expect("freshly built reply header is valid");
+    header.status = status;
+    header.op = 0;
+    header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+    reply
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -456,7 +567,8 @@ pub async fn send_prepare_ok<B, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Consensus, LocalPipeline};
+    use crate::{Consensus, LocalPipeline, VsrAction};
+    use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use message_bus::SendError;
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
@@ -487,11 +599,13 @@ mod tests {
         fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn prepare_message(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
             |_, new| {
                 *new = PrepareHeader {
                     command: Command2::Prepare,
+                    size: std::mem::size_of::<PrepareHeader>() as u32,
                     op,
                     parent,
                     checksum,
@@ -502,6 +616,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn replicate_preflight_fences_prepare_views() {
         let mut consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
@@ -512,6 +627,7 @@ mod tests {
                 |_, new| {
                     *new = PrepareHeader {
                         command: Command2::Prepare,
+                        size: std::mem::size_of::<PrepareHeader>() as u32,
                         op: 1,
                         view,
                         ..Default::default()
@@ -534,6 +650,118 @@ mod tests {
 
         let current = prepare_with_view(2);
         assert!(replicate_preflight(&consensus, current.header()).is_ok());
+    }
+
+    // Regression: DVC must carry commit_max not commit_min - see
+    // `handle_start_view_change`.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn do_view_change_carries_commit_max_not_commit_min() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // Diverge the frontiers: applied (commit_min=5) lags known-committed
+        // (commit_max=13) by more than PIPELINE_PREPARE_QUEUE_MAX (8). op is at
+        // 13 (>= commit_max), so the op clamp on the DVC commit is a no-op here
+        // and the carried value is commit_max. The clamp itself is covered by
+        // `do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op`.
+        consensus.advance_commit_max(13);
+        consensus.sequencer().set_sequence(13);
+        for op in 1..=5 {
+            consensus.advance_commit_min(op);
+        }
+        assert_eq!(consensus.commit_min(), 5);
+        assert_eq!(consensus.commit_max(), 13);
+
+        // An SVC for a higher view from another replica moves this node into the
+        // view change; with f = 1 SVC excluding self, it emits its own DVC.
+        let svc =
+            Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, new: &mut StartViewChangeHeader| {
+                    new.command = Command2::StartViewChange;
+                    new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
+                    new.view = 1;
+                    new.replica = 0;
+                    new.namespace = 0;
+                });
+        let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
+
+        let dvc_commit = actions.iter().find_map(|action| match action {
+            VsrAction::SendDoViewChange { commit, .. } => Some(*commit),
+            _ => None,
+        });
+        assert_eq!(
+            dvc_commit,
+            Some(13),
+            "DVC must carry commit_max (13), not commit_min (5)"
+        );
+    }
+
+    // Regression: a backup that learned commit_max from a heartbeat before
+    // receiving the prepares has commit_max > op. The DVC must clamp commit to
+    // op so `DoViewChangeHeader::validate` (commit <= op) does not drop it;
+    // dropping a quorum DVC stalls the view change.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn do_view_change_commit_clamped_to_op_when_commit_max_exceeds_op() {
+        use iggy_binary_protocol::{ConsensusHeader, DoViewChangeHeader};
+
+        let consensus = VsrConsensus::new(1, 1, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // Behind backup: op = 4, but commit_max = 5 (a heartbeat raised the
+        // commit point ahead of the prepares this replica holds).
+        consensus.sequencer().set_sequence(4);
+        consensus.advance_commit_max(5);
+        assert_eq!(consensus.commit_max(), 5);
+
+        let svc =
+            Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
+                .transmute_header(|_, new: &mut StartViewChangeHeader| {
+                    new.command = Command2::StartViewChange;
+                    new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
+                    new.view = 1;
+                    new.replica = 0;
+                    new.namespace = 0;
+                });
+        let actions = consensus.handle_start_view_change(PlaneKind::Metadata, svc.header());
+
+        let (dvc_op, dvc_commit) = actions
+            .iter()
+            .find_map(|action| match action {
+                VsrAction::SendDoViewChange { op, commit, .. } => Some((*op, *commit)),
+                _ => None,
+            })
+            .expect("a DoViewChange must be emitted");
+        assert_eq!(dvc_op, 4);
+        assert_eq!(
+            dvc_commit, 4,
+            "commit must be clamped to op (4), not commit_max (5)"
+        );
+
+        // The clamped value passes the wire validate gate; the unclamped
+        // commit_max (5) would be rejected and the DVC dropped.
+        let header = |commit: u64| DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 1,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            op: dvc_op,
+            commit,
+            namespace: 0,
+            log_view: 0,
+            reserved: [0; 100],
+        };
+        assert!(header(dvc_commit).validate().is_ok());
+        assert!(
+            header(5).validate().is_err(),
+            "commit > op must be rejected by the wire gate"
+        );
     }
 
     #[test]
@@ -784,5 +1012,43 @@ mod tests {
                 .map(|entry| entry.header.op),
             Some(7)
         );
+    }
+
+    // A deny echoes the request frame with an empty body, carries the error
+    // code in `status`, and keeps `op` at 0 even when the group has committed
+    // ops -- reply consumers read `op == 0` as "nothing committed", and the
+    // deny must never be mistaken for a committed reply.
+    #[test]
+    fn deny_reply_from_request_stamps_status_and_commits_nothing() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.advance_commit_max(4);
+
+        let request = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::DeleteConsumerOffset2,
+            client: 42,
+            request: 7,
+            namespace: 9,
+            ..Default::default()
+        };
+        let status = 3021;
+        let reply = build_deny_reply_from_request(&consensus, &request, status);
+
+        let header = reply.header();
+        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.status, status);
+        assert_eq!(header.op, 0, "a deny commits nothing");
+        assert_eq!(header.commit, 4);
+        assert_eq!(header.client, 42);
+        assert_eq!(header.request, 7);
+        assert_eq!(header.namespace, 9);
+        assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
+        assert_eq!(
+            header.size as usize,
+            std::mem::size_of::<ReplyHeader>(),
+            "deny reply body must be empty"
+        );
+        assert!(header.validate().is_ok());
     }
 }

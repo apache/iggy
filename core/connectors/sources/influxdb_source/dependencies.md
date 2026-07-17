@@ -44,7 +44,6 @@ to `cargo tree -p iggy_connector_influxdb_source` for the full graph.
 | `dashmap` | `^6.1.0` | MIT | Concurrent hash map; injected into this crate's namespace by the `source_connector!` macro expansion in the SDK. Not used directly in source files. |
 | `iggy_common` | `^0.10.1-edge.1` | Apache-2.0 | Shared Iggy types: `DateTime`, `Utc`, and `serde_secret` used for safe token serialisation in config structs. |
 | `iggy_connector_sdk` | `^0.3.1-edge.1` | Apache-2.0 | Core connector abstractions: `Source` trait, `ProducedMessage`, `ProducedMessages`, `ConnectorState`, `Schema`, `Error`, retry/circuit-breaker utilities, and the `source_connector!` registration macro. |
-| `once_cell` | `^1.21.4` | MIT / Apache-2.0 | `Lazy` global; injected by the `source_connector!` macro expansion in the SDK. Not used directly in source files. |
 | `regex` | `^1.12.3` | MIT / Apache-2.0 | Compiles the RFC 3339 cursor-validation regex once via `OnceLock` in `common.rs::cursor_re()`. |
 | `reqwest` | `^0.13.3` | MIT / Apache-2.0 | Async HTTP client used to issue Flux (V2) and SQL (V3) query requests to InfluxDB. |
 | `reqwest-middleware` | `^0.5.1` | MIT | Middleware wrapper around `reqwest::Client` that attaches the retry and tracing layers built by `iggy_connector_sdk::retry::build_retry_client`. |

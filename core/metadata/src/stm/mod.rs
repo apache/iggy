@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod authz;
 pub mod consumer_group;
 pub mod mux;
+pub mod result;
 pub mod snapshot;
 pub mod stream;
 pub mod user;
-
-use bytes::Bytes;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, ReadHandleFactory, WriteHandle};
 use std::cell::Cell;
@@ -85,16 +85,24 @@ pub trait Command {
 }
 
 /// Per-command handler for a given state type.
-/// Each command struct implements this for the state it mutates.
-/// Returns a `Bytes` response that will be threaded into the Reply message.
 ///
-/// `timestamp` is the primary's stamp from the enclosing `PrepareHeader`,
-/// replicated identically to every replica. Handlers that record a wall-clock
-/// instant in state MUST use this value (not `IggyTimestamp::now()`) so the
-/// state-machine apply remains deterministic across replicas.
+/// Each command implements it for the state it mutates, returning an
+/// [`ApplyReply`]: a `code` (0 = success) plus the typed reply `body` to thread
+/// into the Reply message.
+///
+/// Apply MUST be deterministic across replicas: both left/right buffers recompute
+/// it independently and must agree. So `timestamp` (the primary's stamp from the
+/// enclosing `PrepareHeader`, replicated to every replica) is the only wall-clock
+/// source a handler may record, never `IggyTimestamp::now()`; and the result
+/// `code` must be a pure function of `(state, command)`, never of clocks or
+/// allocator reads.
 pub trait StateHandler {
     type State;
-    fn apply(&self, state: &mut Self::State, timestamp: iggy_common::IggyTimestamp) -> Bytes;
+    fn apply(
+        &self,
+        state: &mut Self::State,
+        timestamp: iggy_common::IggyTimestamp,
+    ) -> result::ApplyReply;
 }
 
 #[derive(Debug)]
@@ -292,7 +300,7 @@ macro_rules! define_state {
                 $(
                     pub $field_name: $field_type,
                 )*
-                pub last_result: Option<bytes::Bytes>,
+                pub last_result: Option<$crate::stm::result::ApplyReply>,
             }
 
             impl [<$state Inner>] {
@@ -432,7 +440,7 @@ macro_rules! collect_handlers {
 
             impl $crate::stm::State for $state {
                 type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
-                type Output = bytes::Bytes;
+                type Output = $crate::stm::result::ApplyReply;
                 type Error = <[<$state Inner>] as $crate::stm::Command>::Error;
 
                 fn apply(&self, input: Self::Input) -> Result<::iggy_common::Either<Self::Output, Self::Input>, Self::Error> {

@@ -40,12 +40,16 @@ mod command;
 mod error;
 mod header;
 mod operation;
+mod reply_result;
 
 pub use command::Command2;
 pub use error::ConsensusError;
 pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader, EvictionReason,
-    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN, ReplyHeader,
-    RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader, read_size_field,
+    GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader, RESERVED_COMMAND_LEN,
+    RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    read_size_field,
 };
 pub use operation::Operation;
+pub use reply_result::{RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len};

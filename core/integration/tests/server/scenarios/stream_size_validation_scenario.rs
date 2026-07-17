@@ -20,15 +20,39 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, assert_clean_system, login_root};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
+// The partition plane applies committed ops asynchronously on the owning
+// shard (sends fold into the shared stats at commit-apply; purge/delete
+// zero them when the reconciler drives the wipe), so a read racing that
+// window can see a pre-apply value. Retry until the expectation holds,
+// then make the terminal assertion for a real mismatch.
+const STATS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);
+const STATS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 const S1_NAME: &str = "test-stream-1";
 const T1_NAME: &str = "test-topic-1";
 const S2_NAME: &str = "test-stream-2";
 const T2_NAME: &str = "test-topic-2";
 const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
+#[cfg(not(feature = "vsr"))]
 const MSG_SIZE: u64 = IGGY_MESSAGE_HEADER_SIZE as u64 + MESSAGE_PAYLOAD_SIZE_BYTES; // number of bytes in a single message
 const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one pass of appending
+#[cfg(not(feature = "vsr"))]
 const MSGS_SIZE: u64 = MSG_SIZE * MSGS_COUNT; // number of bytes in a single topic after one pass of appending
+// server-ng accounts the actual on-disk batch framing: one 256-byte
+// `SendMessages2` command header per append pass plus a 48-byte per-message
+// header (`server_common::send_messages2::{COMMAND_HEADER_SIZE,
+// MESSAGE_HEADER_SIZE}`), instead of the legacy 64-byte per-message header.
+// Each pass below sends all `MSGS_COUNT` messages in one batch.
+#[cfg(feature = "vsr")]
+const NG_BATCH_HEADER_SIZE: u64 = 256;
+#[cfg(feature = "vsr")]
+const NG_MESSAGE_HEADER_SIZE: u64 = 48;
+#[cfg(feature = "vsr")]
+const MSGS_SIZE: u64 =
+    NG_BATCH_HEADER_SIZE + (NG_MESSAGE_HEADER_SIZE + MESSAGE_PAYLOAD_SIZE_BYTES) * MSGS_COUNT;
 
 pub async fn run(harness: &TestHarness) {
     let client = harness
@@ -223,7 +247,17 @@ async fn validate_system_stats(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    let stats = client.get_stats().await.unwrap();
+    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let stats = loop {
+        let stats = client.get_stats().await.unwrap();
+        if (stats.messages_count == expected_messages_count
+            && stats.messages_size_bytes.as_bytes_u64() == expected_size)
+            || Instant::now() >= deadline
+        {
+            break stats;
+        }
+        sleep(STATS_RETRY_INTERVAL).await;
+    };
     assert_eq!(
         stats.messages_count, expected_messages_count,
         "system stats messages_count mismatch"
@@ -241,12 +275,22 @@ async fn validate_stream(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    // 1. Validate stream size and number of messages
-    let stream = client
-        .get_stream(&Identifier::from_str(stream_name).unwrap())
-        .await
-        .unwrap()
-        .expect("Failed to get stream");
+    // 1. Fetch until the async commit-apply converges (see the retry note at
+    // the top of the file).
+    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let stream = loop {
+        let stream = client
+            .get_stream(&Identifier::from_str(stream_name).unwrap())
+            .await
+            .unwrap()
+            .expect("Failed to get stream");
+        if (stream.size == expected_size && stream.messages_count == expected_messages_count)
+            || Instant::now() >= deadline
+        {
+            break stream;
+        }
+        sleep(STATS_RETRY_INTERVAL).await;
+    };
 
     // 2. Validate stream size and number of messages
     assert_eq!(stream.size, expected_size);
@@ -260,15 +304,25 @@ async fn validate_topic(
     expected_size: u64,
     expected_messages_count: u64,
 ) {
-    // 1. Validate topic size and number of messages
-    let topic = client
-        .get_topic(
-            &Identifier::from_str(stream_name).unwrap(),
-            &Identifier::from_str(topic_name).unwrap(),
-        )
-        .await
-        .unwrap()
-        .expect("Failed to get topic");
+    // 1. Fetch until the async commit-apply converges (see the retry note at
+    // the top of the file).
+    let deadline = Instant::now() + STATS_CONVERGENCE_TIMEOUT;
+    let topic = loop {
+        let topic = client
+            .get_topic(
+                &Identifier::from_str(stream_name).unwrap(),
+                &Identifier::from_str(topic_name).unwrap(),
+            )
+            .await
+            .unwrap()
+            .expect("Failed to get topic");
+        if (topic.size == expected_size && topic.messages_count == expected_messages_count)
+            || Instant::now() >= deadline
+        {
+            break topic;
+        }
+        sleep(STATS_RETRY_INTERVAL).await;
+    };
 
     // 2. Validate topic size and number of messages
     assert_eq!(topic.size, expected_size);

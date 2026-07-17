@@ -18,6 +18,7 @@
 #![allow(clippy::future_not_send)]
 
 mod iggy_index;
+mod iggy_index_reader;
 mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
@@ -25,21 +26,26 @@ mod journal;
 mod log;
 mod messages_writer;
 mod offset_storage;
+mod poll_plan;
 mod segment;
 mod types;
 
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
+pub use iggy_index::IggyIndex;
+pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use messages_writer::MessagesWriter;
+pub use offset_storage::delete_persisted_offset;
+pub use poll_plan::{AutoCommitApplied, PollPlan};
 pub use segment::Segment;
 use server_common::Message;
 pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer, SendMessagesResult,
+    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairSession, SendMessagesResult,
 };
 
 /// Partition-level data plane operations.
@@ -51,15 +57,6 @@ pub trait Partition {
         &mut self,
         message: Message<PrepareHeader>,
     ) -> impl Future<Output = Result<AppendResult, IggyError>>;
-
-    fn poll_messages(
-        &self,
-        consumer: PollingConsumer,
-        args: PollingArgs,
-    ) -> impl Future<Output = Result<PollQueryResult<4096>, IggyError>> {
-        let _ = (consumer, args);
-        async { Err(IggyError::FeatureUnavailable) }
-    }
 
     /// # Errors
     /// Returns `IggyError::FeatureUnavailable` by default.

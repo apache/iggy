@@ -59,7 +59,8 @@ type IggyTcpClient struct {
 	clientAddress          string
 	currentServerAddress   string
 	connectedAt            time.Time
-	state                  iggcon.State
+	transportState         iggcon.TransportState
+	sessionState           iggcon.SessionState
 	// respHeader is the reused response-status read buffer; guarded by c.mtx.
 	respHeader [ResponseInitialBytesLength]byte
 }
@@ -216,7 +217,8 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
-		state:                  iggcon.StateDisconnected,
+		transportState:         iggcon.TransportStateDisconnected,
+		sessionState:           iggcon.SessionStateUnauthenticated,
 		connectedAt:            time.Time{},
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
@@ -341,6 +343,18 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
+		c.logger.Debug("Cannot send data. Client is shutdown.")
+		return nil, ierror.ErrClientShutdown
+	case iggcon.TransportStateDisconnected:
+		c.logger.Debug("Cannot send data. Client is not connected.")
+		return nil, ierror.ErrNotConnected
+	case iggcon.TransportStateConnecting:
+		c.logger.Debug("Cannot send data. Client is still connecting.")
+		return nil, ierror.ErrNotConnected
+	}
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -384,12 +398,17 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 }
 
 func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
+	commandCode := command.Code(binary.LittleEndian.Uint32(wirePayload[4:8]))
+	c.logger.Debug("Sending a TCP request", slog.Int("payload_length", len(wirePayload)), slog.Int("code", int(commandCode)))
 	if _, err := c.write(wirePayload); err != nil {
 		c.invalidateConnLocked()
 		return nil, err
 	}
 
+	c.logger.Debug("Sent a TCP request, waiting for a response...", slog.Int("code", int(commandCode)))
+
 	if _, err := c.readInto(c.respHeader[:]); err != nil {
+		c.logger.Error("Failed to read response for TCP request", slog.Int("code", int(commandCode)), slog.Any("error", err))
 		c.invalidateConnLocked()
 		return nil, err
 	}
@@ -399,6 +418,8 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	}
 
 	length := int(binary.LittleEndian.Uint32(c.respHeader[4:]))
+	c.logger.Debug("Status: OK.", slog.Int("response_length", length))
+
 	if length <= 1 {
 		return []byte{}, nil
 	}
@@ -412,12 +433,27 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	return buffer, nil
 }
 
+func (c *IggyTcpClient) setSessionState(state iggcon.SessionState) {
+	c.mtx.Lock()
+	c.sessionState = state
+	c.mtx.Unlock()
+}
+
 // invalidateConnLocked closes the connection and marks it as disconnected
 func (c *IggyTcpClient) invalidateConnLocked() {
-	if c.conn != nil {
-		_ = c.conn.Close()
+	_ = c.closeConnLocked()
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
+}
+
+// closeConnLocked closes and drops the current connection.
+func (c *IggyTcpClient) closeConnLocked() error {
+	if c.conn == nil {
+		return nil
 	}
-	c.state = iggcon.StateDisconnected
+	err := c.conn.Close()
+	c.conn = nil
+	return err
 }
 
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
@@ -432,18 +468,22 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // Connect establishes the TCP connection to the server.
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	c.mtx.Lock()
-	switch c.state {
-	case iggcon.StateShutdown:
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
 		c.mtx.Unlock()
+		c.logger.Debug("Cannot connect. Client is shutdown.")
 		return ierror.ErrClientShutdown
-	case iggcon.StateConnected,
-		iggcon.StateAuthenticating,
-		iggcon.StateAuthenticated,
-		iggcon.StateConnecting:
+	case iggcon.TransportStateConnected:
+		clientAddress := c.clientAddress
 		c.mtx.Unlock()
+		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
+		return nil
+	case iggcon.TransportStateConnecting:
+		c.mtx.Unlock()
+		c.logger.Debug("Client is already connecting.")
 		return nil
 	default:
-		c.state = iggcon.StateConnecting
+		c.transportState = iggcon.TransportStateConnecting
 	}
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
@@ -452,10 +492,12 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	if !connectedAt.IsZero() {
 		now := time.Now()
 		elapsed := now.Sub(connectedAt)
-		interval := c.config.reconnection.reestablishAfter
+		reestablishAfter := c.config.reconnection.reestablishAfter
 
-		if elapsed < interval {
-			remaining := interval - elapsed
+		c.logger.Debug("Elapsed time since last connection", slog.Duration("elapsed", elapsed))
+		if elapsed < reestablishAfter {
+			remaining := reestablishAfter - elapsed
+			c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
 			time.Sleep(remaining)
 		}
 	}
@@ -472,15 +514,22 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		retry.Attempts(attempts),
 		retry.Delay(interval),
 		retry.DelayType(retry.FixedDelay),
+		retry.OnRetry(func(n uint, err error) {
+			c.logger.Info("Retrying to connect to server...", slog.Int("retry_count", int(n+1)), slog.Int("max_retries", int(attempts)), slog.Any("error", err))
+		}),
 	).Do(
 		func() error {
+			c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", c.currentServerAddress))
 			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.currentServerAddress)
 			if err != nil {
+				c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
 				return ierror.ErrCannotEstablishConnection
 			}
 
 			tc := connection.(*net.TCPConn)
-			_ = tc.SetNoDelay(c.config.noDelay)
+			if err := tc.SetNoDelay(c.config.noDelay); err != nil {
+				c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
+			}
 
 			c.mtx.Lock()
 			c.clientAddress = tc.LocalAddr().String()
@@ -500,6 +549,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 
 			tlsConn := tls.Client(connection, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
+				c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
 				_ = connection.Close()
 				return fmt.Errorf("TLS handshake failed: %w", err)
 			}
@@ -508,16 +558,20 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			return nil
 		}); err != nil {
 		c.mtx.Lock()
-		c.state = iggcon.StateDisconnected
+		c.transportState = iggcon.TransportStateDisconnected
 		c.mtx.Unlock()
+		if !c.config.reconnection.enabled {
+			c.logger.Warn("Automatic reconnection is disabled.")
+		}
 		// TODO publish event disconnected
 		return err
 	}
 
 	c.mtx.Lock()
 	c.conn = conn
-	c.state = iggcon.StateConnected
+	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
+	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
 	c.mtx.Unlock()
 	return nil
 }
@@ -539,6 +593,7 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	}
 
 	if serverName == "" {
+		c.logger.Error("Failed to create a server name from the domain.", slog.Any("error", ierror.ErrInvalidTlsDomain))
 		return nil, ierror.ErrInvalidTlsDomain
 	}
 	tlsConfig.ServerName = serverName
@@ -547,11 +602,16 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	if c.config.tls.tlsCAFile != "" {
 		caCert, err := os.ReadFile(c.config.tls.tlsCAFile)
 		if err != nil {
+			c.logger.Error("Failed to read the CA file", slog.String("certificate_path", c.config.tls.tlsCAFile), slog.Any("error", err))
 			return nil, ierror.ErrInvalidTlsCertificatePath
 		}
 
 		caCertPool := x509.NewCertPool()
 		if !caCertPool.AppendCertsFromPEM(caCert) {
+			c.logger.Error(
+				"Failed to parse the CA certificate.",
+				slog.String("certificate_path", c.config.tls.tlsCAFile),
+			)
 			return nil, ierror.ErrInvalidTlsCertificate
 		}
 
@@ -565,29 +625,38 @@ func (c *IggyTcpClient) disconnect() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateDisconnected {
+	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
-	c.state = iggcon.StateDisconnected
-	if err := c.conn.Close(); err != nil {
-		return err
-	}
+
+	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
+
+	err := c.closeConnLocked()
+
+	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
 	// TODO event pushing logic
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) shutdown() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
-	if c.state == iggcon.StateShutdown {
+
+	if c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
-	if err := c.conn.Close(); err != nil {
-		return err
-	}
-	c.state = iggcon.StateShutdown
+
+	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
+
+	err := c.closeConnLocked()
+
+	c.transportState = iggcon.TransportStateShutdown
+	c.sessionState = iggcon.SessionStateUnauthenticated
+	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
 	// TODO push shutdown event
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) Close() error {

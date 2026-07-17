@@ -34,6 +34,10 @@ runs:
         cache: "npm"
         cache-dependency-path: foreign/node/package-lock.json
 
+    - name: Pin npm to 11 to match Dependabot lockfile format
+      run: npm install -g npm@11
+      shell: bash
+
     - name: Setup Rust with cache
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache

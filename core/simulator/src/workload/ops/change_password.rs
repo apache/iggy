@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `ChangePassword` op. Live username picked from shadow.
+//! `ChangePassword` op. Targets `Ok` (rotate live user's password) or
+//! `UserNotFound` (fabricated user).
 
-use iggy_binary_protocol::{ReplyHeader, RequestHeader};
+use iggy_binary_protocol::RequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -27,6 +28,8 @@ use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
+pub use metadata::stm::result::ChangePasswordResult as Outcome;
+
 #[derive(Debug, Clone)]
 pub struct Input {
     pub user: String,
@@ -34,12 +37,7 @@ pub struct Input {
     pub new_password: String,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Outcome {
-    Success,
-}
-
-pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
+pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserNotFound];
 
 pub fn sample(
     shadow: &mut Shadow,
@@ -48,18 +46,24 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::Success => {
+        Outcome::Ok => {
             let user = shadow.pick_user_name(prng)?;
-            // After first rotation, `pw-{user}` mismatches; use shadow.
+            // After the first rotation `pw-{user}` is stale; read the shadow.
             let current_password = shadow.password_for(&user)?.to_string();
             let r: u32 = prng.random();
-            let new_password = format!("pw-{r:08x}");
             Some(Input {
                 user,
                 current_password,
-                new_password,
+                new_password: format!("pw-{r:08x}"),
             })
         }
+        Outcome::UserNotFound => Some(Input {
+            user: shadow.fabricate_absent_name("user"),
+            current_password: String::new(),
+            new_password: "pw-missing".to_string(),
+        }),
+        // Not a targeted outcome (absent from `OUTCOMES`); never sampled.
+        Outcome::InvalidCredentials => None,
     }
 }
 
@@ -68,17 +72,24 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader
     client.change_password(&input.user, &input.current_password, &input.new_password)
 }
 
+/// Decode committed `code` into this op's outcome.
+///
+/// # Panics
+/// On an undeclared code; `on_reply` rejects unrecognized codes first.
 #[must_use]
-pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
-    Outcome::Success
+pub const fn classify_reply(code: u32) -> Outcome {
+    Outcome::from_u32(code).expect("on_reply rejects unrecognized result codes before classify")
 }
 
 #[must_use]
 pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::PasswordChanged {
+        Outcome::Ok => Effect::PasswordChanged {
             user: input.user.clone(),
             new_password: input.new_password.clone(),
         },
+        // A committed rejection is a no-op: a missing user, or (never targeted)
+        // a wrong current password, leaves the shadow unchanged.
+        Outcome::UserNotFound | Outcome::InvalidCredentials => Effect::None,
     }
 }
