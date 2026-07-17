@@ -602,6 +602,9 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
     type Error = String;
 
     fn try_from(message: ffi::IggyMessageToSend) -> Result<Self, Self::Error> {
+        // TODO: Document in the C++ SDK that user headers are unordered and keys must be unique.
+        // The BTreeMap sorts entries by kind and value, discards Vec insertion order on send and
+        // poll, and rejects duplicate keys.
         let mut user_headers = BTreeMap::new();
         for entry in message.user_headers {
             let header_entry = RustHeaderEntry::try_from(entry)
