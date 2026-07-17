@@ -30,11 +30,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-// Drives the `iggy` CLI binary against a running server. Probed against
-// server-ng 2026-07-15: ~109/170 pass; the ~42 failures + hangs cluster in
-// `context` (12), `system` (7), `message` (6), `stream` (5) plus scattered
-// others -- needs a dedicated triage pass before un-gating.
-#[cfg(not(feature = "vsr"))]
+// Drives the `iggy` CLI binary against a running server, in both legacy and
+// vsr/server-ng modes. Under vsr, single-node and the default 3-node cluster
+// both pass. A few cases are mode-split where server-ng diverges from legacy by
+// design: flush returns FeatureUnavailable, the session-timeout message
+// differs, and purge is eventually consistent so server state is polled.
 mod cli;
 // A single `#[ignore]`d multi-node ping matrix stub; none of its cells run in
 // either mode today.

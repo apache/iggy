@@ -87,6 +87,7 @@ use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use sysinfo::System as SysinfoSystem;
@@ -701,6 +702,15 @@ where
     )?;
 
     let system = probe_system_stats();
+    // Disk usage of the volume holding iggy data. The data directory is
+    // captured process-globally at bootstrap (the shard doesn't carry server
+    // config on the read path); absent that, or on a probe error, report 0.
+    let (free_disk_space, total_disk_space) = STATS_DATA_PATH.get().map_or((0, 0), |path| {
+        (
+            fs2::available_space(path).unwrap_or(0),
+            fs2::total_space(path).unwrap_or(0),
+        )
+    });
     Ok(StatsResponse {
         process_id: system.process_id,
         cpu_usage: system.cpu_usage,
@@ -733,11 +743,8 @@ where
         iggy_server_semver: crate::SEMANTIC_VERSION.get_numeric_version().ok(),
         cache_metrics: Vec::new(),
         threads_count: system.threads_count,
-        // Disk space needs the configured data directory (legacy reads
-        // `config.system.path`); the shard doesn't expose server config on the
-        // read path, so report 0 rather than probe an unrelated mount.
-        free_disk_space: 0,
-        total_disk_space: 0,
+        free_disk_space,
+        total_disk_space,
     })
 }
 
@@ -796,6 +803,17 @@ impl HostIdentity {
 }
 
 static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
+
+/// Configured data directory, captured once at bootstrap so the sync stats
+/// read path can report disk usage of the volume that holds iggy data rather
+/// than an unrelated mount. Unset (disk stats fall back to 0) until bootstrap.
+static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Capture the configured data directory for `GetStats` disk reporting.
+/// Idempotent: only the first call (process bootstrap) takes effect.
+pub(crate) fn init_stats_data_path(path: PathBuf) {
+    let _ = STATS_DATA_PATH.set(path);
+}
 
 fn probe_system_stats() -> SystemStats {
     let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
