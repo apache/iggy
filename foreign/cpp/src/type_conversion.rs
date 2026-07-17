@@ -433,10 +433,8 @@ impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
     }
 }
 
-impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
-    type Error = String;
-
-    fn try_from(message: RustIggyMessage) -> Result<Self, Self::Error> {
+impl From<RustIggyMessage> for ffi::IggyMessagePolled {
+    fn from(message: RustIggyMessage) -> Self {
         let id_bytes = message.header.id.to_le_bytes();
         let id_lo = u64::from_le_bytes(id_bytes[0..8].try_into().unwrap());
         let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
@@ -445,27 +443,28 @@ impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
                 // Keep polling forward-compatible with future header kinds. Unlike the Rust SDK's
                 // typed decoder, this structural decoder preserves unknown kinds and values whose
                 // lengths do not match their fixed-width kind.
-                let wire_headers = WireUserHeaders::from_bytes(raw_headers).map_err(|error| {
-                    format!("Could not convert polled message user headers: {error}")
-                })?;
-                wire_headers
-                    .iter()
-                    .map(|entry| ffi::HeaderEntry {
-                        key: ffi::HeaderField {
-                            kind: entry.key_kind.0,
-                            value: entry.key.to_vec(),
-                        },
-                        value: ffi::HeaderField {
-                            kind: entry.value_kind.0,
-                            value: entry.value.to_vec(),
-                        },
-                    })
-                    .collect()
+                match WireUserHeaders::from_bytes(raw_headers) {
+                    Ok(wire_headers) => wire_headers
+                        .iter()
+                        .map(|entry| ffi::HeaderEntry {
+                            key: ffi::HeaderField {
+                                kind: entry.key_kind.0,
+                                value: entry.key.to_vec(),
+                            },
+                            value: ffi::HeaderField {
+                                kind: entry.value_kind.0,
+                                value: entry.value.to_vec(),
+                            },
+                        })
+                        .collect(),
+                    // A malformed header must not make its message or poll batch unreadable.
+                    Err(_) => Vec::new(),
+                }
             }
             None => Vec::new(),
         };
 
-        Ok(ffi::IggyMessagePolled {
+        ffi::IggyMessagePolled {
             checksum: message.header.checksum,
             id_lo,
             id_hi,
@@ -477,7 +476,7 @@ impl TryFrom<RustIggyMessage> for ffi::IggyMessagePolled {
             reserved: message.header.reserved,
             payload: message.payload.to_vec(),
             user_headers,
-        })
+        }
     }
 }
 
@@ -809,19 +808,17 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
     }
 }
 
-impl TryFrom<RustPolledMessages> for ffi::PolledMessages {
-    type Error = String;
-
-    fn try_from(messages: RustPolledMessages) -> Result<Self, Self::Error> {
-        Ok(ffi::PolledMessages {
+impl From<RustPolledMessages> for ffi::PolledMessages {
+    fn from(messages: RustPolledMessages) -> Self {
+        ffi::PolledMessages {
             partition_id: messages.partition_id,
             current_offset: messages.current_offset,
             count: messages.count,
             messages: messages
                 .messages
                 .into_iter()
-                .map(ffi::IggyMessagePolled::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
+                .map(ffi::IggyMessagePolled::from)
+                .collect(),
+        }
     }
 }
