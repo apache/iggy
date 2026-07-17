@@ -18,6 +18,7 @@
 //! Kafka response frame parsing and human-readable summaries for `send` / `verify`.
 
 use bytes::Bytes;
+use iggy_gateway_kafka::protocol::header::response_header_version;
 use kafka_protocol::messages::{
     ApiVersionsResponse, CreateTopicsResponse, FetchResponse, ListOffsetsResponse,
     MetadataResponse, ProduceResponse,
@@ -343,78 +344,5 @@ fn format_error_code(code: i16) -> &'static str {
         42 => "INVALID_REQUEST",
         -1 => "UNKNOWN",
         _ => "OTHER",
-    }
-}
-
-fn request_header_version(api_key: i16, api_version: i16) -> i16 {
-    let flex_from = first_flexible_version(api_key);
-    match flex_from {
-        Some(fv) if api_version >= fv => 2,
-        _ => 1,
-    }
-}
-
-fn response_header_version(api_key: i16, api_version: i16) -> i16 {
-    if api_key == 18 {
-        return 0;
-    }
-    if request_header_version(api_key, api_version) >= 2 {
-        1
-    } else {
-        0
-    }
-}
-
-/// First flexible protocol version per API key (matches gateway `header.rs` / kafka-tool framing).
-fn first_flexible_version(api_key: i16) -> Option<i16> {
-    match api_key {
-        0 => Some(9),
-        1 => Some(12),
-        2 => Some(6),
-        3 => Some(9),
-        8 => Some(8),
-        9 => Some(6),
-        10 => Some(3),
-        11 => Some(6),
-        12 => Some(4),
-        13 => Some(4),
-        14 => Some(4),
-        15 => Some(5),
-        16 => Some(3),
-        17 => None,
-        18 => Some(3),
-        19 => Some(5),
-        20 => Some(4),
-        21 => Some(2),
-        22 => Some(2),
-        23 => Some(4),
-        24 => Some(3),
-        25 => Some(3),
-        26 => Some(3),
-        27 => Some(1),
-        28 => Some(3),
-        29 => Some(2),
-        30 => Some(2),
-        31 => Some(2),
-        32 => Some(4),
-        33 => Some(2),
-        34 => Some(2),
-        35 => Some(2),
-        36 => Some(2),
-        37 => Some(2),
-        38 => Some(2),
-        39 => Some(2),
-        40 => Some(2),
-        41 => Some(2),
-        42 => Some(2),
-        43 => Some(2),
-        44 => Some(1),
-        45 | 46 => Some(0),
-        47 => None,
-        48 | 49 => Some(1),
-        50 | 51 | 55 | 56 => Some(0),
-        57 => Some(1),
-        60 | 61 | 64 | 65 | 66 | 67 | 68 | 69 | 71 | 72 | 74 | 75 | 76 => Some(0),
-        _ => None,
     }
 }

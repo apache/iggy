@@ -39,13 +39,23 @@ pub struct ResponseHeader {
     pub correlation_id: i32,
 }
 
-/// Returns the request header version to use for a given (api_key, api_version) pair.
+/// First API version that uses flexible (compact) request encoding for `api_key`.
 ///
-/// Header v1 is the standard non-flexible format (nullable string client_id).
-/// Header v2 is the flexible format (compact nullable string client_id + empty tagged fields).
-/// The threshold at which each API key switches from v1 to v2 is defined by the Kafka protocol.
-pub fn request_header_version(api_key: i16, api_version: i16) -> i16 {
-    let flexible_from: i16 = match api_key {
+/// `None` means the API never uses flexible encoding (request header stays v1 for every
+/// version). Source of truth for kafka-tool framing and for [`request_header_version`].
+#[must_use]
+pub fn first_flexible_version(api_key: i16) -> Option<i16> {
+    let threshold = first_flexible_version_threshold(api_key);
+    if threshold == i16::MAX {
+        None
+    } else {
+        Some(threshold)
+    }
+}
+
+/// Threshold used by [`request_header_version`]. `i16::MAX` = never flexible.
+fn first_flexible_version_threshold(api_key: i16) -> i16 {
+    match api_key {
         0 => 9,         // Produce
         1 => 12,        // Fetch
         2 => 6,         // ListOffsets
@@ -119,8 +129,20 @@ pub fn request_header_version(api_key: i16, api_version: i16) -> i16 {
         79 => 0,        // ShareFetch — always flexible
         80 => 0,        // ShareAcknowledge — always flexible
         _ => i16::MAX,  // Unknown API — assume non-flexible
-    };
-    if api_version >= flexible_from { 2 } else { 1 }
+    }
+}
+
+/// Returns the request header version to use for a given (api_key, api_version) pair.
+///
+/// Header v1 is the standard non-flexible format (nullable string client_id).
+/// Header v2 is the flexible format (compact nullable string client_id + empty tagged fields).
+/// The threshold at which each API key switches from v1 to v2 is defined by the Kafka protocol.
+#[must_use]
+pub fn request_header_version(api_key: i16, api_version: i16) -> i16 {
+    match first_flexible_version(api_key) {
+        Some(flexible_from) if api_version >= flexible_from => 2,
+        _ => 1,
+    }
 }
 
 /// Returns the response header version to use when replying to a given (api_key, api_version).

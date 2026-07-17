@@ -18,6 +18,8 @@
 use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
+use iggy_gateway_kafka::protocol::api::supported_api_ranges;
+use iggy_gateway_kafka::protocol::header::request_header_version;
 use kafka_protocol::messages::*;
 use kafka_protocol::protocol::{Encodable, StrBytes};
 use std::path::PathBuf;
@@ -164,87 +166,19 @@ const API_REGISTRY: &[(i16, &str, i16, i16)] = &[
     (76, "ListClientMetricsResources", 0, 0),
 ];
 
-/// Iggy Kafka gateway #3421 scope — mirrors `SUPPORTED_RANGES` in `iggy_gateway_kafka`.
-const GATEWAY_REGISTRY: &[(i16, &str, i16, i16)] = &[
-    (0, "Produce", 3, 9),
-    (1, "Fetch", 4, 12),
-    (2, "ListOffsets", 1, 6),
-    (3, "Metadata", 0, 9),
-    (18, "ApiVersions", 0, 3),
-    (19, "CreateTopics", 2, 5),
-];
-
-// ── Flexible version table ────────────────────────────────────────────────────
-// Source: flexibleVersions field in each Kafka JSON schema.
-// Returns the first version using compact encoding, or None if never flexible.
-fn first_flexible_version(api_key: i16) -> Option<i16> {
-    match api_key {
-        0 => Some(9),
-        1 => Some(12),
-        2 => Some(6),
-        3 => Some(9),
-        8 => Some(8),
-        9 => Some(6),
-        10 => Some(3),
-        11 => Some(6),
-        12 => Some(4),
-        13 => Some(4),
-        14 => Some(4),
-        15 => Some(5),
-        16 => Some(3),
-        17 => None,
-        18 => Some(3),
-        19 => Some(5),
-        20 => Some(4),
-        21 => Some(2),
-        22 => Some(2),
-        23 => Some(4),
-        24 => Some(3),
-        25 => Some(3),
-        26 => Some(3),
-        27 => Some(1),
-        28 => Some(3),
-        29 => Some(2),
-        30 => Some(2),
-        31 => Some(2),
-        32 => Some(4),
-        33 => Some(2),
-        34 => Some(2),
-        35 => Some(2),
-        36 => Some(2),
-        37 => Some(2),
-        38 => Some(2),
-        39 => Some(2),
-        40 => Some(2),
-        41 => Some(2),
-        42 => Some(2),
-        43 => Some(2),
-        44 => Some(1),
-        45 => Some(1),
-        46 => Some(1),
-        47 => Some(0),
-        48 => Some(1),
-        49 => Some(1),
-        50 => Some(0),
-        51 => Some(0),
-        55 => Some(2),
-        56 => Some(2),
-        57 => Some(1),
-        60 => Some(0),
-        61 => Some(0),
-        64 => Some(0),
-        65 => Some(0),
-        66 => Some(0),
-        67 => Some(0),
-        68 => Some(0),
-        69 => Some(0),
-        71 => Some(0),
-        72 => Some(0),
-        74 => Some(0),
-        75 => Some(0),
-        76 => Some(0),
-        _ => None,
-    }
+/// Gateway verify scope from `iggy_gateway_kafka::supported_api_ranges()`.
+/// Names come from `API_REGISTRY` (Kafka catalog); version bounds come from the gateway.
+fn gateway_verify_registry() -> Vec<(i16, &'static str, i16, i16)> {
+    supported_api_ranges()
+        .iter()
+        .map(|range| {
+            let name = API_REGISTRY
+                .iter()
+                .find(|(key, _, _, _)| *key == range.api_key)
+                .map_or("Unknown", |(_, name, _, _)| *name);
+            (range.api_key, name, range.min_version, range.max_version)
+        })
+        .collect()
 }
 
 // ── Request framing ───────────────────────────────────────────────────────────
@@ -640,9 +574,8 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
 // Build a complete framed Kafka request message ready for TCP transmission.
 fn build_framed(api_key: i16, version: i16, corr: i32) -> Result<Bytes> {
     let payload = build_payload(api_key, version)?;
-    let flexible = first_flexible_version(api_key)
-        .map(|fv| version >= fv)
-        .unwrap_or(false);
+    // Header v2 == flexible request encoding; threshold lives in iggy-gateway-kafka.
+    let flexible = request_header_version(api_key, version) >= 2;
     Ok(frame_request(
         api_key,
         version,
@@ -875,10 +808,11 @@ async fn main() -> Result<()> {
             all_apis,
             quiet,
         } => {
-            let registry = if all_apis {
+            let gateway_registry = gateway_verify_registry();
+            let registry: &[(i16, &str, i16, i16)] = if all_apis {
                 API_REGISTRY
             } else {
-                GATEWAY_REGISTRY
+                &gateway_registry
             };
             let (ok, fail) = run_send(
                 &host, registry, &api_key, version, timeout_ms, fail_fast, quiet,

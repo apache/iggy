@@ -34,6 +34,7 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 hex = "0.4"
+iggy-gateway-kafka = { path = "../.." }
 indexmap = "2"
 kafka-protocol = "0.17"
 tokio = { workspace = true }
