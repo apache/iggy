@@ -15,22 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Python-facing error type bridging [`iggy::prelude::IggyError`] to a
+//! `PyException` subclass so callers can `except IggyError as e` and
+//! inspect `e.code`, `e.name`, and `e.message` directly.
+//!
+//! Error codes and names are defined in
+//! `core/common/src/error/iggy_error.rs`.
+
 use iggy::prelude::IggyError as RustIggyError;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
-/// A Python class representing the Rust's IggyError.
-/// Allows transparent representation of Iggy-specific errors.
-/// You can find all available error codes and names in IggyError enum, which lives in core/common/src/error/iggy_error.rs.
+/// Iggy-specific exception exposed to Python.
 #[gen_stub_pyclass]
 #[pyclass(skip_from_py_object, extends=PyException)]
 #[derive(Clone, Debug)]
 pub struct IggyError {
+    /// Numeric error code from [`iggy::prelude::IggyError::as_code`].
     #[pyo3(get)]
     code: u32,
+    /// Snake-case error variant name from [`iggy::prelude::IggyError::as_string`]
+    /// (e.g. `"topic_name_already_exists"`).
     #[pyo3(get)]
     name: String,
+    /// Human-readable description from the variant's `#[error(...)]` template
+    /// (e.g. `"Topic with name: foo for stream with ID: 1 already exists."`).
     #[pyo3(get)]
     message: String,
 }
@@ -60,6 +70,8 @@ impl IggyError {
 }
 
 impl IggyError {
+    /// Convert a Rust [`RustIggyError`] into a [`PyErr`] carrying this type.
+    /// Use this at every SDK boundary instead of mapping to a generic `PyRuntimeError`.
     pub fn new_err_from_rust(e: RustIggyError) -> PyErr {
         PyErr::new::<IggyError, _>((e.as_code(), e.as_string().to_string(), e.to_string()))
     }

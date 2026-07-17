@@ -19,7 +19,7 @@ import argparse
 import asyncio
 from typing import NamedTuple
 
-from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
+from apache_iggy import IggyClient, IggyError, PollingStrategy, ReceiveMessage
 from loguru import logger
 
 STREAM_NAME = "sample-stream"
@@ -88,6 +88,12 @@ async def consume_messages(client: IggyClient):
                 handle_message(message)
             n_consumed_batches += 1
             await asyncio.sleep(interval)
+        except IggyError as error:
+            logger.error(
+                "Iggy error while consuming messages: "
+                f"[{error.code}] {error.name}: {error.message}"
+            )
+            break
         except Exception as error:
             logger.exception(f"Exception occurred while consuming messages: {error}")
             break
