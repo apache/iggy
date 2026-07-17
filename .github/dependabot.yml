@@ -284,7 +284,6 @@ updates:
   - package-ecosystem: "bazel"
     directories:
       - "/foreign/cpp"
-      - "/bdd/cpp"
     schedule:
       interval: "weekly"
       day: "thursday"

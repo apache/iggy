@@ -15,7 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library", "cc_test")
+
+COMMON_COPTS = [
+    "-Wall",
+    "-Wpedantic",
+    "-Werror",
+    "-Wextra",
+] + select({
+    "@platforms//os:windows": ["/utf-8"],
+    "//conditions:default": [
+        "-finput-charset=UTF-8",
+        "-fexec-charset=UTF-8",
+    ],
+})
 
 genrule(
     name = "cargo_build",
@@ -109,13 +122,7 @@ cc_library(
         "cxxbridge",
         "include",
     ],
-    copts = select({
-        "@platforms//os:windows": ["/utf-8"],
-        "//conditions:default": [
-            "-finput-charset=UTF-8",
-            "-fexec-charset=UTF-8",
-        ],
-    }),
+    copts = COMMON_COPTS,
     linkopts = [
         "-ldl",
         "-lpthread",
@@ -132,6 +139,28 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+cc_binary(
+    name = "bdd_wire_server",
+    srcs = [
+        "tests/bdd/background_steps.cpp",
+        "tests/bdd/messaging_steps.cpp",
+        "tests/bdd/world.hpp",
+    ],
+    copts = COMMON_COPTS + [
+        "-g3",
+        "-O0",
+        "-fno-omit-frame-pointer",
+        "-DDEBUG",
+    ],
+    linkopts = ["-g"],
+    testonly = True,
+    deps = [
+        ":iggy-cpp",
+        "@cucumber-cpp//:cucumber-cpp",
+        "@googletest//:gtest",
+    ],
+)
+
 cc_test(
     name = "unit",
     srcs = glob([
@@ -139,13 +168,7 @@ cc_test(
     ]) + [
         "tests/unit_tests.cpp",
     ],
-    copts = select({
-        "@platforms//os:windows": ["/utf-8"],
-        "//conditions:default": [
-            "-finput-charset=UTF-8",
-            "-fexec-charset=UTF-8",
-        ],
-    }),
+    copts = COMMON_COPTS,
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
@@ -159,13 +182,7 @@ cc_test(
     ]) + [
         "tests/common/test_helpers.hpp",
     ],
-    copts = select({
-        "@platforms//os:windows": ["/utf-8"],
-        "//conditions:default": [
-            "-finput-charset=UTF-8",
-            "-fexec-charset=UTF-8",
-        ],
-    }),
+    copts = COMMON_COPTS,
     tags = [
         "e2e",
     ],
