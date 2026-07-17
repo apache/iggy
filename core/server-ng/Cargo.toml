@@ -43,7 +43,6 @@ ignored = [
     "err_trail",
     "error_set",
     "figlet-rs",
-    "fs2",
     "hash32",
     "human-repr",
     "hwlocality",

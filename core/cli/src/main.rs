@@ -398,7 +398,12 @@ async fn main() -> Result<(), IggyCmdError> {
     let mut command = get_command(command, &cli_options, &iggy_args);
 
     // Create credentials based on command line arguments and command
-    let mut credentials = IggyCredentials::new(&cli_options, &iggy_args, command.login_required())?;
+    let mut credentials = IggyCredentials::new(
+        &cli_options,
+        &iggy_args,
+        command.login_required(),
+        command.prefer_explicit_credentials(),
+    )?;
 
     let encryptor = match iggy_args.encryption_key.is_empty() {
         true => None,

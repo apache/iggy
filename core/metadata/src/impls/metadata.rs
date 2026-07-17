@@ -2062,24 +2062,28 @@ where
             Operation::CreateTopicWithAssignments => {
                 let request = PersistedCreateTopicRequest::decode_from(body)
                     .expect("create topic with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                // A topic may be created with zero partitions and grown later,
+                // so there may be no consensus group to observe yet.
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create topic with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             Operation::CreatePartitionsWithAssignments => {
                 let request = PersistedCreatePartitionsRequest::decode_from(body)
                     .expect("create partitions with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create partitions with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             _ => {}
         }

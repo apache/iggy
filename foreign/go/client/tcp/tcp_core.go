@@ -59,7 +59,8 @@ type IggyTcpClient struct {
 	clientAddress          string
 	currentServerAddress   string
 	connectedAt            time.Time
-	state                  iggcon.State
+	transportState         iggcon.TransportState
+	sessionState           iggcon.SessionState
 	// respHeader is the reused response-status read buffer; guarded by c.mtx.
 	respHeader [ResponseInitialBytesLength]byte
 }
@@ -216,7 +217,8 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
-		state:                  iggcon.StateDisconnected,
+		transportState:         iggcon.TransportStateDisconnected,
+		sessionState:           iggcon.SessionStateUnauthenticated,
 		connectedAt:            time.Time{},
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
@@ -341,14 +343,14 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	switch c.state {
-	case iggcon.StateShutdown:
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
 		c.logger.Debug("Cannot send data. Client is shutdown.")
 		return nil, ierror.ErrClientShutdown
-	case iggcon.StateDisconnected:
+	case iggcon.TransportStateDisconnected:
 		c.logger.Debug("Cannot send data. Client is not connected.")
 		return nil, ierror.ErrNotConnected
-	case iggcon.StateConnecting:
+	case iggcon.TransportStateConnecting:
 		c.logger.Debug("Cannot send data. Client is still connecting.")
 		return nil, ierror.ErrNotConnected
 	}
@@ -431,10 +433,17 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	return buffer, nil
 }
 
+func (c *IggyTcpClient) setSessionState(state iggcon.SessionState) {
+	c.mtx.Lock()
+	c.sessionState = state
+	c.mtx.Unlock()
+}
+
 // invalidateConnLocked closes the connection and marks it as disconnected
 func (c *IggyTcpClient) invalidateConnLocked() {
 	_ = c.closeConnLocked()
-	c.state = iggcon.StateDisconnected
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
 }
 
 // closeConnLocked closes and drops the current connection.
@@ -459,24 +468,22 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // Connect establishes the TCP connection to the server.
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	c.mtx.Lock()
-	switch c.state {
-	case iggcon.StateShutdown:
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
 		c.mtx.Unlock()
 		c.logger.Debug("Cannot connect. Client is shutdown.")
 		return ierror.ErrClientShutdown
-	case iggcon.StateConnected,
-		iggcon.StateAuthenticating,
-		iggcon.StateAuthenticated:
+	case iggcon.TransportStateConnected:
 		clientAddress := c.clientAddress
 		c.mtx.Unlock()
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
 		return nil
-	case iggcon.StateConnecting:
+	case iggcon.TransportStateConnecting:
 		c.mtx.Unlock()
 		c.logger.Debug("Client is already connecting.")
 		return nil
 	default:
-		c.state = iggcon.StateConnecting
+		c.transportState = iggcon.TransportStateConnecting
 	}
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
@@ -551,7 +558,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			return nil
 		}); err != nil {
 		c.mtx.Lock()
-		c.state = iggcon.StateDisconnected
+		c.transportState = iggcon.TransportStateDisconnected
 		c.mtx.Unlock()
 		if !c.config.reconnection.enabled {
 			c.logger.Warn("Automatic reconnection is disabled.")
@@ -562,7 +569,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 
 	c.mtx.Lock()
 	c.conn = conn
-	c.state = iggcon.StateConnected
+	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
 	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
 	c.mtx.Unlock()
@@ -618,12 +625,14 @@ func (c *IggyTcpClient) disconnect() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateDisconnected || c.state == iggcon.StateShutdown {
+	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
 
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
-	c.state = iggcon.StateDisconnected
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
+
 	err := c.closeConnLocked()
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
@@ -635,15 +644,16 @@ func (c *IggyTcpClient) shutdown() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateShutdown {
+	if c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
 
 	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
 
 	err := c.closeConnLocked()
-	c.state = iggcon.StateShutdown
 
+	c.transportState = iggcon.TransportStateShutdown
+	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
 	// TODO push shutdown event
 	return err

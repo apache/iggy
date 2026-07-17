@@ -23,13 +23,19 @@ use iggy::prelude::{
     PolledMessages as RustPolledMessages, Stream as RustStream, StreamDetails as RustStreamDetails,
     Topic as RustTopic, TopicDetails as RustTopicDetails, Validatable,
 };
+use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails,
+    ClusterMetadata as RustClusterMetadata, ClusterNode as RustClusterNode,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
-    Stats as RustStats,
+    GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, Permissions as RustPermissions,
+    Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
 };
+use std::collections::BTreeMap;
 
 impl From<RustIdentifier> for ffi::Identifier {
     fn from(identifier: RustIdentifier) -> Self {
@@ -188,6 +194,119 @@ impl From<RustStats> for ffi::Stats {
     }
 }
 
+impl From<RustTransportEndpoints> for ffi::TransportEndpoints {
+    fn from(endpoints: RustTransportEndpoints) -> Self {
+        ffi::TransportEndpoints {
+            tcp: endpoints.tcp,
+            quic: endpoints.quic,
+            http: endpoints.http,
+            websocket: endpoints.websocket,
+        }
+    }
+}
+
+impl From<RustClusterNode> for ffi::ClusterNode {
+    fn from(node: RustClusterNode) -> Self {
+        ffi::ClusterNode {
+            name: node.name,
+            ip: node.ip,
+            endpoints: ffi::TransportEndpoints::from(node.endpoints),
+            role: node.role.to_string(),
+            status: node.status.to_string(),
+        }
+    }
+}
+
+impl From<RustClusterMetadata> for ffi::ClusterMetadata {
+    fn from(metadata: RustClusterMetadata) -> Self {
+        ffi::ClusterMetadata {
+            name: metadata.name,
+            nodes: metadata
+                .nodes
+                .into_iter()
+                .map(ffi::ClusterNode::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<ffi::GlobalPermissions> for RustGlobalPermissions {
+    fn from(permissions: ffi::GlobalPermissions) -> Self {
+        RustGlobalPermissions {
+            manage_servers: permissions.manage_servers,
+            read_servers: permissions.read_servers,
+            manage_users: permissions.manage_users,
+            read_users: permissions.read_users,
+            manage_streams: permissions.manage_streams,
+            read_streams: permissions.read_streams,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<ffi::TopicPermissions> for RustTopicPermissions {
+    fn from(permissions: ffi::TopicPermissions) -> Self {
+        RustTopicPermissions {
+            manage_topic: permissions.manage_topic,
+            read_topic: permissions.read_topic,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl TryFrom<ffi::StreamPermissions> for RustStreamPermissions {
+    type Error = String;
+
+    fn try_from(permissions: ffi::StreamPermissions) -> Result<Self, Self::Error> {
+        let mut topics = BTreeMap::new();
+        for entry in permissions.topics {
+            let topic_id = entry.topic_id as usize;
+            if topics
+                .insert(topic_id, RustTopicPermissions::from(entry.permissions))
+                .is_some()
+            {
+                return Err(format!("duplicate topic permission ID: {topic_id}"));
+            }
+        }
+        let topics = (!topics.is_empty()).then_some(topics);
+
+        Ok(RustStreamPermissions {
+            manage_stream: permissions.manage_stream,
+            read_stream: permissions.read_stream,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+            topics,
+        })
+    }
+}
+
+impl TryFrom<ffi::Permissions> for RustPermissions {
+    type Error = String;
+
+    fn try_from(permissions: ffi::Permissions) -> Result<Self, Self::Error> {
+        let mut streams = BTreeMap::new();
+        for entry in permissions.streams {
+            let stream_id = entry.stream_id as usize;
+            let stream_permissions = RustStreamPermissions::try_from(entry.permissions)?;
+            if streams.insert(stream_id, stream_permissions).is_some() {
+                return Err(format!("duplicate stream permission ID: {stream_id}"));
+            }
+        }
+        let streams = (!streams.is_empty()).then_some(streams);
+
+        Ok(RustPermissions {
+            global: RustGlobalPermissions::from(permissions.global),
+            streams,
+        })
+    }
+}
+
 impl From<RustPartition> for ffi::Partition {
     fn from(partition: RustPartition) -> Self {
         ffi::Partition {
@@ -319,6 +438,32 @@ impl From<RustIggyMessage> for ffi::IggyMessagePolled {
         let id_bytes = message.header.id.to_le_bytes();
         let id_lo = u64::from_le_bytes(id_bytes[0..8].try_into().unwrap());
         let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
+        let user_headers = match message.user_headers {
+            Some(raw_headers) => {
+                // Keep polling forward-compatible with future header kinds. Unlike the Rust SDK's
+                // typed decoder, this structural decoder preserves unknown kinds and values whose
+                // lengths do not match their fixed-width kind.
+                match WireUserHeaders::from_bytes(raw_headers) {
+                    Ok(wire_headers) => wire_headers
+                        .iter()
+                        .map(|entry| ffi::HeaderEntry {
+                            key: ffi::HeaderField {
+                                kind: entry.key_kind.0,
+                                value: entry.key.to_vec(),
+                            },
+                            value: ffi::HeaderField {
+                                kind: entry.value_kind.0,
+                                value: entry.value.to_vec(),
+                            },
+                        })
+                        .collect(),
+                    // A malformed header must not make its message or poll batch unreadable.
+                    Err(_) => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+
         ffi::IggyMessagePolled {
             checksum: message.header.checksum,
             id_lo,
@@ -330,11 +475,126 @@ impl From<RustIggyMessage> for ffi::IggyMessagePolled {
             payload_length: message.header.payload_length,
             reserved: message.header.reserved,
             payload: message.payload.to_vec(),
-            user_headers: message
-                .user_headers
-                .map(|headers| headers.to_vec())
-                .unwrap_or_default(),
+            user_headers,
         }
+    }
+}
+
+impl TryFrom<ffi::HeaderEntry> for RustHeaderEntry {
+    type Error = String;
+
+    fn try_from(entry: ffi::HeaderEntry) -> Result<Self, Self::Error> {
+        Ok(RustHeaderEntry {
+            key: decode_field(entry.key.kind, entry.key.value)?,
+            value: decode_field(entry.value.kind, entry.value.value)?,
+        })
+    }
+}
+
+fn decode_field<T>(kind: u8, value: Vec<u8>) -> Result<RustHeaderField<T>, String> {
+    let kind = RustHeaderKind::from_code(kind)
+        .map_err(|error| format!("Could not convert header field: {error}"))?;
+
+    match kind {
+        RustHeaderKind::Raw => RustHeaderField::try_from(value)
+            .map_err(|error| format!("Could not convert header field: {error}")),
+        RustHeaderKind::String => {
+            let value = String::from_utf8(value)
+                .map_err(|_| "Could not convert header field: invalid UTF-8 string".to_string())?;
+            RustHeaderField::try_from(value)
+                .map_err(|error| format!("Could not convert header field: {error}"))
+        }
+        RustHeaderKind::Bool => match value.as_slice() {
+            [0] => Ok(RustHeaderField::from(false)),
+            [1] => Ok(RustHeaderField::from(true)),
+            _ => {
+                Err("Could not convert header field: bool values must encode as 0 or 1".to_string())
+            }
+        },
+        RustHeaderKind::Int8 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i8::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int8 values require exactly 1 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int16 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i16::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int16 values require exactly 2 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Int128 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(i128::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: int128 values require exactly 16 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint8 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u8::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint8 values require exactly 1 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint16 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u16::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint16 values require exactly 2 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Uint128 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(u128::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: uint128 values require exactly 16 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Float32 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(f32::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: float32 values require exactly 4 bytes, got {}",
+                value.len()
+            )),
+        },
+        RustHeaderKind::Float64 => match value.try_into() {
+            Ok(bytes) => Ok(RustHeaderField::from(f64::from_le_bytes(bytes))),
+            Err(value) => Err(format!(
+                "Could not convert header field: float64 values require exactly 8 bytes, got {}",
+                value.len()
+            )),
+        },
     }
 }
 
@@ -342,17 +602,28 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
     type Error = String;
 
     fn try_from(message: ffi::IggyMessageToSend) -> Result<Self, Self::Error> {
-        if !message.user_headers.is_empty() {
-            return Err(
-                "Could not convert message: user_headers are not yet supported in the C++ SDK"
-                    .to_string(),
-            );
+        // TODO: Document in the C++ SDK that user headers are unordered and keys must be unique.
+        // The BTreeMap sorts entries by kind and value, discards Vec insertion order on send and
+        // poll, and rejects duplicate keys.
+        let mut user_headers = BTreeMap::new();
+        for entry in message.user_headers {
+            let header_entry = RustHeaderEntry::try_from(entry)
+                .map_err(|error| format!("Could not convert message user headers: {error}"))?;
+            if user_headers
+                .insert(header_entry.key, header_entry.value)
+                .is_some()
+            {
+                return Err(
+                    "Could not convert message user headers: duplicate header key".to_string(),
+                );
+            }
         }
         let id = ((message.id_hi as u128) << 64) | (message.id_lo as u128);
         let payload = Bytes::from(message.payload);
         RustIggyMessage::builder()
             .id(id)
             .payload(payload)
+            .maybe_user_headers((!user_headers.is_empty()).then_some(user_headers))
             .build()
             .map_err(|error| format!("Could not convert message: {error}"))
     }

@@ -52,6 +52,9 @@ TEST_F(LowLevelE2E_Stream, CreateStreamBeforeLoginThrows) {
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->create_stream(stream_name), std::exception);
 }
 
 TEST_F(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
@@ -158,6 +161,10 @@ TEST_F(LowLevelE2E_Stream, UpdateStreamBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->update_stream(make_string_identifier(stream_name), updated_stream_name),
                  std::exception);
 }
@@ -287,7 +294,8 @@ TEST_F(LowLevelE2E_Stream, UpdateStreamOnlyChangesName) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        auto message = iggy::ffi::make_message(to_payload("stream-update-preserve-" + std::to_string(i)));
+        auto message = iggy::ffi::make_message(to_payload("stream-update-preserve-" + std::to_string(i)),
+                                               rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(message));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
@@ -396,6 +404,9 @@ TEST_F(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
     ASSERT_NO_THROW(client->connect());
 
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
 }
 
 TEST_F(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
@@ -475,6 +486,9 @@ TEST_F(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
 
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 }
 
@@ -564,7 +578,8 @@ TEST_F(LowLevelE2E_Stream, GetStreamsFieldsVerification) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        auto msg = iggy::ffi::make_message(to_payload("field-verify-message-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("field-verify-message-" + std::to_string(i)),
+                                           rust::Vec<iggy::ffi::HeaderEntry>());
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -591,6 +606,9 @@ TEST_F(LowLevelE2E_Stream, GetStreamsBeforeLoginThrows) {
 
     ASSERT_THROW(client->get_streams(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_streams(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_streams(), std::exception);
 }
 
@@ -716,7 +734,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamPreservesStreamMetadata) {
     ASSERT_EQ(stream_before_purge.topics.size(), 2u);
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
-    first_topic_messages.push_back(iggy::ffi::make_message(to_payload("preserve-stream-metadata")));
+    first_topic_messages.push_back(
+        iggy::ffi::make_message(to_payload("preserve-stream-metadata"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream_before_purge.id),
                                           make_string_identifier(first_topic_name), "partition_id",
                                           partition_id_bytes(0), std::move(first_topic_messages)));
@@ -809,7 +828,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamRemovesMessagesAndPreservesTopics) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-stream-first-" + std::to_string(i))));
+        first_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-stream-first-" + std::to_string(i)),
+                                                               rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(first_topic_id), "partition_id",
@@ -817,8 +837,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamRemovesMessagesAndPreservesTopics) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> second_topic_messages;
     for (std::uint32_t i = 0; i < 2; ++i) {
-        second_topic_messages.push_back(
-            iggy::ffi::make_message(to_payload("purge-stream-second-" + std::to_string(i))));
+        second_topic_messages.push_back(iggy::ffi::make_message(to_payload("purge-stream-second-" + std::to_string(i)),
+                                                                rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                           make_numeric_identifier(second_topic_id), "partition_id",
@@ -913,7 +933,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamAcrossMultipleTopicsAndPartitionsClearsEve
         rust::Vec<iggy::ffi::IggyMessageToSend> messages;
         for (std::uint32_t i = 0; i < 2; ++i) {
             messages.push_back(iggy::ffi::make_message(
-                to_payload("purge-stream-topic-a-" + std::to_string(partition_id) + "-" + std::to_string(i))));
+                to_payload("purge-stream-topic-a-" + std::to_string(partition_id) + "-" + std::to_string(i)),
+                rust::Vec<iggy::ffi::HeaderEntry>()));
         }
         ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                               make_numeric_identifier(first_topic_id), "partition_id",
@@ -923,7 +944,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamAcrossMultipleTopicsAndPartitionsClearsEve
         rust::Vec<iggy::ffi::IggyMessageToSend> messages;
         for (std::uint32_t i = 0; i < 2; ++i) {
             messages.push_back(iggy::ffi::make_message(
-                to_payload("purge-stream-topic-b-" + std::to_string(partition_id) + "-" + std::to_string(i))));
+                to_payload("purge-stream-topic-b-" + std::to_string(partition_id) + "-" + std::to_string(i)),
+                rust::Vec<iggy::ffi::HeaderEntry>()));
         }
         ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id),
                                               make_numeric_identifier(second_topic_id), "partition_id",
@@ -961,15 +983,15 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamThenSendMessagesAgainSucceeds) {
     const std::uint32_t topic_id = created_stream.topics.front().id;
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_batch;
-    first_batch.push_back(iggy::ffi::make_message(to_payload("before-purge")));
+    first_batch.push_back(iggy::ffi::make_message(to_payload("before-purge"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(first_batch)));
 
     ASSERT_NO_THROW(client->purge_stream(make_string_identifier(stream_name)));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> second_batch;
-    second_batch.push_back(iggy::ffi::make_message(to_payload("after-purge-0")));
-    second_batch.push_back(iggy::ffi::make_message(to_payload("after-purge-1")));
+    second_batch.push_back(iggy::ffi::make_message(to_payload("after-purge-0"), rust::Vec<iggy::ffi::HeaderEntry>()));
+    second_batch.push_back(iggy::ffi::make_message(to_payload("after-purge-1"), rust::Vec<iggy::ffi::HeaderEntry>()));
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(second_batch)));
 
@@ -998,7 +1020,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamTwiceKeepsStreamEmptyAndTopicsIntact) {
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
-        messages.push_back(iggy::ffi::make_message(to_payload("purge-stream-twice-" + std::to_string(i))));
+        messages.push_back(iggy::ffi::make_message(to_payload("purge-stream-twice-" + std::to_string(i)),
+                                                   rust::Vec<iggy::ffi::HeaderEntry>()));
     }
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(created_stream.id), make_numeric_identifier(topic_id),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
@@ -1034,5 +1057,8 @@ TEST_F(LowLevelE2E_Stream, PurgeStreamBeforeLoginThrows) {
 
     ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->purge_stream(make_string_identifier(stream_name)), std::exception);
 }

@@ -150,6 +150,11 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->create_consumer_group(make_string_identifier(stream_name),
                                                                make_string_identifier(topic_name), group_name),
                  std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(unauthenticated_client->create_consumer_group(make_string_identifier(stream_name),
+                                                               make_string_identifier(topic_name), group_name),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
@@ -227,6 +232,11 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->get_consumer_groups(make_string_identifier(stream_name),
                                                              make_string_identifier(topic_name)),
                  std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(unauthenticated_client->get_consumer_groups(make_string_identifier(stream_name),
+                                                             make_string_identifier(topic_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupSucceeds) {
@@ -270,6 +280,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupBeforeLoginThrows) {
                                                              make_string_identifier(group_name)),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->join_consumer_group(make_string_identifier(stream_name),
+                                                             make_string_identifier(topic_name),
+                                                             make_string_identifier(group_name)),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->join_consumer_group(make_string_identifier(stream_name),
                                                              make_string_identifier(topic_name),
                                                              make_string_identifier(group_name)),
@@ -525,6 +541,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupBeforeLoginThrows) {
                                                               make_string_identifier(group_name)),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->leave_consumer_group(make_string_identifier(stream_name),
+                                                              make_string_identifier(topic_name),
+                                                              make_string_identifier(group_name)),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->leave_consumer_group(make_string_identifier(stream_name),
                                                               make_string_identifier(topic_name),
                                                               make_string_identifier(group_name)),
@@ -896,6 +918,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
                                                             make_string_identifier(topic_name),
                                                             make_string_identifier(group_name)),
                  std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_THROW(unauthenticated_client->get_consumer_group(make_string_identifier(stream_name),
+                                                            make_string_identifier(topic_name),
+                                                            make_string_identifier(group_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
@@ -996,6 +1024,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
                                                                make_string_identifier(group_name)),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_THROW(unauthenticated_client->delete_consumer_group(make_string_identifier(stream_name),
+                                                               make_string_identifier(topic_name),
+                                                               make_string_identifier(group_name)),
+                 std::exception);
+    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client->disconnect());
     ASSERT_THROW(unauthenticated_client->delete_consumer_group(make_string_identifier(stream_name),
                                                                make_string_identifier(topic_name),
                                                                make_string_identifier(group_name)),
