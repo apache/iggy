@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod cgroup_memory;
 pub mod clients;
 pub mod cluster;
 pub mod consumer_groups;

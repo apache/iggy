@@ -22,9 +22,21 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::SEC_IN_MICRO;
+use iggy_common::{IggyTimestamp, PersonalAccessTokenInfo};
 use tracing::{Level, event};
 
 const DEFAULT_LOGIN_SESSION_TIMEOUT: u64 = SEC_IN_MICRO * 15 * 60;
+
+/// A stored login session is dead once the server-side PAT backing it is gone
+/// or past its expiry. The server lists expired tokens until a background
+/// cleaner prunes them, so a freshly expired session is caught here rather than
+/// waiting for the token to disappear from the listing.
+fn session_pat_expired(pat: &PersonalAccessTokenInfo) -> bool {
+    match pat.expiry_at {
+        None => false,
+        Some(expiry) => expiry.as_micros() <= IggyTimestamp::now().as_micros(),
+    }
+}
 
 pub struct LoginCmd {
     server_session: ServerSession,
@@ -46,12 +58,11 @@ impl CliCommand for LoginCmd {
         "login command".to_owned()
     }
 
-    async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        if self.server_session.is_active() {
-            event!(target: PRINT_TARGET, Level::INFO, "Already logged into Iggy server {}", self.server_session.get_server_address());
-            return Ok(());
-        }
+    fn prefer_explicit_credentials(&self) -> bool {
+        true
+    }
 
+    async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let tokens = client.get_personal_access_tokens().await.with_context(|| {
             format!(
                 "Problem getting personal access tokens from server: {}",
@@ -59,13 +70,26 @@ impl CliCommand for LoginCmd {
             )
         })?;
 
-        // If local keyring is empty and server has the token for login session, then something
-        // went wrong, and we should delete the token from the server and recreate login session
-        // from scratch - token on the server and local keyring should be in sync.
-        if let Some(token) = tokens
+        let server_token = tokens
             .iter()
-            .find(|pat| pat.name == self.server_session.get_token_name())
-        {
+            .find(|pat| pat.name == self.server_session.get_token_name());
+
+        // A local keyring entry proves a token was stored once, not that it
+        // still authenticates. Report "already logged in" only when the server
+        // still holds a matching, unexpired PAT; a keyring entry left behind by
+        // an expired session is dropped so login recreates it below.
+        if self.server_session.is_active() {
+            if server_token.is_some_and(|pat| !session_pat_expired(pat)) {
+                event!(target: PRINT_TARGET, Level::INFO, "Already logged into Iggy server {}", self.server_session.get_server_address());
+                return Ok(());
+            }
+            self.server_session.delete()?;
+        }
+
+        // Local keyring is empty (or was just cleared for a dead session). If the
+        // server still has the token for the login session, delete it so token on
+        // the server and local keyring stay in sync, then recreate from scratch.
+        if let Some(token) = server_token {
             client
                 .delete_personal_access_token(&token.name)
                 .await

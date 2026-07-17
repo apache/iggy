@@ -18,6 +18,7 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Messages;
 
@@ -43,19 +44,26 @@ internal static class TcpMessageStreamHelpers
         return (status, length);
     }
 
-    internal static int CalculateMessageBytesCount(ReadOnlySpan<Message> messages)
+    internal static int CalculateMessageBytesCount(ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor)
     {
         var bytesCount = 0;
         foreach (var message in messages)
         {
-            bytesCount += 16 + 64 + message.Payload.Length;
-            if (!message.RawUserHeaders.IsEmpty)
+            var payloadLength = message.Payload.Length;
+            var headersLength = message.RawUserHeaders.IsEmpty
+                ? TcpContracts.HeadersByteLength(message.UserHeaders)
+                : message.RawUserHeaders.Length;
+
+            if (encryptor is not null)
             {
-                bytesCount += message.RawUserHeaders.Length;
-                continue;
+                payloadLength = encryptor.GetMaxEncryptedLength(payloadLength);
+                if (headersLength > 0)
+                {
+                    headersLength = encryptor.GetMaxEncryptedLength(headersLength);
+                }
             }
 
-            bytesCount += TcpContracts.HeadersByteLength(message.UserHeaders);
+            bytesCount += 16 + 64 + payloadLength + headersLength;
         }
 
         return bytesCount;

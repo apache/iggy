@@ -45,10 +45,38 @@
 //! every `create_topic`.
 //!
 //! TODO: block VSR-ification of `topics.rs` / `partitions.rs`
-//! `binary_impls` on a materialization barrier (cross-shard
-//! `MaterializedAck` from each assigned shard back to shard 0; shard 0
-//! holds the reply in `client_table` until all acks arrive). Sync-block
-//! alternative was deferred.
+//! `binary_impls` on a materialization barrier. Two changes, both
+//! required together (one without the other does not close the race):
+//!
+//! 1. **Owner becomes the sole writer of its own `shards_table` row.**
+//!    Today any non-owning shard's reconciler independently seeds an
+//!    `InsertRouted` row the moment it observes committed metadata (see
+//!    the bullet above) -- a pure hash computation, no coordination with
+//!    the owner. That is fine for routing (`calculate_shard_assignment`
+//!    is a static function of the namespace, identical on every shard,
+//!    no placement decision to propagate) but it means a row can exist
+//!    before the owner's own `build_partition_fresh` has finished.
+//!    Non-owning shards must stop writing this row ahead of the owner.
+//! 2. **Owner pushes the row to every other shard once materialised**,
+//!    instead of each shard independently guessing it. Cheap: this is a
+//!    same-node, cross-shard-core message (the existing `ReconcileOp`
+//!    inter-shard channel already carries `InsertOwned`/`ConfirmRemove`;
+//!    extend it with a push variant), not a network round trip to
+//!    another replica.
+//!
+//! With both in place, `shards_table.shard_for(ns).is_some()` on ANY
+//! shard implies the owner has already materialised the partition, so
+//! `dispatch::wait_for_partition_routable`'s second-phase `partition_read`
+//! probe (the owner-readiness check a router-side reader currently has to
+//! do by hand, since the table alone can't be trusted) becomes
+//! unnecessary; a single `shards_table` poll is a sufficient barrier for
+//! both server-ng-shard routing AND the pump/client reply. The heavier
+//! "shard 0 holds the client reply until every assigned shard acks"
+//! design was the original idea here; this is a smaller, cheaper
+//! alternative scoped to the local (same-node) table-visibility problem
+//! only, not the reply-timing one -- the create-topic reply can still
+//! ship on metadata commit as it does today, since the retry loop that
+//! consumes `shards_table` is what actually needs the invariant.
 
 use crate::bootstrap::ServerNgShard;
 use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
@@ -213,7 +241,10 @@ pub async fn run_reconciler(
 
     loop {
         let sleep = compio::time::sleep(periodic);
-        futures::select! {
+        // Biased for the same reason as the shard pump: unbiased `select!`
+        // polls arms in process-random order, which a deterministic
+        // simulator cannot seed. Listed order is the intended priority.
+        futures::select_biased! {
             _ = stop_rx.recv().fuse() => break,
             recv = wake_rx.recv().fuse() => {
                 if recv.is_err() {
@@ -243,6 +274,11 @@ struct PassCounters {
     /// Consumer-group offsets reclaimed for groups deleted while their topic
     /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
     cg_offsets_purged: usize,
+    /// Committed delete watermarks not yet fully enforced on local segments.
+    /// Counted so the pass does not arm the fast-skip: the pump can be
+    /// blocked by a consumer barrier or by a rejoin whose offsets land via
+    /// journal repair, and neither unblocking bumps `Streams::revision`.
+    trims_pending: usize,
 }
 
 impl PassCounters {
@@ -254,6 +290,7 @@ impl PassCounters {
             + self.backoff_skipped
             + self.stale
             + self.cg_offsets_purged
+            + self.trims_pending
     }
 }
 
@@ -294,7 +331,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
     reconcile_consumer_group_offsets(ctx, &mut counters).await;
-    reconcile_segment_truncations(ctx);
+    reconcile_segment_truncations(ctx, &mut counters);
     reconcile_partition_purges(ctx);
 
     let local_set: AHashSet<IggyNamespace> =
@@ -771,8 +808,14 @@ fn shards_table_contains(ctx: &ReconcilerCtx, ns: IggyNamespace) -> bool {
 /// carrying a non-zero delete watermark, stage a pump-side trim to that offset.
 /// Idempotent — the pump no-ops once a partition is trimmed past the watermark,
 /// so a redundant pass triggered by an unrelated revision bump is harmless.
-fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
-    let namespaces: Vec<_> = ctx.shard.plane.partitions().namespaces().copied().collect();
+/// A watermark whose enforcement is still incomplete (first local segment
+/// starts below it) counts as pending work: the pump may be blocked by a
+/// consumer barrier or by a rejoin whose offsets arrive via journal repair,
+/// and neither unblocking bumps `Streams::revision`, so the pass must keep
+/// the reconciler ticking until the layout converges.
+fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+    let partitions = ctx.shard.plane.partitions();
+    let namespaces: Vec<_> = partitions.namespaces().copied().collect();
     let streams = ctx.shard.plane.metadata().mux_stm.streams();
     for namespace in namespaces {
         let watermark = streams.partition_delete_watermark(
@@ -780,8 +823,16 @@ fn reconcile_segment_truncations(ctx: &ReconcilerCtx) {
             namespace.topic_id(),
             namespace.partition_id(),
         );
-        if watermark > 0 {
-            ctx.shard.request_truncate_partition(namespace, watermark);
+        if watermark == 0 {
+            continue;
+        }
+        ctx.shard.request_truncate_partition(namespace, watermark);
+        let trimmed = partitions
+            .get_by_ns(&namespace)
+            .and_then(|partition| partition.log.segments().first())
+            .is_none_or(|first| first.start_offset >= watermark);
+        if !trimmed {
+            counters.trims_pending += 1;
         }
     }
 }
@@ -1054,6 +1105,7 @@ mod tests {
                 size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
                 enforce_fsync: false,
                 segment_size: config.system.segment.size,
+                encryptor: None,
             },
         );
         let shards_table = PapayaShardsTable::new();

@@ -88,7 +88,16 @@ pub struct RecoveredMetadata<M> {
     pub mux_stm: M,
     /// `None` means no snapshot existed and no journal entries were replayed.
     /// `Some(op)` is the highest op applied, either from the snapshot or journal replay.
+    ///
+    /// Only the committed prefix is applied: an entry's `commit` header field
+    /// carries the primary's commit watermark when the prepare was sent, and
+    /// journaled does not imply committed.
     pub last_applied_op: Option<u64>,
+    /// Highest op present in the journal, `None` when it is empty. Ops in
+    /// `(last_applied_op, last_journaled_op]` are prepared-but-uncommitted:
+    /// they stay journal-only until the recovered primary re-replicates them
+    /// (or a backup sees the commit point advance past them).
+    pub last_journaled_op: Option<u64>,
 }
 
 /// Recover metadata state from disk.
@@ -104,8 +113,24 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
+/// `seed_baseline` reproduces boot-time state that never reaches the WAL
+/// (today: the locally-ensured root user). It runs on the freshly-defaulted
+/// state machine BEFORE journal replay and ONLY when no snapshot exists, so
+/// replayed ops land on the same baseline (and the same slab ids) they were
+/// originally applied over. A snapshot already contains that baseline.
+///
+/// `solo` marks a single-replica cluster: the quorum is 1/1, so every
+/// journaled op was committed the moment it was written and replay runs to
+/// the journal head. The embedded `commit` stamps cannot be used there: each
+/// stamp is the primary's commit point when the prepare was SENT, so a
+/// pipelined burst (e.g. create-stream + create-topic on one connection) is
+/// stamped entirely below its own ops and would replay as nothing.
 #[allow(clippy::future_not_send)]
-pub async fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
+pub async fn recover<M>(
+    data_dir: &Path,
+    solo: bool,
+    seed_baseline: impl FnOnce(&M),
+) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
         + GatedApply
@@ -125,9 +150,12 @@ where
         .as_ref()
         .map_or(0, |snapshot| snapshot.sequence_number() + 1);
 
-    let mux_stm = match snapshot.as_ref() {
-        Some(snapshot) => M::restore_snapshot(snapshot.snapshot())?,
-        None => M::default(),
+    let mux_stm = if let Some(snapshot) = snapshot.as_ref() {
+        M::restore_snapshot(snapshot.snapshot())?
+    } else {
+        let mux_stm = M::default();
+        seed_baseline(&mux_stm);
+        mux_stm
     };
 
     let journal_path = metadata_dir.join("journal.wal");
@@ -138,11 +166,38 @@ where
     // must repair or truncate the WAL before the node can boot again.
     let headers_to_replay = journal.iter_headers_from(replay_from);
 
+    // Committed watermark: the `commit` field of each journaled prepare is
+    // the primary's commit point when it was sent, so the highest one is the
+    // highest commit this WAL can prove. Ops above it were prepared but not
+    // provably committed; applying them here would fabricate commit knowledge
+    // (a crashed suffix may have been discarded by a view change) and would
+    // hide the suffix from re-replication. A max fold (not `.last()`) so a
+    // future non-monotone stamping change cannot silently under-apply the
+    // committed prefix.
+    let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
+    let commit_watermark = if solo {
+        headers_to_replay
+            .iter()
+            .map(|header| header.op)
+            .fold(snapshot_floor, u64::max)
+    } else {
+        headers_to_replay
+            .iter()
+            .map(|header| header.commit)
+            .fold(snapshot_floor, u64::max)
+    };
+
     let mut last_applied_op: Option<u64> = None;
+    let mut last_journaled_op: Option<u64> = None;
     for header in &headers_to_replay {
         // TODO: Check hash chain integrity against `previous_header`. On a
         // same-view break, stop replay here and mark the remaining entries for
         // repair via VSR instead of panicking.
+
+        last_journaled_op = Some(header.op);
+        if header.op > commit_watermark {
+            continue;
+        }
 
         let entry = journal.entry_at(header).await?.ok_or_else(|| {
             RecoveryError::Io(std::io::Error::new(
@@ -152,7 +207,15 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        mux_stm.gated_update(entry)?;
+        let reply = mux_stm.gated_update(entry)?;
+        tracing::debug!(
+            target: "iggy.metadata.diag",
+            op = header.op,
+            operation = ?header.operation,
+            user_id = header.user_id,
+            reply = ?reply,
+            "recovery replayed op"
+        );
         last_applied_op = Some(header.op);
     }
 
@@ -161,6 +224,7 @@ where
         snapshot,
         mux_stm,
         last_applied_op,
+        last_journaled_op,
     })
 }
 
@@ -180,6 +244,12 @@ mod tests {
     const HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
+        make_prepare_with_commit(op, op.saturating_sub(1), body_size)
+    }
+
+    /// A prepare as a live primary stamps it: `commit` carries the primary's
+    /// commit point when the prepare is sent.
+    fn make_prepare_with_commit(op: u64, commit: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
         let mut buffer = Owned::<4096>::zeroed(total_size);
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
@@ -188,6 +258,7 @@ mod tests {
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;
+        header.commit = commit;
         header.operation = Operation::CreateStream;
         Message::try_from(buffer).unwrap()
     }
@@ -195,7 +266,7 @@ mod tests {
     #[compio::test]
     async fn recover_empty_state() {
         let dir = tempdir().unwrap();
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
 
         assert_eq!(recovered.last_applied_op, None);
         assert!(recovered.journal.last_op().is_none());
@@ -212,7 +283,7 @@ mod tests {
             .persist(&metadata_dir.join("snapshot.bin"))
             .unwrap();
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         assert_eq!(
             recovered
                 .snapshot
@@ -239,10 +310,44 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         assert!(recovered.snapshot.is_none());
-        assert_eq!(recovered.last_applied_op, Some(3));
+        // Op 3's entry proves commit=2; op 3 itself is journaled but not
+        // provably committed, so it stays journal-only.
+        assert_eq!(recovered.last_applied_op, Some(2));
+        assert_eq!(recovered.last_journaled_op, Some(3));
         assert_eq!(recovered.journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn recover_applies_only_the_committed_prefix() {
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        // Ops 1-5 journaled, but the last entry proves commit only up to 3:
+        // the primary crashed before 4 and 5 reached quorum.
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for op in 1..=4u64 {
+                journal
+                    .append(make_prepare_with_commit(op, op.saturating_sub(1), 32))
+                    .await
+                    .unwrap();
+            }
+            journal
+                .append(make_prepare_with_commit(5, 3, 32))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        assert_eq!(recovered.last_applied_op, Some(3));
+        assert_eq!(recovered.last_journaled_op, Some(5));
+        assert_eq!(recovered.journal.last_op(), Some(5));
     }
 
     #[compio::test]
@@ -268,9 +373,10 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
-        // Should replay ops 6-10 (snapshot was at 5)
-        assert_eq!(recovered.last_applied_op, Some(10));
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        // Replays ops 6-9 (snapshot at 5; op 10's entry proves commit=9).
+        assert_eq!(recovered.last_applied_op, Some(9));
+        assert_eq!(recovered.last_journaled_op, Some(10));
         assert_eq!(
             recovered
                 .snapshot

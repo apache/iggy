@@ -904,11 +904,11 @@ impl TestBinary for ServerHandle {
         // Release the reservation BEFORE spawning. Production listeners
         // set `SO_REUSEPORT` in theory, but holding the reservation across
         // child startup races with `bind()` on the child side and
-        // sporadically returns `CannotBindToSocket`. The narrow TOCTOU
-        // window between `release` and the child's `bind` is bounded by
-        // process start latency and harness-controlled environment;
-        // hubcio's TODO in `socket_opts.rs` retires the whole
-        // reservation-socket dance.
+        // sporadically returns `CannotBindToSocket`. Dropping the socket lets
+        // the child bind; the per-port advisory lock the reserver keeps past
+        // this release (see `port_reserver`) still fends off any concurrent
+        // test process until the child has bound. hubcio's TODO in
+        // `socket_opts.rs` retires the whole reservation-socket dance.
         if let Some(reserver) = self.port_reserver.take() {
             reserver.release();
         }

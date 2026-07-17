@@ -16,6 +16,7 @@
 // under the License.
 
 mod api;
+mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;

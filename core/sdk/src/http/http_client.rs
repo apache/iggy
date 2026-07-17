@@ -233,30 +233,6 @@ impl HttpTransport for HttpClient {
         !token.is_empty()
     }
 
-    /// Refresh the access token using the current access token.
-    // TODO(hubcio): method `refresh_access_token` is never used
-    async fn _refresh_access_token(&self) -> Result<(), IggyError> {
-        let token = self.access_token.read().await;
-        if token.is_empty() {
-            return Err(IggyError::AccessTokenMissing);
-        }
-
-        let command = _RefreshToken {
-            token: token.to_owned(),
-        };
-        let response = self.post("/users/refresh-token", &command).await?;
-        let identity_info: IdentityInfo = response
-            .json()
-            .await
-            .map_err(|_| IggyError::InvalidJsonResponse)?;
-        if identity_info.access_token.is_none() {
-            return Err(IggyError::JwtMissing);
-        }
-
-        self.set_token_from_identity(&identity_info).await?;
-        Ok(())
-    }
-
     /// Set the access token.
     async fn set_access_token(&self, token: Option<String>) {
         let mut current_token = self.access_token.write().await;
@@ -321,6 +297,46 @@ impl HttpClient {
         ))
     }
 
+    /// Present the stored access token to `POST /users/refresh-token`, then
+    /// swap it for the reissued one. Returns the new identity so the caller can
+    /// schedule the next refresh from `IdentityInfo.access_token.expiry`
+    /// (unix seconds). Scheduling is the caller's job: no auto-refresh or
+    /// retry-on-401 happens anywhere in the request path.
+    ///
+    /// Server semantics differ and the caller must account for it:
+    /// - Legacy server: one-shot. The presented token is revoked as it is
+    ///   consumed, so a concurrent in-flight request still carrying the old
+    ///   token may fail with 401.
+    /// - server-ng: stateless. The old token stays valid until its natural
+    ///   expiry; refreshing never revokes it.
+    pub async fn refresh_access_token(&self) -> Result<IdentityInfo, IggyError> {
+        // Release the read guard before `set_token_from_identity` takes the
+        // write guard on the same lock, otherwise the reissue self-deadlocks.
+        let current_token = {
+            let token = self.access_token.read().await;
+            if token.is_empty() {
+                return Err(IggyError::AccessTokenMissing);
+            }
+            token.to_owned()
+        };
+
+        let response = self
+            .post(
+                "/users/refresh-token",
+                &RefreshToken {
+                    token: current_token,
+                },
+            )
+            .await?;
+        let identity_info: IdentityInfo = response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)?;
+
+        self.set_token_from_identity(&identity_info).await?;
+        Ok(identity_info)
+    }
+
     async fn handle_response(response: Response) -> Result<Response, IggyError> {
         let status = response.status();
         match status.is_success() {
@@ -357,12 +373,11 @@ impl HttpClient {
 }
 
 #[derive(Debug, Serialize)]
-struct _RefreshToken {
+struct RefreshToken {
     token: String,
 }
 
 /// Unit tests for HttpClient.
-/// Currently only tests for "from_connection_string()" are implemented.
 /// TODO: Add complete unit tests for HttpClient.
 #[cfg(test)]
 mod tests {

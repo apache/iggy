@@ -17,7 +17,6 @@
 
 using System.Buffers;
 using System.Diagnostics;
-using Apache.Iggy.Encryption;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
@@ -35,8 +34,7 @@ public class SendUnitTests
     {
         var messages = new[]
         {
-            new Message(Guid.NewGuid(), new byte[] { 1 }),
-            new Message(Guid.NewGuid(), new byte[] { 2, 3 })
+            new Message(Guid.NewGuid(), new byte[] { 1 }), new Message(Guid.NewGuid(), new byte[] { 2, 3 })
         };
         var unit = new ReadyUnit(messages, null);
 
@@ -64,7 +62,7 @@ public class SendUnitTests
     [Fact]
     public void TypedUnit_ReadyBytes_IsZero_BecauseBytesComeFromPayloadBuffer()
     {
-        var unit = TypedUnit<byte[]>.Batch([new byte[10]], new PassthroughSerializer(), null);
+        TypedUnit<byte[]> unit = TypedUnit<byte[]>.Batch([new byte[10]], new PassthroughSerializer());
 
         Assert.Equal(0, unit.ReadyBytes);
     }
@@ -81,7 +79,7 @@ public class SendUnitTests
     public void TypedUnit_ExposesOriginalValuesAsDroppedValues()
     {
         var payloads = new[] { new byte[] { 1 }, new byte[] { 2, 3 } };
-        var unit = TypedUnit<byte[]>.Batch(payloads, new PassthroughSerializer(), null);
+        TypedUnit<byte[]> unit = TypedUnit<byte[]>.Batch(payloads, new PassthroughSerializer());
 
         Assert.Equal(payloads.Cast<object?>().ToArray(), unit.DroppedValues);
     }
@@ -111,7 +109,7 @@ public class SendUnitTests
     public void TypedUnit_Batch_SerializesIntoPayloadBuffer_AndSlicesInOrder()
     {
         var payloads = new[] { new byte[] { 1, 2 }, new byte[] { 3, 4, 5 }, new byte[] { 6 } };
-        var unit = TypedUnit<byte[]>.Batch(payloads, new PassthroughSerializer(), null);
+        TypedUnit<byte[]> unit = TypedUnit<byte[]>.Batch(payloads, new PassthroughSerializer());
 
         using var payloadBuffer = new PooledBufferWriter(2);
         unit.Serialize(payloadBuffer);
@@ -129,7 +127,7 @@ public class SendUnitTests
     public void TypedUnit_Single_PreservesIdAndHeaders()
     {
         var id = Guid.NewGuid().ToUInt128();
-        var unit = TypedUnit<byte[]>.Single(new byte[] { 9, 9 }, id, null, new PassthroughSerializer(), null);
+        TypedUnit<byte[]> unit = TypedUnit<byte[]>.Single(new byte[] { 9, 9 }, id, null, new PassthroughSerializer());
 
         Assert.Equal(1, unit.Count);
 
@@ -143,25 +141,11 @@ public class SendUnitTests
     }
 
     [Fact]
-    public void TypedUnit_WithEncryptor_EncryptsAtFlush()
-    {
-        var unit = TypedUnit<byte[]>.Single(new byte[] { 1, 2, 3 }, Guid.NewGuid().ToUInt128(), null,
-            new PassthroughSerializer(), new XorEncryptor());
-
-        using var payloadBuffer = new PooledBufferWriter();
-        unit.Serialize(payloadBuffer);
-        var wire = new List<Message>();
-        unit.AppendWire(wire, payloadBuffer.Written);
-
-        Assert.Equal(new byte[] { 1 ^ 0xFF, 2 ^ 0xFF, 3 ^ 0xFF }, wire[0].Payload.ToArray());
-    }
-
-    [Fact]
     public async Task Processor_SendsUnitWhole_AndDisposesOwnerOnce()
     {
         var sentCounts = new List<int>();
-        var client = MockClient(sentCounts);
-        var config = BackgroundConfig(batchSize: 10);
+        Mock<IIggyClient> client = MockClient(sentCounts);
+        var config = BackgroundConfig(10);
 
         await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
         processor.Start();
@@ -185,9 +169,9 @@ public class SendUnitTests
     public async Task Processor_FlushesOnByteLimit_BeforeCountLimit()
     {
         var sentCounts = new List<int>();
-        var client = MockClient(sentCounts);
+        Mock<IIggyClient> client = MockClient(sentCounts);
         // 100-byte messages, 250-byte cap => at most 3 messages per flush; the count limit never trips.
-        var config = BackgroundConfig(batchSize: 1000);
+        var config = BackgroundConfig(1000);
         config.BackgroundMaxBatchBytes = 250;
 
         await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
@@ -195,8 +179,8 @@ public class SendUnitTests
         // Enqueue before Start so the first flush drains the full backlog in cap-sized chunks deterministically.
         for (var i = 0; i < 10; i++)
         {
-            await processor.EnqueueAsync(
-                new ReadyUnit([new Message(Guid.NewGuid(), new byte[100])], null), CancellationToken.None);
+            await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[100])], null),
+                CancellationToken.None);
         }
 
         processor.Start();
@@ -209,14 +193,14 @@ public class SendUnitTests
     [Fact]
     public async Task Processor_Dispose_DisposesQueuedOwners()
     {
-        var client = MockClient(new List<int>());
-        var config = BackgroundConfig(batchSize: 10);
+        Mock<IIggyClient> client = MockClient(new List<int>());
+        var config = BackgroundConfig(10);
 
         var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
 
         var owner = new TrackingDisposable();
-        await processor.EnqueueAsync(
-            new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], owner), CancellationToken.None);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], owner),
+            CancellationToken.None);
 
         await processor.DisposeAsync();
 
@@ -232,13 +216,13 @@ public class SendUnitTests
         client.Setup(c => c.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
                 It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
             .Returns(gate.Task);
-        var config = BackgroundConfig(batchSize: 10);
+        var config = BackgroundConfig(10);
 
         await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
         processor.Start();
 
-        await processor.EnqueueAsync(
-            new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null), CancellationToken.None);
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            CancellationToken.None);
 
         var drain = processor.WaitForDrainAsync(CancellationToken.None);
 
@@ -260,16 +244,19 @@ public class SendUnitTests
         return client;
     }
 
-    private static IggyPublisherConfig BackgroundConfig(int batchSize) => new()
+    private static IggyPublisherConfig BackgroundConfig(int batchSize)
     {
-        StreamId = Identifier.Numeric(1),
-        TopicId = Identifier.Numeric(1),
-        BackgroundBatchSize = batchSize,
-        BackgroundQueueCapacity = 1000,
-        BackgroundFlushInterval = TimeSpan.FromMilliseconds(10),
-        BackgroundDisposalTimeout = TimeSpan.FromSeconds(5),
-        EnableRetry = false
-    };
+        return new IggyPublisherConfig
+        {
+            StreamId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(1),
+            BackgroundBatchSize = batchSize,
+            BackgroundQueueCapacity = 1000,
+            BackgroundFlushInterval = TimeSpan.FromMilliseconds(10),
+            BackgroundDisposalTimeout = TimeSpan.FromSeconds(5),
+            EnableRetry = false
+        };
+    }
 
     private static async Task WaitUntil(Func<bool> condition)
     {
@@ -289,7 +276,10 @@ public class SendUnitTests
     {
         public int DisposeCount { get; private set; }
 
-        public void Dispose() => DisposeCount++;
+        public void Dispose()
+        {
+            DisposeCount++;
+        }
     }
 
     private sealed class PassthroughSerializer : ISerializer<byte[]>
@@ -299,21 +289,5 @@ public class SendUnitTests
             data.CopyTo(writer.GetSpan(data.Length));
             writer.Advance(data.Length);
         }
-    }
-
-    private sealed class XorEncryptor : IMessageEncryptor
-    {
-        public byte[] Encrypt(ReadOnlySpan<byte> plainData)
-        {
-            var result = plainData.ToArray();
-            for (var i = 0; i < result.Length; i++)
-            {
-                result[i] ^= 0xFF;
-            }
-
-            return result;
-        }
-
-        public byte[] Decrypt(ReadOnlySpan<byte> encryptedData) => Encrypt(encryptedData);
     }
 }

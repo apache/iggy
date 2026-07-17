@@ -509,9 +509,13 @@ mod tests {
         header.base_offset = 41;
         header.base_timestamp = 999_999;
 
-        let body =
-            build_polled_messages_body(3, 42, fragment_from_stored_batch(&header, &stored.blob))
-                .expect("re-encodes wire body");
+        let body = build_polled_messages_body(
+            3,
+            42,
+            fragment_from_stored_batch(&header, &stored.blob),
+            None,
+        )
+        .expect("re-encodes wire body");
         let polled = PolledMessages::from_bytes(body).expect("decodes as the SDK does");
 
         assert_eq!(polled.partition_id, 3);

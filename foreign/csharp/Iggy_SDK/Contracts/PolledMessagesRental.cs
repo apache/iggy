@@ -25,6 +25,7 @@ namespace Apache.Iggy.Contracts;
 public sealed class PolledMessagesRental : IDisposable
 {
     private readonly IMemoryOwner<byte> _owner;
+    private readonly IMemoryOwner<byte>? _plaintextOwner;
     private int _disposed;
 
     /// <summary>
@@ -43,16 +44,21 @@ public sealed class PolledMessagesRental : IDisposable
     public required IReadOnlyList<RentedMessageResponse> Messages { get; init; }
 
     /// <summary>
-    ///    Initializes a new instance of the <see cref="PolledMessagesRental" /> class with the specified memory owner.
+    ///     Initializes a new instance of the <see cref="PolledMessagesRental" /> class with the specified memory owner.
     /// </summary>
-    /// <param name="owner"></param>
-    public PolledMessagesRental(IMemoryOwner<byte> owner)
+    /// <param name="owner">Owner of the wire buffer the message slices view into.</param>
+    /// <param name="plaintextOwner">
+    ///     Owner of the buffer holding decrypted payloads/headers when an encryptor is configured; null otherwise.
+    ///     Tied to the same disposal so decrypted slices stay valid for exactly the rental's lifetime.
+    /// </param>
+    public PolledMessagesRental(IMemoryOwner<byte> owner, IMemoryOwner<byte>? plaintextOwner = null)
     {
         _owner = owner;
+        _plaintextOwner = plaintextOwner;
     }
 
     /// <summary>
-    ///     Disposes the rental and returns the underlying buffer to the pool.
+    ///     Disposes the rental and returns the underlying buffers to the pool.
     /// </summary>
     public void Dispose()
     {
@@ -61,6 +67,7 @@ public sealed class PolledMessagesRental : IDisposable
             return;
         }
 
+        _plaintextOwner?.Dispose();
         _owner.Dispose();
     }
 }

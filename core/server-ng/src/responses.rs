@@ -23,12 +23,13 @@
 //! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
 //! resolvers.
 
-use crate::bootstrap::ServerNgShard;
+use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::{BufMut, Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
@@ -77,7 +78,8 @@ use iggy_binary_protocol::{
     Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{Identifier, IggyError, IggyTimestamp, MaxTopicSize};
+use iggy_common::{EncryptorKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
@@ -85,19 +87,27 @@ use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
+use sysinfo::System as SysinfoSystem;
+use system_stats::SystemProbe;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
-pub(crate) fn build_get_personal_access_tokens_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-) -> GetPersonalAccessTokensResponse {
+) -> GetPersonalAccessTokensResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     // PATs are per-user; list the requesting connection's own tokens, resolved
     // from this shard's `SessionManager` (like `get_me`) then read out of the
     // replicated Users STM.
@@ -123,11 +133,17 @@ pub(crate) fn build_get_personal_access_tokens_response(
     })
 }
 
-pub(crate) fn build_get_me_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_get_me_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-) -> ClientDetailsResponse {
+) -> ClientDetailsResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let mut client = sessions
         .borrow()
         .client_record(transport_client_id)
@@ -191,10 +207,16 @@ pub(crate) fn build_get_me_response(
 /// `consumer_groups_count` is resolved from the connection's bound VSR client
 /// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
 /// transport id). Connections that never bound (pre-register) count 0.
-pub(crate) fn connected_client_to_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn connected_client_to_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     info: &ConnectedClientInfo,
-) -> ClientResponse {
+) -> ClientResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let consumer_groups_count = info.vsr_client_id.map_or(0, |vsr_client_id| {
         #[allow(clippy::cast_possible_truncation)]
         let count = shard
@@ -222,14 +244,20 @@ pub(crate) fn connected_client_to_response(
 /// touch the offset of a partition it currently owns. `Ok` for individual
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
 /// stale client re-syncs instead of corrupting the shared group offset.
-fn fence_group_offset(
-    shard: &Rc<ServerNgShard>,
+fn fence_group_offset<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
     client_id: u128,
-) -> Result<(), IggyError> {
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     if consumer.kind != KIND_CONSUMER_GROUP {
         return Ok(());
     }
@@ -259,14 +287,20 @@ fn fence_group_offset(
 
 /// Fence a consumer-group offset op then resolve its target partition
 /// namespace. Shared by the four `Store`/`Delete` consumer-offset arms.
-fn fence_and_resolve_offset_namespace(
-    shard: &Rc<ServerNgShard>,
+fn fence_and_resolve_offset_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     consumer: &WireConsumer,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
     client_id: u128,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     fence_group_offset(
         shard,
         consumer,
@@ -278,12 +312,18 @@ fn fence_and_resolve_offset_namespace(
     resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
-pub(crate) fn resolve_partition_request_namespace(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn resolve_partition_request_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     operation: Operation,
     body: &[u8],
     client_id: u128,
-) -> Result<u64, IggyError> {
+) -> Result<u64, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let namespace = match operation {
         Operation::SendMessages => {
             if body.len() < 4 {
@@ -364,10 +404,16 @@ pub(crate) fn resolve_partition_request_namespace(
     Ok(namespace.inner())
 }
 
-fn resolve_send_messages_namespace(
-    shard: &Rc<ServerNgShard>,
+fn resolve_send_messages_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     header: &SendMessagesHeader,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let partition_id = match &header.partitioning {
         WirePartitioning::PartitionId(partition_id) => *partition_id,
         WirePartitioning::Balanced => shard
@@ -393,12 +439,18 @@ fn resolve_send_messages_namespace(
     )
 }
 
-pub(crate) fn resolve_partition_namespace(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn resolve_partition_namespace<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
-) -> Result<IggyNamespace, IggyError> {
+) -> Result<IggyNamespace, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
     shard
         .plane
@@ -412,13 +464,19 @@ pub(crate) fn resolve_partition_namespace(
 /// `user_id` is the authenticated caller, used only by the identity-scoped
 /// reads (currently the PAT list); every other arm ignores it. Authorization
 /// stays with the per-transport gates that run before this builder.
-pub(crate) fn build_non_replicated_response(
-    shard: &Rc<ServerNgShard>,
+pub(crate) fn build_non_replicated_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
     roster: &ClusterRoster,
-) -> Result<NonReplicatedResponse, IggyError> {
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     match code {
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard).to_bytes(),
@@ -536,16 +594,33 @@ pub(crate) fn build_non_replicated_response(
 /// The leader marking comes from this shard's consensus view; a shard without
 /// consensus (any shard but 0) still serves the full roster, only with no node
 /// marked leader.
-fn build_cluster_metadata_response(
+fn build_cluster_metadata_response<B, MJ, S>(
     roster: &ClusterRoster,
-    shard: &Rc<ServerNgShard>,
-) -> ClusterMetadataResponse {
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> ClusterMetadataResponse
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
+    // Shard 0 reads its live consensus; delegated shards use the view shard 0
+    // publishes into the roster, so leader marking works on every shard.
     let primary_index = shard
         .plane
         .metadata()
         .consensus
         .as_ref()
-        .map(|consensus| consensus.primary_index(consensus.view()));
+        .and_then(|consensus| {
+            let primary_index = consensus.primary_index(consensus.view());
+            // A restarted replica that ceded the primaryship its stale view
+            // assigns it must not advertise itself as leader: clients would
+            // pin to a node that never heartbeats. Report "no leader" until
+            // the election resolves the role.
+            (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
+                .then_some(primary_index)
+        })
+        .or_else(|| roster.current_primary_index());
     let metadata = roster.cluster_metadata(primary_index);
     ClusterMetadataResponse {
         name: metadata.name,
@@ -566,7 +641,15 @@ fn build_cluster_metadata_response(
     }
 }
 
-fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
+fn build_stats_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<StatsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let (
         streams_count,
         topics_count,
@@ -619,6 +702,15 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
     )?;
 
     let system = probe_system_stats();
+    // Disk usage of the volume holding iggy data. The data directory is
+    // captured process-globally at bootstrap (the shard doesn't carry server
+    // config on the read path); absent that, or on a probe error, report 0.
+    let (free_disk_space, total_disk_space) = STATS_DATA_PATH.get().map_or((0, 0), |path| {
+        (
+            fs2::available_space(path).unwrap_or(0),
+            fs2::total_space(path).unwrap_or(0),
+        )
+    });
     Ok(StatsResponse {
         process_id: system.process_id,
         cpu_usage: system.cpu_usage,
@@ -651,11 +743,8 @@ fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, Iggy
         iggy_server_semver: crate::SEMANTIC_VERSION.get_numeric_version().ok(),
         cache_metrics: Vec::new(),
         threads_count: system.threads_count,
-        // Disk space needs the configured data directory (legacy reads
-        // `config.system.path`); the shard doesn't expose server config on the
-        // read path, so report 0 rather than probe an unrelated mount.
-        free_disk_space: 0,
-        total_disk_space: 0,
+        free_disk_space,
+        total_disk_space,
     })
 }
 
@@ -715,58 +804,58 @@ impl HostIdentity {
 
 static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 
-fn probe_system_stats() -> SystemStats {
-    let process_id = std::process::id();
-    let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
-    SYSINFO.with_borrow_mut(|slot| {
-        let sys = slot.get_or_insert_with(SysinfoSystem::new_all);
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(process_id)]), true);
+/// Configured data directory, captured once at bootstrap so the sync stats
+/// read path can report disk usage of the volume that holds iggy data rather
+/// than an unrelated mount. Unset (disk stats fall back to 0) until bootstrap.
+static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-        let mut stats = SystemStats {
-            process_id,
-            cpu_usage: 0.0,
-            total_cpu_usage: sys.global_cpu_usage(),
-            memory_usage: 0,
-            total_memory: sys.total_memory(),
-            available_memory: sys.available_memory(),
-            run_time: 0,
-            start_time: 0,
-            read_bytes: 0,
-            written_bytes: 0,
-            threads_count: 0,
-            hostname: host.hostname.clone(),
-            os_name: host.os_name.clone(),
-            os_version: host.os_version.clone(),
-            kernel_version: host.kernel_version.clone(),
-        };
-
-        if let Some(process) = sys.process(Pid::from_u32(process_id)) {
-            stats.cpu_usage = process.cpu_usage();
-            stats.memory_usage = process.memory();
-            // sysinfo reports whole seconds; the wire fields are micros (the
-            // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
-            // micro-based).
-            stats.run_time = process.run_time().saturating_mul(1_000_000);
-            stats.start_time = process.start_time().saturating_mul(1_000_000);
-            let disk_usage = process.disk_usage();
-            stats.read_bytes = disk_usage.total_read_bytes;
-            stats.written_bytes = disk_usage.total_written_bytes;
-            stats.threads_count = process
-                .tasks()
-                .map_or(0, |tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX));
-        }
-
-        stats
-    })
+/// Capture the configured data directory for `GetStats` disk reporting.
+/// Idempotent: only the first call (process bootstrap) takes effect.
+pub(crate) fn init_stats_data_path(path: PathBuf) {
+    let _ = STATS_DATA_PATH.set(path);
 }
 
-fn build_get_stream_response(
-    shard: &Rc<ServerNgShard>,
+fn probe_system_stats() -> SystemStats {
+    let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
+    let probe = SYSINFO.with_borrow_mut(|slot| {
+        let sys = slot.get_or_insert_with(SysinfoSystem::new);
+        SystemProbe::capture(sys)
+    });
+
+    SystemStats {
+        process_id: probe.process_id,
+        cpu_usage: probe.cpu_usage,
+        total_cpu_usage: probe.total_cpu_usage,
+        memory_usage: probe.memory_usage,
+        total_memory: probe.total_memory,
+        available_memory: probe.available_memory,
+        // sysinfo reports whole seconds; the wire fields are micros (the
+        // SDK decodes them via `IggyDuration` / `IggyTimestamp::from`, both
+        // micro-based).
+        run_time: probe.run_time_secs.saturating_mul(1_000_000),
+        start_time: probe.start_time_secs.saturating_mul(1_000_000),
+        read_bytes: probe.read_bytes,
+        written_bytes: probe.written_bytes,
+        threads_count: probe.threads_count,
+        hostname: host.hostname.clone(),
+        os_name: host.os_name.clone(),
+        os_version: host.os_version.clone(),
+        kernel_version: host.kernel_version.clone(),
+    }
+}
+
+fn build_get_stream_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
-) -> Result<Option<GetStreamResponse>, IggyError> {
+) -> Result<Option<GetStreamResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -780,13 +869,23 @@ fn build_get_stream_response(
             topics: stream
                 .topics
                 .iter()
-                .map(|(_, topic)| topic_header(topic, default_max_topic_size))
+                .map(|(_, topic)| {
+                    topic_header(topic, default_max_topic_size, default_message_expiry)
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         }))
     })
 }
 
-fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsResponse, IggyError> {
+fn build_get_streams_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<GetStreamsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         streams
             .items
@@ -807,7 +906,15 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
     })
 }
 
-fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersResponse, IggyError> {
+fn build_get_users_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
+) -> Result<GetUsersResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.users().read(|users| {
         users
             .items
@@ -818,10 +925,16 @@ fn build_get_users_response(shard: &Rc<ServerNgShard>) -> Result<GetUsersRespons
     })
 }
 
-fn build_get_user_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_user_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     user_id: &WireIdentifier,
-) -> Result<Option<UserDetailsResponse>, IggyError> {
+) -> Result<Option<UserDetailsResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.users().read(|users| {
         let resolved = match user_id {
             WireIdentifier::Numeric(id) => {
@@ -861,12 +974,19 @@ fn personal_access_tokens_response(
     Ok(GetPersonalAccessTokensResponse { tokens })
 }
 
-fn build_get_topic_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_topic_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
-) -> Result<Option<GetTopicResponse>, IggyError> {
+) -> Result<Option<GetTopicResponse>, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
             return Ok(None);
@@ -883,7 +1003,7 @@ fn build_get_topic_response(
             .get(topic_id)
             .ok_or(IggyError::InvalidIdentifier)?;
         Ok(Some(GetTopicResponse {
-            topic: topic_header(topic, default_max_topic_size)?,
+            topic: topic_header(topic, default_max_topic_size, default_message_expiry)?,
             partitions: topic
                 .partitions
                 .iter()
@@ -893,11 +1013,18 @@ fn build_get_topic_response(
     })
 }
 
-fn build_get_topics_response(
-    shard: &Rc<ServerNgShard>,
+fn build_get_topics_response<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
-) -> Result<GetTopicsResponse, IggyError> {
+) -> Result<GetTopicsResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     let default_max_topic_size = shard.plane.metadata().default_max_topic_size();
+    let default_message_expiry = shard.plane.metadata().default_message_expiry();
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
             resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
@@ -908,7 +1035,7 @@ fn build_get_topics_response(
         stream
             .topics
             .iter()
-            .map(|(_, topic)| topic_header(topic, default_max_topic_size))
+            .map(|(_, topic)| topic_header(topic, default_max_topic_size, default_message_expiry))
             .collect::<Result<Vec<_>, _>>()
             .map(|topics| GetTopicsResponse { topics })
     })
@@ -917,11 +1044,17 @@ fn build_get_topics_response(
 /// Reject a consumer-group read whose parent stream/topic is absent with the
 /// legacy typed error naming the level that missed; the group itself missing
 /// stays the shared not-found reply (empty over TCP, 404 over HTTP).
-fn ensure_topic_exists(
-    shard: &Rc<ServerNgShard>,
+fn ensure_topic_exists<B, MJ, S>(
+    shard: &Rc<ShellShard<B, MJ, S>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
-) -> Result<(), IggyError> {
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard.plane.metadata().mux_stm.streams().read(|streams| {
         let resolved_stream =
             resolve_stream_id(streams, stream_id).ok_or_else(|| stream_not_found(stream_id))?;
@@ -1010,15 +1143,31 @@ fn resolve_max_topic_size(max_topic_size: MaxTopicSize, default_bytes: u64) -> u
     }
 }
 
+/// Resolve a topic's stored [`IggyExpiry`] to the wire micros value, mapping the
+/// `ServerDefault` sentinel to this node's configured default. Mirrors
+/// [`resolve_max_topic_size`]: replicated apply stores the sentinel verbatim so
+/// commit stays config-independent across a cluster, and the per-node default is
+/// applied here on read. Primary admission stamps the same default before
+/// replication, so this only bites topics whose stored expiry predates that
+/// stamping (older snapshot / WAL data). Explicit durations and never-expire pass
+/// through.
+fn resolve_message_expiry(message_expiry: IggyExpiry, default_micros: u64) -> u64 {
+    match message_expiry {
+        IggyExpiry::ServerDefault => default_micros,
+        resolved => u64::from(resolved),
+    }
+}
+
 fn topic_header(
     topic: &metadata::stm::stream::Topic,
     default_max_topic_size: u64,
+    default_message_expiry: u64,
 ) -> Result<StreamTopicHeader, IggyError> {
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
         partitions_count: usize_to_u32(topic.partitions.len())?,
-        message_expiry: u64::from(topic.message_expiry),
+        message_expiry: resolve_message_expiry(topic.message_expiry, default_message_expiry),
         compression_algorithm: topic.compression_algorithm.as_code(),
         max_topic_size: resolve_max_topic_size(topic.max_topic_size, default_max_topic_size),
         replication_factor: topic.replication_factor,
@@ -1265,7 +1414,13 @@ pub(crate) fn build_reply_with_body(
     reply
 }
 
-pub(crate) fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
+pub(crate) fn current_metadata_commit<B, MJ, S>(shard: &Rc<ShellShard<B, MJ, S>>) -> u64
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+{
     shard
         .plane
         .metadata()
@@ -1296,6 +1451,7 @@ pub(crate) fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
     fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
     // Body head: [partition_id:4][current_offset:8][count:4]. `count` sits at
     // COUNT_OFFSET and is backpatched once the walk below knows it.
@@ -1363,20 +1519,56 @@ pub(crate) fn build_polled_messages_body(
             body.extend_from_slice(&offset.to_le_bytes());
             body.extend_from_slice(&timestamp.to_le_bytes());
             body.extend_from_slice(&origin_timestamp.to_le_bytes());
-            body.extend_from_slice(
-                &u32::try_from(user_headers_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(
-                &u32::try_from(payload_length)
-                    .expect("length came from u32")
-                    .to_le_bytes(),
-            );
-            body.extend_from_slice(&0u64.to_le_bytes()); // reserved
-            // Stored sections are already in legacy order
-            // (`[payload][user_headers]`): copy through contiguously.
-            body.extend_from_slice(&stream[sections_start..sections_end]);
+            if let Some(encryptor) = encryptor {
+                // At-rest encryption: stored sections are ciphertext (encrypted
+                // once at ingestion, replicated verbatim); this reply is the
+                // single decrypt point, so lengths are rewritten to the
+                // plaintext sizes. The stored per-message checksum still covers
+                // the ciphertext and is passed through untouched (the SDK does
+                // not re-validate it against the reply layout).
+                let payload_end = sections_start + payload_length;
+                let payload = encryptor
+                    .decrypt(&stream[sections_start..payload_end])
+                    .map_err(|_| IggyError::CannotDecryptData)?;
+                let user_headers = if user_headers_length > 0 {
+                    Some(
+                        encryptor
+                            .decrypt(&stream[payload_end..sections_end])
+                            .map_err(|_| IggyError::CannotDecryptData)?,
+                    )
+                } else {
+                    None
+                };
+                let user_headers_bytes: &[u8] = user_headers.as_deref().unwrap_or_default();
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_bytes.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload.len())
+                        .map_err(|_| IggyError::InvalidCommand)?
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                body.extend_from_slice(&payload);
+                body.extend_from_slice(user_headers_bytes);
+            } else {
+                body.extend_from_slice(
+                    &u32::try_from(user_headers_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(
+                    &u32::try_from(payload_length)
+                        .expect("length came from u32")
+                        .to_le_bytes(),
+                );
+                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
+                // Stored sections are already in legacy order
+                // (`[payload][user_headers]`): copy through contiguously.
+                body.extend_from_slice(&stream[sections_start..sections_end]);
+            }
 
             count += 1;
             cursor = sections_end;
@@ -1518,19 +1710,22 @@ mod tests {
     }
 
     #[test]
-    fn topic_header_resolves_server_default_and_passes_explicit_sizes_through() {
-        use iggy_common::{CompressionAlgorithm, IggyExpiry, StreamStats, TopicStats};
+    fn topic_header_resolves_server_default_and_passes_explicit_values_through() {
+        use iggy_common::{
+            CompressionAlgorithm, IggyDuration, IggyExpiry, StreamStats, TopicStats,
+        };
         use std::sync::atomic::AtomicUsize;
 
         const NODE_DEFAULT: u64 = 4 * 1024 * 1024 * 1024;
+        const EXPIRY_DEFAULT_MICROS: u64 = 3_600_000_000;
 
         let parent = Arc::new(StreamStats::default());
-        let topic_with = |max_topic_size| metadata::stm::stream::Topic {
+        let topic_with = |max_topic_size, message_expiry| metadata::stm::stream::Topic {
             id: 0,
             name: Arc::from("topic"),
             created_at: IggyTimestamp::from(1u64),
             replication_factor: 1,
-            message_expiry: IggyExpiry::NeverExpire,
+            message_expiry,
             compression_algorithm: CompressionAlgorithm::None,
             max_topic_size,
             stats: Arc::new(TopicStats::new(parent.clone())),
@@ -1542,17 +1737,36 @@ mod tests {
         };
 
         // ServerDefault (0 on the wire) resolves to this node's configured
-        // default, not the raw 0 the pre-fix read path echoed.
-        let resolved = topic_header(&topic_with(MaxTopicSize::ServerDefault), NODE_DEFAULT)
-            .expect("topic header builds");
+        // default for both size and expiry, not the raw 0 the pre-fix read path
+        // echoed.
+        let resolved = topic_header(
+            &topic_with(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(resolved.max_topic_size, NODE_DEFAULT);
+        assert_eq!(resolved.message_expiry, EXPIRY_DEFAULT_MICROS);
 
-        // Explicit sizes round-trip unchanged, independent of the node default.
-        let custom = topic_header(&topic_with(MaxTopicSize::from(1024u64)), NODE_DEFAULT)
-            .expect("topic header builds");
+        // Explicit values round-trip unchanged, independent of the node default.
+        let custom = topic_header(
+            &topic_with(
+                MaxTopicSize::from(1024u64),
+                IggyExpiry::ExpireDuration(IggyDuration::from(5_000_000u64)),
+            ),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(custom.max_topic_size, 1024);
-        let unlimited = topic_header(&topic_with(MaxTopicSize::Unlimited), NODE_DEFAULT)
-            .expect("topic header builds");
+        assert_eq!(custom.message_expiry, 5_000_000);
+        let unlimited = topic_header(
+            &topic_with(MaxTopicSize::Unlimited, IggyExpiry::NeverExpire),
+            NODE_DEFAULT,
+            EXPIRY_DEFAULT_MICROS,
+        )
+        .expect("topic header builds");
         assert_eq!(unlimited.max_topic_size, u64::MAX);
+        assert_eq!(unlimited.message_expiry, u64::MAX);
     }
 }

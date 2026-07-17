@@ -69,8 +69,7 @@ public class IggyPublisher<T> : IggyPublisher
 
         if (BackgroundProcessor != null)
         {
-            await BackgroundProcessor.EnqueueAsync(
-                TypedUnit<T>.Single(data, id, userHeaders, _serializer, Config.MessageEncryptor), ct);
+            await BackgroundProcessor.EnqueueAsync(TypedUnit<T>.Single(data, id, userHeaders, _serializer), ct);
             return;
         }
 
@@ -79,11 +78,6 @@ public class IggyPublisher<T> : IggyPublisher
         {
             _serializer.Serialize(data, writer);
             var message = new Message(id, writer.Written, userHeaders);
-            if (Config.MessageEncryptor != null)
-            {
-                PublisherEncryption.Encrypt(message, Config.MessageEncryptor);
-            }
-
             await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, message, ct);
         }
         finally
@@ -103,7 +97,7 @@ public class IggyPublisher<T> : IggyPublisher
 
         if (BackgroundProcessor != null)
         {
-            TypedUnit<T> unit = TypedUnit<T>.Batch(data, _serializer, Config.MessageEncryptor);
+            TypedUnit<T> unit = TypedUnit<T>.Batch(data, _serializer);
             if (unit.Count > 0)
             {
                 await BackgroundProcessor.EnqueueAsync(unit, ct);
@@ -135,7 +129,7 @@ public class IggyPublisher<T> : IggyPublisher
 
         if (BackgroundProcessor != null)
         {
-            TypedUnit<T> unit = TypedUnit<T>.Batch(items, _serializer, Config.MessageEncryptor);
+            TypedUnit<T> unit = TypedUnit<T>.Batch(items, _serializer);
             if (unit.Count > 0)
             {
                 await BackgroundProcessor.EnqueueAsync(unit, ct);
@@ -164,13 +158,6 @@ public class IggyPublisher<T> : IggyPublisher
             if (messages.Count == 0)
             {
                 return;
-            }
-
-            if (Config.MessageEncryptor != null)
-            {
-                // Payloads are fresh arrays after encryption, so return the rented buffer now instead of holding plaintext through the send.
-                PublisherEncryption.EncryptAll(messages, Config.MessageEncryptor);
-                batch.Dispose();
             }
 
             await Client.SendMessagesAsync(Config.StreamId, Config.TopicId, Config.Partitioning, messages, ct);

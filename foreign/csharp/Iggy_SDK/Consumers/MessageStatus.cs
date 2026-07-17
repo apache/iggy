@@ -18,22 +18,21 @@
 namespace Apache.Iggy.Consumers;
 
 /// <summary>
-/// Represents the status of a received message
+///     Represents the status of a received message
 /// </summary>
 public enum MessageStatus
 {
     /// <summary>
-    /// Message was successfully received and processed
+    ///     Message was successfully received and processed
     /// </summary>
-    Success,
+    Success = 0,
 
     /// <summary>
-    /// Message decryption failed
+    ///     Message deserialization failed
     /// </summary>
-    DecryptionFailed,
-
-    /// <summary>
-    /// Message deserialization failed
-    /// </summary>
-    DeserializationFailed
+    /// <remarks>
+    ///     Value 1 was DecryptionFailed (removed; decryption failure now throws MessageDecryptionException).
+    ///     Kept at 2 so persisted or compiled-in numeric values stay stable.
+    /// </remarks>
+    DeserializationFailed = 2
 }

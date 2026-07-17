@@ -534,8 +534,30 @@ impl WebSocketClient {
 
     async fn check_and_maybe_redirect(&self) -> Result<bool, IggyError> {
         match &self.config.auto_login {
+            // Leadership still matters without auto-login: the caller signs in
+            // manually, and a login against a non-leader replays for its whole
+            // read timeout. `GetClusterMetadata` is sessionless and pre-auth on
+            // server-ng, so the check works on the unauthenticated connection.
+            // vsr-only: the legacy server auth-gates cluster metadata, so this
+            // check would bounce `Unauthenticated` into the reconnect path and
+            // recurse back into `connect`.
+            #[cfg(feature = "vsr")]
+            AutoLogin::Disabled => self.handle_leader_redirection().await,
+            #[cfg(not(feature = "vsr"))]
             AutoLogin::Disabled => Ok(false),
             AutoLogin::Enabled(_) => {
+                // Check leadership BEFORE signing in: register/login are
+                // consensus ops a backup answers with a transient frame, so
+                // signing in against a non-leader replays for the whole read
+                // timeout instead of failing over. `GetClusterMetadata` is
+                // sessionless and pre-auth on server-ng. vsr-only: the legacy
+                // server auth-gates cluster metadata, so this pre-login check
+                // would bounce `Unauthenticated` into the reconnect path and
+                // recurse back into `connect`.
+                #[cfg(feature = "vsr")]
+                if self.handle_leader_redirection().await? {
+                    return Ok(true);
+                }
                 self.auto_login().await?;
                 self.handle_leader_redirection().await
             }
@@ -752,7 +774,7 @@ impl WebSocketClient {
                     // Server could not commit yet but answered with a complete
                     // frame; the lockstep stream is in sync, so replay the same
                     // request id on this connection after a short pause.
-                    Err(IggyError::TransientNotCommitted)
+                    Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
                         if tokio::time::Instant::now() < retry_deadline =>
                     {
                         let remaining =
