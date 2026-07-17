@@ -236,7 +236,7 @@ class TestConnectivity:
             result = client.login_user(username, password)
             await result
 
-        if expected_exception is IggyError:
+        if isinstance(exc_info.value, IggyError):
             assert exc_info.value.name == expected_iggy_error_name
             assert exc_info.value.code == expected_iggy_error_code
             assert exc_info.value.message == expected_error_message

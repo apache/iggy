@@ -20,6 +20,8 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
+/// A Python class representing the Rust's IggyError.
+/// Allows transparent representation of Iggy-specific errors.
 #[gen_stub_pyclass]
 #[pyclass(skip_from_py_object, extends=PyException)]
 #[derive(Clone, Debug)]
