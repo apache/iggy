@@ -620,20 +620,12 @@ impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
         }
         let id = ((message.id_hi as u128) << 64) | (message.id_lo as u128);
         let payload = Bytes::from(message.payload);
-        if user_headers.is_empty() {
-            RustIggyMessage::builder()
-                .id(id)
-                .payload(payload)
-                .build()
-                .map_err(|error| format!("Could not convert message: {error}"))
-        } else {
-            RustIggyMessage::builder()
-                .id(id)
-                .payload(payload)
-                .user_headers(user_headers)
-                .build()
-                .map_err(|error| format!("Could not convert message: {error}"))
-        }
+        RustIggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .maybe_user_headers((!user_headers.is_empty()).then_some(user_headers))
+            .build()
+            .map_err(|error| format!("Could not convert message: {error}"))
     }
 }
 
