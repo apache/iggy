@@ -36,13 +36,14 @@
 class LowLevelE2E_Client : public E2ETestFixture {};
 
 TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
-    RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
+    RecordProperty("description",
+                   "Connects and returns matching login information using binary connection string formats.");
+    constexpr std::uint32_t root_user_id   = 0;
     const std::string username             = "iggy";
     const std::string password             = "iggy";
     const std::string connection_strings[] = {
         "iggy://iggy:iggy@127.0.0.1:8090",
         "iggy+tcp://iggy:iggy@127.0.0.1:8090",
-        "iggy+http://iggy:iggy@127.0.0.1:3000",
         "",
     };
 
@@ -53,9 +54,37 @@ TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
         ASSERT_NE(client, nullptr);
         TrackClient(client);
 
+        iggy::ffi::LoginInfo login_info{};
+        iggy::ffi::ClientInfoDetails me{};
         ASSERT_NO_THROW(client->connect());
-        ASSERT_NO_THROW(client->login_user(username, password));
+        ASSERT_NO_THROW({ login_info = client->login_user(username, password); });
+        ASSERT_NO_THROW({ me = client->get_me(); });
+
+        EXPECT_EQ(login_info.user_id, root_user_id);
+        EXPECT_TRUE(me.has_user_id);
+        EXPECT_EQ(login_info.user_id, me.user_id);
+        EXPECT_FALSE(login_info.has_access_token);
+        EXPECT_TRUE(static_cast<std::string>(login_info.access_token).empty());
+        EXPECT_EQ(login_info.access_token_expiry, 0u);
     }
+}
+
+TEST_F(LowLevelE2E_Client, HttpLoginReturnsAccessToken) {
+    RecordProperty("description", "Returns root user information and an access token after HTTP login.");
+    constexpr std::uint32_t root_user_id = 0;
+    iggy::ffi::Client *client            = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy+http://iggy:iggy@127.0.0.1:3000"); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    iggy::ffi::LoginInfo login_info{};
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW({ login_info = client->login_user("iggy", "iggy"); });
+
+    EXPECT_EQ(login_info.user_id, root_user_id);
+    EXPECT_TRUE(login_info.has_access_token);
+    EXPECT_FALSE(static_cast<std::string>(login_info.access_token).empty());
+    EXPECT_NE(login_info.access_token_expiry, 0u);
 }
 
 TEST_F(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
@@ -113,21 +142,26 @@ TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
 }
 
 TEST_F(LowLevelE2E_Client, ReloginOnSameClientAfterLogout) {
-    RecordProperty("description", "Allows reauthenticating on the same connected client after a successful logout.");
+    RecordProperty("description", "Returns the same user identity when reauthenticating after a successful logout.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
+    iggy::ffi::LoginInfo first_login{};
+    iggy::ffi::LoginInfo second_login{};
     iggy::ffi::ClientInfoDetails first_me{};
     iggy::ffi::ClientInfoDetails second_me{};
     ASSERT_NO_THROW(client->connect());
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ first_login = client->login_user("iggy", "iggy"); });
     ASSERT_NO_THROW({ first_me = client->get_me(); });
     ASSERT_NO_THROW(client->logout_user());
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ second_login = client->login_user("iggy", "iggy"); });
     ASSERT_NO_THROW({ second_me = client->get_me(); });
 
+    EXPECT_EQ(first_login.user_id, first_me.user_id);
+    EXPECT_EQ(second_login.user_id, second_me.user_id);
+    EXPECT_EQ(second_login.user_id, first_login.user_id);
     EXPECT_EQ(second_me.client_id, first_me.client_id);
     EXPECT_EQ(second_me.user_id, first_me.user_id);
 }

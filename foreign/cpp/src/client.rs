@@ -26,6 +26,7 @@ use iggy::prelude::{
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
     SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
     SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
+    UserStatus as RustUserStatus,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -97,13 +98,14 @@ pub fn new_connection(connection_string: String) -> Result<*mut Client, String> 
 }
 
 impl Client {
-    pub fn login_user(&self, username: String, password: String) -> Result<(), String> {
+    pub fn login_user(&self, username: String, password: String) -> Result<ffi::LoginInfo, String> {
         RUNTIME.block_on(async {
-            self.inner
+            let identity = self
+                .inner
                 .login_user(&username, &password)
                 .await
                 .map_err(|error| format!("Could not login user '{username}': {error}"))?;
-            Ok(())
+            Ok(ffi::LoginInfo::from(identity))
         })
     }
 
@@ -1082,6 +1084,84 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get cluster metadata: {error}"))?;
             Ok(ffi::ClusterMetadata::from(metadata))
+        })
+    }
+
+    pub fn get_user(&self, user_id: ffi::Identifier) -> Result<ffi::UserInfoDetails, String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not get user: invalid user identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let user = self
+                .inner
+                .get_user(&rust_user_id)
+                .await
+                .map_err(|error| format!("Could not get user '{rust_user_id}': {error}"))?;
+            ffi::UserInfoDetails::try_from(user)
+                .map_err(|error| format!("Could not get user '{rust_user_id}': {error}"))
+        })
+    }
+
+    pub fn get_users(&self) -> Result<Vec<ffi::UserInfo>, String> {
+        RUNTIME.block_on(async {
+            let users = self
+                .inner
+                .get_users()
+                .await
+                .map_err(|error| format!("Could not get users: {error}"))?;
+            Ok(users.into_iter().map(ffi::UserInfo::from).collect())
+        })
+    }
+
+    pub fn create_user(
+        &self,
+        username: String,
+        password: String,
+        status: u8,
+    ) -> Result<ffi::UserInfoDetails, String> {
+        let rust_status = RustUserStatus::from_code(status)
+            .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+
+        RUNTIME.block_on(async {
+            let user = self
+                .inner
+                .create_user(&username, &password, rust_status, None)
+                .await
+                .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+            Ok(ffi::UserInfoDetails::from(user))
+        })
+    }
+
+    pub fn delete_user(&self, user_id: ffi::Identifier) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not delete user: invalid user identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_user(&rust_user_id)
+                .await
+                .map_err(|error| format!("Could not delete user '{rust_user_id}': {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn update_user(
+        &self,
+        user_id: ffi::Identifier,
+        username: String,
+        status: u8,
+    ) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
+        let rust_status = RustUserStatus::from_code(status)
+            .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .update_user(&rust_user_id, Some(&username), Some(rust_status))
+                .await
+                .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+            Ok(())
         })
     }
 

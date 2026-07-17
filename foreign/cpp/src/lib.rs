@@ -316,6 +316,29 @@ mod ffi {
         streams: Vec<StreamPermissionEntry>,
     }
 
+    struct UserInfo {
+        id: u32,
+        created_at: u64,
+        status: u8,
+        username: String,
+    }
+
+    struct UserInfoDetails {
+        id: u32,
+        created_at: u64,
+        status: u8,
+        username: String,
+        has_permissions: bool,
+        permissions: Permissions,
+    }
+
+    struct LoginInfo {
+        user_id: u32,
+        has_access_token: bool,
+        access_token: String,
+        access_token_expiry: u64,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
@@ -323,7 +346,7 @@ mod ffi {
 
         // Client functions
         fn new_connection(connection_string: String) -> Result<*mut Client>;
-        fn login_user(self: &Client, username: String, password: String) -> Result<()>;
+        fn login_user(self: &Client, username: String, password: String) -> Result<LoginInfo>;
         fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
@@ -493,11 +516,21 @@ mod ffi {
             partition_id: u32,
             segments_count: u32,
         ) -> Result<()>;
-        // fn get_user(self: &Client, user_id: Identifier) -> Result<()>;
-        // fn get_users(self: &Client) -> Result<()>;
-        // fn create_user(self: &Client, username: String, password: String, status: u8) -> Result<()>;
-        // fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
-        // fn update_user(self: &Client, user_id: Identifier, username: String, status: u8) -> Result<()>;
+        fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
+        fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        fn create_user(
+            self: &Client,
+            username: String,
+            password: String,
+            status: u8,
+        ) -> Result<UserInfoDetails>;
+        fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
+        fn update_user(
+            self: &Client,
+            user_id: Identifier,
+            username: String,
+            status: u8,
+        ) -> Result<()>;
         fn update_permissions(
             self: &Client,
             user_id: Identifier,

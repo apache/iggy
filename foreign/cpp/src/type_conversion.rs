@@ -31,9 +31,10 @@ use iggy_common::{
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
-    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, Permissions as RustPermissions,
-    Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
+    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails,
 };
 use std::collections::BTreeMap;
 
@@ -121,6 +122,59 @@ impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
         match client {
             Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
             None => Err("client not found".to_string()),
+        }
+    }
+}
+
+impl From<RustIdentityInfo> for ffi::LoginInfo {
+    fn from(identity: RustIdentityInfo) -> Self {
+        let has_access_token = identity.access_token.is_some();
+        let (access_token, access_token_expiry) = identity
+            .access_token
+            .map(|token| (token.token, token.expiry))
+            .unwrap_or_default();
+
+        ffi::LoginInfo {
+            user_id: identity.user_id,
+            has_access_token,
+            access_token,
+            access_token_expiry,
+        }
+    }
+}
+
+impl From<RustUserInfo> for ffi::UserInfo {
+    fn from(user: RustUserInfo) -> Self {
+        ffi::UserInfo {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: user.status.as_code(),
+            username: user.username,
+        }
+    }
+}
+
+impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
+    fn from(user: RustUserInfoDetails) -> Self {
+        let has_permissions = user.permissions.is_some();
+        ffi::UserInfoDetails {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: user.status.as_code(),
+            username: user.username,
+            has_permissions,
+            permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
+        }
+    }
+}
+
+impl TryFrom<Option<RustUserInfoDetails>> for ffi::UserInfoDetails {
+    type Error = String;
+
+    fn try_from(user: Option<RustUserInfoDetails>) -> Result<Self, Self::Error> {
+        match user {
+            Some(user) => Ok(ffi::UserInfoDetails::from(user)),
+            None => Err("user not found".to_string()),
         }
     }
 }
@@ -225,6 +279,73 @@ impl From<RustClusterMetadata> for ffi::ClusterMetadata {
                 .nodes
                 .into_iter()
                 .map(ffi::ClusterNode::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RustGlobalPermissions> for ffi::GlobalPermissions {
+    fn from(permissions: RustGlobalPermissions) -> Self {
+        ffi::GlobalPermissions {
+            manage_servers: permissions.manage_servers,
+            read_servers: permissions.read_servers,
+            manage_users: permissions.manage_users,
+            read_users: permissions.read_users,
+            manage_streams: permissions.manage_streams,
+            read_streams: permissions.read_streams,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustTopicPermissions> for ffi::TopicPermissions {
+    fn from(permissions: RustTopicPermissions) -> Self {
+        ffi::TopicPermissions {
+            manage_topic: permissions.manage_topic,
+            read_topic: permissions.read_topic,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustStreamPermissions> for ffi::StreamPermissions {
+    fn from(permissions: RustStreamPermissions) -> Self {
+        ffi::StreamPermissions {
+            manage_stream: permissions.manage_stream,
+            read_stream: permissions.read_stream,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+            topics: permissions
+                .topics
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(topic_id, permissions)| ffi::TopicPermissionEntry {
+                    topic_id: topic_id as u32,
+                    permissions: ffi::TopicPermissions::from(permissions),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RustPermissions> for ffi::Permissions {
+    fn from(permissions: RustPermissions) -> Self {
+        ffi::Permissions {
+            global: ffi::GlobalPermissions::from(permissions.global),
+            streams: permissions
+                .streams
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(stream_id, permissions)| ffi::StreamPermissionEntry {
+                    stream_id: stream_id as u32,
+                    permissions: ffi::StreamPermissions::from(permissions),
+                })
                 .collect(),
         }
     }
