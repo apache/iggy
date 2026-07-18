@@ -358,8 +358,8 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
         void run() throws Exception;
     }
 
-    private static void retryOnTransientNotFound(
-            ThrowingRunnable action, Duration timeout, Duration backoff) throws Exception {
+    private static void retryOnTransientNotFound(ThrowingRunnable action, Duration timeout, Duration backoff)
+            throws Exception {
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
         Throwable last = null;
 
@@ -380,8 +380,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
             }
         }
 
-        throw new AssertionError(
-                "Timed out waiting for stable consumer-group state after transient not-found", last);
+        throw new AssertionError("Timed out waiting for stable consumer-group state after transient not-found", last);
     }
 
     private void awaitMembersCount(ConsumerId groupId, int expectedCount) throws Exception {
