@@ -1048,20 +1048,26 @@ class TestUpdateTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=stream_name, topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info.value.code == 2010
+        assert exc_info.value.name == "topic_id_not_found"
 
     @pytest.mark.asyncio
     async def test_update_topic_in_nonexistent_stream_fails(
         self, iggy_client: IggyClient, unique_name
     ):
         """Test update_topic raises when the stream does not exist."""
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info.value.code == 1009
+        assert exc_info.value.name == "stream_id_not_found"
 
     @pytest.mark.asyncio
     async def test_update_topic_to_existing_name_fails(
@@ -1080,10 +1086,13 @@ class TestUpdateTopic:
             stream=stream_name, name=second_topic, partitions_count=1
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=stream_name, topic_id=second_topic, name=first_topic
             )
+
+        assert exc_info.value.code == 2013
+        assert exc_info.value.name == "topic_name_already_exists"
 
     @pytest.mark.asyncio
     async def test_update_topic_requires_connection_and_auth(self, unique_name):
@@ -1092,16 +1101,22 @@ class TestUpdateTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_before_conn:
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
 
+        assert exc_info_before_conn.value.code == 8
+        assert exc_info_before_conn.value.name == "disconnected"
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_after_conn:
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info_after_conn.value.code == 40
+        assert exc_info_after_conn.value.name == "unauthenticated"
 
 
 class TestDeleteTopic:

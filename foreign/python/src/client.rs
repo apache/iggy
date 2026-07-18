@@ -341,7 +341,7 @@ impl IggyClient {
                     max_size,
                 )
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyIggyError::new_err_from_rust)?;
             Ok(())
         })
     }
@@ -543,7 +543,7 @@ impl IggyClient {
             inner
                 .delete_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyIggyError::new_err_from_rust)?;
             Ok(())
         })
     }
@@ -581,7 +581,7 @@ impl IggyClient {
             inner
                 .join_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyIggyError::new_err_from_rust)?;
             Ok(())
         })
     }
@@ -621,7 +621,7 @@ impl IggyClient {
             inner
                 .leave_consumer_group(&stream_id, &topic_id, &group_id)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(PyIggyError::new_err_from_rust)?;
             Ok(())
         })
     }

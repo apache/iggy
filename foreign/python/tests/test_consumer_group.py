@@ -573,12 +573,15 @@ class TestDeleteConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.delete_consumer_group(
                 stream_name,
                 topic_name,
                 unique_name(),
             )
+
+        assert exc_info.value.code == 5000
+        assert exc_info.value.name == "consumer_group_id_not_found"
 
     @pytest.mark.asyncio
     async def test_delete_consumer_group_removes_live_member(
@@ -696,12 +699,15 @@ class TestJoinConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.join_consumer_group(
                 stream_name,
                 topic_name,
                 unique_name(),
             )
+
+        assert exc_info.value.code == 5000
+        assert exc_info.value.name == "consumer_group_id_not_found"
 
 
 class TestLeaveConsumerGroup:
@@ -786,10 +792,12 @@ class TestLeaveConsumerGroup:
 
         await iggy_client.leave_consumer_group(stream_name, topic_name, group_name)
         with pytest.raises(
-            RuntimeError,
-            match="Consumer group member with client ID:",
-        ):
+            IggyError,
+        ) as exc_info:
             await iggy_client.leave_consumer_group(stream_name, topic_name, group_name)
+
+        assert exc_info.value.code == 5006
+        assert exc_info.value.name == "consumer_group_member_not_found"
 
     @pytest.mark.asyncio
     async def test_leave_nonexistent_consumer_group_fails(
@@ -806,12 +814,15 @@ class TestLeaveConsumerGroup:
             partitions_count=1,
         )
 
-        with pytest.raises(RuntimeError, match="Consumer group with ID:"):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.leave_consumer_group(
                 stream_name,
                 topic_name,
                 unique_name(),
             )
+
+        assert exc_info.value.code == 5000
+        assert exc_info.value.name == "consumer_group_id_not_found"
 
 
 @pytest.mark.parametrize(
@@ -834,12 +845,18 @@ async def test_consumer_group_lifecycle_requires_connection_and_auth(
     method = getattr(client, method_name)
     identifiers = (unique_name(), unique_name(), unique_name())
 
-    with pytest.raises(RuntimeError, match="Disconnected"):
+    with pytest.raises(IggyError) as exc_info_before_conn:
         await method(*identifiers)
 
+    assert exc_info_before_conn.value.code == 8
+    assert exc_info_before_conn.value.name == "disconnected"
+
     await client.connect()
-    with pytest.raises(RuntimeError, match="Unauthenticated"):
+    with pytest.raises(IggyError) as exc_info_after_conn:
         await method(*identifiers)
+
+    assert exc_info_after_conn.value.code == 40
+    assert exc_info_after_conn.value.name == "unauthenticated"
 
 
 class TestConsumerGroup:
