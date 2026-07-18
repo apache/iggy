@@ -49,6 +49,7 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Stream",
     "StreamDetails",
     "StreamPermissions",
     "TcpConfig",
@@ -1055,6 +1056,56 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
+<<<<<<< HEAD
+=======
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
+    def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
+        r"""
+        Gets all streams.
+        Returns a list of streams or a PyRuntimeError on failure.
+        """
+    def update_stream(
+        self, stream_id: builtins.str | builtins.int, name: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Updates a stream's name by id.
+        Returns Ok(()) on successful update or a PyRuntimeError on failure.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes a stream by id.
+        Returns Ok(()) on successful deletion or a PyRuntimeError on failure.
+        """
+    def purge_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Purges all messages from a stream by id.
+        Returns Ok(()) on successful purge or a PyRuntimeError on failure.
+        """
+>>>>>>> 2567de371 (feat(python): add stream listing, update, delete, and purge)
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -1835,6 +1886,16 @@ class SendMessagesResponse:
         memory, not once it is fsynced. A crash-restart can stamp a later batch
         with an offset a client has already recorded.
         """
+
+class Stream:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def topics_count(self) -> builtins.int: ...
 
 @typing.final
 class StreamDetails:
