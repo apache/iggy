@@ -270,13 +270,22 @@ runs:
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
         # decode_validation_tests need gitignored wire fixtures. Generate when
-        # iggy-gateway-kafka is in the DAG test scope (rust-gateway job or parent
-        # rust job — both run gateway tests when gateways/** changes).
+        # iggy-gateway-kafka is in the DAG test scope, or (on a full-workspace run)
+        # when gateways/** changed vs origin/master — avoid building kafka-message-gen
+        # / kafka-protocol when the gateway was not touched.
         NEEDS_KAFKA_FIXTURES=false
-        if [[ -z "$NEXTEST_FILTER" ]]; then
+        if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
           NEEDS_KAFKA_FIXTURES=true
-        elif grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
-          NEEDS_KAFKA_FIXTURES=true
+        elif [[ -z "$NEXTEST_FILTER" ]]; then
+          if git diff --name-only origin/master...HEAD 2>/dev/null | grep -qE '^gateways/'; then
+            NEEDS_KAFKA_FIXTURES=true
+          elif ! git rev-parse --verify origin/master >/dev/null 2>&1; then
+            # Base ref unavailable: full suite still runs gateway tests — generate safely.
+            NEEDS_KAFKA_FIXTURES=true
+            echo "::notice::origin/master unavailable; generating Kafka fixtures for full suite"
+          else
+            echo "::notice::Skipping Kafka wire fixtures (full suite, gateways/** unchanged)"
+          fi
         fi
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
           ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
