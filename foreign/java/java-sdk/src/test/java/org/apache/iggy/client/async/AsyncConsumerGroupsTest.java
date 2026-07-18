@@ -35,6 +35,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.math.BigInteger;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -62,6 +63,8 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
     private static final String TEST_STREAM = "async-cg-test-stream-" + UUID.randomUUID();
     private static final String TEST_TOPIC = "async-cg-test-topic";
     private static final int TIMEOUT_SECONDS = 5;
+    private static final Duration TRANSIENT_RETRY_TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration TRANSIENT_RETRY_BACKOFF = Duration.ofMillis(75);
 
     private static final StreamId STREAM_ID = StreamId.of(TEST_STREAM);
     private static final TopicId TOPIC_ID = TopicId.of(TEST_TOPIC);
@@ -324,35 +327,80 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — join concurrently
-            CompletableFuture.allOf(
-                            client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
-                            secondClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
-                            thirdClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
-                    .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS);
-
-            // then
-            ConsumerGroupDetails afterJoin = client.consumerGroups()
-                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    .get();
-            assertThat(afterJoin.membersCount()).isEqualTo(3);
+            retryOnTransientNotFound(
+                    () -> CompletableFuture.allOf(
+                                    client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
+                                    secondClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
+                                    thirdClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
+                            .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS),
+                    TRANSIENT_RETRY_TIMEOUT,
+                    TRANSIENT_RETRY_BACKOFF);
+            awaitMembersCount(groupId, 3);
 
             // when — leave concurrently
-            CompletableFuture.allOf(
-                            client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
-                            secondClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
-                            thirdClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
-                    .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS);
-
-            // then
-            ConsumerGroupDetails afterLeave = client.consumerGroups()
-                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    .get();
-            assertThat(afterLeave.membersCount()).isEqualTo(0);
+            retryOnTransientNotFound(
+                    () -> CompletableFuture.allOf(
+                                    client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
+                                    secondClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
+                                    thirdClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
+                            .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS),
+                    TRANSIENT_RETRY_TIMEOUT,
+                    TRANSIENT_RETRY_BACKOFF);
+            awaitMembersCount(groupId, 0);
         } finally {
             secondClient.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             thirdClient.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    private static void retryOnTransientNotFound(
+            ThrowingRunnable action, Duration timeout, Duration backoff) throws Exception {
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        Throwable last = null;
+
+        while (System.nanoTime() < deadlineNanos) {
+            try {
+                action.run();
+                return;
+            } catch (ExecutionException exception) {
+                if (exception.getCause() instanceof IggyResourceNotFoundException) {
+                    last = exception.getCause();
+                    Thread.sleep(backoff.toMillis());
+                    continue;
+                }
+                throw exception;
+            } catch (IggyResourceNotFoundException exception) {
+                last = exception;
+                Thread.sleep(backoff.toMillis());
+            }
+        }
+
+        throw new AssertionError(
+                "Timed out waiting for stable consumer-group state after transient not-found", last);
+    }
+
+    private void awaitMembersCount(ConsumerId groupId, int expectedCount) throws Exception {
+        long deadlineNanos = System.nanoTime() + TRANSIENT_RETRY_TIMEOUT.toNanos();
+
+        while (System.nanoTime() < deadlineNanos) {
+            Optional<ConsumerGroupDetails> group = client.consumerGroups()
+                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (group.isPresent() && group.get().membersCount() == expectedCount) {
+                return;
+            }
+            Thread.sleep(TRANSIENT_RETRY_BACKOFF.toMillis());
+        }
+
+        ConsumerGroupDetails group = client.consumerGroups()
+                .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .orElseThrow();
+        assertThat(group.membersCount()).isEqualTo(expectedCount);
     }
 }
