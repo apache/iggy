@@ -25,6 +25,7 @@ using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Publishers;
+using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -40,36 +41,35 @@ public class HeaderEncryptionIntegrationTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithEncryptedHeaders_Should_NotBeReadableWithoutDecryptor(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
+        var encryptor = CreateEncryptor();
+
+        // Publisher on an encrypting client; a plain client raw-polls the same topic to prove the wire bytes
+        // stay encrypted.
+        var encryptingClient = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient(encryptor: encryptor)
+            : await Fixture.CreateHttpClient(encryptor: encryptor);
+        var plainClient = protocol == Protocol.Tcp
             ? await Fixture.CreateTcpClient()
             : await Fixture.CreateHttpClient();
 
-        var encryptor = CreateEncryptor();
-        var testStream = await CreateTestStream(client, protocol);
+        var testStream = await CreateTestStream(plainClient, protocol);
         var streamId = Identifier.String(testStream.StreamId);
         var topicId = Identifier.String(testStream.TopicId);
 
-        // Send message with encrypted headers via publisher
         var publisher = IggyPublisherBuilder
-            .Create(client, streamId, topicId)
+            .Create(encryptingClient, streamId, topicId)
             .WithPartitioning(Partitioning.PartitionId(0))
-            .WithEncryptor(encryptor)
             .Build();
 
         await publisher.InitAsync();
 
-        var headers = CreateTestHeaders();
-        var messages = new List<Message>
-        {
-            new(Guid.NewGuid(), Encoding.UTF8.GetBytes("encrypted payload"), headers)
-        };
+        Dictionary<HeaderKey, HeaderValue> headers = CreateTestHeaders();
+        var messages = new List<Message> { new(Guid.NewGuid(), Encoding.UTF8.GetBytes("encrypted payload"), headers) };
 
         await publisher.SendMessagesAsync(messages);
         await publisher.DisposeAsync();
 
-        // Poll with a normal client (no decryptor)
-        var polled = await client.PollMessagesAsync(
-            streamId, topicId, 0,
+        var polled = await plainClient.PollMessagesAsync(streamId, topicId, 0,
             Consumer.New(0),
             PollingStrategy.Next(),
             1, false);
@@ -85,12 +85,12 @@ public class HeaderEncryptionIntegrationTests
         msg.RawUserHeaders!.Length.ShouldBeGreaterThan(0);
 
         // Manually decrypt and verify payload
-        var decryptedPayload = encryptor.Decrypt(msg.Payload);
+        var decryptedPayload = encryptor.DecryptToArray(msg.Payload);
         Encoding.UTF8.GetString(decryptedPayload).ShouldBe("encrypted payload");
 
         // Manually decrypt and verify headers
-        var decryptedHeaderBytesResult = encryptor.Decrypt(msg.RawUserHeaders);
-        var decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytesResult);
+        var decryptedHeaderBytesResult = encryptor.DecryptToArray(msg.RawUserHeaders);
+        Dictionary<HeaderKey, HeaderValue> decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytesResult);
         decryptedHeaders.Count.ShouldBe(3);
 
         var typeHeader = decryptedHeaders[new HeaderKey { Kind = HeaderKind.String, Value = "type"u8.ToArray() }];
@@ -99,13 +99,15 @@ public class HeaderEncryptionIntegrationTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveAsync_WithDecryptor_Should_DecryptHeadersCorrectly(Protocol protocol)
+    public async Task ReceiveAsync_WithEncryptingClient_Should_DecryptHeadersCorrectly(Protocol protocol)
     {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
-
         var encryptor = CreateEncryptor();
+
+        // One encrypting client serves both publisher and consumer: it encrypts on send and decrypts on poll.
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient(encryptor: encryptor)
+            : await Fixture.CreateHttpClient(encryptor: encryptor);
+
         var testStream = await CreateTestStream(client, protocol);
         var streamId = Identifier.String(testStream.StreamId);
         var topicId = Identifier.String(testStream.TopicId);
@@ -114,12 +116,11 @@ public class HeaderEncryptionIntegrationTests
         var publisher = IggyPublisherBuilder
             .Create(client, streamId, topicId)
             .WithPartitioning(Partitioning.PartitionId(0))
-            .WithEncryptor(encryptor)
             .Build();
 
         await publisher.InitAsync();
 
-        var headers = CreateTestHeaders();
+        Dictionary<HeaderKey, HeaderValue> headers = CreateTestHeaders();
         var messages = new List<Message>
         {
             new(Guid.NewGuid(), Encoding.UTF8.GetBytes("consumer test payload"), headers)
@@ -128,14 +129,13 @@ public class HeaderEncryptionIntegrationTests
         await publisher.SendMessagesAsync(messages);
         await publisher.DisposeAsync();
 
-        // Poll with IggyConsumer that has decryptor configured
+        // Consumer on the same encrypting client decrypts transparently.
         var consumer = IggyConsumerBuilder
             .Create(client, streamId, topicId, Consumer.New(1))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(1)
             .WithPartitionId(0)
             .WithAutoCommitMode(AutoCommitMode.Disabled)
-            .WithDecryptor(encryptor)
             .Build();
 
         await consumer.InitAsync();

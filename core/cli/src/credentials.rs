@@ -60,6 +60,7 @@ impl<'a> IggyCredentials<'a> {
         cli_options: &CliOptions,
         iggy_args: &Args,
         login_required: bool,
+        prefer_explicit_credentials: bool,
     ) -> anyhow::Result<Self, anyhow::Error> {
         if !login_required {
             return Ok(Self {
@@ -69,18 +70,25 @@ impl<'a> IggyCredentials<'a> {
             });
         }
 
-        if let Some(server_address) = iggy_args.get_server_address() {
-            let server_session = ServerSession::new(server_address.clone());
-            if let Some(token) = server_session.get_token() {
-                return Ok(Self {
-                    credentials: Some(Credentials::SessionWithToken(
-                        SecretString::from(token),
-                        server_address,
-                    )),
-                    iggy_client: None,
-                    login_required,
-                });
-            }
+        let session_credentials = || -> Option<Credentials> {
+            let server_address = iggy_args.get_server_address()?;
+            let token = ServerSession::new(server_address.clone()).get_token()?;
+            Some(Credentials::SessionWithToken(
+                SecretString::from(token),
+                server_address,
+            ))
+        };
+
+        // Non-login commands reuse the cached session token first. `iggy login`
+        // sets `prefer_explicit_credentials` so freshly supplied credentials win
+        // over a possibly-expired cached token; it falls back to the cached
+        // token below only when no explicit credentials were provided.
+        if !prefer_explicit_credentials && let Some(credentials) = session_credentials() {
+            return Ok(Self {
+                credentials: Some(credentials),
+                iggy_client: None,
+                login_required,
+            });
         }
 
         #[cfg(feature = "login-session")]
@@ -143,6 +151,15 @@ impl<'a> IggyCredentials<'a> {
                     username: var(ENV_IGGY_USERNAME)?,
                     password: SecretString::from(var(ENV_IGGY_PASSWORD)?),
                 })),
+                iggy_client: None,
+                login_required,
+            })
+        } else if let Some(credentials) = session_credentials() {
+            // `iggy login` with no explicit credentials: reuse the cached
+            // session token so a still-valid session reports "already logged in"
+            // instead of demanding credentials for a no-op.
+            Ok(Self {
+                credentials: Some(credentials),
                 iggy_client: None,
                 login_required,
             })

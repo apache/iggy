@@ -17,30 +17,42 @@
 
 package iggcon
 
-type State uint8
+type TransportState uint8
 
 const (
-	StateShutdown State = iota
-	StateDisconnected
-	StateConnecting
-	StateConnected
-	StateAuthenticating
-	StateAuthenticated
+	TransportStateDisconnected TransportState = iota
+	TransportStateShutdown
+	TransportStateConnecting
+	TransportStateConnected
 )
 
-func (s State) String() string {
+func (s TransportState) String() string {
 	switch s {
-	case StateShutdown:
+	case TransportStateShutdown:
 		return "shutdown"
-	case StateDisconnected:
+	case TransportStateDisconnected:
 		return "disconnected"
-	case StateConnecting:
+	case TransportStateConnecting:
 		return "connecting"
-	case StateConnected:
+	case TransportStateConnected:
 		return "connected"
-	case StateAuthenticating:
-		return "authenticating"
-	case StateAuthenticated:
+	default:
+		return "unknown"
+	}
+}
+
+type SessionState uint8
+
+const (
+	SessionStateUnauthenticated SessionState = iota
+	SessionStateAuthenticated
+)
+
+func (s SessionState) String() string {
+	switch s {
+	case SessionStateUnauthenticated:
+		return "unauthenticated"
+	case SessionStateAuthenticated:
 		return "authenticated"
 	default:
 		return "unknown"

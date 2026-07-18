@@ -330,6 +330,36 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Restart EVERY node and reconnect all clients: the full-cluster
+    /// restart path, where no settled primary survives to answer the rejoin
+    /// probes and the replicas must fall back to an election among their
+    /// recovered logs. All nodes stop BEFORE any starts, so no rejoiner can
+    /// lean on a still-live peer (that would be a rolling restart).
+    pub async fn restart_cluster(&mut self) -> Result<(), TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+
+        for client in &mut self.clients {
+            client.disconnect().await;
+        }
+
+        for server in self.servers.iter_mut().rev() {
+            server.stop_dependents()?;
+            server.stop()?;
+        }
+        for server in &mut self.servers {
+            server.restart()?;
+        }
+
+        self.update_client_addresses();
+        for client in &mut self.clients {
+            client.connect().await?;
+        }
+
+        Ok(())
+    }
+
     /// Get reference to the first (primary) server handle.
     pub fn server(&self) -> &ServerHandle {
         self.servers.first().expect("No servers configured")
@@ -362,6 +392,19 @@ impl TestHarness {
     /// Get reference to all servers.
     pub fn all_servers(&self) -> &[ServerHandle] {
         &self.servers
+    }
+
+    /// Number of requests the trusted-issuer JWKS mock has served, or 0 when no
+    /// JWKS mock is configured. Lets a test bound the server's outbound JWKS
+    /// fetches (e.g. assert an unknown-`kid` flood does not amplify).
+    pub async fn jwks_request_count(&self) -> usize {
+        match &self.jwks_server {
+            Some(server) => server
+                .received_requests()
+                .await
+                .map_or(0, |reqs| reqs.len()),
+            None => 0,
+        }
     }
 
     /// Get the number of server nodes (1 for single server, N for cluster).

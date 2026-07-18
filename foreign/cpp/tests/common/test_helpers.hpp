@@ -24,6 +24,7 @@
 #include <initializer_list>
 #include <random>
 #include <string>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -64,6 +65,38 @@ inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const c
         snapshot_types.push_back(value);
     }
     return snapshot_types;
+}
+
+inline iggy::ffi::HeaderField make_header_field(const iggy::ffi::HeaderKind kind, rust::Vec<std::uint8_t> value) {
+    iggy::ffi::HeaderField field;
+    field.kind  = static_cast<std::uint8_t>(kind);
+    field.value = std::move(value);
+    return field;
+}
+
+inline iggy::ffi::HeaderEntry make_header_entry(iggy::ffi::HeaderField key, iggy::ffi::HeaderField value) {
+    iggy::ffi::HeaderEntry entry;
+    entry.key   = std::move(key);
+    entry.value = std::move(value);
+    return entry;
+}
+
+inline bool has_header(const rust::Vec<iggy::ffi::HeaderEntry> &headers,
+                       const std::uint8_t key_kind,
+                       const rust::Vec<std::uint8_t> &key_value,
+                       const std::uint8_t value_kind,
+                       const rust::Vec<std::uint8_t> &value_value) {
+    for (const auto &header : headers) {
+        if (header.key.kind == key_kind && header.value.kind == value_kind &&
+            header.key.value.size() == key_value.size() &&
+            std::equal(header.key.value.begin(), header.key.value.end(), key_value.begin()) &&
+            header.value.value.size() == value_value.size() &&
+            std::equal(header.value.value.begin(), header.value.value.end(), value_value.begin())) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 struct TrackedConsumerGroup {

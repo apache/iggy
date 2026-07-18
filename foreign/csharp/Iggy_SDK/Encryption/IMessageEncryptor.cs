@@ -18,25 +18,43 @@
 namespace Apache.Iggy.Encryption;
 
 /// <summary>
-///     Interface for encrypting and decrypting message payloads in Iggy messaging system.
-///     Implementations of this interface can be used with IggyPublisher and IggyConsumer
-///     to provide end-to-end encryption of message data.
+///     Encrypts and decrypts message payloads (and user headers) at the wire boundary: the client encrypts
+///     directly into the outgoing wire buffer on send and decrypts into a pooled buffer on poll, so neither
+///     direction allocates per message. Implementations write into a caller-provided destination sized by the
+///     corresponding GetMax*Length bound and return the number of bytes actually written.
 /// </summary>
+/// <remarks>
+///     Implementations must be thread-safe: a single instance is shared by every publisher and consumer on the
+///     client and may encrypt or decrypt on concurrent threads. Nothing enforces this at the boundary: an
+///     implementation that shares mutable cipher state across calls will silently corrupt ciphertext or crash
+///     under concurrent send/poll. See <see cref="AesMessageEncryptor" /> for the built-in AEAD implementation.
+/// </remarks>
 public interface IMessageEncryptor
 {
     /// <summary>
-    ///     Encrypts the provided plain data. Takes a span so the send path can encrypt
-    ///     straight from pooled or rented payload memory.
+    ///     A safe upper bound on the ciphertext length produced by encrypting <paramref name="plaintextLength" />
+    ///     bytes, used to size the wire buffer before encryption runs. Exact for AEAD ciphers
+    ///     (plaintext + nonce + tag).
     /// </summary>
-    /// <param name="plainData">The plain data to encrypt</param>
-    /// <returns>The encrypted data</returns>
-    byte[] Encrypt(ReadOnlySpan<byte> plainData);
+    int GetMaxEncryptedLength(int plaintextLength);
 
     /// <summary>
-    ///     Decrypts the provided encrypted data. Takes a span so the consumer path can
-    ///     decrypt straight from rented payload memory.
+    ///     A safe upper bound on the plaintext length produced by decrypting <paramref name="encryptedLength" />
+    ///     bytes, used to size the pooled buffer the poll path decrypts into.
     /// </summary>
-    /// <param name="encryptedData">The encrypted data to decrypt</param>
-    /// <returns>The decrypted plain data</returns>
-    byte[] Decrypt(ReadOnlySpan<byte> encryptedData);
+    int GetMaxDecryptedLength(int encryptedLength);
+
+    /// <summary>
+    ///     Encrypts <paramref name="plaintext" /> into <paramref name="destination" /> and returns the number of
+    ///     bytes written. The destination is at least <see cref="GetMaxEncryptedLength" /> bytes and does not
+    ///     overlap the source.
+    /// </summary>
+    int Encrypt(ReadOnlySpan<byte> plaintext, Span<byte> destination);
+
+    /// <summary>
+    ///     Decrypts <paramref name="encryptedData" /> into <paramref name="destination" /> and returns the number
+    ///     of bytes written. The destination is at least <see cref="GetMaxDecryptedLength" /> bytes and does not
+    ///     overlap the source. Throws on authentication failure or malformed input.
+    /// </summary>
+    int Decrypt(ReadOnlySpan<byte> encryptedData, Span<byte> destination);
 }

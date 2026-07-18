@@ -42,4 +42,6 @@ pub mod server_error;
 pub mod session_manager;
 pub(crate) mod snapshot;
 pub mod users;
+#[cfg(feature = "iggy-web")]
+pub(crate) mod web;
 pub mod wire;

@@ -329,12 +329,7 @@ async fn should_return_clients(harness: &TestHarness) {
 }
 
 // mcp::should_handle_snapshot
-// The diagnostic `snapshot` op (heap/config/process dump) is not implemented in
-// server-ng; it falls through to the non-replicated catch-all and returns an
-// empty body. Out of scope for metadata/stats parity -- un-ignore if server-ng
-// grows the snapshot subsystem.
 #[iggy_harness(test_client_transport = [Tcp], seed = seeds::mcp_standard)]
-#[ignore = "vsr: server-ng does not implement the diagnostic snapshot op"]
 async fn should_handle_snapshot(harness: &TestHarness) {
     let client = root_client(harness).await;
     let snapshot = client

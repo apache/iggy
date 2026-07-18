@@ -30,6 +30,7 @@ crate-type = ["staticlib"]
 bytes = "1.12.0"
 cxx = "1.0.194"
 iggy = { path = "../../core/sdk" }
+iggy_binary_protocol = { path = "../../core/binary_protocol" }
 iggy_common = { path = "../../core/common" }
 # Explicitly enable the runtime + I/O drivers required by `Runtime::enable_all()` in lib.rs.
 # Listing the features here insulates this crate from upstream SDK feature changes.

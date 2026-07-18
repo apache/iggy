@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -23,6 +24,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::requests::messages::{
+    PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -35,19 +39,17 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::{
-    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
-    UpdateUserRequest,
+    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
+    UpdatePermissionsRequest, UpdateUserRequest,
 };
 use iggy_binary_protocol::{
-    AckLevel, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
+    AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RequestHeader, WireEncode,
+    WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
-use server_common::sharding::IggyNamespace;
-use server_common::{
-    Message,
-    iobuf::Owned,
-    send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned},
-};
+use secrecy::SecretString;
+use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::{Message, iobuf::Owned};
 use std::cell::Cell;
 
 /// Partition-plane request ids are offset into the top half of the `u64` space
@@ -68,6 +70,14 @@ pub struct SimClient {
     /// collides with a metadata id, even under reply duplication. See
     /// [`SimClient::request_id_for`].
     partition_counter: Cell<u64>,
+    /// Deterministic per-message id source for produced messages. The real SDK
+    /// sends `id: 0` and lets the server mint a random UUID
+    /// (`SendMessages2::from_legacy_request` -> `random_id::get_uuid`); that
+    /// mint is unseeded, so under the deterministic executor a produce's
+    /// replicated body bytes (and their checksums) would differ run to run,
+    /// silently breaking seeded replay. Stamping a deterministic id here keeps
+    /// the body a pure function of the seed. See [`SimClient::next_message_id`].
+    message_counter: Cell<u64>,
     session: Cell<u64>,
 }
 
@@ -78,6 +88,7 @@ impl SimClient {
             client_id,
             request_counter: Cell::new(0),
             partition_counter: Cell::new(0),
+            message_counter: Cell::new(0),
             session: Cell::new(0),
         }
     }
@@ -85,6 +96,19 @@ impl SimClient {
     #[must_use]
     pub const fn client_id(&self) -> u128 {
         self.client_id
+    }
+
+    /// Next deterministic, non-zero, cross-client-unique message id, standing
+    /// in for the SDK's `id: 0` / server-side random UUID mint so a produce's
+    /// replicated bytes are a pure function of the seed. The `client_id` fills
+    /// the high 64 bits (ids stay disjoint across clients, whose ids are minted
+    /// small) and a monotonic counter fills the low 64 bits (starts at 1, so
+    /// the id is never 0 and never re-triggers the server's random mint). See
+    /// [`SimClient::message_counter`].
+    fn next_message_id(&self) -> u128 {
+        let seq = self.message_counter.get() + 1;
+        self.message_counter.set(seq);
+        (self.client_id << 64) | u128::from(seq)
     }
 
     /// Bind the session assigned by the consensus layer after registration.
@@ -147,6 +171,10 @@ impl SimClient {
             client: self.client_id,
             session: 0,
             request: 0,
+            // Register is a vsr-reserved op: the shard router picks its
+            // target by comparing this against the metadata consensus
+            // namespace, not by op class.
+            namespace: METADATA_CONSENSUS_NAMESPACE,
             ..Default::default()
         };
 
@@ -155,6 +183,52 @@ impl SimClient {
 
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("register request must be valid")
+    }
+
+    /// Build a credentialed login-register request: the shell-mode
+    /// counterpart of [`SimClient::register`].
+    ///
+    /// Same `Register` / `session=0` / `request=0` envelope, but the body
+    /// carries the `ClientVersionInfo` prefix plus username/password that
+    /// `handle_login_register_request` verifies against the seeded root
+    /// user before the consensus layer assigns the session on commit. Used
+    /// only on the dispatch-shell path (the raw fast path uses `register`).
+    ///
+    /// # Panics
+    /// Panics if a credential exceeds the wire name/secret bounds or the
+    /// request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn login(&self, username: &str, password: &str) -> Message<RequestHeader> {
+        let body = LoginRegisterRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("sim-sdk").expect("sim sdk name is valid"),
+                sdk_version: WireName::new("1.0.0").expect("sim sdk version is valid"),
+            },
+            username: WireName::new(username).expect("login username is a valid wire name"),
+            password: SecretString::from(password.to_owned()),
+            client_context: None,
+        }
+        .to_bytes();
+
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total_size = header_size + body.len();
+        let header = RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation: Operation::Register,
+            size: total_size as u32,
+            client: self.client_id,
+            session: 0,
+            request: 0,
+            namespace: METADATA_CONSENSUS_NAMESPACE,
+            ..Default::default()
+        };
+
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(bytemuck::bytes_of(&header));
+        buffer.extend_from_slice(&body);
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("login request must be valid")
     }
 
     /// # Panics
@@ -437,36 +511,93 @@ impl SimClient {
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    /// # Panics
+    /// Build a `SendMessages` request in the legacy `SendMessagesEncoder` wire
+    /// shape, byte-compatible with what the real SDK sends (`common` binary
+    /// client). VSR clients resolve to an explicit partition before sending, so
+    /// the sim always emits `WirePartitioning::PartitionId`: that is the shape
+    /// the shell's `resolve_partition_request_namespace` decodes, and the raw
+    /// path converts it to `SendMessages2` via `from_legacy_request`.
     ///
-    /// Panics if the simulator cannot encode the provided messages into a valid
-    /// `SendMessages2` request.
+    /// # Panics
+    /// Panics if a namespace id exceeds `u32` or the request buffer is invalid.
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
         messages: &[Bytes],
     ) -> Message<RequestHeader> {
-        let mut batch = IggyMessages2::with_capacity(messages.len());
-        for message in messages {
-            batch.push(IggyMessage2 {
-                header: IggyMessage2Header {
-                    payload_length: message.len() as u32,
-                    ..Default::default()
-                },
-                // Refcount bump; no allocation, no copy.
-                payload: message.clone(),
-                user_headers: None,
-            });
-        }
+        let to_u32 = |v: usize| u32::try_from(v).expect("namespace id fits u32");
+        let stream_id = WireIdentifier::Numeric(to_u32(namespace.stream_id()));
+        let topic_id = WireIdentifier::Numeric(to_u32(namespace.topic_id()));
+        let partitioning = WirePartitioning::PartitionId(to_u32(namespace.partition_id()));
 
-        let batch = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("simulator must build a valid send_messages2 batch");
-        let total_size = std::mem::size_of::<RequestHeader>() + batch.header.total_size();
-        let request_header = self.header(Operation::SendMessages, namespace.inner(), total_size);
-        batch
-            .encode_request(request_header)
-            .expect("simulator must build a valid send_messages2 request")
+        // Stamp a deterministic, non-zero id per message. `id: 0` (the real
+        // SDK's server-assigned path) would make the server mint an unseeded
+        // random UUID into the replicated body, breaking seeded replay of any
+        // produce; see `next_message_id`. `origin_timestamp: 0` keeps the batch
+        // bytes seed-independent.
+        let raw: Vec<RawMessage<'_>> = messages
+            .iter()
+            .map(|message| RawMessage {
+                id: self.next_message_id(),
+                origin_timestamp: 0,
+                headers: None,
+                payload: message.as_ref(),
+            })
+            .collect();
+
+        let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
+        let mut buf = BytesMut::with_capacity(size);
+        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw);
+
+        self.build_request_with_namespace(Operation::SendMessages, &buf, namespace)
+    }
+
+    /// Build a `POLL_MESSAGES` request for an individual consumer, reading
+    /// `count` messages from offset 0 of `namespace`'s partition.
+    ///
+    /// A `NonReplicated` read: the command code sits in the header's
+    /// `reserved` prefix, and the request id ECHOES the current metadata
+    /// counter without advancing it (matching the SDK), so a read never
+    /// gaps the replicated sequence the server's `ClientTable` requires
+    /// gap-free. Requires a bound session (polls are auth-gated).
+    ///
+    /// # Panics
+    /// Panics if the session is unbound or the request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn poll_messages(&self, namespace: IggyNamespace, count: u32) -> Message<RequestHeader> {
+        let (stream_id, topic_id, partition_id) = namespace_ids(namespace);
+        let body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(self.client_id as u32)),
+            stream_id,
+            topic_id,
+            partition_id,
+            strategy: WirePollingStrategy::first(),
+            count,
+            auto_commit: false,
+        }
+        .to_bytes();
+
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let total_size = header_size + body.len();
+        let mut reserved = [0u8; 52];
+        reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+        let header = RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation: Operation::NonReplicated,
+            size: total_size as u32,
+            client: self.client_id,
+            session: self.session_id(),
+            request: self.request_counter.get(),
+            reserved,
+            namespace: namespace.inner(),
+            ..Default::default()
+        };
+
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(bytemuck::bytes_of(&header));
+        buffer.extend_from_slice(&body);
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("poll request must be valid")
     }
 
     pub fn store_consumer_offset(
@@ -592,7 +723,10 @@ impl SimClient {
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = self.header(operation, 0, total_size);
+        // Every `build_request` caller is a metadata-plane op (partition
+        // ops go through `build_request_with_namespace`), and metadata
+        // requests carry the metadata consensus namespace on the wire.
+        let header = self.header(operation, METADATA_CONSENSUS_NAMESPACE, total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);

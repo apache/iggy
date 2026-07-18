@@ -20,7 +20,9 @@ using System.Buffers.Binary;
 using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
@@ -334,7 +336,7 @@ internal static class BinaryMapper
     }
 
     internal static PolledMessagesRental MapRentedMessages(ReadOnlyMemory<byte> payload,
-        IMemoryOwner<byte> payloadOwner)
+        IMemoryOwner<byte> payloadOwner, IMessageEncryptor? encryptor = null)
     {
         ReadOnlySpan<byte> span = payload.Span;
         var length = payload.Length;
@@ -352,72 +354,178 @@ internal static class BinaryMapper
             };
         }
 
-        var maxMessages = (length - 16) / PropertiesSize;
-        var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
-        List<RentedMessageResponse> messages = new(capacity);
-
-        while (position < length)
+        ArrayPoolHelper.SlicedMemoryOwner? plaintextOwner = null;
+        try
         {
-            var checksum = BinaryPrimitives.ReadUInt64LittleEndian(span[position..(position + 8)]);
-            var id = BinaryPrimitives.ReadUInt128LittleEndian(span[(position + 8)..(position + 24)]);
-            var offset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
-            var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
-            var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 40)..(position + 48)]);
-            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 48)..(position + 52)]);
-            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
-            var reserved = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 56)..(position + 64)]);
-
-            var wireHeadersLength = headersLength;
-            if (headersLength < 0)
+            // One plaintext buffer rented up front (sized by a header-only pre-pass) keeps the rented path
+            // allocation-free per message. Tied to the rental's disposal so decrypted slices stay valid.
+            var plaintext = Memory<byte>.Empty;
+            var plainCursor = 0;
+            if (encryptor is not null)
             {
-                throw new ArgumentOutOfRangeException();
+                var total = SumMaxDecryptedLength(span, length, encryptor);
+                if (total > 0)
+                {
+                    plaintextOwner = ArrayPoolHelper.Rent(total, true);
+                    plaintext = plaintextOwner.Memory;
+                }
             }
 
-            var payloadRangeStart = position + 64;
-            var payloadRangeEnd = position + 64 + payloadLength;
-            var headersRangeStart = payloadRangeEnd;
-            var headersRangeEnd = headersRangeStart + headersLength;
-            if (payloadRangeStart > length || payloadRangeEnd > length || headersRangeStart > length ||
-                headersRangeEnd > length)
+            var maxMessages = (length - 16) / PropertiesSize;
+            var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
+            List<RentedMessageResponse> messages = new(capacity);
+
+            while (position < length)
+            {
+                if (!TryReadFrameLengths(span, length, position, out var headersLength, out var payloadLength))
+                {
+                    break;
+                }
+
+                var checksum = BinaryPrimitives.ReadUInt64LittleEndian(span[position..(position + 8)]);
+                var id = BinaryPrimitives.ReadUInt128LittleEndian(span[(position + 8)..(position + 24)]);
+                var offset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
+                var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
+                var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 40)..(position + 48)]);
+                var reserved = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 56)..(position + 64)]);
+
+                var payloadRangeStart = position + 64;
+                var headersRangeStart = payloadRangeStart + payloadLength;
+
+                ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
+                ReadOnlyMemory<byte> rawHeaders = headersLength > 0
+                    ? payload.Slice(headersRangeStart, headersLength)
+                    : ReadOnlyMemory<byte>.Empty;
+
+                // Decrypt into the shared buffer so the message looks like plaintext downstream. Wire lengths
+                // still drive the cursor advance; only the decrypted lengths land on the header.
+                var storedPayloadLength = payloadLength;
+                var storedHeadersLength = headersLength;
+                if (encryptor is not null)
+                {
+                    try
+                    {
+                        // Bound each destination to this message's reserved slice so an encryptor that overruns
+                        // its contract fails fast here instead of corrupting the next message's region.
+                        Memory<byte> payloadDest =
+                            plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(payloadLength));
+                        var writtenPayload = encryptor.Decrypt(payloadSlice.Span, payloadDest.Span);
+                        payloadSlice = payloadDest.Slice(0, writtenPayload);
+                        storedPayloadLength = writtenPayload;
+                        plainCursor += writtenPayload;
+
+                        if (!rawHeaders.IsEmpty)
+                        {
+                            Memory<byte> headersDest =
+                                plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(headersLength));
+                            var writtenHeaders = encryptor.Decrypt(rawHeaders.Span, headersDest.Span);
+                            rawHeaders = headersDest.Slice(0, writtenHeaders);
+                            storedHeadersLength = writtenHeaders;
+                            plainCursor += writtenHeaders;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new MessageDecryptionException(offset, (uint)partitionId, ex);
+                    }
+                }
+
+                messages.Add(new RentedMessageResponse
+                {
+                    Header = new MessageHeader
+                    {
+                        Checksum = checksum,
+                        Id = id,
+                        Offset = offset,
+                        OriginTimestamp = originTimestamp,
+                        PayloadLength = storedPayloadLength,
+                        Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
+                        UserHeadersLength = storedHeadersLength,
+                        Reserved = reserved
+                    },
+                    RawUserHeaders = rawHeaders,
+                    Payload = payloadSlice
+                });
+
+                position += 64 + payloadLength + headersLength;
+                if (position + PropertiesSize >= length)
+                {
+                    break;
+                }
+            }
+
+            return new PolledMessagesRental(payloadOwner, plaintextOwner)
+            {
+                PartitionId = partitionId,
+                CurrentOffset = currentOffset,
+                Messages = messages
+            };
+        }
+        catch
+        {
+            plaintextOwner?.Dispose();
+            throw;
+        }
+    }
+
+    // Shared by the decrypt sizing pre-pass and the main map loop so both agree on which frames are included;
+    // drift would mis-size the shared plaintext buffer. Returns false at buffer end or on a frame running past
+    // the buffer; throws on a negative length so a poison frame surfaces instead of being re-polled forever.
+    private static bool TryReadFrameLengths(ReadOnlySpan<byte> span, int length, int position,
+        out int headersLength, out int payloadLength)
+    {
+        headersLength = 0;
+        payloadLength = 0;
+        if (position + PropertiesSize > length)
+        {
+            return false;
+        }
+
+        headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 48)..(position + 52)]);
+        payloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
+        if (headersLength < 0 || payloadLength < 0)
+        {
+            throw new MalformedResponseException(
+                $"Malformed message frame at byte {position}: negative payload ({payloadLength}) or header " +
+                $"({headersLength}) length.");
+        }
+
+        // Overflow-safe: server-controlled lengths can approach int.MaxValue, so compute the bound in long.
+        if ((long)position + 64 + payloadLength + headersLength > length)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    // Pre-pass summing upper-bound plaintext length so the shared buffer is rented exactly once. Same
+    // TryReadFrameLengths walk as the main loop, so both agree on which messages are included.
+    private static int SumMaxDecryptedLength(ReadOnlySpan<byte> span, int length, IMessageEncryptor encryptor)
+    {
+        var position = 16;
+        var total = 0;
+        while (position < length)
+        {
+            if (!TryReadFrameLengths(span, length, position, out var headersLength, out var payloadLength))
             {
                 break;
             }
 
-            ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
-            ReadOnlyMemory<byte> rawHeaders = headersLength > 0
-                ? payload.Slice(headersRangeStart, headersLength)
-                : ReadOnlyMemory<byte>.Empty;
-
-            messages.Add(new RentedMessageResponse
+            total += encryptor.GetMaxDecryptedLength(payloadLength);
+            if (headersLength > 0)
             {
-                Header = new MessageHeader
-                {
-                    Checksum = checksum,
-                    Id = id,
-                    Offset = offset,
-                    OriginTimestamp = originTimestamp,
-                    PayloadLength = payloadLength,
-                    Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
-                    UserHeadersLength = headersLength,
-                    Reserved = reserved
-                },
-                RawUserHeaders = rawHeaders,
-                Payload = payloadSlice
-            });
+                total += encryptor.GetMaxDecryptedLength(headersLength);
+            }
 
-            position += 64 + payloadLength + wireHeadersLength;
+            position += 64 + payloadLength + headersLength;
             if (position + PropertiesSize >= length)
             {
                 break;
             }
         }
 
-        return new PolledMessagesRental(payloadOwner)
-        {
-            PartitionId = partitionId,
-            CurrentOffset = currentOffset,
-            Messages = messages
-        };
+        return total;
     }
 
     internal static PolledMessages MaterializeMessages(PolledMessagesRental rental)

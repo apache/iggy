@@ -115,12 +115,24 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_state = client
-            .get_stream(&self.stream_name.clone().try_into().unwrap())
-            .await;
-        assert!(stream_state.is_ok());
-        let stream_state = stream_state.unwrap().expect("Stream not found");
-        assert_eq!(stream_state.size, 0);
+        // server-ng purge is eventually consistent: the partition reset (and
+        // its stats zeroing) runs in the reconciler after the metadata commit
+        // the purge command awaited. Legacy is synchronous and satisfies this
+        // on the first poll.
+        let mut purged = false;
+        for _ in 0..60 {
+            let stream_state = client
+                .get_stream(&self.stream_name.clone().try_into().unwrap())
+                .await
+                .expect("get stream")
+                .expect("Stream not found");
+            if stream_state.size == 0 {
+                purged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(purged, "stream size should reach 0 after purge");
 
         let stream_delete = client
             .delete_stream(&self.stream_name.clone().try_into().unwrap())

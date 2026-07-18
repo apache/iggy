@@ -47,7 +47,8 @@ public sealed class ReceivedRentedMessage : IDisposable
     public uint PartitionId { get; init; }
 
     /// <summary>
-    ///     The status of the message (Success, DecryptionFailed).
+    ///     The status of the message. The rented path performs no deserialization or decryption, so this is
+    ///     always <see cref="MessageStatus.Success" />.
     /// </summary>
     public MessageStatus Status { get; init; } = MessageStatus.Success;
 

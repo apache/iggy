@@ -222,6 +222,22 @@ impl ShardMetrics {
         self.partitions_reconcile_failures_total.inc();
     }
 
+    /// Total frame drops across every `{variant, reason}` pair.
+    ///
+    /// Simulator assertion hook: a run without injected loss must keep
+    /// this at zero, otherwise an inbox silently shed a frame (capacity
+    /// too small, or a routing bug). Production scrape goes through the
+    /// prometheus registry.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn frame_drops_value(&self) -> u64 {
+        self.cached_counters
+            .iter()
+            .flatten()
+            .map(prometheus_client::metrics::counter::Counter::get)
+            .sum()
+    }
+
     /// Snapshot of `partitions_materialised_total`. Test-only accessor;
     /// production scrape goes through the prometheus registry.
     #[cfg(test)]

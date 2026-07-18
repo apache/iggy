@@ -73,21 +73,39 @@ impl ConnectorError {
 /// Runtime statistics response from `/stats` endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectorRuntimeStats {
+    /// The version of the connectors runtime.
     pub connectors_runtime_version: String,
+    /// The semantic version of the connectors runtime in the numeric format,
+    /// e.g. 1.2.3 -> 1002003 (major followed by zero-padded three-digit minor and patch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connectors_runtime_version_semver: Option<u32>,
+    /// The unique identifier of the runtime process.
     pub process_id: u32,
+    /// The CPU usage of the runtime process.
     pub cpu_usage: f32,
+    /// The total CPU usage of the system, scoped to the cores this process may run on
+    /// when confined by an affinity/cpuset mask.
     pub total_cpu_usage: f32,
+    /// The memory usage of the runtime process in bytes.
     pub memory_usage: u64,
+    /// The total memory of the system in bytes, or the effective cgroup memory limit when
+    /// the runtime runs inside a memory-capped cgroup (container, systemd slice).
     pub total_memory: u64,
+    /// The available memory of the system in bytes, scoped to the cgroup limit when one applies.
     pub available_memory: u64,
+    /// The elapsed time since the runtime started, in microseconds.
     pub run_time: u64,
+    /// The time the runtime started, in microseconds since the UNIX epoch.
     pub start_time: u64,
+    /// The number of configured source connectors, including disabled and failed ones.
     pub sources_total: u32,
+    /// The number of currently running source connectors.
     pub sources_running: u32,
+    /// The number of configured sink connectors, including disabled and failed ones.
     pub sinks_total: u32,
+    /// The number of currently running sink connectors.
     pub sinks_running: u32,
+    /// Per-connector statistics for every configured source and sink.
     pub connectors: Vec<ConnectorStats>,
 }
 
