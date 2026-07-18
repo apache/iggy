@@ -27,6 +27,7 @@ mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod redshift;
 mod s3;
 mod surrealdb;
 mod wiremock;
@@ -78,6 +79,10 @@ pub use postgres::{
     PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use redshift::{
+    RedshiftSinkByteaFixture, RedshiftSinkFixture, RedshiftSinkJsonFixture,
+    RedshiftSinkNoArchiveFixture,
+};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{
     SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
