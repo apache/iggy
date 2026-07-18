@@ -106,6 +106,8 @@ pub enum TimeoutKind {
     StartViewChangeMessage,
     ViewChangeStatus,
     DoViewChangeMessage,
+    /// Backup re-requesting the current view's `StartView` from its
+    /// primary: fired while a recovering replica probes for the view.
     RequestStartViewMessage,
 }
 
@@ -126,7 +128,7 @@ pub struct TimeoutManager {
 
 #[allow(unused)]
 impl TimeoutManager {
-    // Timeout durations in ticks (10ms per tick). Values are taken from TB.
+    // Timeout durations in ticks (10ms per tick).
     // TODO define 10ms per tick in a separate constant.
     const PING_TICKS: u64 = 100;
     const PREPARE_TICKS: u64 = 25;

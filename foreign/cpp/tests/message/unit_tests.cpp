@@ -32,7 +32,7 @@ TEST(MessageTest, MakeMessageSetsPayload) {
         payload.push_back(static_cast<std::uint8_t>(c));
     }
 
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     ASSERT_EQ(msg.payload.size(), text.size());
     for (std::size_t i = 0; i < text.size(); i++) {
@@ -45,7 +45,7 @@ TEST(MessageTest, MakeMessageZerosIdAndHeaders) {
     rust::Vec<std::uint8_t> payload;
     payload.push_back(0x42);
 
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     EXPECT_EQ(msg.id_lo, 0u);
     EXPECT_EQ(msg.id_hi, 0u);
@@ -56,7 +56,7 @@ TEST(MessageTest, MakeMessageWithEmptyPayload) {
     RecordProperty("description", "Verifies make_message accepts an empty payload.");
     rust::Vec<std::uint8_t> empty_payload;
 
-    auto msg = iggy::ffi::make_message(std::move(empty_payload));
+    auto msg = iggy::ffi::make_message(std::move(empty_payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     ASSERT_EQ(msg.payload.size(), 0u);
 }
@@ -66,7 +66,7 @@ TEST(MessageTest, MakeMessageWithSingleByte) {
     rust::Vec<std::uint8_t> payload;
     payload.push_back(0xFF);
 
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     ASSERT_EQ(msg.payload.size(), 1u);
     EXPECT_EQ(msg.payload[0], 0xFF);
@@ -79,7 +79,7 @@ TEST(MessageTest, MakeMessageWithNullBytes) {
     payload.push_back(0x01);
     payload.push_back(0x00);
 
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     ASSERT_EQ(msg.payload.size(), 3u);
     EXPECT_EQ(msg.payload[0], 0x00);
@@ -91,7 +91,7 @@ TEST(MessageTest, MakeMessageThenSetCustomId) {
     RecordProperty("description", "Verifies custom ID can be set after make_message without affecting payload.");
     rust::Vec<std::uint8_t> payload;
     payload.push_back(0x42);
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     msg.id_lo = 100;
     msg.id_hi = 200;
@@ -109,7 +109,7 @@ TEST(MessageTest, MakeMessageWithLargePayload) {
         payload.push_back(static_cast<std::uint8_t>(i % 256));
     }
 
-    auto msg = iggy::ffi::make_message(std::move(payload));
+    auto msg = iggy::ffi::make_message(std::move(payload), rust::Vec<iggy::ffi::HeaderEntry>());
 
     ASSERT_EQ(msg.payload.size(), 10000u);
     EXPECT_EQ(msg.payload[0], 0u);

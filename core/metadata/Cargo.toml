@@ -28,6 +28,15 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 publish = false
 
+[features]
+# Simulator-only seed helper (`Streams::seed_single_partition`): applies
+# CreateStream + CreateTopic straight onto the writer STM, bypassing metadata
+# consensus, so the deterministic dispatch shell can resolve a namespace
+# without driving the reconciler. A `-p iggy-server-ng` build excludes it;
+# `cargo build --workspace` unifies features so the shared `metadata` unit
+# compiles it in when the simulator requests it. No production caller.
+simulator = []
+
 [dependencies]
 ahash = { workspace = true }
 bytemuck = { workspace = true }

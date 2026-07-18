@@ -26,6 +26,7 @@ use crate::poll_plan::{
     ResidentTailSnapshot,
 };
 use crate::segment::Segment;
+use crate::types::RepairSession;
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -42,7 +43,9 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
-use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader, WireDecode, WireIdentifier};
+use iggy_binary_protocol::{
+    AckLevel, GenericHeader, Operation, PrepareHeader, WireDecode, WireIdentifier,
+};
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
@@ -51,8 +54,8 @@ use iggy_common::{
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
-    Message, SegmentStorage,
-    iobuf::Frozen,
+    MESSAGE_ALIGN, Message, SegmentStorage,
+    iobuf::{Frozen, Owned},
     send_messages2::{
         convert_request_message, decode_prepare_slice, stamp_prepare_for_persistence,
     },
@@ -106,6 +109,16 @@ where
     /// `None` only for in-memory (simulated) partitions.
     partition_dir: Option<String>,
     consumer_offset_enforce_fsync: bool,
+    /// In-flight journal repair:
+    /// set when the recovery handshake finds this replica behind the group's
+    /// commit frontier, cleared when `RepairDone` completes the walk.
+    pub repair: Option<RepairSession>,
+    /// Highest message offset recovered from segments at boot (`None` when
+    /// the partition booted empty). Repaired batches at or below this line
+    /// are already persisted and counted; the flush and commit paths skip
+    /// re-persisting / re-counting them. Immutable after boot, so live
+    /// traffic (always above it) is never affected.
+    pub recovered_durable_offset: Option<u64>,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
@@ -212,7 +225,8 @@ where
 {
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
-        Self {
+        let single_replica = consensus.replica_count() == 1;
+        let partition = Self {
             consensus,
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
@@ -229,11 +243,17 @@ where
             consumer_group_offsets_path: None,
             partition_dir: None,
             consumer_offset_enforce_fsync: false,
+            repair: None,
+            recovered_durable_offset: None,
             pending_consumer_offset_commits: HashMap::new(),
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
             applied_purge_generation: 0,
+        };
+        if single_replica {
+            partition.log.journal().inner.set_repair_retention(false);
         }
+        partition
     }
 
     #[must_use]
@@ -339,10 +359,16 @@ where
         // fails (e.g. disk full, fd exhausted) the pending entry must remain
         // stageable for retry on the next apply. Removing first would strand
         // the op - not on disk AND not in memory.
-        let pending = *self
-            .pending_consumer_offset_commits
-            .get(&op)
-            .ok_or(IggyError::InvalidCommand)?;
+        let pending = match self.pending_consumer_offset_commits.get(&op) {
+            Some(pending) => *pending,
+            // A view change clears the staged table (uncommitted ops may be
+            // superseded by the new view's log), and suffixes adopted via
+            // DoViewChange/StartView or journal repair never pass the live
+            // staging path at all. The journal entry IS the new view's
+            // authoritative content for this op, so re-derive the commit
+            // from it instead of wedging the commit walk.
+            None => self.restage_consumer_offset_from_journal(op)?,
+        };
         // Persist to the on-disk offset table first so a crash after the
         // in-memory apply cannot observe a readable offset that was not
         // durably stored; the in-memory update is idempotent on replay
@@ -1209,9 +1235,31 @@ where
                 }
             }
 
-            assert!(!consensus.is_follower(), "on_request: primary only");
-            assert!(consensus.is_normal(), "on_request: status must be normal");
-            assert!(!consensus.is_syncing(), "on_request: must not be syncing");
+            // A client op landing on a non-primary (or mid-view-change)
+            // replica is a routing artifact -- e.g. the roster still points
+            // here while this group's primaryship moved after a restart.
+            // Answer the typed transient instead of asserting: the SDK
+            // replays and its leader recheck re-routes, whereas a panic
+            // kills the shard and a silent drop wedges the client until its
+            // read timeout.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_syncing() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
 
             // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
@@ -1472,6 +1520,7 @@ where
             if is_backup {
                 consensus.sequencer().set_sequence(header.op);
                 consensus.set_last_prepare_checksum(header.checksum);
+                consensus.observe_prepare_timestamp(header.timestamp);
             }
             if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
                 emit_partition_diag(
@@ -1726,13 +1775,47 @@ where
         self.append_messages(message).await.map(|_| ())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, false).await
+    }
+
+    /// Flush the committed journal prefix to segment storage regardless of
+    /// the `messages_required_to_save` thresholds.
+    ///
+    /// Shutdown-path counterpart of the commit-time persist gate: a graceful
+    /// stop must not lose committed messages that were still resident in the
+    /// in-memory journal (consumer offsets are persisted eagerly, so losing
+    /// the messages would fail recovery with an offset ahead of the data).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IggyError`] when writing the committed batches or their
+    /// index entries to segment storage fails.
+    pub async fn flush_committed_messages(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<(), IggyError> {
+        self.commit_messages_inner(config, true).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn commit_messages_inner(
+        &mut self,
+        config: &PartitionsConfig,
+        force: bool,
+    ) -> Result<(), IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
         let journal_info = self.log.journal().info;
         if journal_info.messages_count == 0 {
+            if force {
+                tracing::info!(
+                    target: "iggy.partitions.diag",
+                    namespace_raw = self.namespace().inner(),
+                    "forced flush: journal counts zero messages, nothing to persist"
+                );
+            }
             return Ok(());
         }
 
@@ -1748,7 +1831,7 @@ where
             >= config.size_of_messages_required_to_save.as_bytes_u64();
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
-        if !should_persist {
+        if !force && !should_persist {
             return Ok(());
         }
 
@@ -1766,128 +1849,205 @@ where
         let commit_max = self.consensus.commit_max();
         let committed_entries = self.log.journal().inner.committed_prefix(commit_max);
         if committed_entries.is_empty() {
+            if force {
+                tracing::info!(
+                    target: "iggy.partitions.diag",
+                    namespace_raw = self.namespace().inner(),
+                    commit_max,
+                    journal_messages = journal_info.messages_count,
+                    "forced flush: no committed entries resident"
+                );
+            }
             return Ok(());
         }
-        let committed_count = committed_entries.len();
-
-        let (frozen_batches, index_bytes, flush_index, batch_count, committed_info) = {
-            let segment = self.log.active_segment();
-            let mut file_position = segment.size.as_bytes_u64();
-            let mut flush_index = None;
-            let mut frozen = Vec::with_capacity(committed_entries.len());
-            let mut batch_count = 0u32;
-            let mut committed_info = JournalInfo::default();
-
-            for entry in committed_entries {
-                // Consumer-offset ops are journaled in the same prefix but carry
-                // no segment bytes; they were applied when staged, so skip them.
-                if peek_operation(&entry) != Operation::SendMessages {
-                    continue;
-                }
-                // A resident committed SendMessages entry decoded once at append
-                // (the offset index) with its checksum stamped over these exact
-                // bytes, so it must decode again here. Guard the invariant for a
-                // future disk read-back path that could make decode fallible.
-                let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
-                    debug_assert!(
-                        false,
-                        "resident committed SendMessages entry failed to decode"
-                    );
-                    continue;
-                };
-                let message_count = batch.message_count();
-                if message_count == 0 {
-                    continue;
-                }
-
-                if flush_index.is_none() {
-                    // Record only; the in-mem cache insert is deferred until the
-                    // batch + index are durable (see post-persist below).
-                    flush_index = Some(crate::iggy_index::IggyIndex::new(
-                        batch.header.base_offset,
-                        batch.header.base_timestamp,
-                        file_position,
-                    ));
-                }
-                file_position += batch.header.total_size() as u64;
-                batch_count += message_count;
-                accumulate_committed_info(
-                    &mut committed_info,
-                    batch.header.base_offset,
-                    batch.header.base_timestamp,
-                    batch.header.total_size() as u64,
-                    message_count,
-                );
-                frozen.push(entry);
+        // Persist the prefix in segment-sized chunks: a segment seals exactly
+        // when its committed bytes reach `max_size`, no matter how many
+        // entries this flush happens to cover. A backup commits in bursts
+        // behind the primary, so any grouping- or timing-sensitive roll rule
+        // (like keying rotation on the journal-position `is_full` above)
+        // seals segments at per-replica offsets, and the offset-keyed segment
+        // GC staged by the reconciler never converges across the cluster.
+        let max_segment_size = self.log.active_segment().max_size.as_bytes_u64();
+        let mut entries = committed_entries.into_iter().peekable();
+        let mut durable_offset = None;
+        // Entries whose bytes are durable but which are still resident in the
+        // journal. Evicted ONCE after the loop: `evict_prefix` drains and
+        // re-appends the whole retained tail, so a per-chunk call would
+        // re-walk that tail once per segment crossed, quadratic in the flush
+        // span -- all under the partition write lock. On an error mid-flush
+        // the accumulated prefix is evicted before propagating, so the retry
+        // re-reads only what did not land.
+        let mut evictable = 0usize;
+        while entries.peek().is_some() {
+            // A recovered active segment can already sit at or past the cap
+            // (crash between persist and rotation); seal it before appending.
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
             }
 
-            let index_bytes = flush_index
-                .as_ref()
-                .map(crate::iggy_index::IggyIndexCache::serialize);
+            let (frozen_batches, index_bytes, flush_index, batch_count, committed_info, chunk_len) = {
+                let segment = self.log.active_segment();
+                let mut file_position = segment.size.as_bytes_u64();
+                let mut flush_index = None;
+                let mut frozen = Vec::with_capacity(entries.len());
+                let mut batch_count = 0u32;
+                let mut committed_info = JournalInfo::default();
+                let mut chunk_len = 0usize;
 
-            (
-                frozen,
-                index_bytes,
-                flush_index,
-                batch_count,
-                committed_info,
-            )
-        };
+                for entry in entries.by_ref() {
+                    chunk_len += 1;
+                    // Consumer-offset ops are journaled in the same prefix but carry
+                    // no segment bytes; they were applied when staged, so skip them.
+                    if peek_operation(&entry) != Operation::SendMessages {
+                        if force {
+                            tracing::info!(
+                                target: "iggy.partitions.diag",
+                                operation = ?peek_operation(&entry),
+                                "forced flush: skipping non-send entry"
+                            );
+                        }
+                        continue;
+                    }
+                    // A resident committed SendMessages entry decoded once at append
+                    // (the offset index) with its checksum stamped over these exact
+                    // bytes, so it must decode again here. Guard the invariant for a
+                    // future disk read-back path that could make decode fallible.
+                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                        tracing::error!(
+                            target: "iggy.partitions.diag",
+                            namespace_raw = self.namespace().inner(),
+                            entry_len = entry.as_slice().len(),
+                            "resident committed SendMessages entry failed to decode"
+                        );
+                        continue;
+                    };
+                    let message_count = batch.message_count();
+                    if message_count == 0 {
+                        continue;
+                    }
+                    // A repaired batch at or below the boot-time recovered
+                    // durable offset is already IN the segments this replica
+                    // recovered; persisting it again would append duplicate
+                    // bytes past the segment end. Evict it without writing.
+                    // Live traffic always sits above the (immutable) line.
+                    let batch_end = batch.header.base_offset + u64::from(message_count) - 1;
+                    if let Some(durable) = self.recovered_durable_offset
+                        && batch_end <= durable
+                    {
+                        continue;
+                    }
 
-        // No committed SendMessages batch was resident (e.g. only uncommitted
-        // ops, or a committed consumer-offset prefix that is not persisted to a
-        // segment). Nothing to flush, but the committed prefix must still be
-        // evicted; no segment bytes are at risk, so evict directly.
-        let Some(index_bytes) = index_bytes else {
-            self.evict_committed_prefix(committed_count).await;
-            return Ok(());
-        };
+                    if flush_index.is_none() {
+                        // Record only; the in-mem cache insert is deferred until the
+                        // batch + index are durable (see post-persist below).
+                        flush_index = Some(crate::iggy_index::IggyIndex::new(
+                            batch.header.base_offset,
+                            batch.header.base_timestamp,
+                            file_position,
+                        ));
+                    }
+                    file_position += batch.header.total_size() as u64;
+                    batch_count += message_count;
+                    accumulate_committed_info(
+                        &mut committed_info,
+                        batch.header.base_offset,
+                        batch.header.base_timestamp,
+                        batch.header.total_size() as u64,
+                        message_count,
+                    );
+                    frozen.push(entry);
+                    if file_position >= max_segment_size {
+                        break;
+                    }
+                }
 
-        // Persist BEFORE eviction so a write failure leaves the committed prefix
-        // resident for retry. The persist is idempotent on failure: a batch
-        // write that lands but whose index save then fails rewinds the segment
-        // write cursor, so the retry overwrites those bytes instead of appending
-        // a duplicate. Only once the bytes are durable do we evict and rebuild
-        // the tail accounting.
-        self.persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
-            .await?;
-        // Insert the flushed sparse-index entry into the in-mem cache only now
-        // that the batch + index are durable. Inserting in the build loop (before
-        // persist) re-inserts a duplicate on a persist-failure retry, which
-        // re-reads the same prefix. The active segment has not rotated yet, so
-        // this targets the segment that received the batches.
-        if let Some(index) = flush_index {
-            self.log.ensure_indexes();
-            let indexes = self.log.active_indexes_mut().expect("indexes must exist");
-            indexes.insert(index.offset, index.timestamp, index.position);
+                let index_bytes = flush_index
+                    .as_ref()
+                    .map(crate::iggy_index::IggyIndexCache::serialize);
+
+                (
+                    frozen,
+                    index_bytes,
+                    flush_index,
+                    batch_count,
+                    committed_info,
+                    chunk_len,
+                )
+            };
+
+            // No committed SendMessages batch was resident in this chunk (e.g.
+            // a committed consumer-offset run that is not persisted to a
+            // segment). Nothing to flush; no segment bytes are at risk, so the
+            // entries just join the evictable prefix.
+            let Some(index_bytes) = index_bytes else {
+                evictable += chunk_len;
+                continue;
+            };
+
+            // Persist BEFORE eviction so a write failure leaves the rest of the
+            // committed prefix resident for retry. The persist is idempotent on
+            // failure: a batch write that lands but whose index save then fails
+            // rewinds the segment write cursor, so the retry overwrites those
+            // bytes instead of appending a duplicate. Chunks already durable
+            // are evicted before the error propagates, so the retry cannot
+            // re-read them (and re-write them past a rotation).
+            if let Err(error) = self
+                .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
+                .await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
+            }
+            // Insert the flushed sparse-index entry into the in-mem cache only now
+            // that the batch + index are durable. Inserting in the build loop (before
+            // persist) re-inserts a duplicate on a persist-failure retry, which
+            // re-reads the same prefix. The active segment has not rotated yet, so
+            // this targets the segment that received the batches.
+            if let Some(index) = flush_index {
+                self.log.ensure_indexes();
+                let indexes = self.log.active_indexes_mut().expect("indexes must exist");
+                indexes.insert(index.offset, index.timestamp, index.position);
+            }
+            evictable += chunk_len;
+
+            // Stamp range metadata on the segment that received the batches
+            // BEFORE rotating: rotation seals it and derives the next segment's
+            // start offset from `end_offset`, so updating after rotation would
+            // tag the fresh segment with the old range and shift every
+            // subsequent segment boundary off the file contents.
+            let segment_index = self.log.segments().len() - 1;
+            let segment = &mut self.log.segments_mut()[segment_index];
+            if segment.start_timestamp == 0 && committed_info.first_timestamp != 0 {
+                segment.start_timestamp = committed_info.first_timestamp;
+            }
+            segment.end_timestamp = committed_info.end_timestamp;
+            segment.max_timestamp = segment.max_timestamp.max(committed_info.max_timestamp);
+            segment.end_offset = committed_info.current_offset;
+            durable_offset = Some(committed_info.current_offset);
+
+            // Seal eagerly once the committed bytes cross the cap so the
+            // segment becomes removable (GC skips the active segment) without
+            // waiting for the next flush.
+            if self.log.active_segment().size.as_bytes_u64() >= max_segment_size
+                && let Err(error) = self.rotate_segment(config).await
+            {
+                self.evict_committed_prefix(evictable).await;
+                return Err(error);
+            }
         }
-        self.evict_committed_prefix(committed_count).await;
-
-        // Stamp range metadata on the segment that received the batches
-        // BEFORE rotating: rotation seals it and derives the next segment's
-        // start offset from `end_offset`, so updating after rotation would
-        // tag the fresh segment with the old range and shift every
-        // subsequent segment boundary off the file contents.
-        let segment_index = self.log.segments().len() - 1;
-        let segment = &mut self.log.segments_mut()[segment_index];
-        if segment.start_timestamp == 0 && committed_info.first_timestamp != 0 {
-            segment.start_timestamp = committed_info.first_timestamp;
-        }
-        segment.end_timestamp = committed_info.end_timestamp;
-        segment.max_timestamp = segment.max_timestamp.max(committed_info.max_timestamp);
-        segment.end_offset = committed_info.current_offset;
-
-        if is_full {
-            self.rotate_segment(config).await?;
-        }
+        self.evict_committed_prefix(evictable).await;
 
         // Aggregate stats (`messages_count`/`size_bytes`) advance at commit in
         // `commit_partition_entry`, not here: this persist path is threshold-
         // gated, so counting here would leave the stats lagging the visible
         // offset until a flush and would double-count once it fires.
-        let durable_offset = committed_info.current_offset;
-        self.offset.store(durable_offset, Ordering::Release);
-        self.stats.set_current_offset(durable_offset);
+        if let Some(durable_offset) = durable_offset {
+            self.offset.store(durable_offset, Ordering::Release);
+            self.stats.set_current_offset(durable_offset);
+        }
         Ok(())
     }
 
@@ -1899,6 +2059,9 @@ where
     /// `evict_prefix` surfaced during its re-append, so the tail is not decoded
     /// a second time.
     async fn evict_committed_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
         let retained = self.log.journal().inner.evict_prefix(count).await;
         let mut retained_info = JournalInfo::default();
         for (_, meta) in &retained {
@@ -2102,15 +2265,24 @@ where
                 }
 
                 if let Some(batch_stats) = committed_visible_offsets.get(&prepare_header.op) {
-                    self.offset.store(batch_stats.end_offset, Ordering::Release);
-                    self.stats.set_current_offset(batch_stats.end_offset);
-                    // Advance the aggregate stats with the visible offset. Disk
-                    // persistence is threshold-gated in `commit_messages`, which
-                    // must not also touch these counters or committed messages
-                    // would be double-counted once they flush.
-                    self.stats
-                        .increment_messages_count(u64::from(batch_stats.message_count));
-                    self.stats.increment_size_bytes(batch_stats.size_bytes);
+                    // A repaired batch at or below the boot-time recovered
+                    // durable offset was already counted (and persisted)
+                    // before the restart; skip it. Live traffic always sits
+                    // above the (immutable) line.
+                    if self
+                        .recovered_durable_offset
+                        .is_none_or(|durable| batch_stats.end_offset > durable)
+                    {
+                        self.offset.store(batch_stats.end_offset, Ordering::Release);
+                        self.stats.set_current_offset(batch_stats.end_offset);
+                        // Advance the aggregate stats with the visible offset. Disk
+                        // persistence is threshold-gated in `commit_messages`, which
+                        // must not also touch these counters or committed messages
+                        // would be double-counted once they flush.
+                        self.stats
+                            .increment_messages_count(u64::from(batch_stats.message_count));
+                        self.stats.increment_size_bytes(batch_stats.size_bytes);
+                    }
                 }
                 !*failed_commit
             }
@@ -2195,6 +2367,43 @@ where
                 .with_operation(header.operation)
                 .with_error(send_error.to_string()),
             );
+        }
+    }
+
+    fn restage_consumer_offset_from_journal(
+        &self,
+        op: u64,
+    ) -> Result<PendingConsumerOffsetCommit, IggyError> {
+        let entry = self
+            .log
+            .journal()
+            .inner
+            .repair_entry(op)
+            .ok_or(IggyError::InvalidCommand)?;
+        // Deep copy: the journal buffer is shared and `Message::try_from`
+        // wants an `Owned`; this path only runs on the post-view-change
+        // fallback, never per-commit.
+        let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(entry.as_slice());
+        let message = Message::<GenericHeader>::try_from(owned)
+            .map_err(|_| IggyError::InvalidCommand)?
+            .try_into_typed::<PrepareHeader>()
+            .map_err(|_| IggyError::InvalidCommand)?;
+        let header = *message.header();
+        let (kind, consumer_id, offset, _ack) =
+            Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
+        match header.operation {
+            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                let offset = offset.ok_or(IggyError::InvalidCommand)?;
+                Ok(if is_auto_commit_client(header.client) {
+                    PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
+                } else {
+                    PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
+                })
+            }
+            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                Ok(PendingConsumerOffsetCommit::delete(kind, consumer_id))
+            }
+            _ => Err(IggyError::InvalidCommand),
         }
     }
 
@@ -2454,15 +2663,15 @@ where
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
         );
+        let index_size_bytes = storage
+            .index_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
+            .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(std::sync::atomic::AtomicU64::new(0)),
-                config.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
 
         let old_storage = &mut self.log.storages_mut()[old_segment_index];
@@ -2698,15 +2907,15 @@ where
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
         );
+        let index_size_bytes = storage
+            .index_writer
+            .as_ref()
+            .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
+            .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                Rc::new(std::sync::atomic::AtomicU64::new(0)),
-                config.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+                .await
+                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -2774,6 +2983,11 @@ where
         self.offset.store(start_offset, Ordering::Release);
         self.dirty_offset.store(start_offset, Ordering::Relaxed);
         self.should_increment_offset = false;
+        // The boot-time durable line marks recovered bytes that must not be
+        // re-persisted, but the purge just deleted those bytes and offsets
+        // restart at 0. Keeping it would make every post-purge batch at or
+        // below the old line evict silently without ever reaching a segment.
+        self.recovered_durable_offset = None;
 
         // Clear consumer + consumer-group offsets (memory + disk). Collect the
         // file paths before deleting so the map guard is not held across an
@@ -2834,6 +3048,236 @@ where
     #[must_use]
     pub fn nth_oldest_sealed_end_offset(&self, count: u32) -> Option<u64> {
         nth_oldest_sealed_end(self.log.segments(), count)
+    }
+
+    /// Ingest one repaired prepare: journal + stage it exactly like a live
+    /// replicated op, minus the view fence, the gap check, and the ack (the
+    /// op is already committed cluster-wide; there is nobody to ack to). The
+    /// commit walk runs at `RepairDone`, after the floor is known.
+    pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
+        let header = *message.header();
+        let Some(session) = &self.repair else {
+            return;
+        };
+        if header.op <= self.consensus().commit_min() || header.op > session.to_op {
+            return;
+        }
+        // Any in-window frame proves the stream is alive; only silence
+        // should age the stall counter.
+        if let Some(session) = self.repair.as_mut() {
+            session.idle_ticks = 0;
+        }
+        if self.log.journal().inner.header_by_op(header.op).is_some() {
+            return;
+        }
+        let applied = if header.operation == Operation::SendMessages {
+            match self.append_repaired_send_messages(message).await {
+                Ok(base_offset) => {
+                    if let (Some(base_offset), Some(session)) = (base_offset, self.repair.as_mut())
+                    {
+                        session.first_batch_offset = Some(
+                            session
+                                .first_batch_offset
+                                .map_or(base_offset, |first| first.min(base_offset)),
+                        );
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.apply_replicated_operation(message).await
+        };
+        if let Err(error) = applied {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                op = header.op,
+                %error,
+                "failed to journal repaired prepare"
+            );
+            return;
+        }
+        // Advance the sequencer only along the CONTIGUOUS journaled
+        // frontier. DVC advertises `op = sequencer.current_sequence()` and
+        // elections pick the max, so bumping straight to a repaired op that
+        // sits above an unfilled hole would let this replica win a view it
+        // cannot walk. A dropped frame stalls the frontier here; the stall
+        // retry refills the hole and the next apply resumes the advance
+        // (walking over ops that were journaled out of order meanwhile).
+        let mut frontier = self.consensus().sequencer().current_sequence();
+        while self
+            .log
+            .journal()
+            .inner
+            .header_by_op(frontier + 1)
+            .is_some()
+        {
+            frontier += 1;
+        }
+        let consensus = self.consensus();
+        if frontier > consensus.sequencer().current_sequence() {
+            consensus.sequencer().set_sequence(frontier);
+        }
+        consensus.set_last_prepare_checksum(header.checksum);
+    }
+
+    /// Conclude a repair stream: settle the commit floor at the serving
+    /// peer's eviction point (everything below it is represented by this
+    /// replica's recovered segments + offset files) and walk the repaired
+    /// window through the normal commit path.
+    pub async fn complete_repair(&mut self, config: &PartitionsConfig) {
+        let Some(session) = self.repair else {
+            return;
+        };
+        if let Some(floor) = session.floor {
+            // A peer may have evicted past this replica's commit frontier;
+            // an unclamped floor would drive commit_min above commit_max and
+            // panic the next advance.
+            let floor = floor.min(self.consensus().commit_max());
+            // The floor claims "recovered durable state stands in below me".
+            // Verify it: the served window must connect to the recovered
+            // segments. A window starting above the durable end means ops
+            // below the floor are neither locally durable nor repaired --
+            // that gap is state-transfer territory, and accepting the floor
+            // would silently serve a holed log. Refuse and stay gap-stopped:
+            // a visible stall beats invisible loss.
+            let durable_end = self.recovered_durable_offset;
+            let connected = match (session.first_batch_offset, durable_end) {
+                (Some(first), Some(durable)) => first <= durable.saturating_add(1),
+                (Some(first), None) => first == 0,
+                // No repaired batch arrived, so there is no offset anchor to
+                // verify the floor's continuum claim against. `None` is only
+                // safe when the served window itself proves it carried no
+                // messages: every op in `(floor, to_op]` journaled and none
+                // of them `SendMessages`. Anything less -- dropped frames, or
+                // a fully evicted window -- is indistinguishable from a
+                // message range below the floor that this replica does not
+                // durably own, and accepting it would serve a holed log.
+                (None, _) => self.repaired_window_is_offsets_only(floor, session.to_op),
+            };
+            if !connected {
+                tracing::error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = self.namespace().inner(),
+                    floor,
+                    first_batch_offset = ?session.first_batch_offset,
+                    recovered_durable_offset = ?durable_end,
+                    "refusing commit floor: repaired window does not connect \
+                     to recovered durable state (needs state transfer)"
+                );
+                self.commit_journal(config).await;
+                return;
+            }
+            let commit_min = self.consensus().commit_min();
+            if floor > commit_min {
+                self.consensus().set_commit_floor(floor);
+            }
+        }
+        let before = self.consensus().commit_min();
+        self.commit_journal(config).await;
+        let commit_min = self.consensus().commit_min();
+        // Completion is decided HERE, not by the peer's served-through
+        // claim: repair frames ride a lossy best-effort bus, so a stream
+        // the peer fully served can still arrive with holes. Only a walk
+        // that reached the requested frontier closes the session; anything
+        // less keeps it armed and the stall retry re-requests the remains
+        // (`commit_min + 1..`), converging over rounds.
+        let done = commit_min >= session.to_op;
+        if done {
+            self.repair = None;
+        }
+        tracing::info!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = self.namespace().inner(),
+            commit_min_before = before,
+            commit_min_after = commit_min,
+            commit_max = self.consensus().commit_max(),
+            to_op = session.to_op,
+            done,
+            "repair window commit walk finished"
+        );
+    }
+
+    /// Whether the served repair window `(floor, to_op]` arrived complete and
+    /// holds no `SendMessages` op. Only then may a commit floor be accepted
+    /// without a batch anchor: the window demonstrably moved no messages, so
+    /// the consumer-offset table on disk stands in below the floor. An empty
+    /// window (`floor >= to_op`) carries no evidence at all and never
+    /// qualifies.
+    fn repaired_window_is_offsets_only(&self, floor: u64, to_op: u64) -> bool {
+        if floor >= to_op {
+            return false;
+        }
+        ((floor + 1)..=to_op).all(|op| {
+            self.log
+                .journal()
+                .inner
+                .header_by_op(op)
+                .is_some_and(|header| header.operation != Operation::SendMessages)
+        })
+    }
+
+    /// Journal a repaired `SendMessages` prepare, preserving its embedded
+    /// batch stamps. A stored prepare was stamped by `append_messages` on
+    /// the serving replica BEFORE it was journaled, so its `base_offset` /
+    /// `base_timestamp` / `batch_checksum` are the canonical values every
+    /// replica agreed on. Re-stamping from this replica's dirty counter
+    /// (what the live path does) mints a second copy of the window at
+    /// fresh offsets whenever recovered segments already hold the
+    /// originals: the counter sits at the recovered durable END, not at
+    /// the op's position in history.
+    async fn append_repaired_send_messages(
+        &mut self,
+        message: Message<PrepareHeader>,
+    ) -> Result<Option<u64>, IggyError> {
+        let write_lock = self.write_lock.clone();
+        let _guard = write_lock.lock().await;
+
+        let (base_offset, base_timestamp, total_size, message_count) = {
+            let batch =
+                decode_prepare_slice(message.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+            (
+                batch.header.base_offset,
+                batch.header.base_timestamp,
+                batch.header.total_size() as u64,
+                batch.message_count(),
+            )
+        };
+        if message_count == 0 {
+            return Ok(None);
+        }
+        let last_offset = base_offset + u64::from(message_count) - 1;
+
+        self.should_increment_offset = true;
+        let dirty = self.dirty_offset.load(Ordering::Relaxed);
+        self.dirty_offset
+            .store(dirty.max(last_offset), Ordering::Relaxed);
+
+        let segment_index = self.log.segments().len() - 1;
+        let current_position = self.log.segments()[segment_index].current_position;
+        self.log.segments_mut()[segment_index].current_position = current_position
+            .checked_add(total_size)
+            .ok_or(IggyError::CannotAppendMessage)?;
+
+        let journal = self.log.journal_mut();
+        journal.info.messages_count += message_count;
+        journal.info.size += IggyByteSize::from(total_size);
+        journal.info.current_offset = last_offset;
+        if journal.info.first_timestamp == 0 {
+            journal.info.first_timestamp = base_timestamp;
+        }
+        journal.info.end_timestamp = base_timestamp;
+        journal.info.max_timestamp = journal.info.max_timestamp.max(base_timestamp);
+        journal
+            .inner
+            .append(message.into_frozen())
+            .await
+            .map_err(|_| IggyError::CannotAppendMessage)?;
+        Ok(Some(base_offset))
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
@@ -3552,6 +3996,124 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn repair_config() -> PartitionsConfig {
+        PartitionsConfig {
+            messages_required_to_save: 1,
+            size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+            enforce_fsync: false,
+            segment_size: IggyByteSize::from(1024 * 1024),
+            encryptor: None,
+        }
+    }
+
+    fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+        RepairSession {
+            nonce: 1,
+            to_op,
+            floor: Some(floor),
+            peer: 0,
+            first_batch_offset,
+            idle_ticks: 0,
+        }
+    }
+
+    async fn journal_prepare(
+        partition: &IggyPartition<IggyMessageBus>,
+        op: u64,
+        operation: Operation,
+    ) {
+        let size = std::mem::size_of::<PrepareHeader>();
+        let prepare = Message::<PrepareHeader>::new(size).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command2::Prepare;
+                header.op = op;
+                header.operation = operation;
+                header.size = u32::try_from(size).expect("prepare header size fits in u32");
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(
+            partition.repair.is_some(),
+            "session must stay armed for retry"
+        );
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_offsets_only_should_accept_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        // Any non-SendMessages operation exercises the offsets-only arm; the
+        // commit walk no-ops operations it does not recognize, so the test
+        // needs no on-disk offset directories.
+        for op in 6..=8 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert!(partition.consensus().commit_min() >= 5);
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_holds_message_op_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        journal_prepare(&partition, 6, Operation::SendMessages).await;
+        for op in 7..=8 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition.repair = Some(armed_session(8, 5, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+    }
+
+    #[compio::test]
+    async fn given_no_repaired_batch_when_window_fully_evicted_should_refuse_commit_floor() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        partition.repair = Some(armed_session(8, 8, None));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_some());
+    }
+
+    #[compio::test]
+    async fn given_repaired_batch_above_durable_end_when_floor_arrives_should_refuse_commit_floor()
+    {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(8);
+        // No recovered segments (durable end None) and the served window's
+        // first batch starts at offset 3: ops below the floor are neither
+        // locally durable nor repaired.
+        partition.repair = Some(armed_session(8, 5, Some(3)));
+
+        partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 0);
     }
 }
 

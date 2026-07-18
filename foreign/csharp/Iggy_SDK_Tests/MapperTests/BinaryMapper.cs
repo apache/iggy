@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers.Binary;
+using System.Security.Cryptography;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Shared;
 using Apache.Iggy.Tests.Utils;
 using Apache.Iggy.Tests.Utils.Groups;
 using Apache.Iggy.Tests.Utils.Messages;
@@ -341,5 +346,111 @@ public sealed class BinaryMapper
         Assert.Equal(stats.OsName, response.OsName);
         Assert.Equal(stats.OsVersion, stats.OsVersion);
         Assert.Equal(stats.KernelVersion, response.KernelVersion);
+    }
+
+    [Fact]
+    public void MapRentedMessages_WithEncryptor_DecryptsPayloadsAndHeadersIntoPooledBuffer()
+    {
+        var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
+        var payload1 = "first-secret-payload"u8.ToArray();
+        var headers1 = "first-secret-headers"u8.ToArray();
+        var payload2 = "second-secret-payload"u8.ToArray();
+
+        var frame1 = BuildEncryptedFrame(encryptor, 100, payload1, headers1);
+        var frame2 = BuildEncryptedFrame(encryptor, 101, payload2, ReadOnlySpan<byte>.Empty);
+
+        var combined = new byte[16 + frame1.Length + frame2.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 101);
+        BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 2);
+        frame1.CopyTo(combined.AsSpan(16));
+        frame2.CopyTo(combined.AsSpan(16 + frame1.Length));
+
+        using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance,
+            encryptor);
+
+        Assert.Equal(7, rental.PartitionId);
+        Assert.Equal(101ul, rental.CurrentOffset);
+        Assert.Equal(2, rental.Messages.Count);
+
+        var first = rental.Messages[0];
+        Assert.Equal(payload1, first.Payload.ToArray());
+        Assert.Equal(headers1, first.RawUserHeaders.ToArray());
+        Assert.Equal(payload1.Length, first.Header.PayloadLength);
+        Assert.Equal(headers1.Length, first.Header.UserHeadersLength);
+
+        var second = rental.Messages[1];
+        Assert.Equal(payload2, second.Payload.ToArray());
+        Assert.True(second.RawUserHeaders.IsEmpty);
+        Assert.Equal(payload2.Length, second.Header.PayloadLength);
+        Assert.Equal(0, second.Header.UserHeadersLength);
+
+        var materialized = Mappers.BinaryMapper.MaterializeMessages(rental);
+        Assert.Equal(payload1, materialized.Messages[0].Payload);
+        Assert.Equal(headers1, materialized.Messages[0].RawUserHeaders);
+        Assert.Equal(payload2, materialized.Messages[1].Payload);
+    }
+
+    [Fact]
+    public void MapRentedMessages_WithEncryptor_NegativePayloadLength_ThrowsInsteadOfSpinning()
+    {
+        var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
+
+        var frame = new byte[64];
+        BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(48, 4), 0); // headersLength
+        BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(52, 4), -64); // payloadLength
+
+        var combined = new byte[16 + frame.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
+        frame.CopyTo(combined.AsSpan(16));
+
+        Assert.Throws<MalformedResponseException>(() =>
+            Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance, encryptor));
+    }
+
+    [Fact]
+    public void MapRentedMessages_WithEncryptor_TamperedCiphertext_ThrowsMessageDecryptionException()
+    {
+        var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
+        var frame = BuildEncryptedFrame(encryptor, 42, "secret-payload"u8, ReadOnlySpan<byte>.Empty);
+
+        frame[64 + 12] ^= 0xFF;
+
+        var combined = new byte[16 + frame.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
+        BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 42);
+        BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
+        frame.CopyTo(combined.AsSpan(16));
+
+        var ex = Assert.Throws<MessageDecryptionException>(() =>
+            Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance, encryptor));
+
+        Assert.Equal(42ul, ex.Offset);
+        Assert.Equal(7u, ex.PartitionId);
+        Assert.IsAssignableFrom<CryptographicException>(ex.InnerException);
+    }
+
+    private static byte[] BuildEncryptedFrame(AesMessageEncryptor encryptor, ulong offset,
+        ReadOnlySpan<byte> plainPayload, ReadOnlySpan<byte> plainHeaders)
+    {
+        var cipherPayload = encryptor.EncryptToArray(plainPayload);
+        var cipherHeaders = plainHeaders.Length > 0 ? encryptor.EncryptToArray(plainHeaders) : [];
+
+        var frame = new byte[64 + cipherPayload.Length + cipherHeaders.Length];
+        Span<byte> span = frame.AsSpan();
+        BinaryPrimitives.WriteUInt64LittleEndian(span[..8], 0);
+        BinaryPrimitives.WriteUInt128LittleEndian(span[8..24], Guid.NewGuid().ToUInt128());
+        BinaryPrimitives.WriteUInt64LittleEndian(span[24..32], offset);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[32..40], 12345);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[40..48], 12345);
+        BinaryPrimitives.WriteInt32LittleEndian(span[48..52], cipherHeaders.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(span[52..56], cipherPayload.Length);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[56..64], 0);
+        cipherPayload.CopyTo(span[64..]);
+        cipherHeaders.CopyTo(span[(64 + cipherPayload.Length)..]);
+
+        return frame;
     }
 }

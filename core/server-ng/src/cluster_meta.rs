@@ -32,6 +32,8 @@ use configs::cluster::{ClusterNodeConfig, TransportPorts};
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Node name reported for the synthesized self node when no roster applies.
 const SELF_NODE_NAME: &str = "iggy-node";
@@ -54,7 +56,14 @@ pub struct ClusterRoster {
     /// This node's own client ports for the same self node (`None` = transport
     /// disabled).
     pub self_ports: TransportPorts,
+    /// Metadata-group view, published by shard 0 (the only shard holding the
+    /// consensus instance) so every shard's cluster-metadata read marks the
+    /// current leader. `u64::MAX` until shard 0 first publishes.
+    pub metadata_view: Arc<AtomicU64>,
 }
+
+/// Sentinel for "shard 0 has not published a view yet".
+pub const METADATA_VIEW_UNKNOWN: u64 = u64::MAX;
 
 impl ClusterRoster {
     /// A cluster-disabled roster with no self address. Used as the pre-bootstrap
@@ -67,7 +76,22 @@ impl ClusterRoster {
             nodes: Vec::new(),
             self_ip: String::new(),
             self_ports: TransportPorts::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         }
+    }
+
+    /// The current metadata primary's roster index, from the shard-0-published
+    /// view; `None` until the first publish or with no roster.
+    pub fn current_primary_index(&self) -> Option<u8> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let view = self.metadata_view.load(Ordering::Relaxed);
+        if view == METADATA_VIEW_UNKNOWN {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        Some((view % self.nodes.len() as u64) as u8)
     }
 
     /// Build the [`ClusterMetadata`] view. With a configured, non-empty roster

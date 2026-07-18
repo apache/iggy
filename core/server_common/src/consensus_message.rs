@@ -18,7 +18,8 @@
 use crate::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    Operation, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader,
+    RequestHeader, RequestPreparesHeader, RequestStartViewHeader, StartViewChangeHeader,
     StartViewHeader,
 };
 use smallvec::SmallVec;
@@ -225,7 +226,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -261,7 +262,7 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if !T::accepts(generic.header().command) {
             return Err(ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: generic.header().command,
@@ -500,6 +501,17 @@ pub enum MessageBag {
     DoViewChange(Message<DoViewChangeHeader>),
     StartView(Message<StartViewHeader>),
     Commit(Message<CommitHeader>),
+    RequestStartView(Message<RequestStartViewHeader>),
+    RequestPrepares(Message<RequestPreparesHeader>),
+    /// A journaled prepare re-sent verbatim for repair (command byte
+    /// distinguishes it from a live `Prepare`: repair bypasses the view
+    /// fence and never acks). Stays typed as `RepairPrepare` through every
+    /// parse -- the router round-trips frames through generic bytes, so a
+    /// parse-time byte restore would surface as a live `Prepare` on the
+    /// second pass and die on the view fence.
+    RepairPrepare(Message<RepairPrepareHeader>),
+    /// `RepairDone` / `RangeEvicted` (one layout, two commands).
+    RepairRangeReply(Message<RepairRangeReplyHeader>),
 }
 
 impl MessageBag {
@@ -513,6 +525,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().command,
             Self::StartView(message) => message.header().command,
             Self::Commit(message) => message.header().command,
+            Self::RequestStartView(message) => message.header().command,
+            Self::RequestPrepares(message) => message.header().command,
+            Self::RepairPrepare(message) => message.header().command(),
+            Self::RepairRangeReply(message) => message.header().command,
         }
     }
 
@@ -526,6 +542,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().size(),
             Self::StartView(message) => message.header().size(),
             Self::Commit(message) => message.header().size(),
+            Self::RequestStartView(message) => message.header().size(),
+            Self::RequestPrepares(message) => message.header().size(),
+            Self::RepairPrepare(message) => message.header().size(),
+            Self::RepairRangeReply(message) => message.header().size(),
         }
     }
 
@@ -539,6 +559,10 @@ impl MessageBag {
             Self::DoViewChange(message) => message.header().operation(),
             Self::StartView(message) => message.header().operation(),
             Self::Commit(message) => message.header().operation(),
+            Self::RequestStartView(message) => message.header().operation(),
+            Self::RequestPrepares(message) => message.header().operation(),
+            Self::RepairPrepare(message) => message.header().operation(),
+            Self::RepairRangeReply(message) => message.header().operation(),
         }
     }
 }
@@ -568,6 +592,22 @@ where
             )),
             Command2::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
             Command2::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
+            Command2::RequestStartView => Ok(Self::RequestStartView(
+                value.try_into_typed::<RequestStartViewHeader>()?,
+            )),
+            Command2::RequestPrepares => Ok(Self::RequestPrepares(
+                value.try_into_typed::<RequestPreparesHeader>()?,
+            )),
+            // A repaired prepare is a stored PrepareHeader frame whose command
+            // byte was rewritten; typed validation would reject the byte, so
+            // parse through the generic backing and trust the prepare-shaped
+            // layout the way the journal that produced it did.
+            Command2::RepairPrepare => Ok(Self::RepairPrepare(
+                value.try_into_typed::<RepairPrepareHeader>()?,
+            )),
+            Command2::RepairDone | Command2::RangeEvicted => Ok(Self::RepairRangeReply(
+                value.try_into_typed::<RepairRangeReplyHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {
@@ -611,6 +651,50 @@ mod tests {
                 .copy_from_slice(&0xCAFE_u128.to_le_bytes());
         }
         o
+    }
+
+    // MessageBag round-trip for the probe + repair command family. Locks
+    // RangeEvicted delivery in particular: RepairDone and RangeEvicted share
+    // one header layout and BOTH must survive the typed parse -- a strict
+    // command match in `try_into_typed` silently dropped every RangeEvicted
+    // frame and with it the whole commit-floor path.
+    #[test]
+    fn probe_and_repair_commands_round_trip_into_bag() {
+        for command in [
+            Command2::RequestStartView,
+            Command2::RequestPrepares,
+            Command2::RepairPrepare,
+            Command2::RepairDone,
+            Command2::RangeEvicted,
+        ] {
+            let mut owned = header_bytes(command, 256);
+            if command == Command2::RequestPrepares {
+                // validate() demands a non-empty 1-based range.
+                const FROM_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, from_op);
+                const TO_OP_OFF: usize =
+                    std::mem::offset_of!(iggy_binary_protocol::RequestPreparesHeader, to_op);
+                let buf = owned.as_mut_slice();
+                buf[FROM_OP_OFF..FROM_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+                buf[TO_OP_OFF..TO_OP_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+            }
+            let generic = Message::<GenericHeader>::try_from(owned)
+                .unwrap_or_else(|e| panic!("{command:?} failed generic framing: {e}"));
+            let bag = MessageBag::try_from(generic)
+                .unwrap_or_else(|e| panic!("{command:?} failed bag parse: {e}"));
+            let routed = matches!(
+                (&bag, command),
+                (MessageBag::RequestStartView(_), Command2::RequestStartView)
+                    | (MessageBag::RequestPrepares(_), Command2::RequestPrepares)
+                    | (MessageBag::RepairPrepare(_), Command2::RepairPrepare)
+                    | (
+                        MessageBag::RepairRangeReply(_),
+                        Command2::RepairDone | Command2::RangeEvicted
+                    )
+            );
+            assert!(routed, "{command:?} parsed into the wrong bag variant");
+            assert_eq!(bag.command(), command, "original command byte must survive");
+        }
     }
 
     // Construction via Message::new (zeroed)

@@ -23,13 +23,18 @@ use crate::stm::consumer_group::{
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, PurgeStreamResult,
-    PurgeTopicResult, UpdateStreamResult, UpdateTopicResult,
+    PurgeTopicResult, TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+// Only `seed_single_partition` (below, sim/test-gated) uses this at module
+// scope; keep the import under the same gate so a production build does not
+// see it as unused. The test module re-imports it independently.
+#[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -542,27 +547,29 @@ impl WireDecode for TruncatePartitionRequest {
 impl StateHandler for TruncatePartitionRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        // Internal op (no client result enum): a missing parent / partition is
-        // an idempotent no-op, like the other reconciler-fed internal ops.
+        // The committed form of a client `DeleteSegments`: an unresolvable
+        // target commits as a rejection, keeping the client's request
+        // sequence contiguous (`request == committed + 1`) while surfacing
+        // the typed error an empty ack would swallow.
         {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
             let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
             let Some(stream) = state.items.get_mut(stream_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
             let Some(topic) = stream.topics.get_mut(topic_id) else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
             let Some(partition) = topic
                 .partitions
                 .iter_mut()
                 .find(|partition| partition.id == self.partition_id as usize)
             else {
-                return ApplyReply::ok(Bytes::new());
+                return ApplyReply::err(TruncatePartitionResult::PartitionNotFound);
             };
             // Monotonic: a stale or duplicate replay never rewinds the watermark.
             if self.up_to_offset > partition.deleted_up_to_offset {
@@ -1154,6 +1161,55 @@ impl Streams {
                 .any(|partition| partition.id == partition_id)
                 .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
         })
+    }
+
+    /// Seed the first stream / topic / partition straight into the STM so a
+    /// simulator or test namespace resolves without driving the metadata
+    /// consensus + reconciler chain (which the simulator does not wire).
+    ///
+    /// Creates stream slab 0, topic slab 0, and one partition `partition_id`
+    /// bound to `consensus_group_id`, so `namespace_from_partition(numeric 0,
+    /// numeric 0, partition_id)` resolves to `IggyNamespace::new(0, 0,
+    /// partition_id)`. Mirrors [`Users::ensure_root_user`]: a seed helper
+    /// that bypasses consensus, never a production runtime path. No-op if a
+    /// stream already occupies slab 0.
+    ///
+    /// # Panics
+    /// Panics if the apply is attempted on a reader handle rather than the
+    /// writer (never for the simulator's writer-backed STM).
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn seed_single_partition(&self, partition_id: u32, consensus_group_id: u64) {
+        if self.read(|inner| inner.items.contains(0)) {
+            return;
+        }
+        self.inner
+            .try_apply(StreamsCommand::CreateStream(
+                CreateStreamRequest {
+                    name: WireName::new("sim-stream").expect("sim stream name is valid"),
+                },
+                IggyTimestamp::from(1),
+            ))
+            .expect("sim stream seed applies on the metadata writer");
+        self.inner
+            .try_apply(StreamsCommand::CreateTopicWithAssignments(
+                CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                        compression_algorithm: 0,
+                        message_expiry: 0,
+                        max_topic_size: 0,
+                        replication_factor: 1,
+                        name: WireName::new("sim-topic").expect("sim topic name is valid"),
+                    },
+                    partitions: vec![CreatedPartitionAssignment {
+                        partition_id,
+                        consensus_group_id,
+                    }],
+                },
+                IggyTimestamp::from(1),
+            ))
+            .expect("sim topic seed applies on the metadata writer");
     }
 
     #[must_use]

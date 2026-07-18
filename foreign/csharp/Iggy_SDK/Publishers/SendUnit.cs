@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Encryption;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Messages;
@@ -118,7 +117,8 @@ internal sealed class ReadyUnit : SendUnit
 
 /// <summary>
 ///     A unit of typed values serialized at flush time into the processor's shared payload buffer. Holds the
-///     serializer and optional encryptor it was created with, so the non-generic processor loop can drive it.
+///     serializer it was created with, so the non-generic processor loop can drive it. Encryption is applied by
+///     the client at send time, not here.
 /// </summary>
 /// <remarks>
 ///     Because serialization is deferred, a value is captured by reference when queued: mutating a queued mutable
@@ -126,7 +126,6 @@ internal sealed class ReadyUnit : SendUnit
 /// </remarks>
 internal sealed class TypedUnit<T> : SendUnit
 {
-    private readonly IMessageEncryptor? _encryptor;
     private readonly Item[] _items;
     private readonly ISerializer<T> _serializer;
 
@@ -146,15 +145,14 @@ internal sealed class TypedUnit<T> : SendUnit
         }
     }
 
-    private TypedUnit(Item[] items, ISerializer<T> serializer, IMessageEncryptor? encryptor)
+    private TypedUnit(Item[] items, ISerializer<T> serializer)
     {
         _items = items;
         _serializer = serializer;
-        _encryptor = encryptor;
     }
 
     public static TypedUnit<T> Single(T value, UInt128 id, Dictionary<HeaderKey, HeaderValue>? headers,
-        ISerializer<T> serializer, IMessageEncryptor? encryptor)
+        ISerializer<T> serializer)
     {
         return new TypedUnit<T>([
             new Item
@@ -163,29 +161,26 @@ internal sealed class TypedUnit<T> : SendUnit
                 Id = id,
                 Headers = headers
             }
-        ], serializer, encryptor);
+        ], serializer);
     }
 
-    public static TypedUnit<T> Batch(IEnumerable<T> values, ISerializer<T> serializer, IMessageEncryptor? encryptor)
+    public static TypedUnit<T> Batch(IEnumerable<T> values, ISerializer<T> serializer)
     {
-        var items = Materialize(values, static value => new Item
-        {
-            Value = value
-        });
-        return new TypedUnit<T>(items, serializer, encryptor);
+        Item[] items = Materialize(values, static value => new Item { Value = value });
+        return new TypedUnit<T>(items, serializer);
     }
 
     public static TypedUnit<T> Batch(
         IEnumerable<(T data, Guid? messageId, Dictionary<HeaderKey, HeaderValue>? userHeaders)> values,
-        ISerializer<T> serializer, IMessageEncryptor? encryptor)
+        ISerializer<T> serializer)
     {
-        var items = Materialize(values, static value => new Item
+        Item[] items = Materialize(values, static value => new Item
         {
             Value = value.data,
             Id = value.messageId?.ToUInt128() ?? UInt128.Zero,
             Headers = value.userHeaders
         });
-        return new TypedUnit<T>(items, serializer, encryptor);
+        return new TypedUnit<T>(items, serializer);
     }
 
     private static Item[] Materialize<TSource>(IEnumerable<TSource> values, Func<TSource, Item> toItem)
@@ -228,11 +223,6 @@ internal sealed class TypedUnit<T> : SendUnit
         {
             ref var item = ref _items[i];
             var message = new Message(item.Id, payloadBuffer.Slice(item.Offset, item.Length), item.Headers);
-            if (_encryptor != null)
-            {
-                PublisherEncryption.Encrypt(message, _encryptor);
-            }
-
             wire.Add(message);
         }
     }

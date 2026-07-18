@@ -30,40 +30,27 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-#[cfg(not(feature = "vsr"))]
+// Drives the `iggy` CLI binary against a running server, in both legacy and
+// vsr/server-ng modes. Under vsr, single-node and the default 3-node cluster
+// both pass. A few cases are mode-split where server-ng diverges from legacy by
+// design: flush returns FeatureUnavailable, the session-timeout message
+// differs, and purge is eventually consistent so server state is polled.
 mod cli;
+// A single `#[ignore]`d multi-node ping matrix stub; none of its cells run in
+// either mode today.
 #[cfg(not(feature = "vsr"))]
 mod cluster;
 mod config_provider;
 mod connectors;
-// TODO(vsr): enable the `data_integrity` suite under the `vsr` feature once
-// the full VSR path is done. Tier 1 (`verify_user_login_after_restart`,
-// `verify_no_plaintext_credentials_on_disk`) is server-side ready (create_user
-// reply body, get_users/get_user via `frontend()`, change_password, cross-shard
-// committed-reply routing) -- proven by `sdk::hello_world::replicated_*` under
-// vsr. Blocked on: (1) these tests use `[Tcp, Http, Quic, WebSocket]` but only
-// Tcp works under vsr today (Http does no VSR framing; WebSocket/Quic hit the
-// compio `buffer.rs:83` bug); (2) the module also carries
-// `verify_after_server_restart` + `verify_consumer_group_partition_assignment`,
-// which need send/poll messages + consumer groups (out of Tier 1 scope).
-//
-// `verify_consumer_group_partition_assignment` (cooperative rebalance):
-// server-ng now implements cooperative rebalance (pending revocations, eager
-// handoff of never-polled/drained partitions via the join-time in-flight
-// gather, drain/timeout completion through the reconciler) -- most of this
-// suite passes. Kept gated under vsr for two reasons: (1) the 84-case
-// multi-client+reconnect matrix is flaky on the open replica-mesh-degradation
-// front (a peer link blip loses a metadata read), and (2) two cases still need
-// follow-ups -- `should_wait_for_manual_commit_before_completing_revocation`
-// needs event-driven (on-commit) completion for sub-second latency (the
-// reconciler completes on its 1s tick), and `should_skip_revoked_partitions_in_
-// round_robin` needs the source client to re-sync to its pollable set after a
-// revocation. server-ng's rebalance is also covered by `server::cg_vsr` +
-// `stale_client_consumer_group_scenario` (both green).
+// Runs under vsr; the one gap (`verify_after_server_restart`) is gated inside
+// the module: its rejoin window exceeds journal retention (state transfer).
 mod data_integrity;
 mod mcp;
 mod sdk;
 mod server;
+// Unit-tests the legacy `server` crate's state-file machinery directly
+// (`server::state::file::FileState` etc.). server-ng replaces that layer with
+// the metadata WAL, so this suite is legacy-only by construction, not a gap.
 #[cfg(not(feature = "vsr"))]
 mod state;
 mod storage;

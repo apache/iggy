@@ -18,9 +18,11 @@
 namespace Apache.Iggy.Exceptions;
 
 /// <summary>
-///     Exception thrown when the response from the server is invalid.
+///     Exception thrown when the response from the server is invalid. Covers server-rejected commands
+///     (error status responses), which may be transient; see <see cref="MalformedResponseException" /> for
+///     unparsable frames the consumer treats as non-retryable poison.
 /// </summary>
-public sealed class InvalidResponseException : Exception
+public class InvalidResponseException : Exception
 {
     /// <summary>
     ///     Initializes a new instance of the <see cref="InvalidResponseException" /> class.

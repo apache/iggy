@@ -31,16 +31,17 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
-        <PackageReference Include="Microsoft.Testing.Extensions.Retry" />
-        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" />
-        <PackageReference Include="Shouldly" />
-        <PackageReference Include="Testcontainers" />
-        <PackageReference Include="TUnit" />
+        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage"/>
+        <PackageReference Include="Microsoft.Testing.Extensions.Retry"/>
+        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport"/>
+        <PackageReference Include="Shouldly"/>
+        <PackageReference Include="Testcontainers"/>
+        <PackageReference Include="TUnit"/>
     </ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj"/>
+        <ProjectReference Include="..\Shared\Shared.csproj"/>
     </ItemGroup>
 
     <ItemGroup>

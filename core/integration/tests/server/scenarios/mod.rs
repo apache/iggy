@@ -21,8 +21,6 @@ pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
-// Only consumed by `cg_vsr` (server-ng); legacy `cg.rs` has no equivalent.
-#[cfg(feature = "vsr")]
 pub mod consumer_group_duplicate_name_create_scenario;
 pub mod consumer_group_join_scenario;
 pub mod consumer_group_new_messages_after_restart_scenario;
@@ -36,13 +34,8 @@ pub mod create_message_payload;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
-// Asserts server log-file rotation/archival policies; server-ng's file
-// logger only captures bootstrap output (shard-thread logs never reach the
-// file), so volume-based rotation rules cannot trigger.
-#[cfg(not(feature = "vsr"))]
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;
@@ -51,9 +44,7 @@ pub mod offset_scenario;
 pub mod permissions_scenario;
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod reconnect_after_restart_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod restart_offset_skip_scenario;
 pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;

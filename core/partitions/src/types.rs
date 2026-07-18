@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{IggyByteSize, PollingStrategy};
+use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -202,6 +203,39 @@ impl Default for PartitionOffsets {
     }
 }
 
+/// Ticks of a stalled repair stream tolerated before a re-request.
+///
+/// Partition group ticks are ~10ms, so ~1s. Repair frames are
+/// fire-and-forget over a lossy bus; a session with no retry wedges
+/// forever on a single dropped frame. The remaining window is re-requested
+/// from the serving peer.
+pub const REPAIR_RETRY_TICKS: u32 = 100;
+
+/// One in-flight journal-repair stream for a partition group.
+#[derive(Debug, Clone, Copy)]
+pub struct RepairSession {
+    /// Fences stale repair frames from an earlier attempt.
+    pub nonce: u128,
+    /// Last op the stream is expected to serve (the frontier at request time).
+    pub to_op: u64,
+    /// Commit floor learned from `RangeEvicted { retained_from }`:
+    /// `retained_from - 1`. `None` until (unless) the serving peer reports a
+    /// truncated prefix.
+    pub floor: Option<u64>,
+    /// The peer serving this stream (re-request target on stall).
+    pub peer: u8,
+    /// Lowest `base_offset` among the repaired `SendMessages` batches:
+    /// where the served window begins in offset space. Compared against the
+    /// boot-recovered durable end when a commit floor arrives -- a window
+    /// starting above `recovered_durable_offset + 1` means ops below the
+    /// floor are neither locally durable nor repaired (state-transfer
+    /// territory), and the floor must be refused.
+    pub first_batch_offset: Option<u64>,
+    /// Ticks since the stream last made progress; at
+    /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
+    pub idle_ticks: u32,
+}
+
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
@@ -216,6 +250,13 @@ pub struct PartitionsConfig {
     pub enforce_fsync: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+    /// Server-side at-rest encryption. Applied ONCE, on the primary at
+    /// ingestion, so the ciphertext replicates verbatim: every replica
+    /// journals, acks, and persists identical bytes (checksums and the
+    /// deterministic segment rolls both depend on that), and the poll path
+    /// decrypts uniformly whether a fragment came from the resident journal
+    /// or from disk.
+    pub encryptor: Option<Arc<EncryptorKind>>,
 }
 
 impl PartitionsConfig {
