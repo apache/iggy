@@ -149,7 +149,7 @@ fn produce_response_v3_roundtrip() {
     let partition = d.read_i32().unwrap();
     assert_eq!(partition, 0);
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 0);
+    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER — stub until Iggy bridge
     let base_offset = d.read_i64().unwrap();
     assert_eq!(base_offset, 0);
     // log_append_time_ms (v2+)
@@ -176,7 +176,7 @@ fn produce_response_v8_includes_record_errors() {
     assert_eq!(partition_count, 1);
     let _partition = d.read_i32().unwrap();
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 0);
+    assert_eq!(error_code, 6); // NOT_LEADER_OR_FOLLOWER — stub until Iggy bridge
     let _base_offset = d.read_i64().unwrap();
     let _log_append_time = d.read_i64().unwrap(); // v2+
     let _log_start_offset = d.read_i64().unwrap(); // v5+
@@ -523,7 +523,7 @@ fn create_topics_response_v2_roundtrip() {
     let resp_topic = d.read_nullable_string().unwrap().unwrap();
     assert_eq!(resp_topic, topic_name);
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 0);
+    assert_eq!(error_code, 41); // NOT_CONTROLLER — stub until Iggy bridge
     let error_msg = d.read_nullable_string().unwrap(); // v1+
     assert!(error_msg.is_none());
     assert_eq!(d.remaining(), 0);
@@ -545,7 +545,7 @@ fn create_topics_response_v5_roundtrip() {
 
     let _topic_name = d.read_compact_nullable_string().unwrap();
     let error_code = d.read_i16().unwrap();
-    assert_eq!(error_code, 0);
+    assert_eq!(error_code, 41); // NOT_CONTROLLER — stub until Iggy bridge
     let _error_msg = d.read_compact_nullable_string().unwrap(); // v1+
     let num_partitions = d.read_i32().unwrap();
     assert_eq!(num_partitions, 1);

@@ -16,7 +16,8 @@
 // under the License.
 
 use iggy_gateway_kafka::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
+    ERROR_NOT_CONTROLLER, ERROR_UNSUPPORTED_VERSION,
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 use iggy_gateway_kafka::protocol::requests::{
@@ -51,10 +52,11 @@ fn create_topics_response_flags_non_positive_partition_count_v2() {
 }
 
 #[test]
-fn create_topics_response_flags_negative_partition_count_v5_flexible() {
+fn create_topics_v5_broker_default_partitions_is_not_invalid_partitions() {
+    // KIP-464: -1 = broker default on CreateTopics v4+; stub still returns NOT_CONTROLLER.
     let req = CreateTopicsRequest {
         topics: vec![CreatableTopic {
-            name: "bad-flex".to_string(),
+            name: "default-parts".to_string(),
             num_partitions: -1,
             replication_factor: 2,
         }],
@@ -66,12 +68,88 @@ fn create_topics_response_flags_negative_partition_count_v5_flexible() {
     assert_eq!(d.read_varint().unwrap(), 2); // one topic
     assert_eq!(
         d.read_compact_nullable_string().unwrap(),
-        Some("bad-flex".to_string())
+        Some("default-parts".to_string())
     );
-    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
+    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
     assert_eq!(d.read_compact_nullable_string().unwrap(), None);
     assert_eq!(d.read_i32().unwrap(), -1);
     assert_eq!(d.read_i16().unwrap(), 2);
+}
+
+#[test]
+fn create_topics_v5_flags_zero_and_below_minus_one_partition_count() {
+    for num_partitions in [0i32, -2] {
+        let req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "bad-parts".to_string(),
+                num_partitions,
+                replication_factor: 1,
+            }],
+            timeout_ms: 5_000,
+            validate_only: false,
+        };
+        let mut d = Decoder::new(encode_create_topics_response(5, &req));
+        assert_eq!(d.read_i32().unwrap(), 0);
+        assert_eq!(d.read_varint().unwrap(), 2);
+        assert_eq!(
+            d.read_compact_nullable_string().unwrap(),
+            Some("bad-parts".to_string())
+        );
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_INVALID_PARTITIONS,
+            "num_partitions={num_partitions}"
+        );
+    }
+}
+
+#[test]
+fn create_topics_v5_flags_invalid_replication_factor() {
+    for replication_factor in [0i16, -2] {
+        let req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "bad-rf".to_string(),
+                num_partitions: 1,
+                replication_factor,
+            }],
+            timeout_ms: 5_000,
+            validate_only: false,
+        };
+        let mut d = Decoder::new(encode_create_topics_response(5, &req));
+        assert_eq!(d.read_i32().unwrap(), 0);
+        assert_eq!(d.read_varint().unwrap(), 2);
+        assert_eq!(
+            d.read_compact_nullable_string().unwrap(),
+            Some("bad-rf".to_string())
+        );
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_INVALID_REPLICATION_FACTOR,
+            "replication_factor={replication_factor}"
+        );
+    }
+}
+
+#[test]
+fn create_topics_v2_rejects_broker_default_sentinel() {
+    // KIP-464 defaults apply from v4; on v2, -1 is still INVALID_PARTITIONS.
+    let req = CreateTopicsRequest {
+        topics: vec![CreatableTopic {
+            name: "legacy".to_string(),
+            num_partitions: -1,
+            replication_factor: 1,
+        }],
+        timeout_ms: 5_000,
+        validate_only: false,
+    };
+    let mut d = Decoder::new(encode_create_topics_response(2, &req));
+    assert_eq!(d.read_i32().unwrap(), 0);
+    assert_eq!(d.read_i32().unwrap(), 1);
+    assert_eq!(
+        d.read_nullable_string().unwrap(),
+        Some("legacy".to_string())
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_PARTITIONS);
 }
 
 #[test]

@@ -173,11 +173,14 @@ Record kcat version and exact error strings in your test log. G1 passing is the 
 
 | Code | Name | When returned |
 | ------ | ------ | --------------- |
-| 0 | NONE | Successful stub response |
-| 42 | INVALID_REQUEST | Produce/Fetch/ListOffsets/CreateTopics decode failure; unsupported request header |
+| 0 | NONE | Successful stub response (Fetch/ListOffsets/ApiVersions) |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce stub (retriable; payload not persisted) |
 | 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub per-topic error |
 | 35 | UNSUPPORTED_VERSION | Out-of-range version or unlisted API key |
-| 42 | INVALID_REQUEST | Unsupported request header version |
+| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
+| 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
+| 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
+| 42 | INVALID_REQUEST | Produce/Fetch/ListOffsets/CreateTopics decode failure; unsupported request header |
 
 ### Response header rules
 

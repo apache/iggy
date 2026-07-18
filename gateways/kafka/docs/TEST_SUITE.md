@@ -76,7 +76,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the sa
 | v8 record_errors array | `decode_validation_tests` | `produce_response_v8_includes_record_errors` |
 | Unsupported v2 → error 35 | `version_firewall_tests` | `produce_unsupported_version_returns_error_only` |
 | Corrupt body → error 42 | `version_firewall_tests` | `corrupt_produce_body_returns_invalid_request_error` |
-| Stub partition error 0 | `handler_regression_tests` | `produce_stub_response_has_zero_error_per_partition` |
+| Stub partition error 6 (not leader) | `handler_regression_tests` | `produce_stub_response_returns_retriable_not_leader` |
 | E2E round-trip | `server_e2e_tests` | `e2e_produce_v3_round_trip_with_fixture` |
 
 ### Fetch (key 1, v4–v12)
@@ -108,7 +108,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the sa
 | v2 roundtrip | `decode_validation_tests` | `create_topics_response_v2_roundtrip` |
 | v5 flexible roundtrip | `decode_validation_tests` | `create_topics_response_v5_roundtrip` |
 | Unsupported v1 | `version_firewall_tests` | `create_topics_unsupported_version_returns_error_only` |
-| Stub error 0 | `handler_regression_tests` | `create_topics_stub_response_has_zero_error` |
+| Stub error 41 (not controller) | `handler_regression_tests` | `create_topics_stub_response_returns_not_controller` |
 
 ---
 

@@ -687,6 +687,7 @@ async fn read_kafka_response(stream: &mut TcpStream) -> std::io::Result<Vec<u8>>
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_send(
     host: &str,
     registry: &[(i16, &str, i16, i16)],
@@ -695,6 +696,7 @@ async fn run_send(
     toms: u64,
     fail_fast: bool,
     quiet: bool,
+    strict: bool,
 ) -> Result<(usize, usize)> {
     let mut stream = connect(host).await?;
     info!("Connected to {host}");
@@ -739,6 +741,15 @@ async fn run_send(
                 Ok(Ok(r)) => {
                     let summary = response::analyze_response(ak, v, corr, &r);
                     summary.print(name, v, quiet);
+                    if strict && let Some(reason) = summary.verify_failure_reason(ak) {
+                        println!("✗ {name} v{v} → verify fail: {reason}");
+                        fail += 1;
+                        if fail_fast {
+                            break 'outer;
+                        }
+                        corr += 1;
+                        continue;
+                    }
                     ok += 1;
                 }
                 Ok(Err(e)) => {
@@ -795,6 +806,7 @@ async fn main() -> Result<()> {
                 timeout_ms,
                 false,
                 quiet,
+                false,
             )
             .await?;
             println!("\nResult: {ok} OK  {fail} failed");
@@ -815,7 +827,7 @@ async fn main() -> Result<()> {
                 &gateway_registry
             };
             let (ok, fail) = run_send(
-                &host, registry, &api_key, version, timeout_ms, fail_fast, quiet,
+                &host, registry, &api_key, version, timeout_ms, fail_fast, quiet, true,
             )
             .await?;
             println!("\n=== Verify: {ok} passed  {fail} failed ===");

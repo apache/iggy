@@ -2,6 +2,8 @@
 
 Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests, validates scoped API keys and versions, and returns stub responses.
 
+> **Stub warning:** Produce does **not** persist records. Valid Produce requests return retriable `NOT_LEADER_OR_FOLLOWER` (6) so clients keep data locally. CreateTopics does **not** create topics; valid requests return `NOT_CONTROLLER` (41). Metadata still reports requested topics as unknown. Persistence lands with the Iggy bridge (see [docs/SCOPE.md](docs/SCOPE.md)).
+
 ## Run
 
 ```bash

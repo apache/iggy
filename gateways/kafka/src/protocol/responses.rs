@@ -19,11 +19,14 @@
 
 #![allow(clippy::pedantic)]
 
-use crate::protocol::api::{ERROR_INVALID_PARTITIONS, ERROR_NONE};
+use crate::protocol::api::{
+    ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR, ERROR_NONE, ERROR_NOT_CONTROLLER,
+    ERROR_NOT_LEADER_OR_FOLLOWER,
+};
 use crate::protocol::codec::Encoder;
 use crate::protocol::requests::{
-    CreateTopicsRequest, FetchRequest, ListOffsetsRequest, ProducePartitionData, ProduceRequest,
-    ProduceTopicData,
+    CreatableTopic, CreateTopicsRequest, FetchRequest, ListOffsetsRequest, ProducePartitionData,
+    ProduceRequest, ProduceTopicData,
 };
 use bytes::Bytes;
 
@@ -40,7 +43,9 @@ pub fn encode_produce_error_response(version: i16, error_code: i16) -> Bytes {
 }
 
 pub fn encode_produce_response(version: i16, req: &ProduceRequest) -> Bytes {
-    encode_produce_response_inner(version, &req.topics, ERROR_NONE)
+    // Stub: discard payload and return a retriable error so clients keep data locally
+    // until the Iggy bridge lands (do not advertise silent success).
+    encode_produce_response_inner(version, &req.topics, ERROR_NOT_LEADER_OR_FOLLOWER)
 }
 
 fn encode_produce_response_inner(
@@ -295,8 +300,6 @@ fn encode_list_offsets_response_inner(
 
 /// Well-formed CreateTopics response with a single placeholder topic.
 pub fn encode_create_topics_error_response(version: i16, error_code: i16) -> Bytes {
-    use crate::protocol::requests::CreatableTopic;
-
     let topics = vec![CreatableTopic {
         name: String::new(),
         num_partitions: 1,
@@ -309,9 +312,41 @@ pub fn encode_create_topics_response(version: i16, req: &CreateTopicsRequest) ->
     encode_create_topics_response_inner(version, &req.topics, ERROR_NONE)
 }
 
+/// Resolve per-topic CreateTopics error.
+///
+/// KIP-464: on v4+, `num_partitions = -1` / `replication_factor = -1` mean broker default.
+/// Error 37 / 38 only for `0` and values `< -1` (and any non-positive value on v2–v3).
+/// When validation passes, the stub returns [`ERROR_NOT_CONTROLLER`] so clients do not
+/// believe the topic was created before the Iggy bridge exists.
+const fn create_topics_topic_error(version: i16, topic: &CreatableTopic, forced_error: i16) -> i16 {
+    if forced_error != ERROR_NONE {
+        return forced_error;
+    }
+
+    let partitions_ok = if version >= 4 {
+        topic.num_partitions == -1 || topic.num_partitions > 0
+    } else {
+        topic.num_partitions > 0
+    };
+    if !partitions_ok {
+        return ERROR_INVALID_PARTITIONS;
+    }
+
+    let replication_ok = if version >= 4 {
+        topic.replication_factor == -1 || topic.replication_factor > 0
+    } else {
+        topic.replication_factor > 0
+    };
+    if !replication_ok {
+        return ERROR_INVALID_REPLICATION_FACTOR;
+    }
+
+    ERROR_NOT_CONTROLLER
+}
+
 fn encode_create_topics_response_inner(
     version: i16,
-    topics: &[crate::protocol::requests::CreatableTopic],
+    topics: &[CreatableTopic],
     topic_error: i16,
 ) -> Bytes {
     let flexible = version >= 5;
@@ -334,13 +369,7 @@ fn encode_create_topics_response_inner(
             e.write_nullable_string_unchecked(Some(&topic.name));
         }
 
-        let error_code = if topic_error != ERROR_NONE {
-            topic_error
-        } else if topic.num_partitions <= 0 {
-            ERROR_INVALID_PARTITIONS
-        } else {
-            ERROR_NONE
-        };
+        let error_code = create_topics_topic_error(version, topic, topic_error);
         e.write_i16(error_code);
 
         if version >= 1 {

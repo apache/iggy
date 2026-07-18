@@ -40,8 +40,13 @@ pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
 pub const ERROR_NONE: i16 = 0;
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// Retriable; Produce stub uses this until the Iggy bridge persists records.
+pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 pub const ERROR_UNSUPPORTED_VERSION: i16 = 35;
 pub const ERROR_INVALID_PARTITIONS: i16 = 37;
+pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+/// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
+pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
 
 const MAX_SUPPORTED_METADATA_VERSION: i16 = 9;

@@ -24,7 +24,7 @@ mod scope;
 
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS, API_KEY_PRODUCE, ERROR_NONE,
-    handle_request,
+    ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER, handle_request,
 };
 use iggy_gateway_kafka::protocol::codec::Decoder;
 
@@ -62,7 +62,7 @@ fn handle_request_succeeds_for_every_supported_version_with_fixture() {
 }
 
 #[test]
-fn produce_stub_response_has_zero_error_per_partition() {
+fn produce_stub_response_returns_retriable_not_leader() {
     for version in 3i16..=9 {
         let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
             continue;
@@ -81,7 +81,11 @@ fn produce_stub_response_has_zero_error_per_partition() {
             let _parts = d.read_i32().unwrap();
         }
         let _partition = d.read_i32().unwrap();
-        assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "Produce v{version}");
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_LEADER_OR_FOLLOWER,
+            "Produce v{version}"
+        );
     }
 }
 
@@ -148,7 +152,7 @@ fn list_offsets_stub_response_has_zero_error() {
 }
 
 #[test]
-fn create_topics_stub_response_has_zero_error() {
+fn create_topics_stub_response_returns_not_controller() {
     for version in 2i16..=5 {
         let Some(body) = load_fixture_body_or_skip(19, "CreateTopics", version) else {
             continue;
@@ -167,6 +171,10 @@ fn create_topics_stub_response_has_zero_error() {
             let _topics = d.read_i32().unwrap();
             let _topic = d.read_nullable_string().unwrap();
         }
-        assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "CreateTopics v{version}");
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_CONTROLLER,
+            "CreateTopics v{version}"
+        );
     }
 }

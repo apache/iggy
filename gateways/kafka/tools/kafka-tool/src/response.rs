@@ -43,6 +43,29 @@ impl ResponseSummary {
         self.primary_error_code != 0
     }
 
+    /// Reasons `verify` should count this response as a failure.
+    ///
+    /// Fails on correlation mismatch, schema decode failure, and unexpected non-zero
+    /// error codes. Stub APIs may return documented non-zero codes (Produce 6,
+    /// Metadata 3, CreateTopics 41).
+    #[must_use]
+    pub fn verify_failure_reason(&self, api_key: i16) -> Option<String> {
+        if !self.correlation_match {
+            return Some("correlation_id mismatch".into());
+        }
+        if let Some(note) = &self.decode_note {
+            return Some(format!("schema decode failure: {note}"));
+        }
+        if !is_acceptable_verify_error(api_key, self.primary_error_code) {
+            return Some(format!(
+                "unexpected error_code={} ({})",
+                self.primary_error_code,
+                format_error_code(self.primary_error_code)
+            ));
+        }
+        None
+    }
+
     pub fn print(&self, api_name: &str, version: i16, quiet: bool) {
         let sym = if self.has_nonzero_error() {
             "⚠"
@@ -74,6 +97,18 @@ impl ResponseSummary {
         if let Some(note) = &self.decode_note {
             println!("    note: {note}");
         }
+    }
+}
+
+fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
+    if error_code == 0 {
+        return true;
+    }
+    match api_key {
+        0 => error_code == 6,   // Produce stub: NOT_LEADER_OR_FOLLOWER
+        3 => error_code == 3,   // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
+        19 => error_code == 41, // CreateTopics stub: NOT_CONTROLLER
+        _ => false,
     }
 }
 
@@ -338,9 +373,12 @@ fn format_error_code(code: i16) -> &'static str {
         1 => "OFFSET_OUT_OF_RANGE",
         2 => "CORRUPT_MESSAGE",
         3 => "UNKNOWN_TOPIC_OR_PARTITION",
+        6 => "NOT_LEADER_OR_FOLLOWER",
         35 => "UNSUPPORTED_VERSION",
         36 => "TOPIC_ALREADY_EXISTS",
         37 => "INVALID_PARTITIONS",
+        38 => "INVALID_REPLICATION_FACTOR",
+        41 => "NOT_CONTROLLER",
         42 => "INVALID_REQUEST",
         -1 => "UNKNOWN",
         _ => "OTHER",
