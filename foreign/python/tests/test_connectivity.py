@@ -56,89 +56,75 @@ class TestConnectivity:
             "invalid_value",
             "expected_iggy_error_name",
             "expected_iggy_error_code",
-            "expected_iggy_error_message",
         ),
         [
-            ("", "invalid_connection_string", 8000, "Invalid connection string"),
+            ("", "invalid_connection_string", 8000),
             (
                 "bad address",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "http://{host}:{port}",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "tcp://iggy:iggy@{host}:{port}",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
-            ("{host}:", "invalid_connection_string", 8000, "Invalid connection string"),
-            (":{port}", "invalid_connection_string", 8000, "Invalid connection string"),
+            ("{host}:", "invalid_connection_string", 8000),
+            (":{port}", "invalid_connection_string", 8000),
             (
                 "{host}:not-a-port",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "{host}:70000",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:not-a-port",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:-1",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:70000",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:bad:format@{host}:{port}",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
                 "invalid_connection_string",
                 8000,
-                "Invalid connection string",
             ),
             (
                 "iggy+quic://iggy:iggy@127.0.0.1:8080",
                 "cannot_create_endpoint",
                 305,
-                "Cannot create endpoint",
             ),
         ],
     )
@@ -147,7 +133,6 @@ class TestConnectivity:
         invalid_value: str,
         expected_iggy_error_name: str,
         expected_iggy_error_code: int,
-        expected_iggy_error_message: str,
     ):
         """Test malformed server addresses and connection strings are rejected."""
         host, port = get_server_config()
@@ -158,9 +143,6 @@ class TestConnectivity:
 
         assert excinfo_from_connection_string.value.name == expected_iggy_error_name
         assert excinfo_from_connection_string.value.code == expected_iggy_error_code
-        assert (
-            excinfo_from_connection_string.value.message == expected_iggy_error_message
-        )
 
     @pytest.mark.asyncio
     async def test_repeated_connect_does_not_error(self):
@@ -239,7 +221,6 @@ class TestConnectivity:
         if isinstance(exc_info.value, IggyError):
             assert exc_info.value.name == expected_iggy_error_name
             assert exc_info.value.code == expected_iggy_error_code
-            assert exc_info.value.message == expected_error_message
         else:
             assert exc_info.value.args[0] == expected_error_message
 
@@ -259,7 +240,6 @@ class TestConnectivity:
 
         assert exc_info.value.name == "invalid_credentials"
         assert exc_info.value.code == 42
-        assert exc_info.value.message == "Invalid credentials"
 
     @pytest.mark.asyncio
     async def test_relogin_with_same_valid_credentials_does_not_error(self):

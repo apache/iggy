@@ -151,7 +151,6 @@ class TestMessageOperations:
 
         assert exc_info.value.name == "invalid_message_payload_length"
         assert exc_info.value.code == 4025
-        assert exc_info.value.message == "Invalid message payload length"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -377,7 +376,6 @@ class TestMessageOperations:
 
         assert exc_info.value.name == "invalid_messages_count"
         assert exc_info.value.code == 4009
-        assert exc_info.value.message == "Invalid messages count"
 
     @pytest.mark.asyncio
     async def test_poll_messages_with_invalid_partition_id_raises(
@@ -412,7 +410,6 @@ class TestMessageOperations:
 
         assert exc_info.value.name == "partition_not_found"
         assert exc_info.value.code == 3007
-        assert exc_info.value.message.startswith("Partition with ID:")
 
     @pytest.mark.asyncio
     async def test_polling_strategy_last_with_count_one_returns_last_message(

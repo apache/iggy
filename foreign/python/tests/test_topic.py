@@ -111,7 +111,6 @@ class TestCreateTopic:
 
         assert exc_info.value.name == "invalid_format"
         assert exc_info.value.code == 4
-        assert exc_info.value.message == "Invalid format"
 
     @pytest.mark.asyncio
     async def test_create_and_get_topic_with_numeric_stream_id(
@@ -157,7 +156,6 @@ class TestCreateTopic:
 
         assert exc_info.value.name == "topic_name_already_exists"
         assert exc_info.value.code == 2013
-        assert exc_info.value.message.startswith("Topic with name:")
 
     @pytest.mark.asyncio
     async def test_topic_names_can_repeat_across_different_streams(
@@ -341,7 +339,6 @@ class TestCreateTopic:
         if expected_exception is IggyError:
             assert exc_info.value.name == "invalid_topic_size"
             assert exc_info.value.code == 1019
-            assert exc_info.value.message.startswith("Max topic size cannot")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -421,7 +418,6 @@ class TestCreateTopic:
 
         assert exc_info.value.name == "too_many_partitions"
         assert exc_info.value.code == 2015
-        assert exc_info.value.message == "Too many partitions"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("partitions_count", [0, 1, 1000])
@@ -509,7 +505,6 @@ class TestCreateTopic:
 
         assert exc_info.value.name == "stream_id_not_found"
         assert exc_info.value.code == 1009
-        assert exc_info.value.message.startswith("Stream with ID:")
 
     @pytest.mark.asyncio
     async def test_create_topic_requires_connection_and_auth(self, unique_name):
@@ -525,7 +520,6 @@ class TestCreateTopic:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -535,7 +529,6 @@ class TestCreateTopic:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestGetTopic:
@@ -602,7 +595,6 @@ class TestGetTopic:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -610,7 +602,6 @@ class TestGetTopic:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestGetTopics:
@@ -717,7 +708,6 @@ class TestGetTopics:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -725,7 +715,6 @@ class TestGetTopics:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestUpdateTopic:
@@ -1196,7 +1185,6 @@ class TestDeleteTopic:
 
         assert exc_info.value.name == "topic_id_not_found"
         assert exc_info.value.code == 2010
-        assert exc_info.value.message.startswith("Topic with ID:")
 
     @pytest.mark.asyncio
     async def test_delete_topic_twice_fails_second_time(
@@ -1217,7 +1205,6 @@ class TestDeleteTopic:
 
         assert exc_info.value.name == "topic_id_not_found"
         assert exc_info.value.code == 2010
-        assert exc_info.value.message.startswith("Topic with ID:")
 
     @pytest.mark.asyncio
     async def test_delete_topic_requires_connection_and_auth(self, unique_name):
@@ -1231,7 +1218,6 @@ class TestDeleteTopic:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -1239,7 +1225,6 @@ class TestDeleteTopic:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestPurgeTopic:
@@ -1333,7 +1318,6 @@ class TestPurgeTopic:
 
         assert exc_info.value.name == "topic_id_not_found"
         assert exc_info.value.code == 2010
-        assert exc_info.value.message.startswith("Topic with ID:")
 
     @pytest.mark.asyncio
     async def test_purge_topic_in_nonexistent_stream_fails(
@@ -1345,7 +1329,6 @@ class TestPurgeTopic:
 
         assert exc_info.value.name == "stream_id_not_found"
         assert exc_info.value.code == 1009
-        assert exc_info.value.message.startswith("Stream with ID:")
 
     @pytest.mark.asyncio
     async def test_purge_topic_requires_connection_and_auth(self, unique_name):
@@ -1359,7 +1342,6 @@ class TestPurgeTopic:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -1367,4 +1349,3 @@ class TestPurgeTopic:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"

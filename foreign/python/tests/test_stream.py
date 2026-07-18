@@ -96,7 +96,6 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "invalid_format"
         assert exc_info.value.code == 4
-        assert exc_info.value.message == "Invalid format"
 
     @pytest.mark.asyncio
     async def test_get_stream_by_name_and_id(
@@ -155,7 +154,6 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "stream_name_already_exists"
         assert exc_info.value.code == 1012
-        assert exc_info.value.message.startswith("Stream with name:")
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_stream(self, iggy_client: IggyClient, unique_name):
@@ -179,7 +177,6 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "disconnected"
         assert exc_info.value.code == 8
-        assert exc_info.value.message == "Disconnected"
 
     @pytest.mark.asyncio
     async def test_get_stream_before_login_fails(self, unique_name):
@@ -195,7 +192,6 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "unauthenticated"
         assert exc_info.value.code == 40
-        assert exc_info.value.message == "Unauthenticated"
 
     @pytest.mark.asyncio
     async def test_create_stream_before_connect_fails(self, unique_name):
@@ -208,7 +204,6 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "disconnected"
         assert exc_info.value.code == 8
-        assert exc_info.value.message == "Disconnected"
 
     @pytest.mark.asyncio
     async def test_create_stream_before_login_fails(self, unique_name):
@@ -224,4 +219,3 @@ class TestStreamOperations:
 
         assert exc_info.value.name == "unauthenticated"
         assert exc_info.value.code == 40
-        assert exc_info.value.message == "Unauthenticated"

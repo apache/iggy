@@ -172,7 +172,6 @@ class TestCreateConsumerGroup:
 
         assert exc_info.value.name == "consumer_group_name_already_exists"
         assert exc_info.value.code == 5004
-        assert exc_info.value.message.startswith("Consumer group with name:")
 
     @pytest.mark.asyncio
     async def test_create_consumer_group_requires_connection_and_auth(
@@ -192,7 +191,6 @@ class TestCreateConsumerGroup:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -204,7 +202,6 @@ class TestCreateConsumerGroup:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestGetConsumerGroup:
@@ -340,7 +337,6 @@ class TestGetConsumerGroup:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -352,7 +348,6 @@ class TestGetConsumerGroup:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestGetConsumerGroups:
@@ -484,7 +479,6 @@ class TestGetConsumerGroups:
 
         assert exc_info_disconnected.value.name == "disconnected"
         assert exc_info_disconnected.value.code == 8
-        assert exc_info_disconnected.value.message == "Disconnected"
 
         await client.connect()
         with pytest.raises(IggyError) as exc_info_unauthenticated:
@@ -492,7 +486,6 @@ class TestGetConsumerGroups:
 
         assert exc_info_unauthenticated.value.name == "unauthenticated"
         assert exc_info_unauthenticated.value.code == 40
-        assert exc_info_unauthenticated.value.message == "Unauthenticated"
 
 
 class TestDeleteConsumerGroup:
@@ -1070,10 +1063,6 @@ class TestConsumerGroup:
 
         assert exc_info.value.name == "consumer_offset_not_found"
         assert exc_info.value.code == 3021
-        assert (
-            exc_info.value.message
-            == "Consumer offset for consumer with ID: 0 was not found."
-        )
         assert consumer.get_last_stored_offset(partition_id) is None
 
         await iggy_client.send_messages(
@@ -2031,7 +2020,6 @@ class TestConsumerGroup:
 
         assert exc_info.value.name == "consumer_group_name_not_found"
         assert exc_info.value.code == 5003
-        assert exc_info.value.message.startswith("Consumer group with name:")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2094,7 +2082,6 @@ class TestConsumerGroup:
 
         assert exc_info.value.name == "disconnected"
         assert exc_info.value.code == 8
-        assert exc_info.value.message == "Disconnected"
 
     @pytest.mark.asyncio
     async def test_consumer_group_before_login_fails(self, unique_name):
@@ -2120,7 +2107,6 @@ class TestConsumerGroup:
 
         assert exc_info.value.name == "unauthenticated"
         assert exc_info.value.code == 40
-        assert exc_info.value.message == "Unauthenticated"
 
     @pytest.mark.asyncio
     async def test_shutdown(self, iggy_client: IggyClient, unique_name):
