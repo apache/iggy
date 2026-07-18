@@ -59,6 +59,8 @@ const AUTHORIZED_OPS_UNKNOWN: i32 = i32::MIN;
 pub enum HandleOutcome {
     /// Write this response body (with a response header).
     Respond(Bytes),
+    /// Write this response body (with a response header), then close the TCP connection.
+    RespondAndClose(Bytes),
     /// Produce with `acks=0`: write nothing, keep the connection open.
     NoResponse,
     /// Client cannot parse an error at this request wire version; close the TCP connection.
@@ -75,7 +77,7 @@ impl HandleOutcome {
     #[must_use]
     pub fn into_optional_response(self) -> Option<Bytes> {
         match self {
-            Self::Respond(body) => Some(body),
+            Self::Respond(body) | Self::RespondAndClose(body) => Some(body),
             Self::NoResponse => None,
             Self::Close => panic!("HandleOutcome::Close has no response body"),
         }
@@ -89,7 +91,7 @@ impl HandleOutcome {
     #[must_use]
     pub fn expect_response(self, msg: &str) -> Bytes {
         match self {
-            Self::Respond(body) => body,
+            Self::Respond(body) | Self::RespondAndClose(body) => body,
             Self::NoResponse => panic!("{msg}: got NoResponse"),
             Self::Close => panic!("{msg}: got Close"),
         }
@@ -312,7 +314,7 @@ fn handle_other_request(
                 ))
             }
         }
-        _ => HandleOutcome::Respond(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
+        _ => HandleOutcome::RespondAndClose(encode_error_only_response(ERROR_UNSUPPORTED_VERSION)),
     }
 }
 

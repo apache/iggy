@@ -35,7 +35,11 @@ use iggy_gateway_kafka::protocol::codec::Decoder;
 
 use fixtures::load_fixture_body_or_skip;
 use server::spawn_test_server;
-use tcp::{build_request_frame, parse_response_payload, read_response_frame, round_trip};
+use std::time::Duration;
+use tcp::{
+    ByteRead, build_request_frame, parse_response_payload, read_byte_with_timeout,
+    read_response_frame, round_trip,
+};
 
 #[tokio::test]
 async fn e2e_apiversions_v1_preserves_correlation_id() {
@@ -83,7 +87,7 @@ async fn e2e_produce_v3_round_trip_with_fixture() {
 }
 
 #[tokio::test]
-async fn e2e_unsupported_api_key_returns_error_without_disconnect() {
+async fn e2e_unsupported_api_key_returns_error_then_closes() {
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
@@ -95,14 +99,12 @@ async fn e2e_unsupported_api_key_returns_error_without_disconnect() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
 
-    // Second request on same connection must still work.
-    let frame2 = build_request_frame(API_KEY_API_VERSIONS, 1, 100, Some("e2e-test"), &[]);
-    stream.write_all(&frame2).await.unwrap();
-    let payload2 = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-    let (corr2, body2) = parse_response_payload(API_KEY_API_VERSIONS, 1, payload2);
-    assert_eq!(corr2, 100);
-    let mut d2 = Decoder::new(body2);
-    assert_eq!(d2.read_i16().unwrap(), 0);
+    // The unsupported-version error is terminal: the server closes the connection.
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "connection must close after the unsupported-version error response"
+    );
 }
 
 #[tokio::test]

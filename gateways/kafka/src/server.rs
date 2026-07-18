@@ -287,7 +287,9 @@ async fn handle_connection(
         );
 
         let body = decoder.read_bytes(decoder.remaining())?;
-        match handle_request(req.api_key, req.api_version, body, &broker) {
+        let outcome = handle_request(req.api_key, req.api_version, body, &broker);
+        let close_after_response = matches!(outcome, HandleOutcome::RespondAndClose(_));
+        match outcome {
             HandleOutcome::NoResponse => {
                 // Produce with acks=0: the wire protocol forbids a response.
             }
@@ -300,7 +302,8 @@ async fn handle_connection(
                 );
                 return Ok(());
             }
-            HandleOutcome::Respond(body_response) => {
+            HandleOutcome::Respond(body_response)
+            | HandleOutcome::RespondAndClose(body_response) => {
                 let resp_header = ResponseHeader {
                     correlation_id: req.correlation_id,
                 };
@@ -312,6 +315,15 @@ async fn handle_connection(
                     config.write_timeout,
                 )
                 .await?;
+                if close_after_response {
+                    warn!(
+                        %peer,
+                        api_key = req.api_key,
+                        api_version = req.api_version,
+                        "closing connection after unsupported-version error response"
+                    );
+                    return Ok(());
+                }
             }
         }
     }

@@ -125,7 +125,7 @@ Fixtures are gitignored under `tools/kafka-tool/kafka_messages/`. CI runs the sa
 | Invalid frame length (0) | `server_integration_tests` | `read_frame_rejects_invalid_lengths` |
 | Frame exceeds max_frame_size | `server_integration_tests`, `server_e2e_tests` | `read_frame_rejects_invalid_lengths`, `e2e_oversized_frame_is_rejected` |
 | Sequential requests on one TCP connection | `server_e2e_tests` | `e2e_sequential_requests_on_one_connection` |
-| Connection survives unsupported API key | `server_e2e_tests` | `e2e_unsupported_api_key_returns_error_without_disconnect` |
+| Unsupported API key returns error then closes connection | `server_e2e_tests` | `e2e_unsupported_api_key_returns_error_then_closes` |
 | Negative frame length closes connection | `server_e2e_tests` | `e2e_negative_frame_length_closes_connection` |
 
 ---

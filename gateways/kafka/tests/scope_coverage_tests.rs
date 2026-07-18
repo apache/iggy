@@ -168,24 +168,28 @@ fn out_of_scope_api_keys_return_unsupported_version_without_panic() {
 }
 
 #[tokio::test]
-async fn out_of_scope_api_keys_e2e_keep_connection_for_follow_up() {
+async fn out_of_scope_api_keys_e2e_respond_then_close() {
     let (addr, _shutdown) = spawn_test_server().await;
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
 
-    for &(api_key, _name) in &OUT_OF_SCOPE_API_KEYS[..4] {
+    for &(api_key, name) in &OUT_OF_SCOPE_API_KEYS[..4] {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
         let frame = build_request_frame(api_key, 0, i32::from(api_key), Some("scope-test"), &[]);
         stream.write_all(&frame).await.expect("write oos key");
+
         let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
         let mut d = Decoder::new(parse_response_payload(api_key, 0, payload).1);
-        assert_eq!(d.read_i16().unwrap(), ERROR_UNSUPPORTED_VERSION);
-    }
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_UNSUPPORTED_VERSION,
+            "{name} (key {api_key})"
+        );
 
-    let follow_up = build_request_frame(API_KEY_API_VERSIONS, 1, 99_999, Some("scope-test"), &[]);
-    stream.write_all(&follow_up).await.expect("follow-up write");
-    let payload = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-    let (corr, body) = parse_response_payload(API_KEY_API_VERSIONS, 1, payload);
-    assert_eq!(corr, 99_999);
-    assert_eq!(Decoder::new(body).read_i16().unwrap(), ERROR_NONE);
+        assert_eq!(
+            tcp::read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+            tcp::ByteRead::Closed,
+            "{name} (key {api_key}) must close the connection after the error response"
+        );
+    }
 }
 
 // ── Version firewall: unsupported version keeps TCP session (except Metadata) ─
