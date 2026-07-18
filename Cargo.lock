@@ -7020,7 +7020,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_meilisearch_sink"
-version = "0.4.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",

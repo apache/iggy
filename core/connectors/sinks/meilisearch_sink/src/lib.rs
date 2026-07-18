@@ -463,13 +463,21 @@ impl MeilisearchSink {
         documents: Vec<Value>,
     ) -> Result<usize, PartialIndexError> {
         let mut accepted = 0usize;
+        let mut accounted = 0usize;
+        let documents_count = documents.len();
         for chunk in documents.chunks(self.config.batch_size) {
             match self.index_document_chunk(client, chunk).await {
-                Ok(indexed) => accepted += indexed,
+                Ok(indexed) => {
+                    accepted += indexed;
+                    accounted += chunk.len();
+                }
                 Err(partial_error) => {
+                    let accepted = accepted + partial_error.accepted;
+                    let accounted = accounted + partial_error.accepted + partial_error.failed;
+                    let failed = partial_error.failed + documents_count.saturating_sub(accounted);
                     return Err(PartialIndexError {
-                        accepted: accepted + partial_error.accepted,
-                        failed: partial_error.failed,
+                        accepted,
+                        failed,
                         error: partial_error.error,
                     });
                 }
@@ -831,6 +839,9 @@ impl Sink for MeilisearchSink {
             Err(partial_error) => {
                 let mut state = self.state.lock().await;
                 state.documents_enqueued += partial_error.accepted;
+                if self.config.wait_for_tasks {
+                    state.documents_confirmed += partial_error.accepted;
+                }
                 state.errors_count += partial_error.failed;
                 drop(state);
                 error!(

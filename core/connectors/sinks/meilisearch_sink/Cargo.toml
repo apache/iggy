@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_meilisearch_sink"
-version = "0.4.0"
+version = "0.4.1-edge.1"
 description = "Iggy Meilisearch sink connector"
 edition = "2024"
 license = "Apache-2.0"

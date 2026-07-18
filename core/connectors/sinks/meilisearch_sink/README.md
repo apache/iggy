@@ -29,7 +29,10 @@ wrapped in a `value` field because Meilisearch documents must be objects. Raw
 payloads are parsed as JSON when possible; otherwise, they are indexed as base64
 data. Text payloads are indexed in a `text` field. Unsupported payload schemas
 are skipped with a warning and counted as sink errors, matching the connector
-runtime's per-record drop behavior for malformed records.
+runtime's per-record drop behavior for malformed records. Because the sink
+returns success after dropping an unsupported-schema record, the runtime can
+commit the consumer offset for that record. There is no built-in dead-letter
+queue for these drops.
 
 When the configured primary key is absent, the connector injects a stable value
 derived from the exact Iggy stream, topic, partition, offset, and message ID.
@@ -48,3 +51,11 @@ failures are not retried, logged, or counted by this connector. If
 `create_index_if_not_exists=true` and the connector creates the index during
 `open()`, it still waits for that index-creation task so the first batch cannot
 race the index creation.
+
+The close-time counters are attempt counters. `documents_enqueued` counts
+documents accepted by completed Meilisearch SDK calls in this process, and
+`documents_confirmed` counts those same documents only when task waiting is
+enabled and the corresponding task reached success. `errors` includes invalid
+records plus documents in failed chunks and trailing chunks that were not
+attempted after an earlier chunk failed. If the runtime redelivers a batch after
+an error, previously submitted documents can be counted again on the retry.
