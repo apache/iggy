@@ -1576,8 +1576,10 @@ fn parse_column_value(data: &str, start: usize) -> (serde_json::Value, usize) {
 }
 
 fn parse_bare_scalar(token: &str) -> serde_json::Value {
+    // test_decoding emits this sentinel for TOASTed columns the UPDATE didn't touch;
+    // treating it as null avoids leaking the literal token as a fake column value.
     match token {
-        "null" => serde_json::Value::Null,
+        "null" | "unchanged-toast-datum" => serde_json::Value::Null,
         "true" => serde_json::Value::Bool(true),
         "false" => serde_json::Value::Bool(false),
         _ => {
@@ -1899,6 +1901,22 @@ mod tests {
         assert_eq!(rec.data["user"], serde_json::json!("quoted_row"));
         assert!(rec.data.get("createdAt").is_some());
         assert!(rec.data.get("\"user\"").is_none());
+    }
+
+    #[test]
+    fn given_unchanged_toast_datum_should_parse_as_null() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::UPDATE_UNCHANGED_TOAST_COLUMN,
+                &["UPDATE"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["note"], serde_json::Value::Null);
+        assert_eq!(rec.data["payload"], serde_json::Value::Null);
+        assert_eq!(rec.data["name"], serde_json::json!("toast_row"));
     }
 
     #[test]
