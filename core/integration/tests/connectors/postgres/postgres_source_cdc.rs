@@ -252,6 +252,31 @@ async fn wait_for_source_status(
     panic!("Source connector did not reach {expected:?} status in time");
 }
 
+// The connector calls pg_logical_slot_get_changes on a fixed poll interval and
+// briefly holds the slot active during each call. A drop landing in that window
+// gets ERROR 55006 (slot is active for PID ...), so retry past transient hits
+// instead of dropping while the poller is guaranteed stopped.
+const PG_OBJECT_IN_USE: &str = "55006";
+
+async fn drop_replication_slot_retrying(pool: &sqlx::PgPool, slot: &str) {
+    for attempt in 0..POLL_ATTEMPTS {
+        match sqlx::query("SELECT pg_drop_replication_slot($1)")
+            .bind(slot)
+            .execute(pool)
+            .await
+        {
+            Ok(_) => return,
+            Err(sqlx::Error::Database(ref db_err))
+                if attempt + 1 < POLL_ATTEMPTS
+                    && db_err.code().as_deref() == Some(PG_OBJECT_IN_USE) =>
+            {
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+            Err(e) => panic!("Failed to drop replication slot {slot}: {e}"),
+        }
+    }
+}
+
 // Two restart scenarios against one container, run in sequence:
 // 1. Simulates upgrading from the old broken version, which left a slot
 //    behind created with the pgoutput plugin. setup_cdc must refuse to
@@ -286,11 +311,7 @@ async fn cdc_source_recovers_from_slot_mismatch_and_restart(
     let http = Client::new();
     wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
 
-    sqlx::query("SELECT pg_drop_replication_slot($1)")
-        .bind(DEFAULT_SLOT)
-        .execute(&pool)
-        .await
-        .expect("Failed to drop the correctly-created slot");
+    drop_replication_slot_retrying(&pool, DEFAULT_SLOT).await;
     sqlx::query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
         .bind(DEFAULT_SLOT)
         .execute(&pool)
