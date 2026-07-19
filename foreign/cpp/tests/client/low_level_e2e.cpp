@@ -35,29 +35,6 @@
 
 class LowLevelE2E_Client : public E2ETestFixture {};
 
-namespace {
-
-constexpr auto session_removal_timeout       = std::chrono::seconds(5);
-constexpr auto session_removal_poll_interval = std::chrono::milliseconds(10);
-
-bool wait_for_client_removal(iggy::ffi::Client *observer, std::uint32_t client_id) {
-    const auto deadline = std::chrono::steady_clock::now() + session_removal_timeout;
-    do {
-        const auto clients = observer->get_clients();
-        const auto removed = std::none_of(clients.begin(), clients.end(),
-                                          [client_id](const auto &client) { return client.client_id == client_id; });
-        if (removed) {
-            return true;
-        }
-
-        std::this_thread::sleep_for(session_removal_poll_interval);
-    } while (std::chrono::steady_clock::now() < deadline);
-
-    return false;
-}
-
-}  // namespace
-
 TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
     RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
     const std::string username             = "iggy";
@@ -426,7 +403,20 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->shutdown());
-    ASSERT_TRUE(wait_for_client_removal(second_client, first_me.client_id));
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
+        }
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
@@ -440,7 +430,20 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->disconnect());
-    ASSERT_TRUE(wait_for_client_removal(second_client, first_me.client_id));
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
+        }
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
