@@ -1516,7 +1516,7 @@ fn parse_record_columns(data: &str) -> serde_json::Map<String, serde_json::Value
             break;
         };
         let name_end = pos + bracket_offset;
-        let column_name = &data[pos..name_end];
+        let column_name = unquote_pg_identifier(&data[pos..name_end]);
 
         let mut depth = 0;
         let mut type_end = name_end;
@@ -1539,7 +1539,7 @@ fn parse_record_columns(data: &str) -> serde_json::Map<String, serde_json::Value
         }
 
         let (value, next_pos) = parse_column_value(data, type_end + 2);
-        result.insert(column_name.to_string(), value);
+        result.insert(column_name, value);
         pos = next_pos;
     }
 
@@ -1883,6 +1883,22 @@ mod tests {
 
         assert_eq!(rec.data["real_val"], serde_json::json!(0));
         assert_eq!(rec.data["double_val"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn given_quoted_mixed_case_column_should_strip_quotes_from_key() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_QUOTED_MIXED_CASE_COLUMN,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["user"], serde_json::json!("quoted_row"));
+        assert!(rec.data.get("createdAt").is_some());
+        assert!(rec.data.get("\"user\"").is_none());
     }
 
     #[test]
