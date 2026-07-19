@@ -203,11 +203,18 @@ impl Snapshot for IggySnapshot {
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
     create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    /// Remaining-journal-slots threshold at which a checkpoint is forced.
+    /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
+    /// least the configured prepare-queue depth (see the static assert and
+    /// [`Self::set_checkpoint_margin`]).
+    checkpoint_margin: Cell<usize>,
 }
 
 impl<M> SnapshotCoordinator<M> {
-    /// Number of remaining journal slots at which a checkpoint is forced.
-    // TODO: tune this margin size
+    /// Default number of remaining journal slots at which a checkpoint is
+    /// forced. Must stay >= the prepare-queue depth: the ops already
+    /// pipelined while a checkpoint runs skip it and append into this
+    /// margin.
     const CHECKPOINT_MARGIN: usize = 64;
 
     #[must_use]
@@ -218,7 +225,17 @@ impl<M> SnapshotCoordinator<M> {
         Self {
             data_dir,
             create_snapshot,
+            checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
         }
+    }
+
+    /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
+    /// this with the configured prepare-queue depth so a deeper pipeline
+    /// keeps its guarantee of journal room while a checkpoint runs; the
+    /// default margin stays the floor.
+    pub fn set_checkpoint_margin(&self, margin: usize) {
+        self.checkpoint_margin
+            .set(margin.max(Self::CHECKPOINT_MARGIN));
     }
 
     /// Create a snapshot, persist it, and drain snapshotted entries from the
@@ -270,13 +287,91 @@ impl<M> SnapshotCoordinator<M> {
         let needs_checkpoint = journal
             .handle()
             .remaining_capacity()
-            .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
+            .is_some_and(|c| c <= self.checkpoint_margin.get());
 
         if needs_checkpoint {
             self.checkpoint(stm, journal, commit_op, created_at).await?;
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+}
+
+// A checkpoint pauses journal reclamation, not admission: while one runs,
+// up to a full prepare queue of already-pipelined ops still needs journal
+// room (their `on_replicate` drivers skip the in-flight checkpoint and
+// append). The margin must cover them or the journal wraps mid-checkpoint.
+const _: () =
+    assert!(SnapshotCoordinator::<()>::CHECKPOINT_MARGIN >= consensus::PIPELINE_PREPARE_QUEUE_MAX);
+
+/// Single-shard async gate serializing the journal-mutation section of
+/// `on_replicate` (forced checkpoint + WAL append).
+///
+/// Many futures can drive `on_replicate` concurrently on one shard (the
+/// pump loop, detached per-client submit tasks, repair). Ungated they race
+/// `SnapshotCoordinator::checkpoint`: every driver crossing the
+/// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
+/// checkpoint, and the concurrent `journal.drain()` calls collide on the
+/// WAL rewrite — shared `wal.tmp`, ENOENT for every rename that loses,
+/// short reads after the winner's reopen. Appends racing a drain are just
+/// as unsound: the drain's live-set partition misses an append landing
+/// mid-rewrite and the rewrite silently discards it.
+///
+/// Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
+/// release wakes every waiter and poll order re-races (arrival-order FIFO
+/// under `futures::join!`-style drivers), cancel-safe (dropping the guard
+/// releases; dropping a waiter leaves only a stale waker).
+struct LocalGate {
+    busy: Cell<bool>,
+    waiters: RefCell<Vec<std::task::Waker>>,
+}
+
+impl LocalGate {
+    const fn new() -> Self {
+        Self {
+            busy: Cell::new(false),
+            waiters: RefCell::new(Vec::new()),
+        }
+    }
+
+    const fn acquire(&self) -> LocalGateAcquire<'_> {
+        LocalGateAcquire { gate: self }
+    }
+}
+
+struct LocalGateAcquire<'a> {
+    gate: &'a LocalGate,
+}
+
+impl<'a> std::future::Future for LocalGateAcquire<'a> {
+    type Output = LocalGateGuard<'a>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.gate.busy.get() {
+            // Re-polls while still busy push a duplicate waker; the extra
+            // wake is spurious and harmless at pipeline-queue scale.
+            self.gate.waiters.borrow_mut().push(cx.waker().clone());
+            std::task::Poll::Pending
+        } else {
+            self.gate.busy.set(true);
+            std::task::Poll::Ready(LocalGateGuard { gate: self.gate })
+        }
+    }
+}
+
+struct LocalGateGuard<'a> {
+    gate: &'a LocalGate,
+}
+
+impl Drop for LocalGateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.busy.set(false);
+        for waker in self.gate.waiters.borrow_mut().drain(..) {
+            waker.wake();
         }
     }
 }
@@ -378,6 +473,9 @@ pub struct IggyMetadata<C, J, S, M> {
     pub allocator: ConsensusGroupAllocator,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
+    /// Serializes `on_replicate`'s journal-mutation section (forced
+    /// checkpoint + WAL append) across concurrent drivers. See [`LocalGate`].
+    journal_gate: LocalGate,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
     /// Late-bound post-commit notifier. Fires once per committed normal op
@@ -427,6 +525,7 @@ where
             mux_stm,
             allocator,
             coordinator,
+            journal_gate: LocalGate::new(),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
@@ -448,6 +547,16 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// shard (responses read it too); only shard 0's copy feeds admission.
     pub fn set_default_max_topic_size(&self, max_topic_size_bytes: u64) {
         self.default_max_topic_size.set(max_topic_size_bytes);
+    }
+
+    /// Raise the forced-checkpoint margin to cover a configured
+    /// prepare-queue depth (`[metadata] prepare_queue_depth`). Clamped to
+    /// the built-in floor by the coordinator; no-op on shards without a
+    /// coordinator.
+    pub fn set_checkpoint_margin(&self, margin: usize) {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.set_checkpoint_margin(margin);
+        }
     }
 
     /// Resolved byte value for `MaxTopicSize::ServerDefault`.
@@ -663,9 +772,25 @@ where
             panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
-        if !self.checkpoint_if_needed(consensus, journal).await {
-            return;
-        }
+        // Serialize the journal-mutation section (forced checkpoint + append)
+        // across concurrent `on_replicate` drivers. Ungated, every driver
+        // crossing the checkpoint boundary ran its own checkpoint and the
+        // concurrent `drain()`s raced the WAL rewrite (`snapshot I/O error:
+        // No such file or directory`) — the single-node "metadata prepare
+        // queue is full" wedge. Held through the append so a drain can never
+        // rewrite the WAL out from under a racing append either.
+        let journal_gate = self.journal_gate.acquire().await;
+
+        // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
+        // prepare: `pipeline_message` already pushed the pipeline entry and
+        // pre-advanced the sequencer, so bailing out here leaves a phantom op
+        // that no repair path re-prepares — the commit frontier gaps behind
+        // it permanently and the pipeline wedges full. `CHECKPOINT_MARGIN >=
+        // PIPELINE_PREPARE_QUEUE_MAX` (static assert above) guarantees the
+        // append below still has room after a failed or skipped attempt; a
+        // journal that truly wraps is refused by append's slot-collision
+        // guard, not here.
+        self.checkpoint_if_needed(consensus, journal).await;
 
         // Backup: gap check (op == current_op + 1).
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
@@ -723,6 +848,9 @@ where
             );
             return;
         }
+
+        // Journal mutation done; wire traffic below must not hold the gate.
+        drop(journal_gate);
 
         // Durable; chain-replicate. `replicate` borrows + freezes; we keep
         // message for the sequencer/checksum bookkeeping below.
@@ -1731,10 +1859,17 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    /// Run a forced checkpoint when the journal is low on capacity.
+    ///
+    /// Diagnostic-only outcome: the caller holds the `journal_gate`, so this
+    /// is single-flight by construction, and a failure is deliberately not
+    /// surfaced as control flow — the prepare being replicated must proceed
+    /// to its append regardless (see the phantom-op comment at the call
+    /// site). The next prepare over the boundary simply retries.
     #[allow(clippy::future_not_send)]
-    async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) -> bool {
+    async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) {
         let Some(coordinator) = &self.coordinator else {
-            return true;
+            return;
         };
 
         // Use commit_min (locally executed), not commit_max. WAL entries
@@ -1757,9 +1892,8 @@ where
                     checkpoint_op = snap_op,
                     "forced checkpoint completed"
                 );
-                true
             }
-            Ok(false) => true,
+            Ok(false) => {}
             Err(e) => {
                 error!(
                     target: "iggy.metadata.diag",
@@ -1767,9 +1901,8 @@ where
                     replica_id = consensus.replica(),
                     checkpoint_op = snap_op,
                     error = %e,
-                    "forced checkpoint failed"
+                    "forced checkpoint failed; continuing without WAL reclamation"
                 );
-                false
             }
         }
     }
@@ -2930,6 +3063,160 @@ mod tests {
         assert!(
             is_caught_up_primary(consensus),
             "gate must reopen once the prefix is fully applied"
+        );
+    }
+
+    /// Reproduces the single-node "metadata prepare queue is full" wedge
+    /// (laserdata cloud-core suite, 2026-07-18).
+    ///
+    /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
+    /// Under a concurrent login/create burst, several `on_replicate` futures
+    /// cross the forced-checkpoint boundary (journal `remaining_capacity <=
+    /// CHECKPOINT_MARGIN`, i.e. op `SLOT_COUNT - MARGIN = 960`) together, and
+    /// every one of them runs a full checkpoint concurrently. The concurrent
+    /// `journal.drain()` calls race on the one fixed `wal.tmp`: the losers
+    /// surface `snapshot I/O error: No such file or directory` (or a short
+    /// read after the winner's reopen). Fatally, `on_replicate` then dropped
+    /// the loser's prepare — AFTER `pipeline_message` had pushed the pipeline
+    /// entry and pre-advanced the sequencer — so the op was never journaled,
+    /// never acked, never committed. The commit frontier gaps permanently:
+    /// logins first bounce `NotCaughtUp`, in-flight clients wedge
+    /// (`InProgress` on logout), and once the pipeline fills every submit is
+    /// rejected `PipelineFull` forever.
+    ///
+    /// Correct behavior: checkpoints are single-flight, a failed or skipped
+    /// checkpoint never discards a pipelined prepare, all racers' ops are
+    /// journaled and commit, and the caught-up gate reopens.
+    #[compio::test]
+    async fn concurrent_checkpoint_boundary_must_not_drop_prepares() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// One op below the forced-checkpoint trigger: the journal holds
+        /// 1024 slots and forces a checkpoint when 64 or fewer remain.
+        const FILL: u64 = 960;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Bootstrap creates the metadata dir; the coordinator's snapshot
+        // persist expects it to exist.
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        // `data_dir` present => SnapshotCoordinator armed, checkpoints live.
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // Fill to one op under the boundary through the real primary path,
+        // acking each op so `commit_min` tracks `last_op` and the pipeline
+        // stays shallow — the steady state the production server was in.
+        let mut loopback = Vec::new();
+        for i in 1..=FILL {
+            let prepare = md
+                .prepare_request(create_stream_request(CLIENT, i, &format!("s{i}")))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md.on_replicate(prepare).await;
+            loopback.clear();
+            consensus.drain_loopback_into(&mut loopback);
+            let ack = loopback
+                .pop()
+                .expect("one self-ack per prepare")
+                .try_into_typed::<PrepareOkHeader>()
+                .expect("loopback holds self PrepareOks");
+            md.on_ack(ack).await;
+        }
+        assert_eq!(consensus.commit_min(), FILL);
+        assert_eq!(
+            md.journal.as_ref().unwrap().remaining_capacity(),
+            Some(64),
+            "fill must stop exactly at the forced-checkpoint boundary"
+        );
+
+        // Three submits race across the boundary — the concurrent
+        // login/create burst from the incident. Every racer sees
+        // `remaining_capacity <= CHECKPOINT_MARGIN` before any drain
+        // completes.
+        let md_ref = &md;
+        let race = |request: u64, name: String| async move {
+            let prepare = md_ref
+                .prepare_request(create_stream_request(CLIENT, request, &name))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md_ref.on_replicate(prepare).await;
+        };
+        futures::join!(
+            race(FILL + 1, format!("s{}", FILL + 1)),
+            race(FILL + 2, format!("s{}", FILL + 2)),
+            race(FILL + 3, format!("s{}", FILL + 3)),
+        );
+
+        // Every racer's prepare must be durably journaled: a dropped one is
+        // unrepairable (nothing re-prepares it) and gaps the frontier.
+        let journal = md.journal.as_ref().unwrap();
+        for op in FILL + 1..=FILL + 3 {
+            assert!(
+                journal.header(op as usize).is_some(),
+                "op {op} vanished from the WAL: a failed checkpoint dropped a pipelined prepare"
+            );
+        }
+        // The checkpoint itself must have happened — once: WAL reclaimed,
+        // snapshot on disk.
+        assert!(
+            journal.remaining_capacity().unwrap() > 900,
+            "checkpoint must have drained the snapshotted prefix, got {:?}",
+            journal.remaining_capacity()
+        );
+        assert!(
+            dir.path()
+                .join(crate::impls::METADATA_DIR)
+                .join("snapshot.bin")
+                .exists(),
+            "checkpoint must persist the snapshot"
+        );
+
+        // The self-acks commit all three racers; any gap here is the
+        // production wedge (commit frontier pinned, PipelineFull forever).
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        assert_eq!(loopback.len(), 3, "one self-ack per racer");
+        for message in loopback.drain(..) {
+            let ack = message
+                .try_into_typed::<PrepareOkHeader>()
+                .expect("loopback holds self PrepareOks");
+            md.on_ack(ack).await;
+        }
+        assert_eq!(
+            consensus.commit_min(),
+            FILL + 3,
+            "commit frontier must cross the checkpoint boundary"
+        );
+        assert!(
+            is_caught_up_primary(consensus),
+            "caught-up gate must reopen after the boundary"
         );
     }
 }

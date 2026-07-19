@@ -250,10 +250,17 @@ impl RequestEntry {
 /// Two-queue pipeline: in-flight prepares + buffered requests.
 #[derive(Debug)]
 pub struct LocalPipeline {
-    /// Uncommitted prepares; cap [`PIPELINE_PREPARE_QUEUE_MAX`].
+    /// Uncommitted prepares; cap [`Self::prepare_queue_max`].
     prepare_queue: VecDeque<PipelineEntry>,
-    /// Requests awaiting a prepare slot; cap [`PIPELINE_REQUEST_QUEUE_MAX`].
+    /// Requests awaiting a prepare slot; cap [`Self::request_queue_max`].
     request_queue: VecDeque<RequestEntry>,
+    /// Depth bound for `prepare_queue`; [`PIPELINE_PREPARE_QUEUE_MAX`]
+    /// unless the operator overrode it (`[metadata]` in the server-ng
+    /// config).
+    prepare_queue_max: usize,
+    /// Depth bound for `request_queue`; [`PIPELINE_REQUEST_QUEUE_MAX`]
+    /// unless overridden alongside `prepare_queue_max`.
+    request_queue_max: usize,
 }
 
 impl Default for LocalPipeline {
@@ -265,9 +272,31 @@ impl Default for LocalPipeline {
 impl LocalPipeline {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_capacities(PIPELINE_PREPARE_QUEUE_MAX, PIPELINE_REQUEST_QUEUE_MAX)
+    }
+
+    /// Pipeline with operator-tuned queue depths.
+    ///
+    /// Callers wiring this from config must keep the journal's
+    /// checkpoint margin >= `prepare_queue_max`: up to a full prepare
+    /// queue of already-pipelined ops appends while a forced checkpoint
+    /// runs, and the margin is what guarantees them journal room (see
+    /// `SnapshotCoordinator` in `core/metadata`).
+    ///
+    /// # Panics
+    /// If a depth is zero — a zero-depth pipeline can never admit an op.
+    #[must_use]
+    pub fn with_capacities(prepare_queue_max: usize, request_queue_max: usize) -> Self {
+        assert!(
+            prepare_queue_max > 0 && request_queue_max > 0,
+            "pipeline queue depths must be non-zero \
+             (prepare={prepare_queue_max}, request={request_queue_max})"
+        );
         Self {
-            prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
-            request_queue: VecDeque::with_capacity(PIPELINE_REQUEST_QUEUE_MAX),
+            prepare_queue: VecDeque::with_capacity(prepare_queue_max),
+            request_queue: VecDeque::with_capacity(request_queue_max),
+            prepare_queue_max,
+            request_queue_max,
         }
     }
 
@@ -278,7 +307,7 @@ impl LocalPipeline {
 
     #[must_use]
     pub fn prepare_queue_full(&self) -> bool {
-        self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX
+        self.prepare_queue.len() >= self.prepare_queue_max
     }
 
     #[must_use]
@@ -288,7 +317,7 @@ impl LocalPipeline {
 
     #[must_use]
     pub fn request_queue_full(&self) -> bool {
-        self.request_queue.len() >= PIPELINE_REQUEST_QUEUE_MAX
+        self.request_queue.len() >= self.request_queue_max
     }
 
     #[must_use]

@@ -7658,6 +7658,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "compio",
+ "futures",
  "iggy_binary_protocol",
  "server_common",
  "tempfile",
@@ -8368,6 +8369,7 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "futures",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
