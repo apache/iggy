@@ -792,17 +792,21 @@ impl PostgresSource {
             return None;
         }
 
-        let rest = rest
+        let (old_key, rest) = match rest
             .strip_prefix("old-key: ")
             .and_then(|old_key| old_key.split_once("new-tuple: "))
-            .map_or(rest, |(_, new_tuple)| new_tuple);
+        {
+            Some((old_key, new_tuple)) => (Some(old_key), new_tuple),
+            None => (None, rest),
+        };
 
         Some(DatabaseRecord {
             table_name,
             operation_type: operation.to_string(),
             timestamp: Utc::now(),
             data: serde_json::Value::Object(parse_record_columns(rest)),
-            old_data: None,
+            old_data: old_key
+                .map(|old_key| serde_json::Value::Object(parse_record_columns(old_key))),
         })
     }
 
@@ -2223,6 +2227,33 @@ mod tests {
             serde_json::json!("see new-tuple: format docs")
         );
         assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+    }
+
+    #[test]
+    fn given_old_key_section_should_populate_old_data() {
+        let src = cdc_source();
+        let data = "table public.probe_events: UPDATE: old-key: id[integer]:1 \
+                     new-tuple: id[integer]:2 amount[numeric]:99.99";
+
+        let rec = src
+            .parse_logical_replication_message(data, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["id"], serde_json::json!(2));
+        assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+        assert_eq!(rec.old_data.unwrap()["id"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn given_no_old_key_section_should_leave_old_data_none() {
+        let src = cdc_source();
+        let data = "table public.probe_events: INSERT: id[integer]:1";
+
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"], None)
+            .unwrap();
+
+        assert!(rec.old_data.is_none());
     }
 
     #[test]
