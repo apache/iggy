@@ -3179,7 +3179,9 @@ mod tests {
         let journal = md.journal.as_ref().unwrap();
         for op in FILL + 1..=FILL + 3 {
             assert!(
-                journal.header(op as usize).is_some(),
+                journal
+                    .header(usize::try_from(op).expect("test ops fit in usize"))
+                    .is_some(),
                 "op {op} vanished from the WAL: a failed checkpoint dropped a pipelined prepare"
             );
         }
@@ -3203,7 +3205,7 @@ mod tests {
         loopback.clear();
         consensus.drain_loopback_into(&mut loopback);
         assert_eq!(loopback.len(), 3, "one self-ack per racer");
-        for message in loopback.drain(..) {
+        for message in loopback {
             let ack = message
                 .try_into_typed::<PrepareOkHeader>()
                 .expect("loopback holds self PrepareOks");
