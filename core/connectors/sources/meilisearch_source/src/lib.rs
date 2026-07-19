@@ -27,6 +27,7 @@ use meilisearch_sdk::{
         Error as MeilisearchSdkError, ErrorCode as MeilisearchErrorCode,
         ErrorType as MeilisearchErrorType,
     },
+    settings::FilterableAttribute,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -140,6 +141,12 @@ struct State {
     poll_count: usize,
 }
 
+#[derive(Debug)]
+struct ValidDocument {
+    document: Value,
+    message_id: Option<u128>,
+}
+
 impl MeilisearchSource {
     pub fn new(id: u32, config: MeilisearchSourceConfig, state: Option<ConnectorState>) -> Self {
         let restored_state = state
@@ -188,31 +195,64 @@ impl MeilisearchSource {
         let mut retries = 0u32;
 
         loop {
-            let health = self
-                .retry_sdk_open_operation("health check", || client.health())
-                .await?;
-            if health.status == "available" {
-                return Ok(());
+            let result = tokio::time::timeout(self.config.timeout, client.health()).await;
+            match result {
+                Ok(Ok(health)) if health.status == "available" => return Ok(()),
+                Ok(Ok(health)) => {
+                    if retries >= self.config.max_open_retries {
+                        return Err(Error::Connection(format!(
+                            "Meilisearch health check returned status '{}'",
+                            health.status
+                        )));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check returned status '{}' (retry {retries}/{}). Retrying in {delay:?}...",
+                        health.status, self.config.max_open_retries
+                    );
+                    sleep(delay).await;
+                }
+                Ok(Err(error)) => {
+                    if retries >= self.config.max_open_retries || !is_transient_sdk_error(&error) {
+                        return Err(map_sdk_error(error));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check failed (retry {retries}/{}): {error}. Retrying in {delay:?}...",
+                        self.config.max_open_retries
+                    );
+                    sleep(delay).await;
+                }
+                Err(_) => {
+                    if retries >= self.config.max_open_retries {
+                        return Err(Error::HttpRequestFailed(format!(
+                            "Meilisearch health check timed out after {:?}",
+                            self.config.timeout
+                        )));
+                    }
+                    retries += 1;
+                    let delay = jitter(exponential_backoff(
+                        self.config.retry_delay,
+                        retries,
+                        self.config.max_retry_delay,
+                    ));
+                    warn!(
+                        "Meilisearch health check timed out after {:?} (retry {retries}/{}). Retrying in {delay:?}...",
+                        self.config.timeout, self.config.max_open_retries
+                    );
+                    sleep(delay).await;
+                }
             }
-
-            if retries >= self.config.max_open_retries {
-                return Err(Error::Connection(format!(
-                    "Meilisearch health check returned status '{}'",
-                    health.status
-                )));
-            }
-
-            retries += 1;
-            let delay = jitter(exponential_backoff(
-                self.config.retry_delay,
-                retries,
-                self.config.max_retry_delay,
-            ));
-            warn!(
-                "Meilisearch health check returned status '{}' (retry {retries}/{}). Retrying in {delay:?}...",
-                health.status, self.config.max_open_retries
-            );
-            sleep(delay).await;
         }
     }
 
@@ -235,7 +275,7 @@ impl MeilisearchSource {
         })
     }
 
-    async fn check_sortable_primary_key(
+    async fn check_primary_key_cursor_settings(
         &self,
         client: &Client,
         primary_key: &str,
@@ -249,13 +289,36 @@ impl MeilisearchSource {
 
         let sortable_attributes = settings.sortable_attributes.unwrap_or_default();
         if primary_key_is_sortable(&sortable_attributes, primary_key) {
-            return Ok(());
+            let filterable_attributes = settings.filterable_attributes.unwrap_or_default();
+            if primary_key_is_filterable(&filterable_attributes, primary_key) {
+                return Ok(());
+            }
+
+            return Err(Error::InvalidConfigValue(format!(
+                "Meilisearch index '{}' must configure primary key '{}' in filterableAttributes for cursor pagination",
+                self.config.index, primary_key
+            )));
         }
 
         Err(Error::InvalidConfigValue(format!(
             "Meilisearch index '{}' must configure primary key '{}' in sortableAttributes for stable source polling",
             self.config.index, primary_key
         )))
+    }
+
+    async fn validate_restored_cursor(&self, primary_key: &str) {
+        let mut state = self.state.lock().await;
+        let Some(last_primary_key) = state.last_primary_key.as_ref() else {
+            return;
+        };
+
+        if let Err(error) = primary_key_filter_literal(last_primary_key) {
+            warn!(
+                "Discarding restored Meilisearch cursor for source connector with ID: {}. Invalid primary key '{}': {error}",
+                self.id, primary_key
+            );
+            state.last_primary_key = None;
+        }
     }
 
     async fn search_documents(&self, client: &Client) -> Result<Vec<ProducedMessage>, Error> {
@@ -292,7 +355,7 @@ impl MeilisearchSource {
             .await?;
         let documents: Vec<Value> = results.hits.into_iter().map(|hit| hit.result).collect();
         let (documents, last_document_primary_key) =
-            valid_documents_and_last_primary_key(documents, primary_key, self.id);
+            valid_documents_and_last_primary_key(documents, primary_key, self.id)?;
         let messages = self.documents_to_messages(documents)?;
 
         let mut state = self.state.lock().await;
@@ -305,10 +368,14 @@ impl MeilisearchSource {
         Ok(messages)
     }
 
-    fn documents_to_messages(&self, documents: Vec<Value>) -> Result<Vec<ProducedMessage>, Error> {
+    fn documents_to_messages(
+        &self,
+        documents: Vec<ValidDocument>,
+    ) -> Result<Vec<ProducedMessage>, Error> {
         documents
             .into_iter()
-            .map(|document| {
+            .map(|valid_document| {
+                let document = valid_document.document;
                 let payload = if self.config.include_metadata {
                     json!({
                         "document": document,
@@ -323,7 +390,7 @@ impl MeilisearchSource {
 
                 serde_json::to_vec(&payload)
                     .map(|payload| ProducedMessage {
-                        id: None,
+                        id: valid_document.message_id,
                         checksum: None,
                         timestamp: None,
                         origin_timestamp: None,
@@ -437,8 +504,9 @@ impl Source for MeilisearchSource {
         let client = self.create_client()?;
         self.check_connectivity(&client).await?;
         let primary_key = self.get_primary_key(&client).await?;
-        self.check_sortable_primary_key(&client, &primary_key)
+        self.check_primary_key_cursor_settings(&client, &primary_key)
             .await?;
+        self.validate_restored_cursor(&primary_key).await;
         info!(
             "Meilisearch source connector with ID: {} requires integer primary key values for cursor pagination. Index: {}, primary key: {}",
             self.id, self.config.index, primary_key
@@ -638,14 +706,24 @@ fn primary_key_filter_literal(value: &Value) -> Result<String, Error> {
     }
 }
 
-fn document_primary_key(document: &Value, primary_key: &str) -> Result<Value, Error> {
+fn document_primary_key<'a>(document: &'a Value, primary_key: &str) -> Result<&'a Value, Error> {
     let value = document.get(primary_key).ok_or_else(|| {
         Error::InvalidConfigValue(format!(
             "Meilisearch document is missing primary key '{primary_key}'"
         ))
     })?;
     primary_key_filter_literal(value)?;
-    Ok(value.clone())
+    Ok(value)
+}
+
+fn primary_key_to_message_id(value: &Value) -> Option<u128> {
+    let number = value.as_number()?;
+    number.as_u64().map(u128::from).or_else(|| {
+        number
+            .as_i64()
+            .filter(|value| *value >= 0)
+            .map(|value| value as u128)
+    })
 }
 
 fn primary_key_is_sortable(sortable_attributes: &[String], primary_key: &str) -> bool {
@@ -654,19 +732,36 @@ fn primary_key_is_sortable(sortable_attributes: &[String], primary_key: &str) ->
         .any(|attribute| attribute == primary_key)
 }
 
+fn primary_key_is_filterable(
+    filterable_attributes: &[FilterableAttribute],
+    primary_key: &str,
+) -> bool {
+    filterable_attributes
+        .iter()
+        .any(|attribute| match attribute {
+            FilterableAttribute::Attribute(attribute) => attribute == primary_key,
+            FilterableAttribute::Settings(settings) => settings
+                .attribute_patterns
+                .iter()
+                .any(|pattern| pattern == "*" || pattern == primary_key),
+        })
+}
+
 fn valid_documents_and_last_primary_key(
     documents: Vec<Value>,
     primary_key: &str,
     connector_id: u32,
-) -> (Vec<Value>, Option<Value>) {
+) -> Result<(Vec<ValidDocument>, Option<Value>), Error> {
     let mut valid_documents = Vec::with_capacity(documents.len());
-    let mut last_primary_key = None;
+    let documents_count = documents.len();
 
     for document in documents {
         match document_primary_key(&document, primary_key) {
             Ok(primary_key_value) => {
-                last_primary_key = Some(primary_key_value);
-                valid_documents.push(document);
+                valid_documents.push(ValidDocument {
+                    message_id: primary_key_to_message_id(primary_key_value),
+                    document,
+                });
             }
             Err(error) => warn!(
                 "Skipping Meilisearch document for source connector with ID: {connector_id}. Invalid primary key '{primary_key}': {error}"
@@ -674,7 +769,18 @@ fn valid_documents_and_last_primary_key(
         }
     }
 
-    (valid_documents, last_primary_key)
+    if documents_count > 0 && valid_documents.is_empty() {
+        return Err(Error::InvalidConfigValue(format!(
+            "Meilisearch source connector with ID: {connector_id} received {documents_count} documents from index, but none had a valid integer primary key '{primary_key}'"
+        )));
+    }
+
+    let last_primary_key = valid_documents
+        .last()
+        .map(|document| document_primary_key(&document.document, primary_key).cloned())
+        .transpose()?;
+
+    Ok((valid_documents, last_primary_key))
 }
 
 fn map_sdk_error(error: MeilisearchSdkError) -> Error {
@@ -937,6 +1043,38 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_is_filterable_should_match_exact_attribute() {
+        let filterable_attributes = vec![
+            FilterableAttribute::Attribute("created_at".to_string()),
+            FilterableAttribute::Attribute("id".to_string()),
+        ];
+
+        assert!(primary_key_is_filterable(&filterable_attributes, "id"));
+        assert!(!primary_key_is_filterable(
+            &filterable_attributes,
+            "user_id"
+        ));
+    }
+
+    #[test]
+    fn primary_key_is_filterable_should_match_wildcard_pattern() {
+        let filterable_attributes = vec![FilterableAttribute::Settings(
+            meilisearch_sdk::settings::FilterableAttributesSettings {
+                attribute_patterns: vec!["*".to_string()],
+                features: meilisearch_sdk::settings::FilterFeatures {
+                    facet_search: false,
+                    filter: meilisearch_sdk::settings::FilterFeatureModes {
+                        equality: true,
+                        comparison: true,
+                    },
+                },
+            },
+        )];
+
+        assert!(primary_key_is_filterable(&filterable_attributes, "id"));
+    }
+
+    #[test]
     fn valid_documents_should_skip_missing_middle_primary_key() {
         let documents = vec![
             json!({"id": 1, "name": "first"}),
@@ -945,11 +1083,11 @@ mod tests {
         ];
 
         let (valid_documents, last_primary_key) =
-            valid_documents_and_last_primary_key(documents, "id", 1);
+            valid_documents_and_last_primary_key(documents, "id", 1).unwrap();
 
         assert_eq!(valid_documents.len(), 2);
-        assert_eq!(valid_documents[0]["name"], "first");
-        assert_eq!(valid_documents[1]["name"], "third");
+        assert_eq!(valid_documents[0].document["name"], "first");
+        assert_eq!(valid_documents[1].document["name"], "third");
         assert_eq!(last_primary_key, Some(json!(3)));
     }
 
@@ -962,26 +1100,25 @@ mod tests {
         ];
 
         let (valid_documents, last_primary_key) =
-            valid_documents_and_last_primary_key(documents, "id", 1);
+            valid_documents_and_last_primary_key(documents, "id", 1).unwrap();
 
         assert_eq!(valid_documents.len(), 2);
-        assert_eq!(valid_documents[0]["name"], "first");
-        assert_eq!(valid_documents[1]["name"], "third");
+        assert_eq!(valid_documents[0].document["name"], "first");
+        assert_eq!(valid_documents[1].document["name"], "third");
         assert_eq!(last_primary_key, Some(json!(3)));
     }
 
     #[test]
-    fn valid_documents_should_return_no_cursor_for_all_invalid_primary_keys() {
+    fn valid_documents_should_reject_all_invalid_primary_keys() {
         let documents = vec![
             json!({"id": 1.5, "name": "float"}),
             json!({"name": "missing"}),
         ];
 
-        let (valid_documents, last_primary_key) =
-            valid_documents_and_last_primary_key(documents, "id", 1);
+        let error = valid_documents_and_last_primary_key(documents, "id", 1)
+            .expect_err("all invalid primary keys should be rejected");
 
-        assert!(valid_documents.is_empty());
-        assert_eq!(last_primary_key, None);
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
     }
 
     #[test]
@@ -991,9 +1128,13 @@ mod tests {
         let mut source = MeilisearchSource::new(1, config, None);
         source.primary_key = Some("id".to_string());
         let messages = source
-            .documents_to_messages(vec![json!({"id": 1, "title": "hello"})])
+            .documents_to_messages(vec![ValidDocument {
+                document: json!({"id": 1, "title": "hello"}),
+                message_id: Some(1),
+            }])
             .unwrap();
 
+        assert_eq!(messages[0].id, Some(1));
         let payload: Value = serde_json::from_slice(&messages[0].payload).unwrap();
         assert_eq!(
             payload,
@@ -1005,5 +1146,40 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn documents_should_use_integer_primary_key_as_message_id() {
+        let source = MeilisearchSource::new(1, config(), None);
+        let (documents, _) = valid_documents_and_last_primary_key(
+            vec![json!({"id": 9007199254740993_u64})],
+            "id",
+            1,
+        )
+        .unwrap();
+
+        let messages = source.documents_to_messages(documents).unwrap();
+
+        assert_eq!(messages[0].id, Some(9007199254740993));
+    }
+
+    #[test]
+    fn restored_non_integer_cursor_should_be_wiped() {
+        let state = State {
+            last_primary_key: Some(json!("bad")),
+            documents_produced: 10,
+            poll_count: 2,
+        };
+        let connector_state = ConnectorState::serialize(&state, CONNECTOR_NAME, 1).unwrap();
+        let source = MeilisearchSource::new(1, config(), Some(connector_state));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            source.validate_restored_cursor("id").await;
+            let restored = source.state.lock().await;
+            assert_eq!(restored.last_primary_key, None);
+            assert_eq!(restored.documents_produced, 10);
+            assert_eq!(restored.poll_count, 2);
+        });
     }
 }
