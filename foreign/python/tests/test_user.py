@@ -21,13 +21,16 @@ from apache_iggy import IggyClient, UserInfoDetails, UserStatus
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
-# Server-side limits: usernames are 3-50 characters, passwords 3-100.
+# Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
+MIN_USERNAME_BYTES = 3
 MAX_USERNAME_BYTES = 50
+MIN_PASSWORD_BYTES = 3
+MAX_PASSWORD_BYTES = 100
 
 
 def _unique_credentials(unique_name) -> tuple[str, str]:
     username = unique_name(max_bytes=MAX_USERNAME_BYTES)
-    password = unique_name(max_bytes=MAX_USERNAME_BYTES)
+    password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
     return username, password
 
 
@@ -109,6 +112,96 @@ class TestCreateUser:
         await client.login_user(username, password)
 
         await iggy_client.delete_user(created.id)
+
+    @pytest.mark.parametrize(
+        "username",
+        ["a" * (MIN_USERNAME_BYTES - 1), "a" * (MAX_USERNAME_BYTES + 1)],
+        ids=["too-short", "too-long"],
+    )
+    @pytest.mark.asyncio
+    async def test_create_user_rejects_out_of_bounds_username(
+        self, iggy_client: IggyClient, unique_name, username
+    ):
+        """Test create_user rejects usernames outside the 3-50 byte range."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.create_user(
+                username, unique_name(max_bytes=MAX_PASSWORD_BYTES)
+            )
+
+    @pytest.mark.parametrize(
+        "password",
+        ["a" * (MIN_PASSWORD_BYTES - 1), "a" * (MAX_PASSWORD_BYTES + 1)],
+        ids=["too-short", "too-long"],
+    )
+    @pytest.mark.asyncio
+    async def test_create_user_rejects_out_of_bounds_password(
+        self, iggy_client: IggyClient, unique_name, password
+    ):
+        """Test create_user rejects passwords outside the 3-100 byte range."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.create_user(
+                unique_name(max_bytes=MAX_USERNAME_BYTES), password
+            )
+
+    @pytest.mark.parametrize(
+        "prefix",
+        ["ユーザー", "사용자", "ผู้ใช้", "🦀🚀"],
+        ids=["japanese", "korean", "thai", "emoji"],
+    )
+    @pytest.mark.asyncio
+    async def test_create_user_accepts_multibyte_credentials(
+        self, iggy_client: IggyClient, unique_name, prefix
+    ):
+        """Test non-ascii credentials within the byte limits are accepted."""
+        username = f"{prefix}{unique_name(min_bytes=4, max_bytes=8)}"
+        password = f"{prefix}{unique_name(min_bytes=4, max_bytes=8)}"
+        assert len(username.encode()) <= MAX_USERNAME_BYTES
+
+        created = await iggy_client.create_user(username, password)
+        assert created.username == username
+
+        fetched = await iggy_client.get_user(username)
+        assert fetched is not None
+        assert fetched.id == created.id
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        await client.login_user(username, password)
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.parametrize(
+        "username",
+        ["あ" * 17, "🦀" * 13],
+        ids=["japanese-51-bytes", "emoji-52-bytes"],
+    )
+    @pytest.mark.asyncio
+    async def test_create_user_username_limit_is_bytes_not_characters(
+        self, iggy_client: IggyClient, unique_name, username
+    ):
+        """Test a username within 50 characters but over 50 bytes is rejected."""
+        assert len(username) <= MAX_USERNAME_BYTES
+        assert len(username.encode()) > MAX_USERNAME_BYTES
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.create_user(
+                username, unique_name(max_bytes=MAX_PASSWORD_BYTES)
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_user_password_limit_is_bytes_not_characters(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a password within 100 characters but over 100 bytes is rejected."""
+        password = "あ" * 34
+        assert len(password) <= MAX_PASSWORD_BYTES
+        assert len(password.encode()) > MAX_PASSWORD_BYTES
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.create_user(
+                unique_name(max_bytes=MAX_USERNAME_BYTES), password
+            )
 
 
 class TestGetUser:
@@ -295,6 +388,46 @@ class TestUpdateUser:
                 unique_name(max_bytes=MAX_USERNAME_BYTES),
                 status=UserStatus.Inactive,
             )
+
+    @pytest.mark.parametrize(
+        "new_username",
+        ["a" * (MIN_USERNAME_BYTES - 1), "a" * (MAX_USERNAME_BYTES + 1), "あ" * 17],
+        ids=["too-short", "too-long", "multibyte-51-bytes"],
+    )
+    @pytest.mark.asyncio
+    async def test_update_user_rejects_out_of_bounds_username(
+        self, iggy_client: IggyClient, unique_name, new_username
+    ):
+        """Test update_user rejects usernames outside the 3-50 byte range."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_user(created.id, username=new_username)
+
+        unchanged = await iggy_client.get_user(created.id)
+        assert unchanged is not None
+        assert unchanged.username == username
+        assert unchanged.status == UserStatus.Active
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_user_accepts_multibyte_username(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_user accepts a non-ascii username within the byte limit."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        new_username = f"사용자{unique_name(min_bytes=4, max_bytes=8)}"
+        await iggy_client.update_user(created.id, username=new_username)
+
+        renamed = await iggy_client.get_user(created.id)
+        assert renamed is not None
+        assert renamed.username == new_username
+
+        await iggy_client.delete_user(created.id)
 
 
 class TestDeleteUser:
