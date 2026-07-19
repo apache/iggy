@@ -113,6 +113,37 @@ class TestCreateUser:
 
         await iggy_client.delete_user(created.id)
 
+    @pytest.mark.asyncio
+    async def test_inactive_user_cannot_login(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test an inactive user is denied login even with correct credentials."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password, UserStatus.Inactive)
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.login_user(username, password)
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_deleted_user_cannot_login(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a deleted user cannot start a fresh authenticated session."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+        await iggy_client.delete_user(created.id)
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.login_user(username, password)
+
     @pytest.mark.parametrize(
         "username",
         ["a" * (MIN_USERNAME_BYTES - 1), "a" * (MAX_USERNAME_BYTES + 1)],
@@ -234,6 +265,23 @@ class TestGetUser:
         assert user_by_id is None
 
     @pytest.mark.asyncio
+    async def test_get_user_rejects_empty_identifier_locally(
+        self, iggy_client: IggyClient
+    ):
+        """Test the empty string is rejected client-side before any server call."""
+        with pytest.raises(ValueError):
+            iggy_client.get_user("")
+
+    @pytest.mark.parametrize("user_id", [-1, 2**32], ids=["negative", "above-u32"])
+    @pytest.mark.asyncio
+    async def test_get_user_rejects_out_of_range_numeric_id(
+        self, iggy_client: IggyClient, user_id
+    ):
+        """Test numeric ids outside the u32 range are rejected client-side."""
+        with pytest.raises(TypeError):
+            iggy_client.get_user(user_id)
+
+    @pytest.mark.asyncio
     async def test_get_user_returns_same_result_when_called_repeatedly(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -341,6 +389,23 @@ class TestUpdateUser:
         await iggy_client.delete_user(created.id)
 
     @pytest.mark.asyncio
+    async def test_update_user_with_no_fields_is_a_noop(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the server permits an update with neither username nor status."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        await iggy_client.update_user(created.id)
+
+        user = await iggy_client.get_user(created.id)
+        assert user is not None
+        assert user.username == username
+        assert user.status == UserStatus.Active
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
     async def test_update_user_applied_repeatedly_is_idempotent(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -374,6 +439,7 @@ class TestUpdateUser:
         unchanged = await iggy_client.get_user(first.id)
         assert unchanged is not None
         assert unchanged.username == first_username
+        assert unchanged.status == UserStatus.Active
 
         await iggy_client.delete_user(first.id)
         await iggy_client.delete_user(second.id)
@@ -462,6 +528,104 @@ class TestDeleteUser:
         """Test delete_user raises for a non-existent user."""
         with pytest.raises(RuntimeError):
             await iggy_client.delete_user(unique_name(max_bytes=MAX_USERNAME_BYTES))
+
+    @pytest.mark.parametrize("root_identifier", ["iggy", 0], ids=["by-name", "by-id"])
+    @pytest.mark.asyncio
+    async def test_delete_root_user_fails(
+        self, iggy_client: IggyClient, root_identifier
+    ):
+        """Test the root user cannot be deleted by username or numeric id."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.delete_user(root_identifier)
+
+        root = await iggy_client.get_user("iggy")
+        assert root is not None
+        assert root.status == UserStatus.Active
+
+    @pytest.mark.asyncio
+    async def test_delete_user_twice_fails(self, iggy_client: IggyClient, unique_name):
+        """Test deleting the same user twice fails on the second call."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        await iggy_client.delete_user(created.id)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_delete_inactive_user(self, iggy_client: IggyClient, unique_name):
+        """Test an inactive user can be deleted."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password, UserStatus.Inactive)
+
+        await iggy_client.delete_user(created.id)
+
+        assert await iggy_client.get_user(created.id) is None
+
+    @pytest.mark.asyncio
+    async def test_deleted_user_disappears_from_listings(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a deleted user is absent from both get_user and get_users."""
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        await iggy_client.delete_user(created.id)
+
+        assert await iggy_client.get_user(username) is None
+        assert await iggy_client.get_user(created.id) is None
+        users = await iggy_client.get_users()
+        assert created.id not in [user.id for user in users]
+        assert username not in [user.username for user in users]
+
+    @pytest.mark.asyncio
+    async def test_deleted_user_live_session_loses_identity(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a session owned by a deleted user can no longer act as that user.
+
+        A regular user holds no permissions, so privileged calls are rejected
+        both before and after deletion. The observable change on the live
+        session is that the user can no longer see itself.
+        """
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        host, port = get_server_config()
+        session = IggyClient(f"{host}:{port}")
+        await session.connect()
+        await session.login_user(username, password)
+        assert await session.get_user(username) is not None
+
+        await iggy_client.delete_user(created.id)
+
+        assert await session.get_user(username) is None
+        with pytest.raises(RuntimeError):
+            await session.get_users()
+
+    @pytest.mark.asyncio
+    async def test_deleted_username_is_reusable_with_fresh_credentials(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a deleted username can be recreated without old password state."""
+        username = unique_name(max_bytes=MAX_USERNAME_BYTES)
+        password = unique_name(max_bytes=MAX_USERNAME_BYTES)
+        new_password = f"{password}x"
+
+        first = await iggy_client.create_user(username, password)
+        await iggy_client.delete_user(first.id)
+
+        recreated = await iggy_client.create_user(username, new_password)
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        with pytest.raises(RuntimeError):
+            await client.login_user(username, password)
+        await client.login_user(username, new_password)
+
+        await iggy_client.delete_user(recreated.id)
 
 
 @pytest.mark.parametrize(
