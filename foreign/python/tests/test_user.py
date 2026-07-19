@@ -132,7 +132,12 @@ class TestGetUser:
         )
         assert user_by_name is None
 
-        user_by_id = await iggy_client.get_user(999999)
+        # Deleting a freshly created user guarantees its id is vacant.
+        username, password = _unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+        await iggy_client.delete_user(created.id)
+
+        user_by_id = await iggy_client.get_user(created.id)
         assert user_by_id is None
 
     @pytest.mark.asyncio
@@ -176,24 +181,13 @@ class TestGetUsers:
         assert all(isinstance(user.id, int) for user in users)
         assert all(isinstance(user.status, UserStatus) for user in users)
 
+        user_ids = [user.id for user in users]
+        assert user_ids == sorted(set(user_ids)), (
+            "get_users must return users in strictly ascending id order"
+        )
+
         await iggy_client.delete_user(first.id)
         await iggy_client.delete_user(second.id)
-
-    @pytest.mark.asyncio
-    async def test_get_users_returns_same_result_when_called_repeatedly(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test repeated get_users calls return a stable user view."""
-        username, password = _unique_credentials(unique_name)
-        created = await iggy_client.create_user(username, password)
-
-        first = await iggy_client.get_users()
-        second = await iggy_client.get_users()
-
-        assert [user.id for user in first] == [user.id for user in second]
-        assert [user.username for user in first] == [user.username for user in second]
-
-        await iggy_client.delete_user(created.id)
 
 
 class TestUpdateUser:
