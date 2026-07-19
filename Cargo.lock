@@ -3184,6 +3184,7 @@ dependencies = [
  "bit-set 0.10.0",
  "bytemuck",
  "bytes",
+ "clock",
  "futures",
  "futures-core",
  "iggy_binary_protocol",
@@ -6588,7 +6589,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.10.1-edge.2"
+version = "0.10.3-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6798,7 +6799,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.1-edge.2"
+version = "0.10.3-edge.1"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6810,7 +6811,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.10.1-edge.2"
+version = "0.10.3-edge.1"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -6842,6 +6843,24 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "iggy_connector_clickhouse_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "iggy_connector_sdk",
+ "rand 0.10.1",
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -11686,7 +11705,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.1-edge.1"
+version = "0.8.2-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -11771,6 +11790,7 @@ dependencies = [
  "ctrlc",
  "cyper",
  "cyper-axum",
+ "cyper-core",
  "dashmap",
  "dotenvy",
  "err_trail",
@@ -11781,6 +11801,8 @@ dependencies = [
  "hash32 1.0.0",
  "human-repr",
  "hwlocality",
+ "hyper",
+ "hyper-util",
  "iggy",
  "iggy_binary_protocol",
  "iggy_common",
@@ -12078,6 +12100,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "clap",
+ "clock",
+ "configs",
  "consensus",
  "enumset",
  "futures",
@@ -12090,6 +12114,8 @@ dependencies = [
  "partitions",
  "rand 0.10.1",
  "rand_xoshiro",
+ "secrecy",
+ "server-ng",
  "server_common",
  "shard",
  "strum 0.28.0",

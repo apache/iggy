@@ -30,9 +30,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-// Drives the `iggy` CLI binary against a running server. Untriaged for vsr:
-// nobody has assessed which of its ~170 cases work against server-ng.
-#[cfg(not(feature = "vsr"))]
+// Drives the `iggy` CLI binary against a running server, in both legacy and
+// vsr/server-ng modes. Under vsr, single-node and the default 3-node cluster
+// both pass. A few cases are mode-split where server-ng diverges from legacy by
+// design: flush returns FeatureUnavailable, the session-timeout message
+// differs, and purge is eventually consistent so server state is polled.
 mod cli;
 // A single `#[ignore]`d multi-node ping matrix stub; none of its cells run in
 // either mode today.
@@ -40,8 +42,8 @@ mod cli;
 mod cluster;
 mod config_provider;
 mod connectors;
-// Runs under vsr. The remaining per-module gap (`verify_after_server_restart`)
-// is gated inside the module with the reason (replica state transfer).
+// Runs under vsr; the one gap (`verify_after_server_restart`) is gated inside
+// the module: its rejoin window exceeds journal retention (state transfer).
 mod data_integrity;
 mod mcp;
 mod sdk;

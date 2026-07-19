@@ -36,10 +36,6 @@ pub mod create_message_payload;
 pub mod cross_protocol_pat_scenario;
 pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
-// Asserts server log-file rotation/archival policies; server-ng's file
-// logger only captures bootstrap output (shard-thread logs never reach the
-// file), so volume-based rotation rules cannot trigger.
-#[cfg(not(feature = "vsr"))]
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;

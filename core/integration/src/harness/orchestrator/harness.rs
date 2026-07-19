@@ -330,6 +330,36 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Restart EVERY node and reconnect all clients: the full-cluster
+    /// restart path, where no settled primary survives to answer the rejoin
+    /// probes and the replicas must fall back to an election among their
+    /// recovered logs. All nodes stop BEFORE any starts, so no rejoiner can
+    /// lean on a still-live peer (that would be a rolling restart).
+    pub async fn restart_cluster(&mut self) -> Result<(), TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+
+        for client in &mut self.clients {
+            client.disconnect().await;
+        }
+
+        for server in self.servers.iter_mut().rev() {
+            server.stop_dependents()?;
+            server.stop()?;
+        }
+        for server in &mut self.servers {
+            server.restart()?;
+        }
+
+        self.update_client_addresses();
+        for client in &mut self.clients {
+            client.connect().await?;
+        }
+
+        Ok(())
+    }
+
     /// Get reference to the first (primary) server handle.
     pub fn server(&self) -> &ServerHandle {
         self.servers.first().expect("No servers configured")

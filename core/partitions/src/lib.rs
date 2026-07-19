@@ -45,7 +45,7 @@ use server_common::Message;
 pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer, SendMessagesResult,
+    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairSession, SendMessagesResult,
 };
 
 /// Partition-level data plane operations.

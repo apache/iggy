@@ -145,11 +145,14 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]);
-    assert_eq!(
-        poll_all_offsets(&client, &stream_ident, &topic_ident).await,
+    await_polled_offsets(
+        &client,
+        &stream_ident,
+        &topic_ident,
         (MSGS_PER_SEALED_SEGMENT..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Messages in the remaining segments survive"
-    );
+        "Messages in the remaining segments survive",
+    )
+    .await;
 
     // After deleting segment 0 (7 messages removed): current_offset must still
     // reflect the true partition max (24), not messages_count - 1 (17).
@@ -201,11 +204,14 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]);
-    assert_eq!(
-        poll_all_offsets(&client, &stream_ident, &topic_ident).await,
+    await_polled_offsets(
+        &client,
+        &stream_ident,
+        &topic_ident,
         (2 * MSGS_PER_SEALED_SEGMENT..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Messages 14..25 survive"
-    );
+        "Messages 14..25 survive",
+    )
+    .await;
 
     // After deleting segments 0 and 1 (14 messages removed): current_offset
     // must still be 24, not messages_count - 1 (10).
@@ -282,21 +288,16 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         &partition_path,
         std::slice::from_ref(&active_segment_offset),
     );
-    assert_eq!(
-        poll_all_offsets(&client, &stream_ident, &topic_ident).await,
+    await_polled_offsets(
+        &client,
+        &stream_ident,
+        &topic_ident,
         (active_segment_offset..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Messages in the active segment survive"
-    );
+        "Messages in the active segment survive",
+    )
+    .await;
 
-    // --- Error cases ---
-    //
-    // Legacy rejects a delete on an unknown target. server-ng acks it without
-    // committing anything (best-effort space management), which gaps the VSR
-    // request sequence: the next metadata op hits the `request == committed + 1`
-    // preflight, gets dropped, and the SDK read-timeout replay panics
-    // (`register_request_id already called`). Skipped under vsr until
-    // unresolvable targets are rejected (or committed as no-ops) at admission.
-    #[cfg(not(feature = "vsr"))]
+    // --- Error cases: deletes on unknown targets must be rejected ---
     {
         assert!(
             client

@@ -70,6 +70,14 @@ pub fn read_size_field(header: &[u8]) -> Option<u32> {
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
+    /// Whether a frame carrying `command` may be typed as this header.
+    /// Defaults to an exact match; a header that serves several commands
+    /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
+    #[must_use]
+    fn accepts(command: Command2) -> bool {
+        command == Self::COMMAND
+    }
+
     /// # Errors
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -687,6 +695,42 @@ impl ConsensusHeader for PrepareHeader {
     }
 }
 
+// RepairPrepareHeader - repair peer -> recovering replica (journal repair)
+
+/// A stored prepare served for journal repair.
+///
+/// Byte-identical to [`PrepareHeader`] except the command, so the recovering
+/// replica routes it to the fence-free repair ingest instead of live
+/// replication. The newtype keeps the frame typed as `RepairPrepare` across
+/// every parse; converting to a live `Prepare` happens once, at the apply
+/// site.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct RepairPrepareHeader(pub PrepareHeader);
+
+impl ConsensusHeader for RepairPrepareHeader {
+    const COMMAND: Command2 = Command2::RepairPrepare;
+    fn operation(&self) -> Operation {
+        self.0.operation
+    }
+    fn command(&self) -> Command2 {
+        self.0.command
+    }
+    fn size(&self) -> u32 {
+        self.0.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.0.command != Command2::RepairPrepare {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RepairPrepare,
+                found: self.0.command,
+            });
+        }
+        Ok(())
+    }
+}
+
 // PrepareOkHeader - replica -> primary (acknowledgement)
 
 /// Replica -> primary: acknowledge a Prepare.
@@ -1013,6 +1057,194 @@ impl ConsensusHeader for StartViewHeader {
             return Err(ConsensusError::InvalidField(
                 "commit cannot exceed op".to_string(),
             ));
+        }
+        Ok(())
+    }
+}
+
+// RequestStartViewHeader - restarted replica asking for the current view
+
+/// Recovering replica -> all replicas: resend me the current `StartView`.
+///
+/// Header-only; only the current view's primary answers, with a targeted
+/// `StartView` (adoption is fenced by the receiver's view monotonicity and
+/// the sender-is-primary check, so no nonce is needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestStartViewHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub namespace: u64,
+    pub reserved: [u8; 120],
+}
+const _: () = {
+    assert!(size_of::<RequestStartViewHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestStartViewHeader, namespace)
+            == offset_of!(RequestStartViewHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestStartViewHeader, reserved) + size_of::<[u8; 120]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestStartViewHeader {
+    const COMMAND: Command2 = Command2::RequestStartView;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestStartView {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestStartView,
+                found: self.command,
+            });
+        }
+        if self.release != 0 {
+            return Err(ConsensusError::InvalidField(
+                "release must be 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RequestPreparesHeader - ask a peer for a range of committed prepares
+
+/// Recovering/holed replica -> a Normal peer: request a repair stream.
+///
+/// Sent to the primary first. Asks for the journaled prepares in
+/// `[from_op, to_op]` for `namespace`. Header-only. The peer answers with
+/// `RepairPrepare` frames in op order, terminated by `RepairDone` or
+/// `RangeEvicted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RequestPreparesHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    pub from_op: u64,
+    pub to_op: u64,
+    pub namespace: u64,
+    pub reserved: [u8; 88],
+}
+const _: () = {
+    assert!(size_of::<RequestPreparesHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RequestPreparesHeader, nonce)
+            == offset_of!(RequestPreparesHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RequestPreparesHeader, reserved) + size_of::<[u8; 88]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RequestPreparesHeader {
+    const COMMAND: Command2 = Command2::RequestPrepares;
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RequestPrepares {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RequestPrepares,
+                found: self.command,
+            });
+        }
+        if self.from_op == 0 || self.from_op > self.to_op {
+            return Err(ConsensusError::InvalidField(
+                "repair range must be non-empty and 1-based".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// RepairRangeReplyHeader - RepairDone / RangeEvicted terminators
+
+/// Serving peer -> requester: terminates a repair stream.
+///
+/// As `RepairDone`, `through_op` is the last op served. As `RangeEvicted`,
+/// `retained_from` is the peer's oldest retained op -- everything older must
+/// come from bulk state sync (phase 3). One layout serves both commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
+#[repr(C)]
+pub struct RepairRangeReplyHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub nonce: u128,
+    /// `RepairDone`: last op served. `RangeEvicted`: oldest retained op.
+    pub op: u64,
+    pub namespace: u64,
+    pub reserved: [u8; 96],
+}
+const _: () = {
+    assert!(size_of::<RepairRangeReplyHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(RepairRangeReplyHeader, nonce)
+            == offset_of!(RepairRangeReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(RepairRangeReplyHeader, reserved) + size_of::<[u8; 96]>() == HEADER_SIZE);
+};
+
+impl ConsensusHeader for RepairRangeReplyHeader {
+    const COMMAND: Command2 = Command2::RepairDone;
+    // One layout, two commands: `RepairDone` terminates a stream,
+    // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
+    // rejects `RangeEvicted` frames before `validate` ever sees them.
+    fn accepts(command: Command2) -> bool {
+        command == Command2::RepairDone || command == Command2::RangeEvicted
+    }
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::RepairDone && self.command != Command2::RangeEvicted {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::RepairDone,
+                found: self.command,
+            });
         }
         Ok(())
     }

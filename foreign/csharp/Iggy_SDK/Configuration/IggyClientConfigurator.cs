@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -65,4 +66,19 @@ public sealed class IggyClientConfigurator
     ///     The logger factory to use.
     /// </summary>
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
+
+    /// <summary>
+    ///     Optional message encryptor. When set, the client encrypts message payloads and user headers on send
+    ///     and decrypts them on poll. Applies to every message on the connection, so topics mixing encrypted
+    ///     and plaintext messages are not supported. The caller owns the encryptor and must dispose it
+    ///     (e.g. <see cref="AesMessageEncryptor" />) after the client is done with it.
+    /// </summary>
+    public IMessageEncryptor? MessageEncryptor { get; set; }
+
+    /// <summary>
+    ///     Opt in to <c>autoCommit: true</c> on the raw poll methods while an encryptor is configured.
+    ///     Off by default: the server commits the offset before the client decrypts, so a decryption failure
+    ///     would silently skip the batch. Does not affect <see cref="Consumers.IggyConsumer" /> commit modes.
+    /// </summary>
+    public bool AllowAutoCommitWithEncryptor { get; set; }
 }

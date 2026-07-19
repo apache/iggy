@@ -118,9 +118,17 @@ pub struct RecoveredMetadata<M> {
 /// state machine BEFORE journal replay and ONLY when no snapshot exists, so
 /// replayed ops land on the same baseline (and the same slab ids) they were
 /// originally applied over. A snapshot already contains that baseline.
+///
+/// `solo` marks a single-replica cluster: the quorum is 1/1, so every
+/// journaled op was committed the moment it was written and replay runs to
+/// the journal head. The embedded `commit` stamps cannot be used there: each
+/// stamp is the primary's commit point when the prepare was SENT, so a
+/// pipelined burst (e.g. create-stream + create-topic on one connection) is
+/// stamped entirely below its own ops and would replay as nothing.
 #[allow(clippy::future_not_send)]
 pub async fn recover<M>(
     data_dir: &Path,
+    solo: bool,
     seed_baseline: impl FnOnce(&M),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
@@ -167,10 +175,17 @@ where
     // future non-monotone stamping change cannot silently under-apply the
     // committed prefix.
     let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let commit_watermark = headers_to_replay
-        .iter()
-        .map(|header| header.commit)
-        .fold(snapshot_floor, u64::max);
+    let commit_watermark = if solo {
+        headers_to_replay
+            .iter()
+            .map(|header| header.op)
+            .fold(snapshot_floor, u64::max)
+    } else {
+        headers_to_replay
+            .iter()
+            .map(|header| header.commit)
+            .fold(snapshot_floor, u64::max)
+    };
 
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
@@ -251,7 +266,7 @@ mod tests {
     #[compio::test]
     async fn recover_empty_state() {
         let dir = tempdir().unwrap();
-        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
 
         assert_eq!(recovered.last_applied_op, None);
         assert!(recovered.journal.last_op().is_none());
@@ -268,7 +283,7 @@ mod tests {
             .persist(&metadata_dir.join("snapshot.bin"))
             .unwrap();
 
-        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         assert_eq!(
             recovered
                 .snapshot
@@ -295,7 +310,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         assert!(recovered.snapshot.is_none());
         // Op 3's entry proves commit=2; op 3 itself is journaled but not
         // provably committed, so it stays journal-only.
@@ -329,7 +344,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         assert_eq!(recovered.last_applied_op, Some(3));
         assert_eq!(recovered.last_journaled_op, Some(5));
         assert_eq!(recovered.journal.last_op(), Some(5));
@@ -358,7 +373,7 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
         // Replays ops 6-9 (snapshot at 5; op 10's entry proves commit=9).
         assert_eq!(recovered.last_applied_op, Some(9));
         assert_eq!(recovered.last_journaled_op, Some(10));

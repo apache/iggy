@@ -50,7 +50,7 @@ use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::installer::conn_info::ClientConnMeta;
 use crate::replica::listener::MessageHandler;
-use crate::{IggyMessageBus, ReplicaHandshakeDoneFn};
+use crate::{ClientConnectionLostFn, IggyMessageBus, ReplicaHandshakeDoneFn};
 use std::rc::Rc;
 use tracing::warn;
 
@@ -112,6 +112,15 @@ pub trait ConnectionInstaller {
     /// subprotocol negotiation: the caller (server-ng) gates command
     /// access via the LOGIN allowlist.
     fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
+
+    /// Per-connection metadata stored at install time, or `None` if the client
+    /// is not (or no longer) connected on this bus. Dispatch reads `peer_addr`
+    /// + `transport` from it to seed the shard's session manager.
+    fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>>;
+
+    /// Register the callback fired when a client connection is lost, so
+    /// dispatch can drive session removal + logout on disconnect.
+    fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn);
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
@@ -182,5 +191,13 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
             }
         });
         self.track_background(handle);
+    }
+
+    fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
+        IggyMessageBus::client_meta(self, client_id)
+    }
+
+    fn set_client_connection_lost_fn(&self, f: ClientConnectionLostFn) {
+        IggyMessageBus::set_client_connection_lost_fn(self, f);
     }
 }

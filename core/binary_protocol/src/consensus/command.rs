@@ -45,6 +45,20 @@ pub enum Command2 {
     ReplicaHello = 14,
     ReplicaChallenge = 15,
     ReplicaFinish = 16,
+
+    // Replica recovery: a restarted replica asks for the current view's
+    // `StartView` instead of trusting stale local state; only that view's
+    // primary answers (with a targeted `StartView`).
+    RequestStartView = 17,
+
+    // Journal repair: fetch committed prepares a replica is missing (rejoin
+    // window or interior hole). `RepairPrepare` carries a journaled prepare
+    // verbatim; `RangeEvicted` is the honest answer when the serving peer no
+    // longer retains the front of the range.
+    RequestPrepares = 18,
+    RepairPrepare = 19,
+    RepairDone = 20,
+    RangeEvicted = 21,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -55,7 +69,7 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= Self::ReplicaFinish as u8
+        *bits <= Self::RangeEvicted as u8
     }
 }
 
@@ -76,8 +90,8 @@ mod tests {
 
     #[test]
     fn replica_auth_commands_are_valid_bit_patterns() {
-        // Locks the is_valid_bit_pattern bump: 14/15/16 parse, 17 still rejects.
-        for command in 14u8..=16 {
+        // Locks the is_valid_bit_pattern bump: 14..=21 parse, 22 still rejects.
+        for command in 14u8..=21 {
             let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
             buf.resize(256, 0);
             buf[60] = command;
@@ -85,7 +99,7 @@ mod tests {
         }
         let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
         buf.resize(256, 0);
-        buf[60] = 17;
+        buf[60] = 22;
         assert!(bytemuck::checked::try_from_bytes::<GenericHeader>(&buf).is_err());
     }
 }

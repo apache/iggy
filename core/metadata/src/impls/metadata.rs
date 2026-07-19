@@ -88,7 +88,7 @@ pub struct IggySnapshot {
 #[allow(unused)]
 impl IggySnapshot {
     #[must_use]
-    pub fn new(sequence_number: u64) -> Self {
+    pub const fn new(sequence_number: u64) -> Self {
         Self {
             snapshot: MetadataSnapshot::new(sequence_number),
         }
@@ -167,11 +167,12 @@ impl Snapshot for IggySnapshot {
     type Timestamp = u64;
     type Inner = MetadataSnapshot;
 
-    fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, SnapshotError>
+    fn create<T>(stm: &T, sequence_number: u64, created_at: u64) -> Result<Self, SnapshotError>
     where
         T: FillSnapshot<MetadataSnapshot>,
     {
         let mut snapshot = MetadataSnapshot::new(sequence_number);
+        snapshot.created_at = created_at;
 
         stm.fill_snapshot(&mut snapshot)?;
 
@@ -201,7 +202,7 @@ impl Snapshot for IggySnapshot {
 /// Owns the data directory path and the snapshot creation function.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
-    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
 }
 
 impl<M> SnapshotCoordinator<M> {
@@ -212,7 +213,7 @@ impl<M> SnapshotCoordinator<M> {
     #[must_use]
     pub fn new(
         data_dir: std::path::PathBuf,
-        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+        create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
     ) -> Self {
         Self {
             data_dir,
@@ -231,11 +232,12 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         last_op: u64,
+        created_at: u64,
     ) -> Result<(), SnapshotError>
     where
         J: JournalHandle,
     {
-        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let snapshot = (self.create_snapshot)(stm, last_op, created_at)?;
         let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
         snapshot.persist(&path)?;
 
@@ -260,6 +262,7 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         commit_op: u64,
+        created_at: u64,
     ) -> Result<bool, SnapshotError>
     where
         J: JournalHandle,
@@ -270,7 +273,7 @@ impl<M> SnapshotCoordinator<M> {
             .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
 
         if needs_checkpoint {
-            self.checkpoint(stm, journal, commit_op).await?;
+            self.checkpoint(stm, journal, commit_op, created_at).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -391,6 +394,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// server config at bootstrap ([`Self::set_default_max_topic_size`]);
     /// defaults to unlimited, matching the shipped server config.
     default_max_topic_size: Cell<u64>,
+    /// Resolved micros value for `IggyExpiry::ServerDefault` (`0` on the wire).
+    /// Same admission-time sentinel resolution as [`Self::default_max_topic_size`];
+    /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
+    /// Defaults to never-expire, matching the shipped server config.
+    default_message_expiry: Cell<u64>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -422,6 +430,7 @@ where
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
+            default_message_expiry: Cell::new(u64::MAX),
         }
     }
 }
@@ -445,6 +454,19 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     #[must_use]
     pub const fn default_max_topic_size(&self) -> u64 {
         self.default_max_topic_size.get()
+    }
+
+    /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
+    /// Server-ng bootstrap calls this with `system.topic.message_expiry` on every
+    /// shard (responses read it too); only shard 0's copy feeds admission.
+    pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
+        self.default_message_expiry.set(message_expiry_micros);
+    }
+
+    /// Resolved micros value for `IggyExpiry::ServerDefault`.
+    #[must_use]
+    pub const fn default_message_expiry(&self) -> u64 {
+        self.default_message_expiry.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -714,6 +736,7 @@ where
         if is_backup {
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
+            consensus.observe_prepare_timestamp(header.timestamp);
         }
 
         // After successful journal write, send prepare_ok to primary.
@@ -1686,8 +1709,12 @@ where
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        // Stamp created_at from the injected consensus clock (seed-derived
+        // under the simulator), not the wall clock, so replayed snapshots are
+        // byte-identical.
+        let created_at = consensus.clock_realtime_micros();
         match coordinator
-            .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+            .checkpoint_if_needed(&self.mux_stm, journal, snap_op, created_at)
             .await
         {
             Ok(true) => {
@@ -1775,6 +1802,9 @@ where
                 if request.max_topic_size == 0 {
                     request.max_topic_size = self.default_max_topic_size.get();
                 }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1836,9 +1866,17 @@ where
             Operation::UpdateTopic => {
                 let mut request = WireUpdateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
+                // Same `ServerDefault` resolution as `CreateTopic` above; rebuild
+                // the prepare only if a sentinel actually needs stamping, else
+                // project the untouched buffer zero-copy.
+                let needs_rewrite = request.max_topic_size == 0 || request.message_expiry == 0;
                 if request.max_topic_size == 0 {
-                    // Same `ServerDefault` resolution as `CreateTopic` above.
                     request.max_topic_size = self.default_max_topic_size.get();
+                }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
+                if needs_rewrite {
                     let body = request.to_bytes();
                     return Ok(build_prepare_message(
                         consensus,
@@ -1991,24 +2029,28 @@ where
             Operation::CreateTopicWithAssignments => {
                 let request = PersistedCreateTopicRequest::decode_from(body)
                     .expect("create topic with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                // A topic may be created with zero partitions and grown later,
+                // so there may be no consensus group to observe yet.
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create topic with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             Operation::CreatePartitionsWithAssignments => {
                 let request = PersistedCreatePartitionsRequest::decode_from(body)
                     .expect("create partitions with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create partitions with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             _ => {}
         }
@@ -2252,8 +2294,9 @@ where
     let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
         .expect("prepare header bytes should be valid");
     // Match `Project::project` (core/consensus/src/impls.rs): the primary
-    // stamps wall-clock once here so every replica's `StateHandler::apply`
-    // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
+    // stamps the injected clock once here (wall time in production, virtual
+    // under the simulator) so every replica's `StateHandler::apply` reads the
+    // same `created_at`. A `0` stamp would persist a 1970-01-01
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions
@@ -2614,6 +2657,38 @@ mod tests {
             prepare.header().user_id,
             ACTING_USER,
             "prepare must carry the ClientTable identity, not the wire value"
+        );
+    }
+
+    #[test]
+    fn prepare_request_stamps_create_topic_message_expiry_default() {
+        // A `CreateTopic` carrying the `ServerDefault` sentinel (0) must be
+        // rewritten at primary admission to the configured default, so the
+        // replicated prepare -- and thus every replica's commit -- holds a
+        // concrete expiry. Mirrors the `max_topic_size` sentinel resolution.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        const CONFIGURED_EXPIRY_MICROS: u64 = 7_200_000_000;
+        let plane = metadata_plane();
+        plane.set_default_message_expiry(CONFIGURED_EXPIRY_MICROS);
+        plane.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // `create_topic_request` builds the body with `message_expiry == 0`.
+        let prepare = plane
+            .prepare_request(create_topic_request(CLIENT, ACTING_USER))
+            .expect("CreateTopic is client-allowed");
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        let persisted = PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode");
+        assert_eq!(
+            persisted.request.message_expiry, CONFIGURED_EXPIRY_MICROS,
+            "ServerDefault expiry must be stamped to the configured default at admission"
         );
     }
 }

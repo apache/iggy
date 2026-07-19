@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Restart-based verifiers stay `not(vsr)`: they restart cluster nodes and
-// assert on-disk state afterward, which VSR can't satisfy until replica state
-// transfer lands (a restarted replica has no way to catch up).
+// Requires state transfer: the 5 MB bench fill is thousands of ops while the
+// partition journal's evicted ring retains only the last 4096, so a restarted
+// replica's rejoin window exceeds what journal repair can serve. The commit
+// floor lets recovered segments stand in for the evicted prefix, but the
+// sub-floor stats/offset seeding this test asserts (exact messages_count /
+// size_bytes across the restart) is state transfer's job.
 #[cfg(not(feature = "vsr"))]
 mod verify_after_server_restart;
 mod verify_user_login_after_restart;
@@ -28,8 +31,7 @@ mod verify_user_login_after_restart;
 mod verify_no_plaintext_credentials_on_disk;
 
 // The cooperative-rebalance matrix runs under vsr too: it exercises server-ng's
-// consumer-group rebalancing (a VSR feature) and never restarts the cluster, so
-// the no-state-transfer limitation above does not apply. Green at 95/95.
+// consumer-group rebalancing (a VSR feature). Green at 95/95.
 mod verify_consumer_group_partition_assignment;
 
 // Cross-replica on-disk data identity is VSR-only.
