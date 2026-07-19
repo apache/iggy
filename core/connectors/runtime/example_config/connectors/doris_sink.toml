@@ -49,6 +49,7 @@ timeout = "30s"
 # re-PUT under the same label, which Doris dedupes. max_retries is the total
 # attempt count (0 or 1 disables retries). With N = max(max_retries, 1), a
 # conservative retention bound is N * 6 * timeout + (N - 1) * max_retry_delay.
+# Values above 10 are honored but warn because they can delay graceful shutdown.
 # max_retries = 3
 # retry_delay = "200ms"
 # max_retry_delay = "5s"

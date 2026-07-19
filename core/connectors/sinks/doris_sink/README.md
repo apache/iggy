@@ -16,7 +16,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
    - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(label_prefix, table, stream, topic)` tuple.
      Identities that sanitize to the same string therefore get distinct labels, whether the collision is in the names (`events.v1` vs `events_v1`) or in two tenants' prefixes that truncate alike (`prod_events_us_east_1` vs `..._2`). Length prefixes prevent boundary-shift aliasing (`("ab","c")` ≠ `("a","bc")`). The target table participates because Doris labels are scoped to a database, not a table.
    - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
-   - Doris dedupes loads by label inside its `label_keep_max_second` window. The in-request retry (step 6) re-PUTs a transiently-failed batch under the same label, so a prior attempt that actually landed (e.g. a `2xx` whose body we couldn't read) is absorbed, not doubled. This protects **in-request retry only**: the runtime commits the offset before `consume()` runs and discards its return, so a failure outliving the retry budget or a crash mid-load is **at-most-once**.
+   - Doris dedupes loads by label inside its `label_keep_max_second` window. The in-request retry (step 6) re-PUTs a transiently-failed batch under the same label, so a prior attempt that actually landed (e.g. a `2xx` with a missing or unreadable body) is absorbed, not doubled. This protects **in-request retry only**: the runtime commits the offset before `consume()` runs and discards its return, so a failure outliving the retry budget or a crash mid-load is **at-most-once**.
 3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it. Where the HTTP stack negotiates the handshake it also lets Doris reject auth/4xx before the body uploads — a secondary benefit, not relied on for correctness.)
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
    `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 (or a redirect with no usable `Location`) are rejected as a permanent `PermanentHttpError`, since retrying a malformed/looping redirect cannot help.
@@ -24,8 +24,9 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
    - `Success` → batch accepted.
    - `Label Already Exists` with `ExistingJobStatus: FINISHED` → idempotent replay, treated as success. `RUNNING` or `CANCELLED` is transient and retried; a missing or unsupported existing-job status is a permanent protocol error.
    - `Publish Timeout` → the transaction is committed but may not yet be visible, so it is treated as success and is not retried.
+   - An empty or unreadable `2xx` response body → ambiguous commit outcome, retried under the same label. A non-empty malformed body remains a permanent protocol error.
    - HTTP `5xx`/`408`/`429` → transient error (`Error::CannotStoreData`): retried in-request up to `max_retries` attempts (exponential backoff + jitter) under the same label before being surfaced.
-   - `Fail`, any other `4xx`, or an unparsable response body → permanent error (`Error::PermanentHttpError`); never retried — re-PUTing bad data would just hammer the FE.
+   - `Fail`, any other `4xx`, or a non-empty unparsable response body → permanent error (`Error::PermanentHttpError`); never retried — re-PUTing bad data would just hammer the FE.
 6. A *transient* failure (the classifications above, plus a transport-level error) is retried in-request: the same batch is re-`PUT` under the same label, up to `max_retries` attempts with backoff and ±20% jitter (`iggy_connector_sdk::retry`). Since the runtime commits the offset at poll time, this is the connector's only redelivery path; once the budget is exhausted the final attempt's error is surfaced and the batch is not retried again — **at-most-once** across polls.
 
 ## Configuration
@@ -41,7 +42,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
 | `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
 | `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
-| `max_retries` | no | `3` | Total Stream Load attempts per batch on a *transient* failure (`0` or `1` disables retries). Each retry re-PUTs under the same label, which Doris dedupes. |
+| `max_retries` | no | `3` | Total Stream Load attempts per batch on a *transient* failure (`0` or `1` disables retries). Each retry re-PUTs under the same label, which Doris dedupes. Values above `10` are honored but emit a startup warning because they can substantially delay graceful shutdown. |
 | `retry_delay` | no | `200ms` | Base backoff before the first retry; doubles each attempt up to `max_retry_delay`, with ±20% jitter. |
 | `max_retry_delay` | no | `5s` | Strict upper bound on a single retry backoff, including jitter. |
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
