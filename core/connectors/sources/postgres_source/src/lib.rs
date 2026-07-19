@@ -183,10 +183,13 @@ impl Source for PostgresSource {
 
         self.connect().await?;
 
+        validate_payload_format(self.config.payload_format.as_deref())?;
+
         match self.config.mode.as_str() {
             "cdc" => {
+                let backend = validate_cdc_backend(self.config.cdc_backend.as_deref())?;
+                validate_capture_operations(self.config.capture_operations.as_deref())?;
                 self.setup_cdc().await?;
-                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
                 info!(
                     "PostgreSQL CDC mode enabled (backend: {backend}) for connector ID: {}",
                     self.id
@@ -387,26 +390,12 @@ impl PostgresSource {
     }
 
     async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
-        let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
-        match backend {
+        match self.config.cdc_backend.as_deref().unwrap_or("builtin") {
             "builtin" => self.poll_cdc_builtin().await,
-            "pg_replicate" => {
-                #[cfg(feature = "cdc_pg_replicate")]
-                {
-                    Err(Error::InitError(
-                        "pg_replicate backend not yet implemented".to_string(),
-                    ))
-                }
-                #[cfg(not(feature = "cdc_pg_replicate"))]
-                {
-                    Err(Error::InitError(
-                        "cdc_backend 'pg_replicate' requested but feature 'cdc_pg_replicate' is not enabled at build time".to_string(),
-                    ))
-                }
-            }
-            other => Err(Error::InitError(format!(
-                "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
-            ))),
+            "pg_replicate" => Err(Error::InitError(
+                "pg_replicate backend not yet implemented".to_string(),
+            )),
+            other => unreachable!("validate_cdc_backend already rejected '{other}'"),
         }
     }
 
@@ -1491,6 +1480,64 @@ fn to_snake_case(input: &str) -> String {
     result
 }
 
+fn validate_cdc_backend(cdc_backend: Option<&str>) -> Result<&str, Error> {
+    let backend = cdc_backend.unwrap_or("builtin");
+    match backend {
+        "builtin" => Ok(backend),
+        "pg_replicate" => {
+            #[cfg(feature = "cdc_pg_replicate")]
+            {
+                Ok(backend)
+            }
+            #[cfg(not(feature = "cdc_pg_replicate"))]
+            {
+                Err(Error::InitError(
+                    "cdc_backend 'pg_replicate' requested but feature 'cdc_pg_replicate' is not enabled at build time".to_string(),
+                ))
+            }
+        }
+        other => Err(Error::InitError(format!(
+            "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
+        ))),
+    }
+}
+
+fn validate_capture_operations(capture_operations: Option<&[String]>) -> Result<(), Error> {
+    const VALID: [&str; 3] = ["INSERT", "UPDATE", "DELETE"];
+    let Some(ops) = capture_operations else {
+        return Ok(());
+    };
+    for op in ops {
+        if !VALID.contains(&op.as_str()) {
+            return Err(Error::InitError(format!(
+                "Unsupported capture_operations value '{op}'. Use any of 'INSERT', 'UPDATE', 'DELETE'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_payload_format(payload_format: Option<&str>) -> Result<(), Error> {
+    const VALID: [&str; 7] = [
+        "json",
+        "bytea",
+        "raw",
+        "text",
+        "json_direct",
+        "jsonb",
+        "jsonb_direct",
+    ];
+    let Some(fmt) = payload_format else {
+        return Ok(());
+    };
+    if !VALID.contains(&fmt.to_lowercase().as_str()) {
+        return Err(Error::InitError(format!(
+            "Unsupported payload_format '{fmt}'. Use 'json', 'bytea'/'raw', 'text', or 'json_direct'/'jsonb'/'jsonb_direct'"
+        )));
+    }
+    Ok(())
+}
+
 fn unquote_pg_identifier(segment: &str) -> String {
     match segment.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         Some(inner) => inner.replace("\"\"", "\""),
@@ -1901,6 +1948,44 @@ mod tests {
         assert_eq!(rec.data["user"], serde_json::json!("quoted_row"));
         assert!(rec.data.get("createdAt").is_some());
         assert!(rec.data.get("\"user\"").is_none());
+    }
+
+    #[test]
+    fn given_unknown_cdc_backend_should_fail_validation() {
+        let err = validate_cdc_backend(Some("built-in")).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_no_cdc_backend_should_default_to_builtin() {
+        assert_eq!(validate_cdc_backend(None).unwrap(), "builtin");
+    }
+
+    #[test]
+    fn given_unsupported_capture_operation_should_fail_validation() {
+        let ops = vec!["INSRT".to_string()];
+        let err = validate_capture_operations(Some(&ops)).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_valid_capture_operations_should_pass_validation() {
+        let ops = vec!["INSERT".to_string(), "DELETE".to_string()];
+        assert!(validate_capture_operations(Some(&ops)).is_ok());
+        assert!(validate_capture_operations(None).is_ok());
+    }
+
+    #[test]
+    fn given_unsupported_payload_format_should_fail_validation() {
+        let err = validate_payload_format(Some("btea")).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_valid_payload_format_should_pass_validation() {
+        assert!(validate_payload_format(Some("bytea")).is_ok());
+        assert!(validate_payload_format(Some("JSON")).is_ok());
+        assert!(validate_payload_format(None).is_ok());
     }
 
     #[test]

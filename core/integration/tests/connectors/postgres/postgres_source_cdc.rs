@@ -252,6 +252,94 @@ async fn wait_for_source_status(
     panic!("Source connector did not reach {expected:?} status in time");
 }
 
+async fn get_active_source_config(http: &Client, api_url: &str) -> serde_json::Value {
+    http.get(format!("{api_url}/sources/{SOURCE_KEY}/configs/active"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("Failed to fetch active source config")
+        .json()
+        .await
+        .expect("Failed to parse active source config")
+}
+
+// CreateSourceConfig has no key/version/active fields - strip what GET
+// .../configs/active added before POSTing the payload back as a new version.
+async fn push_source_config(http: &Client, api_url: &str, mut config: serde_json::Value) -> u64 {
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("key");
+        obj.remove("version");
+        obj.remove("active");
+    }
+    let resp = http
+        .post(format!("{api_url}/sources/{SOURCE_KEY}/configs"))
+        .header("api-key", API_KEY)
+        .json(&config)
+        .send()
+        .await
+        .expect("Failed to call create-config endpoint");
+    assert!(
+        resp.status().is_success(),
+        "Failed to create source config version, got {}",
+        resp.status()
+    );
+    let created: serde_json::Value = resp.json().await.expect("Failed to parse created config");
+    created["version"]
+        .as_u64()
+        .expect("Created config response missing version")
+}
+
+async fn activate_source_config(http: &Client, api_url: &str, version: u64) {
+    let resp = http
+        .put(format!("{api_url}/sources/{SOURCE_KEY}/configs/active"))
+        .header("api-key", API_KEY)
+        .json(&serde_json::json!({ "version": version }))
+        .send()
+        .await
+        .expect("Failed to call activate-config endpoint");
+    assert!(
+        resp.status().is_success(),
+        "Failed to activate source config version {version}, got {}",
+        resp.status()
+    );
+}
+
+async fn restart_source_expect(http: &Client, api_url: &str, should_succeed: bool, context: &str) {
+    let resp = http
+        .post(format!("{api_url}/sources/{SOURCE_KEY}/restart"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("Failed to call restart endpoint");
+    assert_eq!(
+        resp.status().is_success(),
+        should_succeed,
+        "{context}, got {}",
+        resp.status()
+    );
+}
+
+// The local config provider globs every *.toml under config_dir on startup
+// (see LocalConnectorsConfigProvider::init), and config_dir here is the real,
+// shared postgres_source crate directory - so any version this test pushes
+// must be deleted again, or it leaks into every other process that later
+// points at that same directory.
+async fn delete_source_config_version(http: &Client, api_url: &str, version: u64) {
+    let resp = http
+        .delete(format!(
+            "{api_url}/sources/{SOURCE_KEY}/configs?version={version}"
+        ))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("Failed to call delete-config endpoint");
+    assert!(
+        resp.status().is_success(),
+        "Failed to delete source config version {version}, got {}",
+        resp.status()
+    );
+}
+
 // The connector calls pg_logical_slot_get_changes on a fixed poll interval and
 // briefly holds the slot active during each call. A drop landing in that window
 // gets ERROR 55006 (slot is active for PID ...), so retry past transient hits
@@ -277,19 +365,24 @@ async fn drop_replication_slot_retrying(pool: &sqlx::PgPool, slot: &str) {
     }
 }
 
-// Two restart scenarios against one container, run in sequence:
+// Three restart scenarios against one container, run in sequence:
 // 1. Simulates upgrading from the old broken version, which left a slot
 //    behind created with the pgoutput plugin. setup_cdc must refuse to
 //    silently reuse a mismatched slot (which used to fail forever on
 //    every poll instead) - it should fail loudly at startup, and recover
 //    cleanly once the operator drops the bad slot and restarts.
-// 2. Changes written while the connector is down (the slot retains WAL
+// 2. Invalid plugin_config fields (capture_operations, payload_format).
+//    open() must reject each at restart instead of leaving a Running
+//    connector that silently drops every change or emits wrong data - the
+//    same silent-death shape as the slot mismatch above. Config is fixed
+//    one field at a time until restart succeeds and CDC resumes.
+// 3. Changes written while the connector is down (the slot retains WAL
 //    regardless of consumer state) - not the at-least-once crash window
 //    where the slot has already been consumed but send/state-persist
 //    hasn't happened yet. That gap remains open until the slot-peek/LSN
 //    work lands.
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source_cdc_restart.toml")),
     seed = seeds::connector_stream
 )]
 async fn cdc_source_recovers_from_slot_mismatch_and_restart(
@@ -372,6 +465,77 @@ async fn cdc_source_recovers_from_slot_mismatch_and_restart(
         "Expected CDC to resume capturing changes after the slot was fixed"
     );
 
+    // Scenario 2: invalid plugin_config fields must be rejected at restart,
+    // one field at a time, until the config is fully valid again. Every
+    // pushed version is deleted again at the end (see
+    // delete_source_config_version) so nothing outlives this test on disk.
+    let baseline_config = get_active_source_config(&http, &api_url).await;
+    let mut pushed_versions = Vec::new();
+
+    let mut bad_ops = baseline_config.clone();
+    bad_ops["plugin_config"]["capture_operations"] = serde_json::json!(["INSRT"]);
+    let version = push_source_config(&http, &api_url, bad_ops).await;
+    pushed_versions.push(version);
+    activate_source_config(&http, &api_url, version).await;
+    restart_source_expect(
+        &http,
+        &api_url,
+        false,
+        "Restart with an invalid capture_operations entry should not report success",
+    )
+    .await;
+
+    let mut bad_format = baseline_config.clone();
+    bad_format["plugin_config"]["payload_column"] = serde_json::json!("name");
+    bad_format["plugin_config"]["payload_format"] = serde_json::json!("btea");
+    let version = push_source_config(&http, &api_url, bad_format).await;
+    pushed_versions.push(version);
+    activate_source_config(&http, &api_url, version).await;
+    restart_source_expect(
+        &http,
+        &api_url,
+        false,
+        "Restart with an invalid payload_format should not report success",
+    )
+    .await;
+
+    let version = push_source_config(&http, &api_url, baseline_config).await;
+    pushed_versions.push(version);
+    activate_source_config(&http, &api_url, version).await;
+    restart_source_expect(
+        &http,
+        &api_url,
+        true,
+        "Restart with a valid config should succeed",
+    )
+    .await;
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
+
+    let reconfigured_id = before.id as i32 + 1;
+    fixture
+        .insert_row(
+            &pool,
+            reconfigured_id,
+            "reconfigured_row",
+            1,
+            1.0,
+            true,
+            before.timestamp,
+        )
+        .await;
+    let received = poll_cdc_records(&client, &stream_id, &topic_id, &consumer_id, 1).await;
+    assert_eq!(
+        received.len(),
+        1,
+        "Expected CDC to resume capturing changes once the config was fixed"
+    );
+
+    // Deleting the still-active version last falls back to version 0 (the
+    // original config.toml), restoring the pre-test state exactly.
+    for version in pushed_versions {
+        delete_source_config_version(&http, &api_url, version).await;
+    }
+
     harness
         .server_mut()
         .stop_dependents()
@@ -379,7 +543,7 @@ async fn cdc_source_recovers_from_slot_mismatch_and_restart(
 
     // The replication slot retains WAL for changes made while nothing is
     // consuming - this row must still arrive once the connector restarts.
-    let after_id = before.id as i32 + 1;
+    let after_id = reconfigured_id + 1;
     fixture
         .insert_row(
             &pool,
