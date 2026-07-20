@@ -3163,7 +3163,6 @@ mod tests {
     }
 
     /// Reproduces the single-node "metadata prepare queue is full" wedge
-    /// (laserdata cloud-core suite, 2026-07-18).
     ///
     /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
     /// Under a concurrent login/create burst, several `on_replicate` futures
@@ -3319,8 +3318,7 @@ mod tests {
     }
 
     /// The exact window behind the historical "logout/unregister failed
-    /// ... primary not yet caught up on `commit_journal`" reports
-    /// (laserdata harness, 2026-07-17..20): a logout submitted while
+    /// ... primary not yet caught up on `commit_journal`".
     /// ANOTHER client's op sits between quorum-ack (`commit_max` advanced
     /// inside `on_ack`) and apply (`commit_min` behind, driver parked at
     /// the journal read).

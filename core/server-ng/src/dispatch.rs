@@ -2899,8 +2899,7 @@ mod tests {
     }
 
     /// Desired-contract test for the production failure chain "CLI stream
-    /// create succeeded, logout failed: Disconnected" (laserdata harness
-    /// reports, 2026-07-17..20).
+    /// create succeeded, logout failed: Disconnected".
     ///
     /// Why the logout of a CLI invocation fails during ITS OWN successful
     /// `stream create`: the catch-up gate is GLOBAL. The suite runs many
