@@ -3,6 +3,9 @@ target*
 .vscode/
 .vs/
 .zed/
+.claude/feedback/
+.claude/logs/
+.claude/state/
 .DS_Store
 .gradle
 local_data*

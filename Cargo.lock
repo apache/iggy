@@ -8979,6 +8979,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "object_storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "compio",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "object_store"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

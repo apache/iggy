@@ -57,6 +57,7 @@ members = [
     "core/journal",
     "core/message_bus",
     "core/metadata",
+    "core/object_storage",
     "core/partitions",
     "core/sdk",
     "core/server",
@@ -223,6 +224,7 @@ mongodb = { version = "3.7.0", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
+object_storage = { path = "core/object_storage" }
 octocrab = "0.53.1"
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
