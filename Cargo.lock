@@ -7456,7 +7456,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "server",
- "socket2 0.6.4",
  "sqlx",
  "sysinfo 0.39.5",
  "tempfile",

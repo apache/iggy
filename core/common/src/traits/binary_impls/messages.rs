@@ -59,7 +59,7 @@ fn topic_cache_key(stream_id: &Identifier, topic_id: &Identifier) -> String {
 }
 
 /// Sync the requesting member's assignment from the coordinator into the
-/// transport cache. An empty reply means the member holds no partitions.
+/// transport cache. An empty reply means the client is not a member.
 #[cfg(feature = "vsr")]
 async fn sync_group_assignment<B: BinaryClient>(
     client: &B,
@@ -77,14 +77,15 @@ async fn sync_group_assignment<B: BinaryClient>(
         .await?;
     let key = group_cache_key(stream_id, topic_id, group_id);
     if response.is_empty() {
-        // Empty reply = the client is not a member of this group (or holds no
-        // partitions). Record the empty assignment but do NOT `register_group`:
-        // registering would make the heartbeat re-sync it for the connection's
-        // lifetime and leak a `joined_groups` entry per distinct non-member
-        // group ever polled. Only a real membership (non-empty reply) registers.
-        client
-            .consumer_group_state()
-            .set_assignment(key, 0, Vec::new());
+        // Empty reply = not a member: the coordinator sends an assignment
+        // header for any member, including one holding zero partitions.
+        // Registering only on a non-empty reply keeps a non-member group from
+        // leaking a `joined_groups` entry, and the deregister is the only thing
+        // that observes a server-side removal (group deleted, member evicted):
+        // without it `is_registered` latches true and every later poll returns
+        // empty instead of surfacing 5006.
+        client.consumer_group_state().invalidate_assignment(&key);
+        client.consumer_group_state().deregister_group(&key);
         return Ok(());
     }
     let (assignment, _) =
@@ -195,7 +196,18 @@ async fn poll_group_messages<B: BinaryClient>(
     }
     for _ in 0..GROUP_POLL_MAX_ATTEMPTS {
         let Some(partition_id) = client.consumer_group_state().next_group_partition(&key) else {
-            // Synced but holds no partitions: not a member, or none assigned.
+            // Nothing to poll, but the two causes need opposite handling and
+            // only membership tells them apart: a real member can legitimately
+            // hold zero partitions, while a non-member must surface 5006 or
+            // `IggyConsumer` polls an empty assignment forever instead of
+            // rejoining. The client id is not known client-side.
+            if !client.consumer_group_state().is_registered(&key) {
+                return Err(IggyError::ConsumerGroupMemberNotFound(
+                    0,
+                    consumer.id.clone(),
+                    topic_id.clone(),
+                ));
+            }
             return Ok(PolledMessages::empty());
         };
         let request = PollMessagesRequest {
