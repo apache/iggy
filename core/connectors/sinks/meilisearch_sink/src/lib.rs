@@ -20,7 +20,6 @@ use base64::{Engine as _, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_to_serde_json,
     retry::{exponential_backoff, jitter, parse_duration},
     sink_connector,
 };
@@ -37,7 +36,7 @@ use meilisearch_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{cmp, future::Future, time::Duration};
+use std::{cmp, future::Future, net::IpAddr, time::Duration};
 use tokio::{
     sync::Mutex,
     time::{Instant, sleep},
@@ -130,7 +129,8 @@ impl From<MeilisearchSinkConfig> for ResolvedMeilisearchSinkConfig {
     fn from(config: MeilisearchSinkConfig) -> Self {
         let primary_key = config
             .primary_key
-            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_PRIMARY_KEY.to_string());
         let document_action = config.document_action.unwrap_or_default();
         let create_index_if_not_exists = config
@@ -160,7 +160,7 @@ impl From<MeilisearchSinkConfig> for ResolvedMeilisearchSinkConfig {
 
         Self {
             url: config.url,
-            index: config.index,
+            index: config.index.trim().to_string(),
             api_key: config.api_key,
             primary_key,
             document_action,
@@ -196,10 +196,21 @@ impl MeilisearchSink {
 
     fn create_client(&self) -> Result<Client, Error> {
         let url = normalize_host(&self.config.url)?;
+        warn_if_api_key_uses_insecure_http(&self.config.url, &url, self.config.api_key.is_some());
         let api_key = self.config.api_key.as_ref().map(|key| key.expose_secret());
         Client::new(url, api_key).map_err(|error| {
             Error::Connection(format!("Failed to create Meilisearch client: {error}"))
         })
+    }
+
+    fn validate_config(&self) -> Result<(), Error> {
+        if self.config.index.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "Meilisearch index cannot be empty".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     async fn check_connectivity(&self, client: &Client) -> Result<(), Error> {
@@ -342,12 +353,12 @@ impl MeilisearchSink {
 
         let mut document = match payload {
             Payload::Json(value) => {
-                Self::document_from_json_value(owned_value_to_serde_json(&value))
+                Self::document_from_json_value(owned_value_into_serde_json(value))
             }
             Payload::Raw(bytes) => {
                 let mut bytes_copy = bytes.clone();
                 match simd_json::from_slice::<simd_json::OwnedValue>(&mut bytes_copy) {
-                    Ok(value) => Self::document_from_json_value(owned_value_to_serde_json(&value)),
+                    Ok(value) => Self::document_from_json_value(owned_value_into_serde_json(value)),
                     Err(_) => Map::from_iter([
                         (
                             "data".to_string(),
@@ -381,19 +392,16 @@ impl MeilisearchSink {
                 offset,
                 message_id,
             )?;
-            document.insert(
-                self.config.primary_key.clone(),
-                Value::String(value.clone()),
-            );
-            generated_id = Some(value);
+            if self.config.primary_key != DEFAULT_PRIMARY_KEY {
+                generated_id = Some(value.clone());
+            }
+            document.insert(self.config.primary_key.clone(), Value::String(value));
         }
 
         if self.config.include_metadata {
-            if self.config.primary_key != DEFAULT_PRIMARY_KEY
-                && !document.contains_key(DEFAULT_PRIMARY_KEY)
-            {
-                let id = match &generated_id {
-                    Some(id) => id.clone(),
+            if self.config.primary_key != DEFAULT_PRIMARY_KEY {
+                let id = match generated_id {
+                    Some(id) => id,
                     None => generated_document_id_from_parts(
                         topic_metadata,
                         messages_metadata,
@@ -401,37 +409,41 @@ impl MeilisearchSink {
                         message_id,
                     )?,
                 };
-                document.insert(DEFAULT_PRIMARY_KEY.to_string(), Value::String(id));
+                upsert_metadata_field(&mut document, DEFAULT_PRIMARY_KEY, Value::String(id));
             }
-            insert_metadata_field(
+            upsert_metadata_field(
                 &mut document,
                 "iggy_message_id",
                 Value::String(message_id.to_string()),
             );
-            insert_metadata_field(&mut document, "iggy_offset", Value::from(offset));
-            insert_metadata_field(
+            upsert_metadata_field(&mut document, "iggy_offset", Value::from(offset));
+            upsert_metadata_field(
                 &mut document,
                 "iggy_stream",
                 Value::from(topic_metadata.stream.as_str()),
             );
-            insert_metadata_field(
+            upsert_metadata_field(
                 &mut document,
                 "iggy_topic",
                 Value::from(topic_metadata.topic.as_str()),
             );
-            insert_metadata_field(
+            upsert_metadata_field(
                 &mut document,
                 "iggy_partition",
                 Value::from(messages_metadata.partition_id),
             );
-            insert_metadata_field(&mut document, "iggy_checksum", Value::from(checksum));
-            insert_metadata_field(&mut document, "iggy_timestamp", Value::from(timestamp));
-            insert_metadata_field(
+            upsert_metadata_field(
+                &mut document,
+                "iggy_checksum",
+                Value::String(checksum.to_string()),
+            );
+            upsert_metadata_field(&mut document, "iggy_timestamp", Value::from(timestamp));
+            upsert_metadata_field(
                 &mut document,
                 "iggy_origin_timestamp",
                 Value::from(origin_timestamp),
             );
-            insert_metadata_field(
+            upsert_metadata_field(
                 &mut document,
                 "iggy_ingested_at",
                 Value::from(IggyTimestamp::now().as_millis() as i64),
@@ -439,7 +451,7 @@ impl MeilisearchSink {
             if let Some(headers) = &headers
                 && let Ok(headers_value) = serde_json::to_value(headers)
             {
-                insert_metadata_field(&mut document, "iggy_headers", headers_value);
+                upsert_metadata_field(&mut document, "iggy_headers", headers_value);
             }
         }
 
@@ -740,6 +752,7 @@ impl MeilisearchSink {
 #[async_trait]
 impl Sink for MeilisearchSink {
     async fn open(&mut self) -> Result<(), Error> {
+        self.validate_config()?;
         info!(
             "Opening Meilisearch sink connector with ID: {} for URL: {}, index: {}",
             self.id,
@@ -748,13 +761,13 @@ impl Sink for MeilisearchSink {
         );
         if self.config.document_action == MeilisearchDocumentAction::Update {
             warn!(
-                "Meilisearch sink connector with ID: {} is using document_action=update. Runtime retries are at-least-once and partial batch success can apply non-idempotent updates more than once.",
+                "Meilisearch sink connector with ID: {} is using document_action=update. Internal retries and ambiguous task outcomes can apply non-idempotent updates more than once.",
                 self.id
             );
         }
         if !self.config.wait_for_tasks {
             warn!(
-                "Meilisearch sink connector with ID: {} is opening with wait_for_tasks=false. Submitted document tasks may still be in flight or fail after offsets are committed.",
+                "Meilisearch sink connector with ID: {} is opening with wait_for_tasks=false. Submitted document tasks may still be in flight or fail after offsets are committed; this mode does not provide durability.",
                 self.id
             );
         }
@@ -924,13 +937,38 @@ fn generated_document_id_from_parts(
     Ok(format!("iggy_{encoded}"))
 }
 
-fn insert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Value) {
-    if object.contains_key(field) {
+fn upsert_metadata_field(object: &mut Map<String, Value>, field: &str, value: Value) {
+    if object.insert(field.to_string(), value).is_some() {
         debug!(
-            "Document already contains Meilisearch metadata field '{field}', preserving original value"
+            "Document already contains Meilisearch metadata field '{field}', overwriting with connector provenance"
         );
-    } else {
-        object.insert(field.to_string(), value);
+    }
+}
+
+fn owned_value_into_serde_json(value: simd_json::OwnedValue) -> Value {
+    match value {
+        simd_json::OwnedValue::Static(node) => match node {
+            simd_json::StaticNode::Null => Value::Null,
+            simd_json::StaticNode::Bool(value) => Value::Bool(value),
+            simd_json::StaticNode::I64(value) => Value::Number(value.into()),
+            simd_json::StaticNode::U64(value) => Value::Number(value.into()),
+            simd_json::StaticNode::F64(value) => serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+        },
+        simd_json::OwnedValue::String(value) => Value::String(value),
+        simd_json::OwnedValue::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(owned_value_into_serde_json)
+                .collect(),
+        ),
+        simd_json::OwnedValue::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, owned_value_into_serde_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -972,6 +1010,42 @@ fn normalize_host(raw: &str) -> Result<String, Error> {
     base_url.set_query(None);
     base_url.set_fragment(None);
     Ok(base_url.as_str().trim_end_matches('/').to_string())
+}
+
+fn warn_if_api_key_uses_insecure_http(raw: &str, normalized: &str, has_api_key: bool) {
+    if !has_api_key {
+        return;
+    }
+
+    let Ok(url) = Url::parse(normalized) else {
+        return;
+    };
+    if url.scheme() != "http" {
+        return;
+    }
+    let Some(host) = url.host_str() else {
+        return;
+    };
+    if is_loopback_host(host) {
+        return;
+    }
+
+    let scheme_hint = if raw.trim().starts_with("http://") {
+        "explicit http://"
+    } else {
+        "implicit http://"
+    };
+    warn!(
+        "Meilisearch API key is configured with {scheme_hint} for non-loopback host '{host}'. Credentials will be sent without TLS; use https:// unless this is intentional."
+    );
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -1180,6 +1254,7 @@ mod tests {
         assert_eq!(document["iggy_offset"], 11);
         assert_eq!(document["iggy_stream"], "orders.stream");
         assert_eq!(document["iggy_topic"], "created/topic");
+        assert_eq!(document["iggy_checksum"], "12");
     }
 
     #[test]
@@ -1203,20 +1278,22 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_metadata_fields() {
+    fn overwrites_reserved_metadata_fields() {
         let sink = sink_with_config(base_config());
         let payload = Payload::Json(simd_json::json!({
             "name": "Alice",
             "iggy_offset": 999,
-            "iggy_stream": "user-stream"
+            "iggy_stream": "user-stream",
+            "iggy_checksum": 999
         }));
 
         let document = sink
             .prepare_document(&topic_metadata(), &messages_metadata(), message(payload))
             .expect("prepare document");
 
-        assert_eq!(document["iggy_offset"], 999);
-        assert_eq!(document["iggy_stream"], "user-stream");
+        assert_eq!(document["iggy_offset"], 11);
+        assert_eq!(document["iggy_stream"], "orders.stream");
+        assert_eq!(document["iggy_checksum"], "12");
     }
 
     #[test]
@@ -1298,6 +1375,25 @@ mod tests {
             normalize_host("https://localhost:7700/path?foo=bar#section").expect("normalize host");
 
         assert_eq!(url, "https://localhost:7700");
+    }
+
+    #[test]
+    fn validate_config_should_reject_empty_index() {
+        let mut config = base_config();
+        config.index = "  ".to_string();
+        let sink = sink_with_config(config);
+
+        let error = sink.validate_config().expect_err("empty index should fail");
+
+        assert!(matches!(error, Error::InvalidConfigValue(_)));
+    }
+
+    #[test]
+    fn loopback_host_detection_allows_local_addresses() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("meili.prod"));
     }
 
     #[test]

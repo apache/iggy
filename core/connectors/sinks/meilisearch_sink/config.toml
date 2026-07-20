@@ -29,7 +29,7 @@ topics = ["test_topic"]
 schema = "json"
 batch_length = 100
 poll_interval = "5ms"
-consumer_group = "meilisearch_sink_cg"
+consumer_group = "meilisearch_sink"
 
 [plugin_config]
 url = "http://localhost:7700"

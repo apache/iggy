@@ -79,7 +79,7 @@ impl TestFixture for MeilisearchSinkFixture {
             (ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string()),
             (
                 ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
-                "meilisearch_sink_cg".to_string(),
+                "meilisearch_sink".to_string(),
             ),
             (
                 ENV_SINK_PATH.to_string(),
