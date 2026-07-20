@@ -367,9 +367,22 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation, raises ValueError for an
-        invalid `message_expiry` or `max_topic_size`, or a PyRuntimeError on
-        other failures.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            name: Topic name as `str`.
+            partitions_count: Number of partitions as `int`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            replication_factor: Replication factor as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is created.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -665,13 +678,12 @@ class IggyExpiry:
         r"""
         Expire messages this long after they are appended to the topic.
 
-        `duration` must be greater than zero: a zero-length `timedelta` is
-        indistinguishable on the wire from `ServerDefault` and is treated as
-        such by the server. A negative `timedelta` raises `ValueError` when
-        this value is passed to `create_topic`/`update_topic`. The upper
-        bound is whatever a `datetime.timedelta` can represent that also fits
-        in a `u64` microsecond count (about 584,942 years); in practice the
-        server-configured maximum is reached long before that.
+        `duration` must be greater than zero and less than the maximum
+        microsecond count a `u64` can hold (about 584,542 years): those two
+        values are reserved on the wire for `ServerDefault` and `NeverExpire`
+        respectively, so a `duration` at either boundary raises `ValueError`
+        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        also raises `ValueError`.
         """
 
         __match_args__ = ("duration",)
@@ -980,4 +992,7 @@ class TopicDetails:
     def partitions(self) -> builtins.list[Partition]:
         r"""
         The collection of partitions in the topic.
+
+        Rebuilds the list from scratch on every access; cache the result
+        rather than reading this repeatedly in a loop.
         """

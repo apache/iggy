@@ -49,6 +49,32 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// Resolves the shared `create_topic`/`update_topic` parameters, applying
+/// server defaults where the caller left them unset.
+fn resolve_topic_params(
+    compression_algorithm: Option<String>,
+    message_expiry: Option<&IggyExpiry>,
+    max_topic_size: Option<&MaxTopicSize>,
+) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
+    let compression_algorithm = match compression_algorithm {
+        Some(algo) => CompressionAlgorithm::from_str(&algo)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        None => CompressionAlgorithm::default(),
+    };
+
+    let expiry = message_expiry
+        .map(RustIggyExpiry::try_from)
+        .transpose()?
+        .unwrap_or(RustIggyExpiry::ServerDefault);
+
+    let max_size = max_topic_size
+        .map(RustMaxTopicSize::try_from)
+        .transpose()?
+        .unwrap_or(RustMaxTopicSize::ServerDefault);
+
+    Ok((compression_algorithm, expiry, max_size))
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
@@ -170,9 +196,22 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation, raises ValueError for an
-    /// invalid `message_expiry` or `max_topic_size`, or a PyRuntimeError on
-    /// other failures.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     name: Topic name as `str`.
+    ///     partitions_count: Number of partitions as `int`.
+    ///     compression_algorithm: Compression algorithm as `str | None`.
+    ///     replication_factor: Replication factor as `int | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is created.
+    ///
+    /// Raises:
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
     )]
@@ -197,21 +236,8 @@ impl IggyClient {
             &MaxTopicSize,
         >,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
-        };
-
-        let expiry = message_expiry
-            .map(RustIggyExpiry::try_from)
-            .transpose()?
-            .unwrap_or(RustIggyExpiry::ServerDefault);
-
-        let max_size = max_topic_size
-            .map(RustMaxTopicSize::try_from)
-            .transpose()?
-            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let (compression_algorithm, expiry, max_size) =
+            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
@@ -327,21 +353,8 @@ impl IggyClient {
             &MaxTopicSize,
         >,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
-        };
-
-        let expiry = message_expiry
-            .map(RustIggyExpiry::try_from)
-            .transpose()?
-            .unwrap_or(RustIggyExpiry::ServerDefault);
-
-        let max_size = max_topic_size
-            .map(RustMaxTopicSize::try_from)
-            .transpose()?
-            .unwrap_or(RustMaxTopicSize::ServerDefault);
+        let (compression_algorithm, expiry, max_size) =
+            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;

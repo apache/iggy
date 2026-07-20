@@ -313,6 +313,9 @@ impl TopicDetails {
     }
 
     /// The collection of partitions in the topic.
+    ///
+    /// Rebuilds the list from scratch on every access; cache the result
+    /// rather than reading this repeatedly in a loop.
     #[getter]
     pub fn partitions(&self) -> Vec<Partition> {
         self.inner

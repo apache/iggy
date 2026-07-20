@@ -768,6 +768,44 @@ class TestUpdateTopic:
     """Test updating topics via update_topic."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prefix", "min_bytes", "max_bytes"),
+        [
+            ("", 0, 0),
+            ("a" * 248, 256, 256),
+            ("é" * 124, 256, 256),
+            (("é" * 123) + "ab", 256, 256),
+            (("한" * 82) + "ab", 256, 256),
+            (("漢" * 82) + "ab", 256, 256),
+            (("あ" * 82) + "ab", 256, 256),
+            ("😀" * 62, 256, 256),
+            (("😀" * 61) + "abcd", 256, 256),
+        ],
+    )
+    async def test_update_topic_invalid_names(
+        self,
+        iggy_client: IggyClient,
+        unique_name,
+        prefix: str,
+        min_bytes: int,
+        max_bytes: int,
+    ):
+        """Test update_topic enforces byte-length validation."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        invalid_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_topic(
+                stream_id=stream_name, topic_id=topic_name, name=invalid_name
+            )
+
+    @pytest.mark.asyncio
     async def test_update_topic_renames_topic(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -978,6 +1016,8 @@ class TestUpdateTopic:
         [
             (-1, OverflowError),
             (2e64, TypeError),
+            (0, ValueError),
+            (2**64 - 1, ValueError),  # u64::MAX is reserved for Unlimited
         ],
     )
     async def test_update_topic_invalid_max_topic_size(
@@ -1029,6 +1069,39 @@ class TestUpdateTopic:
         assert topic.name == topic_name
         assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
         assert topic.message_expiry.duration == timedelta(minutes=10)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "invalid_duration",
+        [
+            timedelta(seconds=-1),
+            # 0 is the wire sentinel reserved for IggyExpiry.ServerDefault();
+            # matches MaxTopicSize.Custom(0) rejecting its own sentinel.
+            timedelta(0),
+            # u64::MAX microseconds is the wire sentinel reserved for
+            # IggyExpiry.NeverExpire(); matches MaxTopicSize.Custom(u64::MAX).
+            timedelta(microseconds=2**64 - 1),
+        ],
+    )
+    async def test_update_topic_rejects_invalid_message_expiry_duration(
+        self, iggy_client: IggyClient, unique_name, invalid_duration: timedelta
+    ):
+        """Test update_topic rejects an ExpireDuration at a reserved boundary."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        with pytest.raises(ValueError):
+            await iggy_client.update_topic(
+                stream_id=stream_name,
+                topic_id=topic_name,
+                name=topic_name,
+                message_expiry=IggyExpiry.ExpireDuration(invalid_duration),
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
