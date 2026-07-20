@@ -359,8 +359,7 @@ impl IggyMessage {
 
     pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
-        let message_header = self.header.to_bytes();
-        bytes.put_slice(&message_header);
+        self.header.write_to(&mut bytes);
         bytes.put_slice(&self.payload);
         if let Some(user_headers) = &self.user_headers {
             bytes.put_slice(user_headers);
@@ -419,7 +418,7 @@ impl IggyMessage {
     }
 
     pub fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_slice(&self.header.to_bytes());
+        self.header.write_to(buf);
         buf.put_slice(&self.payload);
         if let Some(user_headers) = &self.user_headers {
             buf.put_slice(user_headers);
