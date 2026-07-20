@@ -55,15 +55,21 @@ export const CREATE_USER = {
     if (bPassword.length < 1 || bPassword.length > 255)
       throw new Error('User password should be between 1 and 255 bytes');
 
-    const bPermissions = serializePermissions(permissions);
-
-    return Buffer.concat([
+    const bUser = Buffer.concat([
       uint8ToBuf(bUsername.length),
       bUsername,
       uint8ToBuf(bPassword.length),
       bPassword,
       uint8ToBuf(status),
-      boolToBuf(!!permissions),
+    ]);
+
+    if (!permissions)
+      return Buffer.concat([bUser, boolToBuf(false)]);
+
+    const bPermissions = serializePermissions(permissions);
+    return Buffer.concat([
+      bUser,
+      boolToBuf(true),
       uint32ToBuf(bPermissions.length),
       bPermissions
     ]);
