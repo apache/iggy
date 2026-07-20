@@ -108,7 +108,11 @@ impl IggyMessageHeader {
     }
 
     /// Serializes the header directly into `buf`, without an intermediate allocation.
+    ///
+    /// Reserving up front keeps an unsized `buf` to a single growth, since the
+    /// fields are appended individually.
     pub fn write_to(&self, buf: &mut BytesMut) {
+        buf.reserve(IGGY_MESSAGE_HEADER_SIZE);
         buf.put_u64_le(self.checksum);
         buf.put_u128_le(self.id);
         buf.put_u64_le(self.offset);
