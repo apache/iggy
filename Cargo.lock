@@ -6204,16 +6204,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
-name = "humantime-serde"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57a3db5ea5923d99402c94e9feb261dc5ee9b4efa158b0315f788cf549cc200c"
-dependencies = [
- "humantime",
- "serde",
-]
-
-[[package]]
 name = "hwlocality"
 version = "1.0.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7036,13 +7026,13 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_jdbc_source"
-version = "0.1.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",
  "chrono",
  "dashmap",
- "humantime-serde",
+ "humantime",
  "iggy_common",
  "iggy_connector_sdk",
  "jni 0.21.1",

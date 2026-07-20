@@ -99,7 +99,6 @@ include_metadata = true
 [[streams]]
 stream = "ecommerce"
 topic = "orders"
-partition_id = 1
 ```
 
 ### Bulk Mode Configuration
@@ -188,12 +187,12 @@ topic = "orders"
 | `username` | string | No | - | Database username (optional if in jdbc_url) |
 | `password` | string | No | - | Database password (optional if in jdbc_url) |
 | `query` | string | Yes | - | SQL query to execute (supports `{last_offset}` and `{tracking_column}` placeholders) |
-| `poll_interval` | duration | Yes | - | How often to poll (e.g., "30s", "5m", "1h") |
+| `poll_interval` | string (duration) | No | 5s | How often to poll, as a humantime string (e.g., "30s", "5m", "1h") |
 | `batch_size` | u32 | No | 1000 | Maximum rows to fetch per poll |
 | `tracking_column` | string | Incremental | - | Column to track for incremental reads (required in incremental mode; the query must also `ORDER BY` it) |
 | `initial_offset` | string | No | - | Starting offset value for first poll |
 | `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" (bulk works with ALL databases) |
-| `connection_timeout_ms` | u64 | No | 30000 | Timeout (ms) for the per-poll connection liveness check |
+| `connection_timeout_ms` | u64 | No | 5000 | Timeout (ms) for the per-poll `isValid` liveness check; converted to seconds and capped at 5s |
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
 | `include_metadata` | bool | No | true | Include metadata (table, operation, timestamp) |

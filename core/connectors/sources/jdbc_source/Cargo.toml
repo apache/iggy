@@ -17,19 +17,20 @@
 
 [package]
 name = "iggy_connector_jdbc_source"
-version = "0.1.0"
+version = "0.4.1-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "jdbc", "source"]
 categories = ["database"]
 description = "Generic JDBC source connector for Iggy - supports MySQL, Oracle, SQL Server, H2, and any JDBC-compliant database"
 readme = "README.md"
+publish = false
 
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "humantime-serde"]
+ignored = ["dashmap"]
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "lib"]
 
 [features]
 default = []
@@ -42,8 +43,8 @@ chrono = { workspace = true }
 # Required by source_connector! macro
 dashmap = { workspace = true }
 
-# For parsing duration strings
-humantime-serde = "1.1"
+# For parsing duration strings (poll_interval)
+humantime = { workspace = true }
 
 # Shared serde helpers (SecretString serialization)
 iggy_common = { workspace = true }

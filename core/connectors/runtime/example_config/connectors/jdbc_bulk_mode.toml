@@ -77,5 +77,4 @@ include_metadata = false
 [[streams]]
 stream = "warehouse"
 topic = "product_summary"
-partition_id = 1
 schema = "json"

@@ -62,5 +62,4 @@ connection_timeout_ms = 30000
 [[streams]]
 stream = "sales"
 topic = "orders"
-partition_id = 1
 schema = "json"

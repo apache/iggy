@@ -41,5 +41,4 @@ include_metadata = true
 [[streams]]
 stream = "test"
 topic = "users"
-partition_id = 1
 schema = "json"

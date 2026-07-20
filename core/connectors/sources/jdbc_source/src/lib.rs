@@ -107,6 +107,21 @@ static RE_INCREMENTAL_PREDICATE: std::sync::LazyLock<Regex> = std::sync::LazyLoc
 
 const CONNECTOR_NAME: &str = "JDBC source";
 
+/// Poll interval used when `poll_interval` is unset or empty.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Parse the configured `poll_interval` humantime string into a `Duration`,
+/// falling back to [`DEFAULT_POLL_INTERVAL`] when unset, empty, or unparseable.
+/// `validate_config` separately rejects a set-but-unparseable value so a typo
+/// surfaces at `open()` rather than silently defaulting.
+fn parse_poll_interval(poll_interval: Option<&str>) -> Duration {
+    poll_interval
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| humantime::parse_duration(value).ok())
+        .unwrap_or(DEFAULT_POLL_INTERVAL)
+}
+
 /// Source mode for the JDBC connector
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -148,9 +163,10 @@ pub struct JdbcSourceConfig {
     /// Can use {last_offset} placeholder for incremental reads
     pub query: String,
 
-    /// Polling interval (e.g., "30s", "5m", "1h")
-    #[serde(with = "humantime_serde")]
-    pub poll_interval: Duration,
+    /// Polling interval as a humantime string (e.g., "30s", "5m", "1h"). Parsed
+    /// once at construction; defaults to 5s when unset.
+    #[serde(default)]
+    pub poll_interval: Option<String>,
 
     /// Batch size - maximum rows to fetch per poll
     #[serde(default = "default_batch_size")]
@@ -181,15 +197,16 @@ pub struct JdbcSourceConfig {
     pub jvm_options: Vec<String>,
 
     /// Timeout for the per-poll `Connection.isValid` liveness check (default:
-    /// 30000). JDBC expresses this timeout in whole seconds, so the value is
-    /// converted to seconds and clamped to the 1..=30s range; it does not govern
-    /// connection establishment.
+    /// 5000). JDBC expresses this timeout in whole seconds, so the value is
+    /// converted to seconds and clamped to the 1..=5s range (the check runs on a
+    /// shared worker and must stay short); it does not govern connection
+    /// establishment.
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_ms: u64,
 }
 
 fn default_connection_timeout() -> u64 {
-    30000
+    5000
 }
 
 fn default_batch_size() -> u32 {
@@ -270,6 +287,8 @@ pub struct JdbcSource {
     // direct connection without `&mut self`.
     connection: Mutex<Option<GlobalRef>>,
     state: Arc<Mutex<State>>,
+    // Poll interval parsed once from `config.poll_interval` at construction.
+    poll_interval: Duration,
     // Scheduled start of the next poll, used to pace polls at a fixed cadence
     // that does not drift with per-poll work time. `None` until the first poll.
     next_poll_at: Mutex<Option<Instant>>,
@@ -304,12 +323,14 @@ impl JdbcSource {
                 default_state
             });
 
+        let poll_interval = parse_poll_interval(config.poll_interval.as_deref());
         Self {
             id,
             config,
             jvm: None,
             connection: Mutex::new(None),
             state: Arc::new(Mutex::new(state)),
+            poll_interval,
             next_poll_at: Mutex::new(None),
         }
     }
@@ -555,7 +576,9 @@ impl JdbcSource {
     /// Best-effort `Connection.isValid(timeout)` check. Returns false on any
     /// JNI error so the caller re-establishes the connection.
     fn connection_is_valid(&self, env: &mut JNIEnv, conn: &JObject) -> bool {
-        let timeout_secs = (self.config.connection_timeout_ms / 1000).clamp(1, 30) as i32;
+        // Cap the liveness check short: it runs on a shared block_in_place worker,
+        // so a dead connection must not block it for tens of seconds.
+        let timeout_secs = (self.config.connection_timeout_ms / 1000).clamp(1, 5) as i32;
         match env
             .call_method(conn, "isValid", "(I)Z", &[JValue::Int(timeout_secs)])
             .and_then(|v| v.z())
@@ -1006,6 +1029,27 @@ impl JdbcSource {
         Ok(col_type)
     }
 
+    /// Return `value`, or JSON `null` when the last primitive getter read a SQL
+    /// NULL (detected via `ResultSet.wasNull()`).
+    fn null_or(
+        &self,
+        env: &mut JNIEnv,
+        result_set: &JObject,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let was_null = jni!(
+            env,
+            env.call_method(result_set, "wasNull", "()Z", &[])
+                .and_then(|v| v.z()),
+            "Failed to check wasNull"
+        );
+        Ok(if was_null {
+            serde_json::Value::Null
+        } else {
+            value
+        })
+    }
+
     /// Extract column value based on JDBC type
     fn extract_column_value(
         &self,
@@ -1016,23 +1060,11 @@ impl JdbcSource {
     ) -> Result<serde_json::Value, Error> {
         use java::sql::Types;
 
-        // Check if null first
-        let obj = jni!(
-            env,
-            env.call_method(
-                result_set,
-                "getObject",
-                "(I)Ljava/lang/Object;",
-                &[JValue::Int(column_index)],
-            )
-            .and_then(|v| v.l()),
-            "Failed to get object"
-        );
-
-        if obj.is_null() {
-            return Ok(serde_json::Value::Null);
-        }
-
+        // Primitive getters (getInt/getBoolean/...) return 0/false for SQL NULL,
+        // so `null_or` consults ResultSet.wasNull() after the getter to tell an
+        // actual NULL from a zero value. Object getters (getString/getBytes)
+        // return a null reference for SQL NULL and are null-checked directly, so
+        // there is no separate getObject probe (one JNI call per column, not two).
         match *sql_type {
             Types::BIT | Types::BOOLEAN => {
                 let value = jni!(
@@ -1046,7 +1078,7 @@ impl JdbcSource {
                     .and_then(|v| v.z()),
                     "Failed to get boolean"
                 );
-                Ok(serde_json::Value::Bool(value))
+                self.null_or(env, result_set, serde_json::Value::Bool(value))
             }
             Types::TINYINT | Types::SMALLINT | Types::INTEGER => {
                 let value = jni!(
@@ -1055,7 +1087,7 @@ impl JdbcSource {
                         .and_then(|v| v.i()),
                     "Failed to get int"
                 );
-                Ok(serde_json::json!(value))
+                self.null_or(env, result_set, serde_json::json!(value))
             }
             Types::BIGINT => {
                 let value = jni!(
@@ -1064,7 +1096,7 @@ impl JdbcSource {
                         .and_then(|v| v.j()),
                     "Failed to get long"
                 );
-                Ok(serde_json::json!(value))
+                self.null_or(env, result_set, serde_json::json!(value))
             }
             Types::FLOAT | Types::REAL => {
                 let value = jni!(
@@ -1073,7 +1105,7 @@ impl JdbcSource {
                         .and_then(|v| v.f()),
                     "Failed to get float"
                 );
-                Ok(serde_json::json!(value))
+                self.null_or(env, result_set, serde_json::json!(value))
             }
             Types::DOUBLE => {
                 let value = jni!(
@@ -1087,7 +1119,7 @@ impl JdbcSource {
                     .and_then(|v| v.d()),
                     "Failed to get double"
                 );
-                Ok(serde_json::json!(value))
+                self.null_or(env, result_set, serde_json::json!(value))
             }
             // NUMERIC/DECIMAL can carry more precision than an f64 can represent
             // (e.g. money/large decimals), so emit them as strings to avoid
@@ -1223,6 +1255,17 @@ impl JdbcSource {
             )));
         }
 
+        // A set poll_interval must be a valid humantime string; an unparseable
+        // value would otherwise silently fall back to the default.
+        if let Some(value) = self.config.poll_interval.as_deref()
+            && !value.trim().is_empty()
+            && humantime::parse_duration(value.trim()).is_err()
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "poll_interval '{value}' is not a valid duration (e.g. \"30s\", \"5m\", \"1h\")"
+            )));
+        }
+
         // Separate-credential auth requires both username and password; a
         // half-set pair would silently fall through to URL-embedded credentials.
         if self.config.username.is_some() != self.config.password.is_some() {
@@ -1297,7 +1340,7 @@ impl Source for JdbcSource {
         let scheduled = {
             let mut next = lock_mutex(&self.next_poll_at, "next_poll_at")?;
             let scheduled = next.map_or_else(Instant::now, |planned| planned.max(Instant::now()));
-            *next = Some(scheduled + self.config.poll_interval);
+            *next = Some(scheduled + self.poll_interval);
             scheduled
         };
         let now = Instant::now();
@@ -1686,7 +1729,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -1704,6 +1747,32 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         std::fs::write(&path, b"jar").expect("write temp jar");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn test_parse_poll_interval() {
+        assert_eq!(parse_poll_interval(Some("30s")), Duration::from_secs(30));
+        assert_eq!(parse_poll_interval(Some("5m")), Duration::from_secs(300));
+        // Unset, empty, and unparseable all fall back to the default.
+        assert_eq!(parse_poll_interval(None), DEFAULT_POLL_INTERVAL);
+        assert_eq!(parse_poll_interval(Some("  ")), DEFAULT_POLL_INTERVAL);
+        assert_eq!(
+            parse_poll_interval(Some("not-a-duration")),
+            DEFAULT_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_bad_poll_interval() {
+        let jar = write_temp_jar("jdbc_validate_poll_interval.jar");
+        let mut config = base_config();
+        config.driver_jar_path = jar;
+        config.poll_interval = Some("banana".to_string());
+        let source = JdbcSource::new(1, config, None);
+        let err = source
+            .validate_config()
+            .expect_err("must reject bad poll_interval");
+        assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("poll_interval")));
     }
 
     #[test]
@@ -2051,7 +2120,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM users WHERE id > {last_offset} ORDER BY id".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("0".to_string()),
@@ -2093,7 +2162,7 @@ mod tests {
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
                     .to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("updated_at".to_string()),
             initial_offset: Some("2024-01-01".to_string()),
@@ -2127,7 +2196,7 @@ mod tests {
             query:
                 "SELECT * FROM orders WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
                     .to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("updated_at".to_string()),
             initial_offset: None,
@@ -2161,7 +2230,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM t WHERE {tracking_column} > {last_offset}".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("id; DROP TABLE t".to_string()),
             initial_offset: Some("0".to_string()),
@@ -2184,7 +2253,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM products".to_string(),
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Some("60s".to_string()),
             batch_size: 5000,
             tracking_column: None,
             initial_offset: None,
@@ -2219,7 +2288,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM orders WHERE updated_at > {last_offset}".to_string(),
-            poll_interval: Duration::from_secs(30),
+            poll_interval: Some("30s".to_string()),
             batch_size: 1000,
             tracking_column: Some("updated_at".to_string()),
             initial_offset: Some("2024-01-01 00:00:00".to_string()),
@@ -2313,13 +2382,17 @@ mod tests {
             toml::from_str(toml_str).expect("Failed to parse minimal TOML config");
         assert_eq!(config.driver_class, "org.h2.Driver");
         assert_eq!(config.query, "SELECT * FROM users");
-        assert_eq!(config.poll_interval, Duration::from_secs(30));
+        assert_eq!(config.poll_interval.as_deref(), Some("30s"));
+        assert_eq!(
+            parse_poll_interval(config.poll_interval.as_deref()),
+            Duration::from_secs(30)
+        );
         // Verify defaults are applied
         assert_eq!(config.mode, Mode::Incremental);
         assert_eq!(config.batch_size, 1000);
         assert!(config.include_metadata);
         assert!(!config.snake_case_columns);
-        assert_eq!(config.connection_timeout_ms, 30000);
+        assert_eq!(config.connection_timeout_ms, 5000);
         assert!(config.username.is_none());
         assert!(config.password.is_none());
         assert!(config.tracking_column.is_none());
@@ -2359,7 +2432,10 @@ mod tests {
         assert!(!config.include_metadata);
         assert_eq!(config.jvm_options, vec!["-Xmx512m", "-Xms128m"]);
         assert_eq!(config.connection_timeout_ms, 60000);
-        assert_eq!(config.poll_interval, Duration::from_secs(300));
+        assert_eq!(
+            parse_poll_interval(config.poll_interval.as_deref()),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -2375,7 +2451,10 @@ mod tests {
         let config: JdbcSourceConfig =
             toml::from_str(toml_str).expect("Failed to parse bulk mode config");
         assert_eq!(config.mode, Mode::Bulk);
-        assert_eq!(config.poll_interval, Duration::from_secs(3600));
+        assert_eq!(
+            parse_poll_interval(config.poll_interval.as_deref()),
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]
@@ -2411,7 +2490,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2439,7 +2518,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2464,7 +2543,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM orders WHERE id > {last_offset}".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("100".to_string()),
@@ -2489,7 +2568,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM products".to_string(),
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Some("60s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2518,7 +2597,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2547,7 +2626,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2579,7 +2658,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2608,7 +2687,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2635,7 +2714,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2665,7 +2744,7 @@ mod tests {
             password: None,
             query: "SELECT * FROM users WHERE {tracking_column} > {last_offset} ORDER BY id"
                 .to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: None,
@@ -2702,7 +2781,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM t WHERE id >= {last_offset}".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2725,7 +2804,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT * FROM users ORDER BY id".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: Some("id".to_string()),
             initial_offset: Some("0".to_string()),
@@ -2787,7 +2866,7 @@ mod tests {
             username: Some("admin".to_string()),
             password: Some(SecretString::from("MyP@ssw0rd")),
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,
@@ -2825,7 +2904,7 @@ mod tests {
             username: None,
             password: None,
             query: "SELECT 1".to_string(),
-            poll_interval: Duration::from_secs(10),
+            poll_interval: Some("10s".to_string()),
             batch_size: 100,
             tracking_column: None,
             initial_offset: None,

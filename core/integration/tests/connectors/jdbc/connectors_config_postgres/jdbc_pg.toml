@@ -28,7 +28,6 @@ path = "../../target/debug/libiggy_connector_jdbc_source"
 stream = "test_stream"
 topic = "test_topic"
 schema = "json"
-partition_id = 1
 
 [plugin_config]
 # All required fields - values will be overridden by environment variables
