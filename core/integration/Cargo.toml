@@ -34,6 +34,7 @@ login-session = ["dep:zbus-secret-service-keyring-store"]
 vsr = ["iggy/vsr"]
 
 [dependencies]
+arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -63,6 +64,8 @@ keyring-core = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
+parquet = { workspace = true }
+pgwire = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
@@ -82,6 +85,7 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
 socket2 = { workspace = true }
+sqlparser = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -89,6 +93,7 @@ test-case = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
