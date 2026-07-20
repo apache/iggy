@@ -17,6 +17,8 @@
 
 #[cfg(all(feature = "login-session", secret_service_keyring))]
 mod backend {
+    use iggy_cli::commands::binary_system::session::ServerSession;
+    use std::net::SocketAddr;
     use std::sync::OnceLock;
     use zbus_secret_service_keyring_store::store::Store;
 
@@ -26,8 +28,8 @@ mod backend {
     /// verbatim instead.
     static KEYRING_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
-    pub(crate) fn ensure_keyring_store() {
-        let result = KEYRING_INIT.get_or_init(|| match Store::new() {
+    fn init_store() -> &'static Result<(), String> {
+        KEYRING_INIT.get_or_init(|| match Store::new() {
             Ok(store) => {
                 keyring_core::set_default_store(store);
                 Ok(())
@@ -37,16 +39,36 @@ mod backend {
                  Ensure DBUS_SESSION_BUS_ADDRESS is set and a secret-service \
                  provider (gnome-keyring-daemon, KWallet, KeePassXC) is running."
             )),
-        });
-        if let Err(msg) = result {
+        })
+    }
+
+    pub(crate) fn ensure_keyring_store() {
+        if let Err(msg) = init_store() {
             panic!("{msg}");
         }
     }
+
+    /// Drop the CLI's stored session token for `address`, if one is there.
+    ///
+    /// Runs on both the setup and teardown paths. Errors are swallowed rather
+    /// than asserted on: an absent entry is the normal case, and on teardown a
+    /// panic during unwind aborts the process and buries the failure under test.
+    pub(crate) fn clear_session_entry(address: SocketAddr) {
+        if init_store().is_err() {
+            return;
+        }
+        let _ = ServerSession::new(address.to_string()).delete();
+    }
 }
 
-#[cfg(all(feature = "login-session", secret_service_keyring))]
-pub(crate) use backend::ensure_keyring_store;
-
 #[cfg(not(all(feature = "login-session", secret_service_keyring)))]
-#[allow(dead_code)]
-pub(crate) fn ensure_keyring_store() {}
+mod backend {
+    use std::net::SocketAddr;
+
+    pub(crate) fn ensure_keyring_store() {}
+
+    pub(crate) fn clear_session_entry(_address: SocketAddr) {}
+}
+
+#[allow(unused_imports)]
+pub(crate) use backend::{clear_session_entry, ensure_keyring_store};

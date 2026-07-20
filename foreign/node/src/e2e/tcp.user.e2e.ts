@@ -41,7 +41,30 @@ describe('e2e -> user', async () => {
       PollMessages: true,
       SendMessages: true
     },
-    streams: []
+    streams: [
+      {
+        streamId: 1,
+        permissions: {
+          manageStream: true,
+          readStream: true,
+          manageTopics: true,
+          readTopics: true,
+          pollMessages: true,
+          sendMessages: true
+        },
+        topics: [
+          {
+            topicId: 1,
+            permissions: {
+              manage: true,
+              read: true,
+              pollMessages: true,
+              sendMessages: true
+            }
+          }
+        ]
+      }
+    ]
   };
 
   const cUser = { userId, username, password, status, permissions };
@@ -49,6 +72,7 @@ describe('e2e -> user', async () => {
   it('e2e -> user::create', async () => {
     const user = await c.user.create(cUser);
     assert.ok(user);
+    assert.deepEqual(user.permissions, permissions);
   });
 
   it('e2e -> user::list', async () => {
@@ -89,12 +113,20 @@ describe('e2e -> user', async () => {
   it('e2e -> user::updatePermissions', async () => {
     const user = await c.user.get({ userId: username });
     assert.ok(user);
-    const perms2 = { ...permissions };
-    perms2.global.ReadServers = true;
+    const perms2 = {
+      ...permissions,
+      global: {
+        ...permissions.global,
+        ReadServers: true
+      }
+    };
     const u2 = await c.user.updatePermissions({
       userId: user.id, permissions: perms2
     });
     assert.ok(u2);
+
+    const updatedUser = await c.user.get({ userId: user.id });
+    assert.deepEqual(updatedUser?.permissions, perms2);
   });
 
   it('e2e -> user::delete', async () => {
