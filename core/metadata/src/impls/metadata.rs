@@ -942,7 +942,6 @@ where
             // only the driver that still finds its peeked header at the
             // pipeline head after the await owns that op's commit; everyone
             // else re-peeks and moves on to the next committable op.
-            let mut commits = 0usize;
             let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
             while let Some(prepare_header) = peek_committable_head(consensus) {
                 // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
@@ -1063,7 +1062,6 @@ where
                 };
                 consensus.advance_commit_min(prepare_header.op);
                 emit_sim_event(SimEventKind::OperationCommitted, &event);
-                commits += 1;
 
                 // Fire subscriber BEFORE wire send. Slot already updated
                 // (slot-first ordering, see take_reply_sender). Dropped
@@ -1110,9 +1108,11 @@ where
                 }
             }
 
-            // Each commit frees one prepare slot, promote up to that many
-            // buffered requests so the pipeline stays busy.
-            self.drain_request_queue_into_prepares(commits).await;
+            // Commits freed prepare slots and reopened the catch-up gate;
+            // promote buffered requests so the pipeline stays busy and
+            // absorbed submits (queued while this batch was mid-commit)
+            // dispatch immediately.
+            self.drain_request_queue_into_prepares().await;
         }
     }
 }
@@ -1184,32 +1184,22 @@ where
             return Ok(session);
         }
 
-        // Status + catch-up gate (see doc). Split variants for telemetry:
-        // NotPrimary (try peer) vs NotCaughtUp (retry). Caller policy same.
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
+        // Wrong node: waiting or queueing cannot fix that, the client must
+        // re-route to the primary.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return Err(MetadataSubmitError::NotPrimary);
         }
 
         // Mirror wire-path register_preflight: a racing second prepare fails
-        // check_register on commit. Surface pre-synthesis.
+        // check_register on commit. Surface pre-synthesis. Scans both the
+        // prepare queue and the request queue, so a register absorbed below
+        // dedups its own replays.
         if consensus
             .pipeline()
             .borrow()
             .has_message_from_client(client_id)
         {
             return Err(MetadataSubmitError::InProgress);
-        }
-
-        // TODO(pipeline-backpressure): in-process has no request_queue yet;
-        // terminal on full. Wire path buffers.
-        if consensus.pipeline().borrow().is_full() {
-            return Err(MetadataSubmitError::PipelineFull);
         }
 
         let request = build_register_request_message(consensus, client_id, user_id);
@@ -1222,6 +1212,38 @@ where
             },
             "build_register_request_message produced a header that fails validate()"
         );
+
+        // Catch-up gate (Register only: admitting one while a committed op
+        // is still unapplied races `commit_register`'s session-eq assert) or
+        // prepare queue full: absorb into the request queue instead of
+        // bouncing with a transient error. The queued
+        // entry carries this caller's reply subscriber; the commit path
+        // promotes it (`drain_request_queue_into_prepares`, which re-runs
+        // `register_preflight`) as soon as the in-flight batch drains, and
+        // the await below resolves exactly like the direct dispatch would.
+        if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                // Both queues full: honest terminal backpressure.
+                return Err(MetadataSubmitError::PipelineFull);
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.header().commit),
+                // Entry dropped before commit: view-change reset or a
+                // promotion-time preflight rejection. Same re-check as the
+                // direct path's cancel arm below.
+                Err(Canceled) => self
+                    .client_table
+                    .borrow()
+                    .get_session(client_id)
+                    .ok_or(MetadataSubmitError::Canceled),
+            };
+        }
         // `prepare_request` only fails on `!is_client_allowed`; Register is
         // allowed, so unreachable. Panic loudly on regression instead of
         // smuggling through wire-eviction.
@@ -1284,14 +1306,14 @@ where
             return Ok(consensus.commit_min());
         }
 
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
+        // No catch-up gate here: a logout admitted mid-commit-window is
+        // safe — the wire path has always dispatched non-register ops
+        // without one, and the per-client dedup below covers the only
+        // logout-vs-logout race. It simply pipelines behind the in-flight
+        // batch and commits with it, so a one-shot client's session
+        // teardown is latency, never an error.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return Err(MetadataSubmitError::NotPrimary);
         }
 
         if consensus
@@ -1302,10 +1324,6 @@ where
             return Err(MetadataSubmitError::InProgress);
         }
 
-        if consensus.pipeline().borrow().is_full() {
-            return Err(MetadataSubmitError::PipelineFull);
-        }
-
         let request = build_logout_request_message(consensus, client_id, session, request);
         debug_assert!(
             {
@@ -1314,6 +1332,31 @@ where
             },
             "build_logout_request_message produced a header that fails validate()"
         );
+
+        // Prepare queue full: absorb into the request queue with this
+        // caller's reply subscriber, promoted as
+        // commits free slots.
+        if consensus.pipeline().borrow().is_full() {
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                return Err(MetadataSubmitError::PipelineFull);
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.header().commit),
+                Err(Canceled) => {
+                    if self.client_table.borrow().get_session(client_id).is_none() {
+                        Ok(consensus.commit_min())
+                    } else {
+                        Err(MetadataSubmitError::Canceled)
+                    }
+                }
+            };
+        }
         let prepare = self
             .prepare_request(request)
             .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
@@ -1539,16 +1582,21 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        // Not-primary / not-caught-up is transient: the same request replayed
-        // once a primary is caught up commits fine. Reply with the explicit
-        // transient frame (relayed to the socket by the home shard) so the
-        // client replays immediately rather than waiting out its read-timeout.
+        // Not-primary is transient: the same request replayed against the
+        // current primary commits fine. Reply with the explicit transient
+        // frame (relayed to the socket by the home shard) so the client
+        // replays immediately rather than waiting out its read-timeout.
         // `TransientNotAccepted` specifically: the request never entered the
         // pipeline here, so the client may re-issue it ANYWHERE -- including
         // under a fresh session after failing over to the current leader --
         // without double-apply risk. (`TransientNotCommitted` conversely means
         // the outcome is unknown and only a same-session replay is safe.)
-        if !is_caught_up_primary(consensus) {
+        //
+        // No catch-up gate: a non-register op admitted mid-commit-window
+        // simply pipelines behind the in-flight batch (the wire path has
+        // always done this); the register-specific invariant is guarded in
+        // `submit_register_in_process` / `register_preflight`.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
@@ -1590,15 +1638,38 @@ where
             PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
-        // Pipeline full: backpressure, not failure. The request was not
-        // admitted, so `TransientNotAccepted` (re-issuable anywhere).
+        // Prepare queue full: backpressure, not failure. Absorb into the
+        // request queue with this caller's reply subscriber; the commit
+        // path promotes it as slots free up and the await below resolves
+        // with the committed reply. Only a full request queue is terminal
+        // (`TransientNotAccepted`, re-issuable anywhere: the request never
+        // entered a queue).
         if consensus.pipeline().borrow().is_full() {
-            return Ok(build_result_rejection_reply(
-                &request_header,
-                consensus.commit_max(),
-                IggyError::TransientNotAccepted.as_code(),
-            )
-            .into_generic());
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                return Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotAccepted.as_code(),
+                )
+                .into_generic());
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.into_generic()),
+                // Queued entry dropped (view-change reset) or promoted then
+                // canceled: outcome unknown, same-session replay only.
+                Err(Canceled) => Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotCommitted.as_code(),
+                )
+                .into_generic()),
+            };
         }
 
         // The acting-user RBAC stamp lives in the shared `prepare_request`
@@ -1649,12 +1720,14 @@ where
     ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
-        // can drop the borrow. No commit-max advance flips the gate today;
-        // pin against a future await between check and dispatch.
+        // Register is the one op whose admission requires the catch-up gate
+        // (session-eq assert at commit); its submit path checks the gate and
+        // the check-to-dispatch section is synchronous. Non-register ops
+        // dispatch mid-window by design (they pipeline behind the in-flight
+        // batch, like the wire path always has).
         debug_assert!(
-            is_caught_up_primary(consensus),
-            "dispatch_prepare_and_await: gate flipped between check and dispatch"
+            prepare.header().operation != Operation::Register || is_caught_up_primary(consensus),
+            "dispatch_prepare_and_await: register dispatched with the catch-up gate closed"
         );
         // `on_replicate` awaits: a sibling in-process submit may commit
         // (commit_min advances) or a view change may land (view advances) while
@@ -1797,16 +1870,29 @@ where
     /// client's request between push and drain (Stale / Duplicate /
     /// `AlreadyRegistered`). Skipping produces a duplicate prepare and panics.
     #[allow(clippy::future_not_send)]
-    async fn drain_request_queue_into_prepares(&self, slots_freed: usize) {
+    async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();
-        for _ in 0..slots_freed {
+        // Promote while prepare slots exist. Requests are queued for two
+        // reasons — prepare queue full at arrival, or (in-process register)
+        // the catch-up gate was closed — so promotion is bounded by slots,
+        // not by how many commits just freed: a whole burst absorbed during
+        // one commit window drains the moment the window closes. Promoted
+        // prepares are un-quorum'd, so they never re-close the gate here.
+        loop {
+            if consensus.pipeline().borrow().is_full() {
+                break;
+            }
             let req = consensus.pipeline().borrow_mut().pop_request();
-            let Some(req) = req else { break };
+            let Some(mut req) = req else { break };
 
             let client_id = req.message.header().client;
             let session = req.message.header().session;
             let request = req.message.header().request;
             let operation = req.message.header().operation;
+            // If preflight or projection rejects below, dropping `req` (and
+            // the sender taken from it) wakes an in-process awaiter with
+            // `Canceled`; its submit path re-checks the client table.
+            let reply_sender = req.take_reply_sender();
             let dispatch = if operation == Operation::Register {
                 register_preflight(consensus, &self.client_table, client_id).await
             } else {
@@ -1838,10 +1924,20 @@ where
                     continue;
                 }
             };
-            pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
-                self.on_replicate(prepare)
-            })
-            .await;
+            // Mirror `pipeline_prepare_common`, threading the queued
+            // subscriber into the pipeline entry so the awaiter that parked
+            // at enqueue time resolves on this prepare's commit.
+            assert!(!consensus.is_follower(), "promotion: primary only");
+            assert!(consensus.is_normal(), "promotion: status must be normal");
+            assert!(!consensus.is_syncing(), "promotion: must not be syncing");
+            consensus.verify_pipeline();
+            match reply_sender {
+                Some(sender) => {
+                    consensus.pipeline_message_with_sender(PlaneKind::Metadata, &prepare, sender);
+                }
+                None => consensus.pipeline_message(PlaneKind::Metadata, &prepare),
+            }
+            self.on_replicate(prepare).await;
         }
     }
 }
@@ -3219,6 +3315,267 @@ mod tests {
         assert!(
             is_caught_up_primary(consensus),
             "caught-up gate must reopen after the boundary"
+        );
+    }
+
+    /// The exact window behind the historical "logout/unregister failed
+    /// ... primary not yet caught up on `commit_journal`" reports
+    /// (laserdata harness, 2026-07-17..20): a logout submitted while
+    /// ANOTHER client's op sits between quorum-ack (`commit_max` advanced
+    /// inside `on_ack`) and apply (`commit_min` behind, driver parked at
+    /// the journal read).
+    ///
+    /// New contract (queue absorption): a logout landing in
+    /// that window is NOT bounced with `NotCaughtUp` — non-register ops
+    /// carry no catch-up gate. It pipelines behind the in-flight batch,
+    /// and its submit's inline loopback pump commits both ops in order.
+    /// The parked sibling driver then resumes onto an already-drained
+    /// pipeline and exits via head-revalidation, exercising the
+    /// concurrent-driver safety of the commit loop.
+    #[compio::test]
+    async fn logout_in_mid_commit_window_commits_instead_of_rejecting() {
+        use std::future::Future;
+
+        /// The client logging out; its session is already committed.
+        const CLIENT_A: u128 = 1;
+        /// The client whose in-flight commit closes the gate.
+        const CLIENT_B: u128 = 2;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        for client in [CLIENT_A, CLIENT_B] {
+            md.client_table.borrow_mut().commit_register(
+                client,
+                ACTING_USER,
+                register_reply(client, SESSION),
+                |_| false,
+            );
+        }
+
+        // B's op: prepared, journaled, self-acked onto the loopback queue.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+
+        // Open the window: the first poll of `on_ack` reaches quorum and
+        // advances commit_max synchronously, then parks at the journal
+        // read — commit_min has not moved. This is the exact server state
+        // every production NotCaughtUp line was emitted from.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(
+            driver.as_mut().poll(&mut cx).is_pending(),
+            "driver must park at the journal read inside the commit"
+        );
+        assert_eq!(consensus.commit_max(), 1, "quorum advanced commit_max");
+        assert_eq!(consensus.commit_min(), 0, "apply has not landed yet");
+        assert!(
+            !is_caught_up_primary(consensus),
+            "gate must be closed mid-commit"
+        );
+
+        // A's logout lands in the window. No gate for non-register ops: it
+        // pipelines behind B's committing op, and its inline loopback pump
+        // drives BOTH commits (B's op 1 via head-revalidated takeover, then
+        // its own op 2) before resolving.
+        let outcome = md.submit_logout_in_process(CLIENT_A, SESSION, 2).await;
+        assert_eq!(
+            outcome,
+            Ok(2),
+            "mid-window logout must commit and reply, never bounce NotCaughtUp"
+        );
+        assert_eq!(consensus.commit_min(), 2, "both ops committed in order");
+        assert!(
+            is_caught_up_primary(consensus),
+            "gate reopens once the batch drains"
+        );
+
+        // The parked sibling driver resumes onto a drained pipeline: the
+        // head it peeked is gone, revalidation sends it out without
+        // touching commit state. Drive it to completion to prove it.
+        let mut resumed = false;
+        for _ in 0..1_000 {
+            if driver.as_mut().poll(&mut cx).is_ready() {
+                resumed = true;
+                break;
+            }
+            // Let the runtime deliver the journal-read completion.
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(resumed, "parked driver must exit via head-revalidation");
+        assert_eq!(
+            consensus.commit_min(),
+            2,
+            "resumed driver commits nothing new"
+        );
+        assert_eq!(
+            md.client_table.borrow().get_session(CLIENT_A),
+            None,
+            "session removed by the committed logout"
+        );
+    }
+
+    /// Register is the one op that still honors the catch-up gate (its
+    /// admission races `commit_register`'s session-eq assert against
+    /// committed-but-unapplied ops). New contract: a register arriving in
+    /// the mid-commit window is ABSORBED into the pipeline's request queue
+    /// with its reply subscriber attached, promoted by
+    /// the commit path once the batch drains, and the caller's await
+    /// resolves with the committed session — instead of the historical
+    /// `NotCaughtUp` bounce that one-shot CLI clients surfaced as
+    /// "Disconnected" login failures.
+    #[compio::test]
+    async fn register_in_mid_commit_window_is_queued_then_committed() {
+        use std::future::Future;
+
+        /// The client whose in-flight commit closes the gate.
+        const CLIENT_B: u128 = 2;
+        /// The client registering mid-window.
+        const CLIENT_C: u128 = 3;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT_B,
+            ACTING_USER,
+            register_reply(CLIENT_B, SESSION),
+            |_| false,
+        );
+
+        // B's op journaled + self-acked; park its commit mid-window.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // C's register lands in the window: absorbed, not bounced.
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        assert!(
+            register.as_mut().poll(&mut cx).is_pending(),
+            "mid-window register must park in the request queue, not error"
+        );
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            1,
+            "register buffered in the request queue"
+        );
+
+        // The committing driver drains its batch, then promotes the queued
+        // register into a prepare (its self-ack lands on the loopback).
+        let mut resumed = false;
+        for _ in 0..1_000 {
+            if driver.as_mut().poll(&mut cx).is_ready() {
+                resumed = true;
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(resumed, "B's commit must complete and promote the register");
+        assert_eq!(consensus.commit_min(), 1, "B's op committed");
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            0,
+            "promotion emptied the request queue"
+        );
+
+        // Commit the promoted register (production: the shard pump or any
+        // sibling submit drains this ack) and the parked caller resolves.
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("promoted register must self-ack")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        let mut outcome = None;
+        for _ in 0..1_000 {
+            if let std::task::Poll::Ready(result) = register.as_mut().poll(&mut cx) {
+                outcome = Some(result);
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            outcome.expect("absorbed register must resolve"),
+            Ok(2),
+            "queued register commits with the next batch; session = commit op"
+        );
+        assert_eq!(
+            md.client_table.borrow().get_session(CLIENT_C),
+            Some(2),
+            "session created by the promoted register"
         );
     }
 }

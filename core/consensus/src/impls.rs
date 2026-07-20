@@ -184,13 +184,20 @@ impl PipelineEntry {
     #[must_use]
     pub fn with_subscriber(header: PrepareHeader) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
-        let entry = Self {
+        (Self::with_sender(header, sender), receiver)
+    }
+
+    /// Entry adopting an existing reply sender — used when a request that
+    /// carried a subscriber through the request queue is promoted into a
+    /// prepare slot, so the original in-process awaiter keeps its receiver.
+    #[must_use]
+    pub fn with_sender(header: PrepareHeader, sender: Sender<Message<ReplyHeader>>) -> Self {
+        Self {
             header,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: Some(sender),
-        };
-        (entry, receiver)
+        }
     }
 
     /// Take reply sender; caller fires after slot update (slot-first ordering).
@@ -235,6 +242,11 @@ pub struct RequestEntry {
     // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
     #[allow(dead_code)]
     pub(crate) received_at: i64,
+    /// In-process reply subscriber, carried through the queue so promotion
+    /// can hand it to the pipeline entry (see [`PipelineEntry::with_sender`]).
+    /// `None` = network path. Dropping a queued entry (view-change reset,
+    /// preflight rejection at promotion) wakes the receiver with `Canceled`.
+    pub(crate) reply_sender: Option<Sender<Message<ReplyHeader>>>,
 }
 
 impl RequestEntry {
@@ -243,7 +255,31 @@ impl RequestEntry {
         Self {
             message,
             received_at: 0,
+            reply_sender: None,
         }
+    }
+
+    /// Queued request paired with a fresh receiver that resolves when the
+    /// promoted prepare commits (`Err(Canceled)` if the entry is dropped
+    /// first). The in-process absorption path: a submit that arrives while
+    /// the primary is mid-commit or the prepare queue is full parks here
+    /// instead of being bounced with a transient error.
+    #[must_use]
+    pub fn with_subscriber(
+        message: Message<RequestHeader>,
+    ) -> (Self, Receiver<Message<ReplyHeader>>) {
+        let (sender, receiver) = oneshot::channel();
+        let entry = Self {
+            message,
+            received_at: 0,
+            reply_sender: Some(sender),
+        };
+        (entry, receiver)
+    }
+
+    /// Take the reply sender for hand-off to the promoted pipeline entry.
+    pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
+        self.reply_sender.take()
     }
 }
 
@@ -1160,6 +1196,23 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let (entry, receiver) = PipelineEntry::with_subscriber(*message.header());
         self.push_prepare_entry(plane, message, entry);
         receiver
+    }
+
+    /// [`Self::pipeline_message_with_subscriber`] for a promoted queued
+    /// request: adopts the sender the request carried through the request
+    /// queue instead of minting a fresh channel, so the awaiter that parked
+    /// at enqueue time resolves on this prepare's commit.
+    ///
+    /// # Panics
+    /// If not primary (mirrors [`Consensus::pipeline_message`]).
+    pub fn pipeline_message_with_sender(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+        sender: Sender<Message<ReplyHeader>>,
+    ) {
+        let entry = PipelineEntry::with_sender(*message.header(), sender);
+        self.push_prepare_entry(plane, message, entry);
     }
 
     #[must_use]
