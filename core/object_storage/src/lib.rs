@@ -241,4 +241,53 @@ mod tests {
         assert_eq!(got, testing::pattern(len));
         let _ = std::fs::remove_file(&path);
     }
+
+    #[compio::test]
+    async fn upload_file_rejects_undersized_part_size_for_multipart() {
+        let dir = std::env::temp_dir().join("iggy_object_storage_upload_undersized");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("oversized.bin");
+        // larger than part_size, so upload_file must go through the multipart path and hit the
+        // floor check before ever calling store.put_multipart
+        std::fs::write(&path, testing::pattern(200)).unwrap();
+
+        let store = InMemoryStorage::new();
+        let result = upload_file(&store, "oversized", &path, 100).await;
+        let is_expected_error = matches!(
+            result,
+            Err(ObjectStorageError::PartSizeTooSmall { got: 100, .. })
+        );
+        assert!(
+            is_expected_error,
+            "expected PartSizeTooSmall, got {result:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[compio::test]
+    async fn delete_many_uses_default_per_key_loop() {
+        let store = InMemoryStorage::new();
+        store.put("a", testing::pattern(1)).await.unwrap();
+        store.put("b", testing::pattern(1)).await.unwrap();
+
+        store.delete_many(&["a", "b", "missing"]).await.unwrap();
+
+        assert!(matches!(
+            store.head("a").await,
+            Err(ObjectStorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.head("b").await,
+            Err(ObjectStorageError::NotFound(_))
+        ));
+    }
+
+    #[compio::test]
+    async fn default_matches_new() {
+        let store = InMemoryStorage::default();
+        assert_eq!(
+            store.conditional_write_support(),
+            ConditionalWriteSupport::Atomic
+        );
+    }
 }
