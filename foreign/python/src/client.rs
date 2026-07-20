@@ -38,6 +38,9 @@ use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
 use crate::topic::{Topic, TopicDetails};
+use crate::user::{
+    UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
+};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
@@ -114,6 +117,147 @@ impl IggyClient {
         future_into_py(py, async move {
             inner
                 .login_user(&username, &password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Get the info about a specific user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `UserInfoDetails` if the user exists,
+    ///     or `None` otherwise.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails | None]", imports=("collections.abc")))]
+    fn get_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let user = inner
+                .get_user(&user_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(user.map(PyUserInfoDetails::from))
+        })
+    }
+
+    /// Get the info about all the users.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[UserInfo]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[UserInfo]]", imports=("collections.abc")))]
+    fn get_users<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let users = inner
+                .get_users()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(users.into_iter().map(PyUserInfo::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Create a new user.
+    ///
+    /// The user is created without permissions.
+    ///
+    /// Args:
+    ///     username: Username as `str`.
+    ///     password: Password as `str`.
+    ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the created `UserInfoDetails`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    #[pyo3(signature = (username, password, status=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
+    fn create_user<'a>(
+        &self,
+        py: Python<'a>,
+        username: String,
+        password: String,
+        #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let user = inner
+                .create_user(&username, &password, status, None)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(PyUserInfoDetails::from(user))
+        })
+    }
+
+    /// Update a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     username: New username as `str | None`; unchanged when `None`.
+    ///     status: New status as `UserStatus | None`; unchanged when `None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is updated.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, username=None, status=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_user<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] username: Option<String>,
+        #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let status = status.map(UserStatus::from);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_user(&user_id, username.as_deref(), status)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Delete a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is deleted.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_user(&user_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
