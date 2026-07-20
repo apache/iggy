@@ -48,6 +48,11 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 /// hold. This may need to be tuned properly.
 pub(crate) const SLOT_COUNT: usize = 1024;
 
+/// Default in-memory index size, in slots. Overridable per journal via
+/// [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
+/// journal_slots` in the server-ng config).
+pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
+
 /// Error type for journal operations.
 #[derive(Debug)]
 #[allow(clippy::module_name_repetitions)]
@@ -129,6 +134,19 @@ pub struct PrepareJournal {
     /// set; first-write-wins matches the actual semantics and avoids
     /// `RefCell` borrow-panic risk on the read fast path.
     poisoned: OnceCell<PoisonState>,
+    /// True while a `drain()` is rewriting the WAL. Concurrent drains
+    /// share the one `wal.tmp` swap and race it (truncated tmp, ENOENT
+    /// on the losing rename, reads through a reopened fd), so overlap is
+    /// refused up front with `ResourceBusy` instead. The upper layer
+    /// serializes checkpoints anyway (metadata `journal_gate`); this is
+    /// the journal's own defense so no future caller can reintroduce the
+    /// race silently.
+    drain_in_flight: Cell<bool>,
+    /// Number of slots in the in-memory index; ops map to `op % slot_count`.
+    /// [`DEFAULT_SLOT_COUNT`] unless the operator overrode it. Larger values
+    /// let more committed-but-unsnapshotted entries accumulate between
+    /// checkpoints (more WAL churn headroom, more memory).
+    slot_count: usize,
 }
 
 /// Captured cause of journal poisoning. `stage` names the drain step
@@ -149,8 +167,8 @@ impl fmt::Debug for PrepareJournal {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-const fn slot_for_op(op: u64) -> usize {
-    op as usize % SLOT_COUNT
+const fn slot_for_op(op: u64, slot_count: usize) -> usize {
+    op as usize % slot_count
 }
 
 /// Repair a damaged WAL tail by truncating to `pos`, or surface a loud
@@ -226,6 +244,17 @@ impl Drop for TmpFileGuard {
     }
 }
 
+/// Clears `drain_in_flight` on every exit path of `drain()` — success,
+/// `?` error, or caller cancellation at any await. A stuck flag would
+/// refuse every future drain and let the journal fill for good.
+struct DrainInFlightGuard<'a>(&'a Cell<bool>);
+
+impl Drop for DrainInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
 impl PrepareJournal {
     /// Open the WAL file in read-write mode, scanning forward to rebuild
@@ -242,15 +271,44 @@ impl PrepareJournal {
     /// Returns `JournalError::Io` if the WAL file cannot be opened or read.
     #[allow(clippy::future_not_send)]
     pub async fn open(path: &Path, snapshot_op: u64) -> Result<Self, JournalError> {
+        Self::open_with_slots(path, snapshot_op, DEFAULT_SLOT_COUNT).await
+    }
+
+    /// [`Self::open`] with an operator-tuned index size.
+    ///
+    /// `slot_count` bounds how many committed-but-unsnapshotted entries the
+    /// journal holds before a forced checkpoint must reclaim WAL space; the
+    /// caller owns keeping it above its checkpoint margin + prepare-queue
+    /// depth (validated at config load for the server-ng `[metadata]` knob).
+    ///
+    /// # Errors
+    /// Returns `JournalError::Io` if the WAL file cannot be opened or read,
+    /// or (`InvalidInput`) if `slot_count` is zero.
+    #[allow(clippy::future_not_send)]
+    pub async fn open_with_slots(
+        path: &Path,
+        snapshot_op: u64,
+        slot_count: usize,
+    ) -> Result<Self, JournalError> {
+        if slot_count == 0 {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal slot_count must be non-zero",
+            )));
+        }
         let storage = FileStorage::open(path).await?;
-        Self::scan(storage, snapshot_op).await
+        Self::scan(storage, snapshot_op, slot_count).await
     }
 
     #[allow(clippy::future_not_send)]
-    async fn scan(storage: FileStorage, snapshot_op: u64) -> Result<Self, JournalError> {
+    async fn scan(
+        storage: FileStorage,
+        snapshot_op: u64,
+        slot_count: usize,
+    ) -> Result<Self, JournalError> {
         let file_len = storage.file_len();
-        let mut headers: Vec<Option<PrepareHeader>> = vec![None; SLOT_COUNT];
-        let mut offsets: Vec<Option<u64>> = vec![None; SLOT_COUNT];
+        let mut headers: Vec<Option<PrepareHeader>> = vec![None; slot_count];
+        let mut offsets: Vec<Option<u64>> = vec![None; slot_count];
         let mut last_op: Option<u64> = None;
         let mut pos: u64 = 0;
         let mut header_buf = vec![0u8; HEADER_SIZE];
@@ -306,7 +364,7 @@ impl PrepareJournal {
                 break;
             }
 
-            let slot = slot_for_op(header.op);
+            let slot = slot_for_op(header.op, slot_count);
 
             // Note: Regarding duplicate op in WAL. We rewrite it with whichever
             // is the latest entry.
@@ -334,6 +392,8 @@ impl PrepareJournal {
             last_op: Cell::new(last_op),
             snapshot_op: Cell::new(snapshot_op),
             poisoned: OnceCell::new(),
+            drain_in_flight: Cell::new(false),
+            slot_count,
         })
     }
 
@@ -433,7 +493,7 @@ impl PrepareJournal {
         let (offset, size) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
-            let slot = slot_for_op(header.op);
+            let slot = slot_for_op(header.op, self.slot_count);
             let stored = match headers[slot].as_ref() {
                 Some(h) if h.op == header.op => h,
                 _ => return Ok(None),
@@ -467,7 +527,7 @@ impl Journal<FileStorage> for PrepareJournal {
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = self.headers.borrow();
         Ref::filter_map(headers, |h| {
-            let slot = slot_for_op(idx as u64);
+            let slot = slot_for_op(idx as u64, self.slot_count);
             let header = h[slot].as_ref()?;
             if header.op == idx as u64 {
                 Some(header)
@@ -487,14 +547,14 @@ impl Journal<FileStorage> for PrepareJournal {
 
     fn remaining_capacity(&self) -> Option<usize> {
         let Some(last) = self.last_op.get() else {
-            return Some(SLOT_COUNT);
+            return Some(self.slot_count);
         };
         let snapshot = self.snapshot_op.get();
         if last <= snapshot {
-            return Some(SLOT_COUNT);
+            return Some(self.slot_count);
         }
         let used = (last - snapshot) as usize;
-        Some(SLOT_COUNT.saturating_sub(used))
+        Some(self.slot_count.saturating_sub(used))
     }
 
     /// Remove entries with ops in `ops` from the journal,
@@ -507,6 +567,17 @@ impl Journal<FileStorage> for PrepareJournal {
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
         }
+        // Overlapping drains race the `wal.tmp` swap below (truncate each
+        // other's tmp mid-write, lose the rename to ENOENT, read stale
+        // offsets through the winner's reopened fd). Refuse up front,
+        // before any WAL bytes move.
+        if self.drain_in_flight.replace(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "drain already in flight: concurrent drains would race the WAL rewrite",
+            ));
+        }
+        let _drain_guard = DrainInFlightGuard(&self.drain_in_flight);
         let end_op = *ops.end();
 
         // Partition slots into drained and live entries.
@@ -515,7 +586,7 @@ impl Journal<FileStorage> for PrepareJournal {
         {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
-            for slot in 0..SLOT_COUNT {
+            for slot in 0..self.slot_count {
                 if let (Some(h), Some(off)) = (&headers[slot], offsets[slot]) {
                     if ops.contains(&h.op) {
                         to_drain.push((*h, off));
@@ -615,11 +686,11 @@ impl Journal<FileStorage> for PrepareJournal {
         let mut offsets = self.offsets.borrow_mut();
         let mut pos: u64 = 0;
         for (header, _) in &live {
-            let slot = slot_for_op(header.op);
+            let slot = slot_for_op(header.op, self.slot_count);
             offsets[slot] = Some(pos);
             pos += u64::from(header.size);
         }
-        for slot in 0..SLOT_COUNT {
+        for slot in 0..self.slot_count {
             if let Some(h) = &headers[slot]
                 && ops.contains(&h.op)
             {
@@ -636,7 +707,7 @@ impl Journal<FileStorage> for PrepareJournal {
             return Err(Self::poisoned_io_error(state));
         }
         let header = *entry.header();
-        let slot = slot_for_op(header.op);
+        let slot = slot_for_op(header.op, self.slot_count);
 
         // Slot collision must be detected BEFORE `write_append + fsync`:
         // a post-fsync panic would leave bytes durably on disk, and the
@@ -705,7 +776,7 @@ impl Journal<FileStorage> for PrepareJournal {
         let (size, offset) = {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
-            let slot = slot_for_op(header.op);
+            let slot = slot_for_op(header.op, self.slot_count);
             let stored = headers[slot].as_ref()?;
             if stored.op != header.op {
                 return None;
@@ -1245,5 +1316,50 @@ mod tests {
         assert!(journal.header(1).is_some());
         assert!(journal.header(2).is_some());
         assert_eq!(journal.iter_headers_from(1).len(), 2);
+    }
+
+    #[compio::test]
+    async fn concurrent_drains_are_refused_not_raced() {
+        // Two drivers racing `drain()` share the one fixed `wal.tmp`:
+        // `File::create` truncates the other racer's tmp mid-write, the
+        // first rename consumes the path, and the loser surfaces ENOENT
+        // (production: `forced checkpoint failed ... snapshot I/O error:
+        // No such file or directory`) — or, with luckier timing, both
+        // renames "succeed" over each other's bytes. Contract: exactly
+        // one drain runs; a concurrent call is refused with
+        // `ResourceBusy` before it touches the WAL; the journal stays
+        // healthy either way.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for op in 1..=8 {
+            journal.append(make_prepare(op, 64)).await.unwrap();
+        }
+
+        let (a, b) = futures::join!(journal.drain(1..=4), journal.drain(1..=4));
+        let results = [a.map(|v| v.len()), b.map(|v| v.len())];
+        let (winners, losers): (Vec<_>, Vec<_>) =
+            results.into_iter().partition(std::result::Result::is_ok);
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one concurrent drain may perform the WAL rewrite: {winners:?} / {losers:?}"
+        );
+        assert_eq!(winners[0].as_ref().unwrap(), &4, "winner drains ops 1..=4");
+        assert_eq!(
+            losers[0].as_ref().unwrap_err().kind(),
+            io::ErrorKind::ResourceBusy,
+            "loser must be refused up front, not fail mid-flight on the shared tmp: {losers:?}"
+        );
+
+        // The journal must remain fully usable after the refused call.
+        assert!(journal.poisoned.get().is_none(), "refusal must not poison");
+        for op in 5..=8 {
+            assert!(journal.header(op).is_some(), "live op {op} lost");
+        }
+        journal.append(make_prepare(9, 32)).await.unwrap();
+        let h = *journal.header(9).unwrap();
+        let entry = journal.entry_at(&h).await.unwrap().unwrap();
+        assert_eq!(entry.header().op, 9);
     }
 }

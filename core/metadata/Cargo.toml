@@ -57,6 +57,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 bytes = { workspace = true }
 compio = { workspace = true }
+futures = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

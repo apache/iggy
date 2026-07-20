@@ -28,6 +28,7 @@ use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
 use configs::server_ng::NgSystemConfig;
 use consensus::{MetadataHandle, VsrConsensus};
+use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyTimestamp};
 use message_bus::InstanceToken;
 use send_wrapper::SendWrapper;
@@ -205,8 +206,26 @@ impl HttpInner {
         }
         // Shared Register entry point; on shard 0 (always, for HTTP) it runs
         // `submit_register_in_process` directly on the metadata owner.
-        let session = submit_register_on_owner(&self.shard, client_id, user_id)
+        //
+        // Detached so a client disconnect cannot cancel the Register
+        // mid-flight: the in-process submit drives shared consensus machinery
+        // (pipeline push, WAL append, the `on_ack` commit loop), and hyper
+        // drops this handler future the moment the HTTP peer disconnects.
+        // A canceled submit used to strand consensus state mid-await; now the
+        // detached task always drives it to completion and a disconnect only
+        // drops the receiver half (same discipline as `submit_committed`).
+        let (result_slot, committed) = oneshot::channel();
+        let shard = Rc::clone(&self.shard);
+        compio::runtime::spawn(async move {
+            let result = submit_register_on_owner(&shard, client_id, user_id).await;
+            // A failed send means the handler died mid-await; the Register
+            // itself has already committed, which is what matters.
+            let _ = result_slot.send(result);
+        })
+        .detach();
+        let session = committed
             .await
+            .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
                 warn!(?error, "server-ng HTTP: VSR Register submit failed");
                 AuthError::SessionUnavailable
