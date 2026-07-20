@@ -6,6 +6,7 @@ target*
 .claude/feedback/
 .claude/logs/
 .claude/state/
+.claude/telemetry/
 .DS_Store
 .gradle
 local_data*
