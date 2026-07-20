@@ -70,5 +70,5 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// <param name="payload">The request payload.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
-    Task<byte[]> SendRawWithResponseAsync(uint code, byte[] payload, CancellationToken token = default);
+    Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
 }

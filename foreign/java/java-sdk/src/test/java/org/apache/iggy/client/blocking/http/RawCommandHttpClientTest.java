@@ -30,7 +30,7 @@ class RawCommandHttpClientTest {
     void shouldRejectRawCommands() {
         var client = new IggyHttpClient("http://127.0.0.1:3000");
 
-        assertThatThrownBy(() -> client.sendRawWithResponse(1, new byte[0]))
+        assertThatThrownBy(() -> client.sendBinaryRequest(1, new byte[0]))
                 .isInstanceOf(IggyOperationNotSupportedException.class);
     }
 }

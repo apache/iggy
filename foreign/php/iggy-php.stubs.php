@@ -226,7 +226,7 @@ namespace Iggy {
          * @param string $payload
          * @return string
          */
-        public function sendRawWithResponse(int $code, string $payload): string {}
+        public function sendBinaryRequest(int $code, string $payload): string {}
     }
 
     /**

@@ -113,8 +113,8 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendRawWithResponse(int code, byte[] payload) {
-        throw new IggyOperationNotSupportedException("sendRawWithResponse", "HTTP");
+    public byte[] sendBinaryRequest(int code, byte[] payload) {
+        throw new IggyOperationNotSupportedException("sendBinaryRequest", "HTTP");
     }
 
     @Override

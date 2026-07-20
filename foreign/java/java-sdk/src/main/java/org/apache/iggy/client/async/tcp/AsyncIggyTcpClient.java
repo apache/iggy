@@ -42,6 +42,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -231,7 +232,8 @@ public class AsyncIggyTcpClient {
      * @return a future containing the raw response payload
      * @throws IggyNotConnectedException if {@link #connect()} has not been called
      */
-    public CompletableFuture<byte[]> sendRawWithResponse(int code, byte[] payload) {
+    public CompletableFuture<byte[]> sendBinaryRequest(int code, byte[] payload) {
+        Objects.requireNonNull(payload, "payload cannot be null");
         if (isSessionControlCode(code)) {
             return CompletableFuture.failedFuture(
                     IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
@@ -240,7 +242,7 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
 
-        return connection.send(code, Unpooled.wrappedBuffer(payload)).thenApply(response -> {
+        return connection.send(code, Unpooled.copiedBuffer(payload)).thenApply(response -> {
             try {
                 if (response.readableBytes() <= 1) {
                     return new byte[0];

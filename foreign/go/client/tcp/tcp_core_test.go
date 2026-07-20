@@ -385,7 +385,7 @@ func TestDisconnect_ShutdownClientIsNotResurrected(t *testing.T) {
 	}
 }
 
-func TestSendRawWithResponse_FrameLayoutAndSuccess(t *testing.T) {
+func TestSendBinaryRequest_FrameLayoutAndSuccess(t *testing.T) {
 	c, serverConn := newTestClient(t)
 	const code = uint32(60_000)
 	payload := []byte{0xAA, 0xBB, 0xCC}
@@ -424,7 +424,7 @@ func TestSendRawWithResponse_FrameLayoutAndSuccess(t *testing.T) {
 		}
 	}()
 
-	result, err := c.SendRawWithResponse(context.Background(), code, payload)
+	result, err := c.SendBinaryRequest(context.Background(), code, payload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -445,18 +445,18 @@ func TestSendRawWithResponse_FrameLayoutAndSuccess(t *testing.T) {
 	}
 }
 
-func TestSendRawWithResponse_ErrorStatus(t *testing.T) {
+func TestSendBinaryRequest_ErrorStatus(t *testing.T) {
 	c, serverConn := newTestClient(t)
 
 	go serverRespond(t, serverConn, uint32(ierror.InvalidCommandCode), nil)
 
-	_, err := c.SendRawWithResponse(context.Background(), 60_000, nil)
+	_, err := c.SendBinaryRequest(context.Background(), 60_000, nil)
 	if !errors.Is(err, ierror.ErrInvalidCommand) {
 		t.Errorf("got %v, want %v", err, ierror.ErrInvalidCommand)
 	}
 }
 
-func TestSendRawWithResponse_SessionControlGuard(t *testing.T) {
+func TestSendBinaryRequest_SessionControlGuard(t *testing.T) {
 	c, serverConn := newTestClient(t)
 
 	wrote := make(chan struct{})
@@ -475,7 +475,7 @@ func TestSendRawWithResponse_SessionControlGuard(t *testing.T) {
 		uint32(command.LoginRegisterWithPATCode),
 	}
 	for _, guardedCode := range guardedCodes {
-		_, err := c.SendRawWithResponse(context.Background(), guardedCode, nil)
+		_, err := c.SendBinaryRequest(context.Background(), guardedCode, nil)
 		if !errors.Is(err, ierror.ErrInvalidCommand) {
 			t.Errorf("code %d: got %v, want %v", guardedCode, err, ierror.ErrInvalidCommand)
 		}

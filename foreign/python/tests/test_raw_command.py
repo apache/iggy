@@ -22,14 +22,14 @@ from apache_iggy import IggyClient
 
 @pytest.mark.asyncio
 async def test_raw_ping_returns_empty_response(iggy_client: IggyClient):
-    response = await iggy_client.send_raw_with_response(1, b"")
+    response = await iggy_client.send_binary_request(1, b"")
 
     assert response == b""
 
 
 @pytest.mark.asyncio
 async def test_raw_get_stats_returns_non_empty_response(iggy_client: IggyClient):
-    response = await iggy_client.send_raw_with_response(10, b"")
+    response = await iggy_client.send_binary_request(10, b"")
 
     assert response
 
@@ -38,10 +38,10 @@ async def test_raw_get_stats_returns_non_empty_response(iggy_client: IggyClient)
 @pytest.mark.parametrize("code", [38, 39, 40, 44, 45])
 async def test_raw_session_control_code_is_rejected(iggy_client: IggyClient, code: int):
     with pytest.raises(RuntimeError, match="(?i)invalid command"):
-        await iggy_client.send_raw_with_response(code, b"")
+        await iggy_client.send_binary_request(code, b"")
 
 
 @pytest.mark.asyncio
 async def test_raw_unknown_code_is_rejected_by_server(iggy_client: IggyClient):
     with pytest.raises(RuntimeError, match="(?i)invalid command"):
-        await iggy_client.send_raw_with_response(60_000, b"")
+        await iggy_client.send_binary_request(60_000, b"")

@@ -23,7 +23,7 @@ When(
   'I send a raw command with code {int} and an empty payload',
   async function (this: TestWorld, code: number) {
     try {
-      this.rawResponse = await this.client.sendRawWithResponse(code, Buffer.alloc(0));
+      this.rawResponse = await this.client.sendBinaryRequest(code, Buffer.alloc(0));
       this.rawError = undefined;
     } catch (error) {
       this.rawResponse = undefined;

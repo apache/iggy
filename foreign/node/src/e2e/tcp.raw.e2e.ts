@@ -26,24 +26,24 @@ describe('e2e -> raw', async () => {
   const c = getTestClient();
 
   it('e2e -> raw::ping', async () => {
-    const response = await c.sendRawWithResponse(COMMAND_CODE.Ping, Buffer.alloc(0));
+    const response = await c.sendBinaryRequest(COMMAND_CODE.Ping, Buffer.alloc(0));
     assert.deepEqual(response, Buffer.alloc(0));
   });
 
   it('e2e -> raw::getStats', async () => {
-    const response = await c.sendRawWithResponse(COMMAND_CODE.GetStats, Buffer.alloc(0));
+    const response = await c.sendBinaryRequest(COMMAND_CODE.GetStats, Buffer.alloc(0));
     assert.ok(response.length > 0);
   });
 
   it('e2e -> raw::sessionControlCodeRejectedClientSide', async () => {
     await assert.rejects(
-      () => c.sendRawWithResponse(COMMAND_CODE.LoginUser, Buffer.alloc(0))
+      () => c.sendBinaryRequest(COMMAND_CODE.LoginUser, Buffer.alloc(0))
     );
   });
 
   it('e2e -> raw::unknownCodeRejectedByServer', async () => {
     await assert.rejects(
-      () => c.sendRawWithResponse(60000, Buffer.alloc(0))
+      () => c.sendBinaryRequest(60000, Buffer.alloc(0))
     );
   });
 

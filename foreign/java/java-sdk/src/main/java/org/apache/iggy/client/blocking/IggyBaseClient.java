@@ -31,7 +31,7 @@ public interface IggyBaseClient {
      * @param payload the command payload
      * @return the raw response payload
      */
-    byte[] sendRawWithResponse(int code, byte[] payload);
+    byte[] sendBinaryRequest(int code, byte[] payload);
 
     SystemClient system();
 

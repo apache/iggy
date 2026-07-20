@@ -215,7 +215,7 @@ public class BasicMessagingSteps {
     @When("I send a raw command with code {int} and an empty payload")
     public void sendRawCommand(int code) {
         try {
-            context.lastRawResponse = getClient().sendRawWithResponse(code, new byte[0]);
+            context.lastRawResponse = getClient().sendBinaryRequest(code, new byte[0]);
             context.lastRawError = null;
         } catch (RuntimeException error) {
             context.lastRawResponse = null;

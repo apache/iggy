@@ -594,7 +594,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<byte[]> SendRawWithResponseAsync(uint code, byte[] payload, CancellationToken token = default)
+    public async Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
     {
         if (SessionControlCodes.Contains(code))
         {

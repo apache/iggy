@@ -36,7 +36,7 @@ WHEN("^I send a raw command with code ([0-9]+) and an empty payload$") {
     context->raw_response.clear();
     context->raw_error.clear();
     try {
-        const auto response = context->client->send_raw_with_response(code, rust::Vec<std::uint8_t>());
+        const auto response = context->client->send_binary_request(code, rust::Vec<std::uint8_t>());
         context->raw_response.assign(response.begin(), response.end());
     } catch (const std::exception &error) {
         context->raw_error = error.what();

@@ -59,6 +59,7 @@ func TestFeatures(t *testing.T) {
 			Options: &godog.Options{
 				Format:   "pretty",
 				Paths:    []string{"../../scenarios/raw_command.feature"},
+				Strict:   true,
 				TestingT: t,
 			},
 		})

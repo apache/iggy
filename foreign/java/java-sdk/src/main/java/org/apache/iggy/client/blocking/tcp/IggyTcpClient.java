@@ -95,8 +95,8 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
 
     /** {@inheritDoc} */
     @Override
-    public byte[] sendRawWithResponse(int code, byte[] payload) {
-        return FutureUtil.resolve(asyncClient.sendRawWithResponse(code, payload));
+    public byte[] sendBinaryRequest(int code, byte[] payload) {
+        return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
     }
 
     @Override

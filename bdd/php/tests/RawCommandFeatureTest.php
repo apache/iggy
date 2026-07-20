@@ -66,7 +66,7 @@ final class RawCommandFeatureTest extends TestCase
         }
         if (preg_match('/^I send a raw command with code (\d+) and an empty payload$/', $step, $matches) === 1) {
             try {
-                $this->lastResponse = $this->requireClient()->sendRawWithResponse((int) $matches[1], '');
+                $this->lastResponse = $this->requireClient()->sendBinaryRequest((int) $matches[1], '');
                 $this->lastError = null;
             } catch (Throwable $error) {
                 $this->lastResponse = null;

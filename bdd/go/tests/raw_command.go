@@ -72,7 +72,7 @@ func (rawCommandSteps) givenAuthenticationAsRoot(ctx context.Context) error {
 
 func (rawCommandSteps) whenSendRawCommand(ctx context.Context, code uint32) error {
 	state := getRawCommandCtx(ctx)
-	state.lastResponse, state.lastError = state.client.SendRawWithResponse(ctx, code, nil)
+	state.lastResponse, state.lastError = state.client.SendBinaryRequest(ctx, code, nil)
 	return nil
 }
 

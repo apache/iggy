@@ -1711,18 +1711,18 @@ TEST_F(LowLevelE2E_Client, SnapshotWithInvalidSnapshotTypeThrows) {
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"not-a-real-type"})), std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, SendRawWithResponsePingReturnsEmptyBytes) {
+TEST_F(LowLevelE2E_Client, SendBinaryRequestPingReturnsEmptyBytes) {
     RecordProperty("description", "Returns an empty response body for a raw ping command with an empty payload.");
     constexpr std::uint32_t ping_command_code = 1;
     iggy::ffi::Client *client                 = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> empty_payload;
     rust::Vec<std::uint8_t> response;
-    ASSERT_NO_THROW({ response = client->send_raw_with_response(ping_command_code, empty_payload); });
+    ASSERT_NO_THROW({ response = client->send_binary_request(ping_command_code, empty_payload); });
     EXPECT_TRUE(response.empty());
 }
 
-TEST_F(LowLevelE2E_Client, SendRawWithResponseGetStatsReturnsNonEmptyBytes) {
+TEST_F(LowLevelE2E_Client, SendBinaryRequestGetStatsReturnsNonEmptyBytes) {
     RecordProperty("description",
                    "Returns a non-empty response body for a raw get-stats command with an empty payload.");
     constexpr std::uint32_t get_stats_command_code = 10;
@@ -1730,25 +1730,25 @@ TEST_F(LowLevelE2E_Client, SendRawWithResponseGetStatsReturnsNonEmptyBytes) {
 
     rust::Vec<std::uint8_t> empty_payload;
     rust::Vec<std::uint8_t> response;
-    ASSERT_NO_THROW({ response = client->send_raw_with_response(get_stats_command_code, empty_payload); });
+    ASSERT_NO_THROW({ response = client->send_binary_request(get_stats_command_code, empty_payload); });
     EXPECT_FALSE(response.empty());
 }
 
-TEST_F(LowLevelE2E_Client, SendRawWithResponseLoginUserCodeThrows) {
+TEST_F(LowLevelE2E_Client, SendBinaryRequestLoginUserCodeThrows) {
     RecordProperty("description",
                    "Rejects the login-user session-control code client-side before it reaches the server.");
     constexpr std::uint32_t login_user_command_code = 38;
     iggy::ffi::Client *client                       = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(client->send_raw_with_response(login_user_command_code, empty_payload), std::exception);
+    ASSERT_THROW(client->send_binary_request(login_user_command_code, empty_payload), std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, SendRawWithResponseUnknownCommandCodeThrows) {
+TEST_F(LowLevelE2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
     RecordProperty("description", "Rejects an unknown command code with an invalid-command error from the server.");
     constexpr std::uint32_t unknown_command_code = 60000;
     iggy::ffi::Client *client                    = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> empty_payload;
-    ASSERT_THROW(client->send_raw_with_response(unknown_command_code, empty_payload), std::exception);
+    ASSERT_THROW(client->send_binary_request(unknown_command_code, empty_payload), std::exception);
 }

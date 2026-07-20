@@ -533,7 +533,7 @@ public class HttpMessageStream : IIggyClient
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
     /// <exception cref="FeatureUnavailableException"></exception>
-    public Task<byte[]> SendRawWithResponseAsync(uint code, byte[] payload, CancellationToken token = default)
+    public Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
     {
         throw new FeatureUnavailableException();
     }

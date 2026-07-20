@@ -43,14 +43,21 @@ class RawCommandTcpClientTest extends IntegrationTest {
 
     @Test
     void shouldReturnRawResponsePayloads() {
-        assertThat(client.sendRawWithResponse(1, new byte[0])).isEmpty();
-        assertThat(client.sendRawWithResponse(10, new byte[0])).isNotEmpty();
+        assertThat(client.sendBinaryRequest(1, new byte[0])).isEmpty();
+        assertThat(client.sendBinaryRequest(10, new byte[0])).isNotEmpty();
+    }
+
+    @Test
+    void shouldRejectNullPayload() {
+        assertThatThrownBy(() -> client.sendBinaryRequest(1, null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("payload cannot be null");
     }
 
     @Test
     void shouldRejectAllSessionControlCodes() {
         for (int code : new int[] {38, 39, 40, 44, 45}) {
-            assertThatThrownBy(() -> client.sendRawWithResponse(code, new byte[0]))
+            assertThatThrownBy(() -> client.sendBinaryRequest(code, new byte[0]))
                     .isInstanceOf(IggyServerException.class)
                     .extracting(exception -> ((IggyServerException) exception).getErrorCode())
                     .isEqualTo(IggyErrorCode.INVALID_COMMAND);
@@ -59,7 +66,7 @@ class RawCommandTcpClientTest extends IntegrationTest {
 
     @Test
     void shouldPropagateUnknownCommandError() {
-        assertThatThrownBy(() -> client.sendRawWithResponse(60_000, new byte[0]))
+        assertThatThrownBy(() -> client.sendBinaryRequest(60_000, new byte[0]))
                 .isInstanceOf(IggyServerException.class)
                 .extracting(exception -> ((IggyServerException) exception).getErrorCode())
                 .isEqualTo(IggyErrorCode.INVALID_COMMAND);

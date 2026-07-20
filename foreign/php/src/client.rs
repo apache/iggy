@@ -380,14 +380,14 @@ impl IggyClient {
 
     /// Sends a command code with a payload and returns the raw response bytes.
     /// Session-control codes return an invalid-command exception.
-    pub fn send_raw_with_response(&self, code: u32, payload: Binary<u8>) -> PhpResult<Binary<u8>> {
+    pub fn send_binary_request(&self, code: u32, payload: Binary<u8>) -> PhpResult<Binary<u8>> {
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
             inner
                 .send_binary_request(code, Bytes::from(Vec::<u8>::from(payload)))
                 .await
-                .map(|response| Binary::new(response.to_vec()))
+                .map(|response| Binary::new(Vec::from(response)))
                 .map_err(to_php_exception)
         })
     }

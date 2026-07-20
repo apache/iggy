@@ -246,11 +246,12 @@ export abstract class CommandAPI extends AbstractAPI {
    * @param payload - Raw command payload
    * @returns Raw response payload
    */
-  async sendRawWithResponse(code: number, payload: Buffer): Promise<Buffer> {
+  async sendBinaryRequest(code: number, payload: Buffer): Promise<Buffer> {
     if (SESSION_CONTROL_CODES.has(code))
       throw responseError(code, INVALID_COMMAND_ERROR_CODE);
 
-    const response = await (await this.clientProvider()).sendCommand(code, payload);
+    const requestPayload = Buffer.from(payload);
+    const response = await (await this.clientProvider()).sendCommand(code, requestPayload);
     return response.length <= 1 ? Buffer.alloc(0) : response.data;
   }
 }

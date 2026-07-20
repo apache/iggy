@@ -305,9 +305,9 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 	return resp, err
 }
 
-// SendRawWithResponse sends a command code and payload and returns the raw response body.
+// SendBinaryRequest sends a command code and payload and returns the raw response body.
 // Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
-func (c *IggyTcpClient) SendRawWithResponse(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
+func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
 	if isSessionControlCode(code) {
 		return nil, ierror.ErrInvalidCommand
 	}
@@ -315,10 +315,7 @@ func (c *IggyTcpClient) SendRawWithResponse(ctx context.Context, code uint32, pa
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
 
-	buf := append((*bp)[:0], 0, 0, 0, 0, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint32(buf[4:8], code)
-	buf = append(buf, payload...)
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf)-4))
+	buf := encodeRawWireRequest(*bp, code, payload)
 	*bp = buf
 
 	return c.sendWireAndFetchResponse(ctx, buf)
@@ -343,23 +340,31 @@ func isSessionControlCode(code uint32) bool {
 // AppendBinary can never corrupt the wire frame (which would desync the
 // persistent TCP stream — there is no per-request resync).
 func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
-	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
+	buf = encodeRawWireRequest(buf, uint32(cmd.Code()), nil)
 	if a, ok := cmd.(encoding.BinaryAppender); ok {
 		out, err := a.AppendBinary(buf)
 		if err != nil {
 			return nil, err
 		}
-		binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)-4))
-		return out, nil
+		return finalizeWireRequest(out), nil
 	}
 	body, err := cmd.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
+	return encodeRawWireRequest(buf, uint32(cmd.Code()), body), nil
+}
+
+func encodeRawWireRequest(buf []byte, code uint32, body []byte) []byte {
+	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(buf[4:8], code)
 	buf = append(buf, body...)
+	return finalizeWireRequest(buf)
+}
+
+func finalizeWireRequest(buf []byte) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf)-4))
-	return buf, nil
+	return buf
 }
 
 // sendWireAndFetchResponse sends a pre-built wire payload (length header,

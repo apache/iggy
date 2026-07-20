@@ -38,7 +38,7 @@ const mockRawClient = (): RawClient => ({
   },
 });
 
-describe('CommandAPI.sendRawWithResponse', () => {
+describe('CommandAPI.sendBinaryRequest', () => {
 
   describe('session-control guard', () => {
 
@@ -52,7 +52,7 @@ describe('CommandAPI.sendRawWithResponse', () => {
       it(`rejects code ${code} before reaching the client provider`, async () => {
         const client = new SimpleClient(mockRawClient());
         await assert.rejects(
-          () => client.sendRawWithResponse(code, Buffer.alloc(0)),
+          () => client.sendBinaryRequest(code, Buffer.alloc(0)),
           /code: 3, message: Invalid command/
         );
       });
@@ -75,8 +75,23 @@ describe('CommandAPI.sendRawWithResponse', () => {
       };
     };
     const client = new SimpleClient(raw);
-    const response = await client.sendRawWithResponse(customCode, payload);
+    const response = await client.sendBinaryRequest(customCode, payload);
     assert.deepEqual(response, expectedResponse);
+  });
+
+  it('copies the payload before awaiting the client provider', async () => {
+    const payload = Buffer.from([0xAA, 0xBB, 0xCC]);
+    const expectedPayload = Buffer.from(payload);
+    const raw = mockRawClient();
+    raw.sendCommand = async (_code, sentPayload) => {
+      assert.deepEqual(sentPayload, expectedPayload);
+      return { status: 0, length: 1, data: Buffer.alloc(0) };
+    };
+
+    const request = new SimpleClient(raw).sendBinaryRequest(60_000, payload);
+    payload.fill(0);
+
+    await request;
   });
 
   it('normalizes a one-byte response to an empty buffer', async () => {
@@ -87,7 +102,7 @@ describe('CommandAPI.sendRawWithResponse', () => {
       data: Buffer.from([1]),
     });
 
-    const response = await new SimpleClient(raw).sendRawWithResponse(
+    const response = await new SimpleClient(raw).sendBinaryRequest(
       COMMAND_CODE.Ping,
       Buffer.alloc(0)
     );

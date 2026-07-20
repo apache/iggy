@@ -214,7 +214,7 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   be read repeatedly.
 - Large unsigned values that can overflow PHP integers, such as message checksums,
   are returned as decimal strings.
-- `Iggy\Client::sendRawWithResponse(int $code, string $payload): string` sends a
+- `Iggy\Client::sendBinaryRequest(int $code, string $payload): string` sends a
   command code and payload and returns the raw response body.
 - `Iggy\Client` is synchronous and blocks the current PHP thread.
 - The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after

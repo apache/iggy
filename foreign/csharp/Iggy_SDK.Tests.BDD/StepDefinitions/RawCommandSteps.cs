@@ -37,7 +37,7 @@ public class RawCommandSteps
     {
         try
         {
-            _context.LastRawResponse = await _context.IggyClient.SendRawWithResponseAsync(code, []);
+            _context.LastRawResponse = await _context.IggyClient.SendBinaryRequestAsync(code, []);
             _context.LastRawError = null;
         }
         catch (Exception error)

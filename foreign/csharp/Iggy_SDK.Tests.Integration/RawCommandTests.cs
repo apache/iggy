@@ -31,12 +31,12 @@ public class RawCommandTests
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task SendRawWithResponse_Tcp_ShouldReturnRawPayloads(Protocol protocol)
+    public async Task SendBinaryRequest_Tcp_ShouldReturnRawPayloads(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var pingResponse = await client.SendRawWithResponseAsync(1, []);
-        var statsResponse = await client.SendRawWithResponseAsync(10, []);
+        var pingResponse = await client.SendBinaryRequestAsync(1, []);
+        var statsResponse = await client.SendBinaryRequestAsync(10, []);
 
         pingResponse.ShouldBeEmpty();
         statsResponse.ShouldNotBeEmpty();
@@ -45,14 +45,14 @@ public class RawCommandTests
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task SendRawWithResponse_Tcp_ShouldRejectSessionControlCodes(Protocol protocol)
+    public async Task SendBinaryRequest_Tcp_ShouldRejectSessionControlCodes(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         foreach (var code in new uint[] { 38, 39, 40, 44, 45 })
         {
             var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-                () => client.SendRawWithResponseAsync(code, []));
+                () => client.SendBinaryRequestAsync(code, []));
             exception.StatusCode.ShouldBe(3);
         }
     }
@@ -60,12 +60,12 @@ public class RawCommandTests
     [Test]
     [SkipHttp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task SendRawWithResponse_Tcp_ShouldPropagateServerError(Protocol protocol)
+    public async Task SendBinaryRequest_Tcp_ShouldPropagateServerError(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-            () => client.SendRawWithResponseAsync(60_000, []));
+            () => client.SendBinaryRequestAsync(60_000, []));
 
         exception.StatusCode.ShouldBe(3);
     }
@@ -73,11 +73,11 @@ public class RawCommandTests
     [Test]
     [SkipTcp]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task SendRawWithResponse_Http_ShouldThrowFeatureUnavailable(Protocol protocol)
+    public async Task SendBinaryRequest_Http_ShouldThrowFeatureUnavailable(Protocol protocol)
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         await Should.ThrowAsync<FeatureUnavailableException>(
-            () => client.SendRawWithResponseAsync(1, []));
+            () => client.SendBinaryRequestAsync(1, []));
     }
 }

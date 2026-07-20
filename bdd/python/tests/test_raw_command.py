@@ -52,7 +52,7 @@ def authenticated_root_user(context):
 def send_raw_command(context, code):
     async def send():
         try:
-            context.last_raw_response = await context.client.send_raw_with_response(
+            context.last_raw_response = await context.client.send_binary_request(
                 code, b""
             )
             context.last_raw_error = None

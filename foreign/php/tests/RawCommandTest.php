@@ -34,7 +34,7 @@ final class RawCommandTest extends TestCase
     {
         $client = new_client();
 
-        $response = $client->sendRawWithResponse(self::PING_CODE, '');
+        $response = $client->sendBinaryRequest(self::PING_CODE, '');
 
         assert_same('', $response);
     }
@@ -44,7 +44,7 @@ final class RawCommandTest extends TestCase
     {
         $client = new_client();
 
-        $response = $client->sendRawWithResponse(self::GET_STATS_CODE, '');
+        $response = $client->sendBinaryRequest(self::GET_STATS_CODE, '');
 
         assert_true($response !== '', 'expected a non-empty stats response');
     }
@@ -55,7 +55,7 @@ final class RawCommandTest extends TestCase
     {
         $client = new_client();
 
-        $throwable = assert_throws(static fn () => $client->sendRawWithResponse($code, ''));
+        $throwable = assert_throws(static fn () => $client->sendBinaryRequest($code, ''));
 
         assert_instance_of(IggyException::class, $throwable);
     }
@@ -65,7 +65,7 @@ final class RawCommandTest extends TestCase
     {
         $client = new_client();
 
-        $throwable = assert_throws(static fn () => $client->sendRawWithResponse(self::UNKNOWN_CODE, ''));
+        $throwable = assert_throws(static fn () => $client->sendBinaryRequest(self::UNKNOWN_CODE, ''));
 
         assert_instance_of(IggyException::class, $throwable);
     }

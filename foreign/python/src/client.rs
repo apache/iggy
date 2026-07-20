@@ -840,7 +840,7 @@ impl IggyClient {
     /// Raises:
     ///     PyRuntimeError: If the command cannot be sent or the server returns an error.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
-    fn send_raw_with_response<'a>(
+    fn send_binary_request<'a>(
         &self,
         py: Python<'a>,
         code: u32,

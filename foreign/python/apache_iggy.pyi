@@ -635,7 +635,7 @@ class IggyClient:
         Creates a new consumer group consumer.
         Returns the consumer or a PyRuntimeError on failure.
         """
-    def send_raw_with_response(
+    def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
     ) -> collections.abc.Awaitable[bytes]:
         r"""
