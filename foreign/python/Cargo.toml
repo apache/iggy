@@ -37,7 +37,7 @@ doc = false
 [dependencies]
 bytes = "1.12.0"
 futures = "0.3.32"
-iggy = { path = "../../core/sdk", version = "0.10.3-edge.1" }
+iggy = { path = "../../core/sdk", version = "0.10.3-edge.2" }
 pyo3 = "0.29.0"
 pyo3-async-runtimes = { version = "0.29.0", features = [
     "attributes",
