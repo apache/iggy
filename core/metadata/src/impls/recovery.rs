@@ -129,6 +129,7 @@ pub struct RecoveredMetadata<M> {
 pub async fn recover<M>(
     data_dir: &Path,
     solo: bool,
+    journal_slots: usize,
     seed_baseline: impl FnOnce(&M),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
@@ -160,7 +161,7 @@ where
 
     let journal_path = metadata_dir.join("journal.wal");
     let watermark = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let journal = PrepareJournal::open(&journal_path, watermark).await?;
+    let journal = PrepareJournal::open_with_slots(&journal_path, watermark, journal_slots).await?;
 
     // Intentional fail-fast: a bad entry aborts recovery and the operator
     // must repair or truncate the WAL before the node can boot again.
@@ -266,7 +267,14 @@ mod tests {
     #[compio::test]
     async fn recover_empty_state() {
         let dir = tempdir().unwrap();
-        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            false,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(recovered.last_applied_op, None);
         assert!(recovered.journal.last_op().is_none());
@@ -283,7 +291,14 @@ mod tests {
             .persist(&metadata_dir.join("snapshot.bin"))
             .unwrap();
 
-        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            false,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(
             recovered
                 .snapshot
@@ -310,7 +325,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            false,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert!(recovered.snapshot.is_none());
         // Op 3's entry proves commit=2; op 3 itself is journaled but not
         // provably committed, so it stays journal-only.
@@ -344,7 +366,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            false,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(recovered.last_applied_op, Some(3));
         assert_eq!(recovered.last_journaled_op, Some(5));
         assert_eq!(recovered.journal.last_op(), Some(5));
@@ -373,7 +402,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path(), false, |_| {}).await.unwrap();
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            false,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            |_| {},
+        )
+        .await
+        .unwrap();
         // Replays ops 6-9 (snapshot at 5; op 10's entry proves commit=9).
         assert_eq!(recovered.last_applied_op, Some(9));
         assert_eq!(recovered.last_journaled_op, Some(10));

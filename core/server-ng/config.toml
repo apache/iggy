@@ -696,6 +696,25 @@ self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
+# Metadata consensus plane tunables (shard 0's VSR replica: users,
+# streams, topics, sessions). Size these together: a deeper prepare queue
+# admits more concurrent in-flight metadata ops (e.g. login storms), and
+# the journal must hold enough slots that a forced checkpoint (triggered
+# when remaining slots fall to the checkpoint margin, which itself is
+# max(64, prepare_queue_depth)) stays rare. Validation enforces
+# journal_slots >= 4 * max(64, prepare_queue_depth).
+[metadata]
+# Depth of the metadata prepare queue: how many uncommitted metadata ops
+# may be in flight at once. Submits beyond it are rejected with the
+# transient "metadata prepare queue is full" and retried by the SDK.
+prepare_queue_depth = 32
+
+# Size of the metadata WAL's in-memory index, in slots (one committed but
+# not-yet-snapshotted op per slot). Larger values buy more headroom
+# between forced checkpoints at the cost of memory and bigger WAL
+# rewrites per checkpoint.
+journal_slots = 1024
+
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between
