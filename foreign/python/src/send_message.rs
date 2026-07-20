@@ -17,12 +17,13 @@
 
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
-use pyo3::{prelude::*, types::PyBytes};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pyo3_stub_gen::{
     derive::{gen_stub_pyclass, gen_stub_pymethods},
     impl_stub_type,
 };
-use std::str::FromStr;
+
+use crate::user_headers::py_user_headers_to_rust;
 
 /// A Python class representing a message to be sent.
 /// This class wraps a Rust message meant for sending, facilitating
@@ -61,20 +62,38 @@ impl SendMessage {
     /// This method allows for the creation of a `SendMessage` instance
     /// directly from Python using the provided string or bytes data.
     #[new]
-    pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
-        let inner = match data {
-            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
-            PyMessagePayload::Bytes(data) => {
-                let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
-                RustIggyMessage::builder()
-                    .payload(bytes)
-                    .build()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?
-            }
+    #[pyo3(signature = (data, user_headers=None, id=None))]
+    pub fn new(
+        py: Python,
+        data: PyMessagePayload,
+        #[gen_stub(override_type(type_repr = "dict[typing.Any, typing.Any] | None"))]
+        user_headers: Option<&Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] id: Option<u128>,
+    ) -> PyResult<Self> {
+        let payload = match data {
+            PyMessagePayload::String(data) => Bytes::from(data),
+            PyMessagePayload::Bytes(data) => Bytes::from(data.extract::<Vec<u8>>(py)?),
         };
+        let user_headers = user_headers
+            .map(|headers| {
+                let headers = headers
+                    .cast::<pyo3::types::PyDict>()
+                    .map_err(|_| PyValueError::new_err("User headers must be a dictionary"))?;
+                py_user_headers_to_rust(py, headers)
+            })
+            .transpose()?;
+        let inner = RustIggyMessage::builder()
+            .maybe_id(id)
+            .payload(payload)
+            .maybe_user_headers(user_headers)
+            .build()
+            .map_err(to_value_error)?;
         Ok(Self { inner })
     }
+}
+
+fn to_value_error(error: impl ToString) -> PyErr {
+    PyValueError::new_err(error.to_string())
 }
 
 #[derive(FromPyObject, IntoPyObject)]

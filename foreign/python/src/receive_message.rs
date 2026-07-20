@@ -16,9 +16,12 @@
 // under the License.
 
 use iggy::prelude::{IggyMessage as RustReceiveMessage, PollingStrategy as RustPollingStrategy};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+
+use crate::user_headers::{UserHeaders, rust_user_headers_to_py};
 
 /// A Python class representing a received message.
 /// This class wraps a Rust message, allowing for access to its payload and offset from Python.
@@ -50,6 +53,12 @@ impl ReceiveMessage {
         self.inner.header.timestamp
     }
 
+    /// Retrieves the origin timestamp of the received message.
+    /// The origin timestamp represents when the message was originally created.
+    pub fn origin_timestamp(&self) -> u64 {
+        self.inner.header.origin_timestamp
+    }
+
     /// Retrieves the id of the received message.
     /// The id represents unique identifier of the message within its topic.
     pub fn id(&self) -> u128 {
@@ -71,6 +80,19 @@ impl ReceiveMessage {
     /// Retrieves the partition this message belongs to.
     pub fn partition_id(&self) -> u32 {
         self.partition_id
+    }
+
+    /// Retrieves user headers attached to the received message.
+    #[gen_stub(override_return_type(type_repr = "UserHeaders | None"))]
+    pub fn user_headers<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, UserHeaders>>> {
+        let Some(headers) = self
+            .inner
+            .user_headers_map()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        rust_user_headers_to_py(py, headers).map(Some)
     }
 }
 

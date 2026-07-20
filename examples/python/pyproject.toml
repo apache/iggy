@@ -54,3 +54,8 @@ exclude-newer = "7 days"
 project-includes = [
     "**/*.py*",
 ]
+search-path = [
+    "message-headers",
+    "message-headers/plain-headers",
+    "message-headers/typed-headers",
+]
