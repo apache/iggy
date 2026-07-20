@@ -238,6 +238,9 @@ class TestCreateTopic:
             IggyExpiry.ExpireDuration(timedelta(seconds=1)),
             IggyExpiry.ExpireDuration(timedelta(minutes=10)),
             IggyExpiry.ExpireDuration(timedelta(days=1, seconds=2, microseconds=3)),
+            # days * 86_400 overflows i32 (max ~24,855 days); regression test
+            # for widening the days-to-seconds conversion to i64.
+            IggyExpiry.ExpireDuration(timedelta(days=30_000)),
         ],
     )
     async def test_create_topic_with_message_expiry(

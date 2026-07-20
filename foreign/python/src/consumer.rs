@@ -522,7 +522,8 @@ impl PyStubType for AutoCommitAfter {
 pub fn py_delta_to_iggy_duration(delta1: &Py<PyDelta>) -> PyResult<IggyDuration> {
     Python::attach(|py| {
         let delta = delta1.bind(py);
-        let total_seconds = delta.get_days() * 60 * 60 * 24 + delta.get_seconds();
+        let total_seconds =
+            i64::from(delta.get_days()) * 86_400 + i64::from(delta.get_seconds());
         if total_seconds < 0 {
             return Err(PyValueError::new_err(
                 "duration must not be negative".to_string(),

@@ -42,7 +42,7 @@ pub enum IggyExpiry {
     /// such by the server. A negative `timedelta` raises `ValueError` when
     /// this value is passed to `create_topic`/`update_topic`. The upper
     /// bound is whatever a `datetime.timedelta` can represent that also fits
-    /// in a `u64` microsecond count (about 584,942 years); in practice the
+    /// in a `u64` microsecond count (about 584,542 years); in practice the
     /// server-configured maximum is reached long before that.
     ExpireDuration { duration: Py<PyDelta> },
     /// Retain messages indefinitely; they never expire.
