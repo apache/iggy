@@ -233,7 +233,6 @@ class TestCreateTopic:
     @pytest.mark.parametrize(
         "message_expiry",
         [
-            IggyExpiry.ExpireDuration(timedelta(0)),  # server default sentinel
             IggyExpiry.ExpireDuration(timedelta(microseconds=1)),
             IggyExpiry.ExpireDuration(timedelta(seconds=1)),
             IggyExpiry.ExpireDuration(timedelta(minutes=10)),
@@ -264,19 +263,26 @@ class TestCreateTopic:
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert topic.name == topic_name
-        if message_expiry.duration == timedelta(0):
-            # A zero duration is the server-default sentinel; the server
-            # resolves it to the configured default, which is "never expire".
-            assert isinstance(topic.message_expiry, IggyExpiry.NeverExpire)
-        else:
-            assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
-            assert topic.message_expiry.duration == message_expiry.duration
+        assert isinstance(topic.message_expiry, IggyExpiry.ExpireDuration)
+        assert topic.message_expiry.duration == message_expiry.duration
 
     @pytest.mark.asyncio
-    async def test_create_topic_rejects_negative_message_expiry(
-        self, iggy_client: IggyClient, unique_name
+    @pytest.mark.parametrize(
+        "invalid_duration",
+        [
+            timedelta(seconds=-1),
+            # 0 is the wire sentinel reserved for IggyExpiry.ServerDefault();
+            # matches MaxTopicSize.Custom(0) rejecting its own sentinel.
+            timedelta(0),
+            # u64::MAX microseconds is the wire sentinel reserved for
+            # IggyExpiry.NeverExpire(); matches MaxTopicSize.Custom(u64::MAX).
+            timedelta(microseconds=2**64 - 1),
+        ],
+    )
+    async def test_create_topic_rejects_invalid_message_expiry_duration(
+        self, iggy_client: IggyClient, unique_name, invalid_duration: timedelta
     ):
-        """Test create_topic rejects a negative ExpireDuration timedelta."""
+        """Test create_topic rejects an ExpireDuration at a reserved boundary."""
         stream_name = unique_name()
         topic_name = unique_name()
 
@@ -287,7 +293,7 @@ class TestCreateTopic:
                 stream=stream_name,
                 name=topic_name,
                 partitions_count=1,
-                message_expiry=IggyExpiry.ExpireDuration(timedelta(seconds=-1)),
+                message_expiry=IggyExpiry.ExpireDuration(invalid_duration),
             )
 
     @pytest.mark.asyncio

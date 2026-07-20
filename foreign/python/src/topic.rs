@@ -37,13 +37,12 @@ pub enum IggyExpiry {
     ServerDefault(),
     /// Expire messages this long after they are appended to the topic.
     ///
-    /// `duration` must be greater than zero: a zero-length `timedelta` is
-    /// indistinguishable on the wire from `ServerDefault` and is treated as
-    /// such by the server. A negative `timedelta` raises `ValueError` when
-    /// this value is passed to `create_topic`/`update_topic`. The upper
-    /// bound is whatever a `datetime.timedelta` can represent that also fits
-    /// in a `u64` microsecond count (about 584,542 years); in practice the
-    /// server-configured maximum is reached long before that.
+    /// `duration` must be greater than zero and less than the maximum
+    /// microsecond count a `u64` can hold (about 584,542 years): those two
+    /// values are reserved on the wire for `ServerDefault` and `NeverExpire`
+    /// respectively, so a `duration` at either boundary raises `ValueError`
+    /// when passed to `create_topic`/`update_topic`. A negative `timedelta`
+    /// also raises `ValueError`.
     ExpireDuration { duration: Py<PyDelta> },
     /// Retain messages indefinitely; they never expire.
     NeverExpire(),
@@ -68,7 +67,24 @@ impl TryFrom<&IggyExpiry> for RustIggyExpiry {
         Ok(match expiry {
             IggyExpiry::ServerDefault() => RustIggyExpiry::ServerDefault,
             IggyExpiry::ExpireDuration { duration } => {
-                RustIggyExpiry::ExpireDuration(py_delta_to_iggy_duration(duration)?)
+                let iggy_duration = py_delta_to_iggy_duration(duration)?;
+                if iggy_duration.is_zero() {
+                    return Err(PyValueError::new_err(
+                        "duration must be greater than zero and less than the maximum \
+                         representable microsecond count; those values are reserved for \
+                         IggyExpiry.ServerDefault() and IggyExpiry.NeverExpire() respectively"
+                            .to_string(),
+                    ));
+                }
+                if iggy_duration.get_duration().as_micros() >= u64::MAX as u128 {
+                    return Err(PyValueError::new_err(
+                        "duration must be greater than zero and less than the maximum \
+                         representable microsecond count; those values are reserved for \
+                         IggyExpiry.ServerDefault() and IggyExpiry.NeverExpire() respectively"
+                            .to_string(),
+                    ));
+                }
+                RustIggyExpiry::ExpireDuration(iggy_duration)
             }
             IggyExpiry::NeverExpire() => RustIggyExpiry::NeverExpire,
         })
