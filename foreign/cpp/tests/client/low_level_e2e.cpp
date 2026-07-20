@@ -20,9 +20,11 @@
 // TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
 // attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <gtest/gtest.h>
@@ -31,6 +33,30 @@
 #include "tests/common/test_helpers.hpp"
 
 class LowLevelE2E_Client : public E2ETestFixture {};
+
+namespace {
+// A session is removed server-side when the server observes the closed
+// connection, which can lag the client's disconnect/shutdown call. Poll
+// get_clients from the observing connection until the id is gone rather than
+// asserting once immediately.
+bool WaitForClientRemoved(iggy::ffi::Client *observer, std::uint32_t client_id) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        bool present = false;
+        for (const auto &client : observer->get_clients()) {
+            if (client.client_id == client_id) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+}  // namespace
 
 TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
     RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
@@ -397,21 +423,11 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_shutdown;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->shutdown());
-    ASSERT_NO_THROW({ clients_after_shutdown = second_client->get_clients(); });
 
-    bool found_first = false;
-    for (const auto &client : clients_after_shutdown) {
-        if (client.client_id == first_me.client_id) {
-            found_first = true;
-            break;
-        }
-    }
-
-    EXPECT_FALSE(found_first);
+    EXPECT_TRUE(WaitForClientRemoved(second_client, first_me.client_id));
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
@@ -422,21 +438,11 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_disconnect;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->disconnect());
-    ASSERT_NO_THROW({ clients_after_disconnect = second_client->get_clients(); });
 
-    bool found_first = false;
-    for (const auto &client : clients_after_disconnect) {
-        if (client.client_id == first_me.client_id) {
-            found_first = true;
-            break;
-        }
-    }
-
-    EXPECT_FALSE(found_first);
+    EXPECT_TRUE(WaitForClientRemoved(second_client, first_me.client_id));
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
