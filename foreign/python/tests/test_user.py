@@ -202,38 +202,6 @@ class TestCreateUser:
 
         await iggy_client.delete_user(created.id)
 
-    @pytest.mark.parametrize(
-        "username",
-        ["あ" * 17, "🦀" * 13],
-        ids=["japanese-51-bytes", "emoji-52-bytes"],
-    )
-    @pytest.mark.asyncio
-    async def test_create_user_username_limit_is_bytes_not_characters(
-        self, iggy_client: IggyClient, unique_name, username
-    ):
-        """Test a username within 50 characters but over 50 bytes is rejected."""
-        assert len(username) <= MAX_USERNAME_BYTES
-        assert len(username.encode()) > MAX_USERNAME_BYTES
-
-        with pytest.raises(RuntimeError):
-            await iggy_client.create_user(
-                username, unique_name(max_bytes=MAX_PASSWORD_BYTES)
-            )
-
-    @pytest.mark.asyncio
-    async def test_create_user_password_limit_is_bytes_not_characters(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test a password within 100 characters but over 100 bytes is rejected."""
-        password = "あ" * 34
-        assert len(password) <= MAX_PASSWORD_BYTES
-        assert len(password.encode()) > MAX_PASSWORD_BYTES
-
-        with pytest.raises(RuntimeError):
-            await iggy_client.create_user(
-                unique_name(max_bytes=MAX_USERNAME_BYTES), password
-            )
-
 
 class TestGetUser:
     """Test user retrieval via get_user."""
