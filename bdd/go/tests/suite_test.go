@@ -37,6 +37,7 @@ func TestFeatures(t *testing.T) {
 			Options: &godog.Options{
 				Format:   "pretty",
 				Paths:    []string{"../../scenarios/basic_messaging.feature"},
+				Strict:   true,
 				TestingT: t,
 			},
 		})
@@ -47,6 +48,7 @@ func TestFeatures(t *testing.T) {
 			Options: &godog.Options{
 				Format:   "pretty",
 				Paths:    []string{"../../scenarios/leader_redirection.feature"},
+				Strict:   true,
 				TestingT: t,
 			},
 		})
