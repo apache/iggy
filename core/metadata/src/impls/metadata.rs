@@ -370,7 +370,11 @@ struct LocalGateGuard<'a> {
 impl Drop for LocalGateGuard<'_> {
     fn drop(&mut self) {
         self.gate.busy.set(false);
-        for waker in self.gate.waiters.borrow_mut().drain(..) {
+        // Move the waiters out before waking: `wake()` only schedules under
+        // compio today, but a waker that ever polled a waiter inline would
+        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
+        let waiters = std::mem::take(&mut *self.gate.waiters.borrow_mut());
+        for waker in waiters {
             waker.wake();
         }
     }
@@ -914,8 +918,6 @@ where
 
         let quorum = ack_quorum_reached(consensus, PlaneKind::Metadata, header);
         if quorum {
-            let journal = self.journal.as_ref().unwrap();
-
             debug!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -924,195 +926,7 @@ where
                 "ack quorum received"
             );
 
-            // Commit loop: peek -> await journal read -> revalidate head ->
-            // sync {pop, apply, advance_commit_min}.
-            //
-            // The entry stays in the pipeline across the journal-read await,
-            // so a driver of this function that is dropped there — a hyper
-            // HTTP handler future canceled by peer disconnect, or a parked
-            // in-process submitter — strands nothing: the next driver
-            // (sibling submit, shard pump, repair tick) re-peeks the same
-            // head and commits it. Popping BEFORE the await loses the entry
-            // forever on cancellation (nothing re-applies a popped entry;
-            // `repair_primary_self_acks` is re-ack-only), pinning
-            // `commit_min` below `commit_max` and panicking the next commit
-            // with "commit_min must advance sequentially".
-            //
-            // Concurrent drivers are serialized by the head revalidation:
-            // only the driver that still finds its peeked header at the
-            // pipeline head after the await owns that op's commit; everyone
-            // else re-peeks and moves on to the next committable op.
-            let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
-            while let Some(prepare_header) = peek_committable_head(consensus) {
-                // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-                // When journal compaction is implemented compaction could race
-                // with this lookup if it removes entries below the commit number.
-                let prepare = journal
-                    .handle()
-                    .entry(&prepare_header)
-                    .await
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "on_ack: committed prepare op={} checksum={} must be in journal",
-                            prepare_header.op, prepare_header.checksum
-                        )
-                    });
-
-                // Revalidate after the await: a sibling driver may have
-                // committed this op (and more) while we were parked.
-                let head_is_ours = consensus.pipeline().borrow().head().is_some_and(|head| {
-                    head.header.op == prepare_header.op
-                        && head.header.checksum == prepare_header.checksum
-                });
-                if !head_is_ours {
-                    continue;
-                }
-
-                let mut entry = consensus
-                    .pipeline()
-                    .borrow_mut()
-                    .pop()
-                    .expect("on_ack: revalidated head exists");
-
-                let pipeline_depth = consensus.pipeline().borrow().len();
-                let event = CommitLogEvent {
-                    replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
-                    op: prepare_header.op,
-                    client_id: prepare_header.client,
-                    request_id: prepare_header.request,
-                    operation: prepare_header.operation,
-                    pipeline_depth,
-                };
-
-                // Apply SM + mutate client_table BEFORE advancing commit_min.
-                // `is_caught_up_primary` reads `commit_min == commit_max` as
-                // proof the table is caught up. Table first, counter last:
-                // panic mid-commit leaves the gate closed.
-                //
-                // Invariant: no .await or panic from the pop above through
-                // `advance_commit_min` and the subscriber fire below.
-                // Sync-only — this is what makes pop/apply/advance atomic on
-                // the single-threaded shard and keeps the head revalidation
-                // sound.
-                let reply = if prepare_header.operation == Operation::Register {
-                    // Register: commit_register creates session, no SM.
-                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                    let in_flight =
-                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                    self.client_table.borrow_mut().commit_register(
-                        prepare_header.client,
-                        prepare_header.user_id,
-                        reply.clone(),
-                        in_flight,
-                    );
-                    reply
-                } else if prepare_header.operation == Operation::Logout {
-                    // Logout unregisters the VSR client session on every replica.
-                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
-                    // Drop the disconnected client from every consumer group it
-                    // joined and rebalance. Deterministic side-effect of the
-                    // Logout commit, applied identically on every replica.
-                    self.mux_stm.streams().remove_consumer_group_member(
-                        prepare_header.client,
-                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
-                    );
-                    reply
-                } else {
-                    // Normal op: apply SM, commit_reply. `Err` is decode/corruption
-                    // only; a business rejection commits as a deterministic no-op
-                    // whose `code` rides the reply body, replayed on retry.
-                    let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
-                        panic!(
-                            "on_ack: committed metadata op={} failed to apply: {err}",
-                            prepare_header.op
-                        );
-                    });
-                    // Post-commit notifier (e.g. partition reconciler
-                    // wake-up). Filtering by operation is the
-                    // recipient's responsibility.
-                    self.fire_commit_notifier(prepare_header.operation);
-                    let reply =
-                        build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
-                            apply.write_reply_body(dst);
-                        });
-                    // Cache only if session exists. Client evicted between
-                    // prepare and commit: skip cache (`commit_reply` no-ops),
-                    // wire reply still ships.
-                    let session = self
-                        .client_table
-                        .borrow()
-                        .get_session(prepare_header.client);
-                    if let Some(session) = session {
-                        self.client_table.borrow_mut().commit_reply(
-                            prepare_header.client,
-                            session,
-                            reply.clone(),
-                        );
-                    } else {
-                        tracing::trace!(
-                            client = prepare_header.client,
-                            op = prepare_header.op,
-                            "on_ack: client evicted while being prepared; emitting reply but skipping cache"
-                        );
-                    }
-                    reply
-                };
-                consensus.advance_commit_min(prepare_header.op);
-                emit_sim_event(SimEventKind::OperationCommitted, &event);
-
-                // Fire subscriber BEFORE wire send. Slot already updated
-                // (slot-first ordering, see take_reply_sender). Dropped
-                // receiver: ignored. Still inside the sync region, so an
-                // in-process awaiter is woken atomically with its commit.
-                let had_in_process_subscriber = entry.has_reply_sender();
-                if let Some(sender) = entry.take_reply_sender() {
-                    let _ = sender.send(reply.clone());
-                }
-
-                // Skip wire send when an in-process subscriber consumed the
-                // reply: the caller (e.g. `complete_login_register`,
-                // `handle_logout_request`) ships its own full-body reply on
-                // the same socket. Sending both desyncs the SDK -- it reads
-                // the first frame, fails to decode the typed body, and
-                // leaves the second frame stuck in the socket buffer.
-                if !had_in_process_subscriber {
-                    wire_replies.push((event, reply));
-                }
-            }
-
-            // Wire replies AFTER the commit loop: this region may await, and
-            // a driver dropped here loses only reply frames — every commit
-            // above is applied and its reply cached in the client_table, so
-            // the SDK recovers it via request replay.
-            for (event, reply) in wire_replies {
-                let generic_reply = reply.into_generic();
-                let reply_buffers = freeze_client_reply(generic_reply);
-                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
-
-                if let Err(e) = consensus
-                    .message_bus()
-                    .send_to_client(event.client_id, reply_buffers)
-                    .await
-                {
-                    error!(
-                        client = event.client_id,
-                        op = event.op,
-                        request_id = event.request_id,
-                        operation = ?event.operation,
-                        %e,
-                        "client reply forward failed, no retransmit path; client will time out",
-                    );
-                }
-            }
-
-            // Commits freed prepare slots and reopened the catch-up gate;
-            // promote buffered requests so the pipeline stays busy and
-            // absorbed submits (queued while this batch was mid-commit)
-            // dispatch immediately.
-            self.drain_request_queue_into_prepares().await;
+            self.commit_committable_prefix().await;
         }
     }
 }
@@ -1419,6 +1233,11 @@ where
             .as_ref()
             .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
 
+        // Deliberately bounce-based (no request-queue absorption, unlike the
+        // client submit paths above): the caller is the partition
+        // reconciler's completion loop, which retries on its own tick, and
+        // parking internal completions would tie up request slots that
+        // client submits compete for.
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
@@ -1498,6 +1317,9 @@ where
             "submit_delete_personal_access_token_in_process: consensus only exists on shard 0",
         );
 
+        // Deliberately bounce-based (no request-queue absorption): the
+        // caller is the background PAT cleaner, which simply retries the
+        // deletion on its next sweep.
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
@@ -1862,8 +1684,248 @@ where
         true
     }
 
-    /// Promote up to `slots_freed` buffered requests into prepares after
-    /// `on_ack` commits a prefix.
+    /// Commit the committable prefix, ship the resulting wire replies, and
+    /// promote queued requests into the freed prepare slots.
+    ///
+    /// Runs at the tail of every quorum-advancing `on_ack` and from the
+    /// shard tick via [`Self::resume_stranded_commits`]. Safe under
+    /// concurrent drivers: ownership of each op is arbitrated by the head
+    /// revalidation inside the loop.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
+    async fn commit_committable_prefix(&self) {
+        let consensus = self.consensus.as_ref().unwrap();
+        let journal = self.journal.as_ref().unwrap();
+
+        // Commit loop: peek -> await journal read -> revalidate head ->
+        // sync {pop, apply, advance_commit_min}.
+        //
+        // The entry stays in the pipeline across the journal-read await,
+        // so a driver of this function that is dropped there — a hyper
+        // HTTP handler future canceled by peer disconnect, or a parked
+        // in-process submitter — strands nothing: the next driver
+        // (sibling submit, shard pump, repair tick) re-peeks the same
+        // head and commits it. Popping BEFORE the await loses the entry
+        // forever on cancellation (nothing re-applies a popped entry;
+        // `repair_primary_self_acks` is re-ack-only), pinning
+        // `commit_min` below `commit_max` and panicking the next commit
+        // with "commit_min must advance sequentially".
+        //
+        // Concurrent drivers are serialized by the head revalidation:
+        // only the driver that still finds its peeked header at the
+        // pipeline head after the await owns that op's commit; everyone
+        // else re-peeks and moves on to the next committable op.
+        let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
+        while let Some(prepare_header) = peek_committable_head(consensus) {
+            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
+            // When journal compaction is implemented compaction could race
+            // with this lookup if it removes entries below the commit number.
+            let prepare = journal
+                .handle()
+                .entry(&prepare_header)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "on_ack: committed prepare op={} checksum={} must be in journal",
+                        prepare_header.op, prepare_header.checksum
+                    )
+                });
+
+            // Revalidate after the await: a sibling driver may have
+            // committed this op (and more) while we were parked.
+            let head_is_ours = consensus.pipeline().borrow().head().is_some_and(|head| {
+                head.header.op == prepare_header.op
+                    && head.header.checksum == prepare_header.checksum
+            });
+            if !head_is_ours {
+                continue;
+            }
+
+            let mut entry = consensus
+                .pipeline()
+                .borrow_mut()
+                .pop()
+                .expect("on_ack: revalidated head exists");
+
+            let pipeline_depth = consensus.pipeline().borrow().len();
+            let event = CommitLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                op: prepare_header.op,
+                client_id: prepare_header.client,
+                request_id: prepare_header.request,
+                operation: prepare_header.operation,
+                pipeline_depth,
+            };
+
+            // Apply SM + mutate client_table BEFORE advancing commit_min.
+            // `is_caught_up_primary` reads `commit_min == commit_max` as
+            // proof the table is caught up. Table first, counter last:
+            // panic mid-commit leaves the gate closed.
+            //
+            // Invariant: no .await or panic from the pop above through
+            // `advance_commit_min` and the subscriber fire below.
+            // Sync-only — this is what makes pop/apply/advance atomic on
+            // the single-threaded shard and keeps the head revalidation
+            // sound.
+            let reply = if prepare_header.operation == Operation::Register {
+                // Register: commit_register creates session, no SM.
+                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                self.client_table.borrow_mut().commit_register(
+                    prepare_header.client,
+                    prepare_header.user_id,
+                    reply.clone(),
+                    in_flight,
+                );
+                reply
+            } else if prepare_header.operation == Operation::Logout {
+                // Logout unregisters the VSR client session on every replica.
+                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                self.client_table
+                    .borrow_mut()
+                    .remove_client(prepare_header.client);
+                // Drop the disconnected client from every consumer group it
+                // joined and rebalance. Deterministic side-effect of the
+                // Logout commit, applied identically on every replica.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    prepare_header.client,
+                    iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                );
+                reply
+            } else {
+                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                // only; a business rejection commits as a deterministic no-op
+                // whose `code` rides the reply body, replayed on retry.
+                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
+                    panic!(
+                        "on_ack: committed metadata op={} failed to apply: {err}",
+                        prepare_header.op
+                    );
+                });
+                // Post-commit notifier (e.g. partition reconciler
+                // wake-up). Filtering by operation is the
+                // recipient's responsibility.
+                self.fire_commit_notifier(prepare_header.operation);
+                let reply =
+                    build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
+                        apply.write_reply_body(dst);
+                    });
+                // Cache only if session exists. Client evicted between
+                // prepare and commit: skip cache (`commit_reply` no-ops),
+                // wire reply still ships.
+                let session = self
+                    .client_table
+                    .borrow()
+                    .get_session(prepare_header.client);
+                if let Some(session) = session {
+                    self.client_table.borrow_mut().commit_reply(
+                        prepare_header.client,
+                        session,
+                        reply.clone(),
+                    );
+                } else {
+                    tracing::trace!(
+                        client = prepare_header.client,
+                        op = prepare_header.op,
+                        "on_ack: client evicted while being prepared; emitting reply but skipping cache"
+                    );
+                }
+                reply
+            };
+            consensus.advance_commit_min(prepare_header.op);
+            emit_sim_event(SimEventKind::OperationCommitted, &event);
+
+            // Fire subscriber BEFORE wire send. Slot already updated
+            // (slot-first ordering, see take_reply_sender). Dropped
+            // receiver: ignored. Still inside the sync region, so an
+            // in-process awaiter is woken atomically with its commit.
+            let had_in_process_subscriber = entry.has_reply_sender();
+            if let Some(sender) = entry.take_reply_sender() {
+                let _ = sender.send(reply.clone());
+            }
+
+            // Skip wire send when an in-process subscriber consumed the
+            // reply: the caller (e.g. `complete_login_register`,
+            // `handle_logout_request`) ships its own full-body reply on
+            // the same socket. Sending both desyncs the SDK -- it reads
+            // the first frame, fails to decode the typed body, and
+            // leaves the second frame stuck in the socket buffer.
+            if !had_in_process_subscriber {
+                wire_replies.push((event, reply));
+            }
+        }
+
+        // Wire replies AFTER the commit loop: this region may await, and
+        // a driver dropped here loses only reply frames — every commit
+        // above is applied and its reply cached in the client_table, so
+        // the SDK recovers it via request replay.
+        for (event, reply) in wire_replies {
+            let generic_reply = reply.into_generic();
+            let reply_buffers = freeze_client_reply(generic_reply);
+            emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
+
+            if let Err(e) = consensus
+                .message_bus()
+                .send_to_client(event.client_id, reply_buffers)
+                .await
+            {
+                error!(
+                    client = event.client_id,
+                    op = event.op,
+                    request_id = event.request_id,
+                    operation = ?event.operation,
+                    %e,
+                    "client reply forward failed, no retransmit path; client will time out",
+                );
+            }
+        }
+
+        // Commits freed prepare slots and reopened the catch-up gate;
+        // promote buffered requests so the pipeline stays busy and
+        // absorbed submits (queued while this batch was mid-commit)
+        // dispatch immediately.
+        self.drain_request_queue_into_prepares().await;
+    }
+
+    /// Timer-driven backstop (shard pump tick) for commit work stranded by
+    /// a canceled `on_ack` driver.
+    ///
+    /// The commit loop and the promotion of queued requests run at the tail
+    /// of the quorum-advancing `on_ack` — inside whichever future delivered
+    /// that ack, and that future can be dropped at any of its awaits
+    /// (journal read, wire-reply send). The pipeline is then left with
+    /// committed-but-unapplied entries (`commit_min < commit_max`) and/or
+    /// still-queued requests, and on an idle server nothing re-drives them:
+    /// `ack_quorum_reached` opens the commit path only when `commit_max`
+    /// advances, which duplicate and repair acks never do. This tick entry
+    /// re-runs the same commit path; a still-parked sibling driver loses
+    /// the head revalidation and exits clean.
+    ///
+    /// Ordering note: register promotion requires the catch-up gate open
+    /// (`register_preflight` drops the entry otherwise), and the gate can
+    /// only be closed here while stranded commits exist — which the commit
+    /// loop applies, reopening the gate, before promotion runs.
+    #[allow(clippy::future_not_send)]
+    pub async fn resume_stranded_commits(&self) {
+        let Some(consensus) = self.consensus.as_ref() else {
+            return;
+        };
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return;
+        }
+        let stranded_commits = consensus.commit_min() < consensus.commit_max();
+        let promotable_requests = {
+            let pipeline = consensus.pipeline().borrow();
+            !pipeline.request_queue_is_empty() && !pipeline.is_full()
+        };
+        if !stranded_commits && !promotable_requests {
+            return;
+        }
+        self.commit_committable_prefix().await;
+    }
+
+    /// Promote buffered requests into free prepare slots after a commit
+    /// batch drains.
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
@@ -3575,5 +3637,131 @@ mod tests {
             Some(2),
             "session created by the promoted register"
         );
+    }
+
+    /// The commit loop and the promotion of queued requests run at the tail
+    /// of `on_ack`, inside whichever future delivered the quorum ack. Drop
+    /// that future mid-commit and — on an idle server — nothing re-drives
+    /// the work: duplicate/repair acks do not re-open the commit path
+    /// (quorum already recorded, `commit_max` does not advance), so the
+    /// committed-but-unapplied op pins the catch-up gate closed and an
+    /// absorbed register parks in the request queue indefinitely.
+    ///
+    /// `resume_stranded_commits` (wired into the shard pump tick) is the
+    /// backstop: it re-enters the commit path, applies the stranded prefix,
+    /// and promotes the queued register, whose awaiter then resolves.
+    #[compio::test]
+    async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
+        use std::future::Future;
+
+        /// The client whose in-flight commit is stranded by the dropped driver.
+        const CLIENT_B: u128 = 2;
+        /// The client whose register parks in the request queue.
+        const CLIENT_C: u128 = 3;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT_B,
+            ACTING_USER,
+            register_reply(CLIENT_B, SESSION),
+            |_| false,
+        );
+
+        // B's op journaled + self-acked; park its commit driver mid-window
+        // at the journal read.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // C's register lands in the window: absorbed into the request queue.
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        assert!(register.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+
+        // The committing driver dies at its await — the hyper-disconnect
+        // analogue. Commit and promotion are now stranded: op 1 is quorum'd
+        // (commit_max = 1) but unapplied (commit_min = 0), and no further
+        // ack will arrive to re-drive either.
+        drop(driver);
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert!(
+            register.as_mut().poll(&mut cx).is_pending(),
+            "queued register must still be parked with no driver alive"
+        );
+
+        // The pump tick backstop re-drives: commits op 1 (reopening the
+        // catch-up gate) and promotes the queued register into a prepare
+        // (its self-ack lands on the loopback).
+        md.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), 1, "stranded op 1 applied");
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            0,
+            "queued register promoted"
+        );
+
+        // Commit the promoted register (production: pump loopback drain)
+        // and the parked caller resolves with its session.
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("promoted register must self-ack")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        let mut outcome = None;
+        for _ in 0..1_000 {
+            if let std::task::Poll::Ready(result) = register.as_mut().poll(&mut cx) {
+                outcome = Some(result);
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(outcome.expect("promoted register must resolve"), Ok(2));
+        assert_eq!(md.client_table.borrow().get_session(CLIENT_C), Some(2));
+        assert!(is_caught_up_primary(consensus));
     }
 }

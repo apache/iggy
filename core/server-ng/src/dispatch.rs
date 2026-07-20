@@ -2898,34 +2898,31 @@ mod tests {
         message
     }
 
-    /// Desired-contract test for the production failure chain "CLI stream
+    /// Regression test for the production failure chain "CLI stream
     /// create succeeded, logout failed: Disconnected".
     ///
-    /// Why the logout of a CLI invocation fails during ITS OWN successful
-    /// `stream create`: the catch-up gate is GLOBAL. The suite runs many
-    /// CLI invocations against one shared single-node server; each one is
-    /// three replicated ops (Register, work, Logout). When THIS client's
-    /// logout frame arrives, some SIBLING client's op is regularly sitting
-    /// between quorum-ack (`commit_max` advanced inside `on_ack`) and
-    /// apply (`commit_min` still behind, driver parked at the journal
-    /// read). `submit_logout_in_process` then rejects `NotCaughtUp`, and
-    /// `handle_logout_request` swallows the error: no reply frame, session
-    /// left bound. A one-shot CLI sees only a dead connection — "Problem
-    /// with server logout / Disconnected" — and exits non-zero although
-    /// its create committed; the harness retry then trips "already
-    /// exists".
+    /// Why the logout of a CLI invocation used to fail during ITS OWN
+    /// successful `stream create`: the catch-up gate was GLOBAL. The suite
+    /// runs many CLI invocations against one shared single-node server;
+    /// each one is three replicated ops (Register, work, Logout). When
+    /// THIS client's logout frame arrived, some SIBLING client's op was
+    /// regularly sitting between quorum-ack (`commit_max` advanced inside
+    /// `on_ack`) and apply (`commit_min` still behind, driver parked at
+    /// the journal read). `submit_logout_in_process` then rejected
+    /// `NotCaughtUp`, and `handle_logout_request` swallowed the error: no
+    /// reply frame, session left bound. A one-shot CLI saw only a dead
+    /// connection — "Problem with server logout / Disconnected" — and
+    /// exited non-zero although its create committed; the harness retry
+    /// then tripped "already exists".
     ///
     /// This test rebuilds that interleaving deterministically (client B =
     /// the sibling parked mid-commit; client A = the CLI logging out) and
-    /// asserts the DESIRED contract instead of today's behavior:
+    /// pins the contract that fixed it (non-register ops carry no
+    /// catch-up gate, see `submit_logout_in_process`):
     ///
     ///   a client-initiated logout must always produce a reply frame and
-    ///   unbind the transport session, even when the submit gate is
-    ///   closed — teardown is best-effort, the VSR slot may lapse to the
-    ///   eviction sweep.
-    ///
-    /// It FAILS on current code (silence + bound session) by design: it is
-    /// the reproduction to iterate fixes against.
+    ///   unbind the transport session, even while a sibling's commit is
+    ///   in flight — the logout simply pipelines behind it.
     #[compio::test]
     async fn logout_rejected_by_closed_gate_must_still_reply_to_client() {
         const CLIENT_A: u128 = 1;

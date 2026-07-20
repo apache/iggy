@@ -696,7 +696,6 @@ self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 
-# Message bus configuration.
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
 # streams, topics, sessions). Size these together: a deeper prepare queue
 # admits more concurrent in-flight metadata ops (e.g. login storms), and
@@ -716,6 +715,7 @@ prepare_queue_depth = 32
 # rewrites per checkpoint.
 journal_slots = 1024
 
+# Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between
 # shards. These knobs are consensus-liveness-critical (max_batch gates
