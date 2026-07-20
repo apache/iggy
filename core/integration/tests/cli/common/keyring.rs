@@ -65,7 +65,6 @@ mod backend {
 mod backend {
     use std::net::SocketAddr;
 
-    #[expect(dead_code)]
     pub(crate) fn ensure_keyring_store() {}
 
     pub(crate) fn clear_session_entry(_address: SocketAddr) {}
