@@ -20,15 +20,46 @@
 // TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
 // attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
+
+namespace {
+
+bool has_client_id(const rust::Vec<iggy::ffi::ClientInfo> &clients, const std::uint32_t client_id) {
+    for (const auto &client : clients) {
+        if (client.client_id == client_id) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool wait_until_client_removed(iggy::ffi::Client *observer, const std::uint32_t client_id) {
+    static constexpr std::uint32_t max_attempts = 20;
+
+    for (std::uint32_t attempt = 0; attempt < max_attempts; ++attempt) {
+        const auto clients = observer->get_clients();
+        if (!has_client_id(clients, client_id)) {
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    return false;
+}
+
+}  // namespace
 
 class LowLevelE2E_Client : public E2ETestFixture {};
 
@@ -397,21 +428,13 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_shutdown;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->shutdown());
-    ASSERT_NO_THROW({ clients_after_shutdown = second_client->get_clients(); });
+    bool first_client_removed = false;
+    ASSERT_NO_THROW({ first_client_removed = wait_until_client_removed(second_client, first_me.client_id); });
 
-    bool found_first = false;
-    for (const auto &client : clients_after_shutdown) {
-        if (client.client_id == first_me.client_id) {
-            found_first = true;
-            break;
-        }
-    }
-
-    EXPECT_FALSE(found_first);
+    EXPECT_TRUE(first_client_removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 

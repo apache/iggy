@@ -40,6 +40,7 @@ members = [
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
+    "core/connectors/sinks/meilisearch_sink",
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
@@ -213,6 +214,11 @@ lending-iterator = "0.1.7"
 libc = "0.2.186"
 log = "0.4.33"
 lz4_flex = "0.13.1"
+meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
+    "reqwest",
+    "tls",
+    "jwt_rust_crypto",
+] }
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
