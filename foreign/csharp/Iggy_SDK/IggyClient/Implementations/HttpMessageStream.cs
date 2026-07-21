@@ -525,6 +525,19 @@ public class HttpMessageStream : IIggyClient
         return [];
     }
 
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The opaque request payload.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
+    public Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
+    {
+        throw new FeatureUnavailableException();
+    }
+
     /// <inheritdoc />
     public Task ConnectAsync(CancellationToken token = default)
     {
