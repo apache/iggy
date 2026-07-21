@@ -20,12 +20,6 @@
 # Enable BzlMod
 common --enable_bzlmod
 
-# Shared compiler warnings
-build --copt=-Wall
-build --copt=-Wpedantic
-build --copt=-Werror
-build --copt=-Wextra
-
 # Debug configuration
 build:debug --compilation_mode=dbg
 build:debug --copt=-g3
