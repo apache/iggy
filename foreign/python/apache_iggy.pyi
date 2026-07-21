@@ -514,6 +514,28 @@ class IggyClient:
             PyValueError: If a string identifier is invalid.
             PyRuntimeError: If the request fails.
         """
+    def update_permissions(
+        self,
+        user_id: builtins.str | builtins.int,
+        permissions: Permissions | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Update the permissions of a user by unique ID or username.
+
+        This is a full replacement: the given permissions overwrite the previous
+        ones, and `None` removes them entirely.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            permissions: New permissions as `Permissions | None`.
+
+        Returns:
+            An awaitable that resolves to `None` when the permissions are updated.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the request fails.
+        """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.

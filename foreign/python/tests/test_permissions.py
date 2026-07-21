@@ -28,6 +28,7 @@ from apache_iggy import (
 )
 
 from .utils import (
+    MAX_USERNAME_BYTES,
     login_fresh_client,
     unique_credentials,
 )
@@ -327,3 +328,102 @@ class TestCreateUserWithPermissions:
             await client.get_stream(hidden_name)
 
         await iggy_client.delete_user(created.id)
+
+
+class TestUpdatePermissions:
+    """Test permission updates via update_permissions."""
+
+    @pytest.mark.asyncio
+    async def test_update_permissions_grants_and_round_trips(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test permissions granted after creation come back from get_user."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+        assert created.permissions is None
+
+        permissions = Permissions(global_=GlobalPermissions(read_streams=True))
+        await iggy_client.update_permissions(created.id, permissions)
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        assert fetched.permissions == permissions
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_permissions_replaces_previous_permissions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_permissions overwrites instead of merging."""
+        username, password = unique_credentials(unique_name)
+        initial = Permissions(
+            global_=GlobalPermissions(read_streams=True, read_users=True)
+        )
+        created = await iggy_client.create_user(username, password, permissions=initial)
+
+        replacement = Permissions(global_=GlobalPermissions(read_servers=True))
+        await iggy_client.update_permissions(created.id, replacement)
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        fetched_permissions = fetched.permissions
+        assert fetched_permissions is not None
+        assert fetched_permissions == replacement
+        assert fetched_permissions.global_.read_streams is False
+        assert fetched_permissions.global_.read_users is False
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_permissions_none_clears_permissions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_permissions with None removes existing permissions."""
+        username, password = unique_credentials(unique_name)
+        permissions = Permissions(global_=GlobalPermissions(read_streams=True))
+        created = await iggy_client.create_user(
+            username, password, permissions=permissions
+        )
+
+        await iggy_client.update_permissions(created.id)
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        assert fetched.permissions is None
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_permissions_takes_effect_for_new_session(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a permission granted after creation is enforced on next login."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        denied_client = await login_fresh_client(username, password)
+        with pytest.raises(RuntimeError):
+            await denied_client.create_stream(unique_name(prefix="before-grant-"))
+
+        await iggy_client.update_permissions(
+            created.id, Permissions(global_=GlobalPermissions(manage_streams=True))
+        )
+
+        granted_client = await login_fresh_client(username, password)
+        stream_name = unique_name(prefix="after-grant-")
+        await granted_client.create_stream(stream_name)
+        assert await iggy_client.get_stream(stream_name) is not None
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_update_permissions_nonexistent_user_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_permissions raises for a non-existent user."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_permissions(
+                unique_name(max_bytes=MAX_USERNAME_BYTES),
+                Permissions(global_=GlobalPermissions(read_streams=True)),
+            )

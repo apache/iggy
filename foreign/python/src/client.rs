@@ -268,6 +268,44 @@ impl IggyClient {
         })
     }
 
+    /// Update the permissions of a user by unique ID or username.
+    ///
+    /// This is a full replacement: the given permissions overwrite the previous
+    /// ones, and `None` removes them entirely.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     permissions: New permissions as `Permissions | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the permissions are updated.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, permissions=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_permissions<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let permissions = permissions.map(|permissions| permissions.inner);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_permissions(&user_id, permissions)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Connects the IggyClient to its service.
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
