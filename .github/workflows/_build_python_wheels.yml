@@ -83,7 +83,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.3.0
         with:
           python-version: "3.10"
 
@@ -145,7 +145,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.3.0
         with:
           python-version: "3.10"
 
@@ -207,7 +207,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.3.0
         with:
           python-version: "3.10"
           architecture: x64
