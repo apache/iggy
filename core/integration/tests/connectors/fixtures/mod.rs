@@ -25,6 +25,7 @@ mod http;
 mod iceberg;
 mod influxdb;
 mod mongodb;
+mod mysql;
 mod postgres;
 mod quickwit;
 mod s3;
@@ -71,6 +72,10 @@ pub use influxdb::{
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
+};
+pub use mysql::{
+    MySqlOps, MySqlSourceDeleteFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
+    MySqlSourceMarkFixture, MySqlSourceNoMetadataFixture, MySqlSourceOps, MySqlSourceRawFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
