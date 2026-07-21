@@ -42,6 +42,7 @@ mod backend {
         })
     }
 
+    #[cfg(not(any(target_os = "macos", target_env = "musl")))]
     pub(crate) fn ensure_keyring_store() {
         if let Err(msg) = init_store() {
             panic!("{msg}");
@@ -65,10 +66,12 @@ mod backend {
 mod backend {
     use std::net::SocketAddr;
 
+    #[cfg(not(any(target_os = "macos", target_env = "musl")))]
     pub(crate) fn ensure_keyring_store() {}
 
     pub(crate) fn clear_session_entry(_address: SocketAddr) {}
 }
 
-#[allow(unused_imports)]
-pub(crate) use backend::{clear_session_entry, ensure_keyring_store};
+pub(crate) use backend::clear_session_entry;
+#[cfg(not(any(target_os = "macos", target_env = "musl")))]
+pub(crate) use backend::ensure_keyring_store;
