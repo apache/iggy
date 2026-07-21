@@ -536,6 +536,27 @@ class IggyClient:
             PyValueError: If a string identifier is invalid.
             PyRuntimeError: If the request fails.
         """
+    def change_password(
+        self,
+        user_id: builtins.str | builtins.int,
+        current_password: builtins.str,
+        new_password: builtins.str,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Change the password of a user by unique ID or username.
+
+        Args:
+            user_id: User identifier as `str | int`.
+            current_password: Current password as `str`.
+            new_password: New password as `str`.
+
+        Returns:
+            An awaitable that resolves to `None` when the password is changed.
+
+        Raises:
+            PyValueError: If a string identifier is invalid.
+            PyRuntimeError: If the current password is wrong or the request fails.
+        """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.

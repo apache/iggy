@@ -306,6 +306,39 @@ impl IggyClient {
         })
     }
 
+    /// Change the password of a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     current_password: Current password as `str`.
+    ///     new_password: New password as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the password is changed.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the current password is wrong or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn change_password<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        current_password: String,
+        new_password: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .change_password(&user_id, &current_password, &new_password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Connects the IggyClient to its service.
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]

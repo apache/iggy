@@ -28,9 +28,13 @@ from apache_iggy import (
 )
 
 from .utils import (
+    MAX_PASSWORD_BYTES,
     MAX_USERNAME_BYTES,
+    MIN_PASSWORD_BYTES,
+    get_server_config,
     login_fresh_client,
     unique_credentials,
+    wait_for_ping,
 )
 
 GLOBAL_PERMISSION_FLAGS = [
@@ -426,4 +430,100 @@ class TestUpdatePermissions:
             await iggy_client.update_permissions(
                 unique_name(max_bytes=MAX_USERNAME_BYTES),
                 Permissions(global_=GlobalPermissions(read_streams=True)),
+            )
+
+
+class TestChangePassword:
+    """Test password changes via change_password."""
+
+    @pytest.mark.asyncio
+    async def test_change_password_swaps_credentials(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the new password works for login and the old one is rejected."""
+        username, password = unique_credentials(unique_name)
+        new_password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
+        created = await iggy_client.create_user(username, password)
+
+        await iggy_client.change_password(created.id, password, new_password)
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        await wait_for_ping(client)
+        with pytest.raises(RuntimeError):
+            await client.login_user(username, password)
+        await client.login_user(username, new_password)
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_change_password_rejects_wrong_current_password(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test change_password fails when the current password is wrong."""
+        username = unique_name(max_bytes=MAX_USERNAME_BYTES)
+        # Keep one byte of headroom so the wrong password stays within the
+        # server limit and the failure is about the mismatch, not the length.
+        password = unique_name(max_bytes=MAX_PASSWORD_BYTES - 1)
+        created = await iggy_client.create_user(username, password)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.change_password(
+                created.id, f"{password}x", unique_name(max_bytes=MAX_PASSWORD_BYTES)
+            )
+
+        client = await login_fresh_client(username, password)
+        await client.ping()
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_user_can_change_own_password(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user without permissions can change its own password."""
+        username, password = unique_credentials(unique_name)
+        new_password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
+        created = await iggy_client.create_user(username, password)
+
+        client = await login_fresh_client(username, password)
+        await client.change_password(created.id, password, new_password)
+
+        relogin = await login_fresh_client(username, new_password)
+        await relogin.ping()
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.parametrize(
+        "new_password",
+        ["a" * (MIN_PASSWORD_BYTES - 1), "a" * (MAX_PASSWORD_BYTES + 1)],
+        ids=["too-short", "too-long"],
+    )
+    @pytest.mark.asyncio
+    async def test_change_password_rejects_out_of_bounds_new_password(
+        self, iggy_client: IggyClient, unique_name, new_password
+    ):
+        """Test change_password rejects new passwords outside the 3-100 byte range."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.change_password(created.id, password, new_password)
+
+        client = await login_fresh_client(username, password)
+        await client.ping()
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_change_password_nonexistent_user_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test change_password raises for a non-existent user."""
+        with pytest.raises(RuntimeError):
+            await iggy_client.change_password(
+                unique_name(max_bytes=MAX_USERNAME_BYTES),
+                unique_name(max_bytes=MAX_PASSWORD_BYTES),
+                unique_name(max_bytes=MAX_PASSWORD_BYTES),
             )
