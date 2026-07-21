@@ -1,0 +1,329 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::connectors::fixtures;
+use integration::harness::TestBinaryError;
+use reqwest_middleware::ClientWithMiddleware as HttpClient;
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
+use serde::Deserialize;
+use std::time::Duration;
+use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
+use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::time::sleep;
+use tracing::info;
+
+const MEILISEARCH_IMAGE: &str = "getmeili/meilisearch";
+const MEILISEARCH_TAG: &str = "v1.13";
+const MEILISEARCH_PORT: u16 = 7700;
+const MEILISEARCH_HEALTH_ENDPOINT: &str = "/health";
+pub const TEST_INDEX: &str = "iggy_messages";
+const DOCUMENT_LIST_LIMIT: usize = 10000;
+const POLL_ATTEMPTS: usize = 100;
+const POLL_INTERVAL_MS: u64 = 50;
+
+#[derive(Debug, Deserialize)]
+pub struct MeilisearchDocumentsResponse {
+    pub results: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MeilisearchTaskResponse {
+    task_uid: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MeilisearchTaskStatus {
+    status: String,
+    #[allow(dead_code)]
+    error: Option<serde_json::Value>,
+}
+
+pub struct MeilisearchContainer {
+    #[allow(dead_code)]
+    container: ContainerAsync<GenericImage>,
+    pub base_url: String,
+}
+
+impl MeilisearchContainer {
+    pub async fn start() -> Result<Self, TestBinaryError> {
+        let container = GenericImage::new(MEILISEARCH_IMAGE, MEILISEARCH_TAG)
+            .with_exposed_port(MEILISEARCH_PORT.tcp())
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new(MEILISEARCH_HEALTH_ENDPOINT)
+                    .with_port(MEILISEARCH_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
+            .with_container_name(fixtures::unique_container_name("meilisearch"))
+            .with_env_var("MEILI_ENV", "development")
+            .with_mapped_port(0, MEILISEARCH_PORT.tcp())
+            .start()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "MeilisearchContainer".to_string(),
+                message: format!("Failed to start container: {e}"),
+            })?;
+
+        info!("Started Meilisearch container");
+
+        let mapped_port = container
+            .ports()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "MeilisearchContainer".to_string(),
+                message: format!("Failed to get ports: {e}"),
+            })?
+            .map_to_host_port_ipv4(MEILISEARCH_PORT)
+            .ok_or_else(|| TestBinaryError::FixtureSetup {
+                fixture_type: "MeilisearchContainer".to_string(),
+                message: "No mapping for Meilisearch port".to_string(),
+            })?;
+
+        let base_url = format!("http://localhost:{mapped_port}");
+        info!("Meilisearch container available at {base_url}");
+
+        Ok(Self {
+            container,
+            base_url,
+        })
+    }
+}
+
+pub fn create_http_client() -> HttpClient {
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+    reqwest_middleware::ClientBuilder::new(client)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build()
+}
+
+pub trait MeilisearchOps: Sync {
+    fn container(&self) -> &MeilisearchContainer;
+    fn http_client(&self) -> &HttpClient;
+
+    fn create_source_index(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
+        async move {
+            let url = format!("{}/indexes", self.container().base_url);
+            let response = self
+                .http_client()
+                .post(&url)
+                .json(&serde_json::json!({
+                    "uid": TEST_INDEX,
+                    "primaryKey": "id",
+                }))
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to create Meilisearch source index: {e}"),
+                })?;
+            let task = parse_task_response(response, "create Meilisearch source index").await?;
+            self.wait_for_task(task.task_uid).await?;
+
+            let url = format!(
+                "{}/indexes/{}/settings",
+                self.container().base_url,
+                TEST_INDEX
+            );
+            let response = self
+                .http_client()
+                .patch(&url)
+                .json(&serde_json::json!({
+                    "filterableAttributes": ["id"],
+                    "sortableAttributes": ["id"],
+                }))
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to configure Meilisearch source index: {e}"),
+                })?;
+            let task = parse_task_response(response, "configure Meilisearch source index").await?;
+            self.wait_for_task(task.task_uid).await
+        }
+    }
+
+    fn wait_for_task(
+        &self,
+        task_uid: usize,
+    ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
+        async move {
+            let url = format!("{}/tasks/{task_uid}", self.container().base_url);
+            for _ in 0..POLL_ATTEMPTS {
+                let response = self.http_client().get(&url).send().await.map_err(|e| {
+                    TestBinaryError::InvalidState {
+                        message: format!("Failed to fetch Meilisearch task {task_uid}: {e}"),
+                    }
+                })?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(TestBinaryError::InvalidState {
+                        message: format!(
+                            "Failed to fetch Meilisearch task {task_uid}: status={status}, body={body}"
+                        ),
+                    });
+                }
+
+                let task = response
+                    .json::<MeilisearchTaskStatus>()
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to parse Meilisearch task response: {e}"),
+                    })?;
+                match task.status.as_str() {
+                    "succeeded" => return Ok(()),
+                    "failed" | "canceled" => {
+                        return Err(TestBinaryError::InvalidState {
+                            message: format!(
+                                "Meilisearch task {task_uid} ended with status '{}': {:?}",
+                                task.status, task.error
+                            ),
+                        });
+                    }
+                    _ => sleep(Duration::from_millis(POLL_INTERVAL_MS)).await,
+                }
+            }
+
+            Err(TestBinaryError::InvalidState {
+                message: format!(
+                    "Meilisearch task {task_uid} did not complete after {POLL_ATTEMPTS} attempts"
+                ),
+            })
+        }
+    }
+
+    fn list_documents(
+        &self,
+        index_name: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<serde_json::Value>, TestBinaryError>> + Send
+    {
+        async move {
+            let url = format!(
+                "{}/indexes/{}/documents",
+                self.container().base_url,
+                index_name
+            );
+            let response = self
+                .http_client()
+                .get(&url)
+                .query(&[("limit", DOCUMENT_LIST_LIMIT)])
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to list Meilisearch documents: {e}"),
+                })?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(TestBinaryError::InvalidState {
+                    message: format!(
+                        "Failed to list Meilisearch documents: status={status}, body={body}"
+                    ),
+                });
+            }
+
+            response
+                .json::<MeilisearchDocumentsResponse>()
+                .await
+                .map(|documents| documents.results)
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to parse Meilisearch documents response: {e}"),
+                })
+        }
+    }
+
+    fn wait_for_documents(
+        &self,
+        expected_count: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<serde_json::Value>, TestBinaryError>> + Send
+    {
+        async move {
+            let mut last_count = 0usize;
+            for _ in 0..POLL_ATTEMPTS {
+                if let Ok(documents) = self.list_documents(TEST_INDEX).await {
+                    last_count = documents.len();
+                    if documents.len() >= expected_count {
+                        return Ok(documents);
+                    }
+                }
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+
+            Err(TestBinaryError::InvalidState {
+                message: format!(
+                    "Expected {expected_count} Meilisearch documents, found {last_count} after {POLL_ATTEMPTS} attempts"
+                ),
+            })
+        }
+    }
+
+    fn index_documents(
+        &self,
+        index_name: &str,
+        documents: Vec<serde_json::Value>,
+    ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
+        async move {
+            let url = format!(
+                "{}/indexes/{}/documents",
+                self.container().base_url,
+                index_name
+            );
+            let response = self
+                .http_client()
+                .post(&url)
+                .query(&[("primaryKey", "id")])
+                .json(&documents)
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to index Meilisearch documents: {e}"),
+                })?;
+
+            let task = parse_task_response(response, "index Meilisearch documents").await?;
+            self.wait_for_task(task.task_uid).await
+        }
+    }
+}
+
+async fn parse_task_response(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<MeilisearchTaskResponse, TestBinaryError> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(TestBinaryError::InvalidState {
+            message: format!("Failed to {operation}: status={status}, body={body}"),
+        });
+    }
+
+    response
+        .json::<MeilisearchTaskResponse>()
+        .await
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to parse Meilisearch task response: {e}"),
+        })
+}

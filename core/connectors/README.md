@@ -98,6 +98,7 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 ### Available Sources
 
 - **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **Meilisearch Source** - polls documents from Meilisearch indices
 - **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
 - **Random Source** - generates random test messages (useful for testing/development)
 
