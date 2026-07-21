@@ -26,6 +26,12 @@ import time
 
 from apache_iggy import IggyClient
 
+# Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
+MIN_USERNAME_BYTES = 3
+MAX_USERNAME_BYTES = 50
+MIN_PASSWORD_BYTES = 3
+MAX_PASSWORD_BYTES = 100
+
 
 def get_server_config() -> tuple[str, int]:
     """
@@ -107,3 +113,20 @@ async def wait_for_ping(
                     f"Server not responding to ping after {timeout}s"
                 ) from err
             await asyncio.sleep(interval)
+
+
+def unique_credentials(unique_name) -> tuple[str, str]:
+    """Return a unique (username, password) pair within the server limits."""
+    username = unique_name(max_bytes=MAX_USERNAME_BYTES)
+    password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
+    return username, password
+
+
+async def login_fresh_client(username: str, password: str) -> IggyClient:
+    """Connect a new client to the configured server and log in."""
+    host, port = get_server_config()
+    client = IggyClient(f"{host}:{port}")
+    await client.connect()
+    await wait_for_ping(client)
+    await client.login_user(username, password)
+    return client

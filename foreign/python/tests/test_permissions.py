@@ -21,9 +21,15 @@ import pytest
 
 from apache_iggy import (
     GlobalPermissions,
+    IggyClient,
     Permissions,
     StreamPermissions,
     TopicPermissions,
+)
+
+from .utils import (
+    login_fresh_client,
+    unique_credentials,
 )
 
 GLOBAL_PERMISSION_FLAGS = [
@@ -174,3 +180,150 @@ class TestPermissionsModel:
 
         assert first == second
         assert first != different
+
+
+class TestCreateUserWithPermissions:
+    """Test create_user with the permissions argument."""
+
+    @pytest.mark.asyncio
+    async def test_create_user_without_permissions_has_none(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user created without permissions reports None."""
+        username, password = unique_credentials(unique_name)
+
+        created = await iggy_client.create_user(username, password)
+        assert created.permissions is None
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        assert fetched.permissions is None
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_create_user_with_global_permissions_round_trips(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test global permissions set at creation come back from get_user."""
+        username, password = unique_credentials(unique_name)
+        permissions = Permissions(
+            global_=GlobalPermissions(read_users=True, read_streams=True)
+        )
+
+        created = await iggy_client.create_user(
+            username, password, permissions=permissions
+        )
+        assert created.permissions == permissions
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        assert fetched.permissions == permissions
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_create_user_with_nested_permissions_round_trips(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test per-stream and per-topic permissions survive the round trip."""
+        username, password = unique_credentials(unique_name)
+        stream_name = unique_name(prefix="perm-stream-")
+        await iggy_client.create_stream(stream_name)
+        stream = await iggy_client.get_stream(stream_name)
+        assert stream is not None
+        topic_name = unique_name(prefix="perm-topic-")
+        await iggy_client.create_topic(stream_name, topic_name, partitions_count=1)
+        topic = await iggy_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+
+        permissions = Permissions(
+            streams={
+                stream.id: StreamPermissions(
+                    read_stream=True,
+                    poll_messages=True,
+                    topics={topic.id: TopicPermissions(send_messages=True)},
+                )
+            }
+        )
+        created = await iggy_client.create_user(
+            username, password, permissions=permissions
+        )
+        assert created.permissions == permissions
+
+        fetched = await iggy_client.get_user(created.id)
+        assert fetched is not None
+        fetched_permissions = fetched.permissions
+        assert fetched_permissions is not None
+        assert fetched_permissions == permissions
+        streams = fetched_permissions.streams
+        assert streams is not None
+        assert streams[stream.id].read_stream is True
+        topics = streams[stream.id].topics
+        assert topics is not None
+        assert topics[topic.id].send_messages is True
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_user_with_manage_streams_can_create_stream(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a granted global permission is enforced for the new user."""
+        username, password = unique_credentials(unique_name)
+        permissions = Permissions(global_=GlobalPermissions(manage_streams=True))
+        created = await iggy_client.create_user(
+            username, password, permissions=permissions
+        )
+
+        client = await login_fresh_client(username, password)
+        stream_name = unique_name(prefix="granted-")
+        await client.create_stream(stream_name)
+
+        stream = await iggy_client.get_stream(stream_name)
+        assert stream is not None
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_user_without_permissions_cannot_create_stream(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user created without permissions is denied stream creation."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        client = await login_fresh_client(username, password)
+        with pytest.raises(RuntimeError):
+            await client.create_stream(unique_name(prefix="denied-"))
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_per_stream_permission_is_scoped_to_that_stream(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test read access to one stream does not leak to another stream."""
+        readable_name = unique_name(prefix="readable-")
+        hidden_name = unique_name(prefix="hidden-")
+        await iggy_client.create_stream(readable_name)
+        await iggy_client.create_stream(hidden_name)
+        readable = await iggy_client.get_stream(readable_name)
+        assert readable is not None
+
+        username, password = unique_credentials(unique_name)
+        permissions = Permissions(
+            streams={readable.id: StreamPermissions(read_stream=True)}
+        )
+        created = await iggy_client.create_user(
+            username, password, permissions=permissions
+        )
+
+        client = await login_fresh_client(username, password)
+        visible = await client.get_stream(readable_name)
+        assert visible is not None
+        assert visible.id == readable.id
+        with pytest.raises(RuntimeError):
+            await client.get_stream(hidden_name)
+
+        await iggy_client.delete_user(created.id)

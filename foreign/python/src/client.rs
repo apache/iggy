@@ -34,6 +34,7 @@ use crate::consumer::{
     IggyConsumer, py_delta_to_iggy_duration,
 };
 use crate::identifier::PyIdentifier;
+use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
@@ -171,19 +172,18 @@ impl IggyClient {
 
     /// Create a new user.
     ///
-    /// The user is created without permissions.
-    ///
     /// Args:
     ///     username: Username as `str`.
     ///     password: Password as `str`.
     ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///     permissions: Permissions as `Permissions | None`; the user has none when `None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to the created `UserInfoDetails`.
     ///
     /// Raises:
     ///     PyRuntimeError: If an argument is invalid or the request fails.
-    #[pyo3(signature = (username, password, status=None))]
+    #[pyo3(signature = (username, password, status=None, permissions=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
     fn create_user<'a>(
         &self,
@@ -191,13 +191,17 @@ impl IggyClient {
         username: String,
         password: String,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let permissions = permissions.map(|permissions| permissions.inner);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let user = inner
-                .create_user(&username, &password, status, None)
+                .create_user(&username, &password, status, permissions)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(PyUserInfoDetails::from(user))

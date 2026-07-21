@@ -17,21 +17,24 @@
 
 import pytest
 
-from apache_iggy import IggyClient, UserInfoDetails, UserStatus
+from apache_iggy import (
+    GlobalPermissions,
+    IggyClient,
+    Permissions,
+    UserInfoDetails,
+    UserStatus,
+)
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
-
-# Server-side limits: usernames are 3-50 bytes, passwords 3-100 bytes.
-MIN_USERNAME_BYTES = 3
-MAX_USERNAME_BYTES = 50
-MIN_PASSWORD_BYTES = 3
-MAX_PASSWORD_BYTES = 100
-
-
-def _unique_credentials(unique_name) -> tuple[str, str]:
-    username = unique_name(max_bytes=MAX_USERNAME_BYTES)
-    password = unique_name(max_bytes=MAX_PASSWORD_BYTES)
-    return username, password
+from .utils import (
+    MAX_PASSWORD_BYTES,
+    MAX_USERNAME_BYTES,
+    MIN_PASSWORD_BYTES,
+    MIN_USERNAME_BYTES,
+    get_server_config,
+    unique_credentials,
+    wait_for_ping,
+    wait_for_server,
+)
 
 
 class TestCreateUser:
@@ -40,7 +43,7 @@ class TestCreateUser:
     @pytest.mark.asyncio
     async def test_create_and_get_user(self, iggy_client: IggyClient, unique_name):
         """Test user creation returns details and the user is retrievable."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
 
         created = await iggy_client.create_user(username, password, UserStatus.Active)
         assert isinstance(created, UserInfoDetails)
@@ -66,7 +69,7 @@ class TestCreateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test create_user without an explicit status creates an active user."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
 
         created = await iggy_client.create_user(username, password)
         assert created.status == UserStatus.Active
@@ -76,7 +79,7 @@ class TestCreateUser:
     @pytest.mark.asyncio
     async def test_create_inactive_user(self, iggy_client: IggyClient, unique_name):
         """Test create_user with UserStatus.Inactive creates an inactive user."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
 
         created = await iggy_client.create_user(username, password, UserStatus.Inactive)
         assert created.status == UserStatus.Inactive
@@ -90,7 +93,7 @@ class TestCreateUser:
     @pytest.mark.asyncio
     async def test_duplicate_username_fails(self, iggy_client: IggyClient, unique_name):
         """Test create_user rejects an already taken username."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
 
         created = await iggy_client.create_user(username, password)
 
@@ -102,7 +105,7 @@ class TestCreateUser:
     @pytest.mark.asyncio
     async def test_created_user_can_login(self, iggy_client: IggyClient, unique_name):
         """Test a freshly created user can authenticate with its credentials."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         host, port = get_server_config()
@@ -118,7 +121,7 @@ class TestCreateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test an inactive user is denied login even with correct credentials."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password, UserStatus.Inactive)
 
         host, port = get_server_config()
@@ -134,7 +137,7 @@ class TestCreateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test a deleted user cannot start a fresh authenticated session."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
         await iggy_client.delete_user(created.id)
 
@@ -225,7 +228,7 @@ class TestGetUser:
         assert user_by_name is None
 
         # Deleting a freshly created user guarantees its id is vacant.
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
         await iggy_client.delete_user(created.id)
 
@@ -254,7 +257,7 @@ class TestGetUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test repeated get_user calls return the same user view."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         first = await iggy_client.get_user(username)
@@ -276,8 +279,8 @@ class TestGetUsers:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test get_users returns the root user and newly created users."""
-        first_username, first_password = _unique_credentials(unique_name)
-        second_username, second_password = _unique_credentials(unique_name)
+        first_username, first_password = unique_credentials(unique_name)
+        second_username, second_password = unique_credentials(unique_name)
 
         first = await iggy_client.create_user(first_username, first_password)
         second = await iggy_client.create_user(second_username, second_password)
@@ -305,7 +308,7 @@ class TestUpdateUser:
     @pytest.mark.asyncio
     async def test_update_username(self, iggy_client: IggyClient, unique_name):
         """Test update_user renames a user."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         new_username = unique_name(max_bytes=MAX_USERNAME_BYTES)
 
         created = await iggy_client.create_user(username, password)
@@ -323,7 +326,7 @@ class TestUpdateUser:
     @pytest.mark.asyncio
     async def test_update_status(self, iggy_client: IggyClient, unique_name):
         """Test update_user changes the user status."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
         assert created.status == UserStatus.Active
 
@@ -341,7 +344,7 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test update_user applies a new username and status in one call."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         new_username = unique_name(max_bytes=MAX_USERNAME_BYTES)
         created = await iggy_client.create_user(username, password)
 
@@ -361,7 +364,7 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test the server permits an update with neither username nor status."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         await iggy_client.update_user(created.id)
@@ -378,7 +381,7 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test applying the same update twice succeeds and keeps the state."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         await iggy_client.update_user(created.id, status=UserStatus.Inactive)
@@ -396,8 +399,8 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test update_user rejects renaming to a username another user holds."""
-        first_username, first_password = _unique_credentials(unique_name)
-        second_username, second_password = _unique_credentials(unique_name)
+        first_username, first_password = unique_credentials(unique_name)
+        second_username, second_password = unique_credentials(unique_name)
         first = await iggy_client.create_user(first_username, first_password)
         second = await iggy_client.create_user(second_username, second_password)
 
@@ -433,7 +436,7 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name, new_username
     ):
         """Test update_user rejects usernames outside the 3-50 byte range."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         with pytest.raises(RuntimeError):
@@ -451,7 +454,7 @@ class TestUpdateUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test update_user accepts a non-ascii username within the byte limit."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         new_username = f"사용자{unique_name(min_bytes=4, max_bytes=8)}"
@@ -470,7 +473,7 @@ class TestDeleteUser:
     @pytest.mark.asyncio
     async def test_delete_user_by_name(self, iggy_client: IggyClient, unique_name):
         """Test delete_user removes a user addressed by username."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         await iggy_client.create_user(username, password)
 
         await iggy_client.delete_user(username)
@@ -482,7 +485,7 @@ class TestDeleteUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test delete_user removes a user addressed by numeric id."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         await iggy_client.delete_user(created.id)
@@ -513,7 +516,7 @@ class TestDeleteUser:
     @pytest.mark.asyncio
     async def test_delete_user_twice_fails(self, iggy_client: IggyClient, unique_name):
         """Test deleting the same user twice fails on the second call."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         await iggy_client.delete_user(created.id)
@@ -524,7 +527,7 @@ class TestDeleteUser:
     @pytest.mark.asyncio
     async def test_delete_inactive_user(self, iggy_client: IggyClient, unique_name):
         """Test an inactive user can be deleted."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password, UserStatus.Inactive)
 
         await iggy_client.delete_user(created.id)
@@ -536,7 +539,7 @@ class TestDeleteUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test a deleted user is absent from both get_user and get_users."""
-        username, password = _unique_credentials(unique_name)
+        username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
 
         await iggy_client.delete_user(created.id)
@@ -552,9 +555,25 @@ class TestDeleteUser:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test a session owned by a deleted user can no longer act as that user."""
-        # TODO: Re-enable once permission management lands in the Python SDK.
-        # With only unprivileged users available, this test cannot prove its claim.
-        pass
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(
+            username,
+            password,
+            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+        )
+
+        host, port = get_server_config()
+        client = IggyClient(f"{host}:{port}")
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user(username, password)
+        users_before = await client.get_users()
+        assert any(user.id == created.id for user in users_before)
+
+        await iggy_client.delete_user(created.id)
+
+        with pytest.raises(RuntimeError):
+            await client.get_users()
 
     @pytest.mark.asyncio
     async def test_deleted_username_is_reusable_with_fresh_credentials(

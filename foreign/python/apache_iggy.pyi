@@ -460,16 +460,16 @@ class IggyClient:
         username: builtins.str,
         password: builtins.str,
         status: UserStatus | None = None,
+        permissions: Permissions | None = None,
     ) -> collections.abc.Awaitable[UserInfoDetails]:
         r"""
         Create a new user.
-
-        The user is created without permissions.
 
         Args:
             username: Username as `str`.
             password: Password as `str`.
             status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+            permissions: Permissions as `Permissions | None`; the user has none when `None`.
 
         Returns:
             An awaitable that resolves to the created `UserInfoDetails`.
@@ -1245,6 +1245,11 @@ class UserInfoDetails:
     def username(self) -> builtins.str:
         r"""
         The username of the user.
+        """
+    @property
+    def permissions(self) -> Permissions | None:
+        r"""
+        The permissions of the user, or `None` when the user has none assigned.
         """
 
 @typing.final
