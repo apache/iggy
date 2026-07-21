@@ -196,10 +196,10 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.10.3-edge.1" }
+iggy = { path = "core/sdk", version = "0.10.3-edge.2" }
 iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.3-edge.1" }
-iggy_common = { path = "core/common", version = "0.10.3-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.3-edge.2" }
+iggy_common = { path = "core/common", version = "0.10.3-edge.2" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }

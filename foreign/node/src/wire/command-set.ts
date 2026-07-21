@@ -18,6 +18,9 @@
 
 import type { ClientProvider } from '../client/client.type.js';
 
+import { COMMAND_CODE } from './command.code.js';
+import { responseError } from './error.utils.js';
+
 import { login } from './session/login.command.js';
 import { logout } from './session/logout.command.js';
 import { loginWithToken } from './session/login-with-token.command.js';
@@ -198,6 +201,15 @@ const clusterAPI = (c: ClientProvider) => ({
 
 type ClusterAPI = ReturnType<typeof clusterAPI>;
 
+const SESSION_CONTROL_CODES = new Set([
+  COMMAND_CODE.LoginUser,
+  COMMAND_CODE.LogoutUser,
+  COMMAND_CODE.LoginRegister,
+  COMMAND_CODE.LoginWithAccessToken,
+  COMMAND_CODE.LoginRegisterWithAccessToken,
+]);
+
+const INVALID_COMMAND_ERROR_CODE = 3;
 
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
@@ -225,4 +237,21 @@ export abstract class CommandAPI extends AbstractAPI {
   constructor(c: ClientProvider) {
     super(c);
   }
-};
+
+  /**
+   * Sends a command code with a payload and returns the raw response payload.
+   * Session-control codes are rejected with an invalid-command error.
+   *
+   * @param code - Command code to send
+   * @param payload - Raw command payload
+   * @returns Raw response payload
+   */
+  async sendBinaryRequest(code: number, payload: Buffer): Promise<Buffer> {
+    if (SESSION_CONTROL_CODES.has(code))
+      throw responseError(code, INVALID_COMMAND_ERROR_CODE);
+
+    const requestPayload = Buffer.from(payload);
+    const response = await (await this.clientProvider()).sendCommand(code, requestPayload);
+    return response.length <= 1 ? Buffer.alloc(0) : response.data;
+  }
+}
