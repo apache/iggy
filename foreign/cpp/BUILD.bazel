@@ -148,6 +148,7 @@ cc_binary(
     srcs = [
         "tests/bdd/background_steps.cpp",
         "tests/bdd/messaging_steps.cpp",
+        "tests/bdd/raw_command_steps.cpp",
         "tests/bdd/world.hpp",
     ],
     copts = [
