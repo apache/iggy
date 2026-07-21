@@ -49,4 +49,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bson = { workspace = true }
 simd-json = { workspace = true }

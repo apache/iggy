@@ -50,4 +50,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bson = { workspace = true }
 toml = { workspace = true }

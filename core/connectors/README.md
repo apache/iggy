@@ -17,6 +17,7 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 - **Flexible configuration providers**: Support for local file-based and HTTP-based configuration providers for centralized configuration management.
 - **Observability**: Prometheus metrics with per-stage latency histograms, plus an opt-in per-batch tracing benchmark target.
 - **Structured logging**: Selectable text or JSON log format via `[logging]` configuration.
+- **Payload schemas**: JSON, raw bytes, text, Protocol Buffers, FlatBuffers, Avro, and BSON.
 
 ## Quick Start
 

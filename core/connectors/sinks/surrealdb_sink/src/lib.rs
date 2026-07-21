@@ -899,7 +899,7 @@ fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Erro
             value: Value::String(text),
             encoding: ENCODING_TEXT,
         }),
-        Payload::Raw(_) | Payload::FlatBuffer(_) | Payload::Avro(_) => {
+        Payload::Raw(_) | Payload::FlatBuffer(_) | Payload::Avro(_) | Payload::Bson(_) => {
             build_base64_payload_document(payload)
         }
     }
@@ -1624,6 +1624,27 @@ mod tests {
 
         assert_eq!(document.encoding, ENCODING_BASE64);
         assert_eq!(document.value, Value::String("AAEC/w==".to_string()));
+    }
+
+    #[test]
+    fn given_auto_payload_bson_should_store_document_bytes_as_base64() {
+        let bson_document = bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "active": true
+        };
+        let expected_bytes = bson_document
+            .to_vec()
+            .expect("BSON document should serialize");
+
+        let document = build_auto_payload_document(Payload::Bson(bson_document))
+            .expect("BSON payload should build");
+
+        assert_eq!(document.encoding, ENCODING_BASE64);
+        assert_eq!(
+            document.value,
+            Value::String(general_purpose::STANDARD.encode(expected_bytes))
+        );
     }
 
     #[test]

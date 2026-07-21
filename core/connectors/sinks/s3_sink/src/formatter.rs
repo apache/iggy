@@ -99,7 +99,7 @@ fn format_json_message(
         } else {
             None
         },
-        payload: payload_to_json_value(&message.payload),
+        payload: payload_to_json_value(&message.payload)?,
     };
 
     serde_json::to_vec(&msg).map_err(|e| {
@@ -164,8 +164,8 @@ fn serialize_headers(
     Value::Object(obj)
 }
 
-fn payload_to_json_value(payload: &Payload) -> Value {
-    match payload {
+fn payload_to_json_value(payload: &Payload) -> Result<Value, Error> {
+    let value = match payload {
         Payload::Json(value) => owned_value_to_serde_json(value),
         Payload::Text(text) => Value::String(text.clone()),
         Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
@@ -175,7 +175,11 @@ fn payload_to_json_value(payload: &Payload) -> Value {
         Payload::Proto(text) => Value::String(text.clone()),
         Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
         Payload::Avro(bytes) => Value::String(base64_encode(bytes)),
-    }
+        Payload::Bson(value) => serde_json::to_value(value).map_err(|error| {
+            Error::CannotStoreData(format!("Failed to serialize BSON payload: {error}"))
+        })?,
+    };
+    Ok(value)
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -301,6 +305,29 @@ mod tests {
         assert!(value.get("offset").is_none());
         assert!(value.get("stream").is_none());
         assert_eq!(value["payload"]["key"], "value");
+    }
+
+    #[test]
+    fn json_lines_with_bson_payload_preserves_document() {
+        let payload = Payload::Bson(bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "nested": {
+                "active": true
+            }
+        });
+        let msg = make_message(10, payload);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let bytes = format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines)
+            .expect("BSON payload should format as JSON Lines");
+        let value: Value =
+            serde_json::from_slice(&bytes).expect("formatted message should be valid JSON");
+
+        assert_eq!(value["payload"]["name"], "iggy");
+        assert_eq!(value["payload"]["count"], 42);
+        assert_eq!(value["payload"]["nested"]["active"], true);
     }
 
     #[test]

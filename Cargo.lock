@@ -2375,6 +2375,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bson"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3f109694c4f45353972af96bf97d8a057f82e2d6e496457f4d135b9867a518c"
+dependencies = [
+ "ahash 0.8.12",
+ "base64",
+ "bitvec",
+ "getrandom 0.3.4",
+ "hex",
+ "indexmap 2.14.0",
+ "js-sys",
+ "rand 0.9.4",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "simdutf8",
+ "thiserror 2.0.18",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6942,6 +6965,7 @@ version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "bytes",
  "humantime",
  "iggy_connector_sdk",
@@ -7118,6 +7142,7 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "byte-unit",
  "chrono",
  "dashmap",
@@ -7141,6 +7166,7 @@ dependencies = [
  "apache-avro",
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "dashmap",
  "flatbuffers",
  "http 1.4.2",
@@ -7149,6 +7175,7 @@ dependencies = [
  "iggy_common",
  "postcard",
  "prost",
+ "prost-reflect",
  "prost-types",
  "protox",
  "protox-parse",
@@ -7187,6 +7214,7 @@ version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "base64",
+ "bson 3.1.0",
  "bytes",
  "iggy_common",
  "iggy_connector_sdk",
@@ -8525,7 +8553,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8da0cd419a51a5fb44819e290fbdb0665a54f21dead8923446a799c7f4d26ad9"
 dependencies = [
- "bson",
+ "bson 2.15.0",
  "mongocrypt-sys",
  "once_cell",
  "serde",
@@ -8545,7 +8573,7 @@ checksum = "276ba0cd571553d1f6936c6f180964776ece6ab7507dc8765f8a9c9c49d8cd00"
 dependencies = [
  "base64",
  "bitflags 2.13.0",
- "bson",
+ "bson 2.15.0",
  "derive-where",
  "derive_more",
  "futures-core",

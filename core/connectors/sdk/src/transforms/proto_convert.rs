@@ -479,6 +479,7 @@ impl ProtoConvert {
                     Err(Error::InvalidPayloadType)
                 }
             }
+            Schema::Bson => Err(Error::InvalidPayloadType),
         }
     }
 
@@ -504,6 +505,7 @@ impl ProtoConvert {
                     Err(Error::InvalidPayloadType)
                 }
             }
+            Schema::Bson => Err(Error::InvalidPayloadType),
         }
     }
 
