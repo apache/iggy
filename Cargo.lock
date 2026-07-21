@@ -7424,7 +7424,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "server",
- "socket2 0.6.4",
  "sqlx",
  "sysinfo 0.39.5",
  "tempfile",
@@ -7658,6 +7657,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "compio",
+ "futures",
  "iggy_binary_protocol",
  "server_common",
  "tempfile",
@@ -8368,6 +8368,7 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "futures",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",

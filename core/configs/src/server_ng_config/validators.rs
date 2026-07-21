@@ -80,6 +80,9 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate cluster config")
         })?;
+        self.metadata.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate metadata config")
+        })?;
         self.system
             .logging
             .validate()
