@@ -31,7 +31,7 @@
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
-#include "tests/common/test_helpers.hpp"
+#include "tests/e2e/test_helpers.hpp"
 
 class LowLevelE2E_Client : public E2ETestFixture {};
 
