@@ -6,7 +6,7 @@ stable REST API (`POST /api/v1/dags/{dag_id}/dagRuns`).
 ## Overview
 
 | | |
-|---|---|
+| --- | --- |
 | **Type** | Sink (trigger) |
 | **Direction** | Iggy → Airflow |
 | **API** | Airflow REST (`api_prefix` default `/api/v1`) |
@@ -57,7 +57,7 @@ max_retry_delay = "30s"
 ### Plugin fields
 
 | Field | Required | Default | Description |
-|-------|:--------:|---------|-------------|
+| --- | :---: | --- | --- |
 | `base_url` | yes | — | Airflow webserver base URL |
 | `dag_id` | yes* | — | Default DAG id (*optional if every message sets `dag_id_header`) |
 | `api_prefix` | no | `/api/v1` | REST prefix for version differences |
@@ -92,7 +92,7 @@ Content-Type: application/json
 ### Status handling
 
 | Status | Behavior |
-|--------|----------|
+| --- | --- |
 | 2xx | Success |
 | 409 | Success (run already exists — idempotent replay) |
 | 400 / 401 / 403 / 404 / 422 | Permanent — drop message, do not retry |
@@ -123,5 +123,5 @@ cargo test -p integration -- connectors::airflow
 
 ## Related
 
-- Issue: https://github.com/apache/iggy/issues/3715
-- Roadmap: https://github.com/apache/iggy/issues/2753
+- Issue: [#3715](https://github.com/apache/iggy/issues/3715)
+- Roadmap: [#2753](https://github.com/apache/iggy/issues/2753)
