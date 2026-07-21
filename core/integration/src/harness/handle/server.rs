@@ -901,18 +901,6 @@ impl TestBinary for ServerHandle {
             self.stderr_path = Some(fs::canonicalize(&stderr_path)?);
         }
 
-        // Release the reservation BEFORE spawning. Production listeners
-        // set `SO_REUSEPORT` in theory, but holding the reservation across
-        // child startup races with `bind()` on the child side and
-        // sporadically returns `CannotBindToSocket`. Dropping the socket lets
-        // the child bind; the per-port advisory lock the reserver keeps past
-        // this release (see `port_reserver`) still fends off any concurrent
-        // test process until the child has bound. hubcio's TODO in
-        // `socket_opts.rs` retires the whole reservation-socket dance.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         let child = command.spawn().map_err(|e| TestBinaryError::ProcessSpawn {
             binary: launched_binary,
             source: e,
@@ -992,6 +980,9 @@ impl Restartable for ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
+        // Reap the child before `port_reserver` drops: `Child::drop` detaches
+        // without waiting, so the freed slot could be reused while this server
+        // still holds its ports.
         let _ = self.stop();
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
