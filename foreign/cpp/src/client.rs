@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::{RUNTIME, ffi};
+use bytes::Bytes;
 use iggy::prelude::{
     Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
@@ -1127,6 +1128,19 @@ impl Client {
                     format!("Could not change password for user '{rust_user_id}': {error}")
                 })?;
             Ok(())
+        })
+    }
+
+    /// Sends a command code and payload and returns the raw response bytes.
+    /// Session-control codes return an invalid-command error.
+    pub fn send_binary_request(&self, code: u32, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        RUNTIME.block_on(async {
+            let response = self
+                .inner
+                .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
+            Ok(Vec::from(response))
         })
     }
 }
