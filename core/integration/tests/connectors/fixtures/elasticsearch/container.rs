@@ -20,6 +20,9 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -37,8 +40,12 @@ const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 // name. Per-test isolation comes from a unique index per fixture, not a fresh
 // container.
 const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
-const CLUSTER_READY_ATTEMPTS: usize = 60;
-const CLUSTER_READY_INTERVAL_MS: u64 = 500;
+// Short probe timeouts: create_http_client() uses 30s + retries and must not
+// be used for readiness. One hung attempt there looks like a 60s+ test hang.
+const CLUSTER_READY_ATTEMPTS: usize = 40;
+const CLUSTER_READY_INTERVAL_MS: u64 = 250;
+const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
+const DOCKER_RM_TIMEOUT_SECS: u64 = 15;
 // Indices from prior runs older than this are leftovers: a live concurrent
 // test's index is seconds old, so age-based sweeping never races other tests
 // sharing the reused container.
@@ -179,8 +186,23 @@ impl ElasticsearchContainer {
     }
 
     async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
-        let client = create_http_client();
-        let health_url = format!("{}{ELASTICSEARCH_HEALTH_ENDPOINT}", self.base_url);
+        // Dedicated probe client: short timeout, no retry middleware. The shared
+        // create_http_client() (30s + 3 retries) turns one black-holed request
+        // into a multi-minute hang that looks like the test is stuck.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(
+                CLUSTER_READY_REQUEST_TIMEOUT_MS,
+            ))
+            .build()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "ElasticsearchContainer".to_string(),
+                message: format!("Failed to build readiness HTTP client: {error}"),
+            })?;
+        // timeout=1s keeps ES from holding the request when the cluster is slow.
+        let health_url = format!(
+            "{}{ELASTICSEARCH_HEALTH_ENDPOINT}?timeout=1s",
+            self.base_url
+        );
         let mut last_error = String::from("no attempts made");
 
         for attempt in 1..=CLUSTER_READY_ATTEMPTS {
@@ -233,7 +255,14 @@ impl ElasticsearchContainer {
             creation_date: Option<String>,
         }
 
-        let client = create_http_client();
+        // Short timeout, no retries: sweep is best-effort and must not stall setup.
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        else {
+            warn!("Skipping stale index sweep, failed to build HTTP client");
+            return;
+        };
         let cat_url = format!(
             "{}/_cat/indices/{STALE_INDEX_PATTERNS}?format=json&h=index,creation.date",
             self.base_url
@@ -304,21 +333,49 @@ impl ElasticsearchContainer {
 /// Uses the Docker CLI directly: testcontainers offers no "remove by name" API
 /// and the wedged container was created by an earlier process anyway.
 fn force_remove_container() {
-    match std::process::Command::new("docker")
+    let mut child = match Command::new("docker")
         .args(["rm", "-f", ELASTICSEARCH_CONTAINER_NAME])
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
     {
-        Ok(output) if output.status.success() => {
-            info!("Removed wedged Elasticsearch container '{ELASTICSEARCH_CONTAINER_NAME}'");
-        }
-        Ok(output) => {
-            warn!(
-                "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        Ok(child) => child,
         Err(error) => {
             warn!("Failed to invoke docker rm for '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
+            return;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(DOCKER_RM_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                info!("Removed wedged Elasticsearch container '{ELASTICSEARCH_CONTAINER_NAME}'");
+                return;
+            }
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                warn!(
+                    "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} failed (exit {status}): {stderr}"
+                );
+                return;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!(
+                    "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} timed out after {DOCKER_RM_TIMEOUT_SECS}s"
+                );
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                warn!("Failed waiting for docker rm '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
+                return;
+            }
         }
     }
 }
