@@ -557,6 +557,16 @@ class IggyClient:
             PyValueError: If a string identifier is invalid.
             PyRuntimeError: If the current password is wrong or the request fails.
         """
+    def logout_user(self) -> collections.abc.Awaitable[None]:
+        r"""
+        Log out the currently authenticated user.
+
+        Returns:
+            An awaitable that resolves to `None` when the user is logged out.
+
+        Raises:
+            PyRuntimeError: If the request fails.
+        """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.

@@ -339,6 +339,26 @@ impl IggyClient {
         })
     }
 
+    /// Log out the currently authenticated user.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is logged out.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn logout_user<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .logout_user()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Connects the IggyClient to its service.
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]

@@ -609,6 +609,7 @@ class TestDeleteUser:
         "delete_user",
         "update_permissions",
         "change_password",
+        "logout_user",
     ],
 )
 @pytest.mark.asyncio
@@ -627,6 +628,7 @@ async def test_user_management_requires_connection_and_auth(method_name, unique_
         "delete_user": (username,),
         "update_permissions": (username,),
         "change_password": (username, "secret", "secret2"),
+        "logout_user": (),
     }
     method = getattr(client, method_name)
     args = args_by_method[method_name]

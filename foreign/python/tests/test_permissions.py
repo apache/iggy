@@ -527,3 +527,49 @@ class TestChangePassword:
                 unique_name(max_bytes=MAX_PASSWORD_BYTES),
                 unique_name(max_bytes=MAX_PASSWORD_BYTES),
             )
+
+
+class TestLogoutUser:
+    """Test session termination via logout_user."""
+
+    @pytest.mark.asyncio
+    async def test_logout_user_ends_the_session(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test authenticated calls fail after logout."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(
+            username,
+            password,
+            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+        )
+
+        client = await login_fresh_client(username, password)
+        assert await client.get_user(username) is not None
+
+        await client.logout_user()
+
+        with pytest.raises(RuntimeError):
+            await client.get_user(username)
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_login_after_logout_restores_the_session(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the same client can log in again after logging out."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(
+            username,
+            password,
+            permissions=Permissions(global_=GlobalPermissions(read_users=True)),
+        )
+
+        client = await login_fresh_client(username, password)
+        await client.logout_user()
+
+        await client.login_user(username, password)
+        assert await client.get_user(username) is not None
+
+        await iggy_client.delete_user(created.id)
