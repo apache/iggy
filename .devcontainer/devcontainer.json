@@ -42,7 +42,7 @@
     "8090": { "label": "TCP (binary)" },
     "8092": { "label": "WebSocket" }
   },
-  "postCreateCommand": "sudo chown vscode:vscode target /usr/local/cargo/registry; rustup show && npm --prefix web ci",
+  "postCreateCommand": "sudo chown vscode:vscode target /usr/local/cargo/registry; rustup show && npm --prefix web ci && bash /workspaces/iggy/.devcontainer/notice.sh",
   "customizations": {
     "vscode": {
       "extensions": [
