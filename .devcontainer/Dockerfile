@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Toolchain is pinned by rust-toolchain.toml (channel 1.96.0). The base
+# Toolchain is pinned by rust-toolchain.toml (channel 1.97.1). The base
 # image ships rustup, so the pin auto-resolves on first cargo invocation.
-ARG RUST_VERSION=1.96
+ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-slim-trixie
 
 # Build + runtime dependencies mirror the production Dockerfile builder
