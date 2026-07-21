@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "urlPathPattern": "/api/v1/dags/.*/dagRuns"
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "dag_run_id": "mock-run",
+      "state": "queued"
+    }
+  }
+}

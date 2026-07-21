@@ -17,6 +17,7 @@
 
 use uuid::Uuid;
 
+mod airflow;
 mod clickhouse;
 mod delta;
 mod doris;
@@ -47,6 +48,7 @@ pub(crate) fn unique_container_name(service: &str) -> String {
     )
 }
 
+pub use airflow::AirflowSinkFixture;
 pub use clickhouse::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
