@@ -95,7 +95,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
                 },
             );
         } else if self.quiet_mode {
-            println!("{}", &token.token);
+            println!("{}", token.token);
         } else {
             event!(target: PRINT_TARGET, Level::INFO,
                 "Personal access token with name: {} and {} created",

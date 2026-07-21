@@ -84,7 +84,7 @@ impl UserClient for HttpClient {
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/{}", &user_id.as_cow_str()))
+        self.delete(&format!("{PATH}/{}", user_id.as_cow_str()))
             .await?;
         Ok(())
     }
@@ -96,7 +96,7 @@ impl UserClient for HttpClient {
         status: Option<UserStatus>,
     ) -> Result<(), IggyError> {
         self.put(
-            &format!("{PATH}/{}", &user_id.as_cow_str()),
+            &format!("{PATH}/{}", user_id.as_cow_str()),
             &UpdateUser {
                 user_id: user_id.clone(),
                 username: username.map(|s| s.to_string()),
@@ -113,7 +113,7 @@ impl UserClient for HttpClient {
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
         self.put(
-            &format!("{PATH}/{}/permissions", &user_id.as_cow_str()),
+            &format!("{PATH}/{}/permissions", user_id.as_cow_str()),
             &UpdatePermissions {
                 user_id: user_id.clone(),
                 permissions,
@@ -130,7 +130,7 @@ impl UserClient for HttpClient {
         new_password: &str,
     ) -> Result<(), IggyError> {
         self.put(
-            &format!("{PATH}/{}/password", &user_id.as_cow_str()),
+            &format!("{PATH}/{}/password", user_id.as_cow_str()),
             &ChangePassword {
                 user_id: user_id.clone(),
                 current_password: SecretString::from(current_password),
