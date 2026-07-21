@@ -21,7 +21,8 @@
     "--init",
     "--security-opt", "seccomp=unconfined",
     "--ulimit", "memlock=-1:-1",
-    "--cap-add=SYS_NICE"
+    "--cap-add=SYS_NICE",
+    "--publish", "8080:8080/udp"
   ],
   "mounts": [
     "type=volume,source=iggy-cargo-registry,target=/usr/local/cargo/registry",
