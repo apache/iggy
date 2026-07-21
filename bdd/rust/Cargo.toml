@@ -44,3 +44,8 @@ required-features = ["bdd"]
 name = "leader_redirection"
 harness = false
 required-features = ["bdd"]
+
+[[test]]
+name = "raw_command"
+harness = false
+required-features = ["bdd"]
