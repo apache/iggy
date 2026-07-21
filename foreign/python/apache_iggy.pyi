@@ -32,14 +32,18 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
     "StreamDetails",
+    "StreamPermissions",
     "Topic",
     "TopicDetails",
+    "TopicPermissions",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
@@ -305,6 +309,91 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and consumer groups is allowed.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`.
+            read_topics: Allow reading all topics and consumer groups.
+            poll_messages: Allow polling messages from all streams.
+            send_messages: Allow sending messages to all streams.
         """
 
 @typing.final
@@ -818,6 +907,37 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+@typing.final
+class Permissions:
+    r"""
+    The permissions of a user: global permissions applied to all streams,
+    optionally extended by per-stream permissions.
+    """
+    @property
+    def global_(self) -> GlobalPermissions:
+        r"""
+        The global permissions, applied to all streams.
+        """
+    @property
+    def streams(self) -> dict[int, StreamPermissions] | None:
+        r"""
+        The per-stream permissions keyed by stream ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        global_: GlobalPermissions | None = None,
+        streams: dict[int, StreamPermissions] | None = None,
+    ) -> Permissions:
+        r"""
+        Create permissions from global permissions and optional per-stream permissions.
+
+        Args:
+            global_: Global permissions as `GlobalPermissions | None`; defaults to all denied.
+            streams: Per-stream permissions keyed by stream ID as
+                `dict[int, StreamPermissions] | None`.
+        """
+
 class PollingStrategy:
     @typing.final
     class Offset(PollingStrategy):
@@ -917,6 +1037,72 @@ class StreamDetails:
     def topics_count(self) -> builtins.int: ...
 
 @typing.final
+class StreamPermissions:
+    r"""
+    Permissions for a specific stream and all its topics, optionally refined per topic.
+    They extend the global permissions, they do not override them.
+    """
+    @property
+    def manage_stream(self) -> builtins.bool:
+        r"""
+        Whether managing the stream is allowed; includes `read_stream`.
+        """
+    @property
+    def read_stream(self) -> builtins.bool:
+        r"""
+        Whether reading the stream is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing the stream topics is allowed; includes `read_topics`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading the stream topics and consumer groups is allowed.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the stream is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the stream is allowed.
+        """
+    @property
+    def topics(self) -> dict[int, TopicPermissions] | None:
+        r"""
+        The per-topic permissions keyed by topic ID, or `None` when not set.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        manage_stream: builtins.bool = False,
+        read_stream: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+        topics: dict[int, TopicPermissions] | None = None,
+    ) -> StreamPermissions:
+        r"""
+        Create stream permissions. Every flag defaults to `False`.
+
+        Args:
+            manage_stream: Allow managing the stream; includes `read_stream`.
+            read_stream: Allow reading the stream; includes `read_topics`.
+            manage_topics: Allow managing the stream topics; includes `read_topics`.
+            read_topics: Allow reading the stream topics and consumer groups.
+            poll_messages: Allow polling messages from the stream.
+            send_messages: Allow sending messages to the stream.
+            topics: Per-topic permissions keyed by topic ID as
+                `dict[int, TopicPermissions] | None`.
+        """
+
+@typing.final
 class Topic:
     @property
     def id(self) -> builtins.int:
@@ -970,6 +1156,49 @@ class TopicDetails:
     def replication_factor(self) -> builtins.int:
         r"""
         Replication factor for the topic.
+        """
+
+@typing.final
+class TopicPermissions:
+    r"""
+    Permissions for a specific topic of a stream. The lowest level of permissions.
+    """
+    @property
+    def manage_topic(self) -> builtins.bool:
+        r"""
+        Whether managing the topic is allowed; includes `read_topic`.
+        """
+    @property
+    def read_topic(self) -> builtins.bool:
+        r"""
+        Whether reading the topic and its consumer groups is allowed.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from the topic is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to the topic is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        manage_topic: builtins.bool = False,
+        read_topic: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> TopicPermissions:
+        r"""
+        Create topic permissions. Every flag defaults to `False`.
+
+        Args:
+            manage_topic: Allow managing the topic; includes `read_topic`.
+            read_topic: Allow reading the topic and its consumer groups.
+            poll_messages: Allow polling messages from the topic.
+            send_messages: Allow sending messages to the topic.
         """
 
 @typing.final
