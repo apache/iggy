@@ -243,19 +243,33 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        let http_address = self.http_url();
+        // Prefer /health over `/` so readiness means the connectors API is up,
+        // not some other listener that happened to bind the reserved port.
+        let health_url = format!("{}/health", self.http_url());
         let client = reqwest::Client::new();
 
         for retry in 0..common::DEFAULT_HEALTH_CHECK_RETRIES {
-            match client.get(&http_address).send().await {
-                Ok(_) => {
+            if let Some(pid) = self.pid()
+                && !common::is_process_alive(pid)
+            {
+                let (stdout, stderr) = self.collect_logs();
+                return Err(TestBinaryError::ProcessCrashed {
+                    binary: "iggy-connectors".to_string(),
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                });
+            }
+
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
                     return Ok(());
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     if retry == common::DEFAULT_HEALTH_CHECK_RETRIES - 1 {
                         return Err(TestBinaryError::HealthCheckFailed {
                             binary: "iggy-connectors".to_string(),
-                            address: http_address,
+                            address: health_url,
                             retries: common::DEFAULT_HEALTH_CHECK_RETRIES,
                         });
                     }

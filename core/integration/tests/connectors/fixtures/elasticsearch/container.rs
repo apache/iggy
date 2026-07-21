@@ -26,7 +26,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{
     ContainerAsync, GenericImage, ImageExt, ReuseDirective,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 const ELASTICSEARCH_IMAGE: &str = "docker.io/library/elasticsearch";
 const ELASTICSEARCH_TAG: &str = "9.3.0";
@@ -37,6 +37,13 @@ const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 // name. Per-test isolation comes from a unique index per fixture, not a fresh
 // container.
 const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
+const CLUSTER_READY_ATTEMPTS: usize = 60;
+const CLUSTER_READY_INTERVAL_MS: u64 = 500;
+// Indices from prior runs older than this are leftovers: a live concurrent
+// test's index is seconds old, so age-based sweeping never races other tests
+// sharing the reused container.
+const STALE_INDEX_MAX_AGE_MS: u128 = 30 * 60 * 1000;
+const STALE_INDEX_PATTERNS: &str = "iggy_messages_*,test_documents_*";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -101,6 +108,23 @@ pub struct ElasticsearchContainer {
 
 impl ElasticsearchContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
+        match Self::try_start().await {
+            Ok(started) => Ok(started),
+            Err(first_error) => {
+                // A reused container can be wedged (running but unhealthy:
+                // OOM-killed JVM, corrupted data dir, dead port mapping).
+                // Remove it and retry once with a fresh container instead of
+                // failing every test until someone cleans up manually.
+                warn!(
+                    "Elasticsearch container unusable, removing '{ELASTICSEARCH_CONTAINER_NAME}' and retrying once: {first_error}"
+                );
+                force_remove_container();
+                Self::try_start().await
+            }
+        }
+    }
+
+    async fn try_start() -> Result<Self, TestBinaryError> {
         let container = GenericImage::new(ELASTICSEARCH_IMAGE, ELASTICSEARCH_TAG)
             .with_exposed_port(ELASTICSEARCH_PORT.tcp())
             .with_wait_for(WaitFor::http(
@@ -137,13 +161,165 @@ impl ElasticsearchContainer {
                 message: "No mapping for Elasticsearch port".to_string(),
             })?;
 
-        let base_url = format!("http://localhost:{mapped_port}");
+        // Prefer IPv4 loopback: Docker publishes 0.0.0.0:HOST→9200. `localhost`
+        // can resolve to ::1 first on macOS and black-hole the elasticsearch-rs
+        // client while the fixture's reqwest client still looks healthy.
+        let base_url = format!("http://127.0.0.1:{mapped_port}");
         info!("Elasticsearch container available at {base_url}");
 
-        Ok(Self {
+        let started = Self {
             container,
             base_url,
+        };
+        // ReuseDirective::Always can attach to a days-old container without
+        // re-running HttpWaitStrategy; verify cluster health on every setup.
+        started.wait_until_ready().await?;
+        started.sweep_stale_indices().await;
+        Ok(started)
+    }
+
+    async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
+        let client = create_http_client();
+        let health_url = format!("{}{ELASTICSEARCH_HEALTH_ENDPOINT}", self.base_url);
+        let mut last_error = String::from("no attempts made");
+
+        for attempt in 1..=CLUSTER_READY_ATTEMPTS {
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let body = response.text().await.unwrap_or_default();
+                    if body.contains("\"timed_out\":true") {
+                        last_error = format!(
+                            "cluster health timed out on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {body}"
+                        );
+                    } else {
+                        info!("Elasticsearch cluster ready at {}", self.base_url);
+                        return Ok(());
+                    }
+                }
+                Ok(response) => {
+                    last_error = format!(
+                        "cluster health status {} on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}",
+                        response.status()
+                    );
+                }
+                Err(error) => {
+                    last_error = format!(
+                        "cluster health request failed on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {error}"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CLUSTER_READY_INTERVAL_MS)).await;
+        }
+
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "ElasticsearchContainer".to_string(),
+            message: format!(
+                "Elasticsearch at {} not ready after {CLUSTER_READY_ATTEMPTS} attempts: {last_error}",
+                self.base_url
+            ),
         })
+    }
+
+    /// Delete leftover test indices (empty or partially filled) from previous
+    /// runs so accumulated shards do not degrade the reused container. Only
+    /// indices older than [`STALE_INDEX_MAX_AGE_MS`] are removed, which keeps
+    /// the sweep safe against tests running concurrently in other processes.
+    /// Best-effort: failures are logged, never fail the fixture.
+    async fn sweep_stale_indices(&self) {
+        #[derive(Deserialize)]
+        struct CatIndexEntry {
+            index: String,
+            #[serde(rename = "creation.date")]
+            creation_date: Option<String>,
+        }
+
+        let client = create_http_client();
+        let cat_url = format!(
+            "{}/_cat/indices/{STALE_INDEX_PATTERNS}?format=json&h=index,creation.date",
+            self.base_url
+        );
+
+        let entries = match client.get(&cat_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Vec<CatIndexEntry>>().await {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        warn!("Skipping stale index sweep, unparsable _cat response: {error}");
+                        return;
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    "Skipping stale index sweep, _cat/indices returned {}",
+                    response.status()
+                );
+                return;
+            }
+            Err(error) => {
+                warn!("Skipping stale index sweep, _cat/indices failed: {error}");
+                return;
+            }
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+
+        let stale: Vec<String> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let created_ms = entry.creation_date.as_deref()?.parse::<u128>().ok()?;
+                (now_ms.saturating_sub(created_ms) > STALE_INDEX_MAX_AGE_MS).then_some(entry.index)
+            })
+            .collect();
+
+        if stale.is_empty() {
+            return;
+        }
+
+        // Chunked so the URL stays well under limits with many leftovers.
+        for chunk in stale.chunks(20) {
+            let delete_url = format!("{}/{}", self.base_url, chunk.join(","));
+            match client.delete(&delete_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    info!("Deleted {} stale Elasticsearch test indices", chunk.len());
+                }
+                Ok(response) => {
+                    warn!(
+                        "Failed to delete stale Elasticsearch indices, status {}",
+                        response.status()
+                    );
+                }
+                Err(error) => {
+                    warn!("Failed to delete stale Elasticsearch indices: {error}");
+                }
+            }
+        }
+    }
+}
+
+/// Remove the shared reuse container so the next start creates a fresh one.
+/// Uses the Docker CLI directly: testcontainers offers no "remove by name" API
+/// and the wedged container was created by an earlier process anyway.
+fn force_remove_container() {
+    match std::process::Command::new("docker")
+        .args(["rm", "-f", ELASTICSEARCH_CONTAINER_NAME])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!("Removed wedged Elasticsearch container '{ELASTICSEARCH_CONTAINER_NAME}'");
+        }
+        Ok(output) => {
+            warn!(
+                "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(error) => {
+            warn!("Failed to invoke docker rm for '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
+        }
     }
 }
 

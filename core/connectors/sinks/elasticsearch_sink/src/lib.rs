@@ -31,10 +31,13 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use simd_json::{OwnedValue, prelude::*};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 sink_connector!(ElasticsearchSink);
+
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug)]
 struct State {
@@ -83,7 +86,15 @@ impl ElasticsearchSink {
             .map_err(|error| Error::Connection(format!("Invalid Elasticsearch URL: {error}")))?;
 
         let conn_pool = elasticsearch::http::transport::SingleNodeConnectionPool::new(url);
-        let mut transport_builder = TransportBuilder::new(conn_pool);
+        // elasticsearch-rs defaults to no timeout; without this, a hung ES
+        // connection blocks FFI open() and the connectors HTTP health never binds.
+        let timeout_seconds = self
+            .config
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .max(1);
+        let mut transport_builder =
+            TransportBuilder::new(conn_pool).timeout(Duration::from_secs(timeout_seconds));
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             let credentials =
