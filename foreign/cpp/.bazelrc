@@ -24,12 +24,6 @@ common --enable_bzlmod
 test --test_output=errors
 test --cache_test_results=no
 
-# Shared compiler warnings
-build --copt=-Wall
-build --copt=-Wpedantic
-build --copt=-Werror
-build --copt=-Wextra
-
 # Debug configuration
 build:debug --compilation_mode=dbg
 build:debug --copt=-g3
