@@ -799,7 +799,9 @@ where
         // Backup: gap check (op == current_op + 1).
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
         // sibling on_request races during journal.append await).
-        // TODO: hard assert for backups once message repair lands.
+        // TODO: promote the backup gap warn below to a hard assert or a
+        // repair-session trigger (message repair has landed; the drop-and-
+        // wait-for-retransmit path is the last soft handling left here).
         let is_backup = consensus.is_follower();
         if is_backup {
             if header.op != current_op + 1 {
@@ -2277,8 +2279,11 @@ where
             let op = consensus.commit_min() + 1;
 
             let Some(header) = journal.handle().header(op as usize) else {
-                // TODO: Implement message repair: request missing prepare from
-                // primary or other replicas. Until then, the backup stalls here.
+                // Gap-stop: the walk halts at the first missing prepare and
+                // resumes once it is refilled. Live drops refill via the
+                // primary's prepare retransmit; a replica behind at recovery
+                // or after StartView adoption arms a `MetadataRepairSession`
+                // (shard) that re-requests the missing window.
                 break;
             };
             let header = *header;
