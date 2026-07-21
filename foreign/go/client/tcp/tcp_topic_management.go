@@ -120,3 +120,8 @@ func (c *IggyTcpClient) DeleteTopic(ctx context.Context, streamId, topicId iggco
 	_, err := c.do(ctx, &command.DeleteTopic{StreamId: streamId, TopicId: topicId})
 	return err
 }
+
+func (c *IggyTcpClient) PurgeTopic(ctx context.Context, streamId, topicId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.PurgeTopic{StreamId: streamId, TopicId: topicId})
+	return err
+}

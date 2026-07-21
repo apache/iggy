@@ -21,13 +21,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
-	"github.com/apache/iggy/foreign/go/client"
-	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/cucumber/godog"
-	"github.com/google/uuid"
 )
 
 type basicMessagingCtxKey struct{}
@@ -52,36 +48,21 @@ type basicMessagingSteps struct{}
 
 func (s basicMessagingSteps) givenRunningServer(ctx context.Context) error {
 	c := getBasicMessagingCtx(ctx)
-	addr := os.Getenv("IGGY_TCP_ADDRESS")
-	if addr == "" {
-		addr = "127.0.0.1:8090"
-	}
+	addr := defaultServerAddress()
 	c.serverAddr = &addr
 	return nil
 }
 
 func (s basicMessagingSteps) givenAuthenticationAsRoot(ctx context.Context) error {
 	c := getBasicMessagingCtx(ctx)
-	serverAddr := *c.serverAddr
 
-	cli, err := client.NewIggyClient(
-		client.WithTcp(
-			tcp.WithServerAddress(serverAddr),
-		),
-	)
+	cli, err := connectToServer(ctx, *c.serverAddr)
 	if err != nil {
-		return fmt.Errorf("error creating client: %w", err)
+		return fmt.Errorf("failed to connect to server: %w", err)
 	}
 
-	if err = cli.Connect(ctx); err != nil {
-		return fmt.Errorf("error connecting to server: %w", err)
-	}
-	if err = cli.Ping(ctx); err != nil {
-		return fmt.Errorf("error pinging client: %w", err)
-	}
-
-	if _, err = cli.LoginUser(ctx, "iggy", "iggy"); err != nil {
-		return fmt.Errorf("error logging in: %v", err)
+	if err := loginAsRoot(ctx, cli); err != nil {
+		return fmt.Errorf("failed to login as root: %w", err)
 	}
 
 	c.client = cli
@@ -95,7 +76,7 @@ func (s basicMessagingSteps) whenSendMessages(
 	topicID uint32,
 	partitionID uint32) error {
 	c := getBasicMessagingCtx(ctx)
-	messages, err := s.createTestMessages(messagesCount)
+	messages, err := createTestMessages(messagesCount)
 	if err != nil {
 		return fmt.Errorf("error creating test messages: %w", err)
 	}
@@ -109,20 +90,6 @@ func (s basicMessagingSteps) whenSendMessages(
 
 	c.lastSentMessage = &messages[len(messages)-1]
 	return nil
-}
-
-func (s basicMessagingSteps) createTestMessages(count uint32) ([]iggcon.IggyMessage, error) {
-	messages := make([]iggcon.IggyMessage, 0, count)
-	for i := 0; uint32(i) < count; i++ {
-		id := uuid.New()
-		payload := []byte(fmt.Sprintf("test message %d", i))
-		message, err := iggcon.NewIggyMessage(payload, iggcon.WithID(id))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create message: %w", err)
-		}
-		messages = append(messages, message)
-	}
-	return messages, nil
 }
 
 func (s basicMessagingSteps) whenPollMessages(

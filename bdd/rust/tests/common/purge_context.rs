@@ -15,10 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod auth;
-pub mod leader_redirection;
-pub mod messages;
-pub mod purge;
-pub mod server;
-pub mod streams;
-pub mod topics;
+use cucumber::World;
+use iggy::clients::client::IggyClient;
+use iggy::prelude::{IggyError, PolledMessages};
+use std::collections::HashMap;
+
+#[derive(Debug, World, Default)]
+pub struct PurgeContext {
+    pub client: Option<IggyClient>,
+    pub server_addr: Option<String>,
+    pub stream_ids: HashMap<String, u32>,
+    pub topic_ids: HashMap<String, u32>,
+    pub last_polled_messages: Option<PolledMessages>,
+    pub last_error: Option<IggyError>,
+}

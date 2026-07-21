@@ -44,3 +44,8 @@ required-features = ["bdd"]
 name = "leader_redirection"
 harness = false
 required-features = ["bdd"]
+
+[[test]]
+name = "stream_topic_purge"
+harness = false
+required-features = ["bdd"]

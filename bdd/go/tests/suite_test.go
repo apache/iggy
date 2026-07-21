@@ -53,6 +53,16 @@ func TestFeatures(t *testing.T) {
 			},
 		})
 	}
+	if feature == "all" || feature == "stream_topic_purge" {
+		suites = append(suites, godog.TestSuite{
+			ScenarioInitializer: initPurgeScenario,
+			Options: &godog.Options{
+				Format:   "pretty",
+				Paths:    []string{"../../scenarios/stream_topic_purge.feature"},
+				TestingT: t,
+			},
+		})
+	}
 
 	if len(suites) == 0 {
 		t.Fatalf("unknown BDD_FEATURE=%q", feature)

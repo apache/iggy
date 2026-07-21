@@ -130,6 +130,19 @@ func (d *DeleteTopic) MarshalBinary() ([]byte, error) {
 	return iggcon.MarshalIdentifiers(d.StreamId, d.TopicId)
 }
 
+type PurgeTopic struct {
+	StreamId iggcon.Identifier
+	TopicId  iggcon.Identifier
+}
+
+func (p *PurgeTopic) Code() Code {
+	return PurgeTopicCode
+}
+
+func (p *PurgeTopic) MarshalBinary() ([]byte, error) {
+	return iggcon.MarshalIdentifiers(p.StreamId, p.TopicId)
+}
+
 type UpdateTopic struct {
 	StreamId             iggcon.Identifier           `json:"streamId"`
 	TopicId              iggcon.Identifier           `json:"topicId"`

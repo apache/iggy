@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | all  (default: all)"
+  log "  feature: basic_messaging | leader_redirection | stream_topic_purge | all  (default: all)"
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
@@ -46,7 +46,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|all) ;;
+  basic_messaging|leader_redirection|stream_topic_purge|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -66,7 +66,7 @@ ALL_COMPOSE_FILES=(
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|all)
+  basic_messaging|leader_redirection|stream_topic_purge|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
@@ -90,20 +90,29 @@ if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
 
+unsupported() {
+  local feature="$1" svc="$2"
+  if [ "$SDK" = "all" ]; then
+    log "⚠️ skipping ${svc%-bdd} (does not support ${feature})"
+    return 0
+  else
+    log "❌ ${SDK} does not support feature '${feature}'"
+    return 1
+  fi
+}
+
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
       rust-bdd|go-bdd|csharp-bdd) ;;
-      *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+      *) unsupported "$FEATURE" "$svc" || return 1; return 0 ;;
+    esac
+  fi
+  if [ "$FEATURE" = "stream_topic_purge" ]; then
+    case "$svc" in
+      rust-bdd|go-bdd) ;;
+      *) unsupported "$FEATURE" "$svc" || return 1; return 0 ;;
     esac
   fi
 

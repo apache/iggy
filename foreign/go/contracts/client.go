@@ -53,6 +53,10 @@ type Client interface {
 	// Authentication is required, and the permission to manage the streams.
 	DeleteStream(ctx context.Context, id Identifier) error
 
+	// PurgeStream purge a stream by unique ID or name.
+	// Authentication is required, and the permission to manage the streams.
+	PurgeStream(ctx context.Context, streamId Identifier) error
+
 	// GetTopic Get the info about a specific topic by unique ID or name.
 	// Authentication is required, and the permission to read the topics.
 	GetTopic(ctx context.Context, streamId, topicId Identifier) (*TopicDetails, error)
@@ -90,6 +94,10 @@ type Client interface {
 	// DeleteTopic delete a topic by unique ID or name.
 	// Authentication is required, and the permission to manage the topics.
 	DeleteTopic(ctx context.Context, streamId, topicId Identifier) error
+
+	// PurgeTopic purge a topic by unique stream and topic IDs or names.
+	// Authentication is required, and the permission to manage the topics.
+	PurgeTopic(ctx context.Context, streamId, topicId Identifier) error
 
 	// SendMessages sends messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to send the messages.

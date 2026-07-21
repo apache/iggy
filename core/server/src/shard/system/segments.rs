@@ -17,6 +17,7 @@
 
 use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
+use crate::streaming::partitions::journal::Journal;
 use crate::streaming::segments::Segment;
 use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use server_common::sharding::IggyNamespace;
@@ -508,8 +509,9 @@ impl IggyShard {
 
         let mut partitions = self.local_partitions.borrow_mut();
         if let Some(partition) = partitions.get_mut(namespace) {
+            partition.log.journal_mut().reset();
+            partition.log.clear_in_flight();
             partition.log.add_persisted_segment(segment, storage);
-            // Reset offset when starting fresh with a new segment at offset 0
             partition
                 .offset
                 .store(start_offset, std::sync::atomic::Ordering::SeqCst);

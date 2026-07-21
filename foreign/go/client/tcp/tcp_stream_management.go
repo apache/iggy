@@ -82,3 +82,8 @@ func (c *IggyTcpClient) DeleteStream(ctx context.Context, id iggcon.Identifier) 
 	_, err := c.do(ctx, &command.DeleteStream{StreamId: id})
 	return err
 }
+
+func (c *IggyTcpClient) PurgeStream(ctx context.Context, streamId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.PurgeStream{StreamId: streamId})
+	return err
+}

@@ -30,6 +30,7 @@ services:
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
+      - ./scenarios/stream_topic_purge.feature:/app/features/stream_topic_purge.feature
     command:
       - sh
       - -c
@@ -37,6 +38,7 @@ services:
         case "$$BDD_FEATURE" in
           basic_messaging)    cargo test -p bdd --features bdd --test basic_messaging ;;
           leader_redirection) cargo test -p bdd --features bdd --test leader_redirection ;;
+          stream_topic_purge) cargo test -p bdd --features bdd --test stream_topic_purge ;;
           *)                  cargo test -p bdd --features bdd ;;
         esac
     networks:

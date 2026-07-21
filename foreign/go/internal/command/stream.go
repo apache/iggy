@@ -96,3 +96,15 @@ func (d *DeleteStream) Code() Code {
 func (d *DeleteStream) MarshalBinary() ([]byte, error) {
 	return d.StreamId.MarshalBinary()
 }
+
+type PurgeStream struct {
+	StreamId iggcon.Identifier
+}
+
+func (p *PurgeStream) Code() Code {
+	return PurgeStreamCode
+}
+
+func (p *PurgeStream) MarshalBinary() ([]byte, error) {
+	return p.StreamId.MarshalBinary()
+}

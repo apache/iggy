@@ -137,6 +137,11 @@ impl Journal for MemoryMessageJournal {
         self.batches.is_empty()
     }
 
+    fn reset(&mut self) {
+        self.batches = IggyMessagesBatchSet::default();
+        self.inner = Inner::default();
+    }
+
     fn inner(&self) -> &Self::Inner {
         &self.inner
     }
@@ -203,6 +208,8 @@ pub trait Journal {
 
     /// Timestamp of last message in journal, or None if empty.
     fn last_timestamp(&self) -> Option<u64>;
+
+    fn reset(&mut self);
 
     // `flush` is only useful in case of an journal that has disk backed WAL.
     // This could be merged together with `append`, but not doing this for two reasons.
