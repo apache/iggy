@@ -138,7 +138,7 @@ impl TopicClient for HttpClient {
     ) -> Result<(), IggyError> {
         self.delete(&format!(
             "{}/purge",
-            &get_details_path(&stream_id.as_cow_str(), &topic_id.as_cow_str(),)
+            get_details_path(&stream_id.as_cow_str(), &topic_id.as_cow_str(),)
         ))
         .await?;
         Ok(())
