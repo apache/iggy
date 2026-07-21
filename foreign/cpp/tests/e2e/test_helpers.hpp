@@ -422,6 +422,7 @@ class E2ETestFixture : public ::testing::Test {
         clients_.clear();
     }
 
+  protected:
     std::vector<iggy::ffi::Client *> clients_;
     std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;
