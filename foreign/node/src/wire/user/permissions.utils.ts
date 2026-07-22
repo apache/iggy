@@ -250,19 +250,18 @@ export const deserializeStreamPermissions =
     }
 
     pos += 10;
-    const topics = [];
+    const topics: TopicPerms[] = [];
     const hasTopics = toBool(p.readUInt8(pos));
+    pos += 1;
 
     if (hasTopics) {
-      let read = true;
-      pos += 1;
-      while (read) {
+      let hasNextTopic = true;
+      while (hasNextTopic) {
         const { bytesRead, topicId, permissions } = deserializeTopicPermissions(p, pos);
         pos += bytesRead;
         topics.push({ topicId, permissions });
-
-        if (p.readUInt8(pos) === 0)
-          read = false; // break
+        hasNextTopic = toBool(p.readUInt8(pos));
+        pos += 1;
       }
     }
 
@@ -292,17 +291,20 @@ export const serializeStreamPermissions = (p: StreamPerms) => {
     uint8ToBuf(boolToByte(p.permissions.sendMessages)),
   ]);
 
-  const hasTopic = p.topics.length > 0;
-  const bHasTopic = uint8ToBuf(boolToByte(hasTopic));
-  const bHead = Buffer.concat([bStream, bHasTopic]);
+  const hasTopics = p.topics.length > 0;
+  const bHasTopics = uint8ToBuf(boolToByte(hasTopics));
+  const bHead = Buffer.concat([bStream, bHasTopics]);
 
-  if (!hasTopic)
+  if (!hasTopics)
     return bHead;
 
-  return p.topics.reduce((ac, c) => Buffer.concat([
-    ac, serializeTopicPermissions(c)
-  ]), bHead);
-}
+  const bTopics = p.topics.map((topic, index) => Buffer.concat([
+    serializeTopicPermissions(topic),
+    uint8ToBuf(boolToByte(index < p.topics.length - 1))
+  ]));
+
+  return Buffer.concat([bHead, ...bTopics]);
+};
 
 /**
  * Deserializes complete user permissions from a buffer.
@@ -316,20 +318,20 @@ export const deserializePermissions = (p: Buffer, pos = 0): UserPermissions => {
   const { bytesRead, data } = deserializeGlobalPermissions(p, pos);
   pos += bytesRead;
 
-  const streams = [];
-  const hasStream = toBool(p.readUInt8(pos));
+  const streams: StreamPerms[] = [];
+  const hasStreams = toBool(p.readUInt8(pos));
+  pos += 1;
 
-  if (hasStream) {
-    let readStream = true;
-    pos += 1;
-    while (readStream) {
+  if (hasStreams) {
+    let hasNextStream = true;
+    while (hasNextStream) {
       const {
         bytesRead, streamId, permissions, topics
       } = deserializeStreamPermissions(p, pos);
       streams.push({ streamId, permissions, topics });
       pos += bytesRead;
-      if (p.readUInt8(pos) === 0)
-        readStream = false; // break
+      hasNextStream = toBool(p.readUInt8(pos));
+      pos += 1;
     }
   }
   return {
@@ -340,24 +342,23 @@ export const deserializePermissions = (p: Buffer, pos = 0): UserPermissions => {
 
 /**
  * Serializes user permissions to a buffer.
- * Returns a single zero byte if no permissions provided.
  *
- * @param p - Optional user permissions to serialize
+ * @param p - User permissions to serialize
  * @returns Serialized permissions buffer
  */
-export const serializePermissions = (p?: UserPermissions) => {
-  if (!p)
-    return uint8ToBuf(0);
-
+export const serializePermissions = (p: UserPermissions) => {
   const bGlobal = serializeGlobalPermission(p.global);
-  const hasStream = p.streams.length > 0;
-  const bHasStream = uint8ToBuf(boolToByte(hasStream));
-  const bHead = Buffer.concat([bGlobal, bHasStream]);
+  const hasStreams = p.streams.length > 0;
+  const bHasStreams = uint8ToBuf(boolToByte(hasStreams));
+  const bHead = Buffer.concat([bGlobal, bHasStreams]);
 
-  if (!hasStream)
+  if (!hasStreams)
     return bHead;
 
-  return p.streams.reduce((ac, c) => Buffer.concat([
-    ac, serializeStreamPermissions(c)
-  ]), bHead);
+  const bStreams = p.streams.map((stream, index) => Buffer.concat([
+    serializeStreamPermissions(stream),
+    uint8ToBuf(boolToByte(index < p.streams.length - 1))
+  ]));
+
+  return Buffer.concat([bHead, ...bStreams]);
 };

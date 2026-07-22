@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -172,9 +173,9 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     }
 
     public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy",
-        bool connect = true)
+        bool connect = true, IMessageEncryptor? encryptor = null)
     {
-        var client = await CreateClient(Protocol.Tcp, connect: connect);
+        var client = await CreateClient(Protocol.Tcp, connect: connect, encryptor: encryptor);
 
         if (connect)
         {
@@ -184,9 +185,10 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         return client;
     }
 
-    public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy")
+    public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy",
+        IMessageEncryptor? encryptor = null)
     {
-        var client = await CreateClient(Protocol.Http);
+        var client = await CreateClient(Protocol.Http, encryptor: encryptor);
 
         await client.LoginUserAsync(userName, password);
 
@@ -194,7 +196,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     }
 
     public async Task<IIggyClient> CreateClient(Protocol protocol, Protocol? targetContainer = null,
-        bool connect = true)
+        bool connect = true, IMessageEncryptor? encryptor = null)
     {
         var address = GetIggyAddress(protocol);
 
@@ -208,7 +210,8 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
                 Enabled = true,
                 Username = "iggy",
                 Password = "iggy"
-            }
+            },
+            MessageEncryptor = encryptor
         });
 
         if (connect)

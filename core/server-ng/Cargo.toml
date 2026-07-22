@@ -43,7 +43,6 @@ ignored = [
     "err_trail",
     "error_set",
     "figlet-rs",
-    "fs2",
     "hash32",
     "human-repr",
     "hwlocality",
@@ -73,7 +72,6 @@ ignored = [
     "strum",
     "sysinfo",
     "tempfile",
-    "tower-http",
     "tracing-appender",
     "tracing-opentelemetry",
     "ulid",
@@ -109,6 +107,7 @@ crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
+cyper-core = { workspace = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
 err_trail = { workspace = true }
@@ -118,6 +117,8 @@ fs2 = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
@@ -146,6 +147,7 @@ rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 server_common = { workspace = true }
 shard = { workspace = true }
 shard_allocator = { workspace = true }
@@ -153,8 +155,10 @@ slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
+system_stats = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

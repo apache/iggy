@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
@@ -22,7 +23,7 @@ use iggy::prelude::{
 };
 use pyo3::PyRef;
 use pyo3::prelude::*;
-use pyo3::types::{PyDelta, PyList, PyType};
+use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -38,6 +39,9 @@ use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
+use crate::user::{
+    UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
+};
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
@@ -140,6 +144,147 @@ impl IggyClient {
         future_into_py(py, async move {
             inner
                 .login_user(&username, &password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Get the info about a specific user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `UserInfoDetails` if the user exists,
+    ///     or `None` otherwise.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails | None]", imports=("collections.abc")))]
+    fn get_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let user = inner
+                .get_user(&user_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(user.map(PyUserInfoDetails::from))
+        })
+    }
+
+    /// Get the info about all the users.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[UserInfo]`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[UserInfo]]", imports=("collections.abc")))]
+    fn get_users<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let users = inner
+                .get_users()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(users.into_iter().map(PyUserInfo::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Create a new user.
+    ///
+    /// The user is created without permissions.
+    ///
+    /// Args:
+    ///     username: Username as `str`.
+    ///     password: Password as `str`.
+    ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the created `UserInfoDetails`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    #[pyo3(signature = (username, password, status=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
+    fn create_user<'a>(
+        &self,
+        py: Python<'a>,
+        username: String,
+        password: String,
+        #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let user = inner
+                .create_user(&username, &password, status, None)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(PyUserInfoDetails::from(user))
+        })
+    }
+
+    /// Update a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     username: New username as `str | None`; unchanged when `None`.
+    ///     status: New status as `UserStatus | None`; unchanged when `None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is updated.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, username=None, status=None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_user<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] username: Option<String>,
+        #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let status = status.map(UserStatus::from);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_user(&user_id, username.as_deref(), status)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Delete a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is deleted.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_user(&user_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -544,6 +689,119 @@ impl IggyClient {
         })
     }
 
+    /// Delete a consumer group for a stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the consumer group is deleted.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Join a consumer group for a stream and topic.
+    ///
+    /// This method only registers the current client as a group member. To consume messages
+    /// as a group, use `consumer_group()`, which enables auto-join by default.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the client joins the consumer group.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn join_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .join_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Leave a consumer group for a stream and topic.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     group_id: Consumer group identifier as `str | int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the client leaves the consumer group.
+    ///
+    /// Note:
+    ///     Consumers created from this client for the same group share one server-side
+    ///     membership. Leaving revokes that membership. Consumers with auto-join enabled
+    ///     rejoin on their next poll.
+    ///
+    /// Raises:
+    ///     PyValueError: If a string identifier is invalid.
+    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn leave_consumer_group<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        group_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let group_id = Identifier::try_from(group_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .leave_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Sends a list of messages to the specified topic.
     /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -737,6 +995,37 @@ impl IggyClient {
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
             })
+        })
+    }
+
+    /// Send a command code with a payload and return the raw response bytes.
+    ///
+    /// Session-control codes are rejected client-side. HTTP transport does not
+    /// support raw binary commands.
+    ///
+    /// Args:
+    ///     code: Command code as `int`.
+    ///     payload: Request payload as `bytes`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw response `bytes`.
+    ///
+    /// Raises:
+    ///     PyRuntimeError: If the command cannot be sent or the server returns an error.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn send_binary_request<'a>(
+        &self,
+        py: Python<'a>,
+        code: u32,
+        #[gen_stub(override_type(type_repr = "builtins.bytes"))] payload: Vec<u8>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let response = inner
+                .send_binary_request(code, Bytes::from(payload))
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(Python::attach(|py| PyBytes::new(py, &response).unbind()))
         })
     }
 }

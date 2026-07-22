@@ -24,9 +24,10 @@ use crate::{
     dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
 };
 use bit_set::BitSet;
+use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::IggyTimestamp;
 use message_bus::IggyMessageBus;
@@ -35,6 +36,45 @@ use server_common::Message;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
+
+/// Injected time source for primary-stamped prepare timestamps.
+///
+/// The consensus core never reads the wall clock directly,
+/// so a deterministic host (the simulator) can substitute virtual time
+/// and make prepare timestamps a pure function of the seed.
+/// of the seed. Production defaults to [`IggySystemClock`] through
+/// [`VsrConsensus::new`]; only tests and the simulator construct one
+/// explicitly via [`VsrConsensus::with_clock`].
+///
+/// The clock is type-erased behind `Rc<dyn Clock>` deliberately, to avoid
+/// threading a clock generic through every `VsrConsensus<B, P>` call site. The
+/// one vtable dispatch it costs per stamp is negligible next to the WAL append
+/// each prepare already performs.
+#[derive(Clone)]
+pub struct ConsensusClock(Rc<dyn Clock<Realtime = IggyTimestamp>>);
+
+impl ConsensusClock {
+    #[must_use]
+    pub fn new(clock: Rc<dyn Clock<Realtime = IggyTimestamp>>) -> Self {
+        Self(clock)
+    }
+
+    #[must_use]
+    pub fn system() -> Self {
+        Self(Rc::new(IggySystemClock))
+    }
+
+    fn realtime(&self) -> IggyTimestamp {
+        self.0.realtime()
+    }
+}
+
+impl std::fmt::Debug for ConsensusClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsensusClock")
+    }
+}
 
 pub trait Sequencer {
     type Sequence;
@@ -101,6 +141,11 @@ pub const PIPELINE_REQUEST_QUEUE_MAX: usize = 64;
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
+/// Unanswered `RequestStartView` probes tolerated before a recovering
+/// replica gives up waiting for a settled primary and falls back to an
+/// election (a full-cluster restart leaves nobody able to answer).
+pub const PROBE_ATTEMPTS_MAX: u32 = 5;
+
 /// Maximum number of clients tracked in the clients table.
 /// When exceeded, the client with the oldest committed request is evicted.
 pub const CLIENTS_TABLE_MAX: usize = 8192;
@@ -139,13 +184,20 @@ impl PipelineEntry {
     #[must_use]
     pub fn with_subscriber(header: PrepareHeader) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
-        let entry = Self {
+        (Self::with_sender(header, sender), receiver)
+    }
+
+    /// Entry adopting an existing reply sender — used when a request that
+    /// carried a subscriber through the request queue is promoted into a
+    /// prepare slot, so the original in-process awaiter keeps its receiver.
+    #[must_use]
+    pub fn with_sender(header: PrepareHeader, sender: Sender<Message<ReplyHeader>>) -> Self {
+        Self {
             header,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
             reply_sender: Some(sender),
-        };
-        (entry, receiver)
+        }
     }
 
     /// Take reply sender; caller fires after slot update (slot-first ordering).
@@ -190,6 +242,11 @@ pub struct RequestEntry {
     // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
     #[allow(dead_code)]
     pub(crate) received_at: i64,
+    /// In-process reply subscriber, carried through the queue so promotion
+    /// can hand it to the pipeline entry (see [`PipelineEntry::with_sender`]).
+    /// `None` = network path. Dropping a queued entry (view-change reset,
+    /// preflight rejection at promotion) wakes the receiver with `Canceled`.
+    pub(crate) reply_sender: Option<Sender<Message<ReplyHeader>>>,
 }
 
 impl RequestEntry {
@@ -198,17 +255,48 @@ impl RequestEntry {
         Self {
             message,
             received_at: 0,
+            reply_sender: None,
         }
+    }
+
+    /// Queued request paired with a fresh receiver that resolves when the
+    /// promoted prepare commits (`Err(Canceled)` if the entry is dropped
+    /// first). The in-process absorption path: a submit that arrives while
+    /// the primary is mid-commit or the prepare queue is full parks here
+    /// instead of being bounced with a transient error.
+    #[must_use]
+    pub fn with_subscriber(
+        message: Message<RequestHeader>,
+    ) -> (Self, Receiver<Message<ReplyHeader>>) {
+        let (sender, receiver) = oneshot::channel();
+        let entry = Self {
+            message,
+            received_at: 0,
+            reply_sender: Some(sender),
+        };
+        (entry, receiver)
+    }
+
+    /// Take the reply sender for hand-off to the promoted pipeline entry.
+    pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
+        self.reply_sender.take()
     }
 }
 
 /// Two-queue pipeline: in-flight prepares + buffered requests.
 #[derive(Debug)]
 pub struct LocalPipeline {
-    /// Uncommitted prepares; cap [`PIPELINE_PREPARE_QUEUE_MAX`].
+    /// Uncommitted prepares; cap [`Self::prepare_queue_max`].
     prepare_queue: VecDeque<PipelineEntry>,
-    /// Requests awaiting a prepare slot; cap [`PIPELINE_REQUEST_QUEUE_MAX`].
+    /// Requests awaiting a prepare slot; cap [`Self::request_queue_max`].
     request_queue: VecDeque<RequestEntry>,
+    /// Depth bound for `prepare_queue`; [`PIPELINE_PREPARE_QUEUE_MAX`]
+    /// unless the operator overrode it (`[metadata]` in the server-ng
+    /// config).
+    prepare_queue_max: usize,
+    /// Depth bound for `request_queue`; [`PIPELINE_REQUEST_QUEUE_MAX`]
+    /// unless overridden alongside `prepare_queue_max`.
+    request_queue_max: usize,
 }
 
 impl Default for LocalPipeline {
@@ -220,9 +308,31 @@ impl Default for LocalPipeline {
 impl LocalPipeline {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_capacities(PIPELINE_PREPARE_QUEUE_MAX, PIPELINE_REQUEST_QUEUE_MAX)
+    }
+
+    /// Pipeline with operator-tuned queue depths.
+    ///
+    /// Callers wiring this from config must keep the journal's
+    /// checkpoint margin >= `prepare_queue_max`: up to a full prepare
+    /// queue of already-pipelined ops appends while a forced checkpoint
+    /// runs, and the margin is what guarantees them journal room (see
+    /// `SnapshotCoordinator` in `core/metadata`).
+    ///
+    /// # Panics
+    /// If a depth is zero — a zero-depth pipeline can never admit an op.
+    #[must_use]
+    pub fn with_capacities(prepare_queue_max: usize, request_queue_max: usize) -> Self {
+        assert!(
+            prepare_queue_max > 0 && request_queue_max > 0,
+            "pipeline queue depths must be non-zero \
+             (prepare={prepare_queue_max}, request={request_queue_max})"
+        );
         Self {
-            prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
-            request_queue: VecDeque::with_capacity(PIPELINE_REQUEST_QUEUE_MAX),
+            prepare_queue: VecDeque::with_capacity(prepare_queue_max),
+            request_queue: VecDeque::with_capacity(request_queue_max),
+            prepare_queue_max,
+            request_queue_max,
         }
     }
 
@@ -233,7 +343,7 @@ impl LocalPipeline {
 
     #[must_use]
     pub fn prepare_queue_full(&self) -> bool {
-        self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX
+        self.prepare_queue.len() >= self.prepare_queue_max
     }
 
     #[must_use]
@@ -243,7 +353,7 @@ impl LocalPipeline {
 
     #[must_use]
     pub fn request_queue_full(&self) -> bool {
-        self.request_queue.len() >= PIPELINE_REQUEST_QUEUE_MAX
+        self.request_queue.len() >= self.request_queue_max
     }
 
     #[must_use]
@@ -544,6 +654,21 @@ pub enum Status {
     Recovering,
 }
 
+/// What a received `Commit` heartbeat did, so the caller knows whether to
+/// drain the journal or correct a stale peer.
+#[derive(Debug, Clone, Copy)]
+pub enum CommitOutcome {
+    /// Nothing to do: the heartbeat was absorbed (or ignored as stale /
+    /// foreign / wrong-status) without moving `commit_max`.
+    Accepted,
+    /// `commit_max` advanced; run `commit_journal`.
+    Advanced,
+    /// A replica is still heartbeating an older view in which it was
+    /// primary; this replica is the current view's primary and should
+    /// broadcast `StartView` so the stale replica adopts the view.
+    RespondStartView,
+}
+
 /// Actions to be taken by the caller after processing a VSR event.
 #[derive(Debug, Clone)]
 pub enum VsrAction {
@@ -558,6 +683,11 @@ pub enum VsrAction {
         commit: u64,
         namespace: u64,
     },
+    /// Broadcast a `RequestStartView` probe (recovering replica asking for
+    /// the current view's `StartView`; only that view's primary answers).
+    /// Stamped with the prober's view so peers can fence stale duplicates
+    /// out of the probed-primary election path.
+    SendRequestStartView { view: u32, namespace: u64 },
     /// Send `StartView` to all backups (as new primary).
     SendStartView {
         view: u32,
@@ -651,6 +781,16 @@ where
     // * `replica.log_view ≥ replica.log_view_durable`
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
+    /// Commit point the recovered WAL suffix must re-reach before admitting
+    /// client requests as primary (`0` = no recovered suffix pending).
+    recovery_barrier: Cell<u64>,
+    /// True while this replica declines the primaryship its (stale) recovered
+    /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
+    /// math, so without this flag a restarted view-N primary would still pass
+    /// the submit gate and advertise itself as the roster leader while never
+    /// heartbeating. Cleared as soon as any view transition resolves the role
+    /// legitimately (`StartView` adoption, DVC completion).
+    ceded_primaryship: Cell<bool>,
     status: Cell<Status>,
 
     /// Highest op number that has been locally executed (state machine applied,
@@ -674,6 +814,9 @@ where
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
+    /// Consecutive unanswered `RequestStartView` probes while Recovering;
+    /// at [`PROBE_ATTEMPTS_MAX`] the replica falls back to an election.
+    probe_attempts: Cell<u32>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -690,6 +833,10 @@ where
     /// Monotonic timestamp from the most recent accepted commit heartbeat.
     /// Old/replayed commit messages with a lower timestamp are ignored.
     heartbeat_timestamp: Cell<u64>,
+
+    /// Time source for [`Self::next_monotonic_timestamp`]; see
+    /// [`ConsensusClock`].
+    clock: ConsensusClock,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -703,6 +850,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         namespace: u64,
         message_bus: B,
         pipeline: P,
+    ) -> Self {
+        Self::with_clock(
+            cluster,
+            replica,
+            replica_count,
+            namespace,
+            message_bus,
+            pipeline,
+            ConsensusClock::system(),
+        )
+    }
+
+    /// [`Self::new`] with an explicit time source. Simulator and clock
+    /// tests only; production wiring stays on the system-clock default.
+    ///
+    /// # Panics
+    /// - If `replica >= replica_count`.
+    /// - If `replica_count < 1`.
+    pub fn with_clock(
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        namespace: u64,
+        message_bus: B,
+        pipeline: P,
+        clock: ConsensusClock,
     ) -> Self {
         assert!(
             replica < replica_count,
@@ -730,6 +903,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             namespace,
             view: Cell::new(0),
             log_view: Cell::new(0),
+            recovery_barrier: Cell::new(0),
+            ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
@@ -740,12 +915,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             message_bus,
             loopback_queue: RefCell::new(VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX)),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
+            probe_attempts: Cell::new(0),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_timestamp: Cell::new(0),
+            clock,
         }
     }
 
@@ -758,6 +935,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         } else {
             timeouts.start(TimeoutKind::NormalHeartbeat);
         }
+    }
+
+    /// Initialize a restarted replica as a backup regardless of what its
+    /// recovered view says about primaryship. A resumed stale primary races
+    /// the peers' election: if they moved on (or move on now), two nodes act
+    /// primary for different planes and clients route to the wrong one. Join
+    /// as a backup instead; either the peers' heartbeat timeout elects a
+    /// primary and its `StartView` brings this replica forward, or this
+    /// replica's own silence provokes that election. Unlike
+    /// [`Self::init_recovering`] the local journal is intact, so the normal
+    /// commit walk applies it -- no commit-floor fast-forward.
+    pub fn init_as_backup(&self) {
+        self.status.set(Status::Normal);
+        self.ceded_primaryship.set(true);
+        self.timeouts
+            .borrow_mut()
+            .start(TimeoutKind::NormalHeartbeat);
+    }
+
+    /// See the `ceded_primaryship` field.
+    #[must_use]
+    pub const fn has_ceded_primaryship(&self) -> bool {
+        self.ceded_primaryship.get()
     }
 
     #[must_use]
@@ -888,6 +1088,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.get()
     }
 
+    /// Commit point the recovered WAL suffix must re-reach before this
+    /// replica (as primary) admits new client requests; `0` when no suffix
+    /// was re-pipelined. See `is_caught_up_primary`.
+    pub const fn recovery_barrier(&self) -> u64 {
+        self.recovery_barrier.get()
+    }
+
+    pub fn set_recovery_barrier(&self, required_commit: u64) {
+        self.recovery_barrier.set(required_commit);
+    }
+
     pub fn set_view(&mut self, view: u32) {
         self.view.set(view);
     }
@@ -939,6 +1150,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // past a sibling prepare pipelined during the append await.
         self.sequencer.set_sequence(header.op);
         self.set_last_prepare_checksum(header.checksum);
+        self.observe_prepare_timestamp(header.timestamp);
 
         emit_sim_event(
             SimEventKind::PrepareQueued,
@@ -986,6 +1198,23 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         receiver
     }
 
+    /// [`Self::pipeline_message_with_subscriber`] for a promoted queued
+    /// request: adopts the sender the request carried through the request
+    /// queue instead of minting a fresh channel, so the awaiter that parked
+    /// at enqueue time resolves on this prepare's commit.
+    ///
+    /// # Panics
+    /// If not primary (mirrors [`Consensus::pipeline_message`]).
+    pub fn pipeline_message_with_sender(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+        sender: Sender<Message<ReplyHeader>>,
+    ) {
+        let entry = PipelineEntry::with_sender(*message.header(), sender);
+        self.push_prepare_entry(plane, message, entry);
+    }
+
     #[must_use]
     pub const fn cluster(&self) -> u128 {
         self.cluster
@@ -1010,18 +1239,64 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.last_prepare_checksum.set(checksum);
     }
 
-    /// Returns a primary-stamped prepare timestamp that is strictly greater
-    /// than every previously-stamped value on this primary.
+    /// Primary-stamped prepare timestamp, strictly greater than every value
+    /// this primary has stamped or observed (see
+    /// [`Self::observe_prepare_timestamp`]). Monotonicity guards `created_at`
+    /// ordering against an NTP step backwards.
     ///
-    /// Without monotonicity, an NTP step backwards could produce
-    /// `prepare[N+1].timestamp < prepare[N].timestamp`, breaking
-    /// `created_at` ordering invariants in deterministic state.
+    /// Lower bound only. The upper bound (clamping the read to a Marzullo
+    /// interval over a peer-clock quorum, and abdicating if the primary cannot
+    /// synchronize) is not enforced: Iggy has no peer-clock sync, so a runaway
+    /// primary clock can stamp a far-future value. Backups lift their floor to it on observe,
+    /// before commit, so even a view-change-truncated prepare poisons
+    /// `created_at` cluster-wide and survives view changes. Consensus safety is
+    /// unaffected (all replicas agree on the value); only wall-clock-derived
+    /// semantics (retention, PAT expiry) skew. An upper bound is unenforceable
+    /// at observe time (a backup clamping by its local clock would diverge from
+    /// peers); the only sound site is mint, pending the unbuilt peer-clock
+    /// subsystem.
     pub fn next_monotonic_timestamp(&self) -> u64 {
-        let now = IggyTimestamp::now().as_micros();
+        let now = self.clock.realtime().as_micros();
         let prev = self.last_timestamp.get();
         let next = now.max(prev.saturating_add(1));
+        // Strict monotonicity, except at prev == u64::MAX (saturating add
+        // sticks, stamp repeats): reachable only via a malformed peer stamp
+        // (none rejected yet) or year ~586_524. Debug-only; release never panics.
+        debug_assert!(
+            next > prev,
+            "prepare timestamp not strictly monotonic (prev at u64::MAX?): prev={prev} next={next}"
+        );
         self.last_timestamp.set(next);
         next
+    }
+
+    /// Read-only clock read (microseconds since the Unix epoch). Unlike
+    /// [`Self::next_monotonic_timestamp`] it does not advance the floor:
+    /// snapshots stamp `created_at` from the same seed-derived clock so a
+    /// replayed seed reproduces identical bytes, without consuming the
+    /// monotonic sequence.
+    #[must_use]
+    pub fn clock_realtime_micros(&self) -> u64 {
+        self.clock.realtime().as_micros()
+    }
+
+    /// Lift the monotonic floor to a prepare timestamp observed from the log:
+    /// backups per replicated prepare, recovery for the restored head, pipeline
+    /// rebuilds per entry. Without it the floor is per-primary in-memory state,
+    /// so a new primary whose clock lags its predecessor would stamp below
+    /// committed entries after a view change. Monotone max-merge: idempotent,
+    /// order-independent.
+    ///
+    /// Observed at append (in `on_replicate`), before commit, so a truncated
+    /// prepare still raises the floor: the cluster-wide `created_at` blast
+    /// radius noted on [`Self::next_monotonic_timestamp`]. Deliberate: observing
+    /// at assignment is the conservative floor, and the runaway-clock fix is the
+    /// upper peer-clock (Marzullo) window, not narrowing this to the commit
+    /// path. Revisit only together.
+    pub fn observe_prepare_timestamp(&self, timestamp: u64) {
+        if timestamp > self.last_timestamp.get() {
+            self.last_timestamp.set(timestamp);
+        }
     }
 
     #[must_use]
@@ -1128,6 +1403,67 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
+        if timeouts.fired(TimeoutKind::RequestStartViewMessage) {
+            drop(timeouts);
+            // Two probers share this timeout, both asking "resend me the
+            // current StartView":
+            // - Recovering (boot probe): re-broadcast until the settled
+            //   primary answers or an election's StartView adopts us.
+            // - ViewChange backup: the election may have concluded with our
+            //   copy of the StartView lost; re-requesting it is a
+            //   two-message fix, while the ViewChangeStatus escalation
+            //   backstop burns a fresh cluster-wide election. The would-be
+            //   primary of the view skips the probe (it concludes the view
+            //   itself or escalates).
+            match self.status.get() {
+                Status::Recovering => {
+                    // A probe answered by nobody, repeatedly, means nobody is
+                    // settled -- the whole cluster restarted together and
+                    // every group sits quorum-invisible waiting for a primary
+                    // that cannot exist. Fall back to an election: recovered
+                    // WALs compete on (log_view, op) in the DVC exchange, so
+                    // the best surviving log leads; a group whose members all
+                    // rejoined journal-less elects on equal terms and stands
+                    // on its recovered durable state. Any still-live settled
+                    // primary answers well before the fallback fires.
+                    let attempts = self.probe_attempts.get() + 1;
+                    self.probe_attempts.set(attempts);
+                    if attempts >= PROBE_ATTEMPTS_MAX {
+                        self.finish_view_probe();
+                        actions.extend(
+                            self.start_election(plane, ViewChangeReason::ViewProbeUnanswered),
+                        );
+                    } else {
+                        self.timeouts
+                            .borrow_mut()
+                            .reset(TimeoutKind::RequestStartViewMessage);
+                        actions.push(VsrAction::SendRequestStartView {
+                            view: self.view.get(),
+                            namespace: self.namespace,
+                        });
+                    }
+                }
+                Status::ViewChange if self.primary_index(self.view.get()) != self.replica => {
+                    self.timeouts
+                        .borrow_mut()
+                        .reset(TimeoutKind::RequestStartViewMessage);
+                    actions.push(VsrAction::SendRequestStartView {
+                        view: self.view.get(),
+                        namespace: self.namespace,
+                    });
+                }
+                _ => {
+                    // Stale arm (e.g. went Normal without passing an exit
+                    // that stops it): silence it instead of refiring every
+                    // tick.
+                    self.timeouts
+                        .borrow_mut()
+                        .stop(TimeoutKind::RequestStartViewMessage);
+                }
+            }
+            timeouts = self.timeouts.borrow_mut();
+        }
+
         if timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
             actions.extend(self.handle_view_change_status_timeout(plane));
@@ -1140,8 +1476,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
     fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        // Only backups trigger view change on heartbeat timeout
-        if self.is_primary() {
+        // A recovering replica makes progress through RequestStartView
+        // retries, not elections; it is quorum-invisible.
+        if self.status.get() == Status::Recovering {
+            return Vec::new();
+        }
+
+        // Only backups trigger view change on heartbeat timeout. `is_primary`
+        // is pure view math though: a replica that booted recovering / with
+        // ceded primaryship while sitting at the primary index is a backup by
+        // role -- if it early-returned here it would neither heartbeat nor
+        // start an election, silently dropping out of quorum until an
+        // unrelated view change rescues it. Let it climb StartViewChange like
+        // any other backup.
+        if self.is_primary() && !self.ceded_primaryship.get() {
             return Vec::new();
         }
 
@@ -1150,7 +1498,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Advance to new view and transition to view change
+        self.start_election(plane, ViewChangeReason::NormalHeartbeatTimeout)
+    }
+
+    /// Advance to `view + 1` and start a view change (own SVC counted).
+    fn start_election(&self, plane: PlaneKind, reason: ViewChangeReason) -> Vec<VsrAction> {
         let old_view = self.view.get();
         let new_view = old_view + 1;
 
@@ -1162,12 +1514,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .insert(self.replica as usize);
 
-        // Update timeouts for view change status
         {
             let mut timeouts = self.timeouts.borrow_mut();
             timeouts.stop(TimeoutKind::NormalHeartbeat);
             timeouts.start(TimeoutKind::StartViewChangeMessage);
             timeouts.start(TimeoutKind::ViewChangeStatus);
+            timeouts.start(TimeoutKind::RequestStartViewMessage);
         }
 
         emit_sim_event(
@@ -1176,7 +1528,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 replica: ReplicaLogContext::from_consensus(self, plane),
                 old_view,
                 new_view,
-                reason: ViewChangeReason::NormalHeartbeatTimeout,
+                reason,
             },
         );
 
@@ -1333,19 +1685,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
     fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
-        // TODO(prepare-timeout): adopt TigerBeetle's timer lifecycle
-        // (replica.zig `on_prepare_ok` / `on_prepare_timeout`). They
-        // disarm in the ack path the moment quorum drains the pipeline
-        // (`stop()`) and rearm for the next-oldest prepare when one
-        // commits with others still pending (`reset()`), giving the
-        // invariant "ticking iff pipeline non-empty" (asserted in their
-        // timeout handler) and a timeout that always measures the
-        // current oldest prepare's age. Ours arms once per idle->busy
-        // transition and disarms lazily below, so a prepare pushed late
-        // into an armed window can be retransmitted before it is
-        // `PREPARE_TICKS` old. They also special-case "all remote acks
-        // present, own journal write is the laggard" by retrying the
-        // local write instead of retransmitting.
+        // TODO(prepare-timeout): tighten the timer lifecycle: disarm in
+        // the ack path the moment quorum drains the pipeline and rearm
+        // for the next-oldest prepare when one commits with others still
+        // pending, giving the invariant "ticking iff pipeline non-empty"
+        // and a timeout that always measures the current oldest
+        // prepare's age. Ours arms once per idle->busy transition and
+        // disarms lazily below, so a prepare pushed late into an armed
+        // window can be retransmitted before it is `PREPARE_TICKS` old.
+        // Also worth special-casing "all remote acks present, own
+        // journal write is the laggard" by retrying the local write
+        // instead of retransmitting.
         //
         // Every early return below must stop or back off the timeout.
         // `fired()` stays true until the timer is rearmed, so returning
@@ -1371,6 +1721,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        tracing::debug!(
+            replica = self.replica,
+            view = self.view.get(),
+            targets = targets.len(),
+            first_op = targets.first().map(|(h, _)| h.op),
+            "prepare timeout: retransmitting un-acked prepares"
+        );
         self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
 
         vec![VsrAction::RetransmitPrepares { targets }]
@@ -1417,6 +1774,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             header.namespace, self.namespace,
             "SVC routed to wrong group"
         );
+        // A recovering replica is quorum-invisible: it lost (or cannot trust)
+        // its durable state, so it must not vote history into existence. The
+        // election proceeds among the peers; its conclusion reaches this
+        // replica via StartView, which recovery accepts.
+        if self.status.get() == Status::Recovering {
+            return Vec::new();
+        }
         let from_replica = header.replica;
         let msg_view = header.view;
 
@@ -1444,6 +1808,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.stop(TimeoutKind::NormalHeartbeat);
                 timeouts.start(TimeoutKind::StartViewChangeMessage);
                 timeouts.start(TimeoutKind::ViewChangeStatus);
+                timeouts.start(TimeoutKind::RequestStartViewMessage);
             }
 
             emit_sim_event(
@@ -1565,6 +1930,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             header.namespace, self.namespace,
             "DVC routed to wrong group"
         );
+        // Quorum-invisible while recovering (see handle_start_view_change):
+        // a recovering replica must not collect DVCs and crown itself.
+        if self.status.get() == Status::Recovering {
+            return Vec::new();
+        }
         let from_replica = header.replica;
         let msg_view = header.view;
         let msg_log_view = header.log_view;
@@ -1595,6 +1965,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.stop(TimeoutKind::NormalHeartbeat);
                 timeouts.start(TimeoutKind::StartViewChangeMessage);
                 timeouts.start(TimeoutKind::ViewChangeStatus);
+                timeouts.start(TimeoutKind::RequestStartViewMessage);
             }
 
             emit_sim_event(
@@ -1672,6 +2043,113 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
+    /// Begin the view probe: broadcast `RequestStartView` and keep
+    /// re-broadcasting on `TimeoutKind::RequestStartViewMessage` until the
+    /// current view's primary answers with a targeted `StartView` (or an
+    /// election's `StartView` adopts this replica first). The replica sits
+    /// in `Status::Recovering` meanwhile: it acks nothing, votes in no
+    /// election, and initiates nothing.
+    /// Returns nothing: the first probe rides the
+    /// `RequestStartViewMessage` timeout (~1s after boot), by which point
+    /// the replica mesh -- absent entirely at the boot-time call sites --
+    /// has formed. Emitting an action here implied a send that never
+    /// happened.
+    pub fn begin_view_probe(&self) {
+        tracing::info!(
+            replica = self.replica,
+            namespace_raw = self.namespace,
+            "beginning view probe"
+        );
+        self.status.set(Status::Recovering);
+        self.probe_attempts.set(0);
+        let mut timeouts = self.timeouts.borrow_mut();
+        timeouts.stop(TimeoutKind::Prepare);
+        timeouts.stop(TimeoutKind::CommitMessage);
+        timeouts.stop(TimeoutKind::NormalHeartbeat);
+        timeouts.start(TimeoutKind::RequestStartViewMessage);
+    }
+
+    /// Peer side of the probe (sent by a Recovering replica at boot, or by
+    /// a `ViewChange` backup whose copy of the concluding `StartView` was
+    /// lost). Only the current view's PRIMARY answers, with a `StartView`;
+    /// backups stay silent and the prober retries. Special case: a probe
+    /// FROM the replica that is the current view's primary-by-index proves
+    /// that primary cannot lead (a probing replica has either lost its
+    /// state or abandoned the view), so a peer receiving it elects
+    /// immediately instead of waiting out the heartbeat timeout on a slot
+    /// known to be dead.
+    ///
+    /// # Panics
+    /// Panics when the probe is routed to the wrong group.
+    pub fn handle_request_start_view(
+        &self,
+        plane: PlaneKind,
+        header: &RequestStartViewHeader,
+    ) -> Vec<VsrAction> {
+        assert_eq!(
+            header.namespace, self.namespace,
+            "RequestStartView routed to wrong group"
+        );
+        if self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+        if header.replica == self.replica {
+            return Vec::new();
+        }
+        if self.primary_index(self.view.get()) == header.replica {
+            // Probes are re-broadcast on a timer, so delayed duplicates are
+            // the normal case, and `primary_index` is view % replica_count:
+            // a stale probe from replica R re-matches every replica_count
+            // views. Only a probe stamped with the CURRENT view proves the
+            // current primary is the one probing; anything else falls
+            // through (a backup answers nothing, and the true primary of a
+            // newer view answers with its StartView).
+            if header.view == self.view.get() {
+                return self.start_election(plane, ViewChangeReason::PrimaryProbedView);
+            }
+            return Vec::new();
+        }
+        if !self.is_primary() || self.ceded_primaryship.get() {
+            return Vec::new();
+        }
+        // A primary mid-transition (log_view lagging) has no settled
+        // frontier to publish yet.
+        if self.log_view.get() != self.view.get() {
+            return Vec::new();
+        }
+        vec![VsrAction::SendStartView {
+            view: self.view.get(),
+            op: self.sequencer.current_sequence(),
+            commit: self.commit_max.get(),
+            namespace: self.namespace,
+        }]
+    }
+
+    /// Set the commit floor after journal repair filled `(floor, commit_max]`:
+    /// everything at or below `floor` is represented by this replica's
+    /// recovered durable state (segments + offset files), proven by the
+    /// serving peer answering `RangeEvicted { retained_from = floor + 1 }`.
+    /// Unlike the retired first-commit fast-forward, ops in the repair window
+    /// are journaled and WALKED, never skipped.
+    ///
+    /// # Panics
+    /// Panics when `floor` would rewind the already-executed `commit_min`.
+    pub fn set_commit_floor(&self, floor: u64) {
+        let current = self.commit_min.get();
+        assert!(
+            current <= floor,
+            "commit floor {floor} may not rewind commit_min {current}"
+        );
+        self.commit_min.set(floor);
+    }
+
+    fn finish_view_probe(&self) {
+        self.probe_attempts.set(0);
+        self.timeouts
+            .borrow_mut()
+            .stop(TimeoutKind::RequestStartViewMessage);
+    }
+
     /// Handle a received `StartView` message (backups only).
     ///
     /// "When other replicas receive the STARTVIEW message, they replace their log
@@ -1721,9 +2199,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Accept the StartView and transition to normal
+        tracing::info!(
+            replica = self.replica,
+            old_view = self.view.get(),
+            new_view = msg_view,
+            op = msg_op,
+            commit = msg_commit,
+            "adopting view from StartView"
+        );
+        // A StartView concluding around an in-flight view probe supersedes
+        // it: the new primary's numbers are at least as fresh as any probe
+        // answer.
+        self.finish_view_probe();
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(msg_commit);
         self.reset_view_change_state();
 
@@ -1791,29 +2282,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
+    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
         assert_eq!(
             header.namespace, self.namespace,
             "Commit routed to wrong group"
         );
 
         if self.is_primary() {
-            return false;
+            // A heartbeat from the primary of an OLDER view means that
+            // replica missed our view change entirely -- typically it
+            // restarted while the view advanced and recovered the stale
+            // view from its journal (there is no durable view watermark),
+            // so the SVC/DVC/SV exchange never reached it. Left alone it
+            // wedges: it drops our newer-view traffic as foreign and we
+            // drop its stale prepares, while its live heartbeats keep its
+            // backups from electing anyone. Re-announcing the current view
+            // lets its `handle_start_view` adopt the view and cancel its
+            // stale pipeline.
+            if self.status.get() == Status::Normal
+                && header.view < self.view.get()
+                && header.replica == self.primary_index(header.view)
+            {
+                return CommitOutcome::RespondStartView;
+            }
+            return CommitOutcome::Accepted;
         }
 
         if self.status.get() != Status::Normal {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         if header.view != self.view.get() {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         // TODO: Once connection-level peer verification is added promote
         // this to an assert, the network layer would guarantee the sender
         // matches header.replica.
         if header.replica != self.primary_index(header.view) {
-            return false;
+            return CommitOutcome::Accepted;
         }
 
         // Only accept heartbeats with a strictly newer timestamp to prevent
@@ -1827,7 +2334,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let old_commit_max = self.commit_max.get();
         self.advance_commit_max(header.commit);
-        self.commit_max.get() > old_commit_max
+        if self.commit_max.get() > old_commit_max {
+            CommitOutcome::Advanced
+        } else {
+            CommitOutcome::Accepted
+        }
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
@@ -1853,6 +2364,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Update state
         self.log_view.set(self.view.get());
         self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
         self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 
@@ -1880,6 +2392,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.stop(TimeoutKind::ViewChangeStatus);
             timeouts.stop(TimeoutKind::DoViewChangeMessage);
             timeouts.stop(TimeoutKind::StartViewChangeMessage);
+            timeouts.stop(TimeoutKind::RequestStartViewMessage);
             timeouts.start(TimeoutKind::CommitMessage);
             // If there are uncommitted ops in the rebuilt pipeline, start the
             // Prepare timeout so that lost PrepareOks trigger retransmission.
@@ -2084,7 +2597,8 @@ where
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
-        // Primary stamps wall-clock once at prepare-build; the value is
+        // Primary stamps the injected clock once at prepare-build (wall time
+        // in production, virtual under the simulator); the value is
         // replicated to every backup so apply() reads the same timestamp
         // across the cluster (deterministic state-machine apply). Monotonic
         // wrapper guards against NTP rewinds; see
@@ -2108,6 +2622,10 @@ where
                 timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
+                // Copied verbatim: carries the stamped acting user for client
+                // ops (and the authenticated user on Register), so the in-apply
+                // RBAC gate resolves the same identity on every backup.
+                user_id: old.user_id,
                 ..Default::default()
             }
         })
@@ -2422,5 +2940,106 @@ mod pipeline_entry_tests {
         let header = PrepareHeader::default();
         let mut entry = PipelineEntry::new(header);
         assert!(entry.take_reply_sender().is_none());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_clamp_tests {
+    //! Pin the monotonic-floor contract: a new primary must never stamp a
+    //! prepare below timestamps already in the replicated log, even when its
+    //! wall clock lags the predecessor's.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
+
+    /// Clock frozen at a fixed instant, standing in for a lagging wall
+    /// clock on a freshly elected primary.
+    struct FixedClock(u64);
+
+    impl clock::Clock for FixedClock {
+        type Realtime = IggyTimestamp;
+
+        fn realtime(&self) -> Self::Realtime {
+            IggyTimestamp::from(self.0)
+        }
+    }
+
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+    }
+
+    #[test]
+    fn observed_log_timestamp_floors_new_primary_stamps() {
+        let lagging_clock = ConsensusClock::new(Rc::new(FixedClock(1_000)));
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            1,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            lagging_clock,
+        );
+
+        // Predecessor primary (fast wall clock) committed up to T=50_000;
+        // this replica ingests that head via replication / rebuild.
+        consensus.observe_prepare_timestamp(50_000);
+
+        let stamped = consensus.next_monotonic_timestamp();
+        assert!(
+            stamped > 50_000,
+            "stamp {stamped} regressed below the observed log head"
+        );
+
+        // Own stamps stay strictly monotonic on top of the lifted floor.
+        let second = consensus.next_monotonic_timestamp();
+        assert!(second > stamped);
+
+        // Observing an OLDER timestamp never rewinds the floor.
+        consensus.observe_prepare_timestamp(10);
+        assert!(consensus.next_monotonic_timestamp() > second);
+    }
+
+    #[test]
+    fn wall_clock_ahead_of_log_still_wins() {
+        let leading_clock = ConsensusClock::new(Rc::new(FixedClock(100_000)));
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            1,
+            METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+            leading_clock,
+        );
+        consensus.observe_prepare_timestamp(50_000);
+        assert_eq!(
+            consensus.next_monotonic_timestamp(),
+            100_000,
+            "a clock ahead of the log must stamp real time, not floor + 1"
+        );
     }
 }

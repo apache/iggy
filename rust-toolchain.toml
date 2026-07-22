@@ -16,6 +16,6 @@
 # under the License.
 
 [toolchain]
-channel = "1.96.0"
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
 profile = "default"

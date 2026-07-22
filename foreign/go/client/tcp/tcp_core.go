@@ -59,7 +59,8 @@ type IggyTcpClient struct {
 	clientAddress          string
 	currentServerAddress   string
 	connectedAt            time.Time
-	state                  iggcon.State
+	transportState         iggcon.TransportState
+	sessionState           iggcon.SessionState
 	// respHeader is the reused response-status read buffer; guarded by c.mtx.
 	respHeader [ResponseInitialBytesLength]byte
 }
@@ -216,7 +217,8 @@ func NewIggyTcpClient(logger *slog.Logger, options ...Option) *IggyTcpClient {
 		logger:                 logger,
 		clientAddress:          "",
 		conn:                   nil,
-		state:                  iggcon.StateDisconnected,
+		transportState:         iggcon.TransportStateDisconnected,
+		sessionState:           iggcon.SessionStateUnauthenticated,
 		connectedAt:            time.Time{},
 		leaderRedirectionState: iggcon.LeaderRedirectionState{},
 		currentServerAddress:   opts.config.serverAddress,
@@ -303,29 +305,66 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 	return resp, err
 }
 
+// SendBinaryRequest sends a command code and payload and returns the raw response body.
+// Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
+	if isSessionControlCode(code) {
+		return nil, ierror.ErrInvalidCommand
+	}
+
+	bp := acquireRequestBuf()
+	defer releaseRequestBuf(bp)
+
+	buf := encodeRawWireRequest(*bp, code, payload)
+	*bp = buf
+
+	return c.sendWireAndFetchResponse(ctx, buf)
+}
+
+func isSessionControlCode(code uint32) bool {
+	switch code {
+	case uint32(command.LoginUserCode),
+		uint32(command.LogoutUserCode),
+		uint32(command.LoginRegisterCode),
+		uint32(command.LoginWithAccessTokenCode),
+		uint32(command.LoginRegisterWithPATCode):
+		return true
+	default:
+		return false
+	}
+}
+
 // encodeWireRequest writes the wire-format request (4-byte length, 4-byte
 // code, then body) into buf, growing it as needed. The length prefix is
 // written from the realized body length, so a buggy or unimplemented
 // AppendBinary can never corrupt the wire frame (which would desync the
 // persistent TCP stream — there is no per-request resync).
 func encodeWireRequest(buf []byte, cmd command.Command) ([]byte, error) {
-	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(cmd.Code()))
+	buf = encodeRawWireRequest(buf, uint32(cmd.Code()), nil)
 	if a, ok := cmd.(encoding.BinaryAppender); ok {
 		out, err := a.AppendBinary(buf)
 		if err != nil {
 			return nil, err
 		}
-		binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)-4))
-		return out, nil
+		return finalizeWireRequest(out), nil
 	}
 	body, err := cmd.MarshalBinary()
 	if err != nil {
 		return nil, err
 	}
+	return encodeRawWireRequest(buf, uint32(cmd.Code()), body), nil
+}
+
+func encodeRawWireRequest(buf []byte, code uint32, body []byte) []byte {
+	buf = append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(buf[4:8], code)
 	buf = append(buf, body...)
+	return finalizeWireRequest(buf)
+}
+
+func finalizeWireRequest(buf []byte) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf)-4))
-	return buf, nil
+	return buf
 }
 
 // sendWireAndFetchResponse sends a pre-built wire payload (length header,
@@ -341,14 +380,14 @@ func (c *IggyTcpClient) sendWireAndFetchResponse(ctx context.Context, wirePayloa
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	switch c.state {
-	case iggcon.StateShutdown:
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
 		c.logger.Debug("Cannot send data. Client is shutdown.")
 		return nil, ierror.ErrClientShutdown
-	case iggcon.StateDisconnected:
+	case iggcon.TransportStateDisconnected:
 		c.logger.Debug("Cannot send data. Client is not connected.")
 		return nil, ierror.ErrNotConnected
-	case iggcon.StateConnecting:
+	case iggcon.TransportStateConnecting:
 		c.logger.Debug("Cannot send data. Client is still connecting.")
 		return nil, ierror.ErrNotConnected
 	}
@@ -431,12 +470,27 @@ func (c *IggyTcpClient) sendLocked(wirePayload []byte) ([]byte, error) {
 	return buffer, nil
 }
 
+func (c *IggyTcpClient) setSessionState(state iggcon.SessionState) {
+	c.mtx.Lock()
+	c.sessionState = state
+	c.mtx.Unlock()
+}
+
 // invalidateConnLocked closes the connection and marks it as disconnected
 func (c *IggyTcpClient) invalidateConnLocked() {
-	if c.conn != nil {
-		_ = c.conn.Close()
+	_ = c.closeConnLocked()
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
+}
+
+// closeConnLocked closes and drops the current connection.
+func (c *IggyTcpClient) closeConnLocked() error {
+	if c.conn == nil {
+		return nil
 	}
-	c.state = iggcon.StateDisconnected
+	err := c.conn.Close()
+	c.conn = nil
+	return err
 }
 
 func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
@@ -451,24 +505,22 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // Connect establishes the TCP connection to the server.
 func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	c.mtx.Lock()
-	switch c.state {
-	case iggcon.StateShutdown:
+	switch c.transportState {
+	case iggcon.TransportStateShutdown:
 		c.mtx.Unlock()
 		c.logger.Debug("Cannot connect. Client is shutdown.")
 		return ierror.ErrClientShutdown
-	case iggcon.StateConnected,
-		iggcon.StateAuthenticating,
-		iggcon.StateAuthenticated:
+	case iggcon.TransportStateConnected:
 		clientAddress := c.clientAddress
 		c.mtx.Unlock()
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
 		return nil
-	case iggcon.StateConnecting:
+	case iggcon.TransportStateConnecting:
 		c.mtx.Unlock()
 		c.logger.Debug("Client is already connecting.")
 		return nil
 	default:
-		c.state = iggcon.StateConnecting
+		c.transportState = iggcon.TransportStateConnecting
 	}
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
@@ -543,7 +595,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			return nil
 		}); err != nil {
 		c.mtx.Lock()
-		c.state = iggcon.StateDisconnected
+		c.transportState = iggcon.TransportStateDisconnected
 		c.mtx.Unlock()
 		if !c.config.reconnection.enabled {
 			c.logger.Warn("Automatic reconnection is disabled.")
@@ -554,7 +606,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 
 	c.mtx.Lock()
 	c.conn = conn
-	c.state = iggcon.StateConnected
+	c.transportState = iggcon.TransportStateConnected
 	c.connectedAt = time.Now()
 	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
 	c.mtx.Unlock()
@@ -610,44 +662,38 @@ func (c *IggyTcpClient) disconnect() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateDisconnected {
+	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
 
 	c.logger.Info("Iggy client is disconnecting from server...", slog.String("client_address", c.clientAddress))
-	c.state = iggcon.StateDisconnected
+	c.transportState = iggcon.TransportStateDisconnected
+	c.sessionState = iggcon.SessionStateUnauthenticated
 
-	if c.conn != nil {
-		if err := c.conn.Close(); err != nil {
-			return err
-		}
-	}
+	err := c.closeConnLocked()
 
 	c.logger.Info("Iggy client has disconnected from server.", slog.String("client_address", c.clientAddress))
 	// TODO event pushing logic
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) shutdown() error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	if c.state == iggcon.StateShutdown {
+	if c.transportState == iggcon.TransportStateShutdown {
 		return nil
 	}
 
 	c.logger.Info("Shutting down the Iggy TCP client...", slog.String("client_address", c.clientAddress))
 
-	if c.conn != nil {
-		if err := c.conn.Close(); err != nil {
-			return err
-		}
-	}
+	err := c.closeConnLocked()
 
-	c.state = iggcon.StateShutdown
+	c.transportState = iggcon.TransportStateShutdown
+	c.sessionState = iggcon.SessionStateUnauthenticated
 	c.logger.Info("Iggy TCP client has been shutdown.", slog.String("client_address", c.clientAddress))
 	// TODO push shutdown event
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) Close() error {

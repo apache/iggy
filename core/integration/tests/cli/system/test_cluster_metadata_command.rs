@@ -63,7 +63,6 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
                         "Executing get cluster metadata in table mode\n",
                     ))
                     .stdout(contains("Cluster name:"))
-                    .stdout(contains("single-node"))
                     .stdout(contains("Name"))
                     .stdout(contains("IP"))
                     .stdout(contains("TCP"))
@@ -72,7 +71,6 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
                     .stdout(contains("WebSocket"))
                     .stdout(contains("Role"))
                     .stdout(contains("Status"))
-                    .stdout(contains("iggy-node"))
                     .stdout(contains("leader"))
                     .stdout(contains("healthy"));
             }
@@ -81,8 +79,6 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
                     .success()
                     .stdout(starts_with("Executing get cluster metadata in list mode\n"))
                     .stdout(contains("Cluster name:"))
-                    .stdout(contains("single-node"))
-                    .stdout(contains("iggy-node"))
                     .stdout(contains("leader"))
                     .stdout(contains("healthy"));
             }
@@ -171,7 +167,7 @@ pub async fn should_cluster_help_match() {
 {USAGE_PREFIX} cluster <COMMAND>
 
 Commands:
-  metadata  Get cluster metadata [aliases: m]
+  metadata  Get cluster metadata [alias: m]
   help      Print this message or the help of the given subcommand(s)
 
 Options:

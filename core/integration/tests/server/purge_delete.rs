@@ -19,11 +19,6 @@ use crate::server::scenarios::purge_delete_scenario;
 use integration::iggy_harness;
 use test_case::test_matrix;
 
-// Legacy-only: asserts the exact on-disk layout ([0, 7, 14, 21], 7 messages per
-// 5KiB segment) and per-file byte sizes throughout. server-ng's per-message
-// framing yields a different layout, so the scenario's offset anchors do not
-// hold under vsr. Port to a framing-agnostic form to re-enable.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     segment.size = "5KiB",
     segment.cache_indexes = ["all", "none", "open_segment"],
@@ -44,25 +39,11 @@ async fn should_delete_segments_and_validate_filesystem(
     partition.messages_required_to_save = "1",
     partition.enforce_fsync = "true",
 ))]
-// Recovery on restart is fixed -- server-ng reads its own 24-byte segment index
-// via `segment_recovery` (no more "Index data must be exactly 16 bytes" panic;
-// the server restarts + re-meshes cleanly). restart_on stays vsr-gated on a
-// CLIENT blocker: the SDK `ConsensusSession` cannot reconnect after restart --
-// `register_request_id already called` (core/sdk/src/session.rs:121), the same
-// reconnect/re-register lifecycle `user_scenario` hits. Re-enable once that lands.
-#[cfg_attr(not(feature = "vsr"), test_matrix([restart_off(), restart_on()]))]
-#[cfg_attr(feature = "vsr", test_matrix([restart_off()]))]
+#[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_without_consumers(harness: &mut TestHarness, restart_server: bool) {
     purge_delete_scenario::run_no_consumers(harness, restart_server).await;
 }
 
-// vsr-gated: asserts a segment is freed *exactly* when the polled offset
-// reaches its end — a synchronous-commit assumption. Under vsr the
-// consumer-group auto-commit lags the poll, so the per-message timing does not
-// hold (the barrier itself is correct: the server retains un-consumed
-// segments, verified by `min_committed_offset` + its runtime diag). Legacy-only
-// until redesigned to sync on the committed offset for async commit.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     segment.size = "5KiB",
     segment.cache_indexes = ["all", "none", "open_segment"],
@@ -76,9 +57,6 @@ async fn should_delete_segments_with_consumer_group_barrier(harness: &TestHarnes
     purge_delete_scenario::run_consumer_group_barrier(&client, &data_path).await;
 }
 
-// Legacy-only: pins the [0, 7, 14, 21] layout across a multi-consumer barrier.
-// server-ng framing differs; port to framing-agnostic to re-enable.
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness(server(
     segment.size = "5KiB",
     segment.cache_indexes = ["all", "none", "open_segment"],
@@ -101,11 +79,8 @@ async fn should_block_deletion_until_all_consumers_pass_segment(
 ))]
 // The scenario asserts the exact [0, 7, 14, 21] layout only on the legacy path;
 // under vsr it verifies the framing-agnostic purge outcome (offsets cleared,
-// files deleted, partition reset to a single segment at offset 0). restart_on
-// stays vsr-gated on the SDK reconnect-after-restart lifecycle (see
-// `should_delete_segments_without_consumers`).
-#[cfg_attr(not(feature = "vsr"), test_matrix([restart_off(), restart_on()]))]
-#[cfg_attr(feature = "vsr", test_matrix([restart_off()]))]
+// files deleted, partition reset to a single segment at offset 0).
+#[test_matrix([restart_off(), restart_on()])]
 async fn should_purge_topic_and_clear_consumer_offsets(
     harness: &mut TestHarness,
     restart_server: bool,
@@ -117,9 +92,6 @@ fn restart_off() -> bool {
     false
 }
 
-// Only the `not(vsr)` matrix cell uses restart_on (restart is vsr-gated on the
-// SDK reconnect lifecycle above), so it is unused under the vsr feature.
-#[cfg(not(feature = "vsr"))]
 fn restart_on() -> bool {
     true
 }

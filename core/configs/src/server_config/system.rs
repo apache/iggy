@@ -18,7 +18,7 @@
 use super::cache_indexes::CacheIndexesConfig;
 use super::server::MemoryPoolConfig;
 use super::sharding::ShardingConfig;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, ConfigEnvMappings};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
@@ -33,8 +33,13 @@ use server_common::log::LoggingSettings;
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
 
+// Generic over the sharding config so the legacy server and `server-ng` each
+// bind their own `ShardingConfig` (different knob sets, different default
+// source) while sharing this whole struct and its path helpers. The default
+// type param keeps bare `SystemConfig` meaning the legacy variant, so existing
+// callers compile unchanged.
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct SystemConfig {
+pub struct SystemConfig<S: ConfigEnvMappings = ShardingConfig> {
     pub path: String,
     pub backup: BackupConfig,
     pub state: StateConfig,
@@ -49,7 +54,7 @@ pub struct SystemConfig {
     pub message_deduplication: MessageDeduplicationConfig,
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
-    pub sharding: ShardingConfig,
+    pub sharding: S,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
@@ -188,7 +193,7 @@ pub struct StateConfig {
     pub retry_delay: IggyDuration,
 }
 
-impl SystemConfig {
+impl<S: ConfigEnvMappings> SystemConfig<S> {
     pub fn get_system_path(&self) -> String {
         self.path.to_string()
     }
@@ -352,7 +357,7 @@ impl SystemConfig {
     }
 }
 
-impl SystemPaths for SystemConfig {
+impl<S: ConfigEnvMappings> SystemPaths for SystemConfig<S> {
     fn get_system_path(&self) -> String {
         SystemConfig::get_system_path(self)
     }

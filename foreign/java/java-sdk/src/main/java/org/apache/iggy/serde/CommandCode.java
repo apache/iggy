@@ -55,7 +55,8 @@ public interface CommandCode {
         UPDATE_PERMISSIONS(36),
         CHANGE_PASSWORD(37),
         LOGIN(38),
-        LOGOUT(39);
+        LOGOUT(39),
+        LOGIN_REGISTER(40);
 
         private final int value;
 
@@ -73,7 +74,8 @@ public interface CommandCode {
         GET_ALL(41),
         CREATE(42),
         DELETE(43),
-        LOGIN(44);
+        LOGIN(44),
+        LOGIN_REGISTER(45);
 
         private final int value;
 

@@ -282,7 +282,8 @@ updates:
           - "*"
 
   - package-ecosystem: "bazel"
-    directory: "/foreign/cpp"
+    directories:
+      - "/foreign/cpp"
     schedule:
       interval: "weekly"
       day: "thursday"

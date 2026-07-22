@@ -122,6 +122,8 @@ pub enum IggyError {
     InvalidPersonalAccessTokenExpiry = 56,
     #[error("Request transiently not committed; retry")]
     TransientNotCommitted = 57,
+    #[error("Request transiently not accepted; retry, on any replica")]
+    TransientNotAccepted = 58,
     #[error("Not connected")]
     NotConnected = 61,
     #[error("Client shutdown")]

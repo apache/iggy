@@ -272,10 +272,11 @@ mod tests {
         let mux: MuxStateMachine<MuxTuple> = MuxStateMachine::new(variadic!(users, streams));
 
         let sequence_number = 12345u64;
-        let snapshot = IggySnapshot::create(&mux, sequence_number).unwrap();
+        let created_at = 1_700_000_000_000_000u64;
+        let snapshot = IggySnapshot::create(&mux, sequence_number, created_at).unwrap();
 
         assert_eq!(snapshot.sequence_number(), sequence_number);
-        assert!(snapshot.created_at() > 0);
+        assert_eq!(snapshot.created_at(), created_at);
 
         // Encode to bytes
         let encoded = snapshot.encode().unwrap();
@@ -284,6 +285,7 @@ mod tests {
         // Decode from bytes
         let decoded = IggySnapshot::decode(&encoded).unwrap();
         assert_eq!(decoded.sequence_number(), sequence_number);
+        assert_eq!(decoded.created_at(), created_at);
 
         // Verify snapshot fields are present
         assert!(decoded.snapshot().users.is_some());

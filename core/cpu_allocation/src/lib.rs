@@ -22,10 +22,16 @@
 //! the server config (TOML). The config crate re-exports them, and the
 //! `shard_allocator` crate turns them into a real plan. Kept in their
 //! own little crate so neither side has to pull in the other's heavy
-//! dependencies just to share two small enums.
+//! dependencies just to share two small enums. Also home to
+//! [`allowed_cpus`], the probe for the process's allowed CPU set, which
+//! both sides consult when validating and pinning cores.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::str::FromStr;
+
+mod allowed_cpus;
+
+pub use allowed_cpus::allowed_cpus;
 
 /// Tell server how many CPU cores to grab for shards, and how.
 ///
