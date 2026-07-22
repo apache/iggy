@@ -233,7 +233,7 @@ repos:
         entry: bash -c 'cd foreign/go && golangci-lint run --timeout=5m ./...'
         language: golang
         additional_dependencies:
-          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+          ["github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3"]
         files: ^foreign/go/.*\.go$
         pass_filenames: false
         stages: [pre-push]
@@ -243,7 +243,7 @@ repos:
         entry: bash -c 'cd bdd/go && golangci-lint run --timeout=5m ./...'
         language: golang
         additional_dependencies:
-          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+          ["github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3"]
         files: ^bdd/go/.*\.go$
         pass_filenames: false
         stages: [pre-push]
@@ -253,7 +253,7 @@ repos:
         entry: bash -c 'cd examples/go && golangci-lint run --timeout=5m ./...'
         language: golang
         additional_dependencies:
-          ["github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8"]
+          ["github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3"]
         files: ^examples/go/.*\.go$
         pass_filenames: false
         stages: [pre-push]

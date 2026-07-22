@@ -17,22 +17,22 @@
 
 # C++ BDD harness, built in three stages so the runtime image carries only what the test run
 # needs (~330 MB instead of ~10 GB for a single toolchain image):
-#   1. build   - Bazel builds the cucumber-cpp wire server. bdd/cpp is its own Bazel module and
-#                links the Iggy C++ SDK from foreign/cpp via local_path_override; rules_rust
-#                fetches its own Rust toolchain, so no system Rust is needed.
+#   1. build   - Bazel builds the cucumber-cpp wire server from the foreign/cpp module, where a
+#                symlink exposes the step definitions stored under bdd/cpp; rules_rust fetches
+#                its own Rust toolchain, so no system Rust is needed.
 #   2. deps    - Bundler installs the Ruby Cucumber runner (compiles the ffi native extension).
 #   3. runtime - copies the wire server binary and the vendored gems, then runs cucumber.
 # cucumber-cpp v0.8.0 is wire-only: the Ruby runner reads the shared feature files and drives
 # the C++ wire server over the wire protocol.
 
 # Stage 1: build the wire server with Bazel.
-FROM gcr.io/bazel-public/bazel:9.1.1 AS build
+FROM gcr.io/bazel-public/bazel:9.2.0 AS build
 
 USER root
 WORKDIR /workspace
 COPY . .
 
-RUN cd bdd/cpp \
+RUN cd foreign/cpp \
     && bazel build --config=ci //:bdd_wire_server \
     && cp bazel-bin/bdd_wire_server /tmp/bdd_wire_server
 
