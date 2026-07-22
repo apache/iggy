@@ -18,16 +18,17 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    Client as IggyConnectionClient, ClusterClient,
+    AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
-    IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
-    Permissions as RustPermissions, PollingStrategy, SegmentClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
-    UserStatus as RustUserStatus,
+    IggyClientBuilder as RustIggyClientBuilder, IggyDuration as RustIggyDuration,
+    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
+    MessageClient, PartitionClient, Partitioning, Permissions as RustPermissions, PollingStrategy,
+    SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    UserClient, UserStatus as RustUserStatus,
 };
+use iggy_common::Credentials as RustCredentials;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -74,23 +75,71 @@ pub struct Client {
 ///   (use-after-free).
 /// - This function does not provide synchronisation. The pointer must not be used concurrently
 ///   from multiple threads unless the caller serialises access externally.
-pub fn new_connection(connection_string: String) -> Result<*mut Client, String> {
-    let connection_str = connection_string.as_str();
-    let client = match connection_str {
-        "" => RustIggyClientBuilder::new()
-            .with_tcp()
-            .build()
-            .map_err(|error| format!("Could not build default connection: {error}"))?,
-        s if s.starts_with("iggy://") || s.starts_with("iggy+") => {
-            RustIggyClient::from_connection_string(s)
-                .map_err(|error| format!("Could not parse connection string '{s}': {error}"))?
+pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, String> {
+    let mut builder = RustIggyClientBuilder::new().with_tcp();
+    if !config.server_address.is_empty() {
+        builder = builder.with_server_address(config.server_address);
+    }
+    match config.auto_login_kind.as_str() {
+        "disabled" => {}
+        "username_password" => {
+            builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
+                RustCredentials::UsernamePassword(config.username, config.password.into()),
+            ));
         }
-        s => RustIggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(connection_string.clone())
-            .build()
-            .map_err(|error| format!("Could not build connection for address '{s}': {error}"))?,
-    };
+        "personal_access_token" => {
+            builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
+                RustCredentials::PersonalAccessToken(config.personal_access_token.into()),
+            ));
+        }
+        _ => return Err("Unsupported automatic login kind".to_owned()),
+    }
+    if config.set_reconnection_max_retries {
+        builder = builder.with_reconnection_max_retries(
+            config
+                .has_reconnection_max_retries
+                .then_some(config.reconnection_max_retries),
+        );
+    }
+    if config.has_reconnection_interval {
+        builder = builder.with_reconnection_interval(RustIggyDuration::from(
+            config.reconnection_interval_micros,
+        ));
+    }
+    if config.has_reestablish_after {
+        builder =
+            builder.with_reestablish_after(RustIggyDuration::from(config.reestablish_after_micros));
+    }
+    if config.has_tls_enabled {
+        builder = builder.with_tls_enabled(config.tls_enabled);
+        if config.tls_enabled {
+            if !config.tls_domain.is_empty() {
+                builder = builder.with_tls_domain(config.tls_domain);
+            }
+            if !config.tls_ca_file.is_empty() {
+                builder = builder.with_tls_ca_file(config.tls_ca_file);
+            }
+            if config.has_tls_validate_certificate {
+                builder = builder.with_tls_validate_certificate(config.tls_validate_certificate);
+            }
+        }
+    }
+    if config.no_delay {
+        builder = builder.with_no_delay();
+    }
+    let client = builder
+        .build()
+        .map_err(|error| format!("Could not build configured connection: {error}"))?;
+
+    Ok(Box::into_raw(Box::new(Client {
+        inner: Arc::new(client),
+    })))
+}
+
+pub fn from_connection_string(connection_string: String) -> Result<*mut Client, String> {
+    let client = RustIggyClient::from_connection_string(&connection_string).map_err(|error| {
+        format!("Could not parse connection string '{connection_string}': {error}")
+    })?;
 
     Ok(Box::into_raw(Box::new(Client {
         inner: Arc::new(client),

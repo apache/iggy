@@ -51,7 +51,10 @@ TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
     for (const std::string &connection_string : connection_strings) {
         SCOPED_TRACE(connection_string);
         iggy::ffi::Client *client = nullptr;
-        ASSERT_NO_THROW({ client = iggy::ffi::new_connection(connection_string); });
+        ASSERT_NO_THROW({
+            client = connection_string.empty() ? iggy::ffi::new_connection({})
+                                               : iggy::ffi::from_connection_string(connection_string);
+        });
         ASSERT_NE(client, nullptr);
         TrackClient(client);
 
@@ -74,7 +77,7 @@ TEST_F(LowLevelE2E_Client, HttpLoginReturnsAccessToken) {
     RecordProperty("description", "Returns root user information and an access token after HTTP login.");
     constexpr std::uint32_t root_user_id = 0;
     iggy::ffi::Client *client            = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy+http://iggy:iggy@127.0.0.1:3000"); });
+    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+http://iggy:iggy@127.0.0.1:3000"); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -98,14 +101,14 @@ TEST_F(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
 
     for (const std::string &connection_string : malformed_connection_strings) {
         SCOPED_TRACE(connection_string);
-        ASSERT_THROW({ iggy::ffi::new_connection(connection_string); }, std::exception);
+        ASSERT_THROW({ iggy::ffi::from_connection_string(connection_string); }, std::exception);
     }
 }
 
 TEST_F(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
     RecordProperty("description", "Throws when authentication uses invalid credentials after connecting.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -116,7 +119,7 @@ TEST_F(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
 TEST_F(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
     RecordProperty("description", "Rejects a second login attempt that switches to invalid credentials.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -129,7 +132,7 @@ TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
     RecordProperty("description",
                    "Rejects logout before authentication, both before and after connect, then succeeds after login.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -145,7 +148,7 @@ TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
 TEST_F(LowLevelE2E_Client, ReloginOnSameClientAfterLogout) {
     RecordProperty("description", "Returns the same user identity when reauthenticating after a successful logout.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -171,7 +174,7 @@ TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
     RecordProperty("description",
                    "Rejects repeated logout calls once the authenticated session has already logged out.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1614,7 +1617,7 @@ TEST_F(LowLevelE2E_Client, ChangePasswordUpdatesCredentialsAndCanBeRestored) {
 TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
     RecordProperty("description", "Allows client cleanup after a failed login leaves the connection unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -1627,7 +1630,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenDisconnect) {
     RecordProperty("description",
                    "Connects, logs in, disconnects successfully, and rejects authenticated operations afterward.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1640,7 +1643,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenDisconnect) {
 TEST_F(LowLevelE2E_Client, DisconnectWithoutConnect) {
     RecordProperty("description", "Allows disconnect to be called on a client that was never explicitly connected.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1650,7 +1653,7 @@ TEST_F(LowLevelE2E_Client, DisconnectWithoutConnect) {
 TEST_F(LowLevelE2E_Client, DisconnectWithoutLogin) {
     RecordProperty("description", "Allows disconnect after connect even when no user has authenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1663,7 +1666,7 @@ TEST_F(LowLevelE2E_Client, DisconnectThenReconnectWithoutRelogin) {
     RecordProperty("description",
                    "Requires logging in again after a disconnect and reconnect before authenticated operations work.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1677,7 +1680,7 @@ TEST_F(LowLevelE2E_Client, DisconnectThenReconnectWithoutRelogin) {
 TEST_F(LowLevelE2E_Client, DisconnectAfterFailedLogin) {
     RecordProperty("description", "Allows disconnect after a failed login attempt leaves the client unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1691,7 +1694,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenShutdown) {
     RecordProperty("description",
                    "Connects, logs in, shuts down successfully, and rejects further operations afterward.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1706,7 +1709,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenShutdown) {
 TEST_F(LowLevelE2E_Client, ShutdownWithoutConnect) {
     RecordProperty("description", "Allows shutdown to be called on a client that was never explicitly connected.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1716,7 +1719,7 @@ TEST_F(LowLevelE2E_Client, ShutdownWithoutConnect) {
 TEST_F(LowLevelE2E_Client, ShutdownWithoutLogin) {
     RecordProperty("description", "Allows shutdown after connect even when no user has authenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1728,7 +1731,7 @@ TEST_F(LowLevelE2E_Client, ShutdownWithoutLogin) {
 TEST_F(LowLevelE2E_Client, ShutdownAfterFailedLogin) {
     RecordProperty("description", "Allows shutdown after a failed login attempt leaves the client unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1741,7 +1744,7 @@ TEST_F(LowLevelE2E_Client, ShutdownAfterFailedLogin) {
 TEST_F(LowLevelE2E_Client, RepeatedShutdownCallsHaveStableBehavior) {
     RecordProperty("description", "Keeps repeated shutdown calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1755,7 +1758,7 @@ TEST_F(LowLevelE2E_Client, RepeatedShutdownCallsHaveStableBehavior) {
 TEST_F(LowLevelE2E_Client, ShutdownThenConnectThrows) {
     RecordProperty("description", "Rejects reconnecting a client after shutdown transitions it to a terminal state.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1769,7 +1772,7 @@ TEST_F(LowLevelE2E_Client, ShutdownThenLoginThrows) {
     RecordProperty("description",
                    "Rejects logging in again after shutdown, even when login would normally auto-connect.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1871,7 +1874,7 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) 
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
     RecordProperty("description", "Supports login without an explicit prior connect call.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1881,7 +1884,7 @@ TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
 TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     RecordProperty("description", "Allows connecting without logging in and then deleting the client.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -1892,7 +1895,7 @@ TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
 TEST_F(LowLevelE2E_Client, DeleteWithoutDisconnect) {
     RecordProperty("description", "Allows deleting a connected and authenticated client without disconnecting first.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -1905,7 +1908,7 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     RecordProperty("description",
                    "Keeps repeated connect, login, and delete calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -1921,7 +1924,7 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
 TEST_F(LowLevelE2E_Client, RepeatedDisconnectCallsHaveStableBehavior) {
     RecordProperty("description", "Keeps repeated disconnect calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -3033,7 +3036,8 @@ TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnection
                    "Returns the configured heartbeat interval in microseconds from the connection string.");
     constexpr std::uint64_t configured_heartbeat_micros = 10'000'000ull;
     iggy::ffi::Client *client                           = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
+    ASSERT_NO_THROW(
+        { client = iggy::ffi::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 

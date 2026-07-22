@@ -28,6 +28,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "world.hpp"
 
@@ -44,7 +45,9 @@ GIVEN("^I have a running Iggy server$") {
     // Empty address makes the SDK fall back to its default TCP endpoint; in CI the address
     // is supplied via IGGY_TCP_ADDRESS (e.g. iggy-server:8090).
     const std::string address = env_or("IGGY_TCP_ADDRESS", "");
-    iggy::ffi::Client *client = iggy::ffi::new_connection(address);
+    iggy::ffi::IggyClientConfig config{};
+    config.server_address     = address;
+    iggy::ffi::Client *client = iggy::ffi::new_connection(std::move(config));
     ASSERT_NE(client, nullptr);
     context->client = client;
     context->client->connect();

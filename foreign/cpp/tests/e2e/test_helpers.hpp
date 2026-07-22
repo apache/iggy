@@ -118,7 +118,7 @@ class E2ETestFixture : public ::testing::Test {
 
     iggy::ffi::Client *GetLoggedOutClient() {
         iggy::ffi::Client *client = nullptr;
-        EXPECT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ client = iggy::ffi::new_connection({}); });
         EXPECT_NE(client, nullptr);
         if (client == nullptr) {
             return nullptr;
@@ -251,7 +251,7 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
         EXPECT_NE(cleanup_client, nullptr);
         if (cleanup_client != nullptr) {
             EXPECT_NO_THROW(cleanup_client->connect());
@@ -272,7 +272,7 @@ class E2ETestFixture : public ::testing::Test {
 
         iggy::ffi::Client *cleanup_client = nullptr;
         try {
-            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client = iggy::ffi::new_connection({});
             if (cleanup_client != nullptr) {
                 cleanup_client->connect();
                 cleanup_client->login_user("iggy", "iggy");
@@ -299,7 +299,7 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
         EXPECT_NE(cleanup_client, nullptr);
         if (cleanup_client != nullptr) {
             EXPECT_NO_THROW(cleanup_client->connect());
@@ -323,7 +323,7 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
         EXPECT_NE(cleanup_client, nullptr);
         if (cleanup_client != nullptr) {
             EXPECT_NO_THROW(cleanup_client->connect());
@@ -346,7 +346,7 @@ class E2ETestFixture : public ::testing::Test {
 
         iggy::ffi::Client *cleanup_client = nullptr;
         try {
-            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client = iggy::ffi::new_connection({});
             if (cleanup_client != nullptr) {
                 cleanup_client->connect();
                 cleanup_client->login_user("iggy", "iggy");
@@ -378,7 +378,7 @@ class E2ETestFixture : public ::testing::Test {
 
         iggy::ffi::Client *cleanup_client = nullptr;
         try {
-            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client = iggy::ffi::new_connection({});
             if (cleanup_client != nullptr) {
                 cleanup_client->connect();
                 cleanup_client->login_user("iggy", "iggy");

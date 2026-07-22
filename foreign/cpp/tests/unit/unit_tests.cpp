@@ -24,76 +24,77 @@
 #include "iggy.hpp"
 
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::CompressionAlgorithm::none().compression_algorithm_value(), "none");
-    EXPECT_EQ(iggy::CompressionAlgorithm::gzip().compression_algorithm_value(), "gzip");
+    EXPECT_EQ(iggy::CompressionAlgorithm::None().CompressionAlgorithmValue(), "none");
+    EXPECT_EQ(iggy::CompressionAlgorithm::Gzip().CompressionAlgorithmValue(), "gzip");
 }
 
 TEST(SnapshotCompressionTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SnapshotCompression::stored().snapshot_compression_value(), "stored");
-    EXPECT_EQ(iggy::SnapshotCompression::deflated().snapshot_compression_value(), "deflated");
-    EXPECT_EQ(iggy::SnapshotCompression::bzip2().snapshot_compression_value(), "bzip2");
-    EXPECT_EQ(iggy::SnapshotCompression::zstd().snapshot_compression_value(), "zstd");
-    EXPECT_EQ(iggy::SnapshotCompression::lzma().snapshot_compression_value(), "lzma");
-    EXPECT_EQ(iggy::SnapshotCompression::xz().snapshot_compression_value(), "xz");
+    EXPECT_EQ(iggy::SnapshotCompression::Stored().SnapshotCompressionValue(), "stored");
+    EXPECT_EQ(iggy::SnapshotCompression::Deflated().SnapshotCompressionValue(), "deflated");
+    EXPECT_EQ(iggy::SnapshotCompression::Bzip2().SnapshotCompressionValue(), "bzip2");
+    EXPECT_EQ(iggy::SnapshotCompression::Zstd().SnapshotCompressionValue(), "zstd");
+    EXPECT_EQ(iggy::SnapshotCompression::Lzma().SnapshotCompressionValue(), "lzma");
+    EXPECT_EQ(iggy::SnapshotCompression::Xz().SnapshotCompressionValue(), "xz");
 }
 
 TEST(SystemSnapshotTypeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SystemSnapshotType::filesystem_overview().snapshot_type_value(), "filesystem_overview");
-    EXPECT_EQ(iggy::SystemSnapshotType::process_list().snapshot_type_value(), "process_list");
-    EXPECT_EQ(iggy::SystemSnapshotType::resource_usage().snapshot_type_value(), "resource_usage");
-    EXPECT_EQ(iggy::SystemSnapshotType::test().snapshot_type_value(), "test");
-    EXPECT_EQ(iggy::SystemSnapshotType::server_logs().snapshot_type_value(), "server_logs");
-    EXPECT_EQ(iggy::SystemSnapshotType::server_config().snapshot_type_value(), "server_config");
-    EXPECT_EQ(iggy::SystemSnapshotType::all().snapshot_type_value(), "all");
+    EXPECT_EQ(iggy::SystemSnapshotType::FilesystemOverview().SnapshotTypeValue(), "filesystem_overview");
+    EXPECT_EQ(iggy::SystemSnapshotType::ProcessList().SnapshotTypeValue(), "process_list");
+    EXPECT_EQ(iggy::SystemSnapshotType::ResourceUsage().SnapshotTypeValue(), "resource_usage");
+    EXPECT_EQ(iggy::SystemSnapshotType::Test().SnapshotTypeValue(), "test");
+    EXPECT_EQ(iggy::SystemSnapshotType::ServerLogs().SnapshotTypeValue(), "server_logs");
+    EXPECT_EQ(iggy::SystemSnapshotType::ServerConfig().SnapshotTypeValue(), "server_config");
+    EXPECT_EQ(iggy::SystemSnapshotType::All().SnapshotTypeValue(), "all");
 }
 
 TEST(IdKindTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::IdKind::numeric().id_kind_value(), "numeric");
-    EXPECT_EQ(iggy::IdKind::string().id_kind_value(), "string");
+    EXPECT_EQ(iggy::IdKind::Numeric().IdKindValue(), "numeric");
+    EXPECT_EQ(iggy::IdKind::String().IdKindValue(), "string");
 }
 
 TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::MaxTopicSize::server_default().max_topic_size(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::unlimited().max_topic_size(), "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(0).max_topic_size(), "server_default");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(std::numeric_limits<std::uint64_t>::max()).max_topic_size(), "unlimited");
-    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(1024).max_topic_size(), "1024");
+    EXPECT_EQ(iggy::MaxTopicSize::ServerDefault().MaxTopicSizeValue(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::Unlimited().MaxTopicSizeValue(), "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(0).MaxTopicSizeValue(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(std::numeric_limits<std::uint64_t>::max()).MaxTopicSizeValue(),
+              "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::FromBytes(1024).MaxTopicSizeValue(), "1024");
 }
 
 TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
-    const auto offset = iggy::PollingStrategy::offset(7);
-    EXPECT_EQ(offset.polling_strategy_kind(), "offset");
-    EXPECT_EQ(offset.polling_strategy_value(), 7u);
+    const auto offset = iggy::PollingStrategy::Offset(7);
+    EXPECT_EQ(offset.PollingStrategyKind(), "offset");
+    EXPECT_EQ(offset.PollingStrategyValue(), 7u);
 
-    const auto timestamp = iggy::PollingStrategy::timestamp(42);
-    EXPECT_EQ(timestamp.polling_strategy_kind(), "timestamp");
-    EXPECT_EQ(timestamp.polling_strategy_value(), 42u);
+    const auto timestamp = iggy::PollingStrategy::Timestamp(42);
+    EXPECT_EQ(timestamp.PollingStrategyKind(), "timestamp");
+    EXPECT_EQ(timestamp.PollingStrategyValue(), 42u);
 
-    const auto first = iggy::PollingStrategy::first();
-    EXPECT_EQ(first.polling_strategy_kind(), "first");
-    EXPECT_EQ(first.polling_strategy_value(), 0u);
+    const auto first = iggy::PollingStrategy::First();
+    EXPECT_EQ(first.PollingStrategyKind(), "first");
+    EXPECT_EQ(first.PollingStrategyValue(), 0u);
 
-    const auto last = iggy::PollingStrategy::last();
-    EXPECT_EQ(last.polling_strategy_kind(), "last");
-    EXPECT_EQ(last.polling_strategy_value(), 0u);
+    const auto last = iggy::PollingStrategy::Last();
+    EXPECT_EQ(last.PollingStrategyKind(), "last");
+    EXPECT_EQ(last.PollingStrategyValue(), 0u);
 
-    const auto next = iggy::PollingStrategy::next();
-    EXPECT_EQ(next.polling_strategy_kind(), "next");
-    EXPECT_EQ(next.polling_strategy_value(), 0u);
+    const auto next = iggy::PollingStrategy::Next();
+    EXPECT_EQ(next.PollingStrategyKind(), "next");
+    EXPECT_EQ(next.PollingStrategyValue(), 0u);
 }
 
 TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
-    const auto server_default = iggy::Expiry::server_default();
-    EXPECT_EQ(server_default.expiry_kind(), "server_default");
-    EXPECT_EQ(server_default.expiry_value(), static_cast<std::uint64_t>(0));
+    const auto server_default = iggy::Expiry::ServerDefault();
+    EXPECT_EQ(server_default.ExpiryKind(), "server_default");
+    EXPECT_EQ(server_default.ExpiryValue(), static_cast<std::uint64_t>(0));
 
-    const auto never_expire = iggy::Expiry::never_expire();
-    EXPECT_EQ(never_expire.expiry_kind(), "never_expire");
-    EXPECT_EQ(never_expire.expiry_value(), std::numeric_limits<std::uint64_t>::max());
+    const auto never_expire = iggy::Expiry::NeverExpire();
+    EXPECT_EQ(never_expire.ExpiryKind(), "never_expire");
+    EXPECT_EQ(never_expire.ExpiryValue(), std::numeric_limits<std::uint64_t>::max());
 
-    const auto duration = iggy::Expiry::duration(15);
-    EXPECT_EQ(duration.expiry_kind(), "duration");
-    EXPECT_EQ(duration.expiry_value(), static_cast<std::uint64_t>(15));
+    const auto duration = iggy::Expiry::Duration(15);
+    EXPECT_EQ(duration.ExpiryKind(), "duration");
+    EXPECT_EQ(duration.ExpiryValue(), static_cast<std::uint64_t>(15));
 }
 
 TEST(IggyExceptionTest, StoresMessage) {

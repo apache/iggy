@@ -22,7 +22,7 @@ mod messages;
 mod producer;
 mod type_conversion;
 
-use client::{Client, delete_connection as delete_client, new_connection};
+use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
 use consumer::Consumer;
 use messages::make_message;
 use producer::Producer;
@@ -339,13 +339,36 @@ mod ffi {
         access_token_expiry: u64,
     }
 
+    struct IggyClientConfig {
+        server_address: String,
+        auto_login_kind: String,
+        username: String,
+        password: String,
+        personal_access_token: String,
+        set_reconnection_max_retries: bool,
+        has_reconnection_max_retries: bool,
+        reconnection_max_retries: u32,
+        has_reconnection_interval: bool,
+        reconnection_interval_micros: u64,
+        has_reestablish_after: bool,
+        reestablish_after_micros: u64,
+        has_tls_enabled: bool,
+        tls_enabled: bool,
+        tls_domain: String,
+        tls_ca_file: String,
+        has_tls_validate_certificate: bool,
+        tls_validate_certificate: bool,
+        no_delay: bool,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
         type Producer;
 
         // Client functions
-        fn new_connection(connection_string: String) -> Result<*mut Client>;
+        fn new_connection(config: IggyClientConfig) -> Result<*mut Client>;
+        fn from_connection_string(connection_string: String) -> Result<*mut Client>;
         fn login_user(self: &Client, username: String, password: String) -> Result<LoginInfo>;
         fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
