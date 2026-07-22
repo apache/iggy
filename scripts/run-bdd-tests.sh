@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | all  (default: all)"
+  log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
@@ -46,7 +46,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|all) ;;
+  basic_messaging|leader_redirection|raw_command|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -66,7 +66,7 @@ ALL_COMPOSE_FILES=(
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|all)
+  basic_messaging|leader_redirection|raw_command|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
