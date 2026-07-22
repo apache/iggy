@@ -358,7 +358,9 @@ impl ElasticsearchContainer {
 
 /// Cross-process advisory lock for inspect+rm recovery of the shared reuse
 /// container. Dropping the file releases the lock (including on process crash).
-struct RecoveryLock(File);
+struct RecoveryLock {
+    _file: File,
+}
 
 fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
     let path = std::env::temp_dir().join(RECOVERY_LOCK_FILE_NAME);
@@ -371,7 +373,7 @@ fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
         .map_err(|error| format!("open {}: {error}", path.display()))?;
     file.lock()
         .map_err(|error| format!("lock {}: {error}", path.display()))?;
-    Ok(RecoveryLock(file))
+    Ok(RecoveryLock { _file: file })
 }
 
 /// True only when Docker says the shared container is in a state safe to
