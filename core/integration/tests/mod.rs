@@ -164,7 +164,7 @@ fn write_to_log_file(test_name: &str, buf: &[u8]) {
 fn teardown() {
     // Flush and close all log file handles
     if let Ok(mut files) = LOG_FILES.lock() {
-        for (_, file) in files.iter_mut() {
+        for file in files.values_mut() {
             let _ = file.flush();
         }
         files.clear();

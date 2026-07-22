@@ -17,6 +17,7 @@
 
 use super::COMPONENT_NG;
 use super::message_bus::MessageBusConfig;
+use super::metadata::MetadataConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
@@ -76,6 +77,7 @@ pub struct ServerNgConfig {
     pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
+    pub metadata: MetadataConfig,
     pub message_bus: MessageBusConfig,
 }
 

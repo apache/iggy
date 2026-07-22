@@ -36,10 +36,12 @@ const (
 	ChangePasswordCode       Code = 37
 	LoginUserCode            Code = 38
 	LogoutUserCode           Code = 39
+	LoginRegisterCode        Code = 40
 	GetAccessTokensCode      Code = 41
 	CreateAccessTokenCode    Code = 42
 	DeleteAccessTokenCode    Code = 43
 	LoginWithAccessTokenCode Code = 44
+	LoginRegisterWithPATCode Code = 45
 	PollMessagesCode         Code = 100
 	SendMessagesCode         Code = 101
 	GetOffsetCode            Code = 120

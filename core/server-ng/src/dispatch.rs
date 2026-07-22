@@ -2710,3 +2710,346 @@ where
         .as_ref()
         .and_then(std::rc::Weak::upgrade)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consensus::{LocalPipeline, Plane as _, PlaneKind, VsrConsensus};
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader};
+    use iggy_common::variadic;
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::client_listener::RequestHandler;
+    use message_bus::fd_transfer::DupedFd;
+    use message_bus::installer::ConnectionInstaller;
+    use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
+    use message_bus::replica::listener::MessageHandler;
+    use message_bus::{
+        ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
+        ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    };
+    use metadata::impls::metadata::IggySnapshot;
+    use metadata::stm::stream::Streams;
+    use metadata::stm::user::Users;
+    use metadata::{IggyMetadata, MuxStateMachine};
+    use partitions::{IggyPartitions, PartitionsConfig};
+    use server_common::iobuf::Frozen;
+    use server_common::sharding::ShardId;
+    use server_common::{MESSAGE_ALIGN, Message};
+    use shard::shards_table::PapayaShardsTable;
+    use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::mem::size_of;
+    use std::rc::Rc;
+
+    type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
+    type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
+
+    /// Records every client-bound reply instead of writing to a socket;
+    /// everything else is a no-op. The two `ShellBus` halves are stubbed.
+    #[derive(Debug, Clone, Default)]
+    struct SpyBus {
+        client_replies: Rc<RefCell<Vec<u128>>>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl MessageBus for SpyBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            self.client_replies.borrow_mut().push(client_id);
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    impl ConnectionInstaller for SpyBus {
+        fn install_replica_inbound_fd(
+            &self,
+            _fd: DupedFd,
+            _on_message: MessageHandler,
+            _on_done: ReplicaHandshakeDoneFn,
+        ) {
+        }
+        fn install_replica_outbound_fd(
+            &self,
+            _fd: DupedFd,
+            _replica_id: u8,
+            _on_message: MessageHandler,
+            _on_done: ReplicaHandshakeDoneFn,
+        ) {
+        }
+        fn release_replica_handshake_slot(&self, _slot: u64) {}
+        fn clear_replica_dial_pending(&self, _replica_id: u8) {}
+        fn install_client_fd(
+            &self,
+            _fd: DupedFd,
+            _meta: ClientConnMeta,
+            _on_request: RequestHandler,
+        ) {
+        }
+        fn install_client_ws_fd(
+            &self,
+            _fd: DupedFd,
+            _meta: ClientConnMeta,
+            _on_request: RequestHandler,
+        ) {
+        }
+        fn client_meta(&self, _client_id: u128) -> Option<Rc<ClientConnMeta>> {
+            None
+        }
+        fn set_client_connection_lost_fn(&self, _f: ClientConnectionLostFn) {}
+    }
+
+    /// Minimal committed `Register` reply for `ClientTable::commit_register`
+    /// (reads only `client` and `commit`).
+    fn register_reply(client: u128, session: u64) -> Message<ReplyHeader> {
+        let header_size = size_of::<ReplyHeader>();
+        let mut reply = Message::<ReplyHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut reply.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are a valid ReplyHeader");
+        *header = ReplyHeader {
+            client,
+            request: 0,
+            commit: session,
+            command: Command2::Reply,
+            operation: Operation::Register,
+            ..Default::default()
+        };
+        reply
+    }
+
+    fn request_message(
+        operation: Operation,
+        client: u128,
+        session: u64,
+        request: u64,
+        body: &[u8],
+    ) -> Message<RequestHeader> {
+        let header_size = size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
+                command: Command2::Request,
+                operation,
+                size: u32::try_from(total).expect("test request fits u32"),
+                client,
+                session,
+                request,
+                user_id: 0,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                ..Default::default()
+            };
+        }
+        message
+    }
+
+    /// Raw prepare for the sibling op, standing in for the crate-private
+    /// `prepare_request` projection. `user_id` 0 skips the in-apply RBAC
+    /// gate (server-originated convention), so the op applies cleanly.
+    fn prepare_message(
+        operation: Operation,
+        client: u128,
+        request: u64,
+        body: &[u8],
+    ) -> Message<PrepareHeader> {
+        let header_size = size_of::<PrepareHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut slice[..header_size]);
+            *header = PrepareHeader {
+                command: Command2::Prepare,
+                operation,
+                size: u32::try_from(total).expect("test prepare fits u32"),
+                op: 1,
+                view: 0,
+                client,
+                request,
+                user_id: 0,
+                checksum: 42,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                ..Default::default()
+            };
+        }
+        message
+    }
+
+    /// Regression test for the production failure chain "CLI stream
+    /// create succeeded, logout failed: Disconnected".
+    ///
+    /// Why the logout of a CLI invocation used to fail during ITS OWN
+    /// successful `stream create`: the catch-up gate was GLOBAL. The suite
+    /// runs many CLI invocations against one shared single-node server;
+    /// each one is three replicated ops (Register, work, Logout). When
+    /// THIS client's logout frame arrived, some SIBLING client's op was
+    /// regularly sitting between quorum-ack (`commit_max` advanced inside
+    /// `on_ack`) and apply (`commit_min` still behind, driver parked at
+    /// the journal read). `submit_logout_in_process` then rejected
+    /// `NotCaughtUp`, and `handle_logout_request` swallowed the error: no
+    /// reply frame, session left bound. A one-shot CLI saw only a dead
+    /// connection — "Problem with server logout / Disconnected" — and
+    /// exited non-zero although its create committed; the harness retry
+    /// then tripped "already exists".
+    ///
+    /// This test rebuilds that interleaving deterministically (client B =
+    /// the sibling parked mid-commit; client A = the CLI logging out) and
+    /// pins the contract that fixed it (non-register ops carry no
+    /// catch-up gate, see `submit_logout_in_process`):
+    ///
+    ///   a client-initiated logout must always produce a reply frame and
+    ///   unbind the transport session, even while a sibling's commit is
+    ///   in flight — the logout simply pipelines behind it.
+    #[compio::test]
+    async fn logout_rejected_by_closed_gate_must_still_reply_to_client() {
+        const CLIENT_A: u128 = 1;
+        const CLIENT_B: u128 = 2;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const TRANSPORT_A: u128 = 77;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let bus = SpyBus::default();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, IggySnapshot, TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            TestMux::default(),
+            None,
+        );
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                encryptor: None,
+            },
+        );
+        let shard = Rc::new(TestShard::without_inbox(
+            ShardIdentity::new(0, "logout-window-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+        ));
+        let md = shard.plane.metadata();
+        let consensus = md.consensus.as_ref().unwrap();
+
+        // A and B hold committed sessions (as after their CLI logins).
+        for client in [CLIENT_A, CLIENT_B] {
+            md.client_table.borrow_mut().commit_register(
+                client,
+                ACTING_USER,
+                register_reply(client, SESSION),
+                |_| false,
+            );
+        }
+        // A's transport connection, authenticated + bound — the state a
+        // CLI connection is in right after its create-stream reply.
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            TRANSPORT_A,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        sessions
+            .borrow_mut()
+            .login(TRANSPORT_A, ACTING_USER)
+            .unwrap();
+        sessions
+            .borrow_mut()
+            .bind_session(TRANSPORT_A, CLIENT_A, SESSION)
+            .unwrap();
+
+        // Sibling B's op: prepared, journaled, self-acked through the real
+        // replicate path. (The public submit API cannot be used to open
+        // the window: `dispatch_prepare_and_await` pumps its own loopback
+        // inline, committing before it returns. Production's window is a
+        // sibling submit task parked INSIDE `on_ack`'s awaits — modeled
+        // below by driving `on_ack` by hand.)
+        let create_body = CreateStreamRequest {
+            name: iggy_binary_protocol::primitives::identifier::WireName::new("s1").unwrap(),
+        }
+        .to_bytes();
+        let prepare = prepare_message(Operation::CreateStream, CLIENT_B, 1, &create_body);
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per replicated prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+
+        // Open the window: first poll of `on_ack` advances commit_max at
+        // quorum, then parks at the journal read — commit_min unchanged.
+        // Every production NotCaughtUp logout was submitted exactly here.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(
+            driver.as_mut().poll(&mut cx).is_pending(),
+            "driver must park mid-commit at the journal read"
+        );
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // A's logout lands in the window, through the real dispatch path.
+        let logout = request_message(Operation::Logout, CLIENT_A, SESSION, 2, &[]);
+        handle_logout_request(&shard, &sessions, TRANSPORT_A, logout).await;
+
+        // DESIRED CONTRACT (red on current code): the client must never be
+        // left in silence — that silence is what a one-shot CLI reports as
+        // "Problem with server logout / Disconnected".
+        assert!(
+            bus.client_replies.borrow().contains(&TRANSPORT_A),
+            "logout must produce a reply frame to the client even while the \
+             catch-up gate is closed (silence = CLI 'Disconnected', exit 1)"
+        );
+        assert_eq!(
+            sessions.borrow().get_session(TRANSPORT_A),
+            None,
+            "transport session must be unbound by a client-initiated logout; \
+             the VSR slot may lapse to the eviction sweep"
+        );
+    }
+}
