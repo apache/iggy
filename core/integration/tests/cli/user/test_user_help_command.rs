@@ -32,14 +32,14 @@ pub async fn should_help_match() {
 {USAGE_PREFIX} user <COMMAND>
 
 Commands:
-  create       Create user with given username and password [aliases: c]
-  delete       Delete user with given ID [aliases: d]
-  get          Get details of a single user with given ID [aliases: g]
-  list         List all users [aliases: l]
-  name         Change username for user with given ID [aliases: n]
-  status       Change status for user with given ID [aliases: s]
-  password     Change password for user with given ID [aliases: pwd]
-  permissions  Set permissions for user with given ID [aliases: p]
+  create       Create user with given username and password [alias: c]
+  delete       Delete user with given ID [alias: d]
+  get          Get details of a single user with given ID [alias: g]
+  list         List all users [alias: l]
+  name         Change username for user with given ID [alias: n]
+  status       Change status for user with given ID [alias: s]
+  password     Change password for user with given ID [alias: pwd]
+  permissions  Set permissions for user with given ID [alias: p]
   help         Print this message or the help of the given subcommand(s)
 
 Options:

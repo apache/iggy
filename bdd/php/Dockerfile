@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.96
+ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-slim-trixie AS rust-toolchain
 
 FROM ubuntu:24.04
