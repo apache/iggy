@@ -81,7 +81,7 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
         builder = builder.with_server_address(config.server_address);
     }
     match config.auto_login_kind.as_str() {
-        "disabled" => {}
+        "" | "disabled" => {}
         "username_password" => {
             builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
                 RustCredentials::UsernamePassword(config.username, config.password.into()),
