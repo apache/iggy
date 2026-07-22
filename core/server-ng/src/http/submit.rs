@@ -260,18 +260,29 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
     // is terminal for this session, so it needs no gate-issued contiguous id
     // (mirrors the disconnect path's `u64::MAX`).
     const LOGOUT_REQUEST_ID: u64 = u64::MAX;
-    if let Err(error) = submit_logout_on_owner(
-        &state.shard,
-        session.client_id,
-        session.session,
-        LOGOUT_REQUEST_ID,
-    )
-    .await
-    {
-        warn!(
+    // Detached for the same reason as `submit_committed`: the submit drives
+    // shared consensus machinery, and axum drops this handler future on
+    // client disconnect. A cancel mid-await used to strand consensus state;
+    // the detached task always drives the Logout to completion.
+    let (result_slot, done) = oneshot::channel();
+    let shard = Rc::clone(&state.shard);
+    let vsr_client_id = session.client_id;
+    let vsr_session = session.session;
+    compio::runtime::spawn(async move {
+        let result =
+            submit_logout_on_owner(&shard, vsr_client_id, vsr_session, LOGOUT_REQUEST_ID).await;
+        let _ = result_slot.send(result);
+    })
+    .detach();
+    match done.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(
             ?error,
             "server-ng HTTP: VSR Logout submit failed; slot lingers until eviction"
-        );
+        ),
+        Err(_canceled) => warn!(
+            "server-ng HTTP: VSR Logout task dropped before replying; slot lingers until eviction"
+        ),
     }
     state.forget_session(session);
 }

@@ -20,15 +20,18 @@
 // TODO(slbotbm): Add tests for store_consumer_offset, get_consumer_offset, and delete_consumer_offset functions
 // attached to client after implementing consumer group functions
 // TODO(slbotbm): Add tests for update_permissions after creating create_user, get_user, etc. functions
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
-#include "tests/common/test_helpers.hpp"
+#include "tests/e2e/test_helpers.hpp"
 
 class LowLevelE2E_Client : public E2ETestFixture {};
 
@@ -397,21 +400,23 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterShutdown) {
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_shutdown;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->shutdown());
-    ASSERT_NO_THROW({ clients_after_shutdown = second_client->get_clients(); });
-
-    bool found_first = false;
-    for (const auto &client : clients_after_shutdown) {
-        if (client.client_id == first_me.client_id) {
-            found_first = true;
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
             break;
         }
-    }
-
-    EXPECT_FALSE(found_first);
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
@@ -422,21 +427,23 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_disconnect;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
     ASSERT_NO_THROW(first_client->disconnect());
-    ASSERT_NO_THROW({ clients_after_disconnect = second_client->get_clients(); });
-
-    bool found_first = false;
-    for (const auto &client : clients_after_disconnect) {
-        if (client.client_id == first_me.client_id) {
-            found_first = true;
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
             break;
         }
-    }
-
-    EXPECT_FALSE(found_first);
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
     ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
@@ -1702,4 +1709,46 @@ TEST_F(LowLevelE2E_Client, SnapshotWithInvalidSnapshotTypeThrows) {
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"not-a-real-type"})), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestPingReturnsEmptyBytes) {
+    RecordProperty("description", "Returns an empty response body for a raw ping command with an empty payload.");
+    constexpr std::uint32_t ping_command_code = 1;
+    iggy::ffi::Client *client                 = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    rust::Vec<std::uint8_t> response;
+    ASSERT_NO_THROW({ response = client->send_binary_request(ping_command_code, empty_payload); });
+    EXPECT_TRUE(response.empty());
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestGetStatsReturnsNonEmptyBytes) {
+    RecordProperty("description",
+                   "Returns a non-empty response body for a raw get-stats command with an empty payload.");
+    constexpr std::uint32_t get_stats_command_code = 10;
+    iggy::ffi::Client *client                      = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    rust::Vec<std::uint8_t> response;
+    ASSERT_NO_THROW({ response = client->send_binary_request(get_stats_command_code, empty_payload); });
+    EXPECT_FALSE(response.empty());
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestLoginUserCodeThrows) {
+    RecordProperty("description",
+                   "Rejects the login-user session-control code client-side before it reaches the server.");
+    constexpr std::uint32_t login_user_command_code = 38;
+    iggy::ffi::Client *client                       = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(client->send_binary_request(login_user_command_code, empty_payload), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, SendBinaryRequestUnknownCommandCodeThrows) {
+    RecordProperty("description", "Rejects an unknown command code with an invalid-command error from the server.");
+    constexpr std::uint32_t unknown_command_code = 60000;
+    iggy::ffi::Client *client                    = GetLoggedInClient();
+
+    rust::Vec<std::uint8_t> empty_payload;
+    ASSERT_THROW(client->send_binary_request(unknown_command_code, empty_payload), std::exception);
 }
