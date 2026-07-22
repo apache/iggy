@@ -20,6 +20,7 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -46,6 +47,10 @@ const CLUSTER_READY_ATTEMPTS: usize = 40;
 const CLUSTER_READY_INTERVAL_MS: u64 = 250;
 const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
 const DOCKER_RM_TIMEOUT_SECS: u64 = 15;
+const DOCKER_INSPECT_TIMEOUT_SECS: u64 = 5;
+// Serializes inspect+rm recovery across nextest processes sharing the reused
+// container. Held only on the failure path.
+const RECOVERY_LOCK_FILE_NAME: &str = "iggy-test-elasticsearch-recovery.lock";
 // Indices from prior runs older than this are leftovers: a live concurrent
 // test's index is seconds old, so age-based sweeping never races other tests
 // sharing the reused container.
@@ -118,15 +123,37 @@ impl ElasticsearchContainer {
         match Self::try_start().await {
             Ok(started) => Ok(started),
             Err(first_error) => {
-                // A reused container can be wedged (running but unhealthy:
-                // OOM-killed JVM, corrupted data dir, dead port mapping).
-                // Remove it and retry once with a fresh container instead of
-                // failing every test until someone cleans up manually.
+                // Shared Always-reuse container: never `docker rm -f` on a
+                // transient start/port/health flake. Another nextest worker may
+                // still be using a healthy instance. Recover only when inspect
+                // shows a removable wedged state, under a cross-process lock.
+                let recovery_lock = match acquire_recovery_lock() {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        warn!("Skipping Elasticsearch recovery, could not take lock: {error}");
+                        return Err(first_error);
+                    }
+                };
+
+                if let Ok(started) = Self::try_start().await {
+                    drop(recovery_lock);
+                    return Ok(started);
+                }
+
+                if !container_is_removable_wedged() {
+                    warn!(
+                        "Elasticsearch start failed and '{ELASTICSEARCH_CONTAINER_NAME}' is not in a removable wedged state; leaving it in place: {first_error}"
+                    );
+                    return Err(first_error);
+                }
+
                 warn!(
-                    "Elasticsearch container unusable, removing '{ELASTICSEARCH_CONTAINER_NAME}' and retrying once: {first_error}"
+                    "Elasticsearch container wedged, removing '{ELASTICSEARCH_CONTAINER_NAME}' and retrying once: {first_error}"
                 );
                 force_remove_container();
-                Self::try_start().await
+                let retry_result = Self::try_start().await;
+                drop(recovery_lock);
+                retry_result
             }
         }
     }
@@ -329,9 +356,99 @@ impl ElasticsearchContainer {
     }
 }
 
+/// Cross-process advisory lock for inspect+rm recovery of the shared reuse
+/// container. Dropping the file releases the lock (including on process crash).
+struct RecoveryLock(File);
+
+fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
+    let path = std::env::temp_dir().join(RECOVERY_LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("lock {}: {error}", path.display()))?;
+    Ok(RecoveryLock(file))
+}
+
+/// True only when Docker says the shared container is in a state safe to
+/// force-remove without yanking a healthy instance from a peer process.
+///
+/// Removable: exited/dead/created/paused/restarting, or Docker healthcheck
+/// `unhealthy`. A plain `running` container (even if ES HTTP is flaky) is left
+/// alone: readiness flakes must not `docker rm -f` a shared Always-reuse box.
+fn container_is_removable_wedged() -> bool {
+    let inspect_format = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}";
+    let Some(stdout) = docker_command_stdout(
+        &[
+            "inspect",
+            "-f",
+            inspect_format,
+            ELASTICSEARCH_CONTAINER_NAME,
+        ],
+        DOCKER_INSPECT_TIMEOUT_SECS,
+    ) else {
+        return false;
+    };
+
+    let mut parts = stdout.trim().split('|');
+    let status = parts.next().unwrap_or("").trim();
+    let health = parts.next().unwrap_or("").trim();
+
+    matches!(
+        status,
+        "exited" | "dead" | "created" | "paused" | "restarting"
+    ) || health == "unhealthy"
+}
+
+fn docker_command_stdout(args: &[&str], timeout_secs: u64) -> Option<String> {
+    let mut child = match Command::new("docker")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            warn!("Failed to invoke docker {}: {error}", args.join(" "));
+            return None;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut stdout = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                return Some(stdout);
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!("docker {} timed out after {timeout_secs}s", args.join(" "));
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                warn!("Failed waiting for docker {}: {error}", args.join(" "));
+                return None;
+            }
+        }
+    }
+}
+
 /// Remove the shared reuse container so the next start creates a fresh one.
 /// Uses the Docker CLI directly: testcontainers offers no "remove by name" API
 /// and the wedged container was created by an earlier process anyway.
+/// Caller must hold [`RecoveryLock`] and have confirmed
+/// [`container_is_removable_wedged`].
 fn force_remove_container() {
     let mut child = match Command::new("docker")
         .args(["rm", "-f", ELASTICSEARCH_CONTAINER_NAME])
