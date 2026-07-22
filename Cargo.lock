@@ -4999,6 +4999,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatbuffers-reflection"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c29b83e11dbe84a256acfb8f3ea3637204a6b1b08257cbf1b7dfd48f8ef0904"
+dependencies = [
+ "anyhow",
+ "flatbuffers",
+ "num-traits",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7165,6 +7177,7 @@ dependencies = [
  "base64",
  "dashmap",
  "flatbuffers",
+ "flatbuffers-reflection",
  "http 1.4.2",
  "humantime",
  "iggy",

@@ -71,6 +71,7 @@ excludes = [
     "**/*.pfx",
     "**/*.json",
     "**/*.svg",
+    "core/connectors/sdk/tests/fixtures/flatbuffer/*.bfbs",
     "**/go.mod",
     "**/go.sum",
     "**/.env",

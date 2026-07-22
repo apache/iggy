@@ -43,6 +43,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 dashmap = { workspace = true }
 flatbuffers = { workspace = true }
+flatbuffers-reflection = { workspace = true }
 http = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
