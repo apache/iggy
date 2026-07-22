@@ -48,15 +48,17 @@ pub enum IggyExpiry {
     NeverExpire(),
 }
 
-impl From<RustIggyExpiry> for IggyExpiry {
-    fn from(expiry: RustIggyExpiry) -> Self {
-        match expiry {
+impl TryFrom<RustIggyExpiry> for IggyExpiry {
+    type Error = PyErr;
+
+    fn try_from(expiry: RustIggyExpiry) -> PyResult<Self> {
+        Ok(match expiry {
             RustIggyExpiry::ServerDefault => IggyExpiry::ServerDefault(),
             RustIggyExpiry::ExpireDuration(duration) => IggyExpiry::ExpireDuration {
-                duration: iggy_duration_to_py_delta(duration.get_duration()),
+                duration: iggy_duration_to_py_delta(duration.get_duration())?,
             },
             RustIggyExpiry::NeverExpire => IggyExpiry::NeverExpire(),
-        }
+        })
     }
 }
 
@@ -91,7 +93,7 @@ impl TryFrom<&IggyExpiry> for RustIggyExpiry {
     }
 }
 
-fn iggy_duration_to_py_delta(duration: Duration) -> Py<PyDelta> {
+fn iggy_duration_to_py_delta(duration: Duration) -> PyResult<Py<PyDelta>> {
     let days = duration.as_secs() / 86_400;
     let secs_of_day = duration.as_secs() % 86_400;
     Python::attach(|py| {
@@ -102,8 +104,12 @@ fn iggy_duration_to_py_delta(duration: Duration) -> Py<PyDelta> {
             duration.subsec_micros() as i32,
             true,
         )
-        .expect("topic message expiry duration fits within timedelta bounds")
-        .unbind()
+        .map(|delta| delta.unbind())
+        .map_err(|err| {
+            PyValueError::new_err(format!(
+                "topic message expiry duration does not fit within timedelta bounds: {err}"
+            ))
+        })
     })
 }
 
@@ -212,8 +218,8 @@ impl Topic {
 
     /// The expiry of the messages in the topic.
     #[getter]
-    pub fn message_expiry(&self) -> IggyExpiry {
-        self.inner.message_expiry.into()
+    pub fn message_expiry(&self) -> PyResult<IggyExpiry> {
+        self.inner.message_expiry.try_into()
     }
 
     /// Compression algorithm for the topic.
@@ -290,8 +296,8 @@ impl TopicDetails {
 
     /// The expiry of the messages in the topic.
     #[getter]
-    pub fn message_expiry(&self) -> IggyExpiry {
-        self.inner.message_expiry.into()
+    pub fn message_expiry(&self) -> PyResult<IggyExpiry> {
+        self.inner.message_expiry.try_into()
     }
 
     /// Compression algorithm for the topic.
