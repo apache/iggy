@@ -95,6 +95,7 @@ filenames = [
     "Dockerfile",
     "Dockerfile.test",
     "Dockerfile.flink2_10-java21",
+    "Gemfile",
     "justfile",
 ]
 extensions = [
@@ -107,6 +108,7 @@ extensions = [
     "pyi",
     "sh",
     "toml",
+    "wire",
     "yaml",
     "yml",
 ]

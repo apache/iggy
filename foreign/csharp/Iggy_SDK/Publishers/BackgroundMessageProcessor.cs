@@ -31,29 +31,29 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 {
-    private readonly int _payloadBufferBaselineCapacity;
-    private readonly int _payloadBufferCapacityLimit;
     private readonly EventAggregator<PublisherErrorEventArgs> _backgroundErrorAggregator;
     private readonly CancellationTokenSource _cancellationTokenSource;
-    private readonly CancellationToken _disposalToken;
     private readonly IIggyClient _client;
     private readonly IggyPublisherConfig _config;
+    private readonly CancellationToken _disposalToken;
     private readonly ILogger<BackgroundMessageProcessor> _logger;
     private readonly EventAggregator<MessageBatchFailedEventArgs> _messageBatchErrorAggregator;
+    private readonly int _payloadBufferBaselineCapacity;
+    private readonly int _payloadBufferCapacityLimit;
     private readonly ChannelReader<SendUnit> _reader;
     private readonly List<SendUnit> _units;
     private readonly List<Message> _wire;
     private readonly ChannelWriter<SendUnit> _writer;
-    private PooledBufferWriter _payloadBuffer;
-    private HashSet<SendUnit>? _failed;
     private Task? _backgroundTask;
     private volatile bool _canSend = true;
     private Exception? _crashException;
     private bool _disposed;
     private TaskCompletionSource _drainedSignal = CreateCompletedSignal();
+    private HashSet<SendUnit>? _failed;
 
     // Mutated only via Interlocked; OnUnitsCompleted resolves _drainedSignal on the 1->0 transition.
     private int _inFlight;
+    private PooledBufferWriter _payloadBuffer;
 
     public BackgroundMessageProcessor(IIggyClient client, IggyPublisherConfig config, ILoggerFactory loggerFactory)
     {
@@ -346,8 +346,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     ///     Builds the reused wire-ready <see cref="Message" /> list from the units serialized by
     ///     <see cref="AccumulateBatch" />. Runs as a separate pass because the shared payload buffer can move while
     ///     it grows during serialization, so the slices are stable only once every unit has serialized. Units that
-    ///     failed serialization are skipped; a unit whose encryptor throws here is rolled back out and dropped via
-    ///     <see cref="ReportUnitDropped" />.
+    ///     failed to materialize are rolled back out and dropped via <see cref="ReportUnitDropped" />. Encryption is
+    ///     applied later by the client at send time, so an encryptor failure surfaces as a batch send failure.
     /// </summary>
     private List<Message> MaterializeWire()
     {
@@ -375,7 +375,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         return _wire;
     }
 
-    // Drops only the offending unit so a throwing serializer/encryptor cannot kill the loop and discard the queue.
+    // Drops only the offending unit so a throwing serializer cannot kill the loop and discard the queue.
     private void ReportUnitDropped(SendUnit unit, Exception ex)
     {
         LogFailedToMaterializeUnit(ex);
@@ -383,7 +383,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         if (_backgroundErrorAggregator.HasSubscribers)
         {
             _backgroundErrorAggregator.Publish(new PublisherErrorEventArgs(ex,
-                "Failed to serialize or encrypt a queued message; the unit was dropped", unit.DroppedValues));
+                "Failed to serialize a queued message; the unit was dropped", unit.DroppedValues));
         }
     }
 
@@ -482,8 +482,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 LogFailedToSendBatch(ex, wire.Count);
                 if (_messageBatchErrorAggregator.HasSubscribers)
                 {
-                    _messageBatchErrorAggregator.Publish(
-                        new MessageBatchFailedEventArgs(ex, SnapshotForFailure(wire)));
+                    _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(ex, SnapshotForFailure(wire)));
                 }
             }
 
@@ -554,7 +553,6 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 {
                     Header = source.Header,
                     Payload = source.Payload.ToArray(),
-                    Encrypted = source.Encrypted,
                     UserHeaders = source.UserHeaders,
                     RawUserHeaders = source.RawUserHeaders.IsEmpty ? default : source.RawUserHeaders.ToArray()
                 };
@@ -567,7 +565,6 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 {
                     Header = source.Header,
                     Payload = default,
-                    Encrypted = source.Encrypted,
                     UserHeaders = source.UserHeaders
                 };
             }

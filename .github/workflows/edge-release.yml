@@ -75,7 +75,7 @@ jobs:
           fi
 
       - name: Create edge pre-release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.2
         with:
           tag_name: edge
           name: edge
@@ -110,6 +110,7 @@ jobs:
             - `iggy_connector_random_source`
             - `iggy_connector_s3_sink`
             - `iggy_connector_stdout_sink`
+            - `iggy_connector_surrealdb_sink`
 
             ## Downloads
 

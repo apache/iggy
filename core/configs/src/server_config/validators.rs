@@ -21,13 +21,11 @@ use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
-use super::sharding::{
-    CpuAllocation, INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
-    SHUTDOWN_POLL_INTERVAL_MAX, ShardingConfig,
-};
+use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
 use crate::ConfigurationError;
+use cpu_allocation::allowed_cpus;
 use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
@@ -378,128 +376,70 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
     }
 }
 
+/// Validate a [`CpuAllocation`] against the machine's available parallelism
+/// and, when pinning, the process affinity mask. Shared by the legacy and
+/// server-ng sharding configs, which both carry these two knobs.
+pub(crate) fn validate_cpu_allocation(
+    cpu_allocation: &CpuAllocation,
+    pin_cores: bool,
+) -> Result<(), ConfigurationError> {
+    let available_cpus = available_parallelism()
+        .map_err(|_| {
+            eprintln!("Failed to detect available CPU cores");
+            ConfigurationError::InvalidConfigurationValue
+        })?
+        .get();
+
+    match cpu_allocation {
+        CpuAllocation::All => Ok(()),
+        CpuAllocation::Count(count) => {
+            if *count == 0 {
+                eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if *count > available_cpus {
+                eprintln!(
+                    "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            Ok(())
+        }
+        CpuAllocation::Range(start, end) => {
+            if start >= end {
+                eprintln!(
+                    "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if *end - *start > available_cpus {
+                eprintln!(
+                    "Invalid sharding configuration: cpu_allocation range {start}..{end} yields {} shards, exceeding available CPU cores {available_cpus}",
+                    *end - *start
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            if !pin_cores {
+                return Ok(());
+            }
+            let allowed = allowed_cpus();
+            if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {
+                eprintln!(
+                    "Invalid sharding configuration: cpu_allocation range {start}..{end} includes CPU {cpu}, which is outside the set of cores allowed for this process (affinity/cpuset mask)"
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+            Ok(())
+        }
+        // NUMA topology validation requires hwlocality (runtime dep).
+        // Full NUMA validation happens in shard_allocator at startup.
+        CpuAllocation::NumaAware(_) => Ok(()),
+    }
+}
+
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.inbox_capacity == 0 {
-            eprintln!(
-                "Invalid sharding configuration: inbox_capacity must be > 0 (crossfire silently \
-                 rounds 0 to 1, masking config errors)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if self.inbox_capacity > INBOX_CAPACITY_MAX {
-            eprintln!(
-                "Invalid sharding configuration: inbox_capacity {} exceeds the {} cap (each \
-                 shard preallocates a channel of this size; oversizing here OOMs the process at \
-                 boot)",
-                self.inbox_capacity, INBOX_CAPACITY_MAX
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let drain = self.shutdown_drain_timeout.get_duration();
-        if drain.is_zero() {
-            eprintln!(
-                "Invalid sharding configuration: shutdown_drain_timeout must be > 0 (a zero \
-                 budget force-tears the bus mid-WAL-fsync on every shutdown)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if drain > SHUTDOWN_DRAIN_TIMEOUT_MAX {
-            eprintln!(
-                "Invalid sharding configuration: shutdown_drain_timeout {:?} exceeds the {:?} \
-                 cap (an unbounded drain wedges process exit on bus stall)",
-                drain, SHUTDOWN_DRAIN_TIMEOUT_MAX
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let poll = self.shutdown_poll_interval.get_duration();
-        if poll.is_zero() {
-            eprintln!(
-                "Invalid sharding configuration: shutdown_poll_interval must be > 0 (a zero \
-                 cadence busy-loops every shard's watchdog and metadata-handoff poller)"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if poll > SHUTDOWN_POLL_INTERVAL_MAX {
-            eprintln!(
-                "Invalid sharding configuration: shutdown_poll_interval {:?} exceeds the {:?} \
-                 cap (a coarse cadence stalls Ctrl-C handling and metadata handoff abort)",
-                poll, SHUTDOWN_POLL_INTERVAL_MAX
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if poll > drain {
-            eprintln!(
-                "Invalid sharding configuration: shutdown_poll_interval {:?} must be <= \
-                 shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
-                 the shutdown flag effectively unobservable)",
-                poll, drain
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let reconcile = self.reconcile_periodic_interval.get_duration();
-        if reconcile.is_zero() {
-            eprintln!(
-                "Invalid sharding configuration: reconcile_periodic_interval resolves to zero. \
-                 Note that \"0\", \"none\", \"unlimited\", and \"disabled\" all parse to zero. The \
-                 periodic reconcile tick is a safety net for dropped commit-wakes and cannot be \
-                 turned off; set a positive duration (default \"1s\", max {RECONCILE_PERIODIC_INTERVAL_MAX:?})."
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if reconcile > RECONCILE_PERIODIC_INTERVAL_MAX {
-            eprintln!(
-                "Invalid sharding configuration: reconcile_periodic_interval {:?} exceeds the \
-                 {:?} cap (a long tick makes post-failure convergence latency operator-visible)",
-                reconcile, RECONCILE_PERIODIC_INTERVAL_MAX
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let available_cpus = available_parallelism()
-            .map_err(|_| {
-                eprintln!("Failed to detect available CPU cores");
-                ConfigurationError::InvalidConfigurationValue
-            })?
-            .get();
-
-        match &self.cpu_allocation {
-            CpuAllocation::All => Ok(()),
-            CpuAllocation::Count(count) => {
-                if *count == 0 {
-                    eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
-                    return Err(ConfigurationError::InvalidConfigurationValue);
-                }
-                if *count > available_cpus {
-                    eprintln!(
-                        "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
-                    );
-                    return Err(ConfigurationError::InvalidConfigurationValue);
-                }
-                Ok(())
-            }
-            CpuAllocation::Range(start, end) => {
-                if start >= end {
-                    eprintln!(
-                        "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
-                    );
-                    return Err(ConfigurationError::InvalidConfigurationValue);
-                }
-                if *end > available_cpus {
-                    eprintln!(
-                        "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
-                    );
-                    return Err(ConfigurationError::InvalidConfigurationValue);
-                }
-                Ok(())
-            }
-            // NUMA topology validation requires hwlocality (runtime dep).
-            // Full NUMA validation happens in server::shard_allocator at startup.
-            CpuAllocation::NumaAware(_) => Ok(()),
-        }
+        validate_cpu_allocation(&self.cpu_allocation, self.pin_cores)
     }
 }
 
@@ -947,64 +887,88 @@ mod cluster_shards_count_determinism_tests {
 }
 
 #[cfg(test)]
-mod sharding_shutdown_knob_tests {
+mod sharding_cpu_range_tests {
     use super::*;
-    use crate::server_config::sharding::{SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX};
-    use iggy_common::IggyDuration;
-    use std::time::Duration;
 
     #[test]
-    fn defaults_validate() {
-        assert!(ShardingConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn zero_drain_is_rejected() {
+    fn inverted_range_is_rejected() {
         let cfg = ShardingConfig {
-            shutdown_drain_timeout: IggyDuration::new(Duration::ZERO),
-            ..ShardingConfig::default()
+            cpu_allocation: CpuAllocation::Range(2, 2),
+            pin_cores: true,
         };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn over_cap_drain_is_rejected() {
+    fn pinned_range_within_allowed_set_is_accepted() {
+        let first = allowed_cpus()[0];
         let cfg = ShardingConfig {
-            shutdown_drain_timeout: IggyDuration::new(
-                SHUTDOWN_DRAIN_TIMEOUT_MAX + Duration::from_secs(1),
-            ),
-            ..ShardingConfig::default()
+            cpu_allocation: CpuAllocation::Range(first, first + 1),
+            pin_cores: true,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pinned_range_outside_allowed_set_is_rejected() {
+        let past_last = allowed_cpus().last().copied().unwrap() + 1;
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(past_last, past_last + 1),
+            pin_cores: true,
         };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn zero_poll_is_rejected() {
+    fn pinned_range_wider_than_parallelism_is_rejected() {
+        // Under a cgroup CPU quota the affinity mask stays full while
+        // `available_parallelism` shrinks, so membership alone would
+        // accept this; the shard-count cap must reject it.
+        let first = allowed_cpus()[0];
+        let available = available_parallelism().unwrap().get();
         let cfg = ShardingConfig {
-            shutdown_poll_interval: IggyDuration::new(Duration::ZERO),
-            ..ShardingConfig::default()
+            cpu_allocation: CpuAllocation::Range(first, first + available + 1),
+            pin_cores: true,
         };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn over_cap_poll_is_rejected() {
+    fn unpinned_range_is_capped_by_shard_count_not_core_ids() {
+        // Core ids outside the machine are fine unpinned; only the
+        // resulting shard count matters.
         let cfg = ShardingConfig {
-            shutdown_poll_interval: IggyDuration::new(
-                SHUTDOWN_POLL_INTERVAL_MAX + Duration::from_secs(1),
-            ),
-            ..ShardingConfig::default()
+            cpu_allocation: CpuAllocation::Range(1 << 20, (1 << 20) + 1),
+            pin_cores: false,
+        };
+        assert!(cfg.validate().is_ok());
+
+        let available = available_parallelism().unwrap().get();
+        let cfg = ShardingConfig {
+            cpu_allocation: CpuAllocation::Range(0, available + 1),
+            pin_cores: false,
         };
         assert!(cfg.validate().is_err());
     }
+}
 
+#[cfg(test)]
+mod sharding_embedded_default_tests {
+    use super::*;
+    use figment::Figment;
+    use figment::providers::{Format, Toml};
+
+    // Guards the single source of truth: the legacy sharding defaults resolve
+    // from the embedded legacy TOML, not hard-coded Rust values.
     #[test]
-    fn poll_greater_than_drain_is_rejected() {
-        let cfg = ShardingConfig {
-            shutdown_drain_timeout: IggyDuration::new(Duration::from_millis(20)),
-            shutdown_poll_interval: IggyDuration::new(Duration::from_millis(50)),
-            ..ShardingConfig::default()
-        };
-        assert!(cfg.validate().is_err());
+    fn legacy_embedded_toml_resolves_sharding_defaults() {
+        let toml_str = include_str!("../../../server/config.toml");
+        let config: ServerConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("embedded legacy TOML deserializes");
+        config.validate().expect("embedded legacy config validates");
+
+        assert!(config.system.sharding.pin_cores);
     }
 }

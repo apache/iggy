@@ -26,7 +26,8 @@ namespace Apache.Iggy.Messages;
 /// <summary>
 ///     A message which can be sent to the server. A payload backed by caller-owned (e.g. pooled) memory
 ///     must stay alive until the send copies it to the wire: for a direct send, until the send call
-///     completes; for a background/queued send, until <see cref="Publishers.IggyPublisher.WaitUntilAllSendsAsync" /> returns.
+///     completes; for a background/queued send, until <see cref="Publishers.IggyPublisher.WaitUntilAllSendsAsync" />
+///     returns.
 /// </summary>
 [JsonConverter(typeof(MessageConverter))]
 public class Message
@@ -40,14 +41,6 @@ public class Message
     ///     Message payload.
     /// </summary>
     public required ReadOnlyMemory<byte> Payload { get; set; }
-
-    /// <summary>
-    ///     Whether <see cref="Payload" /> (and any user headers) already hold their encrypted form. Set by the
-    ///     publisher when its encryptor runs; marked messages are skipped, so re-sending one (e.g. a failed-batch
-    ///     snapshot) cannot double-encrypt it. Set it yourself to send an already-encrypted payload past a
-    ///     configured encryptor untouched.
-    /// </summary>
-    public bool Encrypted { get; set; }
 
     /// <summary>
     ///     User defined headers.

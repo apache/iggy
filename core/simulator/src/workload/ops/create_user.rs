@@ -47,6 +47,9 @@ pub fn sample(
     let username = match outcome {
         Outcome::Ok => shadow.fresh_name("user"),
         Outcome::UserAlreadyExists => shadow.pick_user_name(prng)?,
+        // Not a targeted outcome (absent from `OUTCOMES`); the shadow only ever
+        // mints in-bounds names, so an invalid-length username is never sampled.
+        Outcome::InvalidUsername => return None,
     };
     Some(Input {
         password: format!("pw-{username}"),
@@ -75,6 +78,6 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddUser {
             name: input.username.clone(),
         },
-        Outcome::UserAlreadyExists => Effect::None,
+        Outcome::UserAlreadyExists | Outcome::InvalidUsername => Effect::None,
     }
 }

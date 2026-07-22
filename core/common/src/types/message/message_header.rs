@@ -107,16 +107,25 @@ impl IggyMessageHeader {
         })
     }
 
+    /// Serializes the header directly into `buf`, without an intermediate allocation.
+    ///
+    /// Reserving up front keeps an unsized `buf` to a single growth, since the
+    /// fields are appended individually.
+    pub fn write_to(&self, buf: &mut BytesMut) {
+        buf.reserve(IGGY_MESSAGE_HEADER_SIZE);
+        buf.put_u64_le(self.checksum);
+        buf.put_u128_le(self.id);
+        buf.put_u64_le(self.offset);
+        buf.put_u64_le(self.timestamp);
+        buf.put_u64_le(self.origin_timestamp);
+        buf.put_u32_le(self.user_headers_length);
+        buf.put_u32_le(self.payload_length);
+        buf.put_u64_le(self.reserved);
+    }
+
     pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
-        bytes.put_u64_le(self.checksum);
-        bytes.put_u128_le(self.id);
-        bytes.put_u64_le(self.offset);
-        bytes.put_u64_le(self.timestamp);
-        bytes.put_u64_le(self.origin_timestamp);
-        bytes.put_u32_le(self.user_headers_length);
-        bytes.put_u32_le(self.payload_length);
-        bytes.put_u64_le(self.reserved);
+        self.write_to(&mut bytes);
         bytes.freeze()
     }
 
@@ -212,6 +221,61 @@ mod tests {
 
         let deserialized = IggyMessageHeader::from_bytes(bytes).unwrap();
         assert_eq!(header, deserialized);
+    }
+
+    #[test]
+    fn given_populated_header_when_written_into_shared_buffer_should_append_exact_layout() {
+        let header = IggyMessageHeader {
+            checksum: u64::MAX,
+            id: u128::MAX,
+            offset: 42,
+            timestamp: 7,
+            origin_timestamp: 9,
+            user_headers_length: u32::MAX,
+            payload_length: 13,
+            reserved: 0,
+        };
+
+        // Built independently of `to_bytes`, which now shares `write_to`'s
+        // implementation and so cannot serve as an oracle for it.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&header.checksum.to_le_bytes());
+        expected.extend_from_slice(&header.id.to_le_bytes());
+        expected.extend_from_slice(&header.offset.to_le_bytes());
+        expected.extend_from_slice(&header.timestamp.to_le_bytes());
+        expected.extend_from_slice(&header.origin_timestamp.to_le_bytes());
+        expected.extend_from_slice(&header.user_headers_length.to_le_bytes());
+        expected.extend_from_slice(&header.payload_length.to_le_bytes());
+        expected.extend_from_slice(&header.reserved.to_le_bytes());
+
+        let mut buf = BytesMut::new();
+        buf.put_slice(b"prefix");
+        header.write_to(&mut buf);
+
+        assert_eq!(&buf[..6], b"prefix");
+        assert_eq!(&buf[6..], &expected[..]);
+        assert_eq!(expected.len(), IGGY_MESSAGE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn given_header_written_at_offset_when_parsed_back_should_round_trip() {
+        let header = IggyMessageHeader {
+            checksum: 1,
+            id: 2,
+            offset: 3,
+            timestamp: 4,
+            origin_timestamp: 5,
+            user_headers_length: 6,
+            payload_length: 7,
+            reserved: 0,
+        };
+
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        header.write_to(&mut buf);
+
+        let second = Bytes::copy_from_slice(&buf[IGGY_MESSAGE_HEADER_SIZE..]);
+        assert_eq!(IggyMessageHeader::from_bytes(second).unwrap(), header);
     }
 
     #[test]

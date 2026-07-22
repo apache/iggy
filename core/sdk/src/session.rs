@@ -30,15 +30,17 @@
 //!
 //! ```text
 //! new()                  - fresh client_id generated, session = None
-//! register_request_id()  - returns 0 (for the register operation, once only)
+//! begin_register()       - returns 0; re-arms a used session for a re-login
 //! bind(session)          - session assigned by server after register commits
 //! next_request_id()      - returns 1, 2, 3, ... (application requests)
 //! drop + new()           - on disconnect/crash, create a fresh session
 //! ```
 //!
-//! `ConsensusSession` is **not reusable**: on disconnect/crash drop and
-//! recreate. New `client_id` avoids ambiguous re-register; old entry
-//! stays in server `ClientTable` until evicted.
+//! A single registration is one-shot ([`ConsensusSession::register_request_id`]
+//! panics if reused), but a re-login re-arms the same value in place via
+//! [`ConsensusSession::begin_register`], which mints a fresh `client_id` and
+//! clears the binding. A new `client_id` avoids ambiguous re-register; the old
+//! entry stays in the server `ClientTable` until evicted.
 
 /// Consensus-level session state.
 ///
@@ -127,6 +129,21 @@ impl ConsensusSession {
         0
     }
 
+    /// Begin a registration, re-arming the session if it was already used.
+    ///
+    /// A re-login (fresh credentials, reconnect, or restart replay) reuses the
+    /// same `ConsensusSession`. If it is already bound or a prior register was
+    /// consumed, start a fresh session (new `client_id`, unbound) so the
+    /// Register encodes cleanly. Unlike the one-shot
+    /// [`register_request_id`](Self::register_request_id), this never panics on
+    /// a repeat login. Returns the register request id (always 0).
+    pub fn begin_register(&mut self) -> u64 {
+        if self.register_consumed || self.is_bound() {
+            *self = Self::new();
+        }
+        self.register_request_id()
+    }
+
     /// Get the next application request ID and advance the counter.
     ///
     /// Returns 1, 2, 3, ... (request 0 is reserved for register).
@@ -213,6 +230,35 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(1);
         let _ = session.register_request_id();
         let _ = session.register_request_id();
+    }
+
+    #[test]
+    fn begin_register_on_fresh_session_keeps_client_id() {
+        let mut session = ConsensusSession::with_client_id(7);
+        assert_eq!(session.begin_register(), 0);
+        // The first registration keeps the session's client id; only a re-login
+        // re-arms with a fresh one.
+        assert_eq!(session.client_id(), 7);
+        assert!(!session.is_bound());
+    }
+
+    #[test]
+    fn begin_register_re_arms_after_consume_without_bind() {
+        // A prior register that never bound (failed login / dropped connection
+        // before the retry) must not panic the next login.
+        let mut session = ConsensusSession::with_client_id(1);
+        let _ = session.begin_register();
+        assert_eq!(session.begin_register(), 0);
+        assert!(!session.is_bound());
+    }
+
+    #[test]
+    fn begin_register_re_arms_after_bind() {
+        let mut session = ConsensusSession::with_client_id(1);
+        let _ = session.begin_register();
+        session.bind(42);
+        assert_eq!(session.begin_register(), 0);
+        assert!(!session.is_bound());
     }
 
     #[test]

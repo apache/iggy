@@ -34,23 +34,58 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
 ) -> Result<Option<String>, IggyError> {
     debug!("Checking cluster metadata for leader detection");
 
-    match client.get_cluster_metadata().await {
-        Ok(metadata) => {
-            debug!(
-                "Got cluster metadata: {} nodes, cluster: {}",
-                metadata.nodes.len(),
-                metadata.name
-            );
-            process_cluster_metadata(&metadata, current_address, transport)
-        }
-        Err(e) => {
-            warn!(
-                "Failed to get cluster metadata: {}, connection will continue on server node {}",
-                e, current_address
-            );
-            Ok(None)
+    // A cluster can be transiently leaderless: a restarted node cedes the
+    // primaryship its stale view assigns it, and until the peers' election
+    // completes the roster reports no leader. That window is roughly one
+    // heartbeat timeout; poll through it instead of proceeding leaderless
+    // (login against a non-primary replays for its whole read timeout).
+    let deadline = tokio::time::Instant::now() + LEADERLESS_WAIT_BUDGET;
+    loop {
+        match client.get_cluster_metadata().await {
+            Ok(metadata) => {
+                debug!(
+                    "Got cluster metadata: {} nodes, cluster: {}",
+                    metadata.nodes.len(),
+                    metadata.name
+                );
+                match process_cluster_metadata(&metadata, current_address, transport) {
+                    Outcome::Redirect(address) => return Ok(Some(address)),
+                    Outcome::LeaderIsCurrent => return Ok(None),
+                    Outcome::NoLeader => {
+                        if tokio::time::Instant::now() >= deadline {
+                            warn!(
+                                "No active leader found in cluster metadata within {LEADERLESS_WAIT_BUDGET:?}, connection will continue on server node {current_address}",
+                            );
+                            return Ok(None);
+                        }
+                        tokio::time::sleep(LEADERLESS_POLL_INTERVAL).await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to get cluster metadata: {}, connection will continue on server node {}",
+                    e, current_address
+                );
+                return Ok(None);
+            }
         }
     }
+}
+
+/// How long to wait for a transiently leaderless cluster to elect before
+/// proceeding on the current node anyway.
+const LEADERLESS_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const LEADERLESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One leader-check verdict from a cluster-metadata snapshot.
+enum Outcome {
+    /// A healthy leader exists elsewhere; reconnect to it.
+    Redirect(String),
+    /// The current node is the leader (or the cluster is single-node).
+    LeaderIsCurrent,
+    /// No healthy leader is marked (e.g. mid-election).
+    NoLeader,
 }
 
 /// Process cluster metadata and determine if redirection is needed
@@ -58,14 +93,14 @@ fn process_cluster_metadata(
     metadata: &ClusterMetadata,
     current_address: &str,
     transport: TransportProtocol,
-) -> Result<Option<String>, IggyError> {
+) -> Outcome {
     // If there's only one node in the cluster, no redirection is needed
     if metadata.nodes.len() == 1 {
         debug!(
             "Single-node cluster detected ({}), no leader redirection needed",
             metadata.nodes[0].name
         );
-        return Ok(None);
+        return Outcome::LeaderIsCurrent;
     }
 
     let leader = metadata
@@ -93,19 +128,13 @@ fn process_cluster_metadata(
                     "Current connection to {} is not the leader, will redirect to {}",
                     current_address, leader_address
                 );
-                Ok(Some(leader_address))
+                Outcome::Redirect(leader_address)
             } else {
                 debug!("Already connected to leader at {}", current_address);
-                Ok(None)
+                Outcome::LeaderIsCurrent
             }
         }
-        None => {
-            warn!(
-                "No active leader found in cluster metadata, connection will continue on server node {}",
-                current_address
-            );
-            Ok(None)
-        }
+        None => Outcome::NoLeader,
     }
 }
 

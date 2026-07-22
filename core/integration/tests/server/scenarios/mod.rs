@@ -21,8 +21,6 @@ pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
-// Only consumed by `cg_vsr` (server-ng); legacy `cg.rs` has no equivalent.
-#[cfg(feature = "vsr")]
 pub mod consumer_group_duplicate_name_create_scenario;
 pub mod consumer_group_join_scenario;
 pub mod consumer_group_new_messages_after_restart_scenario;
@@ -31,31 +29,25 @@ pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
 pub mod consumer_timestamp_polling_scenario;
 pub mod create_message_payload;
-#[cfg(not(feature = "vsr"))]
+// Cross-protocol PAT visibility (create via HTTP, list via TCP across shards,
+// and the reverse). Runs under vsr too: server-ng serves the PAT routes on its
+// shard-0 HTTP listener and the create/delete commit through the metadata STM,
+// so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
-// Asserts server log-file rotation/archival policies; server-ng's file
-// logger only captures bootstrap output (shard-thread logs never reach the
-// file), so volume-based rotation rules cannot trigger.
-#[cfg(not(feature = "vsr"))]
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod permissions_scenario;
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod reconnect_after_restart_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod restart_offset_skip_scenario;
 pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
 pub mod stream_size_validation_scenario;
@@ -64,7 +56,6 @@ pub mod stress_produce_consume_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
 pub mod timestamp_scenario;
-#[cfg(not(feature = "vsr"))]
 pub mod user_scenario;
 pub mod websocket_tls_scenario;
 

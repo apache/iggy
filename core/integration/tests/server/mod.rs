@@ -15,15 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// a2a_jwt is HTTP-only (JWT against the HTTP transport); vsr has no HTTP.
-#[cfg(not(feature = "vsr"))]
+// a2a_jwt exercises trusted-issuer (JWKS) tokens; both the legacy verifier and
+// server-ng's ported trusted-issuer path verify them.
 mod a2a_jwt;
-// Polling-based consumer-group scenarios are not implemented under vsr yet.
-#[cfg(not(feature = "vsr"))]
 mod cg;
-// The ported round-robin membership join scenario runs against server-ng.
+// Flush (FLUSH_UNSAVED_BUFFER) has no server-ng primitive; it must deny typed.
 #[cfg(feature = "vsr")]
-mod cg_vsr;
+mod flush_vsr;
+// Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no server-ng handler;
+// they must evict typed (MalformedLogin), not stall or reply empty-ok.
+#[cfg(feature = "vsr")]
+mod legacy_login_vsr;
+// Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
+// server-ng suites below.
+#[cfg(feature = "vsr")]
+mod http_client;
+// Raw-HTTP data-plane contract against server-ng's shard-0 listener.
+#[cfg(feature = "vsr")]
+mod http_vsr;
+// Raw-HTTP wire-contract residue against server-ng (status codes + typed error
+// bodies); the RBAC matrix lives in permissions_scenario.
+#[cfg(feature = "vsr")]
+mod http_rbac;
+// End-to-end HTTPS: server-ng serves the REST listener over TLS and negotiates
+// HTTP/2 via ALPN.
+#[cfg(feature = "vsr")]
+mod http_tls;
+// Binary GetClusterMetadata must serve the real roster from a VSR cluster.
+#[cfg(feature = "vsr")]
+mod cluster_metadata_vsr;
 // 80-case race matrix with hardcoded HTTP variants (test_matrix bypasses
 // the harness transport filter).
 mod concurrent_addition;
@@ -33,9 +53,8 @@ mod general;
 mod message_cleanup;
 mod message_retrieval;
 // Server restarts, consumer-group barriers, and DeleteSegments maintenance.
-// `should_delete_segments_without_consumers` is framing-agnostic + async-aware
-// and runs under server-ng; the consumer-group / restart variants stay
-// legacy-shaped (cg polling has its own vsr gaps) and are filtered out there.
+// The full restart matrix (consumer variants included) runs under server-ng:
+// a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;
 mod specific;

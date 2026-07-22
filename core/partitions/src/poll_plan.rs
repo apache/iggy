@@ -22,18 +22,17 @@
 //! `&mut` to the same namespace while a poll is parked, dangling the reference.
 //! So `IggyPartition::build_poll_plan` captures everything a poll needs
 //! synchronously under the borrow into the owned types here, drops the borrow,
-//! then [`PollPlan::execute`] runs the disk read + offset persist on owned data
-//! alone: consumer offsets are already `Arc`, the journal tail is a
-//! point-in-time `Frozen` snapshot, and segment files are re-opened by path. No
-//! value in this module holds a partition reference, so executing a plan is
-//! sound on a detached task concurrently with the pump's own writes.
+//! then [`PollPlan::execute`] runs the disk read + the in-memory auto-commit
+//! apply on owned data alone: consumer offsets are already `Arc`, the journal
+//! tail is a point-in-time `Frozen` snapshot, and segment files are re-opened
+//! by path. No value in this module holds a partition reference, so executing a
+//! plan is sound on a detached task concurrently with the pump's own writes.
 
 use crate::PollFragments;
 use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
-use crate::offset_storage::persist_offset;
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
-    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
+    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
 };
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages2::{COMMAND_HEADER_SIZE, decode_batch_slice};
@@ -60,13 +59,25 @@ pub struct DiskSegment {
     pub(crate) persisted: u64,
 }
 
-/// Owned auto-commit inputs, applied off the partition borrow after a poll (see
-/// module docs). The committed offset is unknown until the poll completes, so
-/// the persist path + fsync flag are captured up front for the later disk write.
+/// Owned auto-commit input, applied off the partition borrow after a poll (see
+/// module docs). Only the in-memory apply happens here; durability is the
+/// replicated [`crate::iggy_partition::IggyPartition::apply_staged_consumer_offset_commit`]
+/// path's job on every node, driven by the `StoreConsumerOffset2` op the serving
+/// shard submits from [`AutoCommitApplied`]. A poll-local disk write would be
+/// node-local only and diverge on failover.
 pub struct AutoCommitCtx {
-    pub(crate) offset_path: Option<String>,
-    pub(crate) enforce_fsync: bool,
     pub(crate) target: AutoCommitTarget,
+}
+
+/// The offset an `auto_commit` poll applied in memory, surfaced for replication.
+///
+/// The serving shard replicates it through the partition consensus (the only
+/// cross-node durable path); `kind` + `consumer_id` are the offset key the
+/// submitted `StoreConsumerOffset2` op must carry.
+pub struct AutoCommitApplied {
+    pub kind: ConsumerKind,
+    pub consumer_id: u32,
+    pub offset: u64,
 }
 
 /// The lock-free offset map this auto-commit updates, captured as an owned
@@ -158,30 +169,27 @@ pub struct PollPlan {
 }
 
 impl PollPlan {
-    /// Whether executing this plan needs off-pump IO: a disk read (`Disk` tier)
-    /// or a consumer-offset persist (`auto_commit`). When `false`, the result is
-    /// fully resident and the caller can [`Self::execute_resident`] + reply on
-    /// the pump without spawning; when `true`, it must spawn [`Self::execute`]
-    /// so the pump is not blocked on file IO.
+    /// Whether executing this plan needs off-pump IO: only a `Disk` tier read.
+    /// When `false` the result is fully resident and the caller runs
+    /// [`Self::execute_resident`] + replies on the pump; when `true` it must
+    /// spawn [`Self::execute`] so the pump is not blocked on file IO.
+    ///
+    /// Auto-commit no longer forces a detached task: its in-memory apply is
+    /// synchronous and its durability rides consensus off the serving shard
+    /// (no poll-local disk write), so a fully-resident `auto_commit` poll still
+    /// replies inline.
     #[must_use]
     pub const fn needs_off_pump_io(&self) -> bool {
-        if matches!(self.tier, PollTier::Disk { .. }) {
-            return true;
-        }
-        // A resident poll only needs a detached task when its auto-commit must
-        // hit disk. With no `offset_path` (sim/dev) the apply is a sync,
-        // in-memory store the pump runs inline via `execute_resident`.
-        match &self.auto_commit {
-            Some(auto_commit) => auto_commit.needs_persist(),
-            None => false,
-        }
+        matches!(self.tier, PollTier::Disk { .. })
     }
 
     /// Execute this plan off the partition borrow: disk read (if any), straddle
-    /// splice into the owned resident-tail snapshot, then persist + apply the
-    /// auto-commit on the owned `Arc` offset map. Holds no partition reference
-    /// (see module docs), so it is safe on a detached task.
-    pub async fn execute(self) -> (PollFragments<4096>, u64) {
+    /// splice into the owned resident-tail snapshot, then apply the auto-commit
+    /// to the owned `Arc` offset map. Holds no partition reference (see module
+    /// docs), so it is safe on a detached task. Returns the served fragments,
+    /// the poll's high-water offset, and the auto-committed offset (if any) for
+    /// the serving shard to replicate through consensus.
+    pub async fn execute(self) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -240,34 +248,21 @@ impl PollPlan {
             },
         };
 
-        if let (Some(last_polled), Some(last_offset)) = (&self.last_polled, last_matching_offset) {
-            last_polled.record(last_offset);
-        }
-
-        if let Some(auto_commit) = self.auto_commit
-            && !fragments.is_empty()
-            && let Some(last_offset) = last_matching_offset
-        {
-            match auto_commit.persist(last_offset).await {
-                // Apply to the in-memory map on the owned `Arc` (no borrow).
-                Ok(()) => auto_commit.apply(last_offset),
-                Err(err) => warn!(
-                    target: "iggy.partitions.diag",
-                    last_offset,
-                    %err,
-                    "poll_read: failed to persist consumer offset"
-                ),
-            }
-        }
-
-        (fragments, commit_offset)
+        finish(
+            self.last_polled.as_ref(),
+            self.auto_commit,
+            commit_offset,
+            fragments,
+            last_matching_offset,
+        )
     }
 
     /// Synchronous fast path for a fully-resident poll
-    /// ([`Self::needs_off_pump_io`] is `false`): no disk read, no
-    /// consumer-offset persist, so the pump can reply inline without spawning.
+    /// ([`Self::needs_off_pump_io`] is `false`): no disk read, so the pump
+    /// applies the auto-commit in memory and replies inline without spawning.
+    /// The auto-committed offset is returned for the serving shard to replicate.
     #[must_use]
-    pub fn execute_resident(self) -> (PollFragments<4096>, u64) {
+    pub fn execute_resident(self) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -281,21 +276,59 @@ impl PollPlan {
                 unreachable!("execute_resident on Disk tier; needs_off_pump_io guards this")
             }
         };
-        if let (Some(last_polled), Some(last_offset)) = (&self.last_polled, last_matching_offset) {
-            last_polled.record(last_offset);
-        }
-        // An auto-commit reaches the resident fast path only when it needs no
-        // disk persist (`needs_off_pump_io` gate), so apply the offset to the
-        // in-memory map inline. `execute()` does the same after its persist;
-        // skipping it here would silently drop the committed offset.
-        if let Some(auto_commit) = self.auto_commit
-            && !fragments.is_empty()
-            && let Some(last_offset) = last_matching_offset
-        {
-            auto_commit.apply(last_offset);
-        }
-        (fragments, commit_offset)
+        finish(
+            self.last_polled.as_ref(),
+            self.auto_commit,
+            commit_offset,
+            fragments,
+            last_matching_offset,
+        )
     }
+}
+
+/// Common tail of [`PollPlan::execute`] and [`PollPlan::execute_resident`],
+/// factored out so the high-water record, auto-commit, and returned triple
+/// stay identical across both.
+fn finish(
+    last_polled: Option<&LastPolledCtx>,
+    auto_commit: Option<AutoCommitCtx>,
+    commit_offset: u64,
+    fragments: PollFragments<4096>,
+    last_matching_offset: Option<u64>,
+) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
+    if let (Some(last_polled), Some(last_offset)) = (last_polled, last_matching_offset) {
+        last_polled.record(last_offset);
+    }
+    let auto_commit_applied = apply_auto_commit(auto_commit, &fragments, last_matching_offset);
+    (fragments, commit_offset, auto_commit_applied)
+}
+
+/// Apply an `auto_commit` to the in-memory offset map (monotone) and surface
+/// the committed offset so the serving shard can replicate it through
+/// consensus. `None` when the poll served nothing (empty fragments) or no
+/// auto-commit was requested. Shared by [`PollPlan::execute`] and
+/// [`PollPlan::execute_resident`] so both apply identically.
+///
+/// The eager in-memory apply preserves read-your-own-poll for a tight
+/// `Consumer::Next` loop that reads before the replicated commit lands; the
+/// commit's apply is an idempotent monotone set, so the double-apply converges.
+fn apply_auto_commit(
+    auto_commit: Option<AutoCommitCtx>,
+    fragments: &PollFragments<4096>,
+    last_matching_offset: Option<u64>,
+) -> Option<AutoCommitApplied> {
+    let auto_commit = auto_commit?;
+    if fragments.is_empty() {
+        return None;
+    }
+    let last_offset = last_matching_offset?;
+    auto_commit.apply(last_offset);
+    let (kind, consumer_id) = auto_commit.kind_and_id();
+    Some(AutoCommitApplied {
+        kind,
+        consumer_id,
+        offset: last_offset,
+    })
 }
 
 pub enum PollTier {
@@ -512,18 +545,16 @@ impl DiskReadPlan {
 }
 
 impl AutoCommitCtx {
-    /// Whether applying this auto-commit needs a real disk persist. `false` for
-    /// sim/dev partitions with no `offset_path`, where the apply is a sync,
-    /// in-memory `papaya` store that the pump can run inline.
-    pub(crate) const fn needs_persist(&self) -> bool {
-        self.offset_path.is_some()
-    }
-
-    /// Persist the committed offset to disk, off the partition borrow.
-    pub(crate) async fn persist(&self, offset: u64) -> Result<(), IggyError> {
-        match &self.offset_path {
-            Some(path) => persist_offset(path, offset, self.enforce_fsync).await,
-            None => Ok(()),
+    /// The offset key (kind + numeric id) this auto-commit targets, for the
+    /// replicated `StoreConsumerOffset2` op the serving shard submits.
+    pub(crate) const fn kind_and_id(&self) -> (ConsumerKind, u32) {
+        match &self.target {
+            AutoCommitTarget::Consumer { consumer_id, .. } => {
+                (ConsumerKind::Consumer, *consumer_id)
+            }
+            AutoCommitTarget::ConsumerGroup { group_id, .. } => {
+                (ConsumerKind::ConsumerGroup, *group_id)
+            }
         }
     }
 
@@ -610,7 +641,12 @@ pub fn upsert_offset<K>(
 /// newer explicit `StoreConsumerOffset` cannot rewind it backward. The
 /// on-miss create branch is identical. The explicit pump path keeps
 /// [`upsert_offset`] (`store`), since an explicit store may legitimately rewind.
-fn upsert_offset_max<K>(
+///
+/// Also used by the replicated commit-apply for a server auto-commit op
+/// ([`crate::iggy_partition::IggyPartition::apply_consumer_offset_commit`]): its
+/// offset was already advanced in memory by the eager poll-path apply, and this
+/// commit can land behind a newer poll, so it must not `store` (rewind) it.
+pub fn upsert_offset_max<K>(
     map: &papaya::HashMap<K, ConsumerOffset>,
     key: K,
     offset: u64,
@@ -684,14 +720,8 @@ mod tests {
         fragments
     }
 
-    fn consumer_auto_commit(
-        offsets: Arc<ConsumerOffsets>,
-        consumer_id: u32,
-        offset_path: Option<String>,
-    ) -> AutoCommitCtx {
+    fn consumer_auto_commit(offsets: Arc<ConsumerOffsets>, consumer_id: u32) -> AutoCommitCtx {
         AutoCommitCtx {
-            offset_path,
-            enforce_fsync: false,
             target: AutoCommitTarget::Consumer {
                 offsets,
                 consumer_id,
@@ -701,15 +731,15 @@ mod tests {
     }
 
     #[test]
-    fn resident_auto_commit_without_offset_path_applies_inline() {
-        // sim/dev partition: auto_commit is requested but there is no
-        // `offset_path`, so the apply is a sync in-memory store. The plan must
-        // stay on the resident fast path (no detached task) AND still record
-        // the committed offset, which the resident path used to drop.
+    fn resident_auto_commit_applies_in_memory_and_surfaces_offset() {
+        // A resident auto_commit poll stays on the inline fast path (no detached
+        // task since the poll no longer persists), applies the committed offset
+        // to the in-memory map for read-your-own-poll, AND surfaces it so the
+        // serving shard replicates it through consensus.
         let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
         let plan = PollPlan {
             commit_offset: 42,
-            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7, None)),
+            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7)),
             last_polled: None,
             tier: PollTier::Resident {
                 fragments: non_empty_fragments(),
@@ -719,12 +749,17 @@ mod tests {
 
         assert!(
             !plan.needs_off_pump_io(),
-            "no offset_path means the apply is sync; the pump must not spawn",
+            "a resident auto_commit no longer persists on the poll path; the pump must not spawn",
         );
 
-        let (fragments, commit_offset) = plan.execute_resident();
+        let (fragments, commit_offset, applied) = plan.execute_resident();
         assert!(!fragments.is_empty(), "resident fragments must be returned");
         assert_eq!(commit_offset, 42, "commit offset is forwarded verbatim");
+
+        let applied = applied.expect("auto_commit must surface the applied offset for replication");
+        assert!(matches!(applied.kind, ConsumerKind::Consumer));
+        assert_eq!(applied.consumer_id, 7);
+        assert_eq!(applied.offset, 5);
 
         let stored = offsets
             .pin()
@@ -738,24 +773,25 @@ mod tests {
     }
 
     #[test]
-    fn resident_auto_commit_with_offset_path_needs_off_pump_io() {
+    fn empty_resident_poll_surfaces_no_auto_commit() {
+        // Nothing served -> nothing to commit: no offset is surfaced and the
+        // in-memory map stays untouched.
         let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
         let plan = PollPlan {
-            commit_offset: 0,
-            auto_commit: Some(consumer_auto_commit(
-                offsets,
-                7,
-                Some("some/path".to_owned()),
-            )),
+            commit_offset: 9,
+            auto_commit: Some(consumer_auto_commit(offsets.clone(), 7)),
             last_polled: None,
-            tier: PollTier::Resident {
-                fragments: non_empty_fragments(),
-                last_matching_offset: Some(5),
-            },
+            tier: PollTier::Empty,
         };
+        let (fragments, _commit_offset, applied) = plan.execute_resident();
+        assert!(fragments.is_empty());
         assert!(
-            plan.needs_off_pump_io(),
-            "a real offset_path persist must be spawned off the pump",
+            applied.is_none(),
+            "empty poll must not surface an auto-commit"
+        );
+        assert!(
+            offsets.pin().get(&7usize).is_none(),
+            "an empty poll must not touch the offset map",
         );
     }
 
@@ -764,7 +800,7 @@ mod tests {
         // Auto-commit must never rewind a newer offset (anti-rewind via
         // fetch_max); an explicit StoreConsumerOffset may legitimately rewind.
         let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        let auto_commit = consumer_auto_commit(offsets.clone(), 7, None);
+        let auto_commit = consumer_auto_commit(offsets.clone(), 7);
 
         auto_commit.apply(10);
         let after_high = offsets

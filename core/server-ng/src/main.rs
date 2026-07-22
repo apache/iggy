@@ -23,9 +23,13 @@ use args::Args;
 use clap::Parser;
 use server_ng::bootstrap::{bootstrap, load_config};
 use server_ng::server_error::ServerNgError;
+use system_stats::capture_allowed_cpus;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
+    // Before shard threads pin themselves: a pinned capture sees one core.
+    capture_allowed_cpus();
+
     let bootstrap_runtime = match server_common::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {
@@ -54,7 +58,7 @@ fn main() -> Result<(), ServerNgError> {
         (
             configs::server_ng::ServerNgConfig,
             Option<u8>,
-            server::log::logger::Logging,
+            server_common::log::Logging,
         ),
         ServerNgError,
     > = bootstrap_runtime.block_on(async {
@@ -65,9 +69,9 @@ fn main() -> Result<(), ServerNgError> {
             let _ = dotenvy::dotenv();
         }
 
-        // TODO: decouple logging from the `server` crate.
-        let mut logging = server::log::logger::Logging::new();
+        let mut logging = server_common::log::Logging::new(server_ng::VERSION);
         logging.early_init();
+        server_common::print_build_info!(server_ng::VERSION);
 
         let config = load_config(&mut logging).await?;
         server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());

@@ -128,10 +128,15 @@ impl Default for MetadataSnapshot {
 impl MetadataSnapshot {
     /// Create a new snapshot with the given sequence number.
     #[must_use]
-    pub fn new(sequence_number: u64) -> Self {
+    pub const fn new(sequence_number: u64) -> Self {
         Self {
             version: 1,
-            created_at: iggy_common::IggyTimestamp::now().as_micros(),
+            // Deterministic placeholder. The real creation time is stamped by
+            // `Snapshot::create` from the consensus-injected clock (see
+            // `VsrConsensus::clock_realtime_micros`) so a replayed simulator
+            // seed reproduces identical snapshot bytes; reading the wall clock
+            // here would reintroduce a nondeterministic input.
+            created_at: 0,
             sequence_number,
             users: None,
             streams: None,
@@ -178,7 +183,13 @@ pub trait Snapshot: Sized {
     /// # Arguments
     /// * `stm` - The state machine to snapshot
     /// * `sequence_number` - Monotonically increasing snapshot sequence number
-    fn create<T>(stm: &T, sequence_number: Self::SequenceNumber) -> Result<Self, Self::Error>
+    /// * `created_at` - Creation time from the injected clock; must be
+    ///   deterministic under simulation, never a wall-clock read
+    fn create<T>(
+        stm: &T,
+        sequence_number: Self::SequenceNumber,
+        created_at: Self::Timestamp,
+    ) -> Result<Self, Self::Error>
     where
         T: FillSnapshot<Self::Inner>;
 

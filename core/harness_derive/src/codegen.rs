@@ -124,16 +124,11 @@ fn generate_variants(attrs: &IggyTestAttrs) -> Vec<TestVariant> {
     variants
 }
 
-/// HTTP is not served by the next-gen (VSR) server, so HTTP transport variants
-/// must not compile into the test binary under `--features vsr`. The proc macro
-/// cannot read the consuming crate's feature flags at expansion time, so it
-/// emits this `cfg` gate on HTTP variants; the `integration` crate resolves it.
-fn vsr_transport_cfg(transport: Transport) -> TokenStream {
-    if matches!(transport, Transport::Http) {
-        quote!(#[cfg(not(feature = "vsr"))])
-    } else {
-        quote!()
-    }
+/// No transport is gated out of the VSR test matrix. Retained as the single
+/// seam where a transport could be excluded from `--features vsr` if one is
+/// ever unsupported by the next-gen server again.
+fn vsr_transport_cfg(_transport: Transport) -> TokenStream {
+    quote!()
 }
 
 /// Generate test code from attributes and input function.

@@ -28,7 +28,9 @@
 //! bootstrap.
 
 use super::message_bus::MessageBusConfig;
+use super::metadata::MetadataConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
+use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
@@ -38,7 +40,6 @@ use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
     PersonalAccessTokenConfig, TelemetryConfig,
 };
-use crate::server_config::system::SystemConfig;
 use std::sync::Arc;
 
 static_toml::static_toml! {
@@ -55,14 +56,27 @@ impl Default for ServerNgConfig {
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(SystemConfig::default()),
+            system: Arc::new(NgSystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
+            metadata: MetadataConfig::default(),
             message_bus: MessageBusConfig::default(),
+        }
+    }
+}
+
+impl Default for MetadataConfig {
+    fn default() -> MetadataConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift (same pattern as MessageBusConfig below).
+        let metadata = &SERVER_NG_CONFIG.metadata;
+        MetadataConfig {
+            prepare_queue_depth: metadata.prepare_queue_depth as usize,
+            journal_slots: metadata.journal_slots as usize,
         }
     }
 }

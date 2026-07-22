@@ -42,18 +42,32 @@ pub(crate) fn maybe_rewrite_pat_request(
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
-    let operation = request.header().operation;
-    let user_id = match operation {
+    let user_id = match request.header().operation {
         Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
             .borrow()
             .get_user_id(transport_client_id)
             .ok_or(IggyError::Unauthenticated)?,
         _ => return Ok((request, None)),
     };
+    rewrite_pat_request_for_user(user_id, request)
+}
 
+/// PAT rewrite for a caller that already holds the authenticated `user_id`.
+///
+/// The HTTP listener authenticates against its own session table rather than
+/// the transport `SessionManager`, so it resolves the id itself and calls this
+/// directly. `CreatePersonalAccessToken` mints the raw token + hash and hands
+/// the raw token back; `DeletePersonalAccessToken` is rewritten to the
+/// replicated form scoped to `user_id` (`only_if_expired` false); every other
+/// operation passes through unchanged with `None` (the HTTP write core routes
+/// all of its ops here, so the non-PAT arm is a no-op, not `unreachable`).
+pub(crate) fn rewrite_pat_request_for_user(
+    user_id: u32,
+    request: Message<RequestHeader>,
+) -> Result<(Message<RequestHeader>, Option<String>), IggyError> {
     let body = request_body(&request);
     let mut raw_token = None;
-    let rewritten = match operation {
+    let rewritten = match request.header().operation {
         Operation::CreatePersonalAccessToken => {
             let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
@@ -84,7 +98,7 @@ pub(crate) fn maybe_rewrite_pat_request(
             }
             .to_bytes()
         }
-        _ => unreachable!(),
+        _ => return Ok((request, None)),
     };
 
     Ok((rewrite_request_body(&request, &rewritten)?, raw_token))

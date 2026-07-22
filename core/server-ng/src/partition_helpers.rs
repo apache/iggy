@@ -24,6 +24,7 @@
 //! local partition yet. The two paths share namespace-bounds validation,
 //! consumer-offset configuration, and initial-segment provisioning.
 
+use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets};
 use crate::server_error::ServerNgError;
 use compio::fs::create_dir_all;
 use configs::server_ng::ServerNgConfig;
@@ -33,15 +34,14 @@ use iggy_common::{
 };
 use message_bus::IggyMessageBus;
 use partitions::{IggyIndexWriter, IggyPartition, MessagesWriter, Segment};
-use server::io::fs_utils::remove_dir_all;
-use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
-use server::streaming::segments::storage::create_segment_storage;
+use server_common::SegmentStorage;
+use server_common::fs_utils::remove_dir_all;
 use server_common::sharding::IggyNamespace;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::error;
+use std::sync::atomic::Ordering;
+use tracing::{error, warn};
 
 /// Validate that a namespace fits within the static caps declared in
 /// `config.extra.namespace`.
@@ -172,10 +172,9 @@ pub async fn create_partition_file_hierarchy(
 ///
 /// # Errors
 ///
-/// Returns [`ServerNgError::RecoveredConsumerOffsetOutOfBounds`] when a
-/// stored offset exceeds `current_offset`, or
-/// [`ServerNgError::ConsumerOffsetsLoad`] when the on-disk files exist
-/// but fail to decode.
+/// Returns [`ServerNgError::ConsumerOffsetsLoad`] when the on-disk files
+/// exist but fail to decode. A stored offset ahead of `current_offset` is
+/// clamped (with a warning), not an error.
 pub fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerNgConfig,
@@ -207,15 +206,20 @@ pub fn configure_consumer_offsets(
         for offset in loaded_consumer_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer",
-                    consumer_id: offset.consumer_id as usize,
-                    offset: recovered_offset,
+                // A crash can persist an offset ahead of the flushed data
+                // (offsets are stored eagerly, messages flush later). Clamp to
+                // the recovered head so the consumer resumes instead of being
+                // stuck polling past the log; mirrors the legacy contract.
+                warn!(
+                    consumer_id = offset.consumer_id,
+                    recovered_offset,
                     current_offset,
                     stream_id,
                     topic_id,
                     partition_id,
-                });
+                    "recovered consumer offset ahead of partition data; clamping"
+                );
+                offset.offset.store(current_offset, Ordering::Relaxed);
             }
             guard.insert(offset.consumer_id as usize, offset);
         }
@@ -233,15 +237,16 @@ pub fn configure_consumer_offsets(
         for (group_id, offset) in loaded_group_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > current_offset {
-                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
-                    consumer_kind: "consumer group",
-                    consumer_id: group_id.0,
-                    offset: recovered_offset,
+                warn!(
+                    consumer_group_id = group_id.0,
+                    recovered_offset,
                     current_offset,
                     stream_id,
                     topic_id,
                     partition_id,
-                });
+                    "recovered consumer group offset ahead of partition data; clamping"
+                );
+                offset.offset.store(current_offset, Ordering::Relaxed);
             }
             guard.insert(group_id, offset);
         }
@@ -333,33 +338,52 @@ pub async fn ensure_initial_segment(
         return Ok(());
     }
 
-    // TODO: decouple segment storage creation from the `server` crate.
-    let storage =
-        create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to create initial segment storage"
-                );
-                source
-            })?;
     let messages_path = config
         .system
         .get_messages_file_path(stream_id, topic_id, partition_id, 0);
     let index_path = config
         .system
         .get_index_path(stream_id, topic_id, partition_id, 0);
+    let enforce_fsync = config.system.partition.enforce_fsync;
+    let storage = SegmentStorage::new(
+        &messages_path,
+        &index_path,
+        0,
+        0,
+        enforce_fsync,
+        enforce_fsync,
+        false,
+    )
+    .await
+    .map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to create initial segment storage"
+        );
+        source
+    })?;
+    // Share the storage's size counters so reads observe persisted bytes;
+    // a writer with a private counter grows the file invisibly to readers.
+    let messages_size_counter = storage
+        .messages_writer
+        .as_ref()
+        .map(|writer| writer.size_counter())
+        .unwrap_or_default();
+    let index_size_counter = storage
+        .index_writer
+        .as_ref()
+        .map(|writer| writer.size_counter())
+        .unwrap_or_default();
     partition.log.add_persisted_segment(
         Segment::new(0, config.system.segment.size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
                 &messages_path,
-                Rc::new(AtomicU64::new(0)),
+                messages_size_counter,
                 config.system.partition.enforce_fsync,
                 false,
             )
@@ -379,7 +403,7 @@ pub async fn ensure_initial_segment(
         Some(Rc::new(
             IggyIndexWriter::new(
                 &index_path,
-                Rc::new(AtomicU64::new(0)),
+                index_size_counter,
                 config.system.partition.enforce_fsync,
                 false,
             )
@@ -439,6 +463,17 @@ pub async fn build_partition_fresh(
     let partition_id = namespace.partition_id();
 
     validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
+    // Sampled BEFORE the hierarchy create: a pre-existing partition directory
+    // is the marker of a prior life (the .log inside may legitimately be
+    // empty -- committed-but-unflushed data dies with the journal), while a
+    // genuinely fresh create finds nothing.
+    let restarted = replica_count > 1
+        && std::fs::metadata(
+            config
+                .system
+                .get_partition_path(stream_id, topic_id, partition_id),
+        )
+        .is_ok();
     create_partition_file_hierarchy(stream_id, topic_id, partition_id, config)
         .await
         .map_err(|source| {
@@ -460,7 +495,21 @@ pub async fn build_partition_fresh(
         bus,
         LocalPipeline::new(),
     );
-    consensus.init();
+    // A partition directory that already holds segment bytes is a RESTART
+    // materialization, not a fresh create: this replica's group state died
+    // with the process, so claiming view-0 primaryship would heartbeat
+    // commit_min=0 at peers that hold the committed log (racing their
+    // election). Join as a quorum-invisible backup and probe for the
+    // current view instead; journal repair re-materializes the data from a
+    // peer, byte-identical by the deterministic-roll/replicated-ciphertext
+    // design. A truly fresh create keeps the plain init: every group needs
+    // its view-0 primary to exist.
+    if restarted {
+        consensus.init_as_backup();
+        consensus.begin_view_probe();
+    } else {
+        consensus.init();
+    }
 
     let mut partition = IggyPartition::new(stats, consensus);
     partition.set_partition_dir(config.system.get_partition_path(

@@ -33,9 +33,9 @@ pub async fn should_help_match() {
 
 Commands:
   create  Create partitions for the specified topic ID
-          and stream ID based on the given count. [aliases: c]
+          and stream ID based on the given count. [alias: c]
   delete  Delete partitions for the specified topic ID
-          and stream ID based on the given count. [aliases: d]
+          and stream ID based on the given count. [alias: d]
   help    Print this message or the help of the given subcommand(s)
 
 Options:

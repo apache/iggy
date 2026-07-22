@@ -29,11 +29,11 @@
 //! Full cross-replica EQUALITY (every live replica holding the same committed
 //! log) is the real consensus property, but it is not asserted yet. Backups
 //! apply prepares in strict order and drop any gap (`op != current_op + 1` in
-//! `metadata::on_replicate` / `iggy_partition`), and there is no log repair
-//! (no `RequestPrepare` / state transfer) to refetch a missed prepare. Under
-//! realistic reorder/drop a behind backup therefore never catches up and
-//! legitimately sits behind the leader at quiesce. Re-enable equality once
-//! message repair lands (the state-sync workstream).
+//! `metadata::on_replicate` / `iggy_partition`), relying on the primary's
+//! retransmit and the repair sessions (`MetadataRepairSession` / partition
+//! `RepairSession`) to refill. Message repair has landed on both planes, so
+//! the equality assert is unblocked but not yet re-enabled: the sim must
+//! first drive quiesce long enough for repair rounds to converge.
 
 use crate::Simulator;
 use crate::replica::Replica;
@@ -180,7 +180,7 @@ pub fn assert_converged(sim: &Simulator, workload: &Workload) {
         let Some(leader) = metadata_leader(sim, &live) else {
             panic!("no metadata leader live at quiesce (seed={seed:#x})");
         };
-        let committed = read_committed_metadata(&sim.replicas[leader]).workload_owned();
+        let committed = read_committed_metadata(&sim.replicas[leader].shards[0]).workload_owned();
         assert_eq!(
             shadow_metadata(&workload.shadow),
             committed,
@@ -194,7 +194,7 @@ pub fn assert_converged(sim: &Simulator, workload: &Workload) {
 /// authoritative holder of the committed metadata log.
 fn metadata_leader(sim: &Simulator, live: &[usize]) -> Option<usize> {
     live.iter().copied().find(|&replica_idx| {
-        sim.replicas[replica_idx]
+        sim.replicas[replica_idx].shards[0]
             .plane
             .metadata()
             .consensus

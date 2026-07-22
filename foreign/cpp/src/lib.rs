@@ -88,11 +88,40 @@ mod ffi {
         topics_count: u32,
     }
 
+    #[repr(u8)]
+    enum HeaderKind {
+        Raw = 1,
+        String = 2,
+        Bool = 3,
+        Int8 = 4,
+        Int16 = 5,
+        Int32 = 6,
+        Int64 = 7,
+        Int128 = 8,
+        Uint8 = 9,
+        Uint16 = 10,
+        Uint32 = 11,
+        Uint64 = 12,
+        Uint128 = 13,
+        Float32 = 14,
+        Float64 = 15,
+    }
+
+    struct HeaderField {
+        kind: u8,
+        value: Vec<u8>,
+    }
+
+    struct HeaderEntry {
+        key: HeaderField,
+        value: HeaderField,
+    }
+
     struct IggyMessageToSend {
         id_lo: u64,
         id_hi: u64,
         payload: Vec<u8>,
-        user_headers: Vec<u8>,
+        user_headers: Vec<HeaderEntry>,
     }
 
     struct IggyMessagePolled {
@@ -106,7 +135,7 @@ mod ffi {
         payload_length: u32,
         reserved: u64,
         payload: Vec<u8>,
-        user_headers: Vec<u8>,
+        user_headers: Vec<HeaderEntry>,
     }
 
     struct PolledMessages {
@@ -220,6 +249,71 @@ mod ffi {
         threads_count: u32,
         free_disk_space: u64,
         total_disk_space: u64,
+    }
+
+    struct TransportEndpoints {
+        tcp: u16,
+        quic: u16,
+        http: u16,
+        websocket: u16,
+    }
+
+    struct ClusterNode {
+        name: String,
+        ip: String,
+        endpoints: TransportEndpoints,
+        role: String,
+        status: String,
+    }
+
+    struct ClusterMetadata {
+        name: String,
+        nodes: Vec<ClusterNode>,
+    }
+
+    struct GlobalPermissions {
+        manage_servers: bool,
+        read_servers: bool,
+        manage_users: bool,
+        read_users: bool,
+        manage_streams: bool,
+        read_streams: bool,
+        manage_topics: bool,
+        read_topics: bool,
+        poll_messages: bool,
+        send_messages: bool,
+    }
+
+    struct TopicPermissions {
+        manage_topic: bool,
+        read_topic: bool,
+        poll_messages: bool,
+        send_messages: bool,
+    }
+
+    struct TopicPermissionEntry {
+        topic_id: u32,
+        permissions: TopicPermissions,
+    }
+
+    struct StreamPermissions {
+        manage_stream: bool,
+        read_stream: bool,
+        manage_topics: bool,
+        read_topics: bool,
+        poll_messages: bool,
+        send_messages: bool,
+        topics: Vec<TopicPermissionEntry>,
+    }
+
+    struct StreamPermissionEntry {
+        stream_id: u32,
+        permissions: StreamPermissions,
+    }
+
+    struct Permissions {
+        global: GlobalPermissions,
+        streams: Vec<StreamPermissionEntry>,
     }
 
     extern "Rust" {
@@ -357,7 +451,7 @@ mod ffi {
             auto_commit: bool,
         ) -> Result<PolledMessages>;
 
-        fn make_message(payload: Vec<u8>) -> IggyMessageToSend;
+        fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
@@ -386,24 +480,45 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
+        fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
 
         // Future functions
-        // fn disconnect(self: &Client) -> Result<()>;
-        // fn shutdown(self: &Client) -> Result<()>;
+        fn disconnect(self: &Client) -> Result<()>;
+        fn shutdown(self: &Client) -> Result<()>;
         // fn subscribe_events(self: &Client) -> Result<()>;
-        // fn delete_segments(self: &Client, stream_id: Identifier, topic_id: Identifier, partition_id: u32, segments_count: u32) -> Result<()>;
+        fn delete_segments(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            segments_count: u32,
+        ) -> Result<()>;
         // fn get_user(self: &Client, user_id: Identifier) -> Result<()>;
         // fn get_users(self: &Client) -> Result<()>;
         // fn create_user(self: &Client, username: String, password: String, status: u8) -> Result<()>;
         // fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
         // fn update_user(self: &Client, user_id: Identifier, username: String, status: u8) -> Result<()>;
-        // fn update_permissions(self: &Client, user_id: Identifier, permissions: Vec<u8>) -> Result<()>;
-        // fn change_password(self: &Client, user_id: Identifier, current_password: String, new_password: String) -> Result<()>;
-        // fn get_cluster_metadata(self: &Client) -> Result<()>;
-        // fn get_personal_access_tokens(self: &Client) -> Result<()>;
-        // fn create_personal_access_token(self: &Client, name: String, expiry: u64) -> Result<()>;
+        fn update_permissions(
+            self: &Client,
+            user_id: Identifier,
+            has_permissions: bool,
+            permissions: Permissions,
+        ) -> Result<()>;
+        fn change_password(
+            self: &Client,
+            user_id: Identifier,
+            current_password: String,
+            new_password: String,
+        ) -> Result<()>;
+        fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
+        // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
+        // fn create_personal_access_token(
+        //     self: &Client,
+        //     name: String,
+        //     expiry: u64,
+        // ) -> Result<RawPersonalAccessToken>;
         // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
-        // fn login_with_personal_access_token(self: &Client, token: String) -> Result<()>;
+        // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client) -> Result<()>;
 

@@ -57,7 +57,7 @@ pub enum NamespaceCapacityError {
 ///
 /// Encodes stream_id (12 bits), topic_id (12 bits), and partition_id (20 bits)
 /// into a single u64 for efficient hashing and routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IggyNamespace(u64);
 
 impl IggyNamespace {

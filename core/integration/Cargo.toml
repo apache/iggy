@@ -66,7 +66,7 @@ mongodb = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
 rmcp = { workspace = true, features = [
@@ -81,7 +81,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
-socket2 = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }

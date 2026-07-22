@@ -18,7 +18,6 @@
 using System.Buffers;
 using System.Text;
 using Apache.Iggy.Contracts;
-using Apache.Iggy.Encryption;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -148,34 +147,6 @@ public class IggyTypedPublisherTests
     }
 
     [Fact]
-    public async Task SendSingle_Direct_Should_EncryptPayload_WhenEncryptorConfigured()
-    {
-        var recorder = new SendRecorder();
-        await using IggyPublisher<string> publisher
-            = await CreatePublisherAsync(BuildClient(recorder), Config(encryptor: new ReverseEncryptor()));
-
-        await publisher.SendAsync("hello", ct: Ct);
-
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Payload.Should().Equal(Reverse(Encoding.UTF8.GetBytes("hello")));
-    }
-
-    [Fact]
-    public async Task SendBatch_Direct_Should_EncryptEveryPayload_WhenEncryptorConfigured()
-    {
-        var recorder = new SendRecorder();
-        await using IggyPublisher<string> publisher
-            = await CreatePublisherAsync(BuildClient(recorder), Config(encryptor: new ReverseEncryptor()));
-
-        await publisher.SendAsync(new[] { "ab", "cd" }, Ct);
-
-        recorder.AllMessages.Select(m => m.Payload)
-            .Should().BeEquivalentTo(
-                new[] { Reverse(Encoding.UTF8.GetBytes("ab")), Reverse(Encoding.UTF8.GetBytes("cd")) },
-                o => o.WithStrictOrdering());
-    }
-
-    [Fact]
     public async Task SendSingle_Should_Throw_WhenNotInitialized()
     {
         var publisher = new IggyPublisher<string>(BuildClient(new SendRecorder()), Config(),
@@ -267,20 +238,6 @@ public class IggyTypedPublisherTests
     }
 
     [Fact]
-    public async Task SendSingle_Background_Should_EncryptPayload_WhenEncryptorConfigured()
-    {
-        var recorder = new SendRecorder();
-        await using IggyPublisher<string> publisher
-            = await CreatePublisherAsync(BuildClient(recorder), Config(true, new ReverseEncryptor()));
-
-        await publisher.SendAsync("hello", ct: Ct);
-        await publisher.WaitUntilAllSendsAsync(Ct);
-
-        var sent = recorder.AllMessages.Should().ContainSingle().Subject;
-        sent.Payload.Should().Equal(Reverse(Encoding.UTF8.GetBytes("hello")));
-    }
-
-    [Fact]
     public async Task SendBackground_Should_DrainEveryMessage_WhenManyProducersEnqueueConcurrently()
     {
         const int producers = 16;
@@ -311,14 +268,7 @@ public class IggyTypedPublisherTests
         return Encoding.UTF8.GetString(message.Payload);
     }
 
-    private static byte[] Reverse(byte[] bytes)
-    {
-        var copy = (byte[])bytes.Clone();
-        Array.Reverse(copy);
-        return copy;
-    }
-
-    private static IggyPublisherConfig<string> Config(bool background = false, IMessageEncryptor? encryptor = null)
+    private static IggyPublisherConfig<string> Config(bool background = false)
     {
         return new IggyPublisherConfig<string>
         {
@@ -326,7 +276,6 @@ public class IggyTypedPublisherTests
             TopicId = Topic,
             Partitioning = Partitioning.None(),
             Serializer = new StringSerializer(),
-            MessageEncryptor = encryptor,
             EnableBackgroundSending = background,
             BackgroundFlushInterval = TimeSpan.FromMilliseconds(15),
             BackgroundBatchSize = 100,
@@ -434,23 +383,6 @@ public class IggyTypedPublisherTests
         public void Serialize(string data, IBufferWriter<byte> writer)
         {
             writer.Write(Encoding.UTF8.GetBytes(data));
-        }
-    }
-
-    private sealed class ReverseEncryptor : IMessageEncryptor
-    {
-        public byte[] Encrypt(ReadOnlySpan<byte> plainData)
-        {
-            var copy = plainData.ToArray();
-            Array.Reverse(copy);
-            return copy;
-        }
-
-        public byte[] Decrypt(ReadOnlySpan<byte> encryptedData)
-        {
-            var copy = encryptedData.ToArray();
-            Array.Reverse(copy);
-            return copy;
         }
     }
 }

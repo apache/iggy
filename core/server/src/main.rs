@@ -40,7 +40,6 @@ use server::metadata::{Metadata, create_metadata_handles};
 use server::server_error::ServerError;
 use server::shard::system::info::SystemInfo;
 use server::shard::{IggyShard, calculate_shard_assignment};
-use server::shard_allocator::ShardAllocator;
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
@@ -48,7 +47,9 @@ use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::ptr::EternalPtr;
 use server_common::MemoryPool;
+use server_common::log::{LoggingSettings, TelemetrySettings};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
+use shard_allocator::ShardAllocator;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -56,6 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use system_stats::capture_allowed_cpus;
 use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";
@@ -115,6 +117,9 @@ fn print_ascii_art(text: &str) {
 
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
+    // Before shard threads pin themselves: a pinned capture sees one core.
+    capture_allowed_cpus();
+
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -145,8 +150,9 @@ fn main() -> Result<(), ServerError> {
 
         // FIRST DISCRETE LOADING STEP.
         // Initialize early logging before config parsing so we can log during bootstrap.
-        let mut logging = Logging::new();
+        let mut logging = Logging::new(server::VERSION);
         logging.early_init();
+        server_common::print_build_info!(server::VERSION);
 
         // SECOND DISCRETE LOADING STEP.
         // Load config and create directories.
@@ -176,8 +182,8 @@ fn main() -> Result<(), ServerError> {
         // From this point on, logs are persisted to file and telemetry is active.
         logging.late_init(
             config.system.get_system_path(),
-            &config.system.logging,
-            &config.telemetry,
+            &LoggingSettings::from(&config.system.logging),
+            &TelemetrySettings::from(&config.telemetry),
         )?;
 
         if is_follower {
@@ -301,7 +307,10 @@ fn main() -> Result<(), ServerError> {
         );
 
         // ELEVENTH DISCRETE LOADING STEP.
-        let shard_allocator = ShardAllocator::new(&config.system.sharding.cpu_allocation)?;
+        let shard_allocator = ShardAllocator::new(
+            &config.system.sharding.cpu_allocation,
+            config.system.sharding.pin_cores,
+        )?;
         let shard_assignment = shard_allocator.to_shard_assignments()?;
 
         #[cfg(feature = "disable-mimalloc")]

@@ -141,15 +141,27 @@ impl IggyCmdTestCase for TestTopicPurgeCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic_state = client
-            .get_topic(
-                &self.stream_name.clone().try_into().unwrap(),
-                &self.topic_name.clone().try_into().unwrap(),
-            )
-            .await;
-        assert!(topic_state.is_ok());
-        let topic_state = topic_state.unwrap().expect("Topic not found");
-        assert_eq!(topic_state.size, 0);
+        // server-ng purge is eventually consistent: the partition reset (and
+        // its stats zeroing) runs in the reconciler after the metadata commit
+        // the purge command awaited. Legacy is synchronous and satisfies this
+        // on the first poll.
+        let mut purged = false;
+        for _ in 0..60 {
+            let topic_state = client
+                .get_topic(
+                    &self.stream_name.clone().try_into().unwrap(),
+                    &self.topic_name.clone().try_into().unwrap(),
+                )
+                .await
+                .expect("get topic")
+                .expect("Topic not found");
+            if topic_state.size == 0 {
+                purged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(purged, "topic size should reach 0 after purge");
 
         let topic_delete = client
             .delete_topic(

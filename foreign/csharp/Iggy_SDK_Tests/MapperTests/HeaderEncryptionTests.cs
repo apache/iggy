@@ -16,6 +16,8 @@
 // under the License.
 
 using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Encryption;
+using Apache.Iggy.Shared;
 
 namespace Apache.Iggy.Tests.MapperTests;
 
@@ -24,8 +26,8 @@ public class HeaderEncryptionTests
     [Fact]
     public void Headers_should_survive_encrypt_decrypt_roundtrip()
     {
-        var key = Encryption.AesMessageEncryptor.GenerateKey();
-        var encryptor = new Encryption.AesMessageEncryptor(key);
+        var key = AesMessageEncryptor.GenerateKey();
+        var encryptor = new AesMessageEncryptor(key);
 
         var originalHeaders = new Dictionary<Headers.HeaderKey, Headers.HeaderValue>
         {
@@ -37,7 +39,7 @@ public class HeaderEncryptionTests
         var headerBytes = HeadersToBytes(originalHeaders);
         Assert.NotEmpty(headerBytes);
 
-        var encrypted = encryptor.Encrypt(headerBytes);
+        var encrypted = encryptor.EncryptToArray(headerBytes);
         Assert.NotEqual(headerBytes, encrypted);
         Assert.True(encrypted.Length > headerBytes.Length);
 
@@ -45,7 +47,7 @@ public class HeaderEncryptionTests
         var parsed = Mappers.BinaryMapper.TryMapHeaders(encrypted);
         Assert.Null(parsed);
 
-        var decrypted = encryptor.Decrypt(encrypted);
+        var decrypted = encryptor.DecryptToArray(encrypted);
         Assert.Equal(headerBytes, decrypted);
 
         var roundTripped = Mappers.BinaryMapper.MapHeaders(decrypted);

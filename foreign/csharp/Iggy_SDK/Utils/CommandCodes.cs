@@ -35,10 +35,12 @@ internal static class CommandCodes
     internal const int CHANGE_PASSWORD_CODE = 37;
     internal const int LOGIN_USER_CODE = 38;
     internal const int LOGOUT_USER_CODE = 39;
+    internal const int LOGIN_REGISTER_CODE = 40;
     internal const int GET_PERSONAL_ACCESS_TOKENS_CODE = 41;
     internal const int CREATE_PERSONAL_ACCESS_TOKEN_CODE = 42;
     internal const int DELETE_PERSONAL_ACCESS_TOKEN_CODE = 43;
     internal const int LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE = 44;
+    internal const int LOGIN_REGISTER_WITH_PAT_CODE = 45;
     internal const int POLL_MESSAGES_CODE = 100;
     internal const int SEND_MESSAGES_CODE = 101;
     internal const int FLUSH_UNSAVED_BUFFER_CODE = 102;

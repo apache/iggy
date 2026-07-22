@@ -24,7 +24,6 @@ use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use configs::{ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, TypedEnvProvider};
-use derive_more::Display;
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
@@ -34,9 +33,11 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use server_common::MemoryPoolConfigOther;
+use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
 use std::env;
-use std::str::FromStr;
 use std::sync::Arc;
+
+pub use server_common::log::TelemetryTransport;
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -158,22 +159,19 @@ pub struct TelemetryTracesConfig {
     pub endpoint: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Display, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum TelemetryTransport {
-    #[display("grpc")]
-    GRPC,
-    #[display("http")]
-    HTTP,
-}
-
-impl FromStr for TelemetryTransport {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "grpc" => Ok(TelemetryTransport::GRPC),
-            "http" => Ok(TelemetryTransport::HTTP),
-            _ => Err(format!("Invalid telemetry transport: {s}")),
+impl From<&TelemetryConfig> for TelemetrySettings {
+    fn from(config: &TelemetryConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            service_name: config.service_name.clone(),
+            logs: TelemetryEndpointSettings {
+                transport: config.logs.transport,
+                endpoint: config.logs.endpoint.clone(),
+            },
+            traces: TelemetryEndpointSettings {
+                transport: config.traces.transport,
+                endpoint: config.traces.endpoint.clone(),
+            },
         }
     }
 }

@@ -17,6 +17,7 @@
 
 use super::COMPONENT_NG;
 use super::message_bus::MessageBusConfig;
+use super::metadata::MetadataConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
@@ -41,6 +42,11 @@ use std::sync::Arc;
 
 const DEFAULT_CONFIG_PATH: &str = "core/server-ng/config.toml";
 
+/// The `server-ng` flavour of [`SystemConfig`], bound to this crate's own
+/// [`super::sharding::ShardingConfig`]. `core/server-ng` names this alias
+/// wherever it refers to the system config.
+pub type NgSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
+
 /// Top-level on-disk config schema for the `server-ng` binary.
 ///
 /// Mirrors the legacy [`crate::server::ServerConfig`] section surface
@@ -64,13 +70,14 @@ pub struct ServerNgConfig {
     pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
-    pub system: Arc<SystemConfig>,
+    pub system: Arc<NgSystemConfig>,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
     pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
+    pub metadata: MetadataConfig,
     pub message_bus: MessageBusConfig,
 }
 
