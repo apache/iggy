@@ -88,6 +88,7 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
+vsr = ["iggy_common/vsr"]
 
 [dependencies]
 ahash = { workspace = true }

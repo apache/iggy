@@ -25,6 +25,7 @@ publish = false
 
 [features]
 bdd = []
+vsr = ["iggy/vsr"]
 
 [dev-dependencies]
 bytes = { workspace = true }
