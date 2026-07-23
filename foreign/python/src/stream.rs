@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::StreamDetails as RustStreamDetails;
+use iggy::prelude::{Stream as RustStream, StreamDetails as RustStreamDetails};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
@@ -36,6 +36,42 @@ impl From<RustStreamDetails> for StreamDetails {
 #[gen_stub_pymethods]
 #[pymethods]
 impl StreamDetails {
+    #[getter]
+    pub fn id(&self) -> u32 {
+        self.inner.id
+    }
+
+    #[getter]
+    pub fn name(&self) -> String {
+        self.inner.name.to_string()
+    }
+
+    #[getter]
+    pub fn messages_count(&self) -> u64 {
+        self.inner.messages_count
+    }
+
+    #[getter]
+    pub fn topics_count(&self) -> u32 {
+        self.inner.topics_count
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass]
+pub struct Stream {
+    pub(crate) inner: RustStream,
+}
+
+impl From<RustStream> for Stream {
+    fn from(stream: RustStream) -> Self {
+        Self { inner: stream }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl Stream {
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id

@@ -36,7 +36,7 @@ use crate::consumer::{
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
-use crate::stream::StreamDetails;
+use crate::stream::{Stream, StreamDetails};
 use crate::topic::{Topic, TopicDetails};
 use crate::user::{
     UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
@@ -310,6 +310,78 @@ impl IggyClient {
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(stream.map(StreamDetails::from))
+        })
+    }
+
+    /// Gets all streams.
+    /// Returns a list of streams or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Stream]]", imports=("collections.abc")))]
+    fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let streams = inner
+                .get_streams()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Updates a stream's name by id.
+    /// Returns Ok(()) on successful update or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        name: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .update_stream(&stream_id, &name)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Deletes a stream by id.
+    /// Returns Ok(()) on successful deletion or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .delete_stream(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Purges all messages from a stream by id.
+    /// Returns Ok(()) on successful purge or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn purge_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .purge_stream(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
         })
     }
 

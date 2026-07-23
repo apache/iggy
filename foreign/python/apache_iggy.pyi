@@ -37,6 +37,7 @@ __all__ = [
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
+    "Stream",
     "StreamDetails",
     "Topic",
     "TopicDetails",
@@ -441,6 +442,32 @@ class IggyClient:
         r"""
         Gets stream by id.
         Returns Option of stream details or a PyRuntimeError on failure.
+        """
+    def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
+        r"""
+        Gets all streams.
+        Returns a list of streams or a PyRuntimeError on failure.
+        """
+    def update_stream(
+        self, stream_id: builtins.str | builtins.int, name: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Updates a stream's name by id.
+        Returns Ok(()) on successful update or a PyRuntimeError on failure.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes a stream by id.
+        Returns Ok(()) on successful deletion or a PyRuntimeError on failure.
+        """
+    def purge_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Purges all messages from a stream by id.
+        Returns Ok(()) on successful purge or a PyRuntimeError on failure.
         """
     def create_topic(
         self,
@@ -904,6 +931,17 @@ class SendMessage:
         This method allows for the creation of a `SendMessage` instance
         directly from Python using the provided string or bytes data.
         """
+
+@typing.final
+class Stream:
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def topics_count(self) -> builtins.int: ...
 
 @typing.final
 class StreamDetails:
