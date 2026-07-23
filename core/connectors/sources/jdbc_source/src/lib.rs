@@ -97,11 +97,20 @@ static RE_PASSWORD_PARAM: std::sync::LazyLock<Regex> =
 static RE_ORACLE_PASS: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"thin:([^/]+)/([^@]+)@").unwrap());
 
-/// Matches the canonical incremental predicate so it can be removed on the first
-/// (no-offset) poll. Case- and whitespace-tolerant so `where {tracking_column}>{last_offset}`
-/// and `WHERE  {tracking_column} >  {last_offset}` are all recognized, rather
-/// than only one exact literal spelling.
-static RE_INCREMENTAL_PREDICATE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+/// Regexes that remove the incremental offset predicate `{tracking_column} >
+/// {last_offset}` on the first (no-offset) poll while preserving any other
+/// `WHERE` conditions. All are case- and whitespace-tolerant. They are applied in
+/// order so an operator-added companion condition (e.g.
+/// `AND {tracking_column} IS NOT NULL`) does not leave a dangling `WHERE ... AND`
+/// or leading `AND ...` fragment. See [`strip_offset_predicate`].
+static RE_OFFSET_PREDICATE_AND_AFTER: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?i)\bWHERE\s+\{tracking_column\}\s*>\s*\{last_offset\}\s+AND\s+").unwrap()
+});
+static RE_OFFSET_PREDICATE_AND_BEFORE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)\s+AND\s+\{tracking_column\}\s*>\s*\{last_offset\}").unwrap()
+    });
+static RE_OFFSET_PREDICATE_BARE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(?i)\bWHERE\s+\{tracking_column\}\s*>\s*\{last_offset\}").unwrap()
 });
 
@@ -790,7 +799,7 @@ impl JdbcSource {
         // request an absurd allocation up front.
         let mut messages = Vec::with_capacity((self.config.batch_size as usize).min(8192));
         let mut row_count: u64 = 0;
-        let mut max_offset: Option<String> = None;
+        let mut last_offset: Option<String> = None;
 
         loop {
             let has_next = jni!(
@@ -816,14 +825,15 @@ impl JdbcSource {
             let _ = unsafe { env.pop_local_frame(&JObject::null()) };
             let (row_data, offset) = row_result?;
 
-            // Track the maximum tracking value across the batch rather than
-            // assuming the last row is the largest, so incremental mode is
-            // correct even if the query is not ordered by the tracking column.
+            // Take the tracking value of the LAST row as the next offset. Rows
+            // arrive in ascending tracking order (validate_config enforces
+            // ORDER BY the tracking column ascending), so the last row is the
+            // high-water mark. Using the last row rather than a Rust-side max
+            // keeps the cursor consistent with the database's own ordering, and
+            // degrades to re-reads (safe, at-least-once) rather than skips if the
+            // ordering is ever imperfect.
             if let Some(offset) = offset {
-                max_offset = Some(match max_offset {
-                    Some(current) => larger_offset(current, offset),
-                    None => offset,
-                });
+                last_offset = Some(offset);
             }
 
             let message = self.build_message(row_data)?;
@@ -831,7 +841,20 @@ impl JdbcSource {
             row_count += 1;
         }
 
-        Ok((messages, row_count, max_offset))
+        // In incremental mode a non-empty batch that never yielded a tracking
+        // value means the tracking column is absent from the result set: the
+        // offset could never advance, so the same batch would be re-read forever.
+        // Fail loudly instead of stalling silently. (A NULL tracking value in a
+        // present column is already rejected per-row by tracking_offset_or_error.)
+        if self.config.mode == Mode::Incremental && row_count > 0 && last_offset.is_none() {
+            return Err(Error::InvalidConfigValue(format!(
+                "tracking column '{}' is not present in the query result; incremental mode cannot \
+                 advance its offset. Include it in the SELECT list.",
+                self.config.tracking_column.as_deref().unwrap_or("")
+            )));
+        }
+
+        Ok((messages, row_count, last_offset))
     }
 
     /// Extract data from a single result set row, returning the row map and optional offset.
@@ -951,7 +974,7 @@ impl JdbcSource {
         // Without an offset yet, drop the incremental predicate but keep the rest
         // of the query (e.g. an ORDER BY) intact.
         if offset.is_none() {
-            query = RE_INCREMENTAL_PREDICATE.replace(&query, "").into_owned();
+            query = strip_offset_predicate(&query);
         }
 
         // Substitute {tracking_column} wherever it still appears (a WHERE and/or
@@ -1154,25 +1177,11 @@ impl JdbcSource {
                     base64::engine::general_purpose::STANDARD.encode(&buf),
                 ))
             }
+            // Date/time types are read via their driver string form. Route
+            // through the null-safe getString path so a NULL date/time yields
+            // JSON null instead of failing the whole poll on get_string(null).
             Types::TIMESTAMP | Types::DATE | Types::TIME => {
-                let value = jni!(
-                    env,
-                    env.call_method(
-                        result_set,
-                        "getString",
-                        "(I)Ljava/lang/String;",
-                        &[JValue::Int(column_index)],
-                    )
-                    .and_then(|v| v.l()),
-                    "Failed to get timestamp"
-                );
-                let str_value: String = jni!(
-                    env,
-                    env.get_string(&JString::from(value)),
-                    "Failed to convert timestamp"
-                )
-                .into();
-                Ok(serde_json::Value::String(str_value))
+                self.get_column_as_string(env, result_set, column_index)
             }
             // Default: getString for all other types (CHAR, VARCHAR, etc.)
             _ => self.get_column_as_string(env, result_set, column_index),
@@ -1266,6 +1275,25 @@ impl JdbcSource {
             )));
         }
 
+        // The query must be non-empty; an empty query only fails later at
+        // prepareStatement with an opaque driver error.
+        if self.config.query.trim().is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "query must not be empty".to_string(),
+            ));
+        }
+
+        // A set initial_offset must be non-blank: an empty value would build
+        // `WHERE tracking > ''` (a type error or always-false on many databases)
+        // rather than the intended cold-start scan.
+        if let Some(initial_offset) = self.config.initial_offset.as_deref()
+            && initial_offset.trim().is_empty()
+        {
+            return Err(Error::InvalidConfigValue(
+                "initial_offset must not be empty; omit it to start from the beginning".to_string(),
+            ));
+        }
+
         // Separate-credential auth requires both username and password; a
         // half-set pair would silently fall through to URL-embedded credentials.
         if self.config.username.is_some() != self.config.password.is_some() {
@@ -1281,10 +1309,15 @@ impl JdbcSource {
         // by that column, setMaxRows returns an arbitrary subset, and advancing
         // the offset to its max permanently skips the unread lower keys.
         if self.config.mode == Mode::Incremental {
-            let Some(tracking_column) = self.config.tracking_column.as_deref() else {
+            let Some(tracking_column) = self
+                .config
+                .tracking_column
+                .as_deref()
+                .filter(|column| !column.trim().is_empty())
+            else {
                 return Err(Error::InvalidConfigValue(
-                    "incremental mode requires tracking_column so the offset can advance; set \
-                     tracking_column, or use mode = \"bulk\""
+                    "incremental mode requires a non-empty tracking_column so the offset can \
+                     advance; set tracking_column, or use mode = \"bulk\""
                         .to_string(),
                 ));
             };
@@ -1514,28 +1547,17 @@ fn finalize_query(query: String) -> Result<String, Error> {
     Ok(query)
 }
 
-/// Return the larger of two offset values. Integer keys are compared as `i128`
-/// first (exact across the full `BIGINT` range, avoiding the f64 precision loss
-/// past 2^53 that would misorder large IDs and contradict the NUMERIC/DECIMAL
-/// -as-string rationale elsewhere in this file); genuinely fractional values
-/// fall back to f64; non-numeric values (ISO-8601 timestamps, text keys) compare
-/// lexicographically.
-///
-/// This assumes the tracking column is homogeneously typed and monotonic under
-/// the database's own ordering. A column that mixes numeric-looking and
-/// non-numeric strings, or a timestamp whose driver string form is not
-/// lexicographically ordered, can make this Rust-side max disagree with the
-/// database's `>` comparison and cause rows to be skipped or re-read. See the
-/// tracking-column guidance in the README.
-fn larger_offset(a: String, b: String) -> String {
-    let b_is_larger = match (a.parse::<i128>(), b.parse::<i128>()) {
-        (Ok(na), Ok(nb)) => nb > na,
-        _ => match (a.parse::<f64>(), b.parse::<f64>()) {
-            (Ok(na), Ok(nb)) => nb > na,
-            _ => b > a,
-        },
-    };
-    if b_is_larger { b } else { a }
+/// Remove the incremental offset predicate `{tracking_column} > {last_offset}`
+/// from a query for the cold-start (no-offset) poll, preserving any other `WHERE`
+/// conditions. Handles the offset term followed by `AND ...`, preceded by
+/// `... AND`, or standing alone, so a companion condition such as
+/// `AND {tracking_column} IS NOT NULL` survives as a valid `WHERE`.
+fn strip_offset_predicate(query: &str) -> String {
+    let query = RE_OFFSET_PREDICATE_AND_AFTER.replace_all(query, "WHERE ");
+    let query = RE_OFFSET_PREDICATE_AND_BEFORE.replace_all(&query, "");
+    RE_OFFSET_PREDICATE_BARE
+        .replace_all(&query, "")
+        .into_owned()
 }
 
 /// Check that an incremental query's result set is ordered ascending by the
@@ -1785,16 +1807,6 @@ mod tests {
     }
 
     #[test]
-    fn test_larger_offset_i128_precision_beyond_f64() {
-        // Two BIGINTs that differ only past 2^53 must still be ordered exactly;
-        // an f64 comparison would collapse them and misorder the offset.
-        let a = "9007199254740993".to_string(); // 2^53 + 1
-        let b = "9007199254740992".to_string(); // 2^53
-        assert_eq!(larger_offset(a.clone(), b.clone()), a);
-        assert_eq!(larger_offset(b, a.clone()), a);
-    }
-
-    #[test]
     fn test_build_query_removes_predicate_case_and_whitespace_insensitive() {
         for query in [
             "select * from t where {tracking_column} > {last_offset} order by id",
@@ -1814,6 +1826,48 @@ mod tests {
             );
             assert!(built.to_lowercase().contains("order by id"));
         }
+    }
+
+    #[test]
+    fn test_strip_offset_predicate_preserves_other_conditions() {
+        // Offset term followed by a companion condition (the README-advised
+        // IS NOT NULL): the AND and the companion condition survive.
+        assert_eq!(
+            strip_offset_predicate(
+                "SELECT * FROM t WHERE {tracking_column} > {last_offset} AND {tracking_column} IS NOT NULL ORDER BY {tracking_column}"
+            ),
+            "SELECT * FROM t WHERE {tracking_column} IS NOT NULL ORDER BY {tracking_column}"
+        );
+        // Offset term preceded by a condition.
+        assert_eq!(
+            strip_offset_predicate(
+                "SELECT * FROM t WHERE active = 1 AND {tracking_column} > {last_offset} ORDER BY id"
+            ),
+            "SELECT * FROM t WHERE active = 1 ORDER BY id"
+        );
+        // Bare offset term (no other condition) drops the whole WHERE.
+        assert!(
+            !strip_offset_predicate(
+                "SELECT * FROM t WHERE {tracking_column} > {last_offset} ORDER BY id"
+            )
+            .contains("{last_offset}")
+        );
+    }
+
+    #[test]
+    fn test_build_query_cold_start_compound_predicate_is_valid() {
+        let mut config = base_config();
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("id".to_string());
+        config.query = "SELECT * FROM t WHERE {tracking_column} > {last_offset} AND {tracking_column} IS NOT NULL ORDER BY {tracking_column}".to_string();
+        let source = JdbcSource::new(1, config, None);
+        // Cold start: no persisted offset, no initial_offset.
+        let built = source.build_query(&State::default()).expect("build query");
+        assert_eq!(built, "SELECT * FROM t WHERE id IS NOT NULL ORDER BY id");
+        assert!(!built.contains("{last_offset}") && !built.contains("{tracking_column}"));
+        // No dangling AND / empty WHERE.
+        assert!(!built.to_uppercase().contains("WHERE AND"));
+        assert!(!built.to_uppercase().contains("AND ORDER"));
     }
 
     #[test]
@@ -1970,6 +2024,39 @@ mod tests {
             "SELECT * FROM t ORDER BY name, id",
             "id"
         ));
+    }
+
+    #[test]
+    fn test_validate_config_rejects_empty_query_and_blank_offsets() {
+        let jar = write_temp_jar("jdbc_validate_blanks.jar");
+        // Empty query.
+        let mut config = base_config();
+        config.driver_jar_path = jar.clone();
+        config.query = "   ".to_string();
+        let source = JdbcSource::new(1, config, None);
+        assert!(
+            matches!(source.validate_config(), Err(Error::InvalidConfigValue(msg)) if msg.contains("query"))
+        );
+
+        // Blank initial_offset.
+        let mut config = base_config();
+        config.driver_jar_path = jar.clone();
+        config.initial_offset = Some("  ".to_string());
+        let source = JdbcSource::new(1, config, None);
+        assert!(
+            matches!(source.validate_config(), Err(Error::InvalidConfigValue(msg)) if msg.contains("initial_offset"))
+        );
+
+        // Blank tracking_column in incremental mode.
+        let mut config = base_config();
+        config.driver_jar_path = jar;
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("".to_string());
+        config.query = "SELECT id FROM t ORDER BY id".to_string();
+        let source = JdbcSource::new(1, config, None);
+        assert!(
+            matches!(source.validate_config(), Err(Error::InvalidConfigValue(msg)) if msg.contains("tracking_column"))
+        );
     }
 
     #[test]
@@ -2330,19 +2417,6 @@ mod tests {
         }
         assert!(!is_transient_sql_state(None));
         assert!(!is_transient_sql_state(Some("")));
-    }
-
-    #[test]
-    fn test_larger_offset_numeric_and_lexical() {
-        // Numeric comparison, not lexical: "100" > "9" numerically.
-        assert_eq!(larger_offset("9".into(), "100".into()), "100");
-        assert_eq!(larger_offset("100".into(), "9".into()), "100");
-        assert_eq!(larger_offset("10.5".into(), "9.9".into()), "10.5");
-        // Non-numeric (timestamps / text) compare lexicographically.
-        assert_eq!(
-            larger_offset("2024-01-01".into(), "2024-06-15".into()),
-            "2024-06-15"
-        );
     }
 
     #[test]

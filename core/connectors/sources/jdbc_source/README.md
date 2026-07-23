@@ -218,21 +218,36 @@ connector refuses to start otherwise):
   `ORDER BY {tracking_column}` or the column name (optionally table-qualified,
   e.g. `ORDER BY t.updated_at`). A composite order such as `ORDER BY other, id`
   (tracking column not first) or a `DESC` order is rejected at `open()`.
+  The `ORDER BY` check is a lexical heuristic that validates single-block
+  `SELECT`s; `UNION`, window-function, or CTE queries may not be validated
+  correctly, so verify the result ordering yourself for those.
 
+The connector takes the tracking value of the **last row** of each ordered batch
+as the next cursor, so the cursor always matches the database's own `ORDER BY`.
 The tracking column must also be:
 
-- **Homogeneously typed and monotonic.** Offsets are compared as integers, then
-  floats, then lexicographically; a column mixing numeric-looking and
-  non-numeric strings can make the connector's comparison disagree with the
-  database's `>` and skip or re-read rows. Prefer an auto-increment ID or a
-  timestamp.
+- **Unique / strictly increasing.** The next poll resumes with a strict
+  `> {last_offset}`, and each batch is capped by `setMaxRows`. If a batch ends in
+  the middle of a run of rows that share the same tracking value (common for a
+  non-unique column like a timestamp), the remaining same-value rows are skipped
+  on the next poll. Use a unique, strictly-increasing key (an auto-increment ID
+  is ideal). If you must track a non-unique column, ensure `batch_size` exceeds
+  the largest group of equal values so a tie never spans a batch boundary.
+  (Keyset pagination with a tie-break is a planned follow-up.)
+- **Monotonic under the database's own ordering.** Because the cursor is the last
+  ordered row and is fed back as `WHERE {tracking_column} > '<value>'`, the column
+  must increase monotonically under the same ordering the database applies to that
+  `>` (including its collation, for text). Prefer an auto-increment ID or a
+  timestamp; a case-insensitively-collated text key can order differently than its
+  bytes and skip or re-read rows.
 - **`NOT NULL`.** A NULL tracking value cannot be watermarked, so the connector
   errors the poll if it reads one and keeps erroring (making no progress) until
   the query is fixed. Exclude NULLs in the query, e.g. `AND {tracking_column} IS
   NOT NULL`.
-- **Lexicographically ordered, for timestamps.** Timestamp columns are read via
-  the driver's string form; ensure that form is ordered (ISO-8601 is). A locale
-  format such as `MM/DD/YYYY` is not monotonic as text and will misorder.
+- **Round-trippable string form, for timestamps.** Timestamp columns are read as
+  the driver's string form and substituted back into the next `WHERE`; ensure the
+  driver emits a form the database orders correctly and can parse back (ISO-8601
+  is safe; a locale format such as `MM/DD/YYYY` is not).
 
 **Example:**
 
@@ -324,7 +339,9 @@ JDBC SQL types are automatically mapped to JSON:
   guarantee is tracked as a follow-up.
 - **Connection recovery.** The connection is validated with `Connection.isValid`
   each poll and transparently re-established (closing the old handle) if it has
-  dropped.
+  dropped. The check runs on the shared `block_in_place` worker, so its timeout
+  (`connection_timeout_ms`) is intentionally converted to whole seconds and
+  capped at 5s: a dead connection must not block the worker for tens of seconds.
 - **`SQLState` classification is informational today.** Query failures are
   classified into transient vs permanent error variants, but the runtime does
   not yet apply differentiated backoff based on that distinction; it currently
