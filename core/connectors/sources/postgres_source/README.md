@@ -41,9 +41,7 @@ primary_key_column = "id"
 # Custom query (optional)
 custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit"
 
-# CDC options (optional)
-enable_wal_cdc = false
-publication_name = "iggy_publication"
+# CDC options (only used when mode = "cdc")
 replication_slot = "iggy_slot"
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 cdc_backend = "builtin"
@@ -69,9 +67,7 @@ cdc_backend = "builtin"
 | `processed_column` | string | none | Boolean column to mark as processed |
 | `primary_key_column` | string | tracking_column | PK for delete/mark operations |
 | `custom_query` | string | none | Custom SQL with parameter substitution |
-| `enable_wal_cdc` | bool | `false` | Enable WAL-based CDC |
-| `publication_name` | string | `iggy_publication` | Logical replication publication |
-| `replication_slot` | string | `iggy_slot` | Replication slot name |
+| `replication_slot` | string | `iggy_slot` | Replication slot name (only used when `mode = "cdc"`) |
 | `capture_operations` | array | `["INSERT","UPDATE","DELETE"]` | CDC operations to capture |
 | `cdc_backend` | string | `builtin` | `builtin` or `pg_replicate` |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
@@ -267,12 +263,32 @@ CDC requires PostgreSQL logical replication setup:
 ```toml
 [plugin_config]
 mode = "cdc"
-enable_wal_cdc = true
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 ```
 
 The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build time.
+
+### Slot Naming
+
+Each CDC connector must use a unique `replication_slot`. Setup accepts any
+pre-existing `test_decoding` slot, so two connectors pointed at the same
+database with the default `replication_slot = "iggy_slot"` will silently
+share one slot. `pg_logical_slot_get_changes` consumes changes on read, so
+each connector only sees a subset of the other's changes instead of erroring.
+Set an explicit, distinct `replication_slot` per connector instance.
+
+### Decommissioning
+
+A replication slot retains WAL for as long as it exists, regardless of
+whether a connector is still consuming it (`max_slot_wal_keep_size` defaults
+to `-1`, i.e. unbounded). Dropping a connector without dropping its slot
+leaves an orphaned slot that accumulates WAL indefinitely and can fill the
+disk. When decommissioning a CDC connector, drop its slot:
+
+```sql
+SELECT pg_drop_replication_slot('iggy_slot');
+```
 
 ## Example Configs
 
@@ -344,7 +360,6 @@ batch_length = 100
 [plugin_config]
 connection_string = "postgresql://user:pass@localhost:5432/mydb"
 mode = "cdc"
-enable_wal_cdc = true
 tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE"]
 ```
