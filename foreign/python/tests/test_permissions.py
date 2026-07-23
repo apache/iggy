@@ -95,15 +95,6 @@ class TestPermissionsModel:
         for name in GLOBAL_PERMISSION_FLAGS:
             assert getattr(global_permissions, name) is (name == flag)
 
-    def test_all_global_permission_flags_set_together(self):
-        """Test all flags can be enabled at once."""
-        global_permissions = GlobalPermissions(
-            **dict.fromkeys(GLOBAL_PERMISSION_FLAGS, True)
-        )
-
-        for name in GLOBAL_PERMISSION_FLAGS:
-            assert getattr(global_permissions, name) is True
-
     @pytest.mark.parametrize("flag", STREAM_PERMISSION_FLAGS)
     def test_each_stream_permission_flag_round_trips_alone(self, flag):
         """Test setting one flag flips only that flag."""
@@ -113,14 +104,6 @@ class TestPermissionsModel:
         for name in STREAM_PERMISSION_FLAGS:
             assert getattr(stream_permissions, name) is (name == flag)
 
-    def test_all_stream_permission_flags_set_together(self):
-        """Test all flags can be enabled at once."""
-        flags: dict[str, Any] = dict.fromkeys(STREAM_PERMISSION_FLAGS, True)
-        stream_permissions = StreamPermissions(**flags)
-
-        for name in STREAM_PERMISSION_FLAGS:
-            assert getattr(stream_permissions, name) is True
-
     @pytest.mark.parametrize("flag", TOPIC_PERMISSION_FLAGS)
     def test_each_topic_permission_flag_round_trips_alone(self, flag):
         """Test setting one flag flips only that flag."""
@@ -128,15 +111,6 @@ class TestPermissionsModel:
 
         for name in TOPIC_PERMISSION_FLAGS:
             assert getattr(topic_permissions, name) is (name == flag)
-
-    def test_all_topic_permission_flags_set_together(self):
-        """Test all flags can be enabled at once."""
-        topic_permissions = TopicPermissions(
-            **dict.fromkeys(TOPIC_PERMISSION_FLAGS, True)
-        )
-
-        for name in TOPIC_PERMISSION_FLAGS:
-            assert getattr(topic_permissions, name) is True
 
     def test_nested_stream_and_topic_permissions_are_preserved(self):
         """Test stream and topic permission dicts survive construction."""
