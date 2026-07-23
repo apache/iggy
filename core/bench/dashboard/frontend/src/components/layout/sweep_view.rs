@@ -178,6 +178,13 @@ fn siblings_match(
     {
         return false;
     }
+    // A cluster run and a single-node run with otherwise equal params must not
+    // pool into one sweep line. Distinct node counts are distinct topologies.
+    if selected.cluster.as_ref().map(|c| c.nodes.len())
+        != candidate.cluster.as_ref().map(|c| c.nodes.len())
+    {
+        return false;
+    }
     SweepAxis::ALL
         .iter()
         .filter(|axis| **axis != varying_axis)
@@ -287,4 +294,53 @@ fn project(
         220.0
     };
     (screen_x, screen_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_report::cluster::{BenchmarkClusterInfo, BenchmarkClusterNode};
+
+    fn cluster(nodes: usize) -> BenchmarkClusterInfo {
+        BenchmarkClusterInfo {
+            name: "vsr".to_string(),
+            nodes: (0..nodes)
+                .map(|index| BenchmarkClusterNode {
+                    name: format!("node-{index}"),
+                    role: "follower".to_string(),
+                    status: "healthy".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn given_equal_params_when_cluster_size_differs_should_not_be_siblings() {
+        let single = BenchmarkReportLight::default();
+        let clustered = BenchmarkReportLight {
+            cluster: Some(cluster(3)),
+            ..Default::default()
+        };
+        assert!(!siblings_match(&single, &clustered, SweepAxis::Producers));
+    }
+
+    #[test]
+    fn given_equal_params_and_equal_cluster_size_should_be_siblings() {
+        let left = BenchmarkReportLight {
+            cluster: Some(cluster(3)),
+            ..Default::default()
+        };
+        let right = BenchmarkReportLight {
+            cluster: Some(cluster(3)),
+            ..Default::default()
+        };
+        assert!(siblings_match(&left, &right, SweepAxis::Producers));
+    }
+
+    #[test]
+    fn given_both_single_node_when_params_equal_should_be_siblings() {
+        let left = BenchmarkReportLight::default();
+        let right = BenchmarkReportLight::default();
+        assert!(siblings_match(&left, &right, SweepAxis::Producers));
+    }
 }
