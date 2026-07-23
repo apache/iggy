@@ -23,5 +23,5 @@ pub fn get_uuid() -> u128 {
 }
 
 pub fn get_ulid() -> Ulid {
-    Ulid::new()
+    Ulid::generate()
 }

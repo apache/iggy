@@ -511,7 +511,6 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     let config = ServerNgConfig::load()
         .await
         .map_err(ServerNgError::Config)?;
-    // TODO: decouple directory bootstrap from the `server` crate.
     create_directories(&config.system).await.map_err(|source| {
         error!(
             system_path = %config.system.get_system_path(),
@@ -797,9 +796,6 @@ fn run_shard_thread(
         .bind_memory()
         .map_err(|source| ServerNgError::MemoryAffinityFailed { shard_id, source })?;
 
-    // TODO(hubcio): decouple runtime creation from the `server` crate
-    // (mirrors the identical TODO in `main.rs`). Reusing legacy here so
-    // server-ng and the legacy server share one io_uring tuning surface.
     let runtime = create_shard_executor()
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
@@ -888,6 +884,7 @@ async fn shard_main(
             let recovered = recover::<ServerNgMuxStateMachine>(
                 data_dir,
                 topology.replica_count == 1,
+                config.metadata.journal_slots,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
@@ -959,6 +956,7 @@ async fn shard_main(
                 topology.self_replica_id,
                 topology.replica_count,
                 Rc::clone(&bus),
+                config.metadata.prepare_queue_depth,
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -975,6 +973,10 @@ async fn shard_main(
     // message expiry) at admission; every shard's copy backs the same resolution in responses.
     metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
     metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
+    // Keep the forced-checkpoint margin >= the configured prepare-queue
+    // depth: ops already pipelined while a checkpoint runs append into that
+    // margin (config validation keeps journal_slots >= 4x this).
+    metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1675,6 +1677,20 @@ async fn build_shard_for_thread(
     Ok((shard, sessions))
 }
 
+// Pin the configs-crate default literals (duplicated there to avoid a
+// build-time edge onto the runtime crates) against the runtime constants,
+// mirroring the message_bus IOV_MAX pin. A drift on either side fails this
+// crate's build until both are reconciled.
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_PREPARE_QUEUE_DEPTH
+        == consensus::PIPELINE_PREPARE_QUEUE_MAX
+);
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
+        == journal::prepare_journal::DEFAULT_SLOT_COUNT
+);
+
+#[allow(clippy::too_many_arguments)]
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
@@ -1683,6 +1699,7 @@ fn restore_metadata_consensus(
     self_replica_id: u8,
     replica_count: u8,
     bus: Rc<IggyMessageBus>,
+    prepare_queue_depth: usize,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1690,7 +1707,10 @@ fn restore_metadata_consensus(
         replica_count,
         server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
-        LocalPipeline::new(),
+        // Request queue keeps the stock 2x ratio over the prepare queue
+        // (32 -> 64 at defaults): buffered requests are cheap relative to
+        // in-flight prepares and drain as prepares commit.
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
 
     let last_header = journal

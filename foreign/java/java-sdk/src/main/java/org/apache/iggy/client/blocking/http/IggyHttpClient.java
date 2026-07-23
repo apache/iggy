@@ -31,6 +31,7 @@ import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
+import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -108,6 +109,12 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
             throw new IggyMissingCredentialsException();
         }
         usersClient.login(username.get(), password.get());
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public byte[] sendBinaryRequest(int code, byte[] payload) {
+        throw new IggyOperationNotSupportedException("sendBinaryRequest", "HTTP");
     }
 
     @Override

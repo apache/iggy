@@ -35,6 +35,7 @@ iggy_binary_protocol = { workspace = true }
 server_common = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

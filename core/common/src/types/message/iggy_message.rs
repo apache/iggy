@@ -359,8 +359,7 @@ impl IggyMessage {
 
     pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
-        let message_header = self.header.to_bytes();
-        bytes.put_slice(&message_header);
+        self.header.write_to(&mut bytes);
         bytes.put_slice(&self.payload);
         if let Some(user_headers) = &self.user_headers {
             bytes.put_slice(user_headers);
@@ -418,8 +417,13 @@ impl IggyMessage {
         })
     }
 
+    /// Serializes the message into `buf`.
+    ///
+    /// `buf` need not be preallocated: the whole message is reserved up front so
+    /// an empty buffer grows once rather than once per appended field.
     pub fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_slice(&self.header.to_bytes());
+        buf.reserve(self.get_size_bytes().as_bytes_usize());
+        self.header.write_to(buf);
         buf.put_slice(&self.payload);
         if let Some(user_headers) = &self.user_headers {
             buf.put_slice(user_headers);
@@ -843,5 +847,41 @@ mod tests {
             original_map.get(&HeaderKey::try_from("correlation-id").unwrap()),
             deserialized_map.get(&HeaderKey::try_from("correlation-id").unwrap())
         );
+    }
+
+    #[test]
+    fn given_empty_destination_buffer_when_written_should_grow_exactly_once() {
+        let message = IggyMessage::builder()
+            .payload(Bytes::from(vec![b'x'; 1024]))
+            .build()
+            .unwrap();
+        let size = message.get_size_bytes().as_bytes_usize();
+
+        let mut buf = BytesMut::new();
+        message.write_to_buffer(&mut buf);
+
+        assert_eq!(buf.len(), size);
+        // A single reservation covers the whole message, so the buffer never
+        // reallocates part-way through the individually appended header fields.
+        assert!(buf.capacity() >= size);
+
+        let mut second = BytesMut::new();
+        message.write_to_buffer(&mut second);
+        assert_eq!(&buf[..], &second[..]);
+    }
+
+    #[test]
+    fn given_buffer_with_existing_content_when_written_should_append_without_disturbing_it() {
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"payload"))
+            .build()
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        buf.put_slice(b"existing");
+        message.write_to_buffer(&mut buf);
+
+        assert_eq!(&buf[..8], b"existing");
+        assert_eq!(&buf[8..], &message.to_bytes()[..]);
     }
 }

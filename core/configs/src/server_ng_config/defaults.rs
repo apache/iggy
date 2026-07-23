@@ -28,6 +28,7 @@
 //! bootstrap.
 
 use super::message_bus::MessageBusConfig;
+use super::metadata::MetadataConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
@@ -62,7 +63,20 @@ impl Default for ServerNgConfig {
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
+            metadata: MetadataConfig::default(),
             message_bus: MessageBusConfig::default(),
+        }
+    }
+}
+
+impl Default for MetadataConfig {
+    fn default() -> MetadataConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift (same pattern as MessageBusConfig below).
+        let metadata = &SERVER_NG_CONFIG.metadata;
+        MetadataConfig {
+            prepare_queue_depth: metadata.prepare_queue_depth as usize,
+            journal_slots: metadata.journal_slots as usize,
         }
     }
 }
