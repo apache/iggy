@@ -44,6 +44,7 @@ pub mod log;
 pub mod retry;
 pub mod sink;
 pub mod source;
+pub(crate) mod structured;
 pub mod transforms;
 
 pub use convert::owned_value_to_serde_json;
