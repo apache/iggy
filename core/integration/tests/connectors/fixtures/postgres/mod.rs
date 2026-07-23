@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod cdc;
 mod container;
 mod sink;
 mod source;
 
+pub use cdc::PostgresSourceCdcFixture;
 pub use container::{PostgresOps, PostgresSourceOps};
 pub use sink::{PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture};
 pub use source::{
