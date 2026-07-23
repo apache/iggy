@@ -84,6 +84,19 @@ fn build_server_config(
         "true".to_string(),
     );
     extra_envs.insert("IGGY_TCP_SOCKET_NODELAY".to_string(), "true".to_string());
+    // Under vsr these scenarios exercise retrieval, not failover, yet run
+    // on the default 3-node cluster. Under a parallel nextest run the box
+    // is oversubscribed and scheduling stalls exceed the 5s default
+    // liveness window, so backups elect a new primary mid-scenario and the
+    // client session dies with it (observed stalls reach ~20s; 60s rides
+    // them out). The knob exists only on server-ng: the legacy flavor's
+    // strict env provider aborts boot on unknown IGGY_ vars, so the gate
+    // is load-bearing.
+    #[cfg(feature = "vsr")]
+    extra_envs.insert(
+        "IGGY_CLUSTER_HEARTBEAT_TIMEOUT".to_string(),
+        "60s".to_string(),
+    );
 
     TestServerConfig::builder().extra_envs(extra_envs).build()
 }

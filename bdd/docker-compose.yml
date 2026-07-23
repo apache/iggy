@@ -25,19 +25,22 @@ services:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - BDD_FEATURE=${BDD_FEATURE:-all}
+      - BDD_RUST_FEATURES=${BDD_RUST_FEATURES:-bdd}
       - RUST_LOG=debug
       - RUSTFLAGS=-C linker=gcc
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
       - ./scenarios/leader_redirection.feature:/app/features/leader_redirection.feature
+      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
     command:
       - sh
       - -c
       - |
         case "$$BDD_FEATURE" in
-          basic_messaging)    cargo test -p bdd --features bdd --test basic_messaging ;;
-          leader_redirection) cargo test -p bdd --features bdd --test leader_redirection ;;
-          *)                  cargo test -p bdd --features bdd ;;
+          basic_messaging)    cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test basic_messaging ;;
+          leader_redirection) cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test leader_redirection ;;
+          raw_command)        cargo test -p bdd --features "$$BDD_RUST_FEATURES" --test raw_command ;;
+          *)                  cargo test -p bdd --features "$$BDD_RUST_FEATURES" ;;
         esac
     networks:
       - iggy-bdd-network
@@ -50,10 +53,21 @@ services:
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
     working_dir: /app
-    command: [ "uv", "run", "--project", "/workspace/bdd/python", "pytest", "tests/", "-v" ]
+    command:
+      - sh
+      - -c
+      - |
+        case "$$BDD_FEATURE" in
+          basic_messaging) TEST_PATH='tests/test_basic_messaging.py' ;;
+          raw_command)     TEST_PATH='tests/test_raw_command.py' ;;
+          *)               TEST_PATH='tests/' ;;
+        esac
+        uv run --project /workspace/bdd/python pytest $$TEST_PATH -v
     networks:
       - iggy-bdd-network
 
@@ -69,10 +83,20 @@ services:
       - IGGY_PORT=8090
       - IGGY_USERNAME=iggy
       - IGGY_PASSWORD=iggy
-      - BDD_FEATURE_FILE=/app/features/basic_messaging.feature
+      - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: [ "./scripts/test.sh", "--configuration", "/workspace/bdd/php/phpunit.xml.dist" ]
+      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+    command:
+      - sh
+      - -c
+      - |
+        case "$$BDD_FEATURE" in
+          basic_messaging) GROUP='--group basic-messaging' ;;
+          raw_command)     GROUP='--group raw-command' ;;
+          *)               GROUP='' ;;
+        esac
+        ./scripts/test.sh --configuration /workspace/bdd/php/phpunit.xml.dist $$GROUP
     networks:
       - iggy-bdd-network
 
@@ -98,7 +122,17 @@ services:
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
-    command: [ "npm", "run", "test:bdd" ]
+      - BDD_FEATURE=${BDD_FEATURE:-all}
+    command:
+      - sh
+      - -c
+      - |
+        case "$$BDD_FEATURE" in
+          basic_messaging) TAGS='--tags @basic-messaging' ;;
+          raw_command)     TAGS='--tags @raw-command' ;;
+          *)               TAGS='' ;;
+        esac
+        npm run test:bdd -- $$TAGS
     networks:
       - iggy-bdd-network
 
@@ -119,6 +153,7 @@ services:
         case "$$BDD_FEATURE" in
           basic_messaging)    FILTER='--filter-trait Category=basic-messaging' ;;
           leader_redirection) FILTER='--filter-trait Category=requires-leader-awareness' ;;
+          raw_command)        FILTER='--filter-trait Category=raw-command' ;;
         esac
         dotnet test $$FILTER
     networks:
@@ -132,9 +167,19 @@ services:
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: [ "gradle", "--no-daemon", "test" ]
+      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
+    command:
+      - sh
+      - -c
+      - |
+        case "$$BDD_FEATURE" in
+          basic_messaging) export CUCUMBER_FILTER_TAGS='@basic-messaging' ;;
+          raw_command)     export CUCUMBER_FILTER_TAGS='@raw-command' ;;
+        esac
+        gradle --no-daemon test
     networks:
       - iggy-bdd-network
 
@@ -146,8 +191,10 @@ services:
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
+      - BDD_FEATURE=${BDD_FEATURE:-all}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+      - ./scenarios/raw_command.feature:/app/features/raw_command.feature
     networks:
       - iggy-bdd-network
 

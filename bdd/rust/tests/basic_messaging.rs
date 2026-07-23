@@ -24,5 +24,8 @@ use cucumber::World;
 
 #[tokio::main]
 async fn main() {
-    GlobalContext::run("../../bdd/scenarios/basic_messaging.feature").await;
+    GlobalContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/basic_messaging.feature")
+        .await;
 }

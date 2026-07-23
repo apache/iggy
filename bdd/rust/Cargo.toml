@@ -25,6 +25,7 @@ publish = false
 
 [features]
 bdd = []
+vsr = ["iggy/vsr"]
 
 [dev-dependencies]
 bytes = { workspace = true }
@@ -42,5 +43,10 @@ required-features = ["bdd"]
 
 [[test]]
 name = "leader_redirection"
+harness = false
+required-features = ["bdd"]
+
+[[test]]
+name = "raw_command"
 harness = false
 required-features = ["bdd"]

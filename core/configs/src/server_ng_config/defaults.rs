@@ -17,16 +17,19 @@
 
 //! `Default` impls for the server-ng config surface.
 //!
-//! Sections that fork (`tcp`, `websocket`, `quic`, `message_bus`) have
-//! their own `Default` impls here, sourced from
+//! Sections that fork (`tcp`, `websocket`, `quic`, `cluster`,
+//! `message_bus`) have their own `Default` impls here, sourced from
 //! `core/server-ng/config.toml` via [`SERVER_NG_CONFIG`]. Sections that
-//! still reuse legacy types (`http`, `cluster`, `system`, `telemetry`,
+//! still reuse legacy types (`http`, `system`, `telemetry`,
 //! `consumer_group`, `data_maintenance`, `message_saver`,
 //! `personal_access_token`, `heartbeat`) delegate to the legacy
 //! `Default` impls; overrides land at the consumer level once
 //! [`super::server_ng::ServerNgConfig::load`] is wired into server-ng's
 //! bootstrap.
 
+use super::cluster::{
+    ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
+};
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
@@ -34,7 +37,6 @@ use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
-use crate::server_config::cluster::ClusterConfig;
 use crate::server_config::http::HttpConfig;
 use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
@@ -65,6 +67,53 @@ impl Default for ServerNgConfig {
             cluster: ClusterConfig::default(),
             metadata: MetadataConfig::default(),
             message_bus: MessageBusConfig::default(),
+        }
+    }
+}
+
+impl Default for ClusterConfig {
+    fn default() -> ClusterConfig {
+        ClusterConfig {
+            enabled: SERVER_NG_CONFIG.cluster.enabled,
+            name: SERVER_NG_CONFIG.cluster.name.parse().unwrap(),
+            heartbeat_timeout: SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
+            nodes: SERVER_NG_CONFIG
+                .cluster
+                .nodes
+                .iter()
+                .map(|node| ClusterNodeConfig {
+                    name: node.name.parse().unwrap(),
+                    ip: node.ip.parse().unwrap(),
+                    replica_id: u8::try_from(node.replica_id).expect(
+                        "static_toml replica_id must fit in u8 (0..=255); \
+                         fix core/server-ng/config.toml",
+                    ),
+                    ports: TransportPorts {
+                        tcp: Some(u16::try_from(node.ports.tcp).expect(
+                            "static_toml cluster.nodes.ports.tcp must fit in u16 (0..=65535); \
+                             fix core/server-ng/config.toml",
+                        )),
+                        quic: Some(u16::try_from(node.ports.quic).expect(
+                            "static_toml cluster.nodes.ports.quic must fit in u16 (0..=65535); \
+                             fix core/server-ng/config.toml",
+                        )),
+                        http: Some(u16::try_from(node.ports.http).expect(
+                            "static_toml cluster.nodes.ports.http must fit in u16 (0..=65535); \
+                             fix core/server-ng/config.toml",
+                        )),
+                        websocket: Some(u16::try_from(node.ports.websocket).expect(
+                            "static_toml cluster.nodes.ports.websocket must fit in u16 (0..=65535); \
+                             fix core/server-ng/config.toml",
+                        )),
+                        tcp_replica: Some(u16::try_from(node.ports.tcp_replica).expect(
+                            "static_toml cluster.nodes.ports.tcp_replica must fit in u16 (0..=65535); \
+                             fix core/server-ng/config.toml",
+                        )),
+                    },
+                })
+                .collect(),
+            auth: ClusterAuthConfig::default(),
+            tls: ClusterTlsConfig::default(),
         }
     }
 }

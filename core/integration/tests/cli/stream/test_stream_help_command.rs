@@ -32,12 +32,12 @@ pub async fn should_help_match() {
 {USAGE_PREFIX} stream <COMMAND>
 
 Commands:
-  create  Create stream with given name [aliases: c]
-  delete  Delete stream with given ID [aliases: d]
-  update  Update stream name for given stream ID [aliases: u]
-  get     Get details of a single stream with given ID [aliases: g]
-  list    List all streams [aliases: l]
-  purge   Purge all topics in given stream ID [aliases: p]
+  create  Create stream with given name [alias: c]
+  delete  Delete stream with given ID [alias: d]
+  update  Update stream name for given stream ID [alias: u]
+  get     Get details of a single stream with given ID [alias: g]
+  list    List all streams [alias: l]
+  purge   Purge all topics in given stream ID [alias: p]
   help    Print this message or the help of the given subcommand(s)
 
 Options:

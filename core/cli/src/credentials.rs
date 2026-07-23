@@ -188,7 +188,7 @@ impl<'a> IggyCredentials<'a> {
                         .with_context(|| {
                             format!(
                                 "Problem with server login for username: {}",
-                                &username_and_password.username
+                                username_and_password.username
                             )
                         })?;
                 }

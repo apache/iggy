@@ -61,12 +61,10 @@ pub struct PostgresSourceConfig {
     pub tracking_column: Option<String>,
     pub initial_offset: Option<String>,
     pub max_connections: Option<u32>,
-    pub enable_wal_cdc: Option<bool>,
     pub custom_query: Option<String>,
     pub snake_case_columns: Option<bool>,
     pub include_metadata: Option<bool>,
     pub replication_slot: Option<String>,
-    pub publication_name: Option<String>,
     pub capture_operations: Option<Vec<String>>,
     pub cdc_backend: Option<String>,
     pub delete_after_read: Option<bool>,
@@ -185,10 +183,13 @@ impl Source for PostgresSource {
 
         self.connect().await?;
 
+        validate_payload_format(self.config.payload_format.as_deref())?;
+
         match self.config.mode.as_str() {
             "cdc" => {
+                let backend = validate_cdc_backend(self.config.cdc_backend.as_deref())?;
+                validate_capture_operations(self.config.capture_operations.as_deref())?;
                 self.setup_cdc().await?;
-                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
                 info!(
                     "PostgreSQL CDC mode enabled (backend: {backend}) for connector ID: {}",
                     self.id
@@ -303,10 +304,6 @@ impl PostgresSource {
     }
 
     async fn setup_cdc(&self) -> Result<(), Error> {
-        if !self.config.enable_wal_cdc.unwrap_or(false) {
-            return Ok(());
-        }
-
         let pool = self.get_pool()?;
 
         let wal_level: String = sqlx::query_scalar("SHOW wal_level")
@@ -320,31 +317,35 @@ impl PostgresSource {
             ));
         }
 
-        let publication_name = self
-            .config
-            .publication_name
-            .as_deref()
-            .unwrap_or("iggy_publication");
-        let quoted_publication = quote_identifier(publication_name)?;
-        let tables_clause = if self.config.tables.is_empty() {
-            "FOR ALL TABLES".to_string()
-        } else {
-            let quoted_tables = self
-                .config
-                .tables
-                .iter()
-                .map(|t| quote_qualified_identifier(t))
-                .collect::<Result<Vec<_>, _>>()?;
-            format!("FOR TABLE {}", quoted_tables.join(", "))
-        };
+        for table in &self.config.tables {
+            let exists: bool = if let Some((schema, name)) = table.split_once('.') {
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+                     WHERE table_schema = $1 AND table_name = $2)",
+                )
+                .bind(schema)
+                .bind(name)
+                .fetch_one(pool)
+                .await
+            } else {
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+                )
+                .bind(table)
+                .fetch_one(pool)
+                .await
+            }
+            .map_err(|e| Error::InitError(format!("Failed to validate table '{table}': {e}")))?;
 
-        let create_publication_sql =
-            format!("CREATE PUBLICATION IF NOT EXISTS {quoted_publication} {tables_clause}");
-
-        sqlx::query(sqlx::AssertSqlSafe(create_publication_sql))
-            .execute(pool)
-            .await
-            .map_err(|e| Error::InitError(format!("Failed to create publication: {e}")))?;
+            // Not fatal - the table may just not exist yet (e.g. a migration
+            // runs shortly after startup).
+            if !exists {
+                warn!(
+                    "Configured table '{table}' does not exist yet. If this is unexpected, \
+                     check config.tables for typos."
+                );
+            }
+        }
 
         let slot_name = self
             .config
@@ -352,40 +353,49 @@ impl PostgresSource {
             .as_deref()
             .unwrap_or("iggy_slot");
 
-        sqlx::query(
-            "SELECT pg_create_logical_replication_slot($1, 'pgoutput') \
-             WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-        )
-        .bind(slot_name)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| Error::InitError(format!("Failed to create replication slot: {e}")))?;
+        let existing_plugin: Option<String> =
+            sqlx::query_scalar("SELECT plugin FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(slot_name)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| Error::InitError(format!("Failed to check replication slot: {e}")))?;
 
-        info!("PostgreSQL CDC setup completed. Publication: {publication_name}, Slot: {slot_name}");
+        match existing_plugin.as_deref() {
+            Some("test_decoding") => {}
+            Some(other) => {
+                return Err(Error::InitError(format!(
+                    "Replication slot '{slot_name}' already exists with plugin '{other}', \
+                     expected 'test_decoding' (likely created by an older version). Drop it \
+                     with SELECT pg_drop_replication_slot('{slot_name}') or set \
+                     replication_slot to a new name."
+                )));
+            }
+            None => {
+                // test_decoding ignores publications entirely, so none is created
+                // here. A future pgoutput-based backend would need one, since
+                // that's the only way to get server-side table filtering under
+                // that plugin.
+                sqlx::query("SELECT pg_create_logical_replication_slot($1, 'test_decoding')")
+                    .bind(slot_name)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| {
+                        Error::InitError(format!("Failed to create replication slot: {e}"))
+                    })?;
+            }
+        }
+
+        info!("PostgreSQL CDC setup completed. Slot: {slot_name}");
         Ok(())
     }
 
     async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
-        let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
-        match backend {
+        match self.config.cdc_backend.as_deref().unwrap_or("builtin") {
             "builtin" => self.poll_cdc_builtin().await,
-            "pg_replicate" => {
-                #[cfg(feature = "cdc_pg_replicate")]
-                {
-                    Err(Error::InitError(
-                        "pg_replicate backend not yet implemented".to_string(),
-                    ))
-                }
-                #[cfg(not(feature = "cdc_pg_replicate"))]
-                {
-                    Err(Error::InitError(
-                        "cdc_backend 'pg_replicate' requested but feature 'cdc_pg_replicate' is not enabled at build time".to_string(),
-                    ))
-                }
-            }
-            other => Err(Error::InitError(format!(
-                "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
-            ))),
+            "pg_replicate" => Err(Error::InitError(
+                "pg_replicate backend not yet implemented".to_string(),
+            )),
+            other => unreachable!("validate_cdc_backend already rejected '{other}'"),
         }
     }
 
@@ -397,40 +407,53 @@ impl PostgresSource {
             .replication_slot
             .as_deref()
             .unwrap_or("iggy_slot");
-        let publication_name = self
-            .config
-            .publication_name
-            .as_deref()
-            .unwrap_or("iggy_publication");
         let capture_ops = self
             .config
             .capture_operations
             .as_ref()
             .map(|ops| ops.iter().map(|s| s.as_str()).collect::<Vec<_>>())
             .unwrap_or_else(|| vec!["INSERT", "UPDATE", "DELETE"]);
+        let captured_tables =
+            (!self.config.tables.is_empty()).then_some(self.config.tables.as_slice());
+        let batch_size = self.config.batch_size.unwrap_or(1000) as i32;
 
-        let logical_repl_sql = format!(
-            "SELECT lsn, xid, data FROM pg_logical_slot_get_changes('{slot_name}', NULL, NULL, 'proto_version', '1', 'publication_names', '{publication_name}')"
-        );
-
-        // Database I/O without holding the lock
-        let rows = sqlx::query(sqlx::AssertSqlSafe(logical_repl_sql))
-            .fetch_all(pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch CDC changes: {e}");
-                Error::InvalidRecord
-            })?;
+        // Database I/O without holding the lock. upto_nchanges is only
+        // checked at transaction-commit boundaries (a single huge transaction
+        // can still exceed it), so this isn't a hard per-call cap - but it
+        // stops the backlog from growing unbounded across many transactions
+        // the way NULL (no limit at all) did.
+        let rows =
+            sqlx::query("SELECT lsn, xid, data FROM pg_logical_slot_get_changes($1, NULL, $2)")
+                .bind(slot_name)
+                .bind(batch_size)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch CDC changes: {e}");
+                    Error::InvalidRecord
+                })?;
 
         let mut messages = Vec::new();
 
         for row in rows {
-            let data: String = row.try_get("data").map_err(|_| Error::InvalidRecord)?;
+            let data: String = match row.try_get("data") {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Skipping CDC row with unreadable data column: {e}");
+                    continue;
+                }
+            };
 
-            if let Some(change_record) = self.parse_logical_replication_message(&data, &capture_ops)
+            if let Some(change_record) =
+                self.parse_logical_replication_message(&data, &capture_ops, captured_tables)
             {
-                let payload =
-                    simd_json::to_vec(&change_record).map_err(|_| Error::InvalidRecord)?;
+                let payload = match simd_json::to_vec(&change_record) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        error!("Skipping CDC row that failed to serialize: {e}");
+                        continue;
+                    }
+                };
 
                 let message = ProducedMessage {
                     id: Some(Uuid::new_v4().as_u128()),
@@ -728,99 +751,63 @@ impl PostgresSource {
         &self,
         data: &str,
         capture_ops: &[&str],
+        captured_tables: Option<&[String]>,
     ) -> Option<DatabaseRecord> {
         if data.starts_with("BEGIN") || data.starts_with("COMMIT") {
             return None;
         }
 
-        if data.starts_with("INSERT:") && capture_ops.contains(&"INSERT") {
-            return self.parse_insert_message(data);
-        }
+        let rest = data.strip_prefix("table ")?;
+        let (qualified_table, rest) = rest.split_once(": ")?;
+        let (operation, rest) = rest.split_once(": ")?;
 
-        if data.starts_with("UPDATE:") && capture_ops.contains(&"UPDATE") {
-            return self.parse_update_message(data);
-        }
-
-        if data.starts_with("DELETE:") && capture_ops.contains(&"DELETE") {
-            return self.parse_delete_message(data);
-        }
-
-        None
-    }
-
-    fn parse_insert_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ")
-            && let Some(colon_pos) = data[table_start..].find(':')
+        if !matches!(operation, "INSERT" | "UPDATE" | "DELETE") || !capture_ops.contains(&operation)
         {
-            let table_part = &data[table_start + 6..table_start + colon_pos];
-            let table_name = table_part
-                .split('.')
-                .next_back()
-                .unwrap_or(table_part)
-                .to_string();
-
-            let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = parse_record_data(data_part);
-
-            return Some(DatabaseRecord {
-                table_name,
-                operation_type: "INSERT".to_string(),
-                timestamp: Utc::now(),
-                data: serde_json::Value::Object(parsed_data),
-                old_data: None,
-            });
+            return None;
         }
-        None
-    }
 
-    fn parse_update_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ")
-            && let Some(colon_pos) = data[table_start..].find(':')
+        let table_name = unquote_pg_identifier(
+            qualified_table
+                .rsplit('.')
+                .next()
+                .unwrap_or(qualified_table),
+        );
+        let unquoted_qualified_table = qualified_table
+            .split('.')
+            .map(unquote_pg_identifier)
+            .collect::<Vec<_>>()
+            .join(".");
+
+        // test_decoding has no server-side table filter, so Postgres already
+        // sent us every table's changes - config.tables scoping happens here.
+        if let Some(tables) = captured_tables
+            && !tables.iter().any(|t| {
+                if t.contains('.') {
+                    t == &unquoted_qualified_table
+                } else {
+                    t == &table_name
+                }
+            })
         {
-            let table_part = &data[table_start + 6..table_start + colon_pos];
-            let table_name = table_part
-                .split('.')
-                .next_back()
-                .unwrap_or(table_part)
-                .to_string();
-
-            let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = parse_record_data(data_part);
-
-            return Some(DatabaseRecord {
-                table_name,
-                operation_type: "UPDATE".to_string(),
-                timestamp: Utc::now(),
-                data: serde_json::Value::Object(parsed_data),
-                old_data: None,
-            });
+            return None;
         }
-        None
-    }
 
-    fn parse_delete_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ")
-            && let Some(colon_pos) = data[table_start..].find(':')
+        let (old_key, rest) = match rest
+            .strip_prefix("old-key: ")
+            .and_then(|old_key| old_key.split_once("new-tuple: "))
         {
-            let table_part = &data[table_start + 6..table_start + colon_pos];
-            let table_name = table_part
-                .split('.')
-                .next_back()
-                .unwrap_or(table_part)
-                .to_string();
+            Some((old_key, new_tuple)) => (Some(old_key), new_tuple),
+            None => (None, rest),
+        };
 
-            let data_part = &data[table_start + colon_pos + 1..];
-            let parsed_data = parse_record_data(data_part);
-
-            return Some(DatabaseRecord {
-                table_name,
-                operation_type: "DELETE".to_string(),
-                timestamp: Utc::now(),
-                data: serde_json::Value::Object(parsed_data),
-                old_data: None,
-            });
-        }
-        None
+        Some(DatabaseRecord {
+            table_name,
+            operation_type: operation.to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::Value::Object(parse_record_columns(rest)),
+            old_data: old_key
+                .map(|old_key| serde_json::Value::Object(parse_record_columns(old_key))),
+        })
     }
 
     fn process_row(
@@ -1497,42 +1484,167 @@ fn to_snake_case(input: &str) -> String {
     result
 }
 
-fn parse_record_data(data: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut result = serde_json::Map::new();
-
-    for part in data.split_whitespace() {
-        if let Some(bracket_pos) = part.find('[')
-            && let Some(_close_bracket) = part.find(']')
-            && let Some(colon_pos) = part.find(':')
-        {
-            let column_name = &part[..bracket_pos];
-            let value_str = &part[colon_pos + 1..];
-
-            let cleaned_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
-                &value_str[1..value_str.len() - 1]
-            } else {
-                value_str
-            };
-
-            let value = if let Ok(num) = cleaned_value.parse::<i64>() {
-                serde_json::Value::Number(serde_json::Number::from(num))
-            } else if let Ok(float) = cleaned_value.parse::<f64>() {
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(float).unwrap_or(serde_json::Number::from(0)),
-                )
-            } else if cleaned_value.eq_ignore_ascii_case("true") {
-                serde_json::Value::Bool(true)
-            } else if cleaned_value.eq_ignore_ascii_case("false") {
-                serde_json::Value::Bool(false)
-            } else {
-                serde_json::Value::String(cleaned_value.to_string())
-            };
-
-            result.insert(column_name.to_string(), value);
+fn validate_cdc_backend(cdc_backend: Option<&str>) -> Result<&str, Error> {
+    let backend = cdc_backend.unwrap_or("builtin");
+    match backend {
+        "builtin" => Ok(backend),
+        "pg_replicate" => {
+            #[cfg(feature = "cdc_pg_replicate")]
+            {
+                Ok(backend)
+            }
+            #[cfg(not(feature = "cdc_pg_replicate"))]
+            {
+                Err(Error::InitError(
+                    "cdc_backend 'pg_replicate' requested but feature 'cdc_pg_replicate' is not enabled at build time".to_string(),
+                ))
+            }
         }
+        other => Err(Error::InitError(format!(
+            "Unsupported cdc_backend '{other}'. Use 'builtin' or 'pg_replicate'"
+        ))),
+    }
+}
+
+fn validate_capture_operations(capture_operations: Option<&[String]>) -> Result<(), Error> {
+    const VALID: [&str; 3] = ["INSERT", "UPDATE", "DELETE"];
+    let Some(ops) = capture_operations else {
+        return Ok(());
+    };
+    for op in ops {
+        if !VALID.contains(&op.as_str()) {
+            return Err(Error::InitError(format!(
+                "Unsupported capture_operations value '{op}'. Use any of 'INSERT', 'UPDATE', 'DELETE'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_payload_format(payload_format: Option<&str>) -> Result<(), Error> {
+    const VALID: [&str; 7] = [
+        "json",
+        "bytea",
+        "raw",
+        "text",
+        "json_direct",
+        "jsonb",
+        "jsonb_direct",
+    ];
+    let Some(fmt) = payload_format else {
+        return Ok(());
+    };
+    if !VALID.contains(&fmt.to_lowercase().as_str()) {
+        return Err(Error::InitError(format!(
+            "Unsupported payload_format '{fmt}'. Use 'json', 'bytea'/'raw', 'text', or 'json_direct'/'jsonb'/'jsonb_direct'"
+        )));
+    }
+    Ok(())
+}
+
+fn unquote_pg_identifier(segment: &str) -> String {
+    match segment.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => segment.to_string(),
+    }
+}
+
+fn parse_record_columns(data: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut result = serde_json::Map::new();
+    let bytes = data.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+
+    while pos < len {
+        while pos < len && bytes[pos] == b' ' {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+
+        let Some(bracket_offset) = data[pos..].find('[') else {
+            break;
+        };
+        let name_end = pos + bracket_offset;
+        let column_name = unquote_pg_identifier(&data[pos..name_end]);
+
+        let mut depth = 0;
+        let mut type_end = name_end;
+        loop {
+            match bytes.get(type_end) {
+                Some(b'[') => depth += 1,
+                Some(b']') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => return result,
+            }
+            type_end += 1;
+        }
+        if bytes.get(type_end + 1) != Some(&b':') {
+            break;
+        }
+
+        let (value, next_pos) = parse_column_value(data, type_end + 2);
+        result.insert(column_name, value);
+        pos = next_pos;
     }
 
     result
+}
+
+fn parse_column_value(data: &str, start: usize) -> (serde_json::Value, usize) {
+    let bytes = data.as_bytes();
+
+    if bytes.get(start) != Some(&b'\'') {
+        let end = data[start..]
+            .find(' ')
+            .map_or(data.len(), |offset| start + offset);
+        return (parse_bare_scalar(&data[start..end]), end);
+    }
+
+    let mut value = String::new();
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\'' {
+            if bytes.get(pos + 1) == Some(&b'\'') {
+                value.push('\'');
+                pos += 2;
+                continue;
+            }
+            pos += 1;
+            break;
+        }
+        let ch = data[pos..].chars().next().unwrap_or('\u{FFFD}');
+        value.push(ch);
+        pos += ch.len_utf8();
+    }
+    (serde_json::Value::String(value), pos)
+}
+
+fn parse_bare_scalar(token: &str) -> serde_json::Value {
+    // test_decoding emits this sentinel for TOASTed columns the UPDATE didn't touch;
+    // treating it as null avoids leaking the literal token as a fake column value.
+    match token {
+        "null" | "unchanged-toast-datum" => serde_json::Value::Null,
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        _ => {
+            if let Ok(i) = token.parse::<i64>() {
+                serde_json::Value::Number(serde_json::Number::from(i))
+            } else if let Ok(f) = token.parse::<f64>()
+                && let Some(num) = serde_json::Number::from_f64(f)
+            {
+                serde_json::Value::Number(num)
+            } else {
+                serde_json::Value::String(token.to_string())
+            }
+        }
+    }
 }
 
 async fn with_retry<T, F, Fut>(operation: F, max_retries: u32, delay_ms: u64) -> Result<T, Error>
@@ -1587,6 +1699,10 @@ fn redact_connection_string(conn_str: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "cdc_fixtures.rs"]
+mod cdc_fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1600,12 +1716,10 @@ mod tests {
             tracking_column: Some("updated_at".to_string()),
             initial_offset: None,
             max_connections: None,
-            enable_wal_cdc: None,
             custom_query: None,
             snake_case_columns: None,
             include_metadata: None,
             replication_slot: None,
-            publication_name: None,
             capture_operations: None,
             cdc_backend: None,
             delete_after_read: None,
@@ -1703,46 +1817,610 @@ mod tests {
         assert!(quote_qualified_identifier(".users").is_err());
     }
 
-    #[test]
-    fn given_insert_message_should_parse_correctly() {
+    fn cdc_source() -> PostgresSource {
         let mut config = test_config();
         config.mode = "cdc".to_string();
-        let src = PostgresSource::new(1, config, None);
+        PostgresSource::new(1, config, None)
+    }
 
-        let data = "INSERT: table public.users: id[1] name['Alice'] active[true]";
+    #[test]
+    fn given_insert_single_row_all_types_should_parse_correctly() {
+        let src = cdc_source();
         let rec = src
-            .parse_logical_replication_message(data, &["INSERT"])
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_SINGLE_ROW_ALL_TYPES,
+                &["INSERT"],
+                None,
+            )
             .unwrap();
-        assert_eq!(rec.table_name, "users");
+
+        assert_eq!(rec.table_name, "probe_events");
         assert_eq!(rec.operation_type, "INSERT");
+        assert_eq!(rec.data["id"], serde_json::json!(2));
+        assert_eq!(rec.data["name"], serde_json::json!("alice"));
+        assert_eq!(rec.data["note"], serde_json::json!("first note"));
+        assert_eq!(rec.data["amount"], serde_json::json!(12.50));
+        assert_eq!(rec.data["active"], serde_json::json!(true));
+        assert_eq!(rec.data["tags"], serde_json::json!("{a,b}"));
+        assert_eq!(rec.data["payload"], serde_json::json!(r#"{"k": 1}"#));
+        assert_eq!(rec.data["small_int"], serde_json::Value::Null);
     }
 
     #[test]
-    fn given_update_message_should_parse_correctly() {
-        let mut config = test_config();
-        config.mode = "cdc".to_string();
-        let src = PostgresSource::new(1, config, None);
-
-        let data = "UPDATE: table public.orders: id[42] total[99.5]";
+    fn given_insert_with_nulls_should_parse_correctly() {
+        let src = cdc_source();
         let rec = src
-            .parse_logical_replication_message(data, &["UPDATE"])
+            .parse_logical_replication_message(cdc_fixtures::INSERT_WITH_NULLS, &["INSERT"], None)
             .unwrap();
-        assert_eq!(rec.table_name, "orders");
+
+        assert_eq!(rec.data["name"], serde_json::json!("bob"));
+        assert_eq!(rec.data["note"], serde_json::Value::Null);
+        assert_eq!(rec.data["amount"], serde_json::Value::Null);
+        assert_eq!(rec.data["active"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn given_multi_row_insert_statement_should_parse_each_row() {
+        let src = cdc_source();
+        for (fixture, name) in cdc_fixtures::INSERT_MULTI_ROW_SINGLE_STATEMENT
+            .iter()
+            .zip(["carol", "dave"])
+        {
+            let rec = src
+                .parse_logical_replication_message(fixture, &["INSERT"], None)
+                .unwrap();
+            assert_eq!(rec.data["name"], serde_json::json!(name));
+        }
+    }
+
+    #[test]
+    fn given_multi_statement_transaction_should_parse_each_insert() {
+        let src = cdc_source();
+        for (fixture, name) in cdc_fixtures::INSERT_MULTI_STATEMENT_ONE_TRANSACTION
+            .iter()
+            .zip(["eve", "frank"])
+        {
+            let rec = src
+                .parse_logical_replication_message(fixture, &["INSERT"], None)
+                .unwrap();
+            assert_eq!(rec.data["name"], serde_json::json!(name));
+        }
+    }
+
+    #[test]
+    fn given_update_single_column_should_keep_other_columns() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::UPDATE_SINGLE_COLUMN,
+                &["UPDATE"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["note"], serde_json::json!("only note changed"));
+        assert_eq!(rec.data["name"], serde_json::json!("bob"));
+    }
+
+    #[test]
+    fn given_delete_multiple_rows_should_parse_each_row() {
+        let src = cdc_source();
+        for (fixture, id) in cdc_fixtures::DELETE_MULTIPLE_ROWS.iter().zip([6, 7]) {
+            let rec = src
+                .parse_logical_replication_message(fixture, &["DELETE"], None)
+                .unwrap();
+            assert_eq!(rec.data["id"], serde_json::json!(id));
+        }
+    }
+
+    #[test]
+    fn given_update_array_column_should_parse_new_array() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::UPDATE_ARRAY_COLUMN, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["int_array"], serde_json::json!("{9,8,7}"));
+    }
+
+    #[test]
+    fn given_negative_zero_float_should_parse_as_zero() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_NEGATIVE_ZERO_FLOAT,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["real_val"], serde_json::json!(0));
+        assert_eq!(rec.data["double_val"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn given_quoted_mixed_case_column_should_strip_quotes_from_key() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_QUOTED_MIXED_CASE_COLUMN,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["user"], serde_json::json!("quoted_row"));
+        assert!(rec.data.get("createdAt").is_some());
+        assert!(rec.data.get("\"user\"").is_none());
+    }
+
+    #[test]
+    fn given_unknown_cdc_backend_should_fail_validation() {
+        let err = validate_cdc_backend(Some("built-in")).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_no_cdc_backend_should_default_to_builtin() {
+        assert_eq!(validate_cdc_backend(None).unwrap(), "builtin");
+    }
+
+    #[test]
+    fn given_unsupported_capture_operation_should_fail_validation() {
+        let ops = vec!["INSRT".to_string()];
+        let err = validate_capture_operations(Some(&ops)).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_valid_capture_operations_should_pass_validation() {
+        let ops = vec!["INSERT".to_string(), "DELETE".to_string()];
+        assert!(validate_capture_operations(Some(&ops)).is_ok());
+        assert!(validate_capture_operations(None).is_ok());
+    }
+
+    #[test]
+    fn given_unsupported_payload_format_should_fail_validation() {
+        let err = validate_payload_format(Some("btea")).unwrap_err();
+        assert!(matches!(err, Error::InitError(_)));
+    }
+
+    #[test]
+    fn given_valid_payload_format_should_pass_validation() {
+        assert!(validate_payload_format(Some("bytea")).is_ok());
+        assert!(validate_payload_format(Some("JSON")).is_ok());
+        assert!(validate_payload_format(None).is_ok());
+    }
+
+    #[test]
+    fn given_unchanged_toast_datum_should_parse_as_null() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::UPDATE_UNCHANGED_TOAST_COLUMN,
+                &["UPDATE"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["note"], serde_json::Value::Null);
+        assert_eq!(rec.data["payload"], serde_json::Value::Null);
+        assert_eq!(rec.data["name"], serde_json::json!("toast_row"));
+    }
+
+    #[test]
+    fn given_update_full_row_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::UPDATE_FULL_ROW, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.table_name, "probe_events");
         assert_eq!(rec.operation_type, "UPDATE");
+        assert_eq!(rec.data["name"], serde_json::json!("alice2"));
+        assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+        assert_eq!(rec.data["active"], serde_json::json!(false));
     }
 
     #[test]
-    fn given_delete_message_should_parse_correctly() {
-        let mut config = test_config();
-        config.mode = "cdc".to_string();
-        let src = PostgresSource::new(1, config, None);
-
-        let data = "DELETE: table public.products: id[7]";
+    fn given_update_to_null_should_parse_correctly() {
+        let src = cdc_source();
         let rec = src
-            .parse_logical_replication_message(data, &["DELETE"])
+            .parse_logical_replication_message(cdc_fixtures::UPDATE_TO_NULL, &["UPDATE"], None)
             .unwrap();
-        assert_eq!(rec.table_name, "products");
+
+        assert_eq!(rec.data["note"], serde_json::Value::Null);
+        assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+    }
+
+    #[test]
+    fn given_update_primary_key_should_parse_new_tuple_only() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::UPDATE_PRIMARY_KEY, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["id"], serde_json::json!(1004));
+        assert_eq!(rec.data["name"], serde_json::json!("carol"));
+    }
+
+    #[test]
+    fn given_delete_row_should_parse_replica_identity_columns() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::DELETE_ROW, &["DELETE"], None)
+            .unwrap();
+
+        assert_eq!(rec.table_name, "probe_events");
         assert_eq!(rec.operation_type, "DELETE");
+        assert_eq!(rec.data["id"], serde_json::json!(5));
+        assert_eq!(rec.data.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn given_structurally_broken_rows_should_return_none() {
+        let src = cdc_source();
+        let capture_ops = ["INSERT", "UPDATE", "DELETE"];
+        let bad_rows = [
+            "",
+            "garbage",
+            "table",
+            "table public.probe_events",
+            "table public.probe_events:",
+            "table public.probe_events: INSERT",
+            "table public.probe_events: INSERT:",
+        ];
+
+        for bad_row in bad_rows {
+            assert!(
+                src.parse_logical_replication_message(bad_row, &capture_ops, None)
+                    .is_none(),
+                "Expected None for structurally broken row: {bad_row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_broken_column_syntax_should_not_panic() {
+        let src = cdc_source();
+        let capture_ops = ["INSERT", "UPDATE", "DELETE"];
+        let bad_rows = [
+            "table : INSERT: id[integer]:1",
+            "table public.probe_events: INSERT: id[integer",
+            "table public.probe_events: INSERT: id[integer]",
+            "table public.probe_events: INSERT: id[integer]:",
+            "table public.probe_events: INSERT: id[integer]:'unterminated",
+        ];
+
+        for bad_row in bad_rows {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                src.parse_logical_replication_message(bad_row, &capture_ops, None)
+            }));
+            assert!(
+                result.is_ok(),
+                "Parsing must not panic on malformed column data: {bad_row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_truncate_message_should_be_ignored() {
+        let src = cdc_source();
+        assert!(
+            src.parse_logical_replication_message(
+                cdc_fixtures::TRUNCATE_TABLE,
+                &["INSERT", "UPDATE", "DELETE"],
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn given_operation_not_in_capture_ops_should_be_ignored() {
+        let src = cdc_source();
+        assert!(
+            src.parse_logical_replication_message(
+                cdc_fixtures::DELETE_ROW,
+                &["INSERT", "UPDATE"],
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn given_schema_qualified_captured_table_should_match_exact_schema_only() {
+        let src = cdc_source();
+        let matching = vec!["public.probe_events".to_string()];
+        let other_schema = vec!["other_schema.probe_events".to_string()];
+
+        assert!(
+            src.parse_logical_replication_message(
+                cdc_fixtures::INSERT_SINGLE_ROW_ALL_TYPES,
+                &["INSERT"],
+                Some(&matching),
+            )
+            .is_some()
+        );
+        assert!(
+            src.parse_logical_replication_message(
+                cdc_fixtures::INSERT_SINGLE_ROW_ALL_TYPES,
+                &["INSERT"],
+                Some(&other_schema),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn given_bare_captured_table_should_match_regardless_of_schema() {
+        let src = cdc_source();
+        let bare = vec!["probe_events".to_string()];
+
+        assert!(
+            src.parse_logical_replication_message(
+                cdc_fixtures::INSERT_SINGLE_ROW_ALL_TYPES,
+                &["INSERT"],
+                Some(&bare),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn given_mixed_case_table_name_should_unquote_for_table_name_and_filter() {
+        let src = cdc_source();
+        let data = r#"table public."MyTable": INSERT: id[integer]:1 name[text]:'alice'"#;
+
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"], None)
+            .unwrap();
+        assert_eq!(rec.table_name, "MyTable");
+
+        let bare = vec!["MyTable".to_string()];
+        assert!(
+            src.parse_logical_replication_message(data, &["INSERT"], Some(&bare))
+                .is_some(),
+            "Unquoted config entry must match the unquoted table name"
+        );
+
+        let qualified = vec!["public.MyTable".to_string()];
+        assert!(
+            src.parse_logical_replication_message(data, &["INSERT"], Some(&qualified))
+                .is_some(),
+            "Schema-qualified config entry must match against the unquoted qualified name"
+        );
+
+        let wrong_case = vec!["mytable".to_string()];
+        assert!(
+            src.parse_logical_replication_message(data, &["INSERT"], Some(&wrong_case))
+                .is_none(),
+            "Postgres identifiers are case-sensitive once quoted - must not fuzzy-match"
+        );
+    }
+
+    #[test]
+    fn given_quoted_identifier_with_embedded_quote_should_unescape() {
+        let src = cdc_source();
+        let data = r#"table public."Weird""Table": INSERT: id[integer]:1"#;
+
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"], None)
+            .unwrap();
+        assert_eq!(rec.table_name, "Weird\"Table");
+    }
+
+    #[test]
+    fn given_new_tuple_substring_in_value_should_not_truncate_ordinary_update() {
+        let src = cdc_source();
+        let data = "table public.probe_events: UPDATE: id[integer]:2 \
+                     note[text]:'see new-tuple: format docs' amount[numeric]:99.99";
+
+        let rec = src
+            .parse_logical_replication_message(data, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["id"], serde_json::json!(2));
+        assert_eq!(
+            rec.data["note"],
+            serde_json::json!("see new-tuple: format docs")
+        );
+        assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+    }
+
+    #[test]
+    fn given_old_key_section_should_populate_old_data() {
+        let src = cdc_source();
+        let data = "table public.probe_events: UPDATE: old-key: id[integer]:1 \
+                     new-tuple: id[integer]:2 amount[numeric]:99.99";
+
+        let rec = src
+            .parse_logical_replication_message(data, &["UPDATE"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["id"], serde_json::json!(2));
+        assert_eq!(rec.data["amount"], serde_json::json!(99.99));
+        assert_eq!(rec.old_data.unwrap()["id"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn given_no_old_key_section_should_leave_old_data_none() {
+        let src = cdc_source();
+        let data = "table public.probe_events: INSERT: id[integer]:1";
+
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"], None)
+            .unwrap();
+
+        assert!(rec.old_data.is_none());
+    }
+
+    #[test]
+    fn given_unicode_and_escaped_quote_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::UNICODE_AND_SPECIAL_CHARS,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rec.data["note"],
+            serde_json::json!("emoji \u{1F680} quote' backslash\\ newline\nend")
+        );
+    }
+
+    #[test]
+    fn given_extended_types_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_EXTENDED_TYPES_NORMAL_VALUES,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["small_int"], serde_json::json!(42));
+        assert_eq!(rec.data["big_int"], serde_json::json!(9000000000i64));
+        assert_eq!(
+            rec.data["real_val"],
+            serde_json::json!("3.14".parse::<f64>().unwrap())
+        );
+        assert_eq!(
+            rec.data["uuid_val"],
+            serde_json::json!("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(rec.data["bytea_val"], serde_json::json!("\\xdeadbeef"));
+        assert_eq!(rec.data["date_val"], serde_json::json!("2024-01-15"));
+        assert_eq!(rec.data["int_array"], serde_json::json!("{1,2,3}"));
+        assert_eq!(rec.data["char_val"], serde_json::json!("ab        "));
+    }
+
+    #[test]
+    fn given_nan_should_parse_as_string() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::INSERT_NUMERIC_NAN, &["INSERT"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["real_val"], serde_json::json!("NaN"));
+        assert_eq!(rec.data["numeric_val"], serde_json::json!("NaN"));
+    }
+
+    #[test]
+    fn given_infinity_should_parse_as_string() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_NUMERIC_INFINITY,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["real_val"], serde_json::json!("Infinity"));
+        assert_eq!(rec.data["double_val"], serde_json::json!("-Infinity"));
+    }
+
+    #[test]
+    fn given_negative_and_boundary_numbers_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_NEGATIVE_AND_BOUNDARY_NUMBERS,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["small_int"], serde_json::json!(-32768));
+        assert_eq!(
+            rec.data["big_int"],
+            serde_json::json!(-9223372036854775808i64)
+        );
+    }
+
+    #[test]
+    fn given_max_boundary_numbers_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_MAX_BOUNDARY_NUMBERS,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["small_int"], serde_json::json!(32767));
+        assert_eq!(
+            rec.data["big_int"],
+            serde_json::json!(9223372036854775807i64)
+        );
+    }
+
+    #[test]
+    fn given_empty_string_vs_null_should_be_distinct() {
+        let src = cdc_source();
+        let empty_row = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_EMPTY_STRING_VS_NULL[0],
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+        let null_row = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_EMPTY_STRING_VS_NULL[1],
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(empty_row.data["note"], serde_json::json!(""));
+        assert_eq!(null_row.data["note"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn given_array_with_null_element_should_parse_as_raw_string() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_ARRAY_WITH_NULL_ELEMENT,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["int_array"], serde_json::json!("{1,2,NULL,4}"));
+    }
+
+    #[test]
+    fn given_empty_array_should_parse_correctly() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(cdc_fixtures::INSERT_EMPTY_ARRAY, &["INSERT"], None)
+            .unwrap();
+
+        assert_eq!(rec.data["int_array"], serde_json::json!("{}"));
+    }
+
+    #[test]
+    fn given_char_padding_vs_varchar_should_preserve_padding() {
+        let src = cdc_source();
+        let rec = src
+            .parse_logical_replication_message(
+                cdc_fixtures::INSERT_CHAR_PADDING_VS_VARCHAR,
+                &["INSERT"],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rec.data["char_val"], serde_json::json!("ab        "));
+        assert_eq!(rec.data["varchar_val"], serde_json::json!("ab"));
     }
 
     #[test]

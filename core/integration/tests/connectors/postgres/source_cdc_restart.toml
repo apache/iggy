@@ -15,19 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-module(
-    name = "iggy_cpp_bdd",
-)
-
-bazel_dep(name = "rules_cc", version = "0.2.20")
-bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
-bazel_dep(name = "cucumber-cpp", version = "0.8.0.bcr.1")
-
-# The Iggy C++ SDK lives in the sibling foreign/cpp Bazel module. Pull it in locally so the
-# wire server links against the same cxx staticlib the SDK ships, without duplicating its
-# build rules here.
-bazel_dep(name = "iggy_cpp", version = "0.1.0")
-local_path_override(
-    module_name = "iggy_cpp",
-    path = "../../foreign/cpp",
-)
+# Dedicated scratch config_dir (see cdc_restart_connectors/): this test posts
+# new plugin_config versions at runtime via the local config provider, which
+# globs every *.toml under config_dir on startup. Pointing that at the shared
+# ../connectors/sources/postgres_source directory (used by other postgres
+# source tests) would let a stray version leak into whichever of those tests
+# happens to boot its own runtime while this one is mid-run.
+[connectors]
+config_type = "local"
+config_dir = "tests/connectors/postgres/cdc_restart_connectors"
