@@ -577,6 +577,13 @@ enabled = false
 # This prevents accidental cross-cluster communication.
 name = "iggy-cluster"
 
+# Backup-side liveness window for a consensus plane's primary (duration).
+# A replica that sees no primary traffic for this long starts a view change.
+# Raise it on oversubscribed hosts where scheduling stalls fake primary
+# death. Must be at least "2s": the primary heartbeats every second, and a
+# window at or below one ping interval would elect on every hiccup.
+heartbeat_timeout = "5s"
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be

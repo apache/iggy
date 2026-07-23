@@ -377,20 +377,49 @@ impl MySqlSource {
             })?;
 
             let Some(row) = row else {
+                // A missing columns row means either the table doesn't exist yet
+                // or the column is absent. Only the latter is a misconfiguration:
+                // a table created after the connector starts is legitimate, so
+                // defer validation rather than permanently disabling the source.
+                let table_exists = sqlx::query(
+                    "SELECT 1 FROM information_schema.tables \
+                     WHERE table_schema = IF(? = '', DATABASE(), ?) \
+                       AND table_name = ?",
+                )
+                .bind(&schema)
+                .bind(&schema)
+                .bind(&table_name)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| {
+                    Error::InitError(format!("failed to probe existence of table '{table}': {e}"))
+                })?
+                .is_some();
+
+                if !table_exists {
+                    warn!(
+                        "table '{table}' does not exist yet; deferring tracking_column \
+                         '{tracking_column}' validation until the table is created"
+                    );
+                    continue;
+                }
+
                 return Err(Error::InitError(format!(
                     "tracking_column '{tracking_column}' not found on table '{table}'"
                 )));
             };
 
-            let is_nullable: String = row.try_get("is_nullable").map_err(|e| {
+            // Read by position: MySQL returns information_schema column names
+            // uppercased (IS_NULLABLE, ...), so try_get by lowercase name misses.
+            let is_nullable: String = row.try_get(0).map_err(|e| {
                 Error::InitError(format!(
                     "failed to read is_nullable for table '{table}': {e}"
                 ))
             })?;
-            let data_type: String = row.try_get("data_type").map_err(|e| {
+            let data_type: String = row.try_get(1).map_err(|e| {
                 Error::InitError(format!("failed to read data_type for table '{table}': {e}"))
             })?;
-            let column_type: String = row.try_get("column_type").map_err(|e| {
+            let column_type: String = row.try_get(2).map_err(|e| {
                 Error::InitError(format!(
                     "failed to read column_type for table '{table}': {e}"
                 ))
@@ -1469,7 +1498,7 @@ mod tests {
         let result = source
             .substitute_query_params(query, "events", &Some("100".to_string()), 50)
             .unwrap();
-        assert!(result.contains("FROM events"));
+        assert!(result.contains("FROM `events`"));
         assert!(result.contains("id > 100"));
         assert!(result.contains("LIMIT 50"));
     }
@@ -1484,7 +1513,7 @@ mod tests {
             .substitute_query_params(query, "logs", &None, 100)
             .unwrap();
         println!("{}", result);
-        assert!(result.contains("FROM logs"));
+        assert!(result.contains("FROM `logs`"));
         assert!(!result.contains("$now"));
         assert!(!result.contains("_unix"));
     }

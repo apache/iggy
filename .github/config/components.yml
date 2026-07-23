@@ -300,6 +300,7 @@ components:
       - "bdd/docker-compose.server.yml"
       - "bdd/docker-compose.cluster.yml"
       - "bdd/docker-compose.coverage.yml"
+      - "bdd/docker-compose.vsr.yml"
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
@@ -311,7 +312,7 @@ components:
     paths:
       - "bdd/rust/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-rust"]
+    tasks: ["bdd-rust", "bdd-rust-vsr"]
 
   bdd-python:
     depends_on:
