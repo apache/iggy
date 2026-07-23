@@ -71,6 +71,9 @@ fn render_config_row(benchmark: &BenchmarkReportLight) -> Html {
     let total_bytes = benchmark.total_bytes();
 
     let mut chips = vec![(actors_label(benchmark), actors_value(benchmark))];
+    if let Some(cluster) = &benchmark.cluster {
+        chips.insert(0, ("Topology", cluster.label()));
+    }
     if params.streams > 0 {
         chips.push(("Streams", params.streams.to_string()));
         // Benchmarks currently create 1 topic per stream; expose it so the
