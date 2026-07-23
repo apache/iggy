@@ -90,6 +90,10 @@ password = "secret_password"
 query = "SELECT * FROM orders WHERE updated_at > {last_offset} ORDER BY updated_at ASC"
 poll_interval = "30s"
 batch_size = 1000
+# updated_at is a timestamp and may not be unique. A run of rows sharing one
+# timestamp that is split across a batch boundary would skip the remainder (see
+# "Unique / strictly increasing" below). Prefer a unique auto-increment key, or
+# keep batch_size larger than any same-timestamp group.
 tracking_column = "updated_at"
 initial_offset = "2024-01-01 00:00:00"
 mode = "incremental"
@@ -168,6 +172,9 @@ password = "YourPassword123"
 query = "SELECT * FROM Orders WHERE OrderDate > {last_offset} ORDER BY OrderDate"
 poll_interval = "15s"
 batch_size = 2000
+# OrderDate is a timestamp and may not be unique; see the uniqueness note on the
+# MySQL example above. Prefer a unique key, or keep batch_size above any
+# same-timestamp group.
 tracking_column = "OrderDate"
 initial_offset = "2024-01-01"
 mode = "incremental"
@@ -519,11 +526,13 @@ query = "SELECT * FROM table WHERE {tracking_column} > {last_offset} ORDER BY {t
 - Efficient for large tables
 - Works with timestamps, IDs, or any orderable column
 
-**Database Examples** (the query must order by the tracking column):
+**Database Examples** (the query must order by the tracking column; a unique,
+strictly-increasing key like an auto-increment ID is safest, see the tracking
+column requirements above):
 
-- MySQL: `WHERE updated_at > {last_offset} ORDER BY updated_at`
+- MySQL: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; ensure `batch_size` exceeds any same-timestamp group, or track a unique id)
 - Oracle: `WHERE id > {last_offset} ORDER BY id` (use a monotonic key; `ROWNUM` is not a valid tracking column)
-- SQL Server: `WHERE updated_at > {last_offset} ORDER BY updated_at`
+- SQL Server: `WHERE updated_at > {last_offset} ORDER BY updated_at` (timestamp; same caveat as MySQL)
 - PostgreSQL: `WHERE id > {last_offset} ORDER BY id`
 
 ### Bulk Mode (Universal)
