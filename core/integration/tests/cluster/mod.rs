@@ -15,24 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::*;
-use integration::iggy_harness;
-
-#[iggy_harness(cluster_nodes = [3, 5, 7],
-    test_client_transport = [ Tcp, Http, WebSocket, Quic, TcpTlsSelfSigned, TcpTlsGenerated, WebSocketTlsSelfSigned, WebSocketTlsGenerated],
-    server(segment.size = ["1MiB", "2MiB"],
-           segment.cache_indexes = ["open_segment", "all"]))]
-#[ignore]
-async fn should_ping_all_cluster_nodes(harness: TestHarness) {
-    for i in 0..harness.cluster_size() {
-        let client = harness
-            .node(i)
-            .test_client()
-            .unwrap()
-            .with_root_login()
-            .connect()
-            .await
-            .unwrap();
-        client.ping().await.unwrap();
-    }
-}
+mod client_table_restart;
