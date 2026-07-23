@@ -47,6 +47,9 @@ enum WarningContext<'a> {
 /// These are used for test control, CI, CLI behavior, config file paths, etc.
 const IGNORED_ENV_VARS: &[&str] = &[
     "IGGY_CI_BUILD",
+    // Test-harness knob: overrides the default cluster size the integration
+    // harness builds; leaks to spawned servers via the IGGY_ env forwarding.
+    "IGGY_TEST_CLUSTER_NODES",
     "IGGY_CONFIG_PATH",
     "IGGY_CONNECTORS_CONFIG_PATH",
     "IGGY_MCP_CONFIG_PATH",

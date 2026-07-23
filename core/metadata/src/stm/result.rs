@@ -184,6 +184,14 @@ result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
 });
+// `TruncatePartition` is the committed form of a client `DeleteSegments`; an
+// unresolvable target commits as a rejection so the request sequence stays
+// contiguous while the client still gets the typed error.
+result_enum!(TruncatePartitionResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    PartitionNotFound = 3007,
+});
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
 // stands in until one is added (a separate `IggyError` change).
@@ -260,6 +268,7 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
             CreatePartitionsResult::from_u32(code).is_some()
         }
         Operation::DeletePartitions => DeletePartitionsResult::from_u32(code).is_some(),
+        Operation::TruncatePartition => TruncatePartitionResult::from_u32(code).is_some(),
         Operation::CreateUser => CreateUserResult::from_u32(code).is_some(),
         Operation::UpdateUser => UpdateUserResult::from_u32(code).is_some(),
         Operation::DeleteUser => DeleteUserResult::from_u32(code).is_some(),

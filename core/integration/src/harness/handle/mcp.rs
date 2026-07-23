@@ -52,7 +52,7 @@ pub struct McpHandle {
     iggy_address: Option<SocketAddr>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
-    port_reserver: Option<SinglePortReserver>,
+    _port_reserver: SinglePortReserver,
 }
 
 impl std::fmt::Debug for McpHandle {
@@ -143,7 +143,7 @@ impl McpHandle {
             iggy_address: None,
             stdout_path: None,
             stderr_path: None,
-            port_reserver: Some(reserver),
+            _port_reserver: reserver,
         }
     }
 }
@@ -242,12 +242,6 @@ impl IggyServerDependent for McpHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        // Release port reservation just before health-checking. Holds the port
-        // while the child initializes, matching the server handle pattern.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         let http_address = format!(
             "http://{}:{}",
             self.server_address.ip(),
@@ -282,6 +276,9 @@ impl IggyServerDependent for McpHandle {
 
 impl Drop for McpHandle {
     fn drop(&mut self) {
+        // Reap the child before `_port_reserver` drops: `Child::drop` detaches
+        // without waiting, so the freed slot could be reused while this MCP
+        // server still holds its ports.
         let _ = self.stop();
         common::dump_logs_on_panic("Iggy MCP server", &self.stdout_path, &self.stderr_path);
     }

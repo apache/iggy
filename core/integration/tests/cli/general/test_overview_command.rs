@@ -43,25 +43,25 @@ CLI for Iggy message streaming platform
 Usage: iggy [OPTIONS] [COMMAND]
 
 Commands:
-  stream           stream operations [aliases: s]
-  topic            topic operations [aliases: t]
-  partition        partition operations [aliases: p]
-  segment          segments operations [aliases: seg]
+  stream           stream operations [alias: s]
+  topic            topic operations [alias: t]
+  partition        partition operations [alias: p]
+  segment          segments operations [alias: seg]
   ping             ping iggy server
   me               get current client info
   stats            get iggy server statistics
   snapshot         collect iggy server troubleshooting data
   pat              personal access token operations
-  user             user operations [aliases: u]
-  client           client operations [aliases: c]
-  cluster          cluster operations [aliases: cl]
-  consumer-group   consumer group operations [aliases: g]
-  consumer-offset  consumer offset operations [aliases: o]
-  message          message operations [aliases: m]
-  context          context operations [aliases: ctx]
-  login            login to Iggy server [aliases: li]
-  logout           logout from Iggy server [aliases: lo]
-  session          login session operations [aliases: sess]
+  user             user operations [alias: u]
+  client           client operations [alias: c]
+  cluster          cluster operations [alias: cl]
+  consumer-group   consumer group operations [alias: g]
+  consumer-offset  consumer offset operations [alias: o]
+  message          message operations [alias: m]
+  context          context operations [alias: ctx]
+  login            login to Iggy server [alias: li]
+  logout           logout from Iggy server [alias: lo]
+  session          login session operations [alias: sess]
   help             Print this message or the help of the given subcommand(s)
 
 

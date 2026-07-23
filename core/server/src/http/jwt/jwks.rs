@@ -15,12 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use dashmap::DashMap;
 use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
-use std::hash::Hash;
 use strum::{Display, EnumString};
+use tokio::sync::Mutex;
+
+/// Minimum wall-clock gap between outbound JWKS fetches for one trusted issuer.
+/// Inside this window a cache miss is authoritative: the issuer's key set was
+/// just read, so an absent `kid` is genuinely absent and no fetch is issued.
+/// This bounds a pre-auth caller replaying unknown `kid`s to at most one
+/// outbound request per issuer per window; the trade is that a freshly rotated
+/// key is only discoverable once the window elapses.
+const JWKS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 thread_local! {
     // cyper 0.9's `Client` is `!Send`/`!Sync` (`Rc`-backed) and `new()`
@@ -89,58 +101,78 @@ struct CacheKey {
 #[derive(Debug, Clone)]
 pub struct JwksClient {
     cache: DashMap<CacheKey, DecodingKey>,
+    /// Per-issuer single-flight and rate-limit guard. The async mutex serialises
+    /// refresh attempts for one issuer so a burst of concurrent misses collapses
+    /// onto a single fetch; the inner instant is when that issuer was last
+    /// fetched and gates [`JWKS_REFRESH_MIN_INTERVAL`]. Keyed only by issuer
+    /// (operator-configured, bounded), never by the attacker-controlled `kid`.
+    refresh_guards: DashMap<String, Arc<Mutex<Option<Instant>>>>,
 }
 
 impl Default for JwksClient {
     fn default() -> Self {
         Self {
             cache: DashMap::new(),
+            refresh_guards: DashMap::new(),
         }
     }
 }
 
 impl JwksClient {
+    /// Resolve the decoding key for `{issuer, kid}`, fetching and caching the
+    /// issuer's JWKS on a cache miss.
+    ///
+    /// A cache miss is served under a per-issuer guard: concurrent misses fetch
+    /// once, and within [`JWKS_REFRESH_MIN_INTERVAL`] of the last fetch a miss is
+    /// treated as a known-absent `kid` and rejected without an outbound request.
+    /// This keeps an unauthenticated caller replaying unknown `kid`s from
+    /// amplifying into unbounded fetches against the issuer's JWKS endpoint.
+    // The per-issuer guard is deliberately held across the JWKS fetch: that hold
+    // is what serialises concurrent misses onto a single outbound request. Drop-
+    // tightening would release it before the await and defeat the single-flight.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn get_key(&self, issuer: &str, jwks_url: &str, kid: &str) -> Option<DecodingKey> {
         let cache_key = CacheKey {
             issuer: issuer.to_string(),
             kid: kid.to_string(),
         };
 
-        // try to get from cache first
+        // Positive-cache fast path: no lock, no fetch.
         if let Some(key) = self.cache.get(&cache_key) {
             return Some(key.clone());
         }
 
-        // fetch and cache if not found
-        if let Ok(key) = self.fetch_and_cache_key(issuer, jwks_url, kid).await {
-            return Some(key);
+        // Take the per-issuer guard so concurrent misses serialise onto one
+        // fetch. Clone the Arc out and drop the DashMap entry lock before the
+        // await, so no shard lock is held across the network I/O.
+        let entry = self.refresh_guards.entry(issuer.to_string()).or_default();
+        let guard = entry.value().clone();
+        drop(entry);
+        let mut last_fetch = guard.lock().await;
+
+        // A prior holder of the guard may have populated our kid while we waited.
+        if let Some(key) = self.cache.get(&cache_key) {
+            return Some(key.clone());
         }
 
-        None
-    }
-
-    async fn fetch_and_cache_key(
-        &self,
-        issuer: &str,
-        jwks_url: &str,
-        kid: &str,
-    ) -> Result<DecodingKey, IggyError> {
-        if let Err(e) = self.refresh_keys(issuer, jwks_url).await {
-            return Err(IggyError::CannotFetchJwks(format!(
-                "Failed to refresh keys: {}",
-                e
-            )));
+        // Inside the refresh window the last fetch's key set still stands, so a
+        // miss here means the kid is genuinely absent: reject without touching
+        // the network. One per-issuer timestamp both negative-caches unknown kids
+        // and rate-limits outbound fetches, with no attacker-keyed state.
+        if let Some(fetched_at) = *last_fetch
+            && fetched_at.elapsed() < JWKS_REFRESH_MIN_INTERVAL
+        {
+            return None;
         }
 
-        let cache_key = CacheKey {
-            issuer: issuer.to_string(),
-            kid: kid.to_string(),
-        };
+        // Stale or first contact: fetch. Record the attempt up front so a failing
+        // issuer is rate-limited too, not re-hit on every miss.
+        *last_fetch = Some(Instant::now());
+        if self.refresh_keys(issuer, jwks_url).await.is_err() {
+            return None;
+        }
 
-        self.cache
-            .get(&cache_key)
-            .map(|entry| entry.clone())
-            .ok_or(IggyError::InvalidAccessToken)
+        self.cache.get(&cache_key).map(|entry| entry.clone())
     }
 
     async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {

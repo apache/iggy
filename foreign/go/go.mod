@@ -6,7 +6,7 @@ require (
 	github.com/avast/retry-go/v5 v5.0.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
-	github.com/klauspost/compress v1.18.6
+	github.com/klauspost/compress v1.19.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	gopkg.in/yaml.v3 v3.0.1

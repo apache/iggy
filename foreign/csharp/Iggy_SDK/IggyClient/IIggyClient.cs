@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Encryption;
+
 namespace Apache.Iggy.IggyClient;
 
 /// <summary>
@@ -25,6 +27,13 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
     IIggySystem, IIggyPartition, IIggySegment, IIggyUsers, IIggyPersonalAccessToken, IDisposable
 {
+    /// <summary>
+    ///     The message encryptor configured on this client, or null when encryption is disabled. When set, the client
+    ///     encrypts on send and decrypts on poll for the whole connection. Defaults to null so existing
+    ///     implementations keep compiling.
+    /// </summary>
+    IMessageEncryptor? MessageEncryptor => null;
+
     /// <summary>
     ///     Subscribes to connection state change events.
     /// </summary>
@@ -49,4 +58,17 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// </summary>
     /// <returns>The current address of the client.</returns>
     string GetCurrentAddress();
+
+    /// <summary>
+    ///     Sends a command code with a payload and returns the raw response bytes.
+    /// </summary>
+    /// <remarks>
+    ///     Session-control codes are rejected with an invalid-command error.
+    ///     HTTP clients report that this operation is unavailable.
+    /// </remarks>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The request payload.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
+    Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
 }

@@ -31,10 +31,12 @@ use metadata::stm::StateMachine;
 use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use server_common::{Message, MessageBag};
 
-/// How often the shard pump drives `VsrConsensus::tick`: heartbeats, prepare
-/// retransmit, and view-change timeouts only advance when the tick runs
-/// ("call this periodically, e.g. every 10ms").
-const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// How often the shard pump drives `VsrConsensus::tick`.
+///
+/// Heartbeats, prepare retransmit, and view-change timeouts only advance
+/// when the tick runs ("call this periodically, e.g. every 10ms"). Public
+/// so the simulator can advance its virtual clock in whole tick intervals.
+pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Decompose a [`MessageBag`] into the routing-relevant tuple
 /// `(operation, namespace, generic_message)`.
@@ -68,6 +70,22 @@ fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) 
             (h.operation(), h.namespace, m.into_generic())
         }
         MessageBag::Commit(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestStartView(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RequestPrepares(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::RepairPrepare(m) => {
+            let h = *m.header();
+            (h.0.operation, h.0.namespace, m.into_generic())
+        }
+        MessageBag::RepairRangeReply(m) => {
             let h = *m.header();
             (h.operation(), h.namespace, m.into_generic())
         }
@@ -112,6 +130,18 @@ where
         };
         let (operation, namespace, generic) = extract_routing(bag);
         self.route_typed(operation, namespace, generic);
+    }
+
+    /// Invoke the client-request handler directly, exactly as the client-fd
+    /// listener does in production once a connection delivers request bytes.
+    /// The simulator's dispatch shell uses this to drive `SimClient` requests
+    /// through the real `on_client_request` path (auth, session binding,
+    /// consensus submit, reply) instead of the raw `dispatch` routing the
+    /// shell-off fast path takes. No production caller: a `-p iggy-server-ng`
+    /// build excludes the `simulator` feature and this method.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn deliver_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
+        (self.on_client_request)(client_id, message);
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
@@ -274,10 +304,17 @@ where
         // it (which would stall heartbeats / prepare retransmit).
         // Single source for the timer, so the re-arm below cannot drift from the
         // initial interval.
-        let rearm_tick = || compio::time::sleep(CONSENSUS_TICK_INTERVAL).fuse();
+        // The tick timer comes from the bus so the environment decides the
+        // clock: compio wall time in production, virtual time in the
+        // simulator (see `MessageBus::sleep`).
+        let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
         loop {
-            futures::select! {
+            // `select_biased!`, not `select!`: the unbiased macro draws its
+            // arm order from a process-random thread-local PRNG, which the
+            // deterministic simulator cannot seed. The listed order is the
+            // intended priority anyway: stop, then tick, then frames.
+            futures::select_biased! {
                 _ = stop.recv().fuse() => break,
                 () = consensus_tick.as_mut() => {
                     // Sharing the pump task is what keeps `tick_partitions`
@@ -329,6 +366,11 @@ where
                 self.apply_reconcile_ops();
             }
         }
+
+        // Final flush: committed messages still resident in the in-memory
+        // journal must reach segment storage before the process exits, or a
+        // graceful restart recovers consumer offsets ahead of the data.
+        self.flush_partitions().await;
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through

@@ -27,11 +27,11 @@ use consensus::{
     PipelineEntry, Plane, PlaneIdentity, PlaneKind, PreflightOutcome, Project, ReplicaLogContext,
     RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
-    build_reply_message_with, build_result_rejection_reply, drain_committable_prefix,
-    emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
-    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
-    replicate_preflight, replicate_to_next_in_chain, request_preflight, send_eviction_to_client,
-    send_prepare_ok as send_prepare_ok_common,
+    build_reply_message_with, build_result_rejection_reply, emit_sim_event,
+    fence_old_prepare_by_commit, is_caught_up_primary,
+    panic_if_hash_chain_would_break_in_same_view, peek_committable_head, pipeline_prepare_common,
+    register_preflight, replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    send_eviction_to_client, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -88,7 +88,7 @@ pub struct IggySnapshot {
 #[allow(unused)]
 impl IggySnapshot {
     #[must_use]
-    pub fn new(sequence_number: u64) -> Self {
+    pub const fn new(sequence_number: u64) -> Self {
         Self {
             snapshot: MetadataSnapshot::new(sequence_number),
         }
@@ -167,11 +167,12 @@ impl Snapshot for IggySnapshot {
     type Timestamp = u64;
     type Inner = MetadataSnapshot;
 
-    fn create<T>(stm: &T, sequence_number: u64) -> Result<Self, SnapshotError>
+    fn create<T>(stm: &T, sequence_number: u64, created_at: u64) -> Result<Self, SnapshotError>
     where
         T: FillSnapshot<MetadataSnapshot>,
     {
         let mut snapshot = MetadataSnapshot::new(sequence_number);
+        snapshot.created_at = created_at;
 
         stm.fill_snapshot(&mut snapshot)?;
 
@@ -201,23 +202,40 @@ impl Snapshot for IggySnapshot {
 /// Owns the data directory path and the snapshot creation function.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
-    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    /// Remaining-journal-slots threshold at which a checkpoint is forced.
+    /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
+    /// least the configured prepare-queue depth (see the static assert and
+    /// [`Self::set_checkpoint_margin`]).
+    checkpoint_margin: Cell<usize>,
 }
 
 impl<M> SnapshotCoordinator<M> {
-    /// Number of remaining journal slots at which a checkpoint is forced.
-    // TODO: tune this margin size
+    /// Default number of remaining journal slots at which a checkpoint is
+    /// forced. Must stay >= the prepare-queue depth: the ops already
+    /// pipelined while a checkpoint runs skip it and append into this
+    /// margin.
     const CHECKPOINT_MARGIN: usize = 64;
 
     #[must_use]
     pub fn new(
         data_dir: std::path::PathBuf,
-        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+        create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
     ) -> Self {
         Self {
             data_dir,
             create_snapshot,
+            checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
         }
+    }
+
+    /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
+    /// this with the configured prepare-queue depth so a deeper pipeline
+    /// keeps its guarantee of journal room while a checkpoint runs; the
+    /// default margin stays the floor.
+    pub fn set_checkpoint_margin(&self, margin: usize) {
+        self.checkpoint_margin
+            .set(margin.max(Self::CHECKPOINT_MARGIN));
     }
 
     /// Create a snapshot, persist it, and drain snapshotted entries from the
@@ -231,11 +249,12 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         last_op: u64,
+        created_at: u64,
     ) -> Result<(), SnapshotError>
     where
         J: JournalHandle,
     {
-        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let snapshot = (self.create_snapshot)(stm, last_op, created_at)?;
         let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
         snapshot.persist(&path)?;
 
@@ -260,6 +279,7 @@ impl<M> SnapshotCoordinator<M> {
         stm: &M,
         journal: &J,
         commit_op: u64,
+        created_at: u64,
     ) -> Result<bool, SnapshotError>
     where
         J: JournalHandle,
@@ -267,13 +287,95 @@ impl<M> SnapshotCoordinator<M> {
         let needs_checkpoint = journal
             .handle()
             .remaining_capacity()
-            .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
+            .is_some_and(|c| c <= self.checkpoint_margin.get());
 
         if needs_checkpoint {
-            self.checkpoint(stm, journal, commit_op).await?;
+            self.checkpoint(stm, journal, commit_op, created_at).await?;
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+}
+
+// A checkpoint pauses journal reclamation, not admission: while one runs,
+// up to a full prepare queue of already-pipelined ops still needs journal
+// room (their `on_replicate` drivers skip the in-flight checkpoint and
+// append). The margin must cover them or the journal wraps mid-checkpoint.
+const _: () =
+    assert!(SnapshotCoordinator::<()>::CHECKPOINT_MARGIN >= consensus::PIPELINE_PREPARE_QUEUE_MAX);
+
+/// Single-shard async gate serializing the journal-mutation section of
+/// `on_replicate` (forced checkpoint + WAL append).
+///
+/// Many futures can drive `on_replicate` concurrently on one shard (the
+/// pump loop, detached per-client submit tasks, repair). Ungated they race
+/// `SnapshotCoordinator::checkpoint`: every driver crossing the
+/// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
+/// checkpoint, and the concurrent `journal.drain()` calls collide on the
+/// WAL rewrite — shared `wal.tmp`, ENOENT for every rename that loses,
+/// short reads after the winner's reopen. Appends racing a drain are just
+/// as unsound: the drain's live-set partition misses an append landing
+/// mid-rewrite and the rewrite silently discards it.
+///
+/// Not a general lock: single-threaded (`Cell`/`RefCell`, never `Sync`),
+/// release wakes every waiter and poll order re-races (arrival-order FIFO
+/// under `futures::join!`-style drivers), cancel-safe (dropping the guard
+/// releases; dropping a waiter leaves only a stale waker).
+struct LocalGate {
+    busy: Cell<bool>,
+    waiters: RefCell<Vec<std::task::Waker>>,
+}
+
+impl LocalGate {
+    const fn new() -> Self {
+        Self {
+            busy: Cell::new(false),
+            waiters: RefCell::new(Vec::new()),
+        }
+    }
+
+    const fn acquire(&self) -> LocalGateAcquire<'_> {
+        LocalGateAcquire { gate: self }
+    }
+}
+
+struct LocalGateAcquire<'a> {
+    gate: &'a LocalGate,
+}
+
+impl<'a> std::future::Future for LocalGateAcquire<'a> {
+    type Output = LocalGateGuard<'a>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.gate.busy.get() {
+            // Re-polls while still busy push a duplicate waker; the extra
+            // wake is spurious and harmless at pipeline-queue scale.
+            self.gate.waiters.borrow_mut().push(cx.waker().clone());
+            std::task::Poll::Pending
+        } else {
+            self.gate.busy.set(true);
+            std::task::Poll::Ready(LocalGateGuard { gate: self.gate })
+        }
+    }
+}
+
+struct LocalGateGuard<'a> {
+    gate: &'a LocalGate,
+}
+
+impl Drop for LocalGateGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.busy.set(false);
+        // Move the waiters out before waking: `wake()` only schedules under
+        // compio today, but a waker that ever polled a waiter inline would
+        // re-enter `acquire`'s `waiters.borrow_mut()` and panic the RefCell.
+        let waiters = std::mem::take(&mut *self.gate.waiters.borrow_mut());
+        for waker in waiters {
+            waker.wake();
         }
     }
 }
@@ -375,6 +477,9 @@ pub struct IggyMetadata<C, J, S, M> {
     pub allocator: ConsensusGroupAllocator,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
+    /// Serializes `on_replicate`'s journal-mutation section (forced
+    /// checkpoint + WAL append) across concurrent drivers. See [`LocalGate`].
+    journal_gate: LocalGate,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
     /// Late-bound post-commit notifier. Fires once per committed normal op
@@ -391,6 +496,11 @@ pub struct IggyMetadata<C, J, S, M> {
     /// server config at bootstrap ([`Self::set_default_max_topic_size`]);
     /// defaults to unlimited, matching the shipped server config.
     default_max_topic_size: Cell<u64>,
+    /// Resolved micros value for `IggyExpiry::ServerDefault` (`0` on the wire).
+    /// Same admission-time sentinel resolution as [`Self::default_max_topic_size`];
+    /// set from server config at bootstrap ([`Self::set_default_message_expiry`]).
+    /// Defaults to never-expire, matching the shipped server config.
+    default_message_expiry: Cell<u64>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -419,9 +529,11 @@ where
             mux_stm,
             allocator,
             coordinator,
+            journal_gate: LocalGate::new(),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             default_max_topic_size: Cell::new(u64::MAX),
+            default_message_expiry: Cell::new(u64::MAX),
         }
     }
 }
@@ -441,10 +553,33 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         self.default_max_topic_size.set(max_topic_size_bytes);
     }
 
+    /// Raise the forced-checkpoint margin to cover a configured
+    /// prepare-queue depth (`[metadata] prepare_queue_depth`). Clamped to
+    /// the built-in floor by the coordinator; no-op on shards without a
+    /// coordinator.
+    pub fn set_checkpoint_margin(&self, margin: usize) {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.set_checkpoint_margin(margin);
+        }
+    }
+
     /// Resolved byte value for `MaxTopicSize::ServerDefault`.
     #[must_use]
     pub const fn default_max_topic_size(&self) -> u64 {
         self.default_max_topic_size.get()
+    }
+
+    /// Install the resolved micros value used for `IggyExpiry::ServerDefault`.
+    /// Server-ng bootstrap calls this with `system.topic.message_expiry` on every
+    /// shard (responses read it too); only shard 0's copy feeds admission.
+    pub fn set_default_message_expiry(&self, message_expiry_micros: u64) {
+        self.default_message_expiry.set(message_expiry_micros);
+    }
+
+    /// Resolved micros value for `IggyExpiry::ServerDefault`.
+    #[must_use]
+    pub const fn default_message_expiry(&self) -> u64 {
+        self.default_message_expiry.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -641,14 +776,32 @@ where
             panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
-        if !self.checkpoint_if_needed(consensus, journal).await {
-            return;
-        }
+        // Serialize the journal-mutation section (forced checkpoint + append)
+        // across concurrent `on_replicate` drivers. Ungated, every driver
+        // crossing the checkpoint boundary ran its own checkpoint and the
+        // concurrent `drain()`s raced the WAL rewrite (`snapshot I/O error:
+        // No such file or directory`) — the single-node "metadata prepare
+        // queue is full" wedge. Held through the append so a drain can never
+        // rewrite the WAL out from under a racing append either.
+        let journal_gate = self.journal_gate.acquire().await;
+
+        // Best-effort WAL reclamation. A failed checkpoint must NOT drop the
+        // prepare: `pipeline_message` already pushed the pipeline entry and
+        // pre-advanced the sequencer, so bailing out here leaves a phantom op
+        // that no repair path re-prepares — the commit frontier gaps behind
+        // it permanently and the pipeline wedges full. `CHECKPOINT_MARGIN >=
+        // PIPELINE_PREPARE_QUEUE_MAX` (static assert above) guarantees the
+        // append below still has room after a failed or skipped attempt; a
+        // journal that truly wraps is refused by append's slot-collision
+        // guard, not here.
+        self.checkpoint_if_needed(consensus, journal).await;
 
         // Backup: gap check (op == current_op + 1).
         // Primary: sequencer pre-advanced by push_prepare_entry (guards
         // sibling on_request races during journal.append await).
-        // TODO: hard assert for backups once message repair lands.
+        // TODO: promote the backup gap warn below to a hard assert or a
+        // repair-session trigger (message repair has landed; the drop-and-
+        // wait-for-retransmit path is the last soft handling left here).
         let is_backup = consensus.is_follower();
         if is_backup {
             if header.op != current_op + 1 {
@@ -702,6 +855,9 @@ where
             return;
         }
 
+        // Journal mutation done; wire traffic below must not hold the gate.
+        drop(journal_gate);
+
         // Durable; chain-replicate. `replicate` borrows + freezes; we keep
         // message for the sequencer/checksum bookkeeping below.
         self.replicate(&message).await;
@@ -714,6 +870,7 @@ where
         if is_backup {
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
+            consensus.observe_prepare_timestamp(header.timestamp);
         }
 
         // After successful journal write, send prepare_ok to primary.
@@ -763,8 +920,6 @@ where
 
         let quorum = ack_quorum_reached(consensus, PlaneKind::Metadata, header);
         if quorum {
-            let journal = self.journal.as_ref().unwrap();
-
             debug!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -773,163 +928,7 @@ where
                 "ack quorum received"
             );
 
-            let drained = drain_committable_prefix(consensus);
-            let drained_count = drained.len();
-            if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
-                debug!(
-                    target: "iggy.metadata.diag",
-                    plane = "metadata",
-                    replica_id = consensus.replica(),
-                    first_op = first.header.op,
-                    last_op = last.header.op,
-                    drained_count = drained_count,
-                    "draining committed metadata prefix"
-                );
-            }
-
-            for mut entry in drained {
-                let prepare_header = entry.header;
-                // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-                // When journal compaction is implemented compaction could race
-                // with this lookup if it removes entries below the commit number.
-                let prepare = journal
-                    .handle()
-                    .entry(&prepare_header)
-                    .await
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "on_ack: committed prepare op={} checksum={} must be in journal",
-                            prepare_header.op, prepare_header.checksum
-                        )
-                    });
-
-                let pipeline_depth = consensus.pipeline().borrow().len();
-                let event = CommitLogEvent {
-                    replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
-                    op: prepare_header.op,
-                    client_id: prepare_header.client,
-                    request_id: prepare_header.request,
-                    operation: prepare_header.operation,
-                    pipeline_depth,
-                };
-
-                // Apply SM + mutate client_table BEFORE advancing commit_min.
-                // `is_caught_up_primary` reads `commit_min == commit_max` as
-                // proof the table is caught up. Table first, counter last:
-                // panic mid-commit leaves the gate closed.
-                //
-                // Invariant: no .await or panic between client_table.commit_*
-                // and advance_commit_min. Sync-only.
-                let reply = if prepare_header.operation == Operation::Register {
-                    // Register: commit_register creates session, no SM.
-                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                    let in_flight =
-                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
-                    self.client_table.borrow_mut().commit_register(
-                        prepare_header.client,
-                        prepare_header.user_id,
-                        reply.clone(),
-                        in_flight,
-                    );
-                    reply
-                } else if prepare_header.operation == Operation::Logout {
-                    // Logout unregisters the VSR client session on every replica.
-                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
-                    // Drop the disconnected client from every consumer group it
-                    // joined and rebalance. Deterministic side-effect of the
-                    // Logout commit, applied identically on every replica.
-                    self.mux_stm.streams().remove_consumer_group_member(
-                        prepare_header.client,
-                        iggy_common::IggyTimestamp::from(prepare_header.timestamp),
-                    );
-                    reply
-                } else {
-                    // Normal op: apply SM, commit_reply. `Err` is decode/corruption
-                    // only; a business rejection commits as a deterministic no-op
-                    // whose `code` rides the reply body, replayed on retry.
-                    let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
-                        panic!(
-                            "on_ack: committed metadata op={} failed to apply: {err}",
-                            prepare_header.op
-                        );
-                    });
-                    // Post-commit notifier (e.g. partition reconciler
-                    // wake-up). Filtering by operation is the
-                    // recipient's responsibility.
-                    self.fire_commit_notifier(prepare_header.operation);
-                    let reply =
-                        build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
-                            apply.write_reply_body(dst);
-                        });
-                    // Cache only if session exists. Client evicted between
-                    // prepare and commit: skip cache (`commit_reply` no-ops),
-                    // wire reply still ships.
-                    let session = self
-                        .client_table
-                        .borrow()
-                        .get_session(prepare_header.client);
-                    if let Some(session) = session {
-                        self.client_table.borrow_mut().commit_reply(
-                            prepare_header.client,
-                            session,
-                            reply.clone(),
-                        );
-                    } else {
-                        tracing::trace!(
-                            client = prepare_header.client,
-                            op = prepare_header.op,
-                            "on_ack: client evicted while being prepared; emitting reply but skipping cache"
-                        );
-                    }
-                    reply
-                };
-                consensus.advance_commit_min(prepare_header.op);
-                emit_sim_event(SimEventKind::OperationCommitted, &event);
-
-                // Fire subscriber BEFORE wire send. Slot already updated
-                // (slot-first ordering, see take_reply_sender). Dropped
-                // receiver: ignored.
-                let had_in_process_subscriber = entry.has_reply_sender();
-                if let Some(sender) = entry.take_reply_sender() {
-                    let _ = sender.send(reply.clone());
-                }
-
-                // Skip wire send when an in-process subscriber consumed the
-                // reply: the caller (e.g. `complete_login_register`,
-                // `handle_logout_request`) ships its own full-body reply on
-                // the same socket. Sending both desyncs the SDK -- it reads
-                // the first frame, fails to decode the typed body, and
-                // leaves the second frame stuck in the socket buffer.
-                if had_in_process_subscriber {
-                    continue;
-                }
-
-                let generic_reply = reply.into_generic();
-                let reply_buffers = freeze_client_reply(generic_reply);
-                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
-
-                if let Err(e) = consensus
-                    .message_bus()
-                    .send_to_client(prepare_header.client, reply_buffers)
-                    .await
-                {
-                    error!(
-                        client = prepare_header.client,
-                        op = prepare_header.op,
-                        request_id = prepare_header.request,
-                        operation = ?prepare_header.operation,
-                        %e,
-                        "client reply forward failed, no retransmit path; client will time out",
-                    );
-                }
-            }
-
-            // Each commit frees one prepare slot, promote up to
-            // drained_count buffered requests so the pipeline stays busy.
-            self.drain_request_queue_into_prepares(drained_count).await;
+            self.commit_committable_prefix().await;
         }
     }
 }
@@ -1001,32 +1000,22 @@ where
             return Ok(session);
         }
 
-        // Status + catch-up gate (see doc). Split variants for telemetry:
-        // NotPrimary (try peer) vs NotCaughtUp (retry). Caller policy same.
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
+        // Wrong node: waiting or queueing cannot fix that, the client must
+        // re-route to the primary.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return Err(MetadataSubmitError::NotPrimary);
         }
 
         // Mirror wire-path register_preflight: a racing second prepare fails
-        // check_register on commit. Surface pre-synthesis.
+        // check_register on commit. Surface pre-synthesis. Scans both the
+        // prepare queue and the request queue, so a register absorbed below
+        // dedups its own replays.
         if consensus
             .pipeline()
             .borrow()
             .has_message_from_client(client_id)
         {
             return Err(MetadataSubmitError::InProgress);
-        }
-
-        // TODO(pipeline-backpressure): in-process has no request_queue yet;
-        // terminal on full. Wire path buffers.
-        if consensus.pipeline().borrow().is_full() {
-            return Err(MetadataSubmitError::PipelineFull);
         }
 
         let request = build_register_request_message(consensus, client_id, user_id);
@@ -1039,6 +1028,38 @@ where
             },
             "build_register_request_message produced a header that fails validate()"
         );
+
+        // Catch-up gate (Register only: admitting one while a committed op
+        // is still unapplied races `commit_register`'s session-eq assert) or
+        // prepare queue full: absorb into the request queue instead of
+        // bouncing with a transient error. The queued
+        // entry carries this caller's reply subscriber; the commit path
+        // promotes it (`drain_request_queue_into_prepares`, which re-runs
+        // `register_preflight`) as soon as the in-flight batch drains, and
+        // the await below resolves exactly like the direct dispatch would.
+        if !is_caught_up_primary(consensus) || consensus.pipeline().borrow().is_full() {
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                // Both queues full: honest terminal backpressure.
+                return Err(MetadataSubmitError::PipelineFull);
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.header().commit),
+                // Entry dropped before commit: view-change reset or a
+                // promotion-time preflight rejection. Same re-check as the
+                // direct path's cancel arm below.
+                Err(Canceled) => self
+                    .client_table
+                    .borrow()
+                    .get_session(client_id)
+                    .ok_or(MetadataSubmitError::Canceled),
+            };
+        }
         // `prepare_request` only fails on `!is_client_allowed`; Register is
         // allowed, so unreachable. Panic loudly on regression instead of
         // smuggling through wire-eviction.
@@ -1101,14 +1122,14 @@ where
             return Ok(consensus.commit_min());
         }
 
-        if !is_caught_up_primary(consensus) {
-            return Err(
-                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
-                    MetadataSubmitError::NotCaughtUp
-                } else {
-                    MetadataSubmitError::NotPrimary
-                },
-            );
+        // No catch-up gate here: a logout admitted mid-commit-window is
+        // safe — the wire path has always dispatched non-register ops
+        // without one, and the per-client dedup below covers the only
+        // logout-vs-logout race. It simply pipelines behind the in-flight
+        // batch and commits with it, so a one-shot client's session
+        // teardown is latency, never an error.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return Err(MetadataSubmitError::NotPrimary);
         }
 
         if consensus
@@ -1119,10 +1140,6 @@ where
             return Err(MetadataSubmitError::InProgress);
         }
 
-        if consensus.pipeline().borrow().is_full() {
-            return Err(MetadataSubmitError::PipelineFull);
-        }
-
         let request = build_logout_request_message(consensus, client_id, session, request);
         debug_assert!(
             {
@@ -1131,6 +1148,31 @@ where
             },
             "build_logout_request_message produced a header that fails validate()"
         );
+
+        // Prepare queue full: absorb into the request queue with this
+        // caller's reply subscriber, promoted as
+        // commits free slots.
+        if consensus.pipeline().borrow().is_full() {
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                return Err(MetadataSubmitError::PipelineFull);
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.header().commit),
+                Err(Canceled) => {
+                    if self.client_table.borrow().get_session(client_id).is_none() {
+                        Ok(consensus.commit_min())
+                    } else {
+                        Err(MetadataSubmitError::Canceled)
+                    }
+                }
+            };
+        }
         let prepare = self
             .prepare_request(request)
             .expect("Operation::Logout is client-allowed; prepare projection cannot fail");
@@ -1193,6 +1235,11 @@ where
             .as_ref()
             .expect("submit_complete_revocation_in_process: consensus only exists on shard 0");
 
+        // Deliberately bounce-based (no request-queue absorption, unlike the
+        // client submit paths above): the caller is the partition
+        // reconciler's completion loop, which retries on its own tick, and
+        // parking internal completions would tie up request slots that
+        // client submits compete for.
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
@@ -1272,6 +1319,9 @@ where
             "submit_delete_personal_access_token_in_process: consensus only exists on shard 0",
         );
 
+        // Deliberately bounce-based (no request-queue absorption): the
+        // caller is the background PAT cleaner, which simply retries the
+        // deletion on its next sweep.
         if !is_caught_up_primary(consensus) {
             return Err(
                 if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
@@ -1356,17 +1406,25 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        // Not-primary / not-caught-up is transient: the same request replayed
-        // once a primary is caught up commits fine. Reply with the explicit
-        // `TransientNotCommitted` frame (relayed to the socket by the home shard)
-        // so the client replays immediately rather than waiting out its
-        // read-timeout. The frame keeps the lockstep TCP/WS stream in framing
-        // sync, so the client resends on the same connection (session intact).
-        if !is_caught_up_primary(consensus) {
+        // Not-primary is transient: the same request replayed against the
+        // current primary commits fine. Reply with the explicit transient
+        // frame (relayed to the socket by the home shard) so the client
+        // replays immediately rather than waiting out its read-timeout.
+        // `TransientNotAccepted` specifically: the request never entered the
+        // pipeline here, so the client may re-issue it ANYWHERE -- including
+        // under a fresh session after failing over to the current leader --
+        // without double-apply risk. (`TransientNotCommitted` conversely means
+        // the outcome is unknown and only a same-session replay is safe.)
+        //
+        // No catch-up gate: a non-register op admitted mid-commit-window
+        // simply pipelines behind the in-flight batch (the wire path has
+        // always done this); the register-specific invariant is guarded in
+        // `submit_register_in_process` / `register_preflight`.
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
+                IggyError::TransientNotAccepted.as_code(),
             )
             .into_generic());
         }
@@ -1404,14 +1462,38 @@ where
             PreflightOutcome::Drop => return Err(MetadataSubmitError::Canceled),
         }
 
-        // Pipeline full: backpressure, not failure. Tell the client to replay.
+        // Prepare queue full: backpressure, not failure. Absorb into the
+        // request queue with this caller's reply subscriber; the commit
+        // path promotes it as slots free up and the await below resolves
+        // with the committed reply. Only a full request queue is terminal
+        // (`TransientNotAccepted`, re-issuable anywhere: the request never
+        // entered a queue).
         if consensus.pipeline().borrow().is_full() {
-            return Ok(build_result_rejection_reply(
-                &request_header,
-                consensus.commit_max(),
-                IggyError::TransientNotCommitted.as_code(),
-            )
-            .into_generic());
+            let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
+            if consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(entry)
+                .is_err()
+            {
+                return Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotAccepted.as_code(),
+                )
+                .into_generic());
+            }
+            return match receiver.await {
+                Ok(reply) => Ok(reply.into_generic()),
+                // Queued entry dropped (view-change reset) or promoted then
+                // canceled: outcome unknown, same-session replay only.
+                Err(Canceled) => Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotCommitted.as_code(),
+                )
+                .into_generic()),
+            };
         }
 
         // The acting-user RBAC stamp lives in the shared `prepare_request`
@@ -1462,12 +1544,14 @@ where
     ) -> Result<Message<ReplyHeader>, Canceled> {
         consensus.verify_pipeline();
         let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
-        // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
-        // can drop the borrow. No commit-max advance flips the gate today;
-        // pin against a future await between check and dispatch.
+        // Register is the one op whose admission requires the catch-up gate
+        // (session-eq assert at commit); its submit path checks the gate and
+        // the check-to-dispatch section is synchronous. Non-register ops
+        // dispatch mid-window by design (they pipeline behind the in-flight
+        // batch, like the wire path always has).
         debug_assert!(
-            is_caught_up_primary(consensus),
-            "dispatch_prepare_and_await: gate flipped between check and dispatch"
+            prepare.header().operation != Operation::Register || is_caught_up_primary(consensus),
+            "dispatch_prepare_and_await: register dispatched with the catch-up gate closed"
         );
         // `on_replicate` awaits: a sibling in-process submit may commit
         // (commit_min advances) or a view change may land (view advances) while
@@ -1602,24 +1686,277 @@ where
         true
     }
 
-    /// Promote up to `slots_freed` buffered requests into prepares after
-    /// `on_ack` commits a prefix.
+    /// Commit the committable prefix, ship the resulting wire replies, and
+    /// promote queued requests into the freed prepare slots.
+    ///
+    /// Runs at the tail of every quorum-advancing `on_ack` and from the
+    /// shard tick via [`Self::resume_stranded_commits`]. Safe under
+    /// concurrent drivers: ownership of each op is arbitrated by the head
+    /// revalidation inside the loop.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
+    async fn commit_committable_prefix(&self) {
+        let consensus = self.consensus.as_ref().unwrap();
+        let journal = self.journal.as_ref().unwrap();
+
+        // Commit loop: peek -> await journal read -> revalidate head ->
+        // sync {pop, apply, advance_commit_min}.
+        //
+        // The entry stays in the pipeline across the journal-read await,
+        // so a driver of this function that is dropped there — a hyper
+        // HTTP handler future canceled by peer disconnect, or a parked
+        // in-process submitter — strands nothing: the next driver
+        // (sibling submit, shard pump, repair tick) re-peeks the same
+        // head and commits it. Popping BEFORE the await loses the entry
+        // forever on cancellation (nothing re-applies a popped entry;
+        // `repair_primary_self_acks` is re-ack-only), pinning
+        // `commit_min` below `commit_max` and panicking the next commit
+        // with "commit_min must advance sequentially".
+        //
+        // Concurrent drivers are serialized by the head revalidation:
+        // only the driver that still finds its peeked header at the
+        // pipeline head after the await owns that op's commit; everyone
+        // else re-peeks and moves on to the next committable op.
+        let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
+        while let Some(prepare_header) = peek_committable_head(consensus) {
+            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
+            // When journal compaction is implemented compaction could race
+            // with this lookup if it removes entries below the commit number.
+            let prepare = journal
+                .handle()
+                .entry(&prepare_header)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "on_ack: committed prepare op={} checksum={} must be in journal",
+                        prepare_header.op, prepare_header.checksum
+                    )
+                });
+
+            // Revalidate after the await: a sibling driver may have
+            // committed this op (and more) while we were parked.
+            let head_is_ours = consensus.pipeline().borrow().head().is_some_and(|head| {
+                head.header.op == prepare_header.op
+                    && head.header.checksum == prepare_header.checksum
+            });
+            if !head_is_ours {
+                continue;
+            }
+
+            let mut entry = consensus
+                .pipeline()
+                .borrow_mut()
+                .pop()
+                .expect("on_ack: revalidated head exists");
+
+            let pipeline_depth = consensus.pipeline().borrow().len();
+            let event = CommitLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                op: prepare_header.op,
+                client_id: prepare_header.client,
+                request_id: prepare_header.request,
+                operation: prepare_header.operation,
+                pipeline_depth,
+            };
+
+            // Apply SM + mutate client_table BEFORE advancing commit_min.
+            // `is_caught_up_primary` reads `commit_min == commit_max` as
+            // proof the table is caught up. Table first, counter last:
+            // panic mid-commit leaves the gate closed.
+            //
+            // Invariant: no .await or panic from the pop above through
+            // `advance_commit_min` and the subscriber fire below.
+            // Sync-only — this is what makes pop/apply/advance atomic on
+            // the single-threaded shard and keeps the head revalidation
+            // sound.
+            let reply = if prepare_header.operation == Operation::Register {
+                // Register: commit_register creates session, no SM.
+                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                self.client_table.borrow_mut().commit_register(
+                    prepare_header.client,
+                    prepare_header.user_id,
+                    reply.clone(),
+                    in_flight,
+                );
+                reply
+            } else if prepare_header.operation == Operation::Logout {
+                // Logout unregisters the VSR client session on every replica.
+                let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                self.client_table
+                    .borrow_mut()
+                    .remove_client(prepare_header.client);
+                // Drop the disconnected client from every consumer group it
+                // joined and rebalance. Deterministic side-effect of the
+                // Logout commit, applied identically on every replica.
+                self.mux_stm.streams().remove_consumer_group_member(
+                    prepare_header.client,
+                    iggy_common::IggyTimestamp::from(prepare_header.timestamp),
+                );
+                reply
+            } else {
+                // Normal op: apply SM, commit_reply. `Err` is decode/corruption
+                // only; a business rejection commits as a deterministic no-op
+                // whose `code` rides the reply body, replayed on retry.
+                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
+                    panic!(
+                        "on_ack: committed metadata op={} failed to apply: {err}",
+                        prepare_header.op
+                    );
+                });
+                // Post-commit notifier (e.g. partition reconciler
+                // wake-up). Filtering by operation is the
+                // recipient's responsibility.
+                self.fire_commit_notifier(prepare_header.operation);
+                let reply =
+                    build_reply_message_with(&prepare_header, apply.reply_body_len(), |dst| {
+                        apply.write_reply_body(dst);
+                    });
+                // Cache only if session exists. Client evicted between
+                // prepare and commit: skip cache (`commit_reply` no-ops),
+                // wire reply still ships.
+                let session = self
+                    .client_table
+                    .borrow()
+                    .get_session(prepare_header.client);
+                if let Some(session) = session {
+                    self.client_table.borrow_mut().commit_reply(
+                        prepare_header.client,
+                        session,
+                        reply.clone(),
+                    );
+                } else {
+                    tracing::trace!(
+                        client = prepare_header.client,
+                        op = prepare_header.op,
+                        "on_ack: client evicted while being prepared; emitting reply but skipping cache"
+                    );
+                }
+                reply
+            };
+            consensus.advance_commit_min(prepare_header.op);
+            emit_sim_event(SimEventKind::OperationCommitted, &event);
+
+            // Fire subscriber BEFORE wire send. Slot already updated
+            // (slot-first ordering, see take_reply_sender). Dropped
+            // receiver: ignored. Still inside the sync region, so an
+            // in-process awaiter is woken atomically with its commit.
+            let had_in_process_subscriber = entry.has_reply_sender();
+            if let Some(sender) = entry.take_reply_sender() {
+                let _ = sender.send(reply.clone());
+            }
+
+            // Skip wire send when an in-process subscriber consumed the
+            // reply: the caller (e.g. `complete_login_register`,
+            // `handle_logout_request`) ships its own full-body reply on
+            // the same socket. Sending both desyncs the SDK -- it reads
+            // the first frame, fails to decode the typed body, and
+            // leaves the second frame stuck in the socket buffer.
+            if !had_in_process_subscriber {
+                wire_replies.push((event, reply));
+            }
+        }
+
+        // Wire replies AFTER the commit loop: this region may await, and
+        // a driver dropped here loses only reply frames — every commit
+        // above is applied and its reply cached in the client_table, so
+        // the SDK recovers it via request replay.
+        for (event, reply) in wire_replies {
+            let generic_reply = reply.into_generic();
+            let reply_buffers = freeze_client_reply(generic_reply);
+            emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
+
+            if let Err(e) = consensus
+                .message_bus()
+                .send_to_client(event.client_id, reply_buffers)
+                .await
+            {
+                error!(
+                    client = event.client_id,
+                    op = event.op,
+                    request_id = event.request_id,
+                    operation = ?event.operation,
+                    %e,
+                    "client reply forward failed, no retransmit path; client will time out",
+                );
+            }
+        }
+
+        // Commits freed prepare slots and reopened the catch-up gate;
+        // promote buffered requests so the pipeline stays busy and
+        // absorbed submits (queued while this batch was mid-commit)
+        // dispatch immediately.
+        self.drain_request_queue_into_prepares().await;
+    }
+
+    /// Timer-driven backstop (shard pump tick) for commit work stranded by
+    /// a canceled `on_ack` driver.
+    ///
+    /// The commit loop and the promotion of queued requests run at the tail
+    /// of the quorum-advancing `on_ack` — inside whichever future delivered
+    /// that ack, and that future can be dropped at any of its awaits
+    /// (journal read, wire-reply send). The pipeline is then left with
+    /// committed-but-unapplied entries (`commit_min < commit_max`) and/or
+    /// still-queued requests, and on an idle server nothing re-drives them:
+    /// `ack_quorum_reached` opens the commit path only when `commit_max`
+    /// advances, which duplicate and repair acks never do. This tick entry
+    /// re-runs the same commit path; a still-parked sibling driver loses
+    /// the head revalidation and exits clean.
+    ///
+    /// Ordering note: register promotion requires the catch-up gate open
+    /// (`register_preflight` drops the entry otherwise), and the gate can
+    /// only be closed here while stranded commits exist — which the commit
+    /// loop applies, reopening the gate, before promotion runs.
+    #[allow(clippy::future_not_send)]
+    pub async fn resume_stranded_commits(&self) {
+        let Some(consensus) = self.consensus.as_ref() else {
+            return;
+        };
+        if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing()) {
+            return;
+        }
+        let stranded_commits = consensus.commit_min() < consensus.commit_max();
+        let promotable_requests = {
+            let pipeline = consensus.pipeline().borrow();
+            !pipeline.request_queue_is_empty() && !pipeline.is_full()
+        };
+        if !stranded_commits && !promotable_requests {
+            return;
+        }
+        self.commit_committable_prefix().await;
+    }
+
+    /// Promote buffered requests into free prepare slots after a commit
+    /// batch drains.
     ///
     /// # Safety
     /// Re-preflight per iteration: `commit_journal` may have advanced the
     /// client's request between push and drain (Stale / Duplicate /
     /// `AlreadyRegistered`). Skipping produces a duplicate prepare and panics.
     #[allow(clippy::future_not_send)]
-    async fn drain_request_queue_into_prepares(&self, slots_freed: usize) {
+    async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();
-        for _ in 0..slots_freed {
+        // Promote while prepare slots exist. Requests are queued for two
+        // reasons — prepare queue full at arrival, or (in-process register)
+        // the catch-up gate was closed — so promotion is bounded by slots,
+        // not by how many commits just freed: a whole burst absorbed during
+        // one commit window drains the moment the window closes. Promoted
+        // prepares are un-quorum'd, so they never re-close the gate here.
+        loop {
+            if consensus.pipeline().borrow().is_full() {
+                break;
+            }
             let req = consensus.pipeline().borrow_mut().pop_request();
-            let Some(req) = req else { break };
+            let Some(mut req) = req else { break };
 
             let client_id = req.message.header().client;
             let session = req.message.header().session;
             let request = req.message.header().request;
             let operation = req.message.header().operation;
+            // If preflight or projection rejects below, dropping `req` (and
+            // the sender taken from it) wakes an in-process awaiter with
+            // `Canceled`; its submit path re-checks the client table.
+            let reply_sender = req.take_reply_sender();
             let dispatch = if operation == Operation::Register {
                 register_preflight(consensus, &self.client_table, client_id).await
             } else {
@@ -1651,10 +1988,20 @@ where
                     continue;
                 }
             };
-            pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
-                self.on_replicate(prepare)
-            })
-            .await;
+            // Mirror `pipeline_prepare_common`, threading the queued
+            // subscriber into the pipeline entry so the awaiter that parked
+            // at enqueue time resolves on this prepare's commit.
+            assert!(!consensus.is_follower(), "promotion: primary only");
+            assert!(consensus.is_normal(), "promotion: status must be normal");
+            assert!(!consensus.is_syncing(), "promotion: must not be syncing");
+            consensus.verify_pipeline();
+            match reply_sender {
+                Some(sender) => {
+                    consensus.pipeline_message_with_sender(PlaneKind::Metadata, &prepare, sender);
+                }
+                None => consensus.pipeline_message(PlaneKind::Metadata, &prepare),
+            }
+            self.on_replicate(prepare).await;
         }
     }
 }
@@ -1672,18 +2019,29 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    /// Run a forced checkpoint when the journal is low on capacity.
+    ///
+    /// Diagnostic-only outcome: the caller holds the `journal_gate`, so this
+    /// is single-flight by construction, and a failure is deliberately not
+    /// surfaced as control flow — the prepare being replicated must proceed
+    /// to its append regardless (see the phantom-op comment at the call
+    /// site). The next prepare over the boundary simply retries.
     #[allow(clippy::future_not_send)]
-    async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) -> bool {
+    async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) {
         let Some(coordinator) = &self.coordinator else {
-            return true;
+            return;
         };
 
         // Use commit_min (locally executed), not commit_max. WAL entries
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        // Stamp created_at from the injected consensus clock (seed-derived
+        // under the simulator), not the wall clock, so replayed snapshots are
+        // byte-identical.
+        let created_at = consensus.clock_realtime_micros();
         match coordinator
-            .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+            .checkpoint_if_needed(&self.mux_stm, journal, snap_op, created_at)
             .await
         {
             Ok(true) => {
@@ -1694,9 +2052,8 @@ where
                     checkpoint_op = snap_op,
                     "forced checkpoint completed"
                 );
-                true
             }
-            Ok(false) => true,
+            Ok(false) => {}
             Err(e) => {
                 error!(
                     target: "iggy.metadata.diag",
@@ -1704,9 +2061,8 @@ where
                     replica_id = consensus.replica(),
                     checkpoint_op = snap_op,
                     error = %e,
-                    "forced checkpoint failed"
+                    "forced checkpoint failed; continuing without WAL reclamation"
                 );
-                false
             }
         }
     }
@@ -1771,6 +2127,9 @@ where
                 if request.max_topic_size == 0 {
                     request.max_topic_size = self.default_max_topic_size.get();
                 }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -1832,9 +2191,17 @@ where
             Operation::UpdateTopic => {
                 let mut request = WireUpdateTopicRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
+                // Same `ServerDefault` resolution as `CreateTopic` above; rebuild
+                // the prepare only if a sentinel actually needs stamping, else
+                // project the untouched buffer zero-copy.
+                let needs_rewrite = request.max_topic_size == 0 || request.message_expiry == 0;
                 if request.max_topic_size == 0 {
-                    // Same `ServerDefault` resolution as `CreateTopic` above.
                     request.max_topic_size = self.default_max_topic_size.get();
+                }
+                if request.message_expiry == 0 {
+                    request.message_expiry = self.default_message_expiry.get();
+                }
+                if needs_rewrite {
                     let body = request.to_bytes();
                     return Ok(build_prepare_message(
                         consensus,
@@ -1912,8 +2279,11 @@ where
             let op = consensus.commit_min() + 1;
 
             let Some(header) = journal.handle().header(op as usize) else {
-                // TODO: Implement message repair: request missing prepare from
-                // primary or other replicas. Until then, the backup stalls here.
+                // Gap-stop: the walk halts at the first missing prepare and
+                // resumes once it is refilled. Live drops refill via the
+                // primary's prepare retransmit; a replica behind at recovery
+                // or after StartView adoption arms a `MetadataRepairSession`
+                // (shard) that re-requests the missing window.
                 break;
             };
             let header = *header;
@@ -1987,24 +2357,28 @@ where
             Operation::CreateTopicWithAssignments => {
                 let request = PersistedCreateTopicRequest::decode_from(body)
                     .expect("create topic with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                // A topic may be created with zero partitions and grown later,
+                // so there may be no consensus group to observe yet.
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create topic with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             Operation::CreatePartitionsWithAssignments => {
                 let request = PersistedCreatePartitionsRequest::decode_from(body)
                     .expect("create partitions with assignments prepare must decode");
-                let highest_consensus_group_id = request
+                if let Some(highest_consensus_group_id) = request
                     .partitions
                     .iter()
                     .map(|partition| partition.consensus_group_id)
                     .max()
-                    .expect("create partitions with assignments must allocate partitions");
-                self.allocator.observe(highest_consensus_group_id);
+                {
+                    self.allocator.observe(highest_consensus_group_id);
+                }
             }
             _ => {}
         }
@@ -2164,9 +2538,40 @@ pub fn build_truncate_partition_client_message(
     partition_id: u32,
     up_to_offset: u64,
 ) -> Message<RequestHeader> {
+    build_truncate_partition_client_message_with_identifiers(
+        template,
+        client_id,
+        session,
+        WireIdentifier::numeric(stream_id),
+        WireIdentifier::numeric(topic_id),
+        partition_id,
+        up_to_offset,
+    )
+}
+
+/// [`build_truncate_partition_client_message`] with the client's raw wire
+/// identifiers (name or id) instead of resolved numeric ids.
+///
+/// Used when the target does not resolve on the handling node: the truncate
+/// still commits, and the apply rejects it as a committed result, keeping the
+/// client's request sequence contiguous while surfacing the typed error.
+///
+/// # Panics
+/// If the total request size exceeds `u32::MAX`; a `TruncatePartition` body is
+/// a few small fields, so this cannot happen in practice.
+#[must_use]
+pub fn build_truncate_partition_client_message_with_identifiers(
+    template: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+    partition_id: u32,
+    up_to_offset: u64,
+) -> Message<RequestHeader> {
     let body = TruncatePartitionRequest {
-        stream_id: WireIdentifier::numeric(stream_id),
-        topic_id: WireIdentifier::numeric(topic_id),
+        stream_id,
+        topic_id,
         partition_id,
         up_to_offset,
     }
@@ -2217,8 +2622,9 @@ where
     let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
         .expect("prepare header bytes should be valid");
     // Match `Project::project` (core/consensus/src/impls.rs): the primary
-    // stamps wall-clock once here so every replica's `StateHandler::apply`
-    // reads the same `created_at`. A `0` stamp would persist a 1970-01-01
+    // stamps the injected clock once here (wall time in production, virtual
+    // under the simulator) so every replica's `StateHandler::apply` reads the
+    // same `created_at`. A `0` stamp would persist a 1970-01-01
     // `created_at` on every CreateStream/CreateTopic/CreatePartitions. The
     // in-process callers that bypass `Project::project` build their prepare
     // through this helper directly (the CreateTopic/CreatePartitions
@@ -2580,5 +2986,787 @@ mod tests {
             ACTING_USER,
             "prepare must carry the ClientTable identity, not the wire value"
         );
+    }
+
+    #[test]
+    fn prepare_request_stamps_create_topic_message_expiry_default() {
+        // A `CreateTopic` carrying the `ServerDefault` sentinel (0) must be
+        // rewritten at primary admission to the configured default, so the
+        // replicated prepare -- and thus every replica's commit -- holds a
+        // concrete expiry. Mirrors the `max_topic_size` sentinel resolution.
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        const CONFIGURED_EXPIRY_MICROS: u64 = 7_200_000_000;
+        let plane = metadata_plane();
+        plane.set_default_message_expiry(CONFIGURED_EXPIRY_MICROS);
+        plane.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // `create_topic_request` builds the body with `message_expiry == 0`.
+        let prepare = plane
+            .prepare_request(create_topic_request(CLIENT, ACTING_USER))
+            .expect("CreateTopic is client-allowed");
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..prepare.header().size as usize];
+        let persisted = PersistedCreateTopicRequest::decode_from(body)
+            .expect("create topic with assignments prepare must decode");
+        assert_eq!(
+            persisted.request.message_expiry, CONFIGURED_EXPIRY_MICROS,
+            "ServerDefault expiry must be stamped to the configured default at admission"
+        );
+    }
+
+    /// Bus whose `send_to_client` parks forever while `stall` is set,
+    /// recording each parked send in `stall_hits`. Models a client whose
+    /// connection writer stalled, so an `on_ack` driver suspends at a wire
+    /// send — an await the test can then cancel the driver at.
+    #[derive(Debug, Default)]
+    struct StallBus {
+        stall: std::cell::Cell<bool>,
+        stall_hits: std::cell::Cell<u32>,
+    }
+
+    // Cell fields make the futures !Send; fine on the single-threaded shard.
+    #[allow(clippy::future_not_send)]
+    impl MessageBus for StallBus {
+        fn track_background(&self, _handle: JoinHandle<()>) {}
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            if self.stall.get() {
+                self.stall_hits.set(self.stall_hits.get() + 1);
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
+        }
+        fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: ClientForwardFn) {}
+    }
+
+    fn create_stream_request(client: u128, request: u64, name: &str) -> Message<RequestHeader> {
+        let body = iggy_binary_protocol::requests::streams::CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+        }
+        .to_bytes();
+        let header_size = size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(&body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
+                command: Command2::Request,
+                operation: Operation::CreateStream,
+                size: u32::try_from(total).unwrap(),
+                client,
+                session: 1,
+                request,
+                user_id: 0,
+                namespace: server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+                ..Default::default()
+            };
+        }
+        message
+    }
+
+    /// Reproduces the `commit_min must advance sequentially` shard-0 crash.
+    ///
+    /// `on_ack` drains (pops) the committable prefix off the pipeline and only
+    /// then applies it, with awaits in between (journal read, wire send). Any
+    /// driver of `on_ack` that is dropped at one of those awaits — a hyper
+    /// HTTP handler future canceled by peer disconnect (`http/state.rs`), or
+    /// any parked in-process submitter — strands the popped-but-unapplied
+    /// entries: nothing can re-apply them (`repair_primary_self_acks` is
+    /// re-ack-only, above `commit_max`), `commit_min` is pinned below
+    /// `commit_max` (every login rejected `NotCaughtUp`), and the next commit
+    /// that quorums panics the shard.
+    ///
+    /// The test parks a driver mid-commit exactly there, cancels it, and then
+    /// delivers the next ack. Correct behavior: the stranded op is still in
+    /// the pipeline and the late ack commits it and everything after it, in
+    /// order. Broken behavior: panic "expected 2, got 3".
+    #[compio::test]
+    async fn dropped_on_ack_driver_must_not_lose_popped_commits() {
+        use std::future::Future;
+
+        const CLIENT: u128 = 1;
+        // The session is the Register op's commit number; it must be > 0 and
+        // sort at-or-under the commits of the three ops below (1..=3).
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            StallBus::default(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // Three prepares through the real primary path: pipeline entry, WAL
+        // append, self-ack onto the loopback queue.
+        for (i, name) in ["s1", "s2", "s3"].iter().enumerate() {
+            let prepare = md
+                .prepare_request(create_stream_request(CLIENT, i as u64 + 1, name))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md.on_replicate(prepare).await;
+        }
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let mut acks = loopback
+            .into_iter()
+            .map(|message| {
+                message
+                    .try_into_typed::<PrepareOkHeader>()
+                    .expect("loopback holds self PrepareOks")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(acks.len(), 3, "one self-ack per replicated prepare");
+        let ack3 = acks.pop().unwrap();
+        let ack2 = acks.pop().unwrap();
+        let ack1 = acks.pop().unwrap();
+
+        // Ack op 2 first: quorum for op 2 alone, but the contiguous prefix
+        // still starts at the un-acked op 1, so nothing commits yet.
+        md.on_ack(ack2).await;
+        assert_eq!(consensus.commit_max(), 0);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // Ack op 1: the quorum walk covers ops 1..=2, so this single driver
+        // commits both. Poll it by hand until it parks at a stalled wire
+        // send mid-`on_ack`, then cancel it — the moral equivalent of hyper
+        // dropping an HTTP handler future on peer disconnect.
+        consensus.message_bus().stall.set(true);
+        {
+            let mut driver = Box::pin(md.on_ack(ack1));
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let mut parked_at_send = false;
+            for _ in 0..1_000 {
+                assert!(
+                    driver.as_mut().poll(&mut cx).is_pending(),
+                    "driver must park at the stalled wire send, not complete"
+                );
+                if consensus.message_bus().stall_hits.get() > 0 {
+                    parked_at_send = true;
+                    break;
+                }
+                // Let the runtime process the journal-read completion the
+                // driver is waiting on, then poll again.
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(
+                parked_at_send,
+                "driver never reached a wire send (commit_min={})",
+                consensus.commit_min()
+            );
+            // Cancel mid-`on_ack`, with at least op 1 applied and the reply
+            // send in flight.
+            drop(driver);
+        }
+        consensus.message_bus().stall.set(false);
+        assert_eq!(consensus.commit_max(), 2, "quorum walk advanced commit_max");
+        assert!(
+            consensus.commit_min() >= 1,
+            "driver applied op 1 before parking at the wire send"
+        );
+
+        // Whatever the canceled driver left behind must still be
+        // committable: delivering the ack for op 3 has to commit every
+        // remaining op, in order. The broken commit path lost op 2 with the
+        // dropped driver (popped, never applied) and panics here with
+        // "commit_min must advance sequentially: expected 2, got 3".
+        md.on_ack(ack3).await;
+        assert_eq!(
+            consensus.commit_min(),
+            3,
+            "late ack must commit the stranded op 2 and then op 3"
+        );
+        assert_eq!(consensus.commit_max(), 3);
+        assert!(
+            is_caught_up_primary(consensus),
+            "gate must reopen once the prefix is fully applied"
+        );
+    }
+
+    /// Reproduces the single-node "metadata prepare queue is full" wedge
+    ///
+    /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
+    /// Under a concurrent login/create burst, several `on_replicate` futures
+    /// cross the forced-checkpoint boundary (journal `remaining_capacity <=
+    /// CHECKPOINT_MARGIN`, i.e. op `SLOT_COUNT - MARGIN = 960`) together, and
+    /// every one of them runs a full checkpoint concurrently. The concurrent
+    /// `journal.drain()` calls race on the one fixed `wal.tmp`: the losers
+    /// surface `snapshot I/O error: No such file or directory` (or a short
+    /// read after the winner's reopen). Fatally, `on_replicate` then dropped
+    /// the loser's prepare — AFTER `pipeline_message` had pushed the pipeline
+    /// entry and pre-advanced the sequencer — so the op was never journaled,
+    /// never acked, never committed. The commit frontier gaps permanently:
+    /// logins first bounce `NotCaughtUp`, in-flight clients wedge
+    /// (`InProgress` on logout), and once the pipeline fills every submit is
+    /// rejected `PipelineFull` forever.
+    ///
+    /// Correct behavior: checkpoints are single-flight, a failed or skipped
+    /// checkpoint never discards a pipelined prepare, all racers' ops are
+    /// journaled and commit, and the caught-up gate reopens.
+    #[compio::test]
+    async fn concurrent_checkpoint_boundary_must_not_drop_prepares() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// One op below the forced-checkpoint trigger: the journal holds
+        /// 1024 slots and forces a checkpoint when 64 or fewer remain.
+        const FILL: u64 = 960;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Bootstrap creates the metadata dir; the coordinator's snapshot
+        // persist expects it to exist.
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        // `data_dir` present => SnapshotCoordinator armed, checkpoints live.
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+            |_| false,
+        );
+
+        // Fill to one op under the boundary through the real primary path,
+        // acking each op so `commit_min` tracks `last_op` and the pipeline
+        // stays shallow — the steady state the production server was in.
+        let mut loopback = Vec::new();
+        for i in 1..=FILL {
+            let prepare = md
+                .prepare_request(create_stream_request(CLIENT, i, &format!("s{i}")))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md.on_replicate(prepare).await;
+            loopback.clear();
+            consensus.drain_loopback_into(&mut loopback);
+            let ack = loopback
+                .pop()
+                .expect("one self-ack per prepare")
+                .try_into_typed::<PrepareOkHeader>()
+                .expect("loopback holds self PrepareOks");
+            md.on_ack(ack).await;
+        }
+        assert_eq!(consensus.commit_min(), FILL);
+        assert_eq!(
+            md.journal.as_ref().unwrap().remaining_capacity(),
+            Some(64),
+            "fill must stop exactly at the forced-checkpoint boundary"
+        );
+
+        // Three submits race across the boundary — the concurrent
+        // login/create burst from the incident. Every racer sees
+        // `remaining_capacity <= CHECKPOINT_MARGIN` before any drain
+        // completes.
+        let md_ref = &md;
+        let race = |request: u64, name: String| async move {
+            let prepare = md_ref
+                .prepare_request(create_stream_request(CLIENT, request, &name))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            md_ref.on_replicate(prepare).await;
+        };
+        futures::join!(
+            race(FILL + 1, format!("s{}", FILL + 1)),
+            race(FILL + 2, format!("s{}", FILL + 2)),
+            race(FILL + 3, format!("s{}", FILL + 3)),
+        );
+
+        // Every racer's prepare must be durably journaled: a dropped one is
+        // unrepairable (nothing re-prepares it) and gaps the frontier.
+        let journal = md.journal.as_ref().unwrap();
+        for op in FILL + 1..=FILL + 3 {
+            assert!(
+                journal
+                    .header(usize::try_from(op).expect("test ops fit in usize"))
+                    .is_some(),
+                "op {op} vanished from the WAL: a failed checkpoint dropped a pipelined prepare"
+            );
+        }
+        // The checkpoint itself must have happened — once: WAL reclaimed,
+        // snapshot on disk.
+        assert!(
+            journal.remaining_capacity().unwrap() > 900,
+            "checkpoint must have drained the snapshotted prefix, got {:?}",
+            journal.remaining_capacity()
+        );
+        assert!(
+            dir.path()
+                .join(crate::impls::METADATA_DIR)
+                .join("snapshot.bin")
+                .exists(),
+            "checkpoint must persist the snapshot"
+        );
+
+        // The self-acks commit all three racers; any gap here is the
+        // production wedge (commit frontier pinned, PipelineFull forever).
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        assert_eq!(loopback.len(), 3, "one self-ack per racer");
+        for message in loopback {
+            let ack = message
+                .try_into_typed::<PrepareOkHeader>()
+                .expect("loopback holds self PrepareOks");
+            md.on_ack(ack).await;
+        }
+        assert_eq!(
+            consensus.commit_min(),
+            FILL + 3,
+            "commit frontier must cross the checkpoint boundary"
+        );
+        assert!(
+            is_caught_up_primary(consensus),
+            "caught-up gate must reopen after the boundary"
+        );
+    }
+
+    /// The exact window behind the historical "logout/unregister failed
+    /// ... primary not yet caught up on `commit_journal`".
+    /// ANOTHER client's op sits between quorum-ack (`commit_max` advanced
+    /// inside `on_ack`) and apply (`commit_min` behind, driver parked at
+    /// the journal read).
+    ///
+    /// New contract (queue absorption): a logout landing in
+    /// that window is NOT bounced with `NotCaughtUp` — non-register ops
+    /// carry no catch-up gate. It pipelines behind the in-flight batch,
+    /// and its submit's inline loopback pump commits both ops in order.
+    /// The parked sibling driver then resumes onto an already-drained
+    /// pipeline and exits via head-revalidation, exercising the
+    /// concurrent-driver safety of the commit loop.
+    #[compio::test]
+    async fn logout_in_mid_commit_window_commits_instead_of_rejecting() {
+        use std::future::Future;
+
+        /// The client logging out; its session is already committed.
+        const CLIENT_A: u128 = 1;
+        /// The client whose in-flight commit closes the gate.
+        const CLIENT_B: u128 = 2;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        for client in [CLIENT_A, CLIENT_B] {
+            md.client_table.borrow_mut().commit_register(
+                client,
+                ACTING_USER,
+                register_reply(client, SESSION),
+                |_| false,
+            );
+        }
+
+        // B's op: prepared, journaled, self-acked onto the loopback queue.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+
+        // Open the window: the first poll of `on_ack` reaches quorum and
+        // advances commit_max synchronously, then parks at the journal
+        // read — commit_min has not moved. This is the exact server state
+        // every production NotCaughtUp line was emitted from.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(
+            driver.as_mut().poll(&mut cx).is_pending(),
+            "driver must park at the journal read inside the commit"
+        );
+        assert_eq!(consensus.commit_max(), 1, "quorum advanced commit_max");
+        assert_eq!(consensus.commit_min(), 0, "apply has not landed yet");
+        assert!(
+            !is_caught_up_primary(consensus),
+            "gate must be closed mid-commit"
+        );
+
+        // A's logout lands in the window. No gate for non-register ops: it
+        // pipelines behind B's committing op, and its inline loopback pump
+        // drives BOTH commits (B's op 1 via head-revalidated takeover, then
+        // its own op 2) before resolving.
+        let outcome = md.submit_logout_in_process(CLIENT_A, SESSION, 2).await;
+        assert_eq!(
+            outcome,
+            Ok(2),
+            "mid-window logout must commit and reply, never bounce NotCaughtUp"
+        );
+        assert_eq!(consensus.commit_min(), 2, "both ops committed in order");
+        assert!(
+            is_caught_up_primary(consensus),
+            "gate reopens once the batch drains"
+        );
+
+        // The parked sibling driver resumes onto a drained pipeline: the
+        // head it peeked is gone, revalidation sends it out without
+        // touching commit state. Drive it to completion to prove it.
+        let mut resumed = false;
+        for _ in 0..1_000 {
+            if driver.as_mut().poll(&mut cx).is_ready() {
+                resumed = true;
+                break;
+            }
+            // Let the runtime deliver the journal-read completion.
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(resumed, "parked driver must exit via head-revalidation");
+        assert_eq!(
+            consensus.commit_min(),
+            2,
+            "resumed driver commits nothing new"
+        );
+        assert_eq!(
+            md.client_table.borrow().get_session(CLIENT_A),
+            None,
+            "session removed by the committed logout"
+        );
+    }
+
+    /// Register is the one op that still honors the catch-up gate (its
+    /// admission races `commit_register`'s session-eq assert against
+    /// committed-but-unapplied ops). New contract: a register arriving in
+    /// the mid-commit window is ABSORBED into the pipeline's request queue
+    /// with its reply subscriber attached, promoted by
+    /// the commit path once the batch drains, and the caller's await
+    /// resolves with the committed session — instead of the historical
+    /// `NotCaughtUp` bounce that one-shot CLI clients surfaced as
+    /// "Disconnected" login failures.
+    #[compio::test]
+    async fn register_in_mid_commit_window_is_queued_then_committed() {
+        use std::future::Future;
+
+        /// The client whose in-flight commit closes the gate.
+        const CLIENT_B: u128 = 2;
+        /// The client registering mid-window.
+        const CLIENT_C: u128 = 3;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT_B,
+            ACTING_USER,
+            register_reply(CLIENT_B, SESSION),
+            |_| false,
+        );
+
+        // B's op journaled + self-acked; park its commit mid-window.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // C's register lands in the window: absorbed, not bounced.
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        assert!(
+            register.as_mut().poll(&mut cx).is_pending(),
+            "mid-window register must park in the request queue, not error"
+        );
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            1,
+            "register buffered in the request queue"
+        );
+
+        // The committing driver drains its batch, then promotes the queued
+        // register into a prepare (its self-ack lands on the loopback).
+        let mut resumed = false;
+        for _ in 0..1_000 {
+            if driver.as_mut().poll(&mut cx).is_ready() {
+                resumed = true;
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(resumed, "B's commit must complete and promote the register");
+        assert_eq!(consensus.commit_min(), 1, "B's op committed");
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            0,
+            "promotion emptied the request queue"
+        );
+
+        // Commit the promoted register (production: the shard pump or any
+        // sibling submit drains this ack) and the parked caller resolves.
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("promoted register must self-ack")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        let mut outcome = None;
+        for _ in 0..1_000 {
+            if let std::task::Poll::Ready(result) = register.as_mut().poll(&mut cx) {
+                outcome = Some(result);
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            outcome.expect("absorbed register must resolve"),
+            Ok(2),
+            "queued register commits with the next batch; session = commit op"
+        );
+        assert_eq!(
+            md.client_table.borrow().get_session(CLIENT_C),
+            Some(2),
+            "session created by the promoted register"
+        );
+    }
+
+    /// The commit loop and the promotion of queued requests run at the tail
+    /// of `on_ack`, inside whichever future delivered the quorum ack. Drop
+    /// that future mid-commit and — on an idle server — nothing re-drives
+    /// the work: duplicate/repair acks do not re-open the commit path
+    /// (quorum already recorded, `commit_max` does not advance), so the
+    /// committed-but-unapplied op pins the catch-up gate closed and an
+    /// absorbed register parks in the request queue indefinitely.
+    ///
+    /// `resume_stranded_commits` (wired into the shard pump tick) is the
+    /// backstop: it re-enters the commit path, applies the stranded prefix,
+    /// and promotes the queued register, whose awaiter then resolves.
+    #[compio::test]
+    async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
+        use std::future::Future;
+
+        /// The client whose in-flight commit is stranded by the dropped driver.
+        const CLIENT_B: u128 = 2;
+        /// The client whose register parks in the request queue.
+        const CLIENT_C: u128 = 3;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT_B,
+            ACTING_USER,
+            register_reply(CLIENT_B, SESSION),
+            |_| false,
+        );
+
+        // B's op journaled + self-acked; park its commit driver mid-window
+        // at the journal read.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT_B, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("one self-ack per prepare")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut driver = Box::pin(md.on_ack(ack));
+        assert!(driver.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+
+        // C's register lands in the window: absorbed into the request queue.
+        let mut register = Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER));
+        assert!(register.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+
+        // The committing driver dies at its await — the hyper-disconnect
+        // analogue. Commit and promotion are now stranded: op 1 is quorum'd
+        // (commit_max = 1) but unapplied (commit_min = 0), and no further
+        // ack will arrive to re-drive either.
+        drop(driver);
+        assert_eq!(consensus.commit_max(), 1);
+        assert_eq!(consensus.commit_min(), 0);
+        assert_eq!(consensus.pipeline().borrow().request_queue_len(), 1);
+        assert!(
+            register.as_mut().poll(&mut cx).is_pending(),
+            "queued register must still be parked with no driver alive"
+        );
+
+        // The pump tick backstop re-drives: commits op 1 (reopening the
+        // catch-up gate) and promotes the queued register into a prepare
+        // (its self-ack lands on the loopback).
+        md.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), 1, "stranded op 1 applied");
+        assert_eq!(
+            consensus.pipeline().borrow().request_queue_len(),
+            0,
+            "queued register promoted"
+        );
+
+        // Commit the promoted register (production: pump loopback drain)
+        // and the parked caller resolves with its session.
+        loopback.clear();
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .expect("promoted register must self-ack")
+            .try_into_typed::<PrepareOkHeader>()
+            .expect("loopback holds self PrepareOks");
+        md.on_ack(ack).await;
+
+        let mut outcome = None;
+        for _ in 0..1_000 {
+            if let std::task::Poll::Ready(result) = register.as_mut().poll(&mut cx) {
+                outcome = Some(result);
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(outcome.expect("promoted register must resolve"), Ok(2));
+        assert_eq!(md.client_table.borrow().get_session(CLIENT_C), Some(2));
+        assert!(is_caught_up_primary(consensus));
     }
 }

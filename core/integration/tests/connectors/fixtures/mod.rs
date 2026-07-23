@@ -17,6 +17,7 @@
 
 use uuid::Uuid;
 
+mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
@@ -27,6 +28,7 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod s3;
+mod surrealdb;
 mod wiremock;
 
 /// Prefix on every test container name so `just clean-test-containers` reaps
@@ -45,6 +47,9 @@ pub(crate) fn unique_container_name(service: &str) -> String {
     )
 }
 
+pub use clickhouse::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
@@ -75,4 +80,8 @@ pub use postgres::{
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
+pub use surrealdb::{
+    SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,
+    SurrealDbSinkRawFixture,
+};
 pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

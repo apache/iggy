@@ -72,6 +72,15 @@ const RESPONSE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "vsr")]
 const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long a request replays `TransientNotCommitted` on the SAME connection
+/// before the client re-checks cluster leadership. A node that stopped being
+/// primary (view change while the connection stayed up) answers transient
+/// forever, so replaying alone never recovers; periodically consult the
+/// roster and fail over to the leader. Bounded by `RESPONSE_READ_TIMEOUT`
+/// overall.
+#[cfg(feature = "vsr")]
+const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
 #[derive(Debug)]
@@ -179,13 +188,6 @@ impl BinaryTransport for TcpClient {
         #[cfg(feature = "vsr")]
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
-            // The replayed login/register must mint a fresh Register: the
-            // failed attempt already consumed the one-shot register request
-            // id and may have half-bound the session.
-            *self
-                .consensus_session
-                .lock()
-                .expect("consensus session mutex poisoned") = ConsensusSession::new();
         }
 
         {
@@ -550,6 +552,19 @@ impl TcpClient {
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
                     info!("Automatic sign-in is disabled.");
+                    // Leadership still matters without auto-login: the caller
+                    // signs in manually, and a login against a non-leader
+                    // replays for its whole read timeout. `GetClusterMetadata`
+                    // is sessionless and pre-auth on server-ng, so the check
+                    // works on the unauthenticated connection. vsr-only: the
+                    // legacy server auth-gates cluster metadata, so this check
+                    // would bounce `Unauthenticated` into the reconnect path
+                    // and recurse back into `connect`.
+                    #[cfg(feature = "vsr")]
+                    {
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
@@ -557,6 +572,15 @@ impl TcpClient {
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
+                    } else if self.handle_leader_redirection().await? {
+                        // Check leadership BEFORE signing in: register/login are
+                        // consensus ops a backup answers with
+                        // `TransientNotCommitted`, so signing in against a
+                        // non-leader replays for the whole read timeout instead
+                        // of failing over. `GetClusterMetadata` is sessionless
+                        // and pre-auth, so it works on the unauthenticated
+                        // connection.
+                        true
                     } else {
                         info!("{NAME} client: {client_address} is signing in...");
                         self.set_state(ClientState::Authenticating).await;
@@ -701,122 +725,74 @@ impl TcpClient {
             _ => {}
         }
 
-        let stream = self.stream.clone();
         #[cfg(feature = "vsr")]
-        let consensus_session = self.consensus_session.clone();
-        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
-        let result = tokio::spawn(async move {
-            let mut stream = stream.lock().await;
-            if let Some(stream) = stream.as_mut() {
-                #[cfg(feature = "vsr")]
-                {
-                    // Encode the request header ONCE: `next_request_id` advances
-                    // here, so a transient replay must reuse the same id for the
-                    // server's dedup. The connection is lockstep (one request in
-                    // flight per client), so a complete reply leaves the stream at
-                    // a clean frame boundary -- a `TransientNotCommitted` answer
-                    // (the server could not commit yet: not-caught-up / in-flight
-                    // / pipeline-full / view-change cancel) lets us resend the
-                    // SAME request on the SAME connection with no reconnect and
-                    // the session intact. Bounded overall by RESPONSE_READ_TIMEOUT.
-                    let (request_header, request_size) = {
-                        let mut consensus_session = consensus_session
-                            .lock()
-                            .expect("consensus session mutex poisoned");
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
-                    };
-                    trace!("Sending a TCP VSR request of size {request_size} with code: {code}");
-                    let header_bytes = bytemuck::bytes_of(&request_header);
-                    // One deadline bounds the whole request including transient
-                    // replays, so a slow primary cannot stretch a single call
-                    // beyond RESPONSE_READ_TIMEOUT.
-                    let retry_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                    loop {
-                        stream.write(header_bytes).await?;
-                        if !payload.is_empty() {
-                            stream.write(&payload).await?;
-                        }
-                        stream.flush().await?;
-                        trace!("Sent a TCP request with code: {code}, waiting for a response...");
-
-                        let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                        // `stream.read` delegates to `read_exact`; on success it
-                        // always returns the requested length, so no short-read
-                        // guard is needed here.
-                        //
-                        // Deadline guards against server-side reply loss (e.g. a
-                        // stalled replication quorum that never commits the op):
-                        // the connection is lockstep, so an unanswered read would
-                        // hold the stream lock forever and wedge every later
-                        // request on this client. On expiry drop the stream --
-                        // a late reply would desync framing for the next request.
-                        //
-                        // One deadline spans BOTH the header and body reads: a
-                        // reply that delivers a header then stalls must not get a
-                        // fresh full timeout for the body.
-                        let header_read = tokio::time::timeout_at(
-                            retry_deadline,
-                            stream.read(&mut response_header),
-                        )
-                        .await;
-                        let Ok(header_read) = header_read else {
-                            error!(
-                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
-                            );
-                            return Err(IggyError::Disconnected);
-                        };
-                        header_read.map_err(|error| {
-                            error!(
-                                "Failed to read VSR response header for TCP request with code: {code}: {error}",
-                            );
-                            IggyError::Disconnected
-                        })?;
-
-                        let response_size = crate::vsr::response_size(&response_header)?;
-                        let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                        let body = if body_size > 0 {
-                            let mut body = BytesMut::with_capacity(body_size);
-                            let body_read = tokio::time::timeout_at(
-                                retry_deadline,
-                                stream.read_buf(&mut body, body_size),
-                            )
-                            .await;
-                            let Ok(body_read) = body_read else {
-                                error!(
-                                    "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
-                                );
-                                return Err(IggyError::Disconnected);
-                            };
-                            body_read.map_err(|error| {
-                                error!(
-                                    "Failed to read VSR response body for TCP request with code: {code}: {error}",
-                                );
-                                IggyError::Disconnected
-                            })?;
-                            body.freeze()
-                        } else {
-                            Bytes::new()
-                        };
-
-                        match crate::vsr::decode_response_split(&response_header, body) {
-                            // Server could not commit yet but answered with a
-                            // complete frame; the lockstep stream is in sync, so
-                            // replay the same request id on this connection after
-                            // a short pause (no reconnect, session intact).
-                            Err(IggyError::TransientNotCommitted)
-                                if tokio::time::Instant::now() < retry_deadline =>
-                            {
-                                let remaining = retry_deadline
-                                    .saturating_duration_since(tokio::time::Instant::now());
-                                tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
-                            }
-                            other => return other,
+        {
+            // One overall deadline bounds the request across transient replays
+            // AND leader failovers, matching the previous single-connection
+            // budget. Login/register replays stay on this connection for the
+            // whole budget: the connect flow owns leader redirection for the
+            // sign-in handshake, and reconnecting from underneath it would
+            // recurse.
+            let overall_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+            let mut preencoded = None;
+            loop {
+                let transient_deadline = if is_login_register_code(code) {
+                    overall_deadline
+                } else {
+                    overall_deadline
+                        .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+                };
+                let (header, result) = self
+                    .send_raw_vsr_attempt(
+                        code,
+                        payload.clone(),
+                        preencoded,
+                        transient_deadline,
+                        overall_deadline,
+                    )
+                    .await;
+                match result {
+                    Err(IggyError::TransientNotAccepted)
+                        if tokio::time::Instant::now() < overall_deadline
+                            && !is_login_register_code(code) =>
+                    {
+                        // The server explicitly did NOT admit the request, so
+                        // re-issuing it -- same id on this session, or a fresh
+                        // id under a new session after a failover -- cannot
+                        // double-apply. Keep the encoded id for same-session
+                        // replays; a redirect re-registers, so the id is
+                        // re-encoded under the new session.
+                        // (`TransientNotCommitted` never reaches this branch:
+                        // its outcome is unknown, so the attempt loop replays
+                        // it same-session for the whole budget and then the
+                        // error propagates to the caller.)
+                        preencoded = header;
+                        if let Ok(true) = self.handle_leader_redirection().await {
+                            self.connect().await?;
+                            preencoded = None;
                         }
                     }
+                    Err(IggyError::Disconnected) => {
+                        // Reply stream state is unknown (timed out or torn
+                        // mid-frame); a late reply would desync framing for the
+                        // next request, so drop the connection and let callers
+                        // reconnect.
+                        self.stream.lock().await.take();
+                        self.set_state(ClientState::Disconnected).await;
+                        return Err(IggyError::Disconnected);
+                    }
+                    other => return other,
                 }
+            }
+        }
 
-                #[cfg(not(feature = "vsr"))]
-                {
+        #[cfg(not(feature = "vsr"))]
+        {
+            let stream = self.stream.clone();
+            // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
+            let result = tokio::spawn(async move {
+                let mut stream = stream.lock().await;
+                if let Some(stream) = stream.as_mut() {
                     let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                     trace!("Sending a TCP request of size {payload_length} with code: {code}");
                     stream.write(&(payload_length as u32).to_le_bytes()).await?;
@@ -851,25 +827,193 @@ impl TcpClient {
                     );
                     return TcpClient::handle_response(status, length, stream).await;
                 }
+
+                error!("Cannot send data. Client is not connected.");
+                Err(IggyError::NotConnected)
+            })
+            .await
+            .map_err(|e| {
+                error!("Task execution failed during TCP request: {}", e);
+                IggyError::TcpError
+            })?;
+
+            if matches!(result, Err(IggyError::Disconnected)) {
+                // Reply stream state is unknown (timed out or torn mid-frame);
+                // a late reply would desync framing for the next request, so
+                // drop the connection and let callers reconnect.
+                self.stream.lock().await.take();
+                self.set_state(ClientState::Disconnected).await;
             }
-
-            error!("Cannot send data. Client is not connected.");
-            Err(IggyError::NotConnected)
-        })
-        .await
-        .map_err(|e| {
-            error!("Task execution failed during TCP request: {}", e);
-            IggyError::TcpError
-        })?;
-
-        if matches!(result, Err(IggyError::Disconnected)) {
-            // Reply stream state is unknown (timed out or torn mid-frame);
-            // a late reply would desync framing for the next request, so
-            // drop the connection and let callers reconnect.
-            self.stream.lock().await.take();
-            self.set_state(ClientState::Disconnected).await;
+            result
         }
-        result
+    }
+
+    /// One send attempt on the current connection: encode the header (or reuse
+    /// `preencoded` so a same-session replay keeps its request id for the
+    /// server's dedup), write the frame, and replay on `TransientNotCommitted`
+    /// until `transient_deadline`. Reads are bounded by `read_deadline` -- the
+    /// full request budget -- so a short transient window cannot tear down a
+    /// connection that is merely slow to reply. Returns the header used so the
+    /// caller can replay the same id on a later attempt.
+    #[cfg(feature = "vsr")]
+    async fn send_raw_vsr_attempt(
+        &self,
+        code: u32,
+        payload: Bytes,
+        preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
+        transient_deadline: tokio::time::Instant,
+        read_deadline: tokio::time::Instant,
+    ) -> (
+        Option<iggy_binary_protocol::consensus::RequestHeader>,
+        Result<Bytes, IggyError>,
+    ) {
+        let stream = self.stream.clone();
+        let consensus_session = self.consensus_session.clone();
+        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
+        let joined = tokio::spawn(async move {
+            let mut stream = stream.lock().await;
+            let Some(stream) = stream.as_mut() else {
+                error!("Cannot send data. Client is not connected.");
+                return (None, Err(IggyError::NotConnected));
+            };
+            // Encode the request header ONCE per session: `next_request_id`
+            // advances here, so a transient replay must reuse the same id for
+            // the server's dedup. The connection is lockstep (one request in
+            // flight per client), so a complete reply leaves the stream at a
+            // clean frame boundary -- a `TransientNotCommitted` answer (the
+            // server could not commit yet: not-caught-up / in-flight /
+            // pipeline-full / view-change cancel) lets us resend the SAME
+            // request on the SAME connection with no reconnect and the session
+            // intact.
+            let request_header = match preencoded {
+                Some(header) => header,
+                None => {
+                    let encoded = {
+                        let mut consensus_session = consensus_session
+                            .lock()
+                            .expect("consensus session mutex poisoned");
+                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
+                    };
+                    match encoded {
+                        Ok((header, request_size)) => {
+                            trace!(
+                                "Sending a TCP VSR request of size {request_size} with code: {code}"
+                            );
+                            header
+                        }
+                        Err(error) => return (None, Err(error)),
+                    }
+                }
+            };
+            let header_bytes = bytemuck::bytes_of(&request_header);
+            let outcome = async {
+                loop {
+                    stream.write(header_bytes).await?;
+                    if !payload.is_empty() {
+                        stream.write(&payload).await?;
+                    }
+                    stream.flush().await?;
+                    trace!("Sent a TCP request with code: {code}, waiting for a response...");
+
+                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                    // `stream.read` delegates to `read_exact`; on success it
+                    // always returns the requested length, so no short-read
+                    // guard is needed here.
+                    //
+                    // Deadline guards against server-side reply loss (e.g. a
+                    // stalled replication quorum that never commits the op):
+                    // the connection is lockstep, so an unanswered read would
+                    // hold the stream lock forever and wedge every later
+                    // request on this client. On expiry drop the stream --
+                    // a late reply would desync framing for the next request.
+                    //
+                    // One deadline spans BOTH the header and body reads: a
+                    // reply that delivers a header then stalls must not get a
+                    // fresh full timeout for the body.
+                    let header_read =
+                        tokio::time::timeout_at(read_deadline, stream.read(&mut response_header))
+                            .await;
+                    let Ok(header_read) = header_read else {
+                        error!(
+                            "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response header for TCP request with code: {code}",
+                        );
+                        return Err(IggyError::Disconnected);
+                    };
+                    header_read.map_err(|error| {
+                        error!(
+                            "Failed to read VSR response header for TCP request with code: {code}: {error}",
+                        );
+                        IggyError::Disconnected
+                    })?;
+
+                    let response_size = crate::vsr::response_size(&response_header)?;
+                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    let body = if body_size > 0 {
+                        let mut body = BytesMut::with_capacity(body_size);
+                        let body_read = tokio::time::timeout_at(
+                            read_deadline,
+                            stream.read_buf(&mut body, body_size),
+                        )
+                        .await;
+                        let Ok(body_read) = body_read else {
+                            error!(
+                                "Timed out after {RESPONSE_READ_TIMEOUT:?} waiting for VSR response body for TCP request with code: {code}",
+                            );
+                            return Err(IggyError::Disconnected);
+                        };
+                        body_read.map_err(|error| {
+                            error!(
+                                "Failed to read VSR response body for TCP request with code: {code}: {error}",
+                            );
+                            IggyError::Disconnected
+                        })?;
+                        body.freeze()
+                    } else {
+                        Bytes::new()
+                    };
+
+                    match crate::vsr::decode_response_split(&response_header, body) {
+                        // `TransientNotCommitted`: the op's outcome is unknown
+                        // (e.g. a view change canceled it in flight) -- ONLY a
+                        // same-session replay of the same request id is safe
+                        // (the client-table serves it from cache if it did
+                        // commit). Replay on this connection for the whole
+                        // request budget; never hand it to the failover path,
+                        // which re-issues under a fresh session and could
+                        // double-apply a committed write.
+                        Err(IggyError::TransientNotCommitted)
+                            if tokio::time::Instant::now() < read_deadline =>
+                        {
+                            let remaining = read_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                        }
+                        // `TransientNotAccepted`: the server never admitted the
+                        // request, so it is re-issuable anywhere. Replay here
+                        // briefly, then hand it back to the caller for a
+                        // leader recheck / failover.
+                        Err(IggyError::TransientNotAccepted)
+                            if tokio::time::Instant::now() < transient_deadline =>
+                        {
+                            let remaining = transient_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            tokio::time::sleep(NOT_READY_RETRY_INTERVAL.min(remaining)).await;
+                        }
+                        other => return other,
+                    }
+                }
+            }
+            .await;
+            (Some(request_header), outcome)
+        })
+        .await;
+        match joined {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Task execution failed during TCP request: {}", e);
+                (None, Err(IggyError::TcpError))
+            }
+        }
     }
 
     async fn get_client_address_value(&self) -> String {

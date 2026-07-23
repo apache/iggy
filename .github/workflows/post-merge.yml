@@ -63,10 +63,10 @@ jobs:
 
       # cargo-rail computes the affected crate set for the Docker :edge gate.
       # Metadata-only `cargo rail plan` (no compile), so it runs on the runner's
-      # preinstalled cargo (rust-toolchain.toml pins 1.96.0) and skips the
+      # preinstalled cargo (rust-toolchain.toml pins 1.97.1) and skips the
       # heavyweight build-cache restore.
       - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.82.7
+        uses: taiki-e/install-action@v2.83.2
         with:
           tool: cargo-rail
 

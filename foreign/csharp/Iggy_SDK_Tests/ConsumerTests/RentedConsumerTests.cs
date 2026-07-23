@@ -130,39 +130,49 @@ public class RentedConsumerTests
     }
 
     [Fact]
-    public async Task ReceiveRentedAsync_Should_YieldDecryptionFailed_AndStillReleaseBuffer_WhenEncryptorThrows()
+    public async Task ReceiveRentedAsync_Should_SurfaceDecryptionException_FromClient()
     {
-        var owner = new TrackingMemoryOwner(1024);
-        IReadOnlyList<RentedMessageResponse> messages = BuildMessages(owner, 1);
-        var rental = new PolledMessagesRental(owner)
+        var client = new Mock<IIggyClient>(MockBehavior.Loose);
+        client.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(c => c.PollMessagesRentedAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<uint?>(), It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(),
+                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new MessageDecryptionException(0, 1, new InvalidOperationException("decrypt fail")));
+        var consumer = new IggyConsumer(client.Object, BuildConfig(), NullLoggerFactory.Instance);
+        await consumer.InitAsync(TestContext.Current.CancellationToken);
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await Assert.ThrowsAsync<MessageDecryptionException>(async () =>
         {
-            PartitionId = 1,
-            CurrentOffset = 0,
-            Messages = messages
-        };
-        Mock<IIggyClient> client = BuildClientMock(new Queue<PolledMessagesRental>(new[] { rental }));
-        var encryptor = new ThrowingEncryptor();
+            await foreach (var _ in consumer.ReceiveRentedAsync(cts.Token))
+            {
+            }
+        });
+
+        await consumer.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ReceiveRentedAsync_Should_Throw_WhenAutoCommitCombinedWithEncryptor()
+    {
+        var client = new Mock<IIggyClient>(MockBehavior.Loose);
+        client.Setup(c => c.ConnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.SetupGet(c => c.MessageEncryptor)
+            .Returns(new AesMessageEncryptor(AesMessageEncryptor.GenerateKey()));
+
         var config = BuildConfig();
-        config.MessageEncryptor = encryptor;
+        config.AutoCommit = true;
         var consumer = new IggyConsumer(client.Object, config, NullLoggerFactory.Instance);
         await consumer.InitAsync(TestContext.Current.CancellationToken);
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        ReceivedRentedMessage? got = null;
-        await using (IAsyncEnumerator<ReceivedRentedMessage> e = consumer.ReceiveRentedAsync(cts.Token)
-                         .GetAsyncEnumerator(TestContext.Current.CancellationToken))
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            Assert.True(await e.MoveNextAsync());
-            got = e.Current;
-        }
-
-        Assert.NotNull(got);
-        Assert.Equal(MessageStatus.DecryptionFailed, got!.Status);
-        Assert.IsType<InvalidOperationException>(got.Error);
-
-        Assert.Equal(0, owner.DisposeCount);
-        got.Dispose();
-        Assert.Equal(1, owner.DisposeCount);
+            await foreach (var _ in consumer.ReceiveRentedAsync(cts.Token))
+            {
+            }
+        });
+        Assert.Contains("AutoCommit", ex.Message);
 
         await consumer.DisposeAsync();
     }
@@ -398,19 +408,6 @@ public class RentedConsumerTests
         public void Dispose()
         {
             DisposeCount++;
-        }
-    }
-
-    private sealed class ThrowingEncryptor : IMessageEncryptor
-    {
-        public byte[] Encrypt(ReadOnlySpan<byte> plainData)
-        {
-            throw new NotSupportedException();
-        }
-
-        public byte[] Decrypt(ReadOnlySpan<byte> encryptedData)
-        {
-            throw new InvalidOperationException("decrypt fail");
         }
     }
 

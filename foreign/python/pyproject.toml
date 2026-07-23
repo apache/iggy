@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.8.1.dev2"
+version = "0.8.1.dev3"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -149,6 +149,16 @@ filterwarnings = [
 
 [tool.uv]
 exclude-newer = "7 days"
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+    { file = "src/**/*.rs" },
+    { file = "../../core/**/Cargo.toml" },
+    { file = "../../core/**/*.rs" },
+]
 
 [tool.pyrefly]
 search-path = ["."]

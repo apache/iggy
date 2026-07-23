@@ -29,7 +29,7 @@ jobs:
   stale:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v10
+      - uses: actions/stale@v10.4.0
         with:
           days-before-pr-stale: 7
           days-before-pr-close: 7

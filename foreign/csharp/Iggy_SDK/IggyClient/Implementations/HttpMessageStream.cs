@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -25,6 +26,8 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
@@ -43,6 +46,7 @@ public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
 
+    private readonly bool _allowAutoCommitWithEncryptor;
     private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
@@ -50,9 +54,12 @@ public class HttpMessageStream : IIggyClient
     //TODO - the error handling pattern is pretty ugly, look into moving it into an extension method
     private readonly JsonSerializerOptions _jsonSerializerOptions;
 
-    internal HttpMessageStream(HttpClient httpClient)
+    internal HttpMessageStream(HttpClient httpClient, IMessageEncryptor? encryptor = null,
+        bool allowAutoCommitWithEncryptor = false)
     {
         _httpClient = httpClient;
+        MessageEncryptor = encryptor;
+        _allowAutoCommitWithEncryptor = allowAutoCommitWithEncryptor;
 
         _jsonSerializerOptions = new JsonSerializerOptions
         {
@@ -248,6 +255,17 @@ public class HttpMessageStream : IIggyClient
         IList<Message> messages,
         CancellationToken token = default)
     {
+        if (MessageEncryptor is not null)
+        {
+            var encrypted = new List<Message>(messages.Count);
+            foreach (var message in messages)
+            {
+                encrypted.Add(EncryptCopy(message, MessageEncryptor));
+            }
+
+            messages = encrypted;
+        }
+
         var request = new MessageSendRequest
         {
             StreamId = streamId,
@@ -287,6 +305,15 @@ public class HttpMessageStream : IIggyClient
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
+        if (autoCommit && MessageEncryptor is not null && !_allowAutoCommitWithEncryptor)
+        {
+            // Server-side autoCommit commits the batch offset before the client decrypts, so a decryption failure
+            // would permanently skip the whole batch. IggyConsumer guards this too, but the raw poll is public and
+            // bypasses that path. Opt out via IggyClientConfigurator.AllowAutoCommitWithEncryptor.
+            throw new InvalidOperationException(
+                "AutoCommit with a message encryptor risks silent message loss: the offset is committed before decryption. Poll with autoCommit false, or set AllowAutoCommitWithEncryptor.");
+        }
+
         var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.ConsumerId}" +
                             $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
@@ -296,6 +323,11 @@ public class HttpMessageStream : IIggyClient
         {
             var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
                                ?? PolledMessages.Empty;
+
+            if (MessageEncryptor is not null)
+            {
+                DecryptMessages(pollMessages.Messages, (uint)pollMessages.PartitionId);
+            }
 
             return pollMessages;
         }
@@ -491,6 +523,19 @@ public class HttpMessageStream : IIggyClient
 
         await HandleResponseAsync(response);
         return [];
+    }
+
+    /// <summary>
+    ///     This method is only supported in TCP protocol
+    /// </summary>
+    /// <param name="code">The numeric command code to send.</param>
+    /// <param name="payload">The opaque request payload.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    /// <exception cref="FeatureUnavailableException"></exception>
+    public Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default)
+    {
+        throw new FeatureUnavailableException();
     }
 
     /// <inheritdoc />
@@ -832,9 +877,106 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public IMessageEncryptor? MessageEncryptor { get; }
+
+    /// <inheritdoc />
     public string GetCurrentAddress()
     {
         return _httpClient.BaseAddress?.ToString() ?? string.Empty;
+    }
+
+    private void DecryptMessages(IReadOnlyList<MessageResponse> messages, uint partitionId)
+    {
+        foreach (var message in messages)
+        {
+            byte[] payload;
+            byte[]? rawHeaders = null;
+            try
+            {
+                payload = Decrypt(MessageEncryptor!, message.Payload);
+                if (message.RawUserHeaders is { Length: > 0 })
+                {
+                    rawHeaders = Decrypt(MessageEncryptor!, message.RawUserHeaders);
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new MessageDecryptionException(message.Header.Offset, partitionId, ex);
+            }
+
+            message.Payload = payload;
+            message.Header = message.Header with { PayloadLength = payload.Length };
+
+            if (rawHeaders is not null)
+            {
+                message.RawUserHeaders = rawHeaders;
+                message.Header = message.Header with { UserHeadersLength = rawHeaders.Length };
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Builds an encrypted copy of <paramref name="message" /> for the send path, leaving the caller's
+    ///     instance untouched with its plaintext payload. HTTP serializes messages to JSON, so it needs
+    ///     standalone ciphertext arrays rather than a slice of a wire buffer.
+    /// </summary>
+    internal static Message EncryptCopy(Message message, IMessageEncryptor encryptor)
+    {
+        var payload = Encrypt(encryptor, message.Payload.Span);
+        var copy = new Message
+        {
+            Header = message.Header with { PayloadLength = payload.Length },
+            Payload = payload
+        };
+
+        if (!message.RawUserHeaders.IsEmpty)
+        {
+            var rawUserHeaders = Encrypt(encryptor, message.RawUserHeaders.Span);
+            copy.RawUserHeaders = rawUserHeaders;
+            copy.Header = copy.Header with { UserHeadersLength = rawUserHeaders.Length };
+        }
+        else if (message.UserHeaders is { Count: > 0 })
+        {
+            var length = TcpContracts.HeadersByteLength(message.UserHeaders);
+            var scratch = ArrayPool<byte>.Shared.Rent(length);
+            try
+            {
+                TcpContracts.WriteHeadersTo(scratch.AsSpan(0, length), message.UserHeaders);
+                var rawUserHeaders = Encrypt(encryptor, scratch.AsSpan(0, length));
+                copy.RawUserHeaders = rawUserHeaders;
+                copy.Header = copy.Header with { UserHeadersLength = rawUserHeaders.Length };
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(scratch, true);
+            }
+        }
+
+        return copy;
+    }
+
+    private static byte[] Encrypt(IMessageEncryptor encryptor, ReadOnlySpan<byte> data)
+    {
+        var ciphertext = new byte[encryptor.GetMaxEncryptedLength(data.Length)];
+        var written = encryptor.Encrypt(data, ciphertext);
+        if (written != ciphertext.Length)
+        {
+            Array.Resize(ref ciphertext, written);
+        }
+
+        return ciphertext;
+    }
+
+    private static byte[] Decrypt(IMessageEncryptor encryptor, ReadOnlySpan<byte> data)
+    {
+        var plaintext = new byte[encryptor.GetMaxDecryptedLength(data.Length)];
+        var written = encryptor.Decrypt(data, plaintext);
+        if (written != plaintext.Length)
+        {
+            Array.Resize(ref plaintext, written);
+        }
+
+        return plaintext;
     }
 
     private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
