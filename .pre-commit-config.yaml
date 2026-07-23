@@ -283,7 +283,7 @@ repos:
     hooks:
       - id: java-gradle-check
         name: java gradle check
-        entry: bash -c 'for dir in foreign/java bdd/java examples/java; do [ -f "$dir/build.gradle.kts" ] && (cd "$dir" && ./gradlew check -x test); done'
+        entry: bash -ec 'for dir in foreign/java bdd/java examples/java; do if [ -f "$dir/build.gradle.kts" ]; then (cd "$dir" && ./gradlew check -x test); fi; done'
         language: system
         files: ^(foreign|bdd|examples)/java/.*\.(java|kt|kts)$
         pass_filenames: false

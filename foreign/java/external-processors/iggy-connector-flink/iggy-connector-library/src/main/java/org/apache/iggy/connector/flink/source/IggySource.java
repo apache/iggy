@@ -26,10 +26,10 @@ import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.config.OffsetConfig;
 import org.apache.iggy.consumergroup.Consumer;
-import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 
 import java.io.Serializable;
 
