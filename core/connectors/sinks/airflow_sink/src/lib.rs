@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Apache Airflow trigger sink: consume Iggy messages and create DAG runs via REST.
+//! Apache Airflow trigger sink: consume Iggy message batches and create one DAG run per batch.
+//!
+//! Airflow runs are jobs, not events. Each `consume()` poll becomes (by default) a single DAG
+//! run whose `conf.messages` holds the batch. Redelivery reuses a deterministic `dag_run_id`
+//! and treats HTTP 409 as success.
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -34,6 +38,7 @@ use reqwest_retry::{
 use reqwest_tracing::TracingMiddleware;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -52,7 +57,6 @@ const DEFAULT_API_PREFIX: &str = "/api/v1";
 const DEFAULT_HEALTH_PATH: &str = "/api/v1/version";
 const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const MAX_RESPONSE_LOG_BYTES: usize = 500;
 
 /// Authentication mode for the Airflow REST API.
@@ -65,11 +69,11 @@ pub enum AuthMode {
     Bearer,
 }
 
-/// How message payload maps into the DAG-run `conf` body.
+/// How each message payload is placed under `conf.messages[].payload`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfMode {
-    /// Entire JSON (or text) payload becomes `conf`.
+    /// Message body becomes `payload` (JSON object as-is; text/raw wrapped as needed).
     #[default]
     Payload,
 }
@@ -79,7 +83,7 @@ pub enum ConfMode {
 pub struct AirflowSinkConfig {
     /// Airflow webserver base URL (required), e.g. `http://localhost:8080`.
     pub base_url: String,
-    /// Default DAG id to trigger (required).
+    /// Default DAG id to trigger (required unless every message sets `dag_id_header`).
     pub dag_id: String,
     /// REST path prefix (default: `/api/v1`).
     pub api_prefix: Option<String>,
@@ -97,11 +101,12 @@ pub struct AirflowSinkConfig {
         serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
     )]
     pub token: Option<SecretString>,
-    /// Message header that overrides `dag_id` when present.
+    /// Message header that overrides `dag_id`. Messages with different values are
+    /// grouped; each group becomes one DAG run (still batch, not per-message).
     pub dag_id_header: Option<String>,
-    /// How payload becomes `conf` (default: `payload`).
+    /// How each payload is encoded under `conf.messages` (default: `payload`).
     pub conf_mode: Option<ConfMode>,
-    /// Nest Iggy metadata under `conf.iggy` (default: false).
+    /// Nest batch Iggy metadata under `conf.iggy` (default: false).
     pub include_iggy_metadata_in_conf: Option<bool>,
     /// Run connectivity check in `open()` (default: true).
     pub health_check_enabled: Option<bool>,
@@ -117,7 +122,7 @@ pub struct AirflowSinkConfig {
     pub verbose_logging: Option<bool>,
 }
 
-/// Trigger sink: one Airflow DAG run per consumed message.
+/// Trigger sink: one Airflow DAG run per consumed poll batch (per DAG id group).
 #[derive(Debug)]
 pub struct AirflowSink {
     id: u32,
@@ -328,64 +333,146 @@ impl AirflowSink {
         Ok(self.dag_id.clone())
     }
 
-    fn build_conf(
+    /// Group messages by resolved DAG id, preserving first-seen order of groups and
+    /// original order of messages within each group.
+    fn group_by_dag_id(
         &self,
-        message: &ConsumedMessage,
+        messages: Vec<ConsumedMessage>,
+    ) -> Result<Vec<(String, Vec<ConsumedMessage>)>, Error> {
+        let mut groups: Vec<(String, Vec<ConsumedMessage>)> = Vec::new();
+        let mut index_by_dag: HashMap<String, usize> = HashMap::new();
+
+        for message in messages {
+            let dag_id = match self.resolve_dag_id(&message) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        "{CONNECTOR_NAME} ID: {} — cannot resolve dag_id at offset {}: {e}",
+                        self.id, message.offset
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    return Err(e);
+                }
+            };
+            if let Some(&idx) = index_by_dag.get(&dag_id) {
+                groups[idx].1.push(message);
+            } else {
+                index_by_dag.insert(dag_id.clone(), groups.len());
+                groups.push((dag_id, vec![message]));
+            }
+        }
+
+        Ok(groups)
+    }
+
+    fn payload_value(&self, payload: Payload) -> Result<serde_json::Value, Error> {
+        match self.conf_mode {
+            ConfMode::Payload => match payload {
+                Payload::Json(value) => Ok(owned_value_to_serde_json(&value)),
+                Payload::Text(text) => Ok(serde_json::Value::String(text)),
+                Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
+                    Ok(serde_json::json!({
+                        "data": general_purpose::STANDARD.encode(&bytes),
+                        "encoding": "base64",
+                    }))
+                }
+                Payload::Proto(proto) => Ok(serde_json::json!({
+                    "data": general_purpose::STANDARD.encode(proto.as_bytes()),
+                    "encoding": "base64",
+                })),
+            },
+        }
+    }
+
+    fn build_batch_conf(
+        &self,
+        messages: &mut [ConsumedMessage],
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        payload: Payload,
-    ) -> Result<serde_json::Value, Error> {
-        let mut conf = match self.conf_mode {
-            ConfMode::Payload => match payload {
-                Payload::Json(value) => owned_value_to_serde_json(&value),
-                Payload::Text(text) => serde_json::json!({ "payload": text }),
-                Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
-                    // Binary payloads are base64 so Airflow conf stays valid JSON.
-                    serde_json::json!({
-                        "payload": general_purpose::STANDARD.encode(&bytes),
-                        "iggy_payload_encoding": "base64",
-                    })
+    ) -> Result<(serde_json::Value, u64, u64, usize), Error> {
+        if messages.is_empty() {
+            return Err(Error::InvalidRecordValue(
+                "cannot build conf for empty message batch".to_string(),
+            ));
+        }
+
+        let first_offset = messages.first().map(|m| m.offset).unwrap_or(0);
+        let last_offset = messages.last().map(|m| m.offset).unwrap_or(first_offset);
+        let mut entries = Vec::with_capacity(messages.len());
+        let mut skipped = 0u64;
+
+        for message in messages.iter_mut() {
+            let offset = message.offset;
+            let id = message.id;
+            let timestamp = message.timestamp;
+            let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
+            match self.payload_value(payload) {
+                Ok(payload_value) => {
+                    entries.push(serde_json::json!({
+                        "offset": offset,
+                        "id": format_u128_as_hex(id),
+                        "timestamp": timestamp,
+                        "payload": payload_value,
+                    }));
                 }
-                Payload::Proto(proto) => serde_json::json!({
-                    "payload": general_purpose::STANDARD.encode(proto.as_bytes()),
-                    "iggy_payload_encoding": "base64",
-                }),
-            },
-        };
+                Err(e) => {
+                    error!(
+                        "{CONNECTOR_NAME} ID: {} — skipping message at offset {} \
+                         (payload conversion failed): {e}",
+                        self.id, offset
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            return Err(Error::InvalidRecordValue(format!(
+                "all {skipped} messages in batch failed payload conversion"
+            )));
+        }
+
+        let message_count = entries.len();
+        let mut conf = serde_json::json!({
+            "messages": entries,
+        });
 
         if self.include_iggy_metadata_in_conf {
-            let conf_obj = conf.as_object_mut().ok_or_else(|| {
-                Error::InvalidRecordValue(
-                    "conf must be a JSON object to nest iggy metadata".to_string(),
-                )
-            })?;
-            conf_obj.insert(
+            conf.as_object_mut().expect("conf is object").insert(
                 "iggy".to_string(),
                 serde_json::json!({
                     "stream": topic_metadata.stream,
                     "topic": topic_metadata.topic,
                     "partition_id": messages_metadata.partition_id,
-                    "offset": message.offset,
-                    "id": format_u128_as_hex(message.id),
-                    "timestamp": message.timestamp,
+                    "first_offset": first_offset,
+                    "last_offset": last_offset,
+                    "message_count": message_count,
                 }),
             );
         }
 
-        Ok(conf)
+        Ok((conf, first_offset, last_offset, message_count))
     }
 
-    async fn trigger_one(
+    async fn trigger_batch(
         &self,
+        dag_id: &str,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        mut message: ConsumedMessage,
+        mut messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        let dag_id = self.resolve_dag_id(&message)?;
-        let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
-        let conf = self.build_conf(&message, topic_metadata, messages_metadata, payload)?;
-        let dag_run_id =
-            build_dag_run_id(messages_metadata.partition_id, message.offset, message.id);
+        let (conf, first_offset, last_offset, message_count) =
+            self.build_batch_conf(&mut messages, topic_metadata, messages_metadata)?;
+
+        // Deterministic across redelivery of the same poll range — not Airflow's
+        // auto `manual__timestamp` form. 409 on create means this batch was already triggered.
+        let dag_run_id = build_batch_dag_run_id(
+            messages_metadata.partition_id,
+            first_offset,
+            last_offset,
+            message_count,
+        );
 
         let body = serde_json::json!({
             "dag_run_id": dag_run_id,
@@ -394,7 +481,7 @@ impl AirflowSink {
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|e| Error::Serialization(format!("dag run body: {e}")))?;
 
-        let url = self.dag_runs_url(&dag_id);
+        let url = self.dag_runs_url(dag_id);
         let client = self.client()?;
         let headers = self.request_headers.as_ref().ok_or_else(|| {
             Error::InitError("request headers not initialized — was open() called?".to_string())
@@ -402,8 +489,9 @@ impl AirflowSink {
 
         if self.verbose {
             debug!(
-                "{CONNECTOR_NAME} ID: {} — triggering DAG '{}' at {} (dag_run_id={}, offset={})",
-                self.id, dag_id, self.log_url, dag_run_id, message.offset
+                "{CONNECTOR_NAME} ID: {} — triggering DAG '{}' at {} \
+                 (dag_run_id={}, messages={}, offsets={}..{})",
+                self.id, dag_id, self.log_url, dag_run_id, message_count, first_offset, last_offset
             );
         }
 
@@ -417,12 +505,13 @@ impl AirflowSink {
             .send()
             .await
             .map_err(|e| {
-                self.errors_count.fetch_add(1, Ordering::Relaxed);
+                self.errors_count
+                    .fetch_add(message_count as u64, Ordering::Relaxed);
                 error!(
-                    "{CONNECTOR_NAME} ID: {} — trigger request failed after retries: {e:#}",
+                    "{CONNECTOR_NAME} ID: {} — batch trigger request failed after retries: {e:#}",
                     self.id
                 );
-                Error::HttpRequestFailed(format!("Airflow trigger {url}: {e}"))
+                Error::HttpRequestFailed(format!("Airflow batch trigger {url}: {e}"))
             })?;
 
         let status = response.status();
@@ -432,11 +521,12 @@ impl AirflowSink {
         if status.is_success() || status_code == 409 {
             if self.verbose {
                 debug!(
-                    "{CONNECTOR_NAME} ID: {} — DAG '{}' trigger ok (status {})",
-                    self.id, dag_id, status_code
+                    "{CONNECTOR_NAME} ID: {} — DAG '{}' batch trigger ok (status {}, messages={})",
+                    self.id, dag_id, status_code, message_count
                 );
             }
-            self.messages_triggered.fetch_add(1, Ordering::Relaxed);
+            self.messages_triggered
+                .fetch_add(message_count as u64, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -446,25 +536,29 @@ impl AirflowSink {
         };
         let truncated = truncate_response(&response_body, MAX_RESPONSE_LOG_BYTES);
 
-        self.errors_count.fetch_add(1, Ordering::Relaxed);
+        self.errors_count
+            .fetch_add(message_count as u64, Ordering::Relaxed);
 
         if is_permanent_status(status_code) {
+            // Auth / missing DAG / bad request: fail the consume so offsets do not
+            // advance past an untriggered batch (do not silent-drop).
             error!(
-                "{CONNECTOR_NAME} ID: {} — permanent trigger failure for DAG '{}' \
+                "{CONNECTOR_NAME} ID: {} — permanent batch trigger failure for DAG '{}' \
                  (status {}). Response: {truncated}",
                 self.id, dag_id, status_code
             );
             return Err(Error::PermanentHttpError(format!(
-                "Airflow trigger status {status_code}: {truncated}"
+                "Airflow batch trigger status {status_code}: {truncated}"
             )));
         }
 
         error!(
-            "{CONNECTOR_NAME} ID: {} — trigger failure for DAG '{}' (status {}). Response: {truncated}",
+            "{CONNECTOR_NAME} ID: {} — batch trigger failure for DAG '{}' (status {}). \
+             Response: {truncated}",
             self.id, dag_id, status_code
         );
         Err(Error::HttpRequestFailed(format!(
-            "Airflow trigger status {status_code}: {truncated}"
+            "Airflow batch trigger status {status_code}: {truncated}"
         )))
     }
 }
@@ -540,7 +634,7 @@ impl Sink for AirflowSink {
 
         info!(
             "Opened {CONNECTOR_NAME} connector ID: {} for URL: {} (dag_id: {}, auth: {:?}, \
-             max_retries: {})",
+             mode: batch, max_retries: {})",
             self.id, self.log_url, self.dag_id, self.auth, self.max_retries
         );
         Ok(())
@@ -556,12 +650,13 @@ impl Sink for AirflowSink {
             return Ok(());
         }
 
+        let total = messages.len();
         if self.verbose {
             info!(
                 "{CONNECTOR_NAME} ID: {} consuming {} messages from stream: {}, topic: {}, \
-                 partition: {}, offset: {}",
+                 partition: {}, offset: {} (one DAG run per DAG-id group)",
                 self.id,
-                messages.len(),
+                total,
                 topic_metadata.stream,
                 topic_metadata.topic,
                 messages_metadata.partition_id,
@@ -569,70 +664,30 @@ impl Sink for AirflowSink {
             );
         } else {
             debug!(
-                "{CONNECTOR_NAME} ID: {} consuming {} messages",
-                self.id,
-                messages.len()
+                "{CONNECTOR_NAME} ID: {} consuming {} messages as batch trigger(s)",
+                self.id, total
             );
         }
 
-        let total = messages.len();
-        let mut triggered = 0u64;
-        let mut failures = 0u64;
-        let mut consecutive_failures = 0u32;
-        let mut last_error: Option<Error> = None;
+        let groups = self.group_by_dag_id(messages)?;
+        let group_count = groups.len();
 
-        for message in messages {
-            let offset = message.offset;
-            match self
-                .trigger_one(topic_metadata, &messages_metadata, message)
+        for (dag_id, group_messages) in groups {
+            let group_size = group_messages.len();
+            if let Err(error) = self
+                .trigger_batch(&dag_id, topic_metadata, &messages_metadata, group_messages)
                 .await
             {
-                Ok(()) => {
-                    triggered += 1;
-                    consecutive_failures = 0;
-                }
-                Err(Error::PermanentHttpError(message)) => {
-                    // Drop permanently bad records; do not abort the batch.
-                    error!(
-                        "{CONNECTOR_NAME} ID: {} dropping message at offset {} (permanent): {message}",
-                        self.id, offset
-                    );
-                    failures += 1;
-                    consecutive_failures = 0;
-                }
-                Err(error) => {
-                    error!(
-                        "{CONNECTOR_NAME} ID: {} failed to trigger at offset {}: {error}",
-                        self.id, offset
-                    );
-                    failures += 1;
-                    consecutive_failures += 1;
-                    last_error = Some(error);
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        let processed = triggered + failures;
-                        let skipped = (total as u64).saturating_sub(processed);
-                        error!(
-                            "{CONNECTOR_NAME} ID: {} aborting batch after {} consecutive failures \
-                             ({} remaining messages skipped)",
-                            self.id, consecutive_failures, skipped
-                        );
-                        self.errors_count.fetch_add(skipped, Ordering::Relaxed);
-                        break;
-                    }
-                }
+                error!(
+                    "{CONNECTOR_NAME} ID: {} failed batch trigger for DAG '{}' \
+                     ({} messages in group, {} groups total): {error}",
+                    self.id, dag_id, group_size, group_count
+                );
+                return Err(error);
             }
         }
 
-        match last_error {
-            Some(error) => {
-                error!(
-                    "{CONNECTOR_NAME} ID: {} partial delivery: {}/{} triggered, {} failures",
-                    self.id, triggered, total, failures
-                );
-                Err(error)
-            }
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -675,12 +730,17 @@ fn is_permanent_status(status: u16) -> bool {
     matches!(status, 400 | 401 | 403 | 404 | 405 | 422)
 }
 
-/// Deterministic DAG run id for idempotent redelivery.
-fn build_dag_run_id(partition_id: u32, offset: u64, message_id: u128) -> String {
-    format!(
-        "iggy-{partition_id}-{offset}-{}",
-        format_u128_as_hex(message_id)
-    )
+/// Deterministic DAG run id for a message batch (idempotent redelivery).
+///
+/// Explicitly set on create — Airflow does **not** auto-assign `manual__timestamp`
+/// when `dag_run_id` is provided.
+fn build_batch_dag_run_id(
+    partition_id: u32,
+    first_offset: u64,
+    last_offset: u64,
+    message_count: usize,
+) -> String {
+    format!("iggy-{partition_id}-{first_offset}-{last_offset}-{message_count}")
 }
 
 fn format_u128_as_hex(id: u128) -> String {
@@ -809,7 +869,7 @@ mod tests {
 
     fn sample_message(offset: u64, payload: Payload) -> ConsumedMessage {
         ConsumedMessage {
-            id: 42,
+            id: 42 + offset as u128,
             offset,
             timestamp: 1_700_000_000_000_000,
             origin_timestamp: 1_700_000_000_000_000,
@@ -817,6 +877,25 @@ mod tests {
             headers: None,
             payload,
         }
+    }
+
+    fn json_payload(raw: &str) -> Payload {
+        let mut bytes = raw.as_bytes().to_vec();
+        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("valid JSON"))
+    }
+
+    fn topic_and_meta() -> (TopicMetadata, MessagesMetadata) {
+        (
+            TopicMetadata {
+                stream: "orders".to_string(),
+                topic: "created".to_string(),
+            },
+            MessagesMetadata {
+                partition_id: 0,
+                current_offset: 3,
+                schema: Schema::Json,
+            },
+        )
     }
 
     #[test]
@@ -846,11 +925,11 @@ mod tests {
     }
 
     #[test]
-    fn given_partition_offset_id_when_build_dag_run_id_should_be_deterministic() {
-        let first = build_dag_run_id(0, 7, 42);
-        let second = build_dag_run_id(0, 7, 42);
+    fn given_batch_range_when_build_dag_run_id_should_be_deterministic() {
+        let first = build_batch_dag_run_id(0, 7, 12, 6);
+        let second = build_batch_dag_run_id(0, 7, 12, 6);
         assert_eq!(first, second);
-        assert_eq!(first, format!("iggy-0-7-{}", format_u128_as_hex(42)));
+        assert_eq!(first, "iggy-0-7-12-6");
     }
 
     #[test]
@@ -872,54 +951,91 @@ mod tests {
         assert!(!is_permanent_status(429));
     }
 
-    fn json_payload(raw: &str) -> Payload {
-        let mut bytes = raw.as_bytes().to_vec();
-        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("valid JSON"))
-    }
-
     #[test]
-    fn given_json_payload_when_build_conf_should_use_object() {
+    fn given_json_batch_when_build_conf_should_wrap_messages_array() {
         let sink = AirflowSink::new(1, test_config());
-        let message = sample_message(3, json_payload(r#"{"order_id":1}"#));
-        let topic = TopicMetadata {
-            stream: "orders".to_string(),
-            topic: "created".to_string(),
-        };
-        let meta = MessagesMetadata {
-            partition_id: 0,
-            current_offset: 3,
-            schema: Schema::Json,
-        };
-        let conf = sink
-            .build_conf(&message, &topic, &meta, json_payload(r#"{"order_id":1}"#))
+        let (topic, meta) = topic_and_meta();
+        let mut messages = vec![
+            sample_message(1, json_payload(r#"{"order_id":1}"#)),
+            sample_message(2, json_payload(r#"{"order_id":2}"#)),
+        ];
+        let (conf, first, last, count) = sink
+            .build_batch_conf(&mut messages, &topic, &meta)
             .expect("conf");
-        assert_eq!(conf["order_id"], 1);
+        assert_eq!(first, 1);
+        assert_eq!(last, 2);
+        assert_eq!(count, 2);
+        let msgs = conf["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["offset"], 1);
+        assert_eq!(msgs[0]["payload"]["order_id"], 1);
+        assert_eq!(msgs[1]["payload"]["order_id"], 2);
         assert!(conf.get("iggy").is_none());
     }
 
     #[test]
-    fn given_include_iggy_metadata_when_build_conf_should_nest_iggy_object() {
+    fn given_include_iggy_metadata_when_build_conf_should_nest_batch_iggy_object() {
         let mut config = test_config();
         config.include_iggy_metadata_in_conf = Some(true);
         let sink = AirflowSink::new(1, config);
-        let message = sample_message(3, json_payload(r#"{"order_id":1}"#));
-        let topic = TopicMetadata {
-            stream: "orders".to_string(),
-            topic: "created".to_string(),
-        };
-        let meta = MessagesMetadata {
-            partition_id: 2,
-            current_offset: 3,
-            schema: Schema::Json,
-        };
-        let conf = sink
-            .build_conf(&message, &topic, &meta, json_payload(r#"{"order_id":1}"#))
+        let (topic, mut meta) = topic_and_meta();
+        meta.partition_id = 2;
+        let mut messages = vec![
+            sample_message(3, json_payload(r#"{"order_id":1}"#)),
+            sample_message(4, json_payload(r#"{"order_id":2}"#)),
+        ];
+        let (conf, _, _, _) = sink
+            .build_batch_conf(&mut messages, &topic, &meta)
             .expect("conf");
-        assert_eq!(conf["order_id"], 1);
         assert_eq!(conf["iggy"]["stream"], "orders");
         assert_eq!(conf["iggy"]["topic"], "created");
         assert_eq!(conf["iggy"]["partition_id"], 2);
-        assert_eq!(conf["iggy"]["offset"], 3);
+        assert_eq!(conf["iggy"]["first_offset"], 3);
+        assert_eq!(conf["iggy"]["last_offset"], 4);
+        assert_eq!(conf["iggy"]["message_count"], 2);
+        assert_eq!(conf["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn given_dag_id_header_when_group_should_split_batches_by_dag() {
+        use iggy_common::{HeaderKey, HeaderValue};
+
+        let mut config = test_config();
+        config.dag_id_header = Some("airflow_dag_id".to_string());
+        let sink = AirflowSink::new(1, config);
+
+        let mut a = sample_message(0, Payload::Text("x".into()));
+        let mut headers_a = BTreeMap::new();
+        headers_a.insert(
+            HeaderKey::try_from("airflow_dag_id").unwrap(),
+            HeaderValue::try_from("dag_a").unwrap(),
+        );
+        a.headers = Some(headers_a);
+
+        let mut b = sample_message(1, Payload::Text("y".into()));
+        let mut headers_b = BTreeMap::new();
+        headers_b.insert(
+            HeaderKey::try_from("airflow_dag_id").unwrap(),
+            HeaderValue::try_from("dag_b").unwrap(),
+        );
+        b.headers = Some(headers_b);
+
+        let mut c = sample_message(2, Payload::Text("z".into()));
+        let mut headers_c = BTreeMap::new();
+        headers_c.insert(
+            HeaderKey::try_from("airflow_dag_id").unwrap(),
+            HeaderValue::try_from("dag_a").unwrap(),
+        );
+        c.headers = Some(headers_c);
+
+        let groups = sink.group_by_dag_id(vec![a, b, c]).expect("groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "dag_a");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[0].1[0].offset, 0);
+        assert_eq!(groups[0].1[1].offset, 2);
+        assert_eq!(groups[1].0, "dag_b");
+        assert_eq!(groups[1].1.len(), 1);
     }
 
     #[test]

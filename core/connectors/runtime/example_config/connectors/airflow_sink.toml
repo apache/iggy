@@ -38,8 +38,9 @@ api_prefix = "/api/v1"
 auth = "basic"
 username = "admin"
 password = "admin"
-# dag_id_header = "airflow_dag_id"
+# dag_id_header = "airflow_dag_id"  # optional: group batch by header DAG id
 conf_mode = "payload"
+# One DAG run per poll batch; conf.messages holds the batch payloads.
 include_iggy_metadata_in_conf = false
 health_check_enabled = true
 health_path = "/api/v1/version"

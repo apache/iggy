@@ -35,7 +35,7 @@ consumer_group = "airflow_sink_group"
 # Required — Airflow webserver base URL (no trailing slash required).
 base_url = "http://localhost:8080"
 
-# Required — default DAG to trigger. Override per message via dag_id_header when set.
+# Required — default DAG to trigger. One DAG run per poll batch (see batch_length).
 dag_id = "example_dag"
 
 # API path prefix (default: /api/v1). Use for Airflow version path differences.
@@ -47,13 +47,14 @@ username = "admin"
 password = "admin"
 # token = "eyJ..."  # when auth = "bearer"
 
-# Optional message header that overrides dag_id for a single trigger.
+# Optional message header that overrides dag_id. Different values split the poll
+# into one batch run per DAG id (still not one run per message).
 # dag_id_header = "airflow_dag_id"
 
-# Put whole JSON payload into TriggerDAGRunPostBody.conf (default: payload).
+# How each message body is placed under conf.messages[].payload (default: payload).
 conf_mode = "payload"
 
-# Nest Iggy stream/topic/partition/offset under conf.iggy (default: false).
+# Nest batch stream/topic/partition/offset range under conf.iggy (default: false).
 include_iggy_metadata_in_conf = false
 
 # Health check on open (default: true). Path is relative to base_url.

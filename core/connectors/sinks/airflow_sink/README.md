@@ -7,14 +7,20 @@ stable REST API (`POST /api/v1/dags/{dag_id}/dagRuns`).
 
 | | |
 | --- | --- |
-| **Type** | Sink (trigger) |
+| **Type** | Sink (batch trigger) |
 | **Direction** | Iggy → Airflow |
 | **API** | Airflow REST (`api_prefix` default `/api/v1`) |
-| **Idempotency** | Deterministic `dag_run_id`; HTTP **409** treated as success |
+| **Unit of work** | One DAG run per poll batch (not per message) |
+| **Idempotency** | Deterministic batch `dag_run_id`; HTTP **409** treated as success |
 
-Each message becomes one DAG run. The message payload is sent as the run's
-`conf` object. Retries re-use the same `dag_run_id` so redelivery does not
-create duplicate runs.
+Airflow runs are jobs, not stream events. Each connector poll becomes **one DAG
+run** whose `conf.messages` holds the batch. Tune volume with stream
+`batch_length` / `poll_interval`. Retries re-use the same `dag_run_id` so
+redelivery does not create duplicate runs.
+
+If `dag_id_header` is set and messages resolve to different DAG ids, the poll is
+split into **one run per DAG id group** (still batches of messages, never one
+run per message by default).
 
 ## Configuration
 
@@ -64,9 +70,9 @@ max_retry_delay = "30s"
 | `auth` | no | `none` | `none`, `basic`, or `bearer` |
 | `username` / `password` | basic | — | Basic auth credentials (`password` is secret) |
 | `token` | bearer | — | Bearer/JWT token (secret) |
-| `dag_id_header` | no | unset | Message header that overrides `dag_id` |
-| `conf_mode` | no | `payload` | Whole payload → `conf` |
-| `include_iggy_metadata_in_conf` | no | `false` | Nest stream/topic/offset under `conf.iggy` |
+| `dag_id_header` | no | unset | Message header that overrides `dag_id` (groups batch by value) |
+| `conf_mode` | no | `payload` | How each message body is placed under `conf.messages[].payload` |
+| `include_iggy_metadata_in_conf` | no | `false` | Nest batch stream/topic/offset range under `conf.iggy` |
 | `health_check_enabled` | no | `true` | `GET` health path in `open()` |
 | `health_path` | no | `/api/v1/version` | Path relative to `base_url` |
 | `timeout` | no | `30s` | HTTP timeout |
@@ -84,10 +90,39 @@ POST {base_url}{api_prefix}/dags/{dag_id}/dagRuns
 Content-Type: application/json
 
 {
-  "dag_run_id": "iggy-{partition}-{offset}-{message_id_hex}",
-  "conf": { ... message payload ... }
+  "dag_run_id": "iggy-{partition}-{first_offset}-{last_offset}-{message_count}",
+  "conf": {
+    "messages": [
+      {
+        "offset": 0,
+        "id": "0000...0001",
+        "timestamp": 1700000000000000,
+        "payload": { "order_id": 1 }
+      },
+      {
+        "offset": 1,
+        "id": "0000...0002",
+        "timestamp": 1700000000000001,
+        "payload": { "order_id": 2 }
+      }
+    ],
+    "iggy": {
+      "stream": "events",
+      "topic": "orders",
+      "partition_id": 0,
+      "first_offset": 0,
+      "last_offset": 1,
+      "message_count": 2
+    }
+  }
 }
 ```
+
+`conf.iggy` is present only when `include_iggy_metadata_in_conf = true`.
+
+The sink always sets `dag_run_id` explicitly. Airflow does **not** fall back to
+`manual__timestamp` when the field is provided. Replaying the same batch yields
+the same id; Airflow responds **409**, which this sink treats as success.
 
 ### Status handling
 
@@ -95,16 +130,29 @@ Content-Type: application/json
 | --- | --- |
 | 2xx | Success |
 | 409 | Success (run already exists — idempotent replay) |
-| 400 / 401 / 403 / 404 / 422 | Permanent — drop message, do not retry |
+| 400 / 401 / 403 / 404 / 422 | Permanent — fail the batch (do not advance as if triggered) |
 | 429 / 5xx | Transient — retry with exponential backoff |
 | Network errors | Transient — retry |
+
+Permanent failures return an error for the whole batch so consumer offsets are
+not committed past an untriggered poll. Fix config/auth/DAG availability and
+retry.
+
+### Throughput guidance
+
+- Prefer larger `batch_length` so one Airflow run processes many messages.
+- Point this sink at **work-sized** streams (export ready, file landed, window
+  closed), not raw high-volume domain firehoses.
+- For a single-message command topic, set `batch_length = 1` so each poll is
+  still one batch run with one entry in `conf.messages`.
 
 ## Out of scope (v1)
 
 - Waiting for DAG completion
 - Airflow source (task/DAG state → Iggy)
-- Batching multiple messages into one DAG run
 - Airflow provider package on the Airflow side
+- In-sink content filters (`apply_function`-style); use a dedicated topic or a
+  future transform if you need selective triggering
 
 ## Build and test
 
