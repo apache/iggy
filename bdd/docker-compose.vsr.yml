@@ -1,0 +1,88 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# server-ng (VSR) override. Swaps the legacy iggy-server binary for
+# iggy-server-ng built with `--features vsr` and adapts args, credentials,
+# and cluster topology to server-ng semantics:
+#   - server-ng takes no `--fresh` / `--with-default-root-credentials` /
+#     `--follower` flags; the only CLI arg is `--replica-id <N>`.
+#   - Root credentials come from IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD
+#     (mandatory when the cluster is enabled).
+#   - `cluster.nodes[*].ip` is parsed as a strict IpAddr (no hostnames)
+#     and cluster listeners bind to that roster IP, so nodes get static
+#     IPs and node healthchecks ping the roster address, not loopback.
+#   - Replica-to-replica consensus requires `ports.tcp_replica`.
+# The leader_redirection feature runs a REAL 2-node VSR cluster here
+# (initial leader = replica 0), not the legacy mock `--follower` server.
+#
+# Activated by: ./scripts/run-bdd-tests.sh --vsr rust [feature]
+# Must be passed LAST so its overrides win over the server/cluster files.
+
+x-server-ng-image: &server-ng-image
+  image: iggy-bdd-server-ng
+  build:
+    context: ..
+    dockerfile: core/server-ng/Dockerfile
+    target: runtime-prebuilt
+    args:
+      PREBUILT_IGGY_SERVER_NG: ${IGGY_SERVER_NG_PATH:-target/debug/iggy-server-ng}
+      PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+
+x-vsr-cluster-env: &vsr-cluster-env
+  IGGY_ROOT_USERNAME: iggy
+  IGGY_ROOT_PASSWORD: iggy
+  IGGY_CLUSTER_NODES_0_IP: 172.28.0.101
+  IGGY_CLUSTER_NODES_1_IP: 172.28.0.102
+  IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA: "8191"
+  IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA: "8192"
+
+services:
+  iggy-server:
+    <<: *server-ng-image
+    command: []
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+
+  iggy-leader:
+    <<: *server-ng-image
+    command: [ "--replica-id", "0" ]
+    environment:
+      <<: *vsr-cluster-env
+    networks:
+      iggy-bdd-network:
+        ipv4_address: 172.28.0.101
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.101:8091", "ping" ]
+
+  iggy-follower:
+    <<: *server-ng-image
+    command: [ "--replica-id", "1" ]
+    environment:
+      <<: *vsr-cluster-env
+    networks:
+      iggy-bdd-network:
+        ipv4_address: 172.28.0.102
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/iggy", "--tcp-server-address", "172.28.0.102:8092", "ping" ]
+
+networks:
+  iggy-bdd-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
