@@ -19,8 +19,8 @@ pub mod subtext;
 pub mod title;
 
 use bench_report::{
-    group_metrics_summary::BenchmarkGroupMetricsSummary, hardware::BenchmarkHardware,
-    individual_metrics_summary::BenchmarkIndividualMetricsSummary,
+    cluster::BenchmarkClusterInfo, group_metrics_summary::BenchmarkGroupMetricsSummary,
+    hardware::BenchmarkHardware, individual_metrics_summary::BenchmarkIndividualMetricsSummary,
     latency_distribution::LatencyDistribution, params::BenchmarkParams,
     server_stats::BenchmarkServerStats,
 };
@@ -34,6 +34,9 @@ pub struct BenchmarkReportLight {
     pub uuid: Uuid,
     pub server_stats: BenchmarkServerStats,
     pub params: BenchmarkParams,
+    /// Cluster topology, present only for cluster benchmarks (None = single node)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster: Option<BenchmarkClusterInfo>,
     pub hardware: BenchmarkHardware,
     pub group_metrics: Vec<BenchmarkGroupMetricsLight>,
     pub individual_metrics: Vec<BenchmarkIndividualMetricsLight>,
