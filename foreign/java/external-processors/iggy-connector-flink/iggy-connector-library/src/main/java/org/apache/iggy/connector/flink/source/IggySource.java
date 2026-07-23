@@ -27,6 +27,7 @@ import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitEnumeratorContext;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
 import org.apache.iggy.connector.config.OffsetConfig;
 import org.apache.iggy.connector.config.TcpEndpoint;
@@ -162,6 +163,11 @@ public class IggySource<T> implements Source<T, IggySourceSplit, IggySourceEnume
                     .host(endpoint.host())
                     .port(endpoint.port())
                     .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
+                    .connectionTimeout(connectionConfig.getConnectionTimeout())
+                    .requestTimeout(connectionConfig.getRequestTimeout())
+                    .retryPolicy(RetryPolicy.fixedDelay(
+                            connectionConfig.getMaxRetries(), connectionConfig.getRetryBackoff()))
+                    .tls(connectionConfig.isEnableTls())
                     .connectionPoolSize(4)
                     .buildAndLogin()
                     .join();
