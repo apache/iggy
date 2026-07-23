@@ -156,13 +156,17 @@ for dockerfile in $DOCKERFILES; do
     elif [ "$MODE" = "fix" ]; then
         if { [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; } || [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
             if [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ] && [ "$SOURCE" = "arg" ]; then
-                sed -i "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
+                sed -i.bak "s/^ARG RUST_VERSION=.*/ARG RUST_VERSION=$EXPECTED_VERSION/" "$dockerfile"
+                rm -f "$dockerfile.bak"
             elif [ -n "$SOURCE" ] && [ "$CURRENT_VERSION" != "$EXPECTED_VERSION" ]; then
-                sed -i -E "/FROM[[:space:]].*\\brust:[0-9]/ s#(\\brust:)[0-9]+\\.[0-9]+(\\.[0-9]+)?#\\1$EXPECTED_VERSION#g" "$dockerfile"
+                sed -i.bak -E "/FROM[[:space:]].*\\brust:[0-9]/ s#(\\brust:)[0-9]+\\.[0-9]+(\\.[0-9]+)?#\\1$EXPECTED_VERSION#g" "$dockerfile"
+                rm -f "$dockerfile.bak"
             fi
             if [ "$RUST_IMAGE_MISMATCH" = "true" ]; then
-                sed -i -E "/$RUST_IMAGE_PATTERN/ s#$RUST_IMAGE_TAG_PATTERN-[^[:space:]]+#\\1-$RUST_IMAGE_VARIANT#g" "$dockerfile"
-                sed -i -E "/$RUST_IMAGE_PATTERN/ { /-$RUST_IMAGE_VARIANT([[:space:]]|$)/! s#$RUST_IMAGE_TAG_PATTERN([[:space:]]|$)#\\1-$RUST_IMAGE_VARIANT\\2#g; }" "$dockerfile"
+                sed -i.bak -E "/$RUST_IMAGE_PATTERN/ s#$RUST_IMAGE_TAG_PATTERN-[^[:space:]]+#\\1-$RUST_IMAGE_VARIANT#g" "$dockerfile"
+                rm -f "$dockerfile.bak"
+                sed -i.bak -E "/$RUST_IMAGE_PATTERN/ { /-$RUST_IMAGE_VARIANT([[:space:]]|$)/! s#$RUST_IMAGE_TAG_PATTERN([[:space:]]|$)#\\1-$RUST_IMAGE_VARIANT\\2#g; }" "$dockerfile"
+                rm -f "$dockerfile.bak"
             fi
             FIXED_FILES=$((FIXED_FILES + 1))
             MESSAGE=""
