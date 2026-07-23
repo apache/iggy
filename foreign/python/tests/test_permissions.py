@@ -380,6 +380,76 @@ class TestUpdatePermissions:
         await iggy_client.delete_user(created.id)
 
     @pytest.mark.asyncio
+    async def test_user_without_manage_users_cannot_update_permissions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user lacking manage_users is denied updating another user."""
+        actor_username, actor_password = unique_credentials(unique_name)
+        actor = await iggy_client.create_user(actor_username, actor_password)
+        target_username, target_password = unique_credentials(unique_name)
+        target = await iggy_client.create_user(target_username, target_password)
+
+        actor_client = await login_fresh_client(actor_username, actor_password)
+        with pytest.raises(RuntimeError):
+            await actor_client.update_permissions(
+                target.id, Permissions(global_=GlobalPermissions(read_streams=True))
+            )
+
+        await iggy_client.delete_user(actor.id)
+        await iggy_client.delete_user(target.id)
+
+    @pytest.mark.asyncio
+    async def test_user_with_manage_users_can_update_permissions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a user granted manage_users can update another user."""
+        actor_username, actor_password = unique_credentials(unique_name)
+        actor = await iggy_client.create_user(
+            actor_username,
+            actor_password,
+            permissions=Permissions(global_=GlobalPermissions(manage_users=True)),
+        )
+        target_username, target_password = unique_credentials(unique_name)
+        target = await iggy_client.create_user(target_username, target_password)
+
+        granted = Permissions(global_=GlobalPermissions(read_streams=True))
+        actor_client = await login_fresh_client(actor_username, actor_password)
+        await actor_client.update_permissions(target.id, granted)
+
+        fetched = await iggy_client.get_user(target.id)
+        assert fetched is not None
+        assert fetched.permissions == granted
+
+        await iggy_client.delete_user(actor.id)
+        await iggy_client.delete_user(target.id)
+
+    @pytest.mark.asyncio
+    async def test_failed_update_leaves_target_permissions_unchanged(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a denied update does not alter the target's permissions."""
+        actor_username, actor_password = unique_credentials(unique_name)
+        actor = await iggy_client.create_user(actor_username, actor_password)
+        target_username, target_password = unique_credentials(unique_name)
+        initial = Permissions(global_=GlobalPermissions(read_users=True))
+        target = await iggy_client.create_user(
+            target_username, target_password, permissions=initial
+        )
+
+        actor_client = await login_fresh_client(actor_username, actor_password)
+        with pytest.raises(RuntimeError):
+            await actor_client.update_permissions(
+                target.id, Permissions(global_=GlobalPermissions(manage_servers=True))
+            )
+
+        fetched = await iggy_client.get_user(target.id)
+        assert fetched is not None
+        assert fetched.permissions == initial
+
+        await iggy_client.delete_user(actor.id)
+        await iggy_client.delete_user(target.id)
+
+    @pytest.mark.asyncio
     async def test_update_permissions_nonexistent_user_fails(
         self, iggy_client: IggyClient, unique_name
     ):
@@ -509,6 +579,20 @@ class TestLogoutUser:
 
         with pytest.raises(RuntimeError):
             await client.get_user(username)
+
+        await iggy_client.delete_user(created.id)
+
+    @pytest.mark.asyncio
+    async def test_logout_twice_fails(self, iggy_client: IggyClient, unique_name):
+        """Test a second logout on the same session raises."""
+        username, password = unique_credentials(unique_name)
+        created = await iggy_client.create_user(username, password)
+
+        client = await login_fresh_client(username, password)
+        await client.logout_user()
+
+        with pytest.raises(RuntimeError):
+            await client.logout_user()
 
         await iggy_client.delete_user(created.id)
 
