@@ -511,7 +511,6 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, Server
     let config = ServerNgConfig::load()
         .await
         .map_err(ServerNgError::Config)?;
-    // TODO: decouple directory bootstrap from the `server` crate.
     create_directories(&config.system).await.map_err(|source| {
         error!(
             system_path = %config.system.get_system_path(),
@@ -797,9 +796,6 @@ fn run_shard_thread(
         .bind_memory()
         .map_err(|source| ServerNgError::MemoryAffinityFailed { shard_id, source })?;
 
-    // TODO(hubcio): decouple runtime creation from the `server` crate
-    // (mirrors the identical TODO in `main.rs`). Reusing legacy here so
-    // server-ng and the legacy server share one io_uring tuning surface.
     let runtime = create_shard_executor()
         .map_err(|source| ServerNgError::ShardRuntimeCreateFailed { shard_id, source })?;
 
