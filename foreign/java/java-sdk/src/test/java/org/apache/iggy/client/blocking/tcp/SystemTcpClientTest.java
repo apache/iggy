@@ -60,4 +60,14 @@ class SystemTcpClientTest extends SystemClientBaseTest {
         assertThat(clients).isNotNull();
         assertThat(clients.size()).isGreaterThanOrEqualTo(1); // At least our connection
     }
+
+    @Test
+    void shouldStayOnSingleNodeAfterLogin() {
+        // when
+        var connectionInfo = ((IggyTcpClient) client).getConnectionInfo();
+
+        // then
+        assertThat(connectionInfo.host()).isEqualTo(serverHost());
+        assertThat(connectionInfo.port()).isEqualTo(serverTcpPort());
+    }
 }

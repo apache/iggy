@@ -21,10 +21,16 @@ package org.apache.iggy.serde;
 
 import io.netty.buffer.ByteBuf;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.cluster.ClusterMetadata;
+import org.apache.iggy.cluster.ClusterNode;
+import org.apache.iggy.cluster.ClusterNodeRole;
+import org.apache.iggy.cluster.ClusterNodeStatus;
+import org.apache.iggy.cluster.TransportEndpoints;
 import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
+import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
@@ -67,6 +73,8 @@ import java.util.Optional;
  * Provides deserialization of ByteBuf to domain objects according to Iggy wire protocol.
  */
 public final class BytesDeserializer {
+
+    private static final int MIN_CLUSTER_NODE_BYTES = 18;
 
     private BytesDeserializer() {}
 
@@ -349,6 +357,33 @@ public final class BytesDeserializer {
         return new ConsumerGroupInfo(streamId, topicId, groupId);
     }
 
+    public static ClusterMetadata readClusterMetadata(ByteBuf response) {
+        var name = readU32PrefixedString(response, "cluster name");
+        var nodesCount = response.readUnsignedIntLE();
+        if (nodesCount > response.readableBytes() / MIN_CLUSTER_NODE_BYTES) {
+            throw new IggyMalformedResponseException("Cluster nodes count " + nodesCount
+                    + " exceeds remaining payload of " + response.readableBytes() + " bytes");
+        }
+        List<ClusterNode> nodes = new ArrayList<>(toInt(nodesCount));
+        for (int i = 0; i < nodesCount; i++) {
+            nodes.add(readClusterNode(response));
+        }
+        return new ClusterMetadata(name, nodes);
+    }
+
+    public static ClusterNode readClusterNode(ByteBuf response) {
+        var name = readU32PrefixedString(response, "cluster node name");
+        var ip = readU32PrefixedString(response, "cluster node ip");
+        var tcpPort = response.readUnsignedShortLE();
+        var quicPort = response.readUnsignedShortLE();
+        var httpPort = response.readUnsignedShortLE();
+        var websocketPort = response.readUnsignedShortLE();
+        var role = ClusterNodeRole.fromCode(response.readUnsignedByte());
+        var status = ClusterNodeStatus.fromCode(response.readUnsignedByte());
+        return new ClusterNode(
+                name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
+    }
+
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {
         var userInfo = readUserInfo(response);
 
@@ -446,6 +481,18 @@ public final class BytesDeserializer {
         var expiry = readU64AsBigInteger(response);
         Optional<BigInteger> expiryOptional = expiry.equals(BigInteger.ZERO) ? Optional.empty() : Optional.of(expiry);
         return new PersonalAccessTokenInfo(name, expiryOptional);
+    }
+
+    private static String readU32PrefixedString(ByteBuf buffer, String field) {
+        if (buffer.readableBytes() < Integer.BYTES) {
+            throw new IggyMalformedResponseException("Missing length prefix for " + field);
+        }
+        var length = buffer.readUnsignedIntLE();
+        if (length > buffer.readableBytes()) {
+            throw new IggyMalformedResponseException("Length " + length + " for " + field
+                    + " exceeds remaining payload of " + buffer.readableBytes() + " bytes");
+        }
+        return buffer.readCharSequence(toInt(length), StandardCharsets.UTF_8).toString();
     }
 
     static BigInteger readU64AsBigInteger(ByteBuf buffer) {

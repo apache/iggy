@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
@@ -91,6 +92,17 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
      */
     public IdentityInfo login() {
         return FutureUtil.resolve(asyncClient.login());
+    }
+
+    /**
+     * Returns the server address this client currently targets. Leader
+     * redirection can change it after login, so it may differ from the
+     * address the client was built with.
+     *
+     * @return the current {@link ConnectionInfo}
+     */
+    public ConnectionInfo getConnectionInfo() {
+        return asyncClient.getConnectionInfo();
     }
 
     /** {@inheritDoc} */

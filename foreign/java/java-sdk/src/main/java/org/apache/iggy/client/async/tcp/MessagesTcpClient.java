@@ -34,6 +34,7 @@ import org.apache.iggy.serde.CommandCode;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
@@ -42,10 +43,14 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
  */
 public class MessagesTcpClient implements MessagesClient {
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public MessagesTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -79,7 +84,7 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        return connection.send(CommandCode.Messages.POLL.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Messages.POLL.getValue(), payload).thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
             } finally {
@@ -123,7 +128,7 @@ public class MessagesTcpClient implements MessagesClient {
         }
 
         // Send async request (no response data expected for send)
-        return connection.send(CommandCode.Messages.SEND.getValue(), payload).thenAccept(response -> {
+        return connection().send(CommandCode.Messages.SEND.getValue(), payload).thenAccept(response -> {
             // Response received, messages sent successfully
             response.release(); // Release the buffer
         });

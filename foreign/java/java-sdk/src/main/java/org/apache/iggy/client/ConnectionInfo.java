@@ -17,26 +17,24 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.client;
 
-import org.apache.iggy.cluster.ClusterMetadata;
-import org.apache.iggy.system.ClientInfo;
-import org.apache.iggy.system.ClientInfoDetails;
-import org.apache.iggy.system.Stats;
+/**
+ * The server address a client currently targets. Leader redirection can
+ * change it after login, so it may differ from the address the client was
+ * built with.
+ *
+ * @param host the server hostname or IP address
+ * @param port the server port
+ */
+public record ConnectionInfo(String host, int port) {
 
-import java.util.List;
-
-public interface SystemClient {
-
-    Stats getStats();
-
-    ClusterMetadata getClusterMetadata();
-
-    ClientInfoDetails getMe();
-
-    ClientInfoDetails getClient(Long clientId);
-
-    List<ClientInfo> getClients();
-
-    String ping();
+    /**
+     * Returns the address in {@code host:port} form.
+     *
+     * @return the server address
+     */
+    public String serverAddress() {
+        return host + ":" + port;
+    }
 }

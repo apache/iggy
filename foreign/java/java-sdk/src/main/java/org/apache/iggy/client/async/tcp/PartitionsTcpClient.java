@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
  * Async TCP implementation of partitions client.
@@ -35,10 +36,14 @@ import java.util.concurrent.CompletableFuture;
 public class PartitionsTcpClient implements PartitionsClient {
     private static final Logger log = LoggerFactory.getLogger(PartitionsTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public PartitionsTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public PartitionsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -49,9 +54,11 @@ public class PartitionsTcpClient implements PartitionsClient {
 
         log.debug("Creating {} partitions for stream: {}, topic: {}", partitionsCount, streamId, topicId);
 
-        return connection.send(CommandCode.Partition.CREATE.getValue(), payload).thenAccept(response -> {
-            response.release();
-        });
+        return connection()
+                .send(CommandCode.Partition.CREATE.getValue(), payload)
+                .thenAccept(response -> {
+                    response.release();
+                });
     }
 
     @Override
@@ -62,8 +69,10 @@ public class PartitionsTcpClient implements PartitionsClient {
 
         log.debug("Deleting {} partitions for stream: {}, topic: {}", partitionsCount, streamId, topicId);
 
-        return connection.send(CommandCode.Partition.DELETE.getValue(), payload).thenAccept(response -> {
-            response.release();
-        });
+        return connection()
+                .send(CommandCode.Partition.DELETE.getValue(), payload)
+                .thenAccept(response -> {
+                    response.release();
+                });
     }
 }

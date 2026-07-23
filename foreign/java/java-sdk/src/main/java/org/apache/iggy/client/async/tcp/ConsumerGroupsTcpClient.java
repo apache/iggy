@@ -36,6 +36,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
  * Async TCP implementation of consumer groups client.
@@ -43,10 +44,14 @@ import java.util.concurrent.CompletableFuture;
 public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerGroupsTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public ConsumerGroupsTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public ConsumerGroupsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -58,7 +63,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.GET.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -80,7 +85,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Getting consumer groups - Stream: {}, Topic: {}", streamId, topicId);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.GET_ALL.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -108,7 +113,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.CREATE.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -127,7 +132,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Deleting consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.DELETE.getValue(), payload)
                 .thenAccept(response -> {
                     response.release();
@@ -149,7 +154,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Joining consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.JOIN.getValue(), payload)
                 .thenAccept(response -> {
                     log.debug("Successfully joined consumer group");
@@ -172,7 +177,7 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
         log.debug("Leaving consumer group - Stream: {}, Topic: {}, Group: {}", streamId, topicId, groupId);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerGroup.LEAVE.getValue(), payload)
                 .thenAccept(response -> {
                     log.debug("Successfully left consumer group");

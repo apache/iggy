@@ -36,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
@@ -45,22 +46,32 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
 public class UsersTcpClient implements UsersClient {
     private static final Logger log = LoggerFactory.getLogger(UsersTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final LoginRedirectionHook redirectionHook;
 
-    public UsersTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public UsersTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, LoginRedirectionHook.NONE);
+    }
+
+    UsersTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, LoginRedirectionHook redirectionHook) {
+        this.connectionSupplier = connectionSupplier;
+        this.redirectionHook = redirectionHook;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
     public CompletableFuture<Optional<UserInfoDetails>> getUser(UserId userId) {
         var payload = toBytes(userId);
-        return connection.exchangeForOptional(CommandCode.User.GET, payload, BytesDeserializer::readUserInfoDetails);
+        return connection().exchangeForOptional(CommandCode.User.GET, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
     public CompletableFuture<List<UserInfo>> getUsers() {
         var payload = Unpooled.EMPTY_BUFFER;
-        return connection.exchangeForList(CommandCode.User.GET_ALL, payload, BytesDeserializer::readUserInfo);
+        return connection().exchangeForList(CommandCode.User.GET_ALL, payload, BytesDeserializer::readUserInfo);
     }
 
     @Override
@@ -79,13 +90,13 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection.exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
+        return connection().exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
     public CompletableFuture<Void> deleteUser(UserId userId) {
         var payload = toBytes(userId);
-        return connection.sendAndRelease(CommandCode.User.DELETE, payload);
+        return connection().sendAndRelease(CommandCode.User.DELETE, payload);
     }
 
     @Override
@@ -104,7 +115,7 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection.sendAndRelease(CommandCode.User.UPDATE, payload);
+        return connection().sendAndRelease(CommandCode.User.UPDATE, payload);
     }
 
     @Override
@@ -120,7 +131,7 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection.sendAndRelease(CommandCode.User.UPDATE_PERMISSIONS, payload);
+        return connection().sendAndRelease(CommandCode.User.UPDATE_PERMISSIONS, payload);
     }
 
     @Override
@@ -129,11 +140,17 @@ public class UsersTcpClient implements UsersClient {
         payload.writeBytes(toBytes(currentPassword));
         payload.writeBytes(toBytes(newPassword));
 
-        return connection.sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
+        return connection().sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
     }
 
     @Override
     public CompletableFuture<IdentityInfo> login(String username, String password) {
+        return loginWithoutRedirect(username, password).thenCompose(identity -> redirectionHook
+                .afterLogin(() -> loginWithoutRedirect(username, password))
+                .thenApply(redirectedIdentity -> redirectedIdentity != null ? redirectedIdentity : identity));
+    }
+
+    private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {
         String version = IggyVersion.getInstance().getUserAgent();
         String context = IggyVersion.getInstance().toString();
 
@@ -150,9 +167,8 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging in user: {}", username);
 
-        return connection.send(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.User.LOGIN.getValue(), payload).thenApply(response -> {
             try {
-                // Read the user ID from response (4-byte unsigned int LE)
                 var userId = response.readUnsignedIntLE();
                 return new IdentityInfo(userId, Optional.empty());
             } finally {
@@ -167,7 +183,7 @@ public class UsersTcpClient implements UsersClient {
 
         log.debug("Logging out");
 
-        return connection.send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
+        return connection().send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
             response.release();
             log.debug("Logged out successfully");
         });
