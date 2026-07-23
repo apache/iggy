@@ -68,6 +68,8 @@ members = [
     "core/system_stats",
     "core/tools",
     "examples/rust",
+    "gateways/kafka",
+    "gateways/kafka/tools/kafka-tool",
 ]
 exclude = ["foreign/cpp", "foreign/php", "foreign/python"]
 resolver = "3"

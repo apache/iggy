@@ -162,6 +162,7 @@ components:
       - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
+      - "rust-gateway"
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
@@ -512,3 +513,20 @@ components:
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"
     tasks: ["validate"] # Could run workflow validation
+
+  # gateways are not Rust components, but we want to run them in CI
+  rust-gateway:
+    depends_on:
+      - "rust-sdk"
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "gateways/**"
+    tasks:
+      - "check"
+      - "fmt"
+      - "clippy"
+      - "sort"
+      - "test-1"
+      - "test-2"
+      - "machete"
