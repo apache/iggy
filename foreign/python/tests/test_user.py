@@ -50,12 +50,14 @@ class TestCreateUser:
         assert isinstance(created.id, int)
         assert created.username == username
         assert created.status == UserStatus.Active
+        assert created.permissions is None
 
         user_by_name = await iggy_client.get_user(username)
         assert user_by_name is not None
         assert user_by_name.id == created.id
         assert user_by_name.username == username
         assert user_by_name.status == UserStatus.Active
+        assert user_by_name.permissions is None
 
         user_by_id = await iggy_client.get_user(created.id)
         assert user_by_id is not None

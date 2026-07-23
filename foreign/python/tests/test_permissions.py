@@ -165,22 +165,6 @@ class TestCreateUserWithPermissions:
     """Test create_user with the permissions argument."""
 
     @pytest.mark.asyncio
-    async def test_create_user_without_permissions_has_none(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test a user created without permissions reports None."""
-        username, password = unique_credentials(unique_name)
-
-        created = await iggy_client.create_user(username, password)
-        assert created.permissions is None
-
-        fetched = await iggy_client.get_user(created.id)
-        assert fetched is not None
-        assert fetched.permissions is None
-
-        await iggy_client.delete_user(created.id)
-
-    @pytest.mark.asyncio
     async def test_create_user_with_global_permissions_round_trips(
         self, iggy_client: IggyClient, unique_name
     ):
