@@ -107,6 +107,12 @@ impl Default for ClusterConfig {
                 .parse()
                 .unwrap(),
             view_probe_attempts_max: SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32,
+            repair_retry_interval: SERVER_NG_CONFIG
+                .cluster
+                .repair_retry_interval
+                .parse()
+                .unwrap(),
+            repair_chunk_max: SERVER_NG_CONFIG.cluster.repair_chunk_max as usize,
             nodes: SERVER_NG_CONFIG
                 .cluster
                 .nodes
@@ -168,6 +174,8 @@ impl Default for PartitionConfig {
         let partition = &SERVER_NG_CONFIG.partition;
         PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
+            evicted_ring_capacity: partition.evicted_ring_capacity as usize,
+            evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
         }
     }
 }

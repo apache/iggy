@@ -61,6 +61,17 @@ pub const DEFAULT_VIEW_PROBE_ATTEMPTS_MAX: u32 = 5;
 /// typo guard, not a sizing endorsement.
 const MAX_VIEW_PROBE_ATTEMPTS: u32 = 100;
 
+/// Default per-round repair-serving chunk. Duplicated here rather than imported
+/// so `core/configs` keeps off a build-time edge onto `core/shard` (mirroring
+/// [`DEFAULT_VIEW_PROBE_ATTEMPTS_MAX`]); `core/server-ng`'s bootstrap
+/// static-asserts it equal to `shard::REPAIR_CHUNK_MAX`.
+pub const DEFAULT_REPAIR_CHUNK_MAX: usize = 128;
+
+/// Upper bound on `repair_chunk_max`. A chunk rides the per-peer bus queue, so
+/// the load-bearing rule is `repair_chunk_max < message_bus.peer_queue_capacity`
+/// (enforced at the top level); this standalone ceiling is a typo guard.
+const MAX_REPAIR_CHUNK_MAX: usize = 1024;
+
 /// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
 /// is KDF-derived from these bytes at use-site, so any encoding clearing this
 /// length is accepted.
@@ -126,6 +137,22 @@ fn default_request_start_view_retransmit_interval() -> IggyDuration {
 /// itself lives in `core/server-ng/config.toml` like every other default.
 fn default_view_probe_attempts_max() -> u32 {
     SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_repair_retry_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .repair_retry_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_repair_chunk_max() -> usize {
+    SERVER_NG_CONFIG.cluster.repair_chunk_max as usize
 }
 
 #[serde_as]
@@ -199,6 +226,25 @@ pub struct ClusterConfig {
     /// `MAX_VIEW_PROBE_ATTEMPTS`.
     #[serde(default = "default_view_probe_attempts_max")]
     pub view_probe_attempts_max: u32,
+    /// How long a stalled journal-repair stream waits before re-requesting its
+    /// remaining window from the serving peer. Repair frames are
+    /// fire-and-forget over the lossy bus, so a session with no retry wedges
+    /// forever on a single dropped frame. Paces both the metadata and
+    /// partition repair loops. Sizes the retry threshold in consensus ticks.
+    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
+    /// to zero) is rejected at boot.
+    #[serde(default = "default_repair_retry_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub repair_retry_interval: IggyDuration,
+    /// Prepares a peer serves per repair round before the requester walks to
+    /// the next chunk. Each frame rides the per-peer message-bus queue, so this
+    /// must stay below `message_bus.peer_queue_capacity` or a full round
+    /// overruns the queue and silently drops frames (enforced at the top
+    /// level). Applies to both the metadata and partition repair planes. Must
+    /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
+    #[serde(default = "default_repair_chunk_max")]
+    pub repair_chunk_max: usize,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -432,6 +478,31 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // The repair retry interval sizes a tick threshold that has to advance;
+        // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
+        // every stalled repair stream - reject them. The chunk is a per-round
+        // count with a standalone typo ceiling; the load-bearing rule against
+        // message_bus.peer_queue_capacity is enforced at the top level.
+        if self.repair_retry_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_retry_interval must be nonzero \
+                 (it paces stalled-repair retries)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.repair_chunk_max == 0 {
+            eprintln!("Invalid cluster configuration: cluster.repair_chunk_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.repair_chunk_max > MAX_REPAIR_CHUNK_MAX {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_chunk_max ({}) exceeds the maximum \
+                 ({MAX_REPAIR_CHUNK_MAX})",
+                self.repair_chunk_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         if self.nodes.is_empty() {
             eprintln!(
                 "Invalid cluster configuration: cluster.nodes must contain at least one entry when cluster is enabled"
@@ -596,6 +667,8 @@ mod tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            repair_retry_interval: default_repair_retry_interval(),
+            repair_chunk_max: default_repair_chunk_max(),
             nodes: Vec::new(),
             auth: ClusterAuthConfig {
                 enabled: true,
@@ -640,6 +713,8 @@ mod cluster_validate_tests {
             request_start_view_retransmit_interval: default_request_start_view_retransmit_interval(
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
+            repair_retry_interval: default_repair_retry_interval(),
+            repair_chunk_max: default_repair_chunk_max(),
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
@@ -752,6 +827,38 @@ mod cluster_validate_tests {
     fn validate_accepts_view_probe_attempts_at_ceiling() {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.view_probe_attempts_max = MAX_VIEW_PROBE_ATTEMPTS;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_retry_interval() {
+        // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
+        // stalled repair streams.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_retry_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_chunk_max() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_repair_chunk_max_above_ceiling() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = MAX_REPAIR_CHUNK_MAX + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_repair_chunk_max_at_ceiling() {
+        // Section-level validate only; the cross-section rule against
+        // message_bus.peer_queue_capacity lives in the top-level validate.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_chunk_max = MAX_REPAIR_CHUNK_MAX;
         assert!(c.validate().is_ok());
     }
 

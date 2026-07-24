@@ -523,6 +523,14 @@ pub async fn build_partition_fresh(
     }
 
     let mut partition = IggyPartition::new(stats, consensus);
+    // Surface the evicted-ring ceilings from config onto the fresh journal.
+    // IggyPartition::new has already disabled retention for single-replica
+    // groups (nobody to serve), so this only sizes the multi-replica ring; the
+    // caps are inert while retention is off.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
     partition.set_partition_dir(config.system.get_partition_path(
         stream_id,
         topic_id,

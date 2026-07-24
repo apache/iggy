@@ -1688,6 +1688,10 @@ async fn build_shard_for_thread(
     .map_err(ServerNgError::ShardConstruction)?;
 
     let shard = Rc::new(built.shard);
+    // Repair pacing is shared by both planes' repair loops, so it is a
+    // per-shard tunable set once here rather than per consensus group.
+    shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_repair_chunk_max(config.cluster.repair_chunk_max as u64);
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
     Ok((shard, sessions))
 }
@@ -1713,6 +1717,14 @@ const _: () = assert!(
 );
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_CAPACITY == partitions::EVICTED_RING_CAPACITY
+);
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_EVICTED_RING_BYTES_MAX == partitions::EVICTED_RING_BYTES_MAX
+);
+const _: () =
+    assert!(configs::ng_cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {
@@ -1806,6 +1818,17 @@ pub(crate) fn request_start_view_ticks(config: &ServerNgConfig) -> u64 {
             .request_start_view_retransmit_interval
             .get_duration(),
     )
+}
+
+/// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
+/// journal-repair stream waits before re-requesting its window. Both planes'
+/// repair loops share it, so it is applied once per shard (not per consensus
+/// group). Clamped to `u32`, the width of the session idle-tick counter.
+pub(crate) fn repair_retry_ticks(config: &ServerNgConfig) -> u32 {
+    u32::try_from(duration_to_ticks(
+        config.cluster.repair_retry_interval.get_duration(),
+    ))
+    .unwrap_or(u32::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2018,6 +2041,13 @@ async fn load_partition(
             })?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    // Recovered partitions honor the same config-surfaced ring ceilings as the
+    // fresh-create path (build_partition_fresh). Retention is already off for
+    // single-replica groups, so this only sizes the multi-replica ring.
+    partition.log.journal().inner.set_ring_caps(
+        config.partition.evicted_ring_capacity,
+        config.partition.evicted_ring_bytes_max.as_bytes_u64(),
+    );
     partition.set_partition_dir(config.system.get_partition_path(
         stream_id,
         topic_id,
@@ -3412,6 +3442,66 @@ mod tests {
             consensus::PROBE_ATTEMPTS_MAX,
             "[cluster] view_probe_attempts_max default drifted from \
              consensus::PROBE_ATTEMPTS_MAX"
+        );
+    }
+
+    #[test]
+    fn default_repair_retry_interval_matches_partitions_constant() {
+        // The config default lives in core/server-ng/config.toml (a string, so
+        // no static assert can pin it); keep it in lockstep with the built-in
+        // the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .repair_retry_interval
+            .get_duration()
+            .as_millis();
+        let built_in =
+            u128::from(partitions::REPAIR_RETRY_TICKS) * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] repair_retry_interval default drifted from \
+             partitions::REPAIR_RETRY_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_repair_chunk_max_matches_shard_constant() {
+        // Belt and suspenders with the static assert above: that pins the
+        // duplicated configs-crate literal, this pins the shipped config.toml
+        // value the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default().repair_chunk_max;
+        assert_eq!(
+            config_default as u64,
+            shard::REPAIR_CHUNK_MAX,
+            "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_capacity_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default =
+            configs::ng_partition::PartitionConfig::default().evicted_ring_capacity;
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_CAPACITY,
+            "[partition] evicted_ring_capacity default drifted from \
+             partitions::EVICTED_RING_CAPACITY"
+        );
+    }
+
+    #[test]
+    fn default_evicted_ring_bytes_max_matches_partitions_constant() {
+        // Belt and suspenders with the static assert above; this pins the
+        // shipped config.toml value.
+        let config_default = configs::ng_partition::PartitionConfig::default()
+            .evicted_ring_bytes_max
+            .as_bytes_u64();
+        assert_eq!(
+            config_default,
+            partitions::EVICTED_RING_BYTES_MAX,
+            "[partition] evicted_ring_bytes_max default drifted from \
+             partitions::EVICTED_RING_BYTES_MAX"
         );
     }
 

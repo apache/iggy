@@ -160,6 +160,20 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                 format!("{COMPONENT_NG} (error: {e}) - failed to validate message_bus config")
             })?;
 
+        // Repair frames ride the bounded per-peer message-bus queue. A repair
+        // round of cluster.repair_chunk_max frames that meets or overruns
+        // message_bus.peer_queue_capacity drops its own tail silently, wedging
+        // the repair loop into slow retries. Keep the chunk strictly below the
+        // queue; this also floors peer_queue_capacity, which is otherwise only
+        // checked for > 0.
+        if self.cluster.repair_chunk_max >= self.message_bus.peer_queue_capacity {
+            eprintln!(
+                "{COMPONENT_NG} cluster.repair_chunk_max ({}) must be < message_bus.peer_queue_capacity ({}): repair frames ride the per-peer bus queue, so a chunk that fills or overruns it drops frames and wedges repair",
+                self.cluster.repair_chunk_max, self.message_bus.peer_queue_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         self.quic.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate quic config")
         })?;
@@ -337,6 +351,29 @@ mod tests {
     fn given_zero_message_expiry_when_validating_should_reject() {
         let config = config_with_override("[system.topic]\nmessage_expiry = \"0s\"\n");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_peer_queue_capacity_not_above_repair_chunk_max_when_validating_should_reject() {
+        // The default repair_chunk_max (128) must stay strictly below
+        // peer_queue_capacity; shrinking the queue to the chunk size is the
+        // silent wedged-repair footgun this cross-section guard closes.
+        let config = config_with_override("[message_bus]\npeer_queue_capacity = 128\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        config
+            .validate()
+            .expect("a chunk below the peer queue capacity must validate");
     }
 
     /// The warn-helper baseline is [`ServerNgConfig::default`], but the reused

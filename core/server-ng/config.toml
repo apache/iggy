@@ -634,6 +634,19 @@ request_start_view_retransmit_interval = "1s"
 # Must be between 1 and 100.
 view_probe_attempts_max = 5
 
+# How long a stalled journal-repair stream waits before re-requesting its
+# remaining window from the serving peer (duration). Repair frames are
+# fire-and-forget over the lossy bus, so a session with no retry wedges forever
+# on a single dropped frame. Paces both the metadata and partition repair loops;
+# must be nonzero.
+repair_retry_interval = "1s"
+
+# Prepares a peer serves per repair round before the requester walks to the next
+# chunk (integer). Each frame rides the per-peer message-bus queue, so this must
+# stay strictly below message_bus.peer_queue_capacity or a full round overruns
+# the queue and drops frames. Must be > 0 and <= 1024.
+repair_chunk_max = 128
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be
@@ -788,6 +801,18 @@ clients_table_max = 8192
 # beyond it are rejected with the transient prepare-queue-full path and
 # retried by the SDK. Must be > 0 and <= 256.
 prepare_queue_depth = 32
+
+# Entries the evicted ring retains per multi-replica partition for journal
+# repair after a peer rejoins. Larger widens the window a restarting peer can be
+# served from the ring before falling back to bulk sync, at the cost of pinned
+# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
+# retain nothing regardless.
+evicted_ring_capacity = 4096
+
+# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
+# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
+# large batches can pin. Must be > 0 and <= "256 MiB".
+evicted_ring_bytes_max = "16 MiB"
 
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
