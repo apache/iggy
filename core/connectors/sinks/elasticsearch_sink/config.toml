@@ -36,6 +36,4 @@ url = "http://localhost:9200"
 index = "iggy_messages"
 create_index_if_not_exists = true
 batch_size = 100
-# Client-wide timeout for open() and bulk consume(). 0 is clamped to 1s.
-# Raise for slow bulk; timed-out consume drops the batch after poll commit (#2927/#2928).
 timeout_seconds = 30
