@@ -232,10 +232,10 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
     assert_eq!(count, message_count as i64);
 
     // Round 2: send the same payloads again with the same Iggy IDs. The
-    // connector generates a deterministic Stream Load label per (stream,
-    // topic, partition, first_offset, last_offset). Because Iggy assigns
-    // monotonic offsets, the second batch lands at different offsets and
-    // gets a different label — so duplicates WOULD land if the replay
+    // connector generates a deterministic Stream Load label per (target table,
+    // stream, topic, partition, first_offset, last_offset). Because Iggy
+    // assigns monotonic offsets, the second batch lands at different offsets
+    // and gets a different label — so duplicates WOULD land if the replay
     // deduplication only relied on Iggy IDs. The point of this test is the
     // converse case below.
     //
@@ -270,6 +270,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
         for last in first..=last_offset {
             let candidate = iggy_connector_doris_sink::build_label(
                 "iggy_test",
+                TEST_TABLE,
                 seeds::names::STREAM,
                 seeds::names::TOPIC,
                 0,
