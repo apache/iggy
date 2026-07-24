@@ -1987,6 +1987,17 @@ body.dark .dense-row.active {
     opacity: 0.7;
 }
 
+.dense-row-cluster {
+    flex-shrink: 0;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: rgba(56, 189, 248, 0.14);
+    color: #38bdf8;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+}
+
 .dense-row-compare-btn {
     display: inline-flex;
     align-items: center;

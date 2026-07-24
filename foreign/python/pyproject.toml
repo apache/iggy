@@ -149,6 +149,16 @@ filterwarnings = [
 
 [tool.uv]
 exclude-newer = "7 days"
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+    { file = "src/**/*.rs" },
+    { file = "../../core/**/Cargo.toml" },
+    { file = "../../core/**/*.rs" },
+]
 
 [tool.pyrefly]
 search-path = ["."]

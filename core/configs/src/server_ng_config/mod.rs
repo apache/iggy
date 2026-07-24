@@ -27,6 +27,7 @@
 //! wiring PR for `core/server-ng`'s bootstrap and the message_bus crate's
 //! runtime type is a separate change.
 
+pub mod cluster;
 pub mod defaults;
 pub mod displays;
 pub mod message_bus;

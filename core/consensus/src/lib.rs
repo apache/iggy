@@ -162,3 +162,4 @@ pub use observability::*;
 mod view_change_quorum;
 pub use view_change_quorum::*;
 mod vsr_timeout;
+pub use vsr_timeout::TimeoutManager;

@@ -48,6 +48,7 @@ pub fn benchmarks_list(props: &BenchmarksListProps) -> Html {
     let param_filters = ui_state.param_filters.clone();
     let search = ui_state.sidebar_search.to_lowercase();
     let kind_filter = ui_state.sidebar_kind_filter.clone();
+    let topology_filter = ui_state.topology_filter;
     let hardware_filter = ui_state.hardware_filter.clone();
     let gitref_filter = ui_state.gitref_filter.clone();
     let sort = ui_state.sidebar_sort;
@@ -123,6 +124,7 @@ pub fn benchmarks_list(props: &BenchmarksListProps) -> Html {
         .iter()
         .filter(|benchmark| param_filters.matches(benchmark))
         .filter(|benchmark| kind_filter_matches(&kind_filter, benchmark.params.benchmark_kind))
+        .filter(|benchmark| topology_filter.matches(benchmark))
         .filter(|benchmark| hardware_matches(hardware_filter.as_deref(), benchmark))
         .filter(|benchmark| gitref_matches(gitref_filter.as_deref(), benchmark))
         .filter(|benchmark| search_matches(&search, benchmark))

@@ -17,7 +17,7 @@
 
 [package]
 name = "server-ng"
-version = "0.8.0"
+version = "0.9.0-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -88,6 +88,7 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
+vsr = ["iggy_common/vsr"]
 
 [dependencies]
 ahash = { workspace = true }

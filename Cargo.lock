@@ -11814,7 +11814,7 @@ dependencies = [
 
 [[package]]
 name = "server-ng"
-version = "0.8.0"
+version = "0.9.0-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "argon2",

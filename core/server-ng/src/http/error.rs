@@ -491,7 +491,7 @@ pub(in crate::http) fn primary_redirect_location(
 mod tests {
     use super::*;
 
-    use configs::cluster::{ClusterNodeConfig, TransportPorts};
+    use configs::ng_cluster::{ClusterNodeConfig, TransportPorts};
 
     const READ_PATH: &str = "/streams?consistency=linearizable";
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
