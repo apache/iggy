@@ -142,7 +142,7 @@ const fn barrier_state(barrier: u64, commit_min: u64, expired: bool) -> BarrierW
 /// `Ok(())` immediately when no suffix is pending (`recovery_barrier() == 0`).
 ///
 /// Bounded by the barrier's paired deadline (scaled from the configured
-/// heartbeat; see `recovery_barrier_deadline`). If the suffix has not
+/// cluster timeouts; see `recovery_barrier_deadline`). If the suffix has not
 /// re-committed by then the read fails loud with a retryable 503
 /// ([`ReadError::RecoveryIncomplete`]) instead of silently serving pre-restart
 /// state a client already saw acked; the caller retries against a converged

@@ -964,7 +964,10 @@ async fn shard_main(
                 view_change_status_ticks(config),
                 request_start_view_ticks(config),
                 config.cluster.view_probe_attempts_max,
-                recovery_barrier_deadline(config.cluster.heartbeat_timeout.get_duration()),
+                recovery_barrier_deadline(
+                    config.cluster.heartbeat_timeout.get_duration(),
+                    config.cluster.view_change_status_timeout.get_duration(),
+                ),
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -1723,27 +1726,33 @@ pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
 /// worst-case recovery is dominated by the heartbeat-independent term - the
 /// `ViewChangeStatus` backstop plus election ceremony and suffix recommit,
 /// empirically ~7s - so the scaled value must never fall under this or a
-/// fast-heartbeat cluster would 503 legitimate reads mid-recovery. That
-/// backstop is now the configurable `[cluster] view_change_status_timeout` (5s
-/// default), so a deployment that raises it far past the default stretches this
-/// heartbeat-independent term beyond what the floor assumes.
+/// fast-heartbeat cluster would 503 legitimate reads mid-recovery. The backstop
+/// is the configurable `[cluster] view_change_status_timeout`; raising it past
+/// its 5s default is why `recovery_barrier_deadline` scales that knob in too
+/// rather than leaning on this floor to cover it.
 const RECOVERY_BARRIER_DEADLINE_FLOOR: Duration = Duration::from_secs(15);
 
-/// Heartbeat multiplier for the recovery deadline: a slower heartbeat stretches
-/// election and suffix recommit proportionally. 3x reproduces the empirically
-/// chosen 15s margin at the 5s default (3 x 5s = 15s) and holds that safety
-/// factor as the heartbeat grows.
-const RECOVERY_BARRIER_HEARTBEAT_MULTIPLIER: u32 = 3;
+/// Safety factor applied to each scaled term of the recovery deadline: a slower
+/// heartbeat stretches election and suffix recommit proportionally, and a wider
+/// status backstop stretches the ceremony it bounds. 3x reproduces the
+/// empirically chosen 15s margin at the shared 5s default (3 x 5s = 15s) and
+/// holds that factor as either knob grows.
+const RECOVERY_BARRIER_MULTIPLIER: u32 = 3;
 
 /// How long the post-restart read path waits for the recovered WAL suffix to
-/// re-commit before failing loud (retryable 503): the larger of the
-/// heartbeat-independent floor and a heartbeat-scaled window. Derived from
-/// `[cluster] heartbeat_timeout` rather than its own knob so the two cannot
-/// drift; see `await_recovery_barrier` for the read-side wait.
-pub(crate) fn recovery_barrier_deadline(heartbeat: Duration) -> Duration {
-    // saturating: heartbeat_timeout has no config ceiling, plain `*` panics
+/// re-commit before failing loud (retryable 503): the largest of the fixed
+/// floor, a `[cluster] heartbeat_timeout`-scaled window, and a
+/// `[cluster] view_change_status_timeout`-scaled window. Both knobs feed it
+/// because either, raised far past its default, stretches worst-case recovery
+/// past the fixed floor; see `await_recovery_barrier` for the read-side wait.
+pub(crate) fn recovery_barrier_deadline(
+    heartbeat: Duration,
+    view_change_status: Duration,
+) -> Duration {
+    // saturating: neither timeout has a config ceiling, plain `*` panics
     heartbeat
-        .saturating_mul(RECOVERY_BARRIER_HEARTBEAT_MULTIPLIER)
+        .saturating_mul(RECOVERY_BARRIER_MULTIPLIER)
+        .max(view_change_status.saturating_mul(RECOVERY_BARRIER_MULTIPLIER))
         .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
 }
 
@@ -3205,12 +3214,13 @@ mod tests {
         // Below the 5s default the heartbeat-independent recovery term (~7s of
         // ViewChangeStatus backstop plus ceremony) dominates, so the floor
         // governs however small the heartbeat is; 3 x 5s lands exactly on it.
+        // A default-sized status backstop stays on the floor, not above it.
         assert_eq!(
-            recovery_barrier_deadline(Duration::from_secs(1)),
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(5)),
             RECOVERY_BARRIER_DEADLINE_FLOOR
         );
         assert_eq!(
-            recovery_barrier_deadline(Duration::from_secs(5)),
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::from_secs(5)),
             RECOVERY_BARRIER_DEADLINE_FLOOR
         );
     }
@@ -3219,22 +3229,55 @@ mod tests {
     fn recovery_barrier_deadline_scales_past_the_floor_for_large_heartbeats() {
         // Once 3 x heartbeat clears the floor the scaled window governs, so a
         // slow-heartbeat cluster is not failed 503 before its longer recovery
-        // can finish.
+        // can finish. A default-sized status backstop stays under it.
         assert_eq!(
-            recovery_barrier_deadline(Duration::from_secs(10)),
+            recovery_barrier_deadline(Duration::from_secs(10), Duration::from_secs(5)),
             Duration::from_secs(30)
         );
         assert_eq!(
-            recovery_barrier_deadline(Duration::from_secs(15)),
+            recovery_barrier_deadline(Duration::from_secs(15), Duration::from_secs(5)),
             Duration::from_secs(45)
         );
     }
 
     #[test]
+    fn recovery_barrier_deadline_scales_with_the_status_backstop() {
+        // A raised view-change status backstop stretches worst-case recovery
+        // even when the heartbeat stays fast, so the deadline must track it or
+        // post-restart reads 503 before a slow election settles.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1), Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_at_config_defaults_matches_the_floor() {
+        // Folding the status term in must not move the stock deadline: at the
+        // shared 5s defaults each scaled term lands exactly on the 15s floor,
+        // so an un-tuned cluster keeps its pre-existing recovery window.
+        let cluster = configs::ng_cluster::ClusterConfig::default();
+        assert_eq!(
+            recovery_barrier_deadline(
+                cluster.heartbeat_timeout.get_duration(),
+                cluster.view_change_status_timeout.get_duration(),
+            ),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
     fn recovery_barrier_deadline_saturates_instead_of_panicking() {
-        // heartbeat_timeout has no config ceiling, so the multiply must
+        // Neither timeout has a config ceiling, so both multiplies must
         // saturate rather than abort boot on an absurd parseable value.
-        assert_eq!(recovery_barrier_deadline(Duration::MAX), Duration::MAX);
+        assert_eq!(
+            recovery_barrier_deadline(Duration::MAX, Duration::from_secs(5)),
+            Duration::MAX
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5), Duration::MAX),
+            Duration::MAX
+        );
     }
 
     #[test]
