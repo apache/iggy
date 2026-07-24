@@ -31,6 +31,6 @@ pub use server_config::{
 };
 pub use server_ng_config::{
     COMPONENT_NG, cluster as ng_cluster, http_admission as ng_http_admission, message_bus,
-    metadata as ng_metadata, quic as ng_quic, server_ng, sharding as ng_sharding, tcp as ng_tcp,
-    websocket as ng_websocket,
+    metadata as ng_metadata, partition as ng_partition, quic as ng_quic, server_ng,
+    sharding as ng_sharding, tcp as ng_tcp, websocket as ng_websocket,
 };

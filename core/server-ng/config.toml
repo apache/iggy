@@ -749,6 +749,16 @@ prepare_queue_depth = 32
 # rewrites per checkpoint.
 journal_slots = 1024
 
+# Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
+# plane), a pipeline exists per partition, so raising this multiplies pinned
+# request-buffer memory by the partition count. Keep it modest.
+[partition]
+# Depth of a partition's prepare queue: how many uncommitted produce /
+# consumer-offset ops may be in flight at once for that partition. Submits
+# beyond it are rejected with the transient prepare-queue-full path and
+# retried by the SDK. Must be > 0 and <= 256.
+prepare_queue_depth = 32
+
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between

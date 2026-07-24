@@ -487,13 +487,16 @@ pub async fn build_partition_fresh(
             source
         })?;
 
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
     consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));

@@ -83,6 +83,9 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
         self.metadata.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate metadata config")
         })?;
+        self.partition.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate partition config")
+        })?;
         self.http_admission
             .validate()
             .error(|e: &ConfigurationError| {

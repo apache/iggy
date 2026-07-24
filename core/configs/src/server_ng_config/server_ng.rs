@@ -20,6 +20,7 @@ use super::cluster::ClusterConfig;
 use super::http_admission::HttpAdmissionConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
 use super::websocket::WebSocketConfig;
@@ -80,6 +81,7 @@ pub struct ServerNgConfig {
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
     pub metadata: MetadataConfig,
+    pub partition: PartitionConfig,
     pub message_bus: MessageBusConfig,
 }
 

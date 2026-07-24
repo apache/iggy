@@ -1693,6 +1693,10 @@ const _: () = assert!(
     configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
         == journal::prepare_journal::DEFAULT_SLOT_COUNT
 );
+const _: () = assert!(
+    configs::ng_partition::DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH
+        == consensus::PIPELINE_PREPARE_QUEUE_MAX
+);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
 /// sub-tick value still fires and saturated on overflow.
 fn duration_to_ticks(interval: Duration) -> u64 {
@@ -1893,13 +1897,16 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
     let consensus = VsrConsensus::new(
         cluster_id,
         self_replica_id,
         replica_count,
         namespace.inner(),
         bus,
-        LocalPipeline::new(),
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
     consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
@@ -3211,6 +3218,21 @@ mod tests {
             config_default, built_in,
             "[cluster] prepare_retransmit_interval default drifted from \
              TimeoutManager::PREPARE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_partition_prepare_queue_depth_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml and flows
+        // through PartitionConfig::default(); keep the embedded value in
+        // lockstep with the pipeline depth LocalPipeline::new() (the simulator
+        // and tests) runs on, so a default deployment is byte-identical.
+        let config_default = configs::ng_partition::PartitionConfig::default().prepare_queue_depth;
+        assert_eq!(
+            config_default,
+            consensus::PIPELINE_PREPARE_QUEUE_MAX,
+            "[partition] prepare_queue_depth default drifted from \
+             consensus::PIPELINE_PREPARE_QUEUE_MAX"
         );
     }
 

@@ -33,6 +33,7 @@ use super::cluster::{
 use super::http_admission::HttpAdmissionConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::NgSystemConfig;
 use super::server_ng::{ExtraConfig, ServerNgConfig};
@@ -68,6 +69,7 @@ impl Default for ServerNgConfig {
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
             metadata: MetadataConfig::default(),
+            partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
         }
     }
@@ -138,6 +140,17 @@ impl Default for MetadataConfig {
         MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
+        }
+    }
+}
+
+impl Default for PartitionConfig {
+    fn default() -> PartitionConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift (same pattern as MetadataConfig above).
+        let partition = &SERVER_NG_CONFIG.partition;
+        PartitionConfig {
+            prepare_queue_depth: partition.prepare_queue_depth as usize,
         }
     }
 }
