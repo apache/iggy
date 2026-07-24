@@ -350,9 +350,12 @@ impl PrepareJournal {
             // `PrepareHeader` projection in consensus builds prepares with
             // `..Default::default()` so the integrity fields are always 0.
             // Until a producer computes them, verification here would be
-            // trivially-passing noise. Without it, a body bit-flip that
-            // leaves the header valid is replayed silently as corrupt
-            // state. Committed bytes are meant to be byte-identical across
+            // trivially-passing noise. The per-message receive gate now rejects
+            // transit body corruption on a follower before apply, but this
+            // recovery scan still does not re-verify body integrity read back
+            // from disk, so an at-rest body bit-flip that leaves the header
+            // valid is replayed silently. Committed bytes are meant to be
+            // byte-identical across
             // replicas (deterministic apply, timestamp replicated not
             // re-projected), so once the producer computes the integrity fields
             // they should agree on every node and this check can be turned on

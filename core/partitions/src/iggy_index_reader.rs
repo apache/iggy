@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex};
+use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use bytes::Buf;
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
@@ -113,5 +113,38 @@ impl IggyIndexReader {
             self.read_entry_at((count - 1) * IGGY_INDEX_SIZE as u64)
                 .await?,
         ))
+    }
+
+    /// Load every whole entry into an [`IggyIndexCache`] for offset / timestamp
+    /// lower-bound lookups. Reads the whole file in one pass (index files are
+    /// tiny: one sparse entry per flushed chunk). A trailing partial entry
+    /// (torn write) is ignored (see [`Self::entry_count`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file metadata or bytes cannot be read.
+    pub async fn load_all(&self) -> Result<IggyIndexCache, IggyError> {
+        let count = usize::try_from(self.entry_count().await?)
+            .map_err(|_| IggyError::CannotReadFileMetadata)?;
+        if count == 0 {
+            return Ok(IggyIndexCache::empty());
+        }
+
+        // `with_capacity` (len 0): `read_exact_at` fills the spare capacity in
+        // place and advances the length (see `read_entry_at`).
+        let buffer = Vec::with_capacity(count * IGGY_INDEX_SIZE);
+        let (result, buffer): (std::io::Result<()>, Vec<u8>) =
+            self.file.read_exact_at(buffer, 0).await.into();
+        result.map_err(|_| IggyError::CannotReadFile)?;
+
+        let mut cache = IggyIndexCache::with_capacity(count);
+        let mut view = buffer.as_slice();
+        for _ in 0..count {
+            let offset = view.get_u64_le();
+            let timestamp = view.get_u64_le();
+            let position = view.get_u64_le();
+            cache.insert(offset, timestamp, position);
+        }
+        Ok(cache)
     }
 }

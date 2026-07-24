@@ -361,7 +361,7 @@ mod tests {
                                 purge_generation: 0,
                             }],
                             consumer_groups: Vec::new(),
-                            next_consumer_group_id: 1,
+                            next_consumer_group_id: 0,
                         },
                     )],
                 },

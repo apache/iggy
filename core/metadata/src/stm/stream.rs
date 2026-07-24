@@ -201,7 +201,7 @@ impl Default for Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 }
@@ -229,7 +229,7 @@ impl Topic {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         }
     }
 
@@ -1416,7 +1416,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
-            next_consumer_group_id: 1,
+            next_consumer_group_id: 0,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -1862,17 +1862,14 @@ impl Snapshotable for Streams {
                         .iter()
                         .map(|(_, group_snap)| (Arc::from(group_snap.name.as_str()), group_snap.id))
                         .collect(),
-                    next_consumer_group_id: topic_snap
-                        .next_consumer_group_id
-                        .max(
-                            topic_snap
-                                .consumer_groups
-                                .iter()
-                                .map(|(id, _)| id + 1)
-                                .max()
-                                .unwrap_or(1),
-                        )
-                        .max(1),
+                    next_consumer_group_id: topic_snap.next_consumer_group_id.max(
+                        topic_snap
+                            .consumer_groups
+                            .iter()
+                            .map(|(id, _)| id + 1)
+                            .max()
+                            .unwrap_or(0),
+                    ),
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()

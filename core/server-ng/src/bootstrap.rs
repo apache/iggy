@@ -481,6 +481,7 @@ struct TcpTopology {
     replica_listen_addr: Option<SocketAddr>,
     ws_listen_addr: Option<SocketAddr>,
     quic_listen_addr: Option<SocketAddr>,
+    http_listen_addr: Option<SocketAddr>,
     tcp_tls_listen_addr: Option<SocketAddr>,
     peers: Vec<(u8, SocketAddr)>,
 }
@@ -1473,19 +1474,13 @@ fn spawn_shutdown_watchdog(
 /// Copy the configured cluster roster plus this node's own client ports into
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
 /// the real topology. `self_*` back only the cluster-disabled self-synthesis;
-/// the HTTP port is read from config since HTTP binds outside this topology.
+/// every self port comes from the resolved topology so the reported HTTP port
+/// matches the address this node actually binds (the roster port in a cluster).
 fn build_cluster_roster(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     metadata_view: Arc<AtomicU64>,
 ) -> ClusterRoster {
-    let http_port = if config.http.enabled {
-        parse_socket_addr("http.address", &config.http.address)
-            .ok()
-            .map(|addr| addr.port())
-    } else {
-        None
-    };
     ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
@@ -1494,7 +1489,7 @@ fn build_cluster_roster(
         self_ports: configs::ng_cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
             quic: topology.quic_listen_addr.map(|addr| addr.port()),
-            http: http_port,
+            http: topology.http_listen_addr.map(|addr| addr.port()),
             websocket: topology.ws_listen_addr.map(|addr| addr.port()),
             tcp_replica: None,
         },
@@ -2026,6 +2021,8 @@ fn resolve_tcp_topology(
     )?;
     let default_quic_addr =
         resolve_optional_listener_addr(config.quic.enabled, "quic.address", &config.quic.address)?;
+    let default_http_addr =
+        resolve_optional_listener_addr(config.http.enabled, "http.address", &config.http.address)?;
     if !config.cluster.enabled {
         if let Some(replica_id) = current_replica_id
             && replica_id != SHARD_REPLICA_ID
@@ -2048,6 +2045,7 @@ fn resolve_tcp_topology(
             replica_listen_addr: Some(SocketAddr::new(default_client_addr.ip(), 0)),
             ws_listen_addr: default_ws_addr,
             quic_listen_addr: default_quic_addr,
+            http_listen_addr: default_http_addr,
             tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(default_client_addr),
             peers: Vec::new(),
         });
@@ -2068,11 +2066,17 @@ fn resolve_tcp_topology(
             count: config.cluster.nodes.len(),
         }
     })?;
-    let (client_listen_addr, ws_listen_addr, quic_listen_addr) = resolve_cluster_client_addrs(
+    let ClusterClientAddrs {
+        client: client_listen_addr,
+        ws: ws_listen_addr,
+        quic: quic_listen_addr,
+        http: http_listen_addr,
+    } = resolve_cluster_client_addrs(
         self_node,
         default_client_addr,
         default_ws_addr,
         default_quic_addr,
+        default_http_addr,
     )?;
     let replica_port =
         self_node
@@ -2096,6 +2100,7 @@ fn resolve_tcp_topology(
         replica_listen_addr,
         ws_listen_addr,
         quic_listen_addr,
+        http_listen_addr,
         tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(client_listen_addr),
         peers,
     })
@@ -2112,31 +2117,52 @@ fn resolve_optional_listener_addr(
     Ok(None)
 }
 
+/// Client-facing listener addresses resolved for this cluster node. Each port
+/// comes from the node's roster entry, falling back to the top-level listener
+/// default when the roster leaves it unset.
+struct ClusterClientAddrs {
+    client: SocketAddr,
+    ws: Option<SocketAddr>,
+    quic: Option<SocketAddr>,
+    http: Option<SocketAddr>,
+}
+
 fn resolve_cluster_client_addrs(
     self_node: &configs::ng_cluster::ClusterNodeConfig,
     default_client_addr: SocketAddr,
     default_ws_addr: Option<SocketAddr>,
     default_quic_addr: Option<SocketAddr>,
-) -> Result<(SocketAddr, Option<SocketAddr>, Option<SocketAddr>), ServerNgError> {
+    default_http_addr: Option<SocketAddr>,
+) -> Result<ClusterClientAddrs, ServerNgError> {
     let client_port = self_node
         .ports
         .tcp
         .unwrap_or_else(|| default_client_addr.port());
-    let client_listen_addr =
-        socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
-    let ws_listen_addr = resolve_cluster_optional_addr(
+    let client = socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let ws = resolve_cluster_optional_addr(
         self_node,
         "cluster.nodes[*].ports.websocket",
         default_ws_addr,
         |ports| ports.websocket,
     )?;
-    let quic_listen_addr = resolve_cluster_optional_addr(
+    let quic = resolve_cluster_optional_addr(
         self_node,
         "cluster.nodes[*].ports.quic",
         default_quic_addr,
         |ports| ports.quic,
     )?;
-    Ok((client_listen_addr, ws_listen_addr, quic_listen_addr))
+    let http = resolve_cluster_optional_addr(
+        self_node,
+        "cluster.nodes[*].ports.http",
+        default_http_addr,
+        |ports| ports.http,
+    )?;
+    Ok(ClusterClientAddrs {
+        client,
+        ws,
+        quic,
+        http,
+    })
 }
 
 fn resolve_cluster_optional_addr(
@@ -2208,8 +2234,7 @@ async fn start_tcp_runtime(
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds independently. Shard-0 gating comes from the sole
     // caller of this function.
-    if config.http.enabled {
-        let http_addr = parse_socket_addr("http.address", &config.http.address)?;
+    if let Some(http_addr) = topology.http_listen_addr {
         let self_ports = configs::ng_cluster::TransportPorts {
             tcp: config
                 .tcp
@@ -3302,5 +3327,64 @@ mod tests {
             matches!(err, ServerNgError::MetadataHandoffAborted { shard_id: 2 }),
             "expected MetadataHandoffAborted, got {err:?}"
         );
+    }
+
+    fn cluster_node(ip: &str, http: Option<u16>) -> configs::ng_cluster::ClusterNodeConfig {
+        configs::ng_cluster::ClusterNodeConfig {
+            name: "node".to_owned(),
+            ip: ip.to_owned(),
+            replica_id: 0,
+            ports: configs::ng_cluster::TransportPorts {
+                http,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn addr(value: &str) -> SocketAddr {
+        value.parse().expect("valid socket address literal")
+    }
+
+    #[test]
+    fn cluster_http_addr_prefers_roster_port_over_default() {
+        // A byte-identical top-level [http].address is shared across nodes on
+        // one host; the per-node roster port must win so each binds a distinct
+        // HTTP socket instead of colliding on the shared default.
+        let node = cluster_node("127.0.0.1", Some(18090));
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("127.0.0.1:18070"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        )
+        .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, Some(addr("127.0.0.1:18090")));
+    }
+
+    #[test]
+    fn cluster_http_addr_falls_back_to_default_port_on_self_node_ip() {
+        // No roster HTTP port: keep the top-level port but still bind the
+        // node's own roster IP, exactly like the ws/quic fallback.
+        let node = cluster_node("10.0.0.5", None);
+        let addrs = resolve_cluster_client_addrs(
+            &node,
+            addr("10.0.0.5:18070"),
+            None,
+            None,
+            Some(addr("127.0.0.1:3000")),
+        )
+        .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, Some(addr("10.0.0.5:3000")));
+    }
+
+    #[test]
+    fn cluster_http_addr_is_none_when_http_disabled() {
+        // http.enabled = false collapses default_http_addr to None; no roster
+        // port can revive a listener the operator turned off.
+        let node = cluster_node("127.0.0.1", Some(18090));
+        let addrs = resolve_cluster_client_addrs(&node, addr("127.0.0.1:18070"), None, None, None)
+            .expect("cluster address resolution must succeed");
+        assert_eq!(addrs.http, None);
     }
 }
