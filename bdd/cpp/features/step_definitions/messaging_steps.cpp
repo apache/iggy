@@ -72,15 +72,15 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
     // Drive the SDK through the typed helpers in iggy.hpp rather than raw strings. Options that
     // still take plain strings below (partitioning kind, consumer kind) mark where the C++ SDK
     // does not yet expose a typed wrapper.
-    const auto compression    = iggy::CompressionAlgorithm::none();
-    const auto message_expiry = iggy::Expiry::never_expire();
-    const auto max_topic_size = iggy::MaxTopicSize::server_default();
+    const auto compression    = iggy::CompressionAlgorithm::None();
+    const auto message_expiry = iggy::Expiry::NeverExpire();
+    const auto max_topic_size = iggy::MaxTopicSize::ServerDefault();
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
                                   static_cast<std::uint32_t>(partitions_count),
-                                  std::string(compression.compression_algorithm_value()), 0,
-                                  std::string(message_expiry.expiry_kind()), message_expiry.expiry_value(),
-                                  std::string(max_topic_size.max_topic_size()));
+                                  std::string(compression.CompressionAlgorithmValue()), 0,
+                                  std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
+                                  std::string(max_topic_size.MaxTopicSizeValue()));
 }
 
 THEN("^the topic should be created successfully$") {
@@ -146,12 +146,12 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     REGEX_PARAM(int, offset);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto polling_strategy = iggy::PollingStrategy::offset(static_cast<std::uint64_t>(offset));
+    const auto polling_strategy = iggy::PollingStrategy::Offset(static_cast<std::uint64_t>(offset));
     const auto polled           = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), std::string(polling_strategy.polling_strategy_kind()),
-        polling_strategy.polling_strategy_value(), 100, false);
+        "consumer", bdd::make_numeric_identifier(1), std::string(polling_strategy.PollingStrategyKind()),
+        polling_strategy.PollingStrategyValue(), 100, false);
 
     context->polled.count = polled.count;
     context->polled.offsets.clear();

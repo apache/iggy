@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -36,26 +37,58 @@
 class LowLevelE2E_Client : public E2ETestFixture {};
 
 TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
-    RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
+    RecordProperty("description",
+                   "Connects and returns matching login information using binary connection string formats.");
+    constexpr std::uint32_t root_user_id   = 0;
     const std::string username             = "iggy";
     const std::string password             = "iggy";
     const std::string connection_strings[] = {
         "iggy://iggy:iggy@127.0.0.1:8090",
         "iggy+tcp://iggy:iggy@127.0.0.1:8090",
-        "iggy+http://iggy:iggy@127.0.0.1:3000",
         "",
     };
 
     for (const std::string &connection_string : connection_strings) {
         SCOPED_TRACE(connection_string);
         iggy::ffi::Client *client = nullptr;
-        ASSERT_NO_THROW({ client = iggy::ffi::new_connection(connection_string); });
+        ASSERT_NO_THROW({
+            client = connection_string.empty() ? iggy::ffi::new_connection({})
+                                               : iggy::ffi::from_connection_string(connection_string);
+        });
         ASSERT_NE(client, nullptr);
         TrackClient(client);
 
+        iggy::ffi::LoginInfo login_info{};
+        iggy::ffi::ClientInfoDetails me{};
         ASSERT_NO_THROW(client->connect());
-        ASSERT_NO_THROW(client->login_user(username, password));
+        ASSERT_NO_THROW({ login_info = client->login_user(username, password); });
+        ASSERT_NO_THROW({ me = client->get_me(); });
+
+        EXPECT_EQ(login_info.user_id, root_user_id);
+        EXPECT_TRUE(me.has_user_id);
+        EXPECT_EQ(login_info.user_id, me.user_id);
+        EXPECT_FALSE(login_info.has_access_token);
+        EXPECT_TRUE(static_cast<std::string>(login_info.access_token).empty());
+        EXPECT_EQ(login_info.access_token_expiry, 0u);
     }
+}
+
+TEST_F(LowLevelE2E_Client, HttpLoginReturnsAccessToken) {
+    RecordProperty("description", "Returns root user information and an access token after HTTP login.");
+    constexpr std::uint32_t root_user_id = 0;
+    iggy::ffi::Client *client            = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::from_connection_string("iggy+http://iggy:iggy@127.0.0.1:3000"); });
+    ASSERT_NE(client, nullptr);
+    TrackClient(client);
+
+    iggy::ffi::LoginInfo login_info{};
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW({ login_info = client->login_user("iggy", "iggy"); });
+
+    EXPECT_EQ(login_info.user_id, root_user_id);
+    EXPECT_TRUE(login_info.has_access_token);
+    EXPECT_FALSE(static_cast<std::string>(login_info.access_token).empty());
+    EXPECT_NE(login_info.access_token_expiry, 0u);
 }
 
 TEST_F(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
@@ -68,14 +101,14 @@ TEST_F(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
 
     for (const std::string &connection_string : malformed_connection_strings) {
         SCOPED_TRACE(connection_string);
-        ASSERT_THROW({ iggy::ffi::new_connection(connection_string); }, std::exception);
+        ASSERT_THROW({ iggy::ffi::from_connection_string(connection_string); }, std::exception);
     }
 }
 
 TEST_F(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
     RecordProperty("description", "Throws when authentication uses invalid credentials after connecting.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -86,7 +119,7 @@ TEST_F(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
 TEST_F(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
     RecordProperty("description", "Rejects a second login attempt that switches to invalid credentials.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -99,7 +132,7 @@ TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
     RecordProperty("description",
                    "Rejects logout before authentication, both before and after connect, then succeeds after login.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -113,21 +146,26 @@ TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
 }
 
 TEST_F(LowLevelE2E_Client, ReloginOnSameClientAfterLogout) {
-    RecordProperty("description", "Allows reauthenticating on the same connected client after a successful logout.");
+    RecordProperty("description", "Returns the same user identity when reauthenticating after a successful logout.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
+    iggy::ffi::LoginInfo first_login{};
+    iggy::ffi::LoginInfo second_login{};
     iggy::ffi::ClientInfoDetails first_me{};
     iggy::ffi::ClientInfoDetails second_me{};
     ASSERT_NO_THROW(client->connect());
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ first_login = client->login_user("iggy", "iggy"); });
     ASSERT_NO_THROW({ first_me = client->get_me(); });
     ASSERT_NO_THROW(client->logout_user());
-    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW({ second_login = client->login_user("iggy", "iggy"); });
     ASSERT_NO_THROW({ second_me = client->get_me(); });
 
+    EXPECT_EQ(first_login.user_id, first_me.user_id);
+    EXPECT_EQ(second_login.user_id, second_me.user_id);
+    EXPECT_EQ(second_login.user_id, first_login.user_id);
     EXPECT_EQ(second_me.client_id, first_me.client_id);
     EXPECT_EQ(second_me.user_id, first_me.user_id);
 }
@@ -136,7 +174,7 @@ TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
     RecordProperty("description",
                    "Rejects repeated logout calls once the authenticated session has already logged out.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -144,6 +182,1355 @@ TEST_F(LowLevelE2E_Client, LogoutErrorsWhenCalledMoreThanOnce) {
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
     ASSERT_NO_THROW(client->logout_user());
     ASSERT_THROW(client->logout_user(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserWithUsernameOutsideLengthBoundsThrows) {
+    RecordProperty("description", "Rejects 2-byte and 51-byte usernames over TCP without creating users.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    const std::string too_short_username(2, 'a');
+    const std::string too_long_username(51, 'a');
+    const std::string usernames[] = {too_short_username, too_long_username};
+
+    ASSERT_EQ(too_short_username.size(), 2u);
+    ASSERT_EQ(too_long_username.size(), 51u);
+    for (const auto &username : usernames) {
+        SCOPED_TRACE(username.size());
+        ASSERT_THROW(client->create_user(username, "secret123", 1, false, iggy::ffi::Permissions{}), std::exception);
+        ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserAcceptsNonAsciiAndNonAlphabeticUsernames) {
+    RecordProperty("description",
+                   "Creates and retrieves usernames containing punctuation, multilingual UTF-8, and emoji over TCP.");
+    iggy::ffi::Client *client     = GetLoggedInClient();
+    const std::string suffix      = GetRandomName(12);
+    const std::string usernames[] = {
+        "!@#_" + suffix, "ユーザー_" + suffix, "用户_" + suffix, "नाम_" + suffix, "사용자_" + suffix, "😀🚀_" + suffix,
+    };
+
+    for (const auto &username : usernames) {
+        SCOPED_TRACE(username);
+        ASSERT_LE(username.size(), 50u);
+
+        iggy::ffi::UserInfoDetails created_user{};
+        iggy::ffi::UserInfoDetails fetched_user{};
+        ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+        ASSERT_NO_THROW({ fetched_user = client->get_user(make_string_identifier(username)); });
+
+        EXPECT_EQ(fetched_user.id, created_user.id);
+        EXPECT_EQ(static_cast<std::string>(created_user.username), username);
+        EXPECT_EQ(static_cast<std::string>(fetched_user.username), username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserBeforeLoginThrows) {
+    RecordProperty("description", "Rejects user creation without an active authenticated session.");
+    iggy::ffi::Client *client               = GetLoggedOutClient();
+    iggy::ffi::Client *root                 = GetLoggedInClient();
+    const std::string before_login_username = GetRandomName(50);
+    const std::string logged_out_username   = GetRandomName(50);
+    const std::string disconnected_username = GetRandomName(50);
+
+    ASSERT_THROW(client->create_user(before_login_username, "secret123", 1, false, iggy::ffi::Permissions{}),
+                 std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->create_user(before_login_username, "secret123", 1, false, iggy::ffi::Permissions{}),
+                 std::exception);
+
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->create_user(logged_out_username, "secret123", 1, false, iggy::ffi::Permissions{}),
+                 std::exception);
+
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->create_user(disconnected_username, "secret123", 1, false, iggy::ffi::Permissions{}),
+                 std::exception);
+
+    ASSERT_THROW(root->get_user(make_string_identifier(before_login_username)), std::exception);
+    ASSERT_THROW(root->get_user(make_string_identifier(logged_out_username)), std::exception);
+    ASSERT_THROW(root->get_user(make_string_identifier(disconnected_username)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserAcceptsUsernameAndPasswordLengthBounds) {
+    RecordProperty("description",
+                   "Creates users with shortest and longest ASCII usernames and passwords that can authenticate.");
+    iggy::ffi::Client *root_client     = GetLoggedInClient();
+    iggy::ffi::Client *shortest_client = GetLoggedOutClient();
+    iggy::ffi::Client *longest_client  = GetLoggedOutClient();
+    std::string shortest_username      = GetRandomName(3);
+    std::string longest_username       = GetRandomName(50);
+    const std::string shortest_password(3, 'a');
+    const std::string longest_password(100, 'a');
+    longest_username.resize(50, 'a');
+    ASSERT_EQ(shortest_username.size(), 3u);
+    ASSERT_EQ(longest_username.size(), 50u);
+    ASSERT_EQ(shortest_password.size(), 3u);
+    ASSERT_EQ(longest_password.size(), 100u);
+
+    iggy::ffi::UserInfoDetails shortest_user{};
+    iggy::ffi::UserInfoDetails longest_user{};
+    iggy::ffi::UserInfoDetails fetched_shortest{};
+    iggy::ffi::UserInfoDetails fetched_longest{};
+    ASSERT_NO_THROW({ shortest_user = CreateUser(root_client, shortest_username, shortest_password, 1); });
+    ASSERT_NO_THROW({ longest_user = CreateUser(root_client, longest_username, longest_password, 1); });
+    ASSERT_NO_THROW({ fetched_shortest = root_client->get_user(make_string_identifier(shortest_username)); });
+    ASSERT_NO_THROW({ fetched_longest = root_client->get_user(make_string_identifier(longest_username)); });
+    ASSERT_NO_THROW(shortest_client->connect());
+    ASSERT_NO_THROW(longest_client->connect());
+    ASSERT_NO_THROW(shortest_client->login_user(shortest_username, shortest_password));
+    ASSERT_NO_THROW(longest_client->login_user(longest_username, longest_password));
+
+    EXPECT_EQ(static_cast<std::string>(shortest_user.username), shortest_username);
+    EXPECT_EQ(static_cast<std::string>(longest_user.username), longest_username);
+    EXPECT_EQ(fetched_shortest.id, shortest_user.id);
+    EXPECT_EQ(fetched_longest.id, longest_user.id);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserWithPasswordOutsideLengthBoundsThrows) {
+    RecordProperty("description", "Rejects 2-byte and 101-byte passwords without creating users.");
+    iggy::ffi::Client *client        = GetLoggedInClient();
+    const std::string short_username = GetRandomName(50);
+    const std::string long_username  = GetRandomName(50);
+    const std::string short_password(2, 'a');
+    const std::string long_password(101, 'a');
+    ASSERT_EQ(short_password.size(), 2u);
+    ASSERT_EQ(long_password.size(), 101u);
+
+    ASSERT_THROW(client->create_user(short_username, short_password, 1, false, iggy::ffi::Permissions{}),
+                 std::exception);
+    ASSERT_THROW(client->create_user(long_username, long_password, 1, false, iggy::ffi::Permissions{}), std::exception);
+    ASSERT_THROW(client->get_user(make_string_identifier(short_username)), std::exception);
+    ASSERT_THROW(client->get_user(make_string_identifier(long_username)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserWithInvalidStatusThrows) {
+    RecordProperty("description", "Rejects invalid status codes before creating users.");
+    iggy::ffi::Client *client     = GetLoggedInClient();
+    const std::uint8_t statuses[] = {0, 3, std::numeric_limits<std::uint8_t>::max()};
+
+    for (const std::uint8_t status : statuses) {
+        const std::string username = GetRandomName(50);
+        SCOPED_TRACE(status);
+        ASSERT_THROW(client->create_user(username, "secret123", status, false, iggy::ffi::Permissions{}),
+                     std::exception);
+        ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserReturnsCreatedActiveUserDetails) {
+    RecordProperty("description", "Returns and persists active user details.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    iggy::ffi::UserInfoDetails fetched_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+    ASSERT_NO_THROW({ fetched_user = client->get_user(make_string_identifier(username)); });
+
+    EXPECT_EQ(fetched_user.id, created_user.id);
+    EXPECT_EQ(static_cast<std::string>(created_user.username), username);
+    EXPECT_EQ(static_cast<std::string>(fetched_user.username), username);
+    EXPECT_EQ(created_user.status, 1u);
+    EXPECT_EQ(fetched_user.status, 1u);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserRejectsDuplicateUsernameWithoutChangingOriginal) {
+    RecordProperty("description", "Rejects duplicate usernames without changing the existing user.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    const std::string username     = GetRandomName(50);
+    const std::string password     = "original-secret";
+    iggy::ffi::UserInfoDetails original{};
+    ASSERT_NO_THROW({ original = CreateUser(root_client, username, password, 1); });
+
+    ASSERT_THROW(root_client->create_user(username, "replacement-secret", 2, false, iggy::ffi::Permissions{}),
+                 std::exception);
+
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched.id, original.id);
+    EXPECT_EQ(fetched.status, 1u);
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, password));
+    iggy::ffi::Client *replacement_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(replacement_client->connect());
+    ASSERT_THROW(replacement_client->login_user(username, "replacement-secret"), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserPreservesNestedPermissionsInCreateAndGetResponses) {
+    RecordProperty("description",
+                   "Creates a user with global and per-resource permissions, then verifies create_user and get_user "
+                   "return the same flags and numeric stream/topic IDs.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_servers = true;
+    permissions.global.read_users     = true;
+    permissions.global.manage_streams = true;
+    permissions.global.read_topics    = true;
+    permissions.global.send_messages  = true;
+
+    iggy::ffi::StreamPermissionEntry first_stream{};
+    first_stream.stream_id                 = 42;
+    first_stream.permissions.manage_stream = true;
+    first_stream.permissions.read_topics   = true;
+    first_stream.permissions.send_messages = true;
+    iggy::ffi::TopicPermissionEntry first_topic{};
+    first_topic.topic_id                  = 7;
+    first_topic.permissions.manage_topic  = true;
+    first_topic.permissions.poll_messages = true;
+    iggy::ffi::TopicPermissionEntry second_topic{};
+    second_topic.topic_id                  = 9;
+    second_topic.permissions.read_topic    = true;
+    second_topic.permissions.send_messages = true;
+    first_stream.permissions.topics.push_back(std::move(first_topic));
+    first_stream.permissions.topics.push_back(std::move(second_topic));
+
+    iggy::ffi::StreamPermissionEntry second_stream{};
+    second_stream.stream_id                 = 84;
+    second_stream.permissions.read_stream   = true;
+    second_stream.permissions.manage_topics = true;
+    second_stream.permissions.poll_messages = true;
+    iggy::ffi::TopicPermissionEntry third_topic{};
+    third_topic.topic_id               = 3;
+    third_topic.permissions.read_topic = true;
+    second_stream.permissions.topics.push_back(std::move(third_topic));
+    permissions.streams.push_back(std::move(first_stream));
+    permissions.streams.push_back(std::move(second_stream));
+
+    iggy::ffi::UserInfoDetails created{};
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(username)); });
+    for (const auto *user : {&created, &fetched}) {
+        EXPECT_TRUE(user->permissions.global.manage_servers);
+        EXPECT_FALSE(user->permissions.global.read_servers);
+        EXPECT_FALSE(user->permissions.global.manage_users);
+        EXPECT_TRUE(user->permissions.global.read_users);
+        EXPECT_TRUE(user->permissions.global.manage_streams);
+        EXPECT_FALSE(user->permissions.global.read_streams);
+        EXPECT_FALSE(user->permissions.global.manage_topics);
+        EXPECT_TRUE(user->permissions.global.read_topics);
+        EXPECT_FALSE(user->permissions.global.poll_messages);
+        EXPECT_TRUE(user->permissions.global.send_messages);
+        ASSERT_EQ(user->permissions.streams.size(), 2u);
+
+        const iggy::ffi::StreamPermissionEntry *stream_42 = nullptr;
+        const iggy::ffi::StreamPermissionEntry *stream_84 = nullptr;
+        for (const auto &stream : user->permissions.streams) {
+            if (stream.stream_id == 42) {
+                stream_42 = &stream;
+            }
+            if (stream.stream_id == 84) {
+                stream_84 = &stream;
+            }
+        }
+        ASSERT_NE(stream_42, nullptr);
+        ASSERT_NE(stream_84, nullptr);
+        EXPECT_TRUE(stream_42->permissions.manage_stream);
+        EXPECT_FALSE(stream_42->permissions.read_stream);
+        EXPECT_FALSE(stream_42->permissions.manage_topics);
+        EXPECT_TRUE(stream_42->permissions.read_topics);
+        EXPECT_FALSE(stream_42->permissions.poll_messages);
+        EXPECT_TRUE(stream_42->permissions.send_messages);
+        ASSERT_EQ(stream_42->permissions.topics.size(), 2u);
+        const iggy::ffi::TopicPermissionEntry *topic_7 = nullptr;
+        const iggy::ffi::TopicPermissionEntry *topic_9 = nullptr;
+        for (const auto &topic : stream_42->permissions.topics) {
+            if (topic.topic_id == 7) {
+                topic_7 = &topic;
+            }
+            if (topic.topic_id == 9) {
+                topic_9 = &topic;
+            }
+        }
+        ASSERT_NE(topic_7, nullptr);
+        ASSERT_NE(topic_9, nullptr);
+        EXPECT_TRUE(topic_7->permissions.manage_topic);
+        EXPECT_FALSE(topic_7->permissions.read_topic);
+        EXPECT_TRUE(topic_7->permissions.poll_messages);
+        EXPECT_FALSE(topic_7->permissions.send_messages);
+        EXPECT_FALSE(topic_9->permissions.manage_topic);
+        EXPECT_TRUE(topic_9->permissions.read_topic);
+        EXPECT_FALSE(topic_9->permissions.poll_messages);
+        EXPECT_TRUE(topic_9->permissions.send_messages);
+        EXPECT_FALSE(stream_84->permissions.manage_stream);
+        EXPECT_TRUE(stream_84->permissions.read_stream);
+        EXPECT_TRUE(stream_84->permissions.manage_topics);
+        EXPECT_FALSE(stream_84->permissions.read_topics);
+        EXPECT_TRUE(stream_84->permissions.poll_messages);
+        EXPECT_FALSE(stream_84->permissions.send_messages);
+        ASSERT_EQ(stream_84->permissions.topics.size(), 1u);
+        EXPECT_EQ(stream_84->permissions.topics[0].topic_id, 3u);
+        EXPECT_FALSE(stream_84->permissions.topics[0].permissions.manage_topic);
+        EXPECT_TRUE(stream_84->permissions.topics[0].permissions.read_topic);
+        EXPECT_FALSE(stream_84->permissions.topics[0].permissions.poll_messages);
+        EXPECT_FALSE(stream_84->permissions.topics[0].permissions.send_messages);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, CreatedUserCanReadOnlyTopicGrantedByPermissions) {
+    RecordProperty("description",
+                   "Creates a user with read access to one topic, then verifies that topic can be fetched and a topic "
+                   "in another stream is denied.");
+    iggy::ffi::Client *root_client        = GetLoggedInClient();
+    iggy::ffi::Client *user_client        = GetLoggedOutClient();
+    const std::string allowed_stream_name = GetRandomName();
+    const std::string denied_stream_name  = GetRandomName();
+    const std::string allowed_topic_name  = GetRandomName();
+    const std::string denied_topic_name   = GetRandomName();
+    const std::string username            = GetRandomName(50);
+
+    iggy::ffi::StreamDetails allowed_stream{};
+    iggy::ffi::StreamDetails denied_stream{};
+    ASSERT_NO_THROW({ allowed_stream = root_client->create_stream(allowed_stream_name); });
+    TrackStream(allowed_stream_name);
+    ASSERT_NO_THROW({ denied_stream = root_client->create_stream(denied_stream_name); });
+    TrackStream(denied_stream_name);
+
+    iggy::ffi::TopicDetails allowed_topic{};
+    iggy::ffi::TopicDetails denied_topic{};
+    ASSERT_NO_THROW({
+        allowed_topic = root_client->create_topic(make_numeric_identifier(allowed_stream.id), allowed_topic_name, 1,
+                                                  "none", 0, "server_default", 0, "server_default");
+        denied_topic  = root_client->create_topic(make_numeric_identifier(denied_stream.id), denied_topic_name, 1,
+                                                  "none", 0, "server_default", 0, "server_default");
+    });
+
+    iggy::ffi::Permissions permissions{};
+    iggy::ffi::StreamPermissionEntry stream_permissions{};
+    stream_permissions.stream_id = allowed_stream.id;
+    iggy::ffi::TopicPermissionEntry topic_permissions{};
+    topic_permissions.topic_id               = allowed_topic.id;
+    topic_permissions.permissions.read_topic = true;
+    stream_permissions.permissions.topics.push_back(std::move(topic_permissions));
+    permissions.streams.push_back(std::move(stream_permissions));
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::TopicDetails fetched_topic{};
+    ASSERT_NO_THROW({
+        fetched_topic = user_client->get_topic(make_numeric_identifier(allowed_stream.id),
+                                               make_numeric_identifier(allowed_topic.id));
+    });
+    EXPECT_EQ(fetched_topic.id, allowed_topic.id);
+    EXPECT_EQ(static_cast<std::string>(fetched_topic.name), allowed_topic_name);
+    ASSERT_THROW(
+        user_client->get_topic(make_numeric_identifier(denied_stream.id), make_numeric_identifier(denied_topic.id)),
+        std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserRejectsDuplicateStreamPermissionIdsWithoutCreatingUser) {
+    RecordProperty("description",
+                   "Attempts to create a user with two permission entries for stream ID 42, then verifies creation "
+                   "fails and no user is stored.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    iggy::ffi::StreamPermissionEntry first_stream{};
+    iggy::ffi::StreamPermissionEntry second_stream{};
+    first_stream.stream_id  = 42;
+    second_stream.stream_id = 42;
+    permissions.streams.push_back(std::move(first_stream));
+    permissions.streams.push_back(std::move(second_stream));
+
+    ASSERT_THROW(client->create_user(username, "secret123", 1, true, std::move(permissions)), std::exception);
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreateUserRejectsDuplicateTopicPermissionIdsWithoutCreatingUser) {
+    RecordProperty("description",
+                   "Attempts to create a user with two permission entries for topic ID 7 in the same stream, then "
+                   "verifies creation fails and no user is stored.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    iggy::ffi::StreamPermissionEntry stream{};
+    stream.stream_id = 42;
+    iggy::ffi::TopicPermissionEntry first_topic{};
+    iggy::ffi::TopicPermissionEntry second_topic{};
+    first_topic.topic_id  = 7;
+    second_topic.topic_id = 7;
+    stream.permissions.topics.push_back(std::move(first_topic));
+    stream.permissions.topics.push_back(std::move(second_topic));
+    permissions.streams.push_back(std::move(stream));
+
+    ASSERT_THROW(client->create_user(username, "secret123", 1, true, std::move(permissions)), std::exception);
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowCreateUser) {
+    RecordProperty("description", "Rejects user creation by a user with read_users but not manage_users.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    const std::string username     = GetRandomName(50);
+    const std::string target       = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    ASSERT_THROW(user_client->create_user(target, "secret123", 1, false, iggy::ffi::Permissions{}), std::exception);
+    ASSERT_THROW(root_client->get_user(make_string_identifier(target)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsGrantingAdditionalPermissions) {
+    RecordProperty("description", "Allows a user manager to grant a child a permission the manager does not have.");
+    iggy::ffi::Client *root_client     = GetLoggedInClient();
+    iggy::ffi::Client *manager_client  = GetLoggedOutClient();
+    iggy::ffi::Client *child_client    = GetLoggedOutClient();
+    const std::string manager_username = GetRandomName(50);
+    const std::string child_username   = GetRandomName(50);
+    const std::string denied_stream    = GetRandomName();
+    const std::string child_stream     = GetRandomName();
+    iggy::ffi::Permissions manager_permissions{};
+    manager_permissions.global.manage_users   = true;
+    manager_permissions.global.manage_streams = false;
+    ASSERT_NO_THROW(
+        { CreateUser(root_client, manager_username, "secret123", 1, true, std::move(manager_permissions)); });
+    ASSERT_NO_THROW(manager_client->connect());
+    ASSERT_NO_THROW(manager_client->login_user(manager_username, "secret123"));
+    ASSERT_THROW(manager_client->create_stream(denied_stream), std::exception);
+
+    iggy::ffi::Permissions child_permissions{};
+    child_permissions.global.manage_streams = true;
+    iggy::ffi::UserInfoDetails child{};
+    ASSERT_NO_THROW(
+        { child = CreateUser(manager_client, child_username, "child-secret", 1, true, std::move(child_permissions)); });
+    EXPECT_EQ(static_cast<std::string>(child.username), child_username);
+    EXPECT_EQ(child.status, 1u);
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(child_username)); });
+    EXPECT_EQ(fetched.id, child.id);
+    EXPECT_TRUE(fetched.permissions.global.manage_streams);
+
+    ASSERT_NO_THROW(child_client->connect());
+    ASSERT_NO_THROW(child_client->login_user(child_username, "child-secret"));
+    ASSERT_NO_THROW(child_client->create_stream(child_stream));
+    TrackStream(child_stream);
+}
+
+TEST_F(LowLevelE2E_Client, CreatedActiveUserAuthenticatesOnlyWithSuppliedPassword) {
+    RecordProperty("description", "Authenticates an active user only with its supplied password.");
+    iggy::ffi::Client *root_client  = GetLoggedInClient();
+    iggy::ffi::Client *valid_client = GetLoggedOutClient();
+    iggy::ffi::Client *wrong_client = GetLoggedOutClient();
+    const std::string username      = GetRandomName(50);
+    const std::string password      = "known-secret";
+    ASSERT_NO_THROW({ CreateUser(root_client, username, password, 1); });
+    ASSERT_NO_THROW(valid_client->connect());
+    ASSERT_NO_THROW(wrong_client->connect());
+    ASSERT_NO_THROW(valid_client->login_user(username, password));
+    ASSERT_THROW(wrong_client->login_user(username, "other-secret"), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, CreatedInactiveUserCannotAuthenticate) {
+    RecordProperty("description", "Persists inactive users but rejects authentication for them.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    const std::string username     = GetRandomName(50);
+    const std::string password     = "inactive-secret";
+    iggy::ffi::UserInfoDetails created{};
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ created = CreateUser(root_client, username, password, 2); });
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(created.status, 2u);
+    EXPECT_EQ(fetched.status, 2u);
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_THROW(user_client->login_user(username, password), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsUnauthenticatedClientWithoutChangingTarget) {
+    RecordProperty("description", "Rejects user updates without an active authenticated session.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    const std::string replacement  = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(root_client, username, "secret123", 1); });
+
+    iggy::ffi::Client *client = GetLoggedOutClient();
+    ASSERT_THROW(client->update_user(make_string_identifier(username), replacement, 2), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->update_user(make_string_identifier(username), replacement, 2), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->update_user(make_string_identifier(username), replacement, 2), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->update_user(make_string_identifier(username), replacement, 2), std::exception);
+
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), username);
+    EXPECT_EQ(fetched.status, 1u);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsUnknownUsernameAndNumericId) {
+    RecordProperty("description", "Rejects updates for unknown username and numeric identifiers.");
+    iggy::ffi::Client *client           = GetLoggedInClient();
+    const std::string unknown_username  = GetRandomName(50);
+    const std::string proposed_username = GetRandomName(50);
+    const auto unknown_id               = std::numeric_limits<std::uint32_t>::max();
+
+    ASSERT_THROW(client->update_user(make_string_identifier(unknown_username), proposed_username, 2), std::exception);
+    ASSERT_THROW(client->update_user(make_numeric_identifier(unknown_id), GetRandomName(50), 2), std::exception);
+    ASSERT_THROW(client->get_user(make_string_identifier(proposed_username)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserByUsernameChangesUsernameAndStatus) {
+    RecordProperty("description", "Updates a user by username and changes both username and status.");
+    iggy::ffi::Client *client     = GetLoggedInClient();
+    const std::string username    = GetRandomName(50);
+    const std::string replacement = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", 1); });
+    ASSERT_NO_THROW(client->update_user(make_string_identifier(username), replacement, 2));
+    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
+    ASSERT_NE(tracked_user, tracked_user_names_.end());
+    if (tracked_user != tracked_user_names_.end()) {
+        *tracked_user = replacement;
+    }
+
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(replacement)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), replacement);
+    EXPECT_EQ(fetched.status, 2u);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserByNumericIdChangesUsernameAndStatus) {
+    RecordProperty("description", "Updates a user by numeric ID and changes both username and status.");
+    iggy::ffi::Client *client     = GetLoggedInClient();
+    const std::string username    = GetRandomName(50);
+    const std::string replacement = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", 2); });
+    ASSERT_NO_THROW(client->update_user(make_numeric_identifier(created.id), replacement, 1));
+    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
+    ASSERT_NE(tracked_user, tracked_user_names_.end());
+    if (tracked_user != tracked_user_names_.end()) {
+        *tracked_user = replacement;
+    }
+
+    iggy::ffi::UserInfoDetails by_id{};
+    iggy::ffi::UserInfoDetails by_name{};
+    ASSERT_NO_THROW({ by_id = client->get_user(make_numeric_identifier(created.id)); });
+    ASSERT_NO_THROW({ by_name = client->get_user(make_string_identifier(replacement)); });
+    EXPECT_EQ(by_id.id, created.id);
+    EXPECT_EQ(by_name.id, created.id);
+    EXPECT_EQ(static_cast<std::string>(by_id.username), replacement);
+    EXPECT_EQ(static_cast<std::string>(by_name.username), replacement);
+    EXPECT_EQ(by_id.status, 1u);
+    EXPECT_EQ(by_name.status, 1u);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserAcceptsUsernameLengthBounds) {
+    RecordProperty("description", "Accepts exact three-byte and fifty-byte username boundaries.");
+    iggy::ffi::Client *client           = GetLoggedInClient();
+    const std::string first_username    = GetRandomName(50);
+    const std::string second_username   = GetRandomName(50);
+    const std::string first_replacement = GetRandomName(3);
+    std::string second_replacement      = GetRandomName(50);
+    second_replacement.resize(50);
+    ASSERT_NE(first_replacement, second_replacement);
+    iggy::ffi::UserInfoDetails first{};
+    iggy::ffi::UserInfoDetails second{};
+    ASSERT_NO_THROW({ first = CreateUser(client, first_username, "secret123", 1); });
+    ASSERT_NO_THROW({ second = CreateUser(client, second_username, "secret123", 1); });
+    ASSERT_NO_THROW(client->update_user(make_string_identifier(first_username), first_replacement, 1));
+    const auto first_tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), first_username);
+    ASSERT_NE(first_tracked_user, tracked_user_names_.end());
+    if (first_tracked_user != tracked_user_names_.end()) {
+        *first_tracked_user = first_replacement;
+    }
+    ASSERT_NO_THROW(client->update_user(make_string_identifier(second_username), second_replacement, 1));
+    const auto second_tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), second_username);
+    ASSERT_NE(second_tracked_user, tracked_user_names_.end());
+    if (second_tracked_user != tracked_user_names_.end()) {
+        *second_tracked_user = second_replacement;
+    }
+
+    iggy::ffi::UserInfoDetails fetched_first{};
+    iggy::ffi::UserInfoDetails fetched_second{};
+    ASSERT_NO_THROW({ fetched_first = client->get_user(make_string_identifier(first_replacement)); });
+    ASSERT_NO_THROW({ fetched_second = client->get_user(make_string_identifier(second_replacement)); });
+    EXPECT_EQ(fetched_first.id, first.id);
+    EXPECT_EQ(fetched_second.id, second.id);
+    EXPECT_EQ(static_cast<std::string>(fetched_first.username), first_replacement);
+    EXPECT_EQ(static_cast<std::string>(fetched_second.username), second_replacement);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsUsernameOutsideLengthBounds) {
+    RecordProperty("description", "Rejects username sizes outside the SDK and server limits.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    const std::string source  = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(client, source, "secret123", 1); });
+    const std::string invalid_usernames[] = {
+        "", "a", "aa", std::string(51, 'c'), std::string(255, 'd'), std::string(256, 'e')};
+
+    for (const auto &replacement : invalid_usernames) {
+        ASSERT_THROW(client->update_user(make_string_identifier(source), replacement, 1), std::exception);
+    }
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(source)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(fetched.status, 1u);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), source);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserAcceptsNonAsciiAndNonAlphabeticUsername) {
+    RecordProperty("description", "Accepts representative non-ASCII and non-alphabetic usernames.");
+    iggy::ffi::Client *client        = GetLoggedInClient();
+    const std::string suffix         = GetRandomName(8);
+    const std::string sources[]      = {GetRandomName(50), GetRandomName(50), GetRandomName(50)};
+    const std::string replacements[] = {"!@#_" + suffix, "ユーザー_" + suffix, "😀🚀_" + suffix};
+    ASSERT_LE(replacements[0].size(), 50u);
+    ASSERT_LE(replacements[1].size(), 50u);
+    ASSERT_LE(replacements[2].size(), 50u);
+    for (std::size_t index = 0; index < 3; ++index) {
+        iggy::ffi::UserInfoDetails created{};
+        ASSERT_NO_THROW({ created = CreateUser(client, sources[index], "secret123", 1); });
+        ASSERT_NO_THROW(client->update_user(make_string_identifier(sources[index]), replacements[index], 1));
+        const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), sources[index]);
+        ASSERT_NE(tracked_user, tracked_user_names_.end());
+        if (tracked_user != tracked_user_names_.end()) {
+            *tracked_user = replacements[index];
+        }
+        iggy::ffi::UserInfoDetails fetched{};
+        ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(replacements[index])); });
+        EXPECT_EQ(fetched.id, created.id);
+        EXPECT_EQ(static_cast<std::string>(fetched.username), replacements[index]);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsInvalidStatusWithoutRenamingTarget) {
+    RecordProperty("description", "Rejects invalid status codes atomically with username changes.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", 1); });
+    const std::uint8_t statuses[] = {0, 3, std::numeric_limits<std::uint8_t>::max()};
+    for (const auto status : statuses) {
+        const std::string replacement = GetRandomName(50);
+        ASSERT_THROW(client->update_user(make_string_identifier(username), replacement, status), std::exception);
+        ASSERT_THROW(client->get_user(make_string_identifier(replacement)), std::exception);
+    }
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(fetched.status, 1u);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), username);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsDuplicateUsernameWithoutChangingStatus) {
+    RecordProperty("description", "Rejects duplicate usernames without partially applying the status update.");
+    iggy::ffi::Client *client           = GetLoggedInClient();
+    const std::string target_username   = GetRandomName(50);
+    const std::string conflict_username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails target{};
+    iggy::ffi::UserInfoDetails conflict{};
+    ASSERT_NO_THROW({ target = CreateUser(client, target_username, "secret123", 1); });
+    ASSERT_NO_THROW({ conflict = CreateUser(client, conflict_username, "secret123", 2); });
+    ASSERT_THROW(client->update_user(make_string_identifier(target_username), conflict_username, 2), std::exception);
+    iggy::ffi::UserInfoDetails fetched_target{};
+    iggy::ffi::UserInfoDetails fetched_conflict{};
+    ASSERT_NO_THROW({ fetched_target = client->get_user(make_string_identifier(target_username)); });
+    ASSERT_NO_THROW({ fetched_conflict = client->get_user(make_string_identifier(conflict_username)); });
+    EXPECT_EQ(fetched_target.id, target.id);
+    EXPECT_EQ(fetched_conflict.id, conflict.id);
+    EXPECT_EQ(fetched_target.status, 1u);
+    EXPECT_EQ(fetched_conflict.status, 2u);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserAllowsCurrentUsernameWhileChangingStatus) {
+    RecordProperty("description", "Allows a same-username update that changes status.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", 1); });
+    ASSERT_NO_THROW(client->update_user(make_string_identifier(username), username, 2));
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(fetched.status, 2u);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), username);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserPreservesPasswordPermissionsAndCreationData) {
+    RecordProperty("description", "Preserves password, permissions, ID, and creation timestamp after a rename.");
+    iggy::ffi::Client *root_client  = GetLoggedInClient();
+    iggy::ffi::Client *valid_client = GetLoggedOutClient();
+    iggy::ffi::Client *old_client   = GetLoggedOutClient();
+    const std::string username      = GetRandomName(50);
+    const std::string replacement   = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users    = true;
+    permissions.global.read_streams  = true;
+    permissions.global.send_messages = true;
+    iggy::ffi::UserInfoDetails created{};
+    ASSERT_NO_THROW({ created = CreateUser(root_client, username, "known-secret", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW(root_client->update_user(make_string_identifier(username), replacement, 1));
+    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
+    ASSERT_NE(tracked_user, tracked_user_names_.end());
+    if (tracked_user != tracked_user_names_.end()) {
+        *tracked_user = replacement;
+    }
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(replacement)); });
+    EXPECT_EQ(fetched.id, created.id);
+    EXPECT_EQ(fetched.created_at, created.created_at);
+    EXPECT_TRUE(fetched.has_permissions);
+    EXPECT_TRUE(fetched.permissions.global.read_users);
+    EXPECT_TRUE(fetched.permissions.global.read_streams);
+    EXPECT_TRUE(fetched.permissions.global.send_messages);
+    ASSERT_NO_THROW(valid_client->connect());
+    ASSERT_NO_THROW(valid_client->login_user(replacement, "known-secret"));
+    ASSERT_NO_THROW(old_client->connect());
+    ASSERT_THROW(old_client->login_user(username, "known-secret"), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserToInactiveBlocksFreshLoginUntilReactivated) {
+    RecordProperty("description", "Blocks fresh login while inactive and restores it when active.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    const std::string username     = GetRandomName(50);
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "known-secret", 1); });
+    ASSERT_NO_THROW(root_client->update_user(make_string_identifier(username), username, 2));
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_THROW(user_client->login_user(username, "known-secret"), std::exception);
+    ASSERT_NO_THROW(root_client->update_user(make_string_identifier(username), username, 1));
+    ASSERT_NO_THROW(user_client->login_user(username, "known-secret"));
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRenameMakesOldUsernameReusable) {
+    RecordProperty("description", "Releases the old username for a new user after a successful rename.");
+    iggy::ffi::Client *client      = GetLoggedInClient();
+    const std::string old_username = GetRandomName(50);
+    const std::string new_username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails first{};
+    ASSERT_NO_THROW({ first = CreateUser(client, old_username, "secret123", 1); });
+    ASSERT_NO_THROW(client->update_user(make_string_identifier(old_username), new_username, 1));
+    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), old_username);
+    ASSERT_NE(tracked_user, tracked_user_names_.end());
+    if (tracked_user != tracked_user_names_.end()) {
+        *tracked_user = new_username;
+    }
+    iggy::ffi::UserInfoDetails second{};
+    ASSERT_NO_THROW({ second = CreateUser(client, old_username, "secret123", 1); });
+    EXPECT_EQ(static_cast<std::string>(client->get_user(make_string_identifier(new_username)).username), new_username);
+    EXPECT_EQ(static_cast<std::string>(client->get_user(make_string_identifier(old_username)).username), old_username);
+}
+
+TEST_F(LowLevelE2E_Client, UpdateUserRejectsRenameToRootUsername) {
+    RecordProperty("description", "Rejects changing a non-root user's username to root's username.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ target = CreateUser(client, username, "secret123", 1); });
+    ASSERT_THROW(client->update_user(make_string_identifier(username), "iggy", 2), std::exception);
+    iggy::ffi::UserInfoDetails root{};
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ root = client->get_user(make_string_identifier("iggy")); });
+    ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(root.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(root.username), "iggy");
+    EXPECT_EQ(root.status, 1u);
+    EXPECT_EQ(fetched.id, target.id);
+    EXPECT_EQ(fetched.status, 1u);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), username);
+}
+
+TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowUpdateUser) {
+    RecordProperty("description", "Rejects updates from a user with read_users but not manage_users.");
+    iggy::ffi::Client *root_client    = GetLoggedInClient();
+    iggy::ffi::Client *caller_client  = GetLoggedOutClient();
+    const std::string caller_username = GetRandomName(50);
+    const std::string target_username = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, caller_username, "secret123", 1, true, std::move(permissions)); });
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_username, "secret123", 1); });
+    ASSERT_NO_THROW(caller_client->connect());
+    ASSERT_NO_THROW(caller_client->login_user(caller_username, "secret123"));
+    ASSERT_THROW(caller_client->update_user(make_string_identifier(target_username), GetRandomName(50), 2),
+                 std::exception);
+    ASSERT_THROW(caller_client->update_user(make_string_identifier(caller_username), GetRandomName(50), 2),
+                 std::exception);
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(target_username)); });
+    EXPECT_EQ(fetched.id, target.id);
+    EXPECT_EQ(fetched.status, 1u);
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsUpdateWithoutReadUsers) {
+    RecordProperty("description", "Allows updates from a manager without read_users permission.");
+    iggy::ffi::Client *root_client     = GetLoggedInClient();
+    iggy::ffi::Client *manager_client  = GetLoggedOutClient();
+    const std::string manager_username = GetRandomName(50);
+    const std::string target_username  = GetRandomName(50);
+    const std::string replacement      = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, manager_username, "secret123", 1, true, std::move(permissions)); });
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_username, "secret123", 1); });
+    ASSERT_NO_THROW(manager_client->connect());
+    ASSERT_NO_THROW(manager_client->login_user(manager_username, "secret123"));
+    ASSERT_NO_THROW(manager_client->update_user(make_string_identifier(target_username), replacement, 2));
+    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), target_username);
+    ASSERT_NE(tracked_user, tracked_user_names_.end());
+    if (tracked_user != tracked_user_names_.end()) {
+        *tracked_user = replacement;
+    }
+    iggy::ffi::UserInfoDetails fetched{};
+    ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(replacement)); });
+    EXPECT_EQ(fetched.id, target.id);
+    EXPECT_EQ(fetched.status, 2u);
+    EXPECT_EQ(static_cast<std::string>(fetched.username), replacement);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserBeforeLoginThrows) {
+    RecordProperty("description", "Rejects user lookup without an active authenticated session.");
+    iggy::ffi::Client *client = GetLoggedOutClient();
+
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_user(make_string_identifier("iggy")), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserByUsernameReturnsRootDetails) {
+    RecordProperty("description", "Returns deterministic root details for a username lookup.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::UserInfoDetails user{};
+    ASSERT_NO_THROW({ user = client->get_user(make_string_identifier("iggy")); });
+
+    EXPECT_EQ(user.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(user.username), "iggy");
+    EXPECT_EQ(user.status, 1u);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserByNumericIdMatchesUsernameLookup) {
+    RecordProperty("description", "Returns equivalent root details for username and numeric identifiers.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+
+    iggy::ffi::UserInfoDetails by_username{};
+    iggy::ffi::UserInfoDetails by_id{};
+    ASSERT_NO_THROW({ by_username = client->get_user(make_string_identifier("iggy")); });
+    ASSERT_NO_THROW({ by_id = client->get_user(make_numeric_identifier(0)); });
+
+    EXPECT_EQ(by_id.id, by_username.id);
+    EXPECT_EQ(by_id.status, by_username.status);
+    EXPECT_EQ(static_cast<std::string>(by_id.username), static_cast<std::string>(by_username.username));
+    EXPECT_EQ(by_id.permissions.global.manage_servers, by_username.permissions.global.manage_servers);
+    EXPECT_EQ(by_id.permissions.global.read_servers, by_username.permissions.global.read_servers);
+    EXPECT_EQ(by_id.permissions.global.manage_users, by_username.permissions.global.manage_users);
+    EXPECT_EQ(by_id.permissions.global.read_users, by_username.permissions.global.read_users);
+    EXPECT_EQ(by_id.permissions.global.manage_streams, by_username.permissions.global.manage_streams);
+    EXPECT_EQ(by_id.permissions.global.read_streams, by_username.permissions.global.read_streams);
+    EXPECT_EQ(by_id.permissions.global.manage_topics, by_username.permissions.global.manage_topics);
+    EXPECT_EQ(by_id.permissions.global.read_topics, by_username.permissions.global.read_topics);
+    EXPECT_EQ(by_id.permissions.global.poll_messages, by_username.permissions.global.poll_messages);
+    EXPECT_EQ(by_id.permissions.global.send_messages, by_username.permissions.global.send_messages);
+    EXPECT_EQ(by_id.permissions.streams.size(), by_username.permissions.streams.size());
+}
+
+TEST_F(LowLevelE2E_Client, GetUserWithUnknownIdentifierThrows) {
+    RecordProperty("description", "Rejects lookups for unknown username and numeric identifiers.");
+    iggy::ffi::Client *client      = GetLoggedInClient();
+    const std::string unknown_user = GetRandomName(50);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(unknown_user)), std::exception);
+    ASSERT_THROW(client->get_user(make_numeric_identifier(std::numeric_limits<std::uint32_t>::max())), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersBeforeLoginThrows) {
+    RecordProperty("description", "Rejects listing users without an active authenticated session.");
+    iggy::ffi::Client *client = GetLoggedOutClient();
+
+    ASSERT_THROW(client->get_users(), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->get_users(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->get_users(), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->get_users(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, GetUserAllowsSelfLookupWithoutReadUsersPermission) {
+    RecordProperty("description", "Allows a user without read_users permission to read its own details.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = false;
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW(
+        { created_user = CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails by_username{};
+    iggy::ffi::UserInfoDetails by_id{};
+    ASSERT_NO_THROW({ by_username = user_client->get_user(make_string_identifier(username)); });
+    ASSERT_NO_THROW({ by_id = user_client->get_user(make_numeric_identifier(created_user.id)); });
+
+    EXPECT_EQ(by_username.id, created_user.id);
+    EXPECT_EQ(by_id.id, created_user.id);
+    EXPECT_EQ(static_cast<std::string>(by_username.username), username);
+    EXPECT_EQ(static_cast<std::string>(by_id.username), username);
+    EXPECT_EQ(by_username.status, 1u);
+    EXPECT_EQ(by_id.status, 1u);
+    EXPECT_FALSE(by_username.permissions.global.read_users);
+    EXPECT_FALSE(by_id.permissions.global.read_users);
+}
+
+TEST_F(LowLevelE2E_Client, UserWithoutReadUsersPermissionCannotQueryOtherUsers) {
+    RecordProperty("description", "Rejects other-user lookup and listing without read_users permission.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = false;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    ASSERT_THROW(user_client->get_user(make_numeric_identifier(0)), std::exception);
+    ASSERT_THROW(user_client->get_users(), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, ReadUsersPermissionAllowsUserQueries) {
+    RecordProperty("description", "Allows user lookup and listing with only read_users permission.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails root{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ root = user_client->get_user(make_numeric_identifier(0)); });
+    ASSERT_NO_THROW({ users = user_client->get_users(); });
+
+    EXPECT_EQ(root.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(root.username), "iggy");
+    bool found_self = false;
+    for (const auto &user : users) {
+        if (static_cast<std::string>(user.username) == username) {
+            found_self = true;
+        }
+    }
+    EXPECT_TRUE(found_self);
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionImpliesReadUsers) {
+    RecordProperty("description", "Allows user lookup and listing when manage_users is set without read_users.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_users = true;
+    permissions.global.read_users   = false;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", 1, true, std::move(permissions)); });
+
+    iggy::ffi::Client *user_client = GetLoggedOutClient();
+    ASSERT_NO_THROW(user_client->connect());
+    ASSERT_NO_THROW(user_client->login_user(username, "secret123"));
+
+    iggy::ffi::UserInfoDetails root{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ root = user_client->get_user(make_numeric_identifier(0)); });
+    ASSERT_NO_THROW({ users = user_client->get_users(); });
+
+    EXPECT_EQ(root.id, 0u);
+    EXPECT_EQ(static_cast<std::string>(root.username), "iggy");
+    bool found_self = false;
+    for (const auto &user : users) {
+        if (static_cast<std::string>(user.username) == username) {
+            found_self = true;
+        }
+    }
+    EXPECT_TRUE(found_self);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersContainsCreatedUser) {
+    RecordProperty("description", "Lists a created user with the input username and status.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    bool found_user = false;
+    for (const auto &user : users) {
+        if (user.id == created_user.id) {
+            found_user = true;
+            EXPECT_EQ(static_cast<std::string>(user.username), username);
+            EXPECT_EQ(user.status, 1u);
+        }
+    }
+    EXPECT_TRUE(found_user);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersReturnsAllCreatedUsersOrderedById) {
+    RecordProperty("description", "Returns every created user without pagination, ordered by ID over TCP.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    rust::Vec<iggy::ffi::UserInfo> users_before;
+    ASSERT_NO_THROW({ users_before = client->get_users(); });
+
+    const std::string first_username  = GetRandomName(50);
+    const std::string second_username = GetRandomName(50);
+    const std::string third_username  = GetRandomName(50);
+    iggy::ffi::UserInfoDetails first_user{};
+    iggy::ffi::UserInfoDetails second_user{};
+    iggy::ffi::UserInfoDetails third_user{};
+    ASSERT_NO_THROW({ first_user = CreateUser(client, first_username, "secret123", 1); });
+    ASSERT_NO_THROW({ second_user = CreateUser(client, second_username, "secret123", 1); });
+    ASSERT_NO_THROW({ third_user = CreateUser(client, third_username, "secret123", 1); });
+
+    rust::Vec<iggy::ffi::UserInfo> users_after;
+    ASSERT_NO_THROW({ users_after = client->get_users(); });
+    ASSERT_EQ(users_after.size(), users_before.size() + 3);
+
+    bool found_first  = false;
+    bool found_second = false;
+    bool found_third  = false;
+    for (std::size_t index = 0; index < users_after.size(); ++index) {
+        if (index > 0) {
+            EXPECT_LT(users_after[index - 1].id, users_after[index].id);
+        }
+        const auto &user           = users_after[index];
+        const std::string username = static_cast<std::string>(user.username);
+        if (user.id == first_user.id && username == first_username) {
+            found_first = true;
+        }
+        if (user.id == second_user.id && username == second_username) {
+            found_second = true;
+        }
+        if (user.id == third_user.id && username == third_username) {
+            found_third = true;
+        }
+    }
+    EXPECT_TRUE(found_first);
+    EXPECT_TRUE(found_second);
+    EXPECT_TRUE(found_third);
+}
+
+TEST_F(LowLevelE2E_Client, GetUsersMatchesGetUserDetails) {
+    RecordProperty("description", "Returns consistent ID, username, and status from user query APIs.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    iggy::ffi::UserInfoDetails user_details{};
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ user_details = client->get_user(make_string_identifier(username)); });
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    EXPECT_EQ(user_details.id, created_user.id);
+    EXPECT_EQ(static_cast<std::string>(user_details.username), username);
+    EXPECT_EQ(user_details.status, 1u);
+    bool found_user = false;
+    for (const auto &user : users) {
+        if (user.id == user_details.id) {
+            found_user = true;
+            EXPECT_EQ(static_cast<std::string>(user.username), username);
+            EXPECT_EQ(user.status, 1u);
+        }
+    }
+    EXPECT_TRUE(found_user);
+}
+
+TEST_F(LowLevelE2E_Client, DeletedUserDisappearsFromGetUserAndGetUsers) {
+    RecordProperty("description", "Removes a deleted user from detail and list queries.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+    ASSERT_NO_THROW(client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == created_user.id && static_cast<std::string>(user.username) == username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRejectsUnauthenticatedClientWithoutDeletingTarget) {
+    RecordProperty("description", "Rejects user deletion without an active authenticated session.");
+    iggy::ffi::Client *root_client = GetLoggedInClient();
+    iggy::ffi::Client *client      = GetLoggedOutClient();
+    const std::string username     = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(root_client, username, "secret123", 1); });
+
+    ASSERT_THROW(client->delete_user(make_string_identifier(username)), std::exception);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->delete_user(make_string_identifier(username)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->logout_user());
+    ASSERT_THROW(client->delete_user(make_string_identifier(username)), std::exception);
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->disconnect());
+    ASSERT_THROW(client->delete_user(make_string_identifier(username)), std::exception);
+
+    iggy::ffi::UserInfoDetails fetched_user{};
+    ASSERT_NO_THROW({ fetched_user = root_client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched_user.id, created_user.id);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRejectsUnknownUsernameAndNumericId) {
+    RecordProperty("description", "Rejects deletion of unknown string and numeric user identifiers.");
+    iggy::ffi::Client *client          = GetLoggedInClient();
+    const std::string unknown_user     = GetRandomName(50);
+    constexpr std::uint32_t unknown_id = std::numeric_limits<std::uint32_t>::max();
+
+    ASSERT_THROW(client->delete_user(make_string_identifier(unknown_user)), std::exception);
+    ASSERT_THROW(client->delete_user(make_numeric_identifier(unknown_id)), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRejectsRootWithoutChangingRoot) {
+    RecordProperty("description", "Rejects root deletion by username and numeric ID without changing root.");
+    iggy::ffi::Client *client = GetLoggedInClient();
+    iggy::ffi::UserInfoDetails before_by_username{};
+    iggy::ffi::UserInfoDetails before_by_id{};
+    ASSERT_NO_THROW({ before_by_username = client->get_user(make_string_identifier("iggy")); });
+    ASSERT_NO_THROW({ before_by_id = client->get_user(make_numeric_identifier(0)); });
+    ASSERT_EQ(before_by_username.id, 0u);
+    ASSERT_EQ(before_by_id.id, 0u);
+
+    ASSERT_THROW(client->delete_user(make_string_identifier("iggy")), std::exception);
+    ASSERT_THROW(client->delete_user(make_numeric_identifier(0)), std::exception);
+
+    iggy::ffi::UserInfoDetails after_by_username{};
+    iggy::ffi::UserInfoDetails after_by_id{};
+    ASSERT_NO_THROW({ after_by_username = client->get_user(make_string_identifier("iggy")); });
+    ASSERT_NO_THROW({ after_by_id = client->get_user(make_numeric_identifier(0)); });
+    for (const auto *root : {&after_by_username, &after_by_id}) {
+        EXPECT_EQ(root->id, 0u);
+        EXPECT_EQ(static_cast<std::string>(root->username), "iggy");
+        EXPECT_EQ(root->status, 1u);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserByNumericIdRemovesTarget) {
+    RecordProperty("description", "Deletes a user selected by its numeric ID.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    ASSERT_NO_THROW(client->delete_user(make_numeric_identifier(created_user.id)));
+    ForgetUser(username);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == created_user.id && static_cast<std::string>(user.username) == username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRejectsRepeatedDeletion) {
+    RecordProperty("description", "Rejects deleting the same user twice.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 1); });
+
+    ASSERT_NO_THROW(client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+    ASSERT_THROW(client->delete_user(make_string_identifier(username)), std::exception);
+
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == created_user.id && static_cast<std::string>(user.username) == username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, ReadUsersPermissionDoesNotAllowDeleteUser) {
+    RecordProperty("description", "Rejects other-user and self deletion with read_users but not manage_users.");
+    iggy::ffi::Client *root_client   = GetLoggedInClient();
+    iggy::ffi::Client *caller_client = GetLoggedOutClient();
+    const std::string caller_name    = GetRandomName(50);
+    const std::string target_name    = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_users   = true;
+    permissions.global.manage_users = false;
+    iggy::ffi::UserInfoDetails caller{};
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW(
+        { caller = CreateUser(root_client, caller_name, "caller-secret", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_name, "target-secret", 1); });
+    ASSERT_NO_THROW(caller_client->connect());
+    ASSERT_NO_THROW(caller_client->login_user(caller_name, "caller-secret"));
+
+    ASSERT_THROW(caller_client->delete_user(make_string_identifier(target_name)), std::exception);
+    ASSERT_THROW(caller_client->delete_user(make_string_identifier(caller_name)), std::exception);
+
+    iggy::ffi::UserInfoDetails fetched_caller{};
+    iggy::ffi::UserInfoDetails fetched_target{};
+    ASSERT_NO_THROW({ fetched_caller = root_client->get_user(make_string_identifier(caller_name)); });
+    ASSERT_NO_THROW({ fetched_target = root_client->get_user(make_string_identifier(target_name)); });
+    EXPECT_EQ(fetched_caller.id, caller.id);
+    EXPECT_EQ(fetched_target.id, target.id);
+}
+
+TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsDeleteUser) {
+    RecordProperty("description", "Allows deletion with manage_users even when read_users is false.");
+    iggy::ffi::Client *root_client    = GetLoggedInClient();
+    iggy::ffi::Client *manager_client = GetLoggedOutClient();
+    const std::string manager_name    = GetRandomName(50);
+    const std::string target_name     = GetRandomName(50);
+    iggy::ffi::Permissions permissions{};
+    permissions.global.manage_users = true;
+    permissions.global.read_users   = false;
+    iggy::ffi::UserInfoDetails target{};
+    ASSERT_NO_THROW({ CreateUser(root_client, manager_name, "manager-secret", 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_name, "target-secret", 1); });
+    ASSERT_NO_THROW(manager_client->connect());
+    ASSERT_NO_THROW(manager_client->login_user(manager_name, "manager-secret"));
+
+    ASSERT_NO_THROW(manager_client->delete_user(make_string_identifier(target_name)));
+    ForgetUser(target_name);
+
+    ASSERT_THROW(root_client->get_user(make_string_identifier(target_name)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = root_client->get_users(); });
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == target.id && static_cast<std::string>(user.username) == target_name);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRemovesOnlyTheTarget) {
+    RecordProperty("description", "Deletes only the selected user and leaves another user usable.");
+    iggy::ffi::Client *root_client     = GetLoggedInClient();
+    iggy::ffi::Client *survivor_client = GetLoggedOutClient();
+    const std::string target_name      = GetRandomName(50);
+    const std::string survivor_name    = GetRandomName(50);
+    iggy::ffi::UserInfoDetails target{};
+    iggy::ffi::UserInfoDetails survivor{};
+    ASSERT_NO_THROW({ target = CreateUser(root_client, target_name, "target-secret", 1); });
+    ASSERT_NO_THROW({ survivor = CreateUser(root_client, survivor_name, "survivor-secret", 1); });
+
+    ASSERT_NO_THROW(root_client->delete_user(make_numeric_identifier(target.id)));
+    ForgetUser(target_name);
+
+    ASSERT_THROW(root_client->get_user(make_string_identifier(target_name)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = root_client->get_users(); });
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == target.id && static_cast<std::string>(user.username) == target_name);
+    }
+
+    iggy::ffi::UserInfoDetails fetched_survivor{};
+    ASSERT_NO_THROW({ fetched_survivor = root_client->get_user(make_string_identifier(survivor_name)); });
+    EXPECT_EQ(fetched_survivor.id, survivor.id);
+    EXPECT_EQ(static_cast<std::string>(fetched_survivor.username), survivor_name);
+    EXPECT_EQ(fetched_survivor.status, survivor.status);
+    ASSERT_NO_THROW(survivor_client->connect());
+    ASSERT_NO_THROW(survivor_client->login_user(survivor_name, "survivor-secret"));
+}
+
+TEST_F(LowLevelE2E_Client, DeleteInactiveUserSucceeds) {
+    RecordProperty("description", "Deletes an inactive user by username.");
+    iggy::ffi::Client *client  = GetLoggedInClient();
+    const std::string username = GetRandomName(50);
+    iggy::ffi::UserInfoDetails created_user{};
+    ASSERT_NO_THROW({ created_user = CreateUser(client, username, "secret123", 2); });
+
+    ASSERT_NO_THROW(client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+
+    ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
+    rust::Vec<iggy::ffi::UserInfo> users;
+    ASSERT_NO_THROW({ users = client->get_users(); });
+    for (const auto &user : users) {
+        EXPECT_FALSE(user.id == created_user.id && static_cast<std::string>(user.username) == username);
+    }
+}
+
+TEST_F(LowLevelE2E_Client, DeleteUserRevokesExistingSessions) {
+    RecordProperty("description", "Revokes an existing session and prevents fresh login after user deletion.");
+    iggy::ffi::Client *root_client   = GetLoggedInClient();
+    iggy::ffi::Client *target_client = GetLoggedOutClient();
+    iggy::ffi::Client *fresh_client  = GetLoggedOutClient();
+    const std::string username       = GetRandomName(50);
+    const std::string password       = "target-secret";
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_servers = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, password, 1, true, std::move(permissions)); });
+    ASSERT_NO_THROW(target_client->connect());
+    ASSERT_NO_THROW(target_client->login_user(username, password));
+    iggy::ffi::Stats stats{};
+    ASSERT_NO_THROW({ stats = target_client->get_stats(); });
+
+    ASSERT_NO_THROW(root_client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+
+    ASSERT_THROW(target_client->get_stats(), std::exception);
+    ASSERT_NO_THROW(fresh_client->connect());
+    ASSERT_THROW(fresh_client->login_user(username, password), std::exception);
+}
+
+TEST_F(LowLevelE2E_Client, DeletedUsernameCanBeRecreatedWithoutOldCredentialsOrPermissions) {
+    RecordProperty("description", "Recreates a deleted username without retaining old credentials or permissions.");
+    iggy::ffi::Client *root_client         = GetLoggedInClient();
+    iggy::ffi::Client *new_password_client = GetLoggedOutClient();
+    iggy::ffi::Client *old_password_client = GetLoggedOutClient();
+    const std::string username             = GetRandomName(50);
+    const std::string old_password         = "old-secret";
+    const std::string new_password         = "new-secret";
+    iggy::ffi::Permissions permissions{};
+    permissions.global.read_servers = true;
+    ASSERT_NO_THROW({ CreateUser(root_client, username, old_password, 1, true, std::move(permissions)); });
+
+    ASSERT_NO_THROW(root_client->delete_user(make_string_identifier(username)));
+    ForgetUser(username);
+
+    iggy::ffi::UserInfoDetails replacement{};
+    ASSERT_NO_THROW({ replacement = CreateUser(root_client, username, new_password, 1); });
+    EXPECT_EQ(static_cast<std::string>(replacement.username), username);
+    EXPECT_FALSE(replacement.has_permissions);
+    EXPECT_FALSE(replacement.permissions.global.read_servers);
+    EXPECT_TRUE(replacement.permissions.streams.empty());
+
+    iggy::ffi::UserInfoDetails fetched_replacement{};
+    ASSERT_NO_THROW({ fetched_replacement = root_client->get_user(make_string_identifier(username)); });
+    EXPECT_EQ(fetched_replacement.id, replacement.id);
+
+    ASSERT_NO_THROW(new_password_client->connect());
+    ASSERT_NO_THROW(new_password_client->login_user(username, new_password));
+    ASSERT_NO_THROW(old_password_client->connect());
+    ASSERT_THROW(old_password_client->login_user(username, old_password), std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, ChangePasswordBeforeLoginThrows) {
@@ -230,7 +1617,7 @@ TEST_F(LowLevelE2E_Client, ChangePasswordUpdatesCredentialsAndCanBeRestored) {
 TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
     RecordProperty("description", "Allows client cleanup after a failed login leaves the connection unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -243,7 +1630,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenDisconnect) {
     RecordProperty("description",
                    "Connects, logs in, disconnects successfully, and rejects authenticated operations afterward.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -256,7 +1643,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenDisconnect) {
 TEST_F(LowLevelE2E_Client, DisconnectWithoutConnect) {
     RecordProperty("description", "Allows disconnect to be called on a client that was never explicitly connected.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -266,7 +1653,7 @@ TEST_F(LowLevelE2E_Client, DisconnectWithoutConnect) {
 TEST_F(LowLevelE2E_Client, DisconnectWithoutLogin) {
     RecordProperty("description", "Allows disconnect after connect even when no user has authenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -279,7 +1666,7 @@ TEST_F(LowLevelE2E_Client, DisconnectThenReconnectWithoutRelogin) {
     RecordProperty("description",
                    "Requires logging in again after a disconnect and reconnect before authenticated operations work.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -293,7 +1680,7 @@ TEST_F(LowLevelE2E_Client, DisconnectThenReconnectWithoutRelogin) {
 TEST_F(LowLevelE2E_Client, DisconnectAfterFailedLogin) {
     RecordProperty("description", "Allows disconnect after a failed login attempt leaves the client unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -307,7 +1694,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenShutdown) {
     RecordProperty("description",
                    "Connects, logs in, shuts down successfully, and rejects further operations afterward.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -322,7 +1709,7 @@ TEST_F(LowLevelE2E_Client, ConnectLoginThenShutdown) {
 TEST_F(LowLevelE2E_Client, ShutdownWithoutConnect) {
     RecordProperty("description", "Allows shutdown to be called on a client that was never explicitly connected.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -332,7 +1719,7 @@ TEST_F(LowLevelE2E_Client, ShutdownWithoutConnect) {
 TEST_F(LowLevelE2E_Client, ShutdownWithoutLogin) {
     RecordProperty("description", "Allows shutdown after connect even when no user has authenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -344,7 +1731,7 @@ TEST_F(LowLevelE2E_Client, ShutdownWithoutLogin) {
 TEST_F(LowLevelE2E_Client, ShutdownAfterFailedLogin) {
     RecordProperty("description", "Allows shutdown after a failed login attempt leaves the client unauthenticated.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -357,7 +1744,7 @@ TEST_F(LowLevelE2E_Client, ShutdownAfterFailedLogin) {
 TEST_F(LowLevelE2E_Client, RepeatedShutdownCallsHaveStableBehavior) {
     RecordProperty("description", "Keeps repeated shutdown calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -371,7 +1758,7 @@ TEST_F(LowLevelE2E_Client, RepeatedShutdownCallsHaveStableBehavior) {
 TEST_F(LowLevelE2E_Client, ShutdownThenConnectThrows) {
     RecordProperty("description", "Rejects reconnecting a client after shutdown transitions it to a terminal state.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -385,7 +1772,7 @@ TEST_F(LowLevelE2E_Client, ShutdownThenLoginThrows) {
     RecordProperty("description",
                    "Rejects logging in again after shutdown, even when login would normally auto-connect.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -487,7 +1874,7 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) 
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
     RecordProperty("description", "Supports login without an explicit prior connect call.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -497,7 +1884,7 @@ TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
 TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     RecordProperty("description", "Allows connecting without logging in and then deleting the client.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -508,7 +1895,7 @@ TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
 TEST_F(LowLevelE2E_Client, DeleteWithoutDisconnect) {
     RecordProperty("description", "Allows deleting a connected and authenticated client without disconnecting first.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -521,7 +1908,7 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     RecordProperty("description",
                    "Keeps repeated connect, login, and delete calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
 
     ASSERT_NO_THROW(client->connect());
@@ -537,7 +1924,7 @@ TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
 TEST_F(LowLevelE2E_Client, RepeatedDisconnectCallsHaveStableBehavior) {
     RecordProperty("description", "Keeps repeated disconnect calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection({}); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 
@@ -1649,7 +3036,8 @@ TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnection
                    "Returns the configured heartbeat interval in microseconds from the connection string.");
     constexpr std::uint64_t configured_heartbeat_micros = 10'000'000ull;
     iggy::ffi::Client *client                           = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
+    ASSERT_NO_THROW(
+        { client = iggy::ffi::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
     ASSERT_NE(client, nullptr);
     TrackClient(client);
 

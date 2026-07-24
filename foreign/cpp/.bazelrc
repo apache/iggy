@@ -20,6 +20,10 @@
 # Enable BzlMod
 common --enable_bzlmod
 
+# Default test behavior
+test --test_output=errors
+test --cache_test_results=no
+
 # Debug configuration
 build:debug --compilation_mode=dbg
 build:debug --copt=-g3
@@ -44,5 +48,4 @@ build:ci --config=release
 build:ci --lockfile_mode=error
 
 test:ci --lockfile_mode=error
-test:ci --test_output=errors
 test:ci --test_summary=detailed
