@@ -213,14 +213,14 @@ repos:
     hooks:
       - id: go-fmt
         name: go fmt
-        entry: bash -c 'for dir in foreign/go bdd/go examples/go; do [ -d "$dir" ] && (cd "$dir" && gofmt -w -s .); done'
+        entry: bash -ec 'for dir in foreign/go bdd/go examples/go; do if [ -d "$dir" ]; then (cd "$dir" && gofmt -w -s .); fi; done'
         language: system
         files: ^(foreign|bdd|examples)/go/.*\.go$
         pass_filenames: false
 
       - id: go-mod-tidy
         name: go mod tidy
-        entry: bash -c 'for dir in foreign/go bdd/go examples/go; do [ -f "$dir/go.mod" ] && (cd "$dir" && go mod tidy && git diff --exit-code go.mod go.sum); done'
+        entry: bash -ec 'for dir in foreign/go bdd/go examples/go; do if [ -f "$dir/go.mod" ]; then (cd "$dir" && go mod tidy && git diff --exit-code go.mod go.sum); fi; done'
         language: system
         files: ^(foreign|bdd|examples)/go/(.*\.go|go\.mod|go\.sum)$
         pass_filenames: false
@@ -263,7 +263,7 @@ repos:
     hooks:
       - id: node-eslint
         name: node eslint
-        entry: bash -c 'for dir in foreign/node examples/node; do [ -f "$dir/package.json" ] && (cd "$dir" && { [ -x node_modules/.bin/eslint ] || npm ci --ignore-scripts; } && npm run lint); done'
+        entry: bash -ec 'for dir in foreign/node examples/node; do if [ -f "$dir/package.json" ]; then (cd "$dir" && { [ -x node_modules/.bin/eslint ] || npm ci --ignore-scripts; } && npm run lint); fi; done'
         language: system
         files: ^(foreign|examples)/node/.*\.ts$
         pass_filenames: false
