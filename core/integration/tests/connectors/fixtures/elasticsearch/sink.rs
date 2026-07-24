@@ -116,11 +116,14 @@ impl ElasticsearchSinkFixture {
                 message: format!("Failed to build refresh probe client: {error}"),
             })?;
         let url = format!("{}/{}/_refresh", self.container.base_url, self.index);
-        let response = client.post(&url).send().await.map_err(|error| {
-            TestBinaryError::InvalidState {
-                message: format!("Failed to refresh index: {error}"),
-            }
-        })?;
+        let response =
+            client
+                .post(&url)
+                .send()
+                .await
+                .map_err(|error| TestBinaryError::InvalidState {
+                    message: format!("Failed to refresh index: {error}"),
+                })?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
