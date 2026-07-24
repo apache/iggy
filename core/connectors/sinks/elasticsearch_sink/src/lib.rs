@@ -54,6 +54,11 @@ pub struct ElasticsearchSinkConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
     pub password: Option<SecretString>,
     pub batch_size: Option<usize>,
+    /// Client-wide HTTP timeout for open() and bulk consume(). Values of `0`
+    /// are clamped to 1s (a zero duration would fail every request immediately).
+    /// Raise this for slow bulk workloads; until runtime ack/retry (#2927/#2928),
+    /// a timeout on consume drops the batch after the poll offset is already
+    /// committed.
     pub timeout_seconds: Option<u64>,
     pub create_index_if_not_exists: Option<bool>,
     pub index_mapping: Option<serde_json::Value>,
@@ -86,8 +91,10 @@ impl ElasticsearchSink {
             .map_err(|error| Error::Connection(format!("Invalid Elasticsearch URL: {error}")))?;
 
         let conn_pool = elasticsearch::http::transport::SingleNodeConnectionPool::new(url);
-        // elasticsearch-rs defaults to no timeout; without this, a hung ES
-        // connection blocks FFI open() and the connectors HTTP health never binds.
+        // elasticsearch-rs defaults to no timeout. This client-global timeout is
+        // an infinite-hang backstop for open() and for bulk consume() — not the
+        // primary #3728 flake fix (that is the harness readiness gate, which
+        // expires sooner than the 30s default). Values of 0 clamp to 1s.
         let timeout_seconds = self
             .config
             .timeout_seconds

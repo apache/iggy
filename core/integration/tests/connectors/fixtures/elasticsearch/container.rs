@@ -20,9 +20,8 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
-use std::fs::{File, OpenOptions};
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
@@ -51,6 +50,10 @@ const DOCKER_INSPECT_TIMEOUT_SECS: u64 = 5;
 // Serializes inspect+rm recovery across nextest processes sharing the reused
 // container. Held only on the failure path.
 const RECOVERY_LOCK_FILE_NAME: &str = "iggy-test-elasticsearch-recovery.lock";
+// Bound lock wait so a peer mid-recovery cannot park a current-thread runtime
+// for two full container startups with no upper limit.
+const RECOVERY_LOCK_TIMEOUT_SECS: u64 = 30;
+const RECOVERY_LOCK_POLL_MS: u64 = 50;
 // Indices from prior runs older than this are leftovers: a live concurrent
 // test's index is seconds old, so age-based sweeping never races other tests
 // sharing the reused container.
@@ -127,7 +130,7 @@ impl ElasticsearchContainer {
                 // transient start/port/health flake. Another nextest worker may
                 // still be using a healthy instance. Recover only when inspect
                 // shows a removable wedged state, under a cross-process lock.
-                let recovery_lock = match acquire_recovery_lock() {
+                let recovery_lock = match acquire_recovery_lock().await {
                     Ok(lock) => lock,
                     Err(error) => {
                         warn!("Skipping Elasticsearch recovery, could not take lock: {error}");
@@ -140,7 +143,7 @@ impl ElasticsearchContainer {
                     return Ok(started);
                 }
 
-                if !container_is_removable_wedged() {
+                if !container_is_removable_wedged().await {
                     warn!(
                         "Elasticsearch start failed and '{ELASTICSEARCH_CONTAINER_NAME}' is not in a removable wedged state; leaving it in place: {first_error}"
                     );
@@ -150,7 +153,7 @@ impl ElasticsearchContainer {
                 warn!(
                     "Elasticsearch container wedged, removing '{ELASTICSEARCH_CONTAINER_NAME}' and retrying once: {first_error}"
                 );
-                force_remove_container();
+                force_remove_container().await;
                 let retry_result = Self::try_start().await;
                 drop(recovery_lock);
                 retry_result
@@ -213,6 +216,12 @@ impl ElasticsearchContainer {
     }
 
     async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
+        #[derive(Deserialize)]
+        struct ClusterHealth {
+            timed_out: bool,
+            status: String,
+        }
+
         // Dedicated probe client: short timeout, no retry middleware. The shared
         // create_http_client() (30s + 3 retries) turns one black-holed request
         // into a multi-minute hang that looks like the test is stuck.
@@ -225,9 +234,11 @@ impl ElasticsearchContainer {
                 fixture_type: "ElasticsearchContainer".to_string(),
                 message: format!("Failed to build readiness HTTP client: {error}"),
             })?;
-        // timeout=1s keeps ES from holding the request when the cluster is slow.
+        // wait_for_status=yellow makes ES block until yellow/green or timeout=1s
+        // elapses; without wait_for_*, timeout is ignored and red still returns
+        // 200 with timed_out=false.
         let health_url = format!(
-            "{}{ELASTICSEARCH_HEALTH_ENDPOINT}?timeout=1s",
+            "{}{ELASTICSEARCH_HEALTH_ENDPOINT}?wait_for_status=yellow&timeout=1s",
             self.base_url
         );
         let mut last_error = String::from("no attempts made");
@@ -235,14 +246,25 @@ impl ElasticsearchContainer {
         for attempt in 1..=CLUSTER_READY_ATTEMPTS {
             match client.get(&health_url).send().await {
                 Ok(response) if response.status().is_success() => {
-                    let body = response.text().await.unwrap_or_default();
-                    if body.contains("\"timed_out\":true") {
-                        last_error = format!(
-                            "cluster health timed out on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {body}"
-                        );
-                    } else {
-                        info!("Elasticsearch cluster ready at {}", self.base_url);
-                        return Ok(());
+                    match response.json::<ClusterHealth>().await {
+                        Ok(health) if !health.timed_out => {
+                            info!(
+                                "Elasticsearch cluster ready at {} (status={})",
+                                self.base_url, health.status
+                            );
+                            return Ok(());
+                        }
+                        Ok(health) => {
+                            last_error = format!(
+                                "cluster health timed out on attempt {attempt}/{CLUSTER_READY_ATTEMPTS} (status={})",
+                                health.status
+                            );
+                        }
+                        Err(error) => {
+                            last_error = format!(
+                                "cluster health body unparsable on attempt {attempt}/{CLUSTER_READY_ATTEMPTS}: {error}"
+                            );
+                        }
                     }
                 }
                 Ok(response) => {
@@ -358,11 +380,15 @@ impl ElasticsearchContainer {
 
 /// Cross-process advisory lock for inspect+rm recovery of the shared reuse
 /// container. Dropping the file releases the lock (including on process crash).
+///
+/// Assumes every nextest process shares the same `std::env::temp_dir()` (and
+/// thus the same lock file). A per-process `TMPDIR` makes each worker lock its
+/// own path and recovery can race silently.
 struct RecoveryLock {
     _file: File,
 }
 
-fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
+async fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
     let path = std::env::temp_dir().join(RECOVERY_LOCK_FILE_NAME);
     let file = OpenOptions::new()
         .read(true)
@@ -371,9 +397,25 @@ fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
         .truncate(false)
         .open(&path)
         .map_err(|error| format!("open {}: {error}", path.display()))?;
-    file.lock()
-        .map_err(|error| format!("lock {}: {error}", path.display()))?;
-    Ok(RecoveryLock { _file: file })
+
+    let deadline = Instant::now() + Duration::from_secs(RECOVERY_LOCK_TIMEOUT_SECS);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(RecoveryLock { _file: file }),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(RECOVERY_LOCK_POLL_MS)).await;
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "timed out after {RECOVERY_LOCK_TIMEOUT_SECS}s waiting for {}",
+                    path.display()
+                ));
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("lock {}: {error}", path.display()));
+            }
+        }
+    }
 }
 
 /// True only when Docker says the shared container is in a state safe to
@@ -382,7 +424,7 @@ fn acquire_recovery_lock() -> Result<RecoveryLock, String> {
 /// Removable: exited/dead/created/paused/restarting, or Docker healthcheck
 /// `unhealthy`. A plain `running` container (even if ES HTTP is flaky) is left
 /// alone: readiness flakes must not `docker rm -f` a shared Always-reuse box.
-fn container_is_removable_wedged() -> bool {
+async fn container_is_removable_wedged() -> bool {
     let inspect_format = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}";
     let Some(stdout) = docker_command_stdout(
         &[
@@ -392,7 +434,9 @@ fn container_is_removable_wedged() -> bool {
             ELASTICSEARCH_CONTAINER_NAME,
         ],
         DOCKER_INSPECT_TIMEOUT_SECS,
-    ) else {
+    )
+    .await
+    else {
         return false;
     };
 
@@ -406,42 +450,26 @@ fn container_is_removable_wedged() -> bool {
     ) || health == "unhealthy"
 }
 
-fn docker_command_stdout(args: &[&str], timeout_secs: u64) -> Option<String> {
-    let mut child = match Command::new("docker")
+async fn docker_command_stdout(args: &[&str], timeout_secs: u64) -> Option<String> {
+    let mut command = tokio::process::Command::new("docker");
+    command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            warn!("Failed to invoke docker {}: {error}", args.join(" "));
-            return None;
-        }
-    };
+        .kill_on_drop(true);
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                let mut stdout = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_string(&mut stdout);
-                }
-                return Some(stdout);
-            }
-            Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                warn!("docker {} timed out after {timeout_secs}s", args.join(" "));
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(error) => {
-                warn!("Failed waiting for docker {}: {error}", args.join(" "));
-                return None;
-            }
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            warn!("Failed to invoke docker {}: {error}", args.join(" "));
+            None
+        }
+        Err(_) => {
+            warn!("docker {} timed out after {timeout_secs}s", args.join(" "));
+            None
         }
     }
 }
@@ -451,50 +479,37 @@ fn docker_command_stdout(args: &[&str], timeout_secs: u64) -> Option<String> {
 /// and the wedged container was created by an earlier process anyway.
 /// Caller must hold [`RecoveryLock`] and have confirmed
 /// [`container_is_removable_wedged`].
-fn force_remove_container() {
-    let mut child = match Command::new("docker")
+async fn force_remove_container() {
+    let mut command = tokio::process::Command::new("docker");
+    command
         .args(["rm", "-f", ELASTICSEARCH_CONTAINER_NAME])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            warn!("Failed to invoke docker rm for '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
-            return;
-        }
-    };
+        .kill_on_drop(true);
 
-    let deadline = Instant::now() + Duration::from_secs(DOCKER_RM_TIMEOUT_SECS);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                info!("Removed wedged Elasticsearch container '{ELASTICSEARCH_CONTAINER_NAME}'");
-                return;
-            }
-            Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                warn!(
-                    "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} failed (exit {status}): {stderr}"
-                );
-                return;
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                warn!(
-                    "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} timed out after {DOCKER_RM_TIMEOUT_SECS}s"
-                );
-                return;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(error) => {
-                warn!("Failed waiting for docker rm '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
-                return;
-            }
+    match tokio::time::timeout(
+        Duration::from_secs(DOCKER_RM_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => {
+            info!("Removed wedged Elasticsearch container '{ELASTICSEARCH_CONTAINER_NAME}'");
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} failed (exit {}): {stderr}",
+                output.status
+            );
+        }
+        Ok(Err(error)) => {
+            warn!("Failed to invoke docker rm for '{ELASTICSEARCH_CONTAINER_NAME}': {error}");
+        }
+        Err(_) => {
+            warn!(
+                "docker rm -f {ELASTICSEARCH_CONTAINER_NAME} timed out after {DOCKER_RM_TIMEOUT_SECS}s"
+            );
         }
     }
 }

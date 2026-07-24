@@ -33,6 +33,7 @@ use uuid::Uuid;
 const SINK_INDEX_PREFIX: &str = "iggy_messages";
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
+const REFRESH_PROBE_TIMEOUT_MS: u64 = 2_000;
 
 pub struct ElasticsearchSinkFixture {
     container: ElasticsearchContainer,
@@ -64,8 +65,9 @@ impl ElasticsearchSinkFixture {
         let mut last_error: Option<TestBinaryError> = None;
 
         for _ in 0..POLL_ATTEMPTS {
-            // Refresh so near-real-time search/count sees recently indexed docs.
-            if let Err(error) = self.refresh_index().await {
+            // Short-timeout probe: create_http_client() is 30s + 3 retries and
+            // would inflate failure-path wait_for_documents up to minutes.
+            if let Err(error) = self.refresh_index_probe().await {
                 last_error = Some(error);
                 sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
                 continue;
@@ -103,6 +105,30 @@ impl ElasticsearchSinkFixture {
 
     pub async fn refresh_index(&self) -> Result<(), TestBinaryError> {
         ElasticsearchOps::refresh_index(self, &self.index).await
+    }
+
+    /// Refresh with a short-timeout client for the document poll loop.
+    async fn refresh_index_probe(&self) -> Result<(), TestBinaryError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(REFRESH_PROBE_TIMEOUT_MS))
+            .build()
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to build refresh probe client: {error}"),
+            })?;
+        let url = format!("{}/{}/_refresh", self.container.base_url, self.index);
+        let response = client.post(&url).send().await.map_err(|error| {
+            TestBinaryError::InvalidState {
+                message: format!("Failed to refresh index: {error}"),
+            }
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(TestBinaryError::InvalidState {
+                message: format!("Failed to refresh index: status={status}, body={body}"),
+            });
+        }
+        Ok(())
     }
 }
 
