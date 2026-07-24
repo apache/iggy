@@ -24,6 +24,8 @@ use pyo3_stub_gen::{
 };
 use std::str::FromStr;
 
+use crate::error::IggyError as PyIggyError;
+
 /// A Python class representing a message to be sent.
 /// This class wraps a Rust message meant for sending, facilitating
 /// the creation of such messages from Python and their subsequent use in Rust.
@@ -63,14 +65,15 @@ impl SendMessage {
     #[new]
     pub fn new(py: Python, data: PyMessagePayload) -> PyResult<Self> {
         let inner = match data {
-            PyMessagePayload::String(data) => RustIggyMessage::from_str(&data)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            PyMessagePayload::String(data) => {
+                RustIggyMessage::from_str(&data).map_err(PyIggyError::new_err_from_rust)?
+            }
             PyMessagePayload::Bytes(data) => {
                 let bytes = Bytes::from(data.extract::<Vec<u8>>(py)?);
                 RustIggyMessage::builder()
                     .payload(bytes)
                     .build()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?
+                    .map_err(PyIggyError::new_err_from_rust)?
             }
         };
         Ok(Self { inner })

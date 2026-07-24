@@ -17,7 +17,7 @@
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, IggyError
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -91,8 +91,11 @@ class TestStreamOperations:
         """Test create_stream enforces byte-length validation."""
         stream_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_stream(stream_name)
+
+        assert exc_info.value.name == "invalid_format"
+        assert exc_info.value.code == 4
 
     @pytest.mark.asyncio
     async def test_get_stream_by_name_and_id(
@@ -146,10 +149,11 @@ class TestStreamOperations:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_stream(stream_name)
 
-        assert "already exists" in str(exc_info.value)
+        assert exc_info.value.name == "stream_name_already_exists"
+        assert exc_info.value.code == 1012
 
     @pytest.mark.asyncio
     async def test_get_nonexistent_stream(self, iggy_client: IggyClient, unique_name):
@@ -168,8 +172,11 @@ class TestStreamOperations:
         host, port = get_server_config()
         client = IggyClient(f"{host}:{port}")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await client.get_stream(unique_name())
+
+        assert exc_info.value.name == "disconnected"
+        assert exc_info.value.code == 8
 
     @pytest.mark.asyncio
     async def test_get_stream_before_login_fails(self, unique_name):
@@ -180,8 +187,11 @@ class TestStreamOperations:
         client = IggyClient(f"{host}:{port}")
         await client.connect()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await client.get_stream(unique_name())
+
+        assert exc_info.value.name == "unauthenticated"
+        assert exc_info.value.code == 40
 
     @pytest.mark.asyncio
     async def test_create_stream_before_connect_fails(self, unique_name):
@@ -189,8 +199,11 @@ class TestStreamOperations:
         host, port = get_server_config()
         client = IggyClient(f"{host}:{port}")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await client.create_stream(unique_name())
+
+        assert exc_info.value.name == "disconnected"
+        assert exc_info.value.code == 8
 
     @pytest.mark.asyncio
     async def test_create_stream_before_login_fails(self, unique_name):
@@ -201,5 +214,8 @@ class TestStreamOperations:
         client = IggyClient(f"{host}:{port}")
         await client.connect()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await client.create_stream(unique_name())
+
+        assert exc_info.value.name == "unauthenticated"
+        assert exc_info.value.code == 40

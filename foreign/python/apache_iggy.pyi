@@ -34,6 +34,7 @@ __all__ = [
     "ConsumerGroupMember",
     "IggyClient",
     "IggyConsumer",
+    "IggyError",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
@@ -817,6 +818,24 @@ class IggyConsumer:
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
+
+@typing.final
+class IggyError(builtins.Exception):
+    r"""
+    A Python class representing the Rust's IggyError.
+    Allows transparent representation of Iggy-specific errors.
+    """
+    @property
+    def code(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def message(self) -> builtins.str: ...
+    def __new__(
+        cls, code: builtins.int, name: builtins.str, message: builtins.str
+    ) -> IggyError: ...
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
 
 class PollingStrategy:
     @typing.final

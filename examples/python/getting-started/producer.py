@@ -20,7 +20,7 @@ import asyncio
 import typing
 import urllib.parse
 
-from apache_iggy import IggyClient, StreamDetails, TopicDetails
+from apache_iggy import IggyClient, IggyError, StreamDetails, TopicDetails
 from apache_iggy import SendMessage as Message
 from loguru import logger
 
@@ -135,6 +135,10 @@ async def init_system(client: IggyClient):
         else:
             logger.warning(f"Stream {stream.name} already exists with ID {stream.id}")
 
+    except IggyError as error:
+        logger.error(
+            f"Error creating stream: [{error.code}] {error.name}: {error.message}"
+        )
     except Exception as error:
         logger.error(f"Error creating stream: {error}")
         logger.exception(error)
@@ -152,6 +156,10 @@ async def init_system(client: IggyClient):
             logger.info("Topic was created successfully.")
         else:
             logger.warning(f"Topic {topic.name} already exists with ID {topic.id}")
+    except IggyError as error:
+        logger.error(
+            f"Error creating topic: [{error.code}] {error.name}: {error.message}"
+        )
     except Exception as error:
         logger.error(f"Error creating topic {error}")
         logger.exception(error)
@@ -189,6 +197,11 @@ async def produce_messages(client: IggyClient):
             logger.info(
                 f"Successfully sent batch of {messages_per_batch} messages. "
                 f"Batch ID: {current_id // messages_per_batch}"
+            )
+        except IggyError as error:
+            logger.error(
+                "Iggy error while sending messages: "
+                f"[{error.code}] {error.name}: {error.message}"
             )
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")

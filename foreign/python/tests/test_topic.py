@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import IggyClient, SendMessage
+from apache_iggy import IggyClient, IggyError, SendMessage
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -104,10 +104,13 @@ class TestCreateTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_topic(
                 stream=stream_name, name=topic_name, partitions_count=1
             )
+
+        assert exc_info.value.name == "invalid_format"
+        assert exc_info.value.code == 4
 
     @pytest.mark.asyncio
     async def test_create_and_get_topic_with_numeric_stream_id(
@@ -146,12 +149,13 @@ class TestCreateTopic:
             stream=stream_name, name=topic_name, partitions_count=1
         )
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_topic(
                 stream=stream_name, name=topic_name, partitions_count=1
             )
 
-        assert "already exists" in str(exc_info.value)
+        assert exc_info.value.name == "topic_name_already_exists"
+        assert exc_info.value.code == 2013
 
     @pytest.mark.asyncio
     async def test_topic_names_can_repeat_across_different_streams(
@@ -306,7 +310,7 @@ class TestCreateTopic:
     @pytest.mark.parametrize(
         ("max_topic_size", "expected_exception"),
         [
-            (4563, RuntimeError),
+            (4563, IggyError),
             (-1, OverflowError),
             (2e64, TypeError),
         ],
@@ -324,13 +328,17 @@ class TestCreateTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(expected_exception):
+        with pytest.raises(expected_exception) as exc_info:
             await iggy_client.create_topic(
                 stream=stream_name,
                 name=topic_name,
                 partitions_count=1,
                 max_topic_size=max_topic_size,
             )
+
+        if expected_exception is IggyError:
+            assert exc_info.value.name == "invalid_topic_size"
+            assert exc_info.value.code == 1019
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -403,12 +411,13 @@ class TestCreateTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_topic(
                 stream=stream_name, name=topic_name, partitions_count=partitions_count
             )
 
-        assert "Too many partitions" in str(exc_info.value)
+        assert exc_info.value.name == "too_many_partitions"
+        assert exc_info.value.code == 2015
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("partitions_count", [0, 1, 1000])
@@ -489,10 +498,13 @@ class TestCreateTopic:
         nonexistent_stream = unique_name()
         topic_name = unique_name()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.create_topic(
                 stream=nonexistent_stream, name=topic_name, partitions_count=1
             )
+
+        assert exc_info.value.name == "stream_id_not_found"
+        assert exc_info.value.code == 1009
 
     @pytest.mark.asyncio
     async def test_create_topic_requires_connection_and_auth(self, unique_name):
@@ -501,16 +513,22 @@ class TestCreateTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_disconnected:
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
             )
 
+        assert exc_info_disconnected.value.name == "disconnected"
+        assert exc_info_disconnected.value.code == 8
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_unauthenticated:
             await client.create_topic(
                 stream=unique_name(), name=unique_name(), partitions_count=1
             )
+
+        assert exc_info_unauthenticated.value.name == "unauthenticated"
+        assert exc_info_unauthenticated.value.code == 40
 
 
 class TestGetTopic:
@@ -572,12 +590,18 @@ class TestGetTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_disconnected:
             await client.get_topic(unique_name(), unique_name())
 
+        assert exc_info_disconnected.value.name == "disconnected"
+        assert exc_info_disconnected.value.code == 8
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_unauthenticated:
             await client.get_topic(unique_name(), unique_name())
+
+        assert exc_info_unauthenticated.value.name == "unauthenticated"
+        assert exc_info_unauthenticated.value.code == 40
 
 
 class TestGetTopics:
@@ -679,12 +703,18 @@ class TestGetTopics:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_disconnected:
             await client.get_topics(unique_name())
 
+        assert exc_info_disconnected.value.name == "disconnected"
+        assert exc_info_disconnected.value.code == 8
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_unauthenticated:
             await client.get_topics(unique_name())
+
+        assert exc_info_unauthenticated.value.name == "unauthenticated"
+        assert exc_info_unauthenticated.value.code == 40
 
 
 class TestUpdateTopic:
@@ -1018,20 +1048,26 @@ class TestUpdateTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=stream_name, topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info.value.code == 2010
+        assert exc_info.value.name == "topic_id_not_found"
 
     @pytest.mark.asyncio
     async def test_update_topic_in_nonexistent_stream_fails(
         self, iggy_client: IggyClient, unique_name
     ):
         """Test update_topic raises when the stream does not exist."""
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info.value.code == 1009
+        assert exc_info.value.name == "stream_id_not_found"
 
     @pytest.mark.asyncio
     async def test_update_topic_to_existing_name_fails(
@@ -1050,10 +1086,13 @@ class TestUpdateTopic:
             stream=stream_name, name=second_topic, partitions_count=1
         )
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.update_topic(
                 stream_id=stream_name, topic_id=second_topic, name=first_topic
             )
+
+        assert exc_info.value.code == 2013
+        assert exc_info.value.name == "topic_name_already_exists"
 
     @pytest.mark.asyncio
     async def test_update_topic_requires_connection_and_auth(self, unique_name):
@@ -1062,16 +1101,22 @@ class TestUpdateTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_before_conn:
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
 
+        assert exc_info_before_conn.value.code == 8
+        assert exc_info_before_conn.value.name == "disconnected"
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_after_conn:
             await client.update_topic(
                 stream_id=unique_name(), topic_id=unique_name(), name=unique_name()
             )
+
+        assert exc_info_after_conn.value.code == 40
+        assert exc_info_after_conn.value.name == "unauthenticated"
 
 
 class TestDeleteTopic:
@@ -1150,8 +1195,11 @@ class TestDeleteTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.delete_topic(stream_name, unique_name())
+
+        assert exc_info.value.name == "topic_id_not_found"
+        assert exc_info.value.code == 2010
 
     @pytest.mark.asyncio
     async def test_delete_topic_twice_fails_second_time(
@@ -1167,8 +1215,11 @@ class TestDeleteTopic:
         )
 
         await iggy_client.delete_topic(stream_name, topic_name)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.delete_topic(stream_name, topic_name)
+
+        assert exc_info.value.name == "topic_id_not_found"
+        assert exc_info.value.code == 2010
 
     @pytest.mark.asyncio
     async def test_delete_topic_requires_connection_and_auth(self, unique_name):
@@ -1177,12 +1228,18 @@ class TestDeleteTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_disconnected:
             await client.delete_topic(unique_name(), unique_name())
 
+        assert exc_info_disconnected.value.name == "disconnected"
+        assert exc_info_disconnected.value.code == 8
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_unauthenticated:
             await client.delete_topic(unique_name(), unique_name())
+
+        assert exc_info_unauthenticated.value.name == "unauthenticated"
+        assert exc_info_unauthenticated.value.code == 40
 
 
 class TestPurgeTopic:
@@ -1271,16 +1328,22 @@ class TestPurgeTopic:
 
         await iggy_client.create_stream(stream_name)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.purge_topic(stream_name, unique_name())
+
+        assert exc_info.value.name == "topic_id_not_found"
+        assert exc_info.value.code == 2010
 
     @pytest.mark.asyncio
     async def test_purge_topic_in_nonexistent_stream_fails(
         self, iggy_client: IggyClient, unique_name
     ):
         """Test purge_topic raises when the stream does not exist."""
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info:
             await iggy_client.purge_topic(unique_name(), unique_name())
+
+        assert exc_info.value.name == "stream_id_not_found"
+        assert exc_info.value.code == 1009
 
     @pytest.mark.asyncio
     async def test_purge_topic_requires_connection_and_auth(self, unique_name):
@@ -1289,9 +1352,15 @@ class TestPurgeTopic:
         wait_for_server(host, port)
 
         client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_disconnected:
             await client.purge_topic(unique_name(), unique_name())
 
+        assert exc_info_disconnected.value.name == "disconnected"
+        assert exc_info_disconnected.value.code == 8
+
         await client.connect()
-        with pytest.raises(RuntimeError):
+        with pytest.raises(IggyError) as exc_info_unauthenticated:
             await client.purge_topic(unique_name(), unique_name())
+
+        assert exc_info_unauthenticated.value.name == "unauthenticated"
+        assert exc_info_unauthenticated.value.code == 40
