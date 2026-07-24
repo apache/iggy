@@ -59,6 +59,17 @@ jobs:
           server_version=$(scripts/extract-version.sh rust-server)
           echo "server_version=${server_version}" >> "$GITHUB_OUTPUT"
 
+      - name: Render bundled connector plugin list
+        id: plugins
+        run: |
+          # Derive the plugin list from cargo metadata so the release notes
+          # stay in sync with what is actually built (see connector-plugins.sh).
+          {
+            echo "list<<PLUGINS_EOF"
+            scripts/ci/connector-plugins.sh --names | sed 's/^/- `/; s/$/`/'
+            echo "PLUGINS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -101,16 +112,7 @@ jobs:
             - `iggy-connectors` - The connectors runtime
 
             ## Connector plugins included (.so)
-            - `iggy_connector_elasticsearch_sink`
-            - `iggy_connector_elasticsearch_source`
-            - `iggy_connector_iceberg_sink`
-            - `iggy_connector_postgres_sink`
-            - `iggy_connector_postgres_source`
-            - `iggy_connector_quickwit_sink`
-            - `iggy_connector_random_source`
-            - `iggy_connector_s3_sink`
-            - `iggy_connector_stdout_sink`
-            - `iggy_connector_surrealdb_sink`
+            ${{ steps.plugins.outputs.list }}
 
             ## Downloads
 
