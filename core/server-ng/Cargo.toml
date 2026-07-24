@@ -88,7 +88,10 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
-vsr = ["iggy_common/vsr"]
+# forward iggy/vsr: the SDK gates its VsrSessionControl impls on its own
+# feature while the trait surface follows iggy_common/vsr; without the
+# forward a bare `-p server-ng --features vsr` build breaks in the SDK
+vsr = ["iggy_common/vsr", "iggy/vsr"]
 
 [dependencies]
 ahash = { workspace = true }
