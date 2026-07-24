@@ -122,7 +122,8 @@ ensure_line() {
     fi
 
     if [ "$MODE" = "fix" ]; then
-        sed -i -E "s|$current_pattern|$replacement|" "$file"
+        sed -i.bak -E "s|$current_pattern|$replacement|" "$file"
+        rm -f "$file.bak"
         FIXED_CHECKS=$((FIXED_CHECKS + 1))
         echo -e "${GREEN}Fixed${NC} $file: $description"
     else
@@ -149,7 +150,8 @@ ensure_classifiers() {
         return
     fi
 
-    mapfile -t versions < <(sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$file")
+    versions=()
+    while IFS= read -r _py_ver_tmp; do versions+=("$_py_ver_tmp"); done < <(sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$file")
 
     if [ "${#versions[@]}" -eq 0 ]; then
         echo -e "${RED}✗${NC} $file: could not find Python version classifiers"
@@ -187,12 +189,18 @@ ensure_classifiers() {
             version_number=$((version_major * 100 + version_minor))
 
             if [ "$version_number" -lt "$PYTHON_VERSION_NUMBER" ]; then
-                sed -i -E "/^    \"Programming Language :: Python :: ${version//./\\.}\",$/d" "$file"
+                sed -i.bak -E "/^    \"Programming Language :: Python :: ${version//./\\.}\",$/d" "$file"
+                rm -f "$file.bak"
             fi
         done
 
         if [ "$has_minimum" -eq 0 ]; then
-            sed -i -E "/^    \"Programming Language :: Python :: ${PYTHON_VERSION_MAJOR}\",$/a\\    \"Programming Language :: Python :: ${PYTHON_VERSION}\"," "$file"
+            awk -v major="$PYTHON_VERSION_MAJOR" -v version="$PYTHON_VERSION" '
+              { print }
+              $0 == "    \"Programming Language :: Python :: " major "\"," {
+                printf "    \"Programming Language :: Python :: %s\",\n", version
+              }
+            ' "$file" > "$file.new" && mv "$file.new" "$file"
         fi
 
         FIXED_CHECKS=$((FIXED_CHECKS + 1))
@@ -244,7 +252,8 @@ ensure_lock_python_requirement() {
     fi
 
     if [ "$MODE" = "fix" ]; then
-        sed -i -E "1,${top_level_end}s|$current_pattern|$replacement|" "$file"
+        sed -i.bak -E "1,${top_level_end}s|$current_pattern|$replacement|" "$file"
+        rm -f "$file.bak"
         FIXED_CHECKS=$((FIXED_CHECKS + 1))
         echo -e "${GREEN}Fixed${NC} $file: lock file Python requirement"
     else
@@ -270,7 +279,8 @@ ensure_wheel_interpreters() {
         return
     fi
 
-    mapfile -t classifier_versions < <(sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$SOURCE_FILE")
+    classifier_versions=()
+    while IFS= read -r _py_cls_tmp; do classifier_versions+=("$_py_cls_tmp"); done < <(sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$SOURCE_FILE")
 
     if [ "${#classifier_versions[@]}" -eq 0 ]; then
         echo -e "${RED}✗${NC} $SOURCE_FILE: could not find Python version classifiers"
@@ -303,7 +313,8 @@ ensure_wheel_interpreters() {
     fi
 
     if [ "$MODE" = "fix" ]; then
-        sed -i -E "s|(--interpreter ).*$|\\1${expected_interpreters}|" "$file"
+        sed -i.bak -E "s|(--interpreter ).*$|\\1${expected_interpreters}|" "$file"
+        rm -f "$file.bak"
         FIXED_CHECKS=$((FIXED_CHECKS + 1))
         echo -e "${GREEN}Fixed${NC} $file: wheel interpreter versions"
     else

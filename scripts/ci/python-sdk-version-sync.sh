@@ -139,9 +139,9 @@ compare_versions() {
         dev2="0"
     fi
 
-    # Compare base versions using sort -V
+    # Compare base versions using POSIX sort (X.Y.Z numeric per component).
     local sorted
-    sorted=$(printf '%s\n%s' "$base1" "$base2" | sort -V | head -1)
+    sorted=$(printf '%s\n%s' "$base1" "$base2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)
 
     if [ "$base1" != "$base2" ]; then
         if [ "$sorted" = "$base1" ]; then
@@ -196,13 +196,15 @@ elif [ "$MODE" = "fix" ]; then
         # Cargo version is newer, update pyproject.toml
         NEW_PYPROJECT_VERSION="$CARGO_NORMALIZED"
         echo -e "${YELLOW}Cargo.toml has newer version, updating pyproject.toml...${NC}"
-        sed -i "s/^version = \"$PYPROJECT_VERSION\"/version = \"$NEW_PYPROJECT_VERSION\"/" "$PYPROJECT_TOML"
+        sed -i.bak "s/^version = \"$PYPROJECT_VERSION\"/version = \"$NEW_PYPROJECT_VERSION\"/" "$PYPROJECT_TOML"
+        rm -f "$PYPROJECT_TOML.bak"
         echo -e "${GREEN}✓ Updated $PYPROJECT_TOML: $PYPROJECT_VERSION -> $NEW_PYPROJECT_VERSION${NC}"
     elif [ "$COMPARISON" = "2" ]; then
         # pyproject version is newer, update Cargo.toml
         NEW_CARGO_VERSION=$(to_cargo_format "$PYPROJECT_NORMALIZED")
         echo -e "${YELLOW}pyproject.toml has newer version, updating Cargo.toml...${NC}"
-        sed -i "s/^version = \"$CARGO_VERSION\"/version = \"$NEW_CARGO_VERSION\"/" "$CARGO_TOML"
+        sed -i.bak "s/^version = \"$CARGO_VERSION\"/version = \"$NEW_CARGO_VERSION\"/" "$CARGO_TOML"
+        rm -f "$CARGO_TOML.bak"
         echo -e "${GREEN}✓ Updated $CARGO_TOML: $CARGO_VERSION -> $NEW_CARGO_VERSION${NC}"
     fi
 
