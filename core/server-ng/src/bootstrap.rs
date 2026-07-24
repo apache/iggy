@@ -960,6 +960,7 @@ async fn shard_main(
                 cluster_heartbeat_ticks(config),
                 commit_broadcast_ticks(config),
                 prepare_retransmit_ticks(config),
+                recovery_barrier_deadline(config.cluster.heartbeat_timeout.get_duration()),
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -1707,6 +1708,32 @@ pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
     duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
 }
 
+/// Floor for the post-restart read-recovery deadline (see
+/// [`recovery_barrier_deadline`]). At and below the 5s default heartbeat the
+/// worst-case recovery is dominated by the heartbeat-independent term - the
+/// `ViewChangeStatus` backstop plus election ceremony and suffix recommit,
+/// empirically ~7s - so the scaled value must never fall under this or a
+/// fast-heartbeat cluster would 503 legitimate reads mid-recovery.
+const RECOVERY_BARRIER_DEADLINE_FLOOR: Duration = Duration::from_secs(15);
+
+/// Heartbeat multiplier for the recovery deadline: a slower heartbeat stretches
+/// election and suffix recommit proportionally. 3x reproduces the empirically
+/// chosen 15s margin at the 5s default (3 x 5s = 15s) and holds that safety
+/// factor as the heartbeat grows.
+const RECOVERY_BARRIER_HEARTBEAT_MULTIPLIER: u32 = 3;
+
+/// How long the post-restart read path waits for the recovered WAL suffix to
+/// re-commit before failing loud (retryable 503): the larger of the
+/// heartbeat-independent floor and a heartbeat-scaled window. Derived from
+/// `[cluster] heartbeat_timeout` rather than its own knob so the two cannot
+/// drift; see `await_recovery_barrier` for the read-side wait.
+pub(crate) fn recovery_barrier_deadline(heartbeat: Duration) -> Duration {
+    // saturating: heartbeat_timeout has no config ceiling, plain `*` panics
+    heartbeat
+        .saturating_mul(RECOVERY_BARRIER_HEARTBEAT_MULTIPLIER)
+        .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
+}
+
 /// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
 /// primary broadcasts its commit point, the cluster's liveness feed. Applied
 /// to every consensus group, matching `cluster_heartbeat_ticks`.
@@ -1734,6 +1761,7 @@ fn restore_metadata_consensus(
     normal_heartbeat_ticks: u64,
     commit_message_ticks: u64,
     prepare_ticks: u64,
+    recovery_deadline: Duration,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1813,10 +1841,11 @@ fn restore_metadata_consensus(
     // primary; via StartView adoption + the local commit walk on a rejoined
     // backup), serving reads would show pre-restart state that clients already
     // saw acked -- gate them on the barrier regardless of role. If the suffix
-    // never committed cluster-wide, the barrier times out on the read path and
-    // serving resumes (`await_recovery_barrier`).
+    // never re-commits cluster-wide, the read path fails loud with a retryable
+    // 503 once the paired deadline expires (`await_recovery_barrier`).
     if commit_watermark < restored_op {
         consensus.set_recovery_barrier(restored_op);
+        consensus.set_recovery_deadline(recovery_deadline);
     }
 
     // Re-pipeline the prepared-but-uncommitted suffix so the primary's
@@ -3110,6 +3139,43 @@ mod tests {
             "[cluster] heartbeat_timeout default drifted from \
              TimeoutManager::NORMAL_HEARTBEAT_TICKS"
         );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_holds_the_floor_for_small_heartbeats() {
+        // Below the 5s default the heartbeat-independent recovery term (~7s of
+        // ViewChangeStatus backstop plus ceremony) dominates, so the floor
+        // governs however small the heartbeat is; 3 x 5s lands exactly on it.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(1)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(5)),
+            RECOVERY_BARRIER_DEADLINE_FLOOR
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_scales_past_the_floor_for_large_heartbeats() {
+        // Once 3 x heartbeat clears the floor the scaled window governs, so a
+        // slow-heartbeat cluster is not failed 503 before its longer recovery
+        // can finish.
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(10)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            recovery_barrier_deadline(Duration::from_secs(15)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn recovery_barrier_deadline_saturates_instead_of_panicking() {
+        // heartbeat_timeout has no config ceiling, so the multiply must
+        // saturate rather than abort boot on an absurd parseable value.
+        assert_eq!(recovery_barrier_deadline(Duration::MAX), Duration::MAX);
     }
 
     #[test]

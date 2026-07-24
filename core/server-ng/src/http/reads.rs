@@ -90,7 +90,7 @@ pub(in crate::http) async fn read_local(
     body: &[u8],
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
-    await_recovery_barrier(&state.shard).await;
+    await_recovery_barrier(&state.shard).await?;
     authorize_read(state, identity, consistency, rule)?;
     match build_non_replicated_response(
         &state.shard,
@@ -106,25 +106,54 @@ pub(in crate::http) async fn read_local(
     }
 }
 
+/// One recovery-barrier check's outcome, factored out of [`await_recovery_barrier`]
+/// so the expiry decision is unit-testable without a runtime: the loop reads the
+/// clock and injects whether the deadline has passed.
+#[derive(Debug, PartialEq, Eq)]
+enum BarrierWait {
+    /// Barrier met, or none armed: serve the read.
+    Ready,
+    /// Barrier unmet and the deadline has passed: fail loud.
+    Expired,
+    /// Barrier unmet, deadline still ahead: keep polling.
+    Pending,
+}
+
+/// Decide the barrier outcome from the armed barrier, the locally applied commit
+/// point, and whether the deadline has passed. A met barrier wins over an
+/// expired deadline, so recovery that completes as the deadline lands still
+/// serves rather than 503-ing.
+const fn barrier_state(barrier: u64, commit_min: u64, expired: bool) -> BarrierWait {
+    if barrier == 0 || commit_min >= barrier {
+        BarrierWait::Ready
+    } else if expired {
+        BarrierWait::Expired
+    } else {
+        BarrierWait::Pending
+    }
+}
+
 /// Hold a local read while the recovered WAL suffix re-commits.
 ///
 /// Recovery re-pipelines prepared-but-uncommitted ops that clients saw
 /// committed before the restart; JWT-authenticated HTTP reads skip consensus
 /// entirely, so without this wait they can observe state that rolls back
 /// committed history in the first few hundred milliseconds after a restart.
-/// No-op (`recovery_barrier() == 0`) outside that window. Bounded: the
-/// suffix needs a backup quorum to re-commit, so serve anyway after the
-/// deadline rather than wedging reads on a partitioned cluster.
-pub(in crate::http) async fn await_recovery_barrier(shard: &Rc<ServerNgShard>) {
-    // Must outlast a full post-restart convergence: the peers' election
-    // (several heartbeat timeouts in the worst case) plus the new primary
-    // re-committing the journaled suffix. A shorter deadline expires mid
-    // view-change and serves pre-restart state that clients saw acked.
-    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// `Ok(())` immediately when no suffix is pending (`recovery_barrier() == 0`).
+///
+/// Bounded by the barrier's paired deadline (scaled from the configured
+/// heartbeat; see `recovery_barrier_deadline`). If the suffix has not
+/// re-committed by then the read fails loud with a retryable 503
+/// ([`ReadError::RecoveryIncomplete`]) instead of silently serving pre-restart
+/// state a client already saw acked; the caller retries against a converged
+/// cluster.
+pub(in crate::http) async fn await_recovery_barrier(
+    shard: &Rc<ServerNgShard>,
+) -> Result<(), ReadError> {
     const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
     let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
-        return;
+        return Ok(());
     };
     let barrier = consensus.recovery_barrier();
     // Gate on commit_MIN (locally applied), not commit_max (known committed):
@@ -132,20 +161,24 @@ pub(in crate::http) async fn await_recovery_barrier(shard: &Rc<ServerNgShard>) {
     // journal applying ops, and this task interleaves with that walk at its
     // await points -- a commit_max gate would serve state from before the
     // suffix applied (e.g. a pre-restart password change not yet visible).
-    if barrier == 0 || consensus.commit_min() >= barrier {
-        return;
+    if barrier_state(barrier, consensus.commit_min(), false) == BarrierWait::Ready {
+        return Ok(());
     }
-    let deadline = std::time::Instant::now() + DEADLINE;
-    while consensus.commit_min() < barrier {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!(
-                barrier,
-                commit_min = consensus.commit_min(),
-                "recovered suffix still unapplied past deadline; serving read anyway"
-            );
-            return;
+    let deadline = std::time::Instant::now() + consensus.recovery_deadline();
+    loop {
+        let expired = std::time::Instant::now() >= deadline;
+        match barrier_state(barrier, consensus.commit_min(), expired) {
+            BarrierWait::Ready => return Ok(()),
+            BarrierWait::Expired => {
+                tracing::warn!(
+                    barrier,
+                    commit_min = consensus.commit_min(),
+                    "recovered suffix still unapplied past deadline; failing read with retryable 503"
+                );
+                return Err(ReadError::RecoveryIncomplete);
+            }
+            BarrierWait::Pending => compio::time::sleep(POLL).await,
         }
-        compio::time::sleep(POLL).await;
     }
 }
 
@@ -227,4 +260,39 @@ pub(in crate::http) fn authorize_data_plane(
         .mux_stm
         .users()
         .authorize(|permissioner| rule(permissioner, user_id, stream_id, topic_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BarrierWait, barrier_state};
+
+    #[test]
+    fn barrier_state_ready_when_no_barrier_armed() {
+        assert_eq!(barrier_state(0, 0, false), BarrierWait::Ready);
+        assert_eq!(barrier_state(0, 0, true), BarrierWait::Ready);
+    }
+
+    #[test]
+    fn barrier_state_ready_when_commit_reached_barrier() {
+        assert_eq!(barrier_state(5, 5, false), BarrierWait::Ready);
+        assert_eq!(barrier_state(5, 6, false), BarrierWait::Ready);
+    }
+
+    #[test]
+    fn barrier_state_pending_while_unmet_before_deadline() {
+        assert_eq!(barrier_state(5, 3, false), BarrierWait::Pending);
+    }
+
+    #[test]
+    fn barrier_state_expires_when_unmet_past_deadline() {
+        // Red before the fail-loud change: an expired barrier used to serve the
+        // read (a bare `()`), now an unmet barrier past its deadline is a
+        // distinct terminal outcome the wait maps to a retryable 503.
+        assert_eq!(barrier_state(5, 3, true), BarrierWait::Expired);
+    }
+
+    #[test]
+    fn barrier_state_met_wins_over_expired_deadline() {
+        assert_eq!(barrier_state(5, 5, true), BarrierWait::Ready);
+    }
 }

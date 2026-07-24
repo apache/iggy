@@ -37,6 +37,7 @@ use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Injected time source for primary-stamped prepare timestamps.
 ///
@@ -790,6 +791,10 @@ where
     /// Commit point the recovered WAL suffix must re-reach before admitting
     /// client requests as primary (`0` = no recovered suffix pending).
     recovery_barrier: Cell<u64>,
+    /// Wall-clock budget the recovered suffix has to re-commit before a waiter
+    /// on [`Self::recovery_barrier`] gives up. Armed together with the barrier;
+    /// `ZERO` when no suffix is pending (barrier `0`), which no waiter reads.
+    recovery_deadline: Cell<Duration>,
     /// True while this replica declines the primaryship its (stale) recovered
     /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
     /// math, so without this flag a restarted view-N primary would still pass
@@ -915,6 +920,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             view: Cell::new(0),
             log_view: Cell::new(0),
             recovery_barrier: Cell::new(0),
+            recovery_deadline: Cell::new(Duration::ZERO),
             ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
@@ -1133,6 +1139,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn set_recovery_barrier(&self, required_commit: u64) {
         self.recovery_barrier.set(required_commit);
+    }
+
+    /// Deadline paired with [`Self::recovery_barrier`]; only meaningful while the
+    /// barrier is armed (non-zero).
+    #[must_use]
+    pub const fn recovery_deadline(&self) -> Duration {
+        self.recovery_deadline.get()
+    }
+
+    pub fn set_recovery_deadline(&self, deadline: Duration) {
+        self.recovery_deadline.set(deadline);
     }
 
     pub fn set_view(&mut self, view: u32) {
