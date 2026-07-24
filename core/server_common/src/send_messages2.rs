@@ -173,12 +173,12 @@ impl SendMessages2Owned {
             header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
             header[36..40].copy_from_slice(&payload_length.to_le_bytes());
 
-            let checksum = calculate_checksum_parts(&header[8..], &message.payload, user_headers);
-            header[0..8].copy_from_slice(&checksum.to_le_bytes());
-
+            let msg_start = blob.len();
             blob.extend_from_slice(&header);
             blob.extend_from_slice(&message.payload);
             blob.extend_from_slice(user_headers);
+            let checksum = XxHash3_64::oneshot(&blob[msg_start + 8..]);
+            blob[msg_start..msg_start + 8].copy_from_slice(&checksum.to_le_bytes());
         }
 
         let blob = blob.freeze();
@@ -501,12 +501,12 @@ pub fn encrypt_batch_request(
         header[28..32].copy_from_slice(&view.header.timestamp_delta.to_le_bytes());
         header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
         header[36..40].copy_from_slice(&payload_length.to_le_bytes());
-        let checksum = calculate_checksum_parts(&header[8..], &encrypted_payload, user_headers);
-        header[0..8].copy_from_slice(&checksum.to_le_bytes());
-
+        let msg_start = blob.len();
         blob.extend_from_slice(&header);
         blob.extend_from_slice(&encrypted_payload);
         blob.extend_from_slice(user_headers);
+        let checksum = XxHash3_64::oneshot(&blob[msg_start + 8..]);
+        blob[msg_start..msg_start + 8].copy_from_slice(&checksum.to_le_bytes());
     }
 
     let blob = blob.freeze();
@@ -633,15 +633,18 @@ fn transcode_legacy_request(
         header[28..32].copy_from_slice(&timestamp_delta.to_le_bytes());
         header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
         header[36..40].copy_from_slice(&payload_length.to_le_bytes());
-        let checksum = calculate_checksum_parts(&header[8..], legacy.payload, legacy.user_headers);
-        header[0..8].copy_from_slice(&checksum.to_le_bytes());
-
+        let msg_start = write;
         bytes[write..write + MESSAGE_HEADER_SIZE].copy_from_slice(&header);
         write += MESSAGE_HEADER_SIZE;
         bytes[write..write + legacy.payload.len()].copy_from_slice(legacy.payload);
         write += legacy.payload.len();
         bytes[write..write + legacy.user_headers.len()].copy_from_slice(legacy.user_headers);
         write += legacy.user_headers.len();
+        // The cover is [msg_start + 8 .. write], including the 8 reserved zero
+        // header bytes. This relies on the stack header being zero-initialized,
+        // not on the output buffer being pre-zeroed.
+        let checksum = XxHash3_64::oneshot(&bytes[msg_start + 8..write]);
+        bytes[msg_start..msg_start + 8].copy_from_slice(&checksum.to_le_bytes());
     }
 
     let mut command = SendMessages2Header::new(
@@ -829,15 +832,10 @@ pub fn verify_received_send_messages(bytes: &[u8]) -> Result<(), IggyError> {
     let mut verified = 0u32;
     let mut covered = 0usize;
     for framed in batch.iter_with_offsets() {
-        // Raw header tail (`header[8..48]`, the checksum-covered fields plus the
-        // zero reserved bytes) sourced from the blob, not rebuilt from decoded
-        // fields, so the cover is byte-exact with the encoder's.
-        let header_tail = &blob[framed.start + 8..framed.start + MESSAGE_HEADER_SIZE];
-        let expected = calculate_checksum_parts(
-            header_tail,
-            framed.message.payload,
-            framed.message.user_headers,
-        );
+        // Cover (`header[8..48] || payload || user_headers`) hashed raw from
+        // the blob, not rebuilt from decoded fields, so it is byte-exact with
+        // the encoder's.
+        let expected = XxHash3_64::oneshot(&blob[framed.start + 8..framed.end]);
         if expected != framed.message.header.checksum {
             return Err(IggyError::InvalidMessageChecksum(
                 framed.message.header.checksum,
@@ -919,16 +917,6 @@ impl<'a> LegacyMessageRef<'a> {
             total_size,
         })
     }
-}
-
-// Hash in storage order: header tail, payload, user headers (the message
-// sections follow the legacy wire layout).
-fn calculate_checksum_parts(header_tail: &[u8], payload: &[u8], user_headers: &[u8]) -> u64 {
-    let mut hasher = XxHash3_64::new();
-    hasher.write(header_tail);
-    hasher.write(payload);
-    hasher.write(user_headers);
-    hasher.finish()
 }
 
 fn calculate_batch_checksum(header: &SendMessages2Header, blob: &[u8]) -> u64 {
@@ -1173,6 +1161,47 @@ mod tests {
             ),
             "a flipped stored checksum must fail the per-message check",
         );
+    }
+
+    #[test]
+    fn checksum_oneshot_matches_streaming_reference() {
+        // Formula pin: the per-message checksum is XxHash3-64 (default seed)
+        // over `header[8..48] || payload || user_headers` as one byte stream.
+        // The encoders hash the concatenation in a single oneshot pass; this
+        // streaming reference feeds the same parts separately. Both must agree
+        // for every shape, or checksums at rest stop verifying.
+        fn streaming_reference(header_tail: &[u8], payload: &[u8], user_headers: &[u8]) -> u64 {
+            let mut hasher = XxHash3_64::new();
+            hasher.write(header_tail);
+            hasher.write(payload);
+            hasher.write(user_headers);
+            hasher.finish()
+        }
+
+        let header_tail: Vec<u8> = (0u8..40).collect();
+        let kilobyte: Vec<u8> = (0..1024u32).map(|index| (index % 251) as u8).collect();
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[], &[]),
+            (b"payload-bytes", &[]),
+            (b"payload-bytes", b"user-header-bytes"),
+            (&kilobyte, &[]),
+            (&kilobyte, &kilobyte[..7]),
+            (&kilobyte[..1023], &kilobyte[..7]),
+        ];
+        for (payload, user_headers) in cases {
+            let mut concatenated =
+                Vec::with_capacity(header_tail.len() + payload.len() + user_headers.len());
+            concatenated.extend_from_slice(&header_tail);
+            concatenated.extend_from_slice(payload);
+            concatenated.extend_from_slice(user_headers);
+            assert_eq!(
+                XxHash3_64::oneshot(&concatenated),
+                streaming_reference(&header_tail, payload, user_headers),
+                "oneshot must match the streaming reference for payload {} B, user headers {} B",
+                payload.len(),
+                user_headers.len(),
+            );
+        }
     }
 
     /// Legacy `SendMessages` request body: `[metadata_len=4][message_count]`
