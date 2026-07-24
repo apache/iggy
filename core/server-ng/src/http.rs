@@ -146,8 +146,12 @@ pub async fn start(
 
     if http_config.tls.enabled {
         let server_config = tls::load_http_tls_server_config(&http_config.tls)?;
-        let (connections, pump) =
-            tls::spawn_accept_pump(listener, server_config, shard.bus.token());
+        let (connections, pump) = tls::spawn_accept_pump(
+            listener,
+            server_config,
+            shard.bus.config().handshake_grace,
+            shard.bus.token(),
+        );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server-ng HTTPS listener started");
         let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));

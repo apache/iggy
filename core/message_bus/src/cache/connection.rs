@@ -22,8 +22,6 @@ use rand::seq::SliceRandom;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
-pub const DEFAULT_MAX_CONNECTIONS_PER_REPLICA: usize = 8;
-
 pub trait ShardedState {
     type Entry;
     type Delta;
