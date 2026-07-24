@@ -122,16 +122,18 @@ impl Sequencer for LocalSequencer {
     }
 }
 
-/// TODO The below numbers need to be added a consensus config
-/// TODO understand how to configure these numbers.
-/// Maximum number of prepares that can be in-flight in the pipeline.
+/// Default in-flight prepare-queue depth.
 ///
-/// Sized to absorb a synchronized client burst (e.g. the 20-way
-/// concurrent-creation race tests across TCP/QUIC/WebSocket) without
-/// `PipelineFull`-rejecting and disconnecting clients that cannot replay in
-/// time. At depth 8 the QUIC burst wedges the metadata consensus even in
-/// release. Stays well under the journal's `SLOT_COUNT` (1024) and the inbox
-/// capacity headroom.
+/// [`LocalPipeline::new`] uses it, and the server-ng config default
+/// (`DEFAULT_METADATA_PREPARE_QUEUE_DEPTH`) is static-asserted equal to it at
+/// bootstrap. Operators raise the running bound via `[metadata]
+/// prepare_queue_depth`; the pipeline then carries its own capacity (see
+/// [`LocalPipeline::with_capacities`]).
+///
+/// Sized to absorb a synchronized client burst (the 20-way concurrent-creation
+/// race tests across TCP/QUIC/WebSocket) without `PipelineFull`-rejecting
+/// clients that cannot replay in time; a depth of 8 wedged the QUIC burst even
+/// in release. Stays well under the journal's slot count and the inbox headroom.
 pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 32;
 
 /// Max accepted-but-not-yet-prepared requests buffered behind a full
@@ -447,7 +449,7 @@ impl LocalPipeline {
     }
 
     /// Find a message by op number and checksum (immutable).
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
@@ -478,7 +480,7 @@ impl LocalPipeline {
     }
 
     /// Find a message by op number only.
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
@@ -494,7 +496,7 @@ impl LocalPipeline {
 
     /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
         let head_op = self.prepare_queue.front()?.header.op;
@@ -531,8 +533,8 @@ impl LocalPipeline {
     /// If any invariant is violated.
     pub fn verify(&self) {
         // Check capacity limits
-        assert!(self.prepare_queue.len() <= PIPELINE_PREPARE_QUEUE_MAX);
-        assert!(self.request_queue.len() <= PIPELINE_REQUEST_QUEUE_MAX);
+        assert!(self.prepare_queue.len() <= self.prepare_queue_max);
+        assert!(self.request_queue.len() <= self.request_queue_max);
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
@@ -620,6 +622,10 @@ impl Pipeline for LocalPipeline {
 
     fn len(&self) -> usize {
         self.prepare_count()
+    }
+
+    fn prepare_queue_max(&self) -> usize {
+        self.prepare_queue_max
     }
 
     fn verify(&self) {
@@ -809,6 +815,10 @@ where
     last_prepare_checksum: Cell<u128>,
 
     pipeline: RefCell<P>,
+    /// Snapshot of the pipeline's in-flight prepare capacity, taken at
+    /// construction. Bounds the loopback queue and the view-change rebuild
+    /// range without re-borrowing `pipeline`.
+    prepare_queue_max: usize,
 
     message_bus: B,
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
@@ -896,6 +906,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // across groups. Consider using a proper hash (e.g., Murmur3) of
         // (replica_id, namespace) for production.
         let timeout_seed = u128::from(replica) ^ u128::from(namespace);
+        let prepare_queue_max = pipeline.prepare_queue_max();
         Self {
             cluster,
             replica,
@@ -912,8 +923,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
+            prepare_queue_max,
             message_bus,
-            loopback_queue: RefCell::new(VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX)),
+            loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
@@ -2436,13 +2448,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // incoming PrepareOk messages can be matched and commits can proceed.
         if max_commit < new_op {
             assert!(
-                (new_op - max_commit) <= PIPELINE_PREPARE_QUEUE_MAX as u64,
+                (new_op - max_commit) <= self.prepare_queue_max as u64,
                 "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
                  DVC winner claims more in-flight ops than the pipeline can hold",
                 max_commit + 1,
                 new_op,
                 new_op - max_commit,
-                PIPELINE_PREPARE_QUEUE_MAX,
+                self.prepare_queue_max,
             );
             actions.push(VsrAction::RebuildPipeline {
                 from_op: max_commit + 1,
@@ -2554,7 +2566,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     // TODO: Route SVC/DVC self-messages through loopback once VsrAction dispatch is implemented.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
         assert!(
-            self.loopback_queue.borrow().len() < PIPELINE_PREPARE_QUEUE_MAX,
+            self.loopback_queue.borrow().len() < self.prepare_queue_max,
             "loopback queue overflow: {} items",
             self.loopback_queue.borrow().len()
         );
@@ -2948,6 +2960,38 @@ mod pipeline_entry_tests {
         let header = PrepareHeader::default();
         let mut entry = PipelineEntry::new(header);
         assert!(entry.take_reply_sender().is_none());
+    }
+
+    /// A pipeline configured deeper than [`PIPELINE_PREPARE_QUEUE_MAX`] must
+    /// verify a full queue instead of tripping the capacity assert: the bound
+    /// tracks the configured depth, not the default const.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn given_prepare_queue_depth_above_default_when_verify_should_not_panic() {
+        let depth = PIPELINE_PREPARE_QUEUE_MAX * 2;
+        let mut pipeline = LocalPipeline::with_capacities(depth, depth * 2);
+
+        let mut parent = 0u128;
+        for op in 1..=depth as u64 {
+            let checksum = u128::from(op);
+            let header = PrepareHeader {
+                command: Command2::Prepare,
+                size: std::mem::size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                checksum,
+                ..Default::default()
+            };
+            pipeline.push(PipelineEntry::new(header));
+            parent = checksum;
+        }
+
+        assert!(
+            pipeline.prepare_queue_full(),
+            "queue filled to the configured depth"
+        );
+        // Would panic on the old `len() <= PIPELINE_PREPARE_QUEUE_MAX` assert.
+        pipeline.verify();
     }
 }
 
