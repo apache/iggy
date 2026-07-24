@@ -78,9 +78,17 @@ pub(in crate::http) struct HttpInner {
     /// requests for one credential from each running its own `Register`.
     pub(in crate::http) registrations: RegistrationBarrier,
     pub(in crate::http) roster: ClusterRoster,
+    /// Shard-0-global cap on concurrently awaited partition writes, from
+    /// `[http_admission] max_in_flight_writes`. Passed to `admit_partition_write`
+    /// alongside the per-session cap.
+    pub(in crate::http) max_in_flight_writes: u32,
+    /// Per-session cap on concurrently awaited partition writes, from
+    /// `[http_admission] max_in_flight_writes_per_session`. Uniform across
+    /// sessions, so it lives here rather than on each `HttpSession`.
+    pub(in crate::http) max_in_flight_writes_per_session: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
-    /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
-    /// it, so every admission is paired with exactly one release.
+    /// by `max_in_flight_writes`. Only [`InFlightWriteGuard`] touches it, so
+    /// every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
 }
 

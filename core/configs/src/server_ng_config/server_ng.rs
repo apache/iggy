@@ -17,6 +17,7 @@
 
 use super::COMPONENT_NG;
 use super::cluster::ClusterConfig;
+use super::http_admission::HttpAdmissionConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::quic::QuicConfig;
@@ -74,6 +75,7 @@ pub struct ServerNgConfig {
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
+    pub http_admission: HttpAdmissionConfig,
     pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,

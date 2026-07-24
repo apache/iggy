@@ -173,6 +173,20 @@ cert_file = "core/certs/iggy_cert.pem"
 # Path to the TLS key file.
 key_file = "core/certs/iggy_key.pem"
 
+# Admission caps for shard-0 HTTP awaited partition writes (produce and
+# consumer-offset writes that park a handler and pin a buffered body until the
+# write commits). These bound how much buffered memory and consensus-pump delay
+# concurrent HTTP writes can impose on shard 0.
+[http_admission]
+# Shard-0-global budget for concurrently awaited partition writes across every
+# session. Requests past it are refused with a server-busy 503. Must be > 0.
+max_in_flight_writes = 128
+
+# Per-session cap on concurrently awaited partition writes, so one credential
+# that outruns its own commits gets a too-many-in-flight 429 before it can
+# starve the shared budget. Must be > 0 and must not exceed max_in_flight_writes.
+max_in_flight_writes_per_session = 32
+
 # TCP server configuration.
 [tcp]
 # Determines if the TCP server is active.

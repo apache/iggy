@@ -52,6 +52,7 @@ use axum::middleware::{Next, from_fn};
 use axum::routing::{delete, get, post, put};
 use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::ng_cluster::{ClusterConfig, TransportPorts};
+use configs::ng_http_admission::HttpAdmissionConfig;
 use configs::server_ng::NgSystemConfig;
 use iggy_common::IggyError;
 use message_bus::client_listener;
@@ -93,6 +94,7 @@ pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
+    admission: &HttpAdmissionConfig,
     cluster: &ClusterConfig,
     system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
@@ -129,6 +131,8 @@ pub async fn start(
             // never consulted here.
             metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
+        max_in_flight_writes: admission.max_in_flight_writes,
+        max_in_flight_writes_per_session: admission.max_in_flight_writes_per_session,
         in_flight_writes: Cell::new(0),
     }));
     // Saturating: a configured limit past the pointer width (32-bit target,

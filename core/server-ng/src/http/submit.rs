@@ -308,7 +308,12 @@ pub(in crate::http) async fn partition_write_replicated(
     // actually unbounded - the slot install, the dispatch, and the parked
     // reply await that pins this request's buffers for up to the reply
     // timeout. Held across every exit below; released by `Drop`.
-    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
+    let _in_flight = admit_partition_write(
+        &session.in_flight_writes,
+        &state.in_flight_writes,
+        state.max_in_flight_writes_per_session,
+        state.max_in_flight_writes,
+    )?;
     ensure_in_process_reply_target(state, session);
     let request_id = session.next_data_request_id();
     let message = build_request_message(
@@ -371,7 +376,12 @@ pub(in crate::http) async fn produce_unacked(
     session: &HttpSession,
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
-    let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
+    let _in_flight = admit_partition_write(
+        &session.in_flight_writes,
+        &state.in_flight_writes,
+        state.max_in_flight_writes_per_session,
+        state.max_in_flight_writes,
+    )?;
     let request_id = session.next_data_request_id();
     let message = build_request_message(
         Operation::SendMessages,

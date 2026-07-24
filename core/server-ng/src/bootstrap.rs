@@ -2251,6 +2251,7 @@ async fn start_tcp_runtime(
             shard,
             http_addr,
             &config.http,
+            &config.http_admission,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,

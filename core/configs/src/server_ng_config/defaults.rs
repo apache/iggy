@@ -30,6 +30,7 @@
 use super::cluster::{
     ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
 };
+use super::http_admission::HttpAdmissionConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
@@ -63,6 +64,7 @@ impl Default for ServerNgConfig {
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
             http: HttpConfig::default(),
+            http_admission: HttpAdmissionConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
             metadata: MetadataConfig::default(),
@@ -136,6 +138,20 @@ impl Default for MetadataConfig {
         MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
+        }
+    }
+}
+
+impl Default for HttpAdmissionConfig {
+    fn default() -> HttpAdmissionConfig {
+        // Read from the embedded TOML so the Default impl and the on-disk
+        // schema cannot drift; the lockstep test pins these to the canonical
+        // caps.
+        let http_admission = &SERVER_NG_CONFIG.http_admission;
+        HttpAdmissionConfig {
+            max_in_flight_writes: http_admission.max_in_flight_writes as u32,
+            max_in_flight_writes_per_session: http_admission.max_in_flight_writes_per_session
+                as u32,
         }
     }
 }

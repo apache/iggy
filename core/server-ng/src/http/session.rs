@@ -88,7 +88,7 @@ pub(in crate::http) struct HttpSession {
     /// token.
     pub(in crate::http) registry_token: Cell<Option<InstanceToken>>,
     /// Awaited partition writes currently in flight on this session, gated by
-    /// [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]. Only [`InFlightWriteGuard`]
+    /// `HttpInner::max_in_flight_writes_per_session`. Only [`InFlightWriteGuard`]
     /// touches it, so every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
 }

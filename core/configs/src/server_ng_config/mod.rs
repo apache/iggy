@@ -30,6 +30,7 @@
 pub mod cluster;
 pub mod defaults;
 pub mod displays;
+pub mod http_admission;
 pub mod message_bus;
 pub mod metadata;
 pub mod quic;

@@ -221,14 +221,14 @@ pub(in crate::http) enum PartitionWriteError {
     /// The in-process reply slot could not be installed. Transient server
     /// condition -> the shared 503, retryable.
     Unavailable,
-    /// This session is already at [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]
+    /// This session is already at its `http_admission.max_in_flight_writes_per_session`
     /// awaited writes. 429: the caller's own concurrency is the problem, so
     /// it must drain its outstanding writes before submitting more.
     TooManyInFlight,
-    /// Shard 0 is already at [`MAX_IN_FLIGHT_WRITES_GLOBAL`] awaited writes
-    /// across all sessions. 503 with its own code (distinct from the shared
-    /// consensus-unavailable body) so an operator can tell admission shedding
-    /// from a consensus outage.
+    /// Shard 0 is already at its `http_admission.max_in_flight_writes` awaited
+    /// writes across all sessions. 503 with its own code (distinct from the
+    /// shared consensus-unavailable body) so an operator can tell admission
+    /// shedding from a consensus outage.
     ServerBusy,
     /// No committed reply within [`PARTITION_WRITE_REPLY_TIMEOUT`], or the
     /// session's reply target was torn down mid-wait. 504: the commit may
@@ -323,10 +323,10 @@ fn service_unavailable() -> Response {
     )
 }
 
-/// 429 for a session at [`MAX_IN_FLIGHT_WRITES_PER_SESSION`] awaited partition
-/// writes. Shaped like every other HTTP error (`ErrorResponse`) so clients
-/// parse one error schema; the remedy is the caller's own: let outstanding
-/// writes finish, then retry.
+/// 429 for a session at its `http_admission.max_in_flight_writes_per_session`
+/// awaited partition writes. Shaped like every other HTTP error
+/// (`ErrorResponse`) so clients parse one error schema; the remedy is the
+/// caller's own: let outstanding writes finish, then retry.
 fn too_many_in_flight_response() -> Response {
     with_retry_after(error_response(
         StatusCode::TOO_MANY_REQUESTS,
@@ -335,8 +335,8 @@ fn too_many_in_flight_response() -> Response {
     ))
 }
 
-/// 503 for shard 0 at [`MAX_IN_FLIGHT_WRITES_GLOBAL`] awaited partition writes
-/// across all sessions. A distinct `server_busy` code (unlike the shared
+/// 503 for shard 0 at its `http_admission.max_in_flight_writes` awaited partition
+/// writes across all sessions. A distinct `server_busy` code (unlike the shared
 /// consensus-unavailable 503) so admission shedding is tellable from a
 /// consensus outage; retry with backoff.
 fn server_busy_response() -> Response {
