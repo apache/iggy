@@ -501,6 +501,11 @@ pub async fn build_partition_fresh(
     consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
     consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));
     consensus.set_prepare_ticks(crate::bootstrap::prepare_retransmit_ticks(config));
+    consensus
+        .set_view_change_retransmit_ticks(crate::bootstrap::view_change_retransmit_ticks(config));
+    consensus.set_view_change_status_ticks(crate::bootstrap::view_change_status_ticks(config));
+    consensus.set_request_start_view_ticks(crate::bootstrap::request_start_view_ticks(config));
+    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
     // with the process, so claiming view-0 primaryship would heartbeat

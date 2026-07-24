@@ -137,10 +137,23 @@ impl TimeoutManager {
     /// Public so the runtime can pin its config default (`[cluster]
     /// heartbeat_timeout`) against this built-in with a static assert.
     pub const NORMAL_HEARTBEAT_TICKS: u64 = 500;
-    const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
-    const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
-    const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
-    const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
+    /// Public so the runtime can pin its `[cluster]
+    /// view_change_retransmit_interval` config default against this built-in.
+    /// Deliberately equal to [`Self::DO_VIEW_CHANGE_MESSAGE_TICKS`]: one config
+    /// knob drives both retransmit timers.
+    pub const START_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its `[cluster] view_change_status_timeout`
+    /// config default against this built-in.
+    pub const VIEW_CHANGE_STATUS_TICKS: u64 = 500;
+    /// Public so the runtime can pin its `[cluster]
+    /// view_change_retransmit_interval` config default against this built-in.
+    /// Deliberately equal to [`Self::START_VIEW_CHANGE_MESSAGE_TICKS`]: one
+    /// config knob drives both retransmit timers.
+    pub const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its `[cluster]
+    /// request_start_view_retransmit_interval` config default against this
+    /// built-in.
+    pub const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
     #[must_use]
     pub fn new(replica_id: u128) -> Self {
@@ -186,6 +199,36 @@ impl TimeoutManager {
     /// starts ticking (i.e. before `init`).
     pub const fn set_prepare_ticks(&mut self, ticks: u64) {
         self.prepare = Timeout::new(self.prepare.id, ticks);
+    }
+
+    /// Override the view-change retransmit interval (`[cluster]
+    /// view_change_retransmit_interval`), in consensus ticks. Drives BOTH the
+    /// `StartViewChange` and `DoViewChange` retransmit timers - kept equal by
+    /// design so a view change retransmits both messages at one cadence.
+    /// Replaces the timeout objects, so any countdown already in flight is
+    /// discarded: call before the replica starts ticking (i.e. before `init`).
+    pub const fn set_view_change_retransmit_ticks(&mut self, ticks: u64) {
+        self.start_view_change_message = Timeout::new(self.start_view_change_message.id, ticks);
+        self.do_view_change_message = Timeout::new(self.do_view_change_message.id, ticks);
+    }
+
+    /// Override the view-change status backstop (`[cluster]
+    /// view_change_status_timeout`), in consensus ticks. A view change stalled
+    /// this long escalates to a fresh cluster-wide election. Replaces the
+    /// timeout object, so any countdown already in flight is discarded: call
+    /// before the replica starts ticking (i.e. before `init`).
+    pub const fn set_view_change_status_ticks(&mut self, ticks: u64) {
+        self.view_change_status = Timeout::new(self.view_change_status.id, ticks);
+    }
+
+    /// Override the request-start-view retransmit interval (`[cluster]
+    /// request_start_view_retransmit_interval`), in consensus ticks: how often
+    /// a recovering or view-change backup re-requests the current view's
+    /// `StartView`. Replaces the timeout object, so any countdown already in
+    /// flight is discarded: call before the replica starts ticking (i.e. before
+    /// `init`).
+    pub const fn set_request_start_view_ticks(&mut self, ticks: u64) {
+        self.request_start_view_message = Timeout::new(self.request_start_view_message.id, ticks);
     }
 
     /// Tick all timeouts

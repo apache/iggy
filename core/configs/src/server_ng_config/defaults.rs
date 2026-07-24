@@ -91,6 +91,22 @@ impl Default for ClusterConfig {
                 .prepare_retransmit_interval
                 .parse()
                 .unwrap(),
+            view_change_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .view_change_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_change_status_timeout: SERVER_NG_CONFIG
+                .cluster
+                .view_change_status_timeout
+                .parse()
+                .unwrap(),
+            request_start_view_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .request_start_view_retransmit_interval
+                .parse()
+                .unwrap(),
+            view_probe_attempts_max: SERVER_NG_CONFIG.cluster.view_probe_attempts_max as u32,
             nodes: SERVER_NG_CONFIG
                 .cluster
                 .nodes

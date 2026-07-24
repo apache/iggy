@@ -830,8 +830,14 @@ where
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
     /// Consecutive unanswered `RequestStartView` probes while Recovering;
-    /// at [`PROBE_ATTEMPTS_MAX`] the replica falls back to an election.
+    /// at the `probe_attempts_max` ceiling the replica falls back to an
+    /// election.
     probe_attempts: Cell<u32>,
+    /// Probe-attempt ceiling backing the fall-back-to-election decision,
+    /// seeded from [`PROBE_ATTEMPTS_MAX`] and overridable by the runtime via
+    /// `[cluster] view_probe_attempts_max`. The simulator and tests keep the
+    /// built-in default.
+    probe_attempts_max: Cell<u32>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -934,6 +940,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
+            probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
@@ -966,6 +973,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// countdown already in flight.
     pub fn set_prepare_ticks(&self, ticks: u64) {
         self.timeouts.borrow_mut().set_prepare_ticks(ticks);
+    }
+
+    /// Override the view-change retransmit interval (`StartViewChange` and
+    /// `DoViewChange`, kept equal), in consensus ticks. Sized from `[cluster]
+    /// view_change_retransmit_interval` by the runtime. Must run before `init`
+    /// / `init_as_backup`: the override discards any countdown already in
+    /// flight.
+    pub fn set_view_change_retransmit_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_view_change_retransmit_ticks(ticks);
+    }
+
+    /// Override the view-change status backstop, in consensus ticks. Sized from
+    /// `[cluster] view_change_status_timeout` by the runtime. Must run before
+    /// `init` / `init_as_backup`: the override discards any countdown already
+    /// in flight.
+    pub fn set_view_change_status_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_view_change_status_ticks(ticks);
+    }
+
+    /// Override the request-start-view retransmit interval, in consensus ticks.
+    /// Sized from `[cluster] request_start_view_retransmit_interval` by the
+    /// runtime. Must run before `init` / `init_as_backup`: the override
+    /// discards any countdown already in flight.
+    pub fn set_request_start_view_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_request_start_view_ticks(ticks);
+    }
+
+    /// Override the recovering-replica probe-attempt ceiling before it falls
+    /// back to an election. Sized from `[cluster] view_probe_attempts_max` by
+    /// the runtime; the simulator and tests keep [`PROBE_ATTEMPTS_MAX`]. Must
+    /// run before `init` / `init_as_backup`.
+    pub fn set_probe_attempts_max(&self, max: u32) {
+        self.probe_attempts_max.set(max);
     }
 
     pub fn init(&self) {
@@ -1481,7 +1527,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     // primary answers well before the fallback fires.
                     let attempts = self.probe_attempts.get() + 1;
                     self.probe_attempts.set(attempts);
-                    if attempts >= PROBE_ATTEMPTS_MAX {
+                    if attempts >= self.probe_attempts_max.get() {
                         self.finish_view_probe();
                         actions.extend(
                             self.start_election(plane, ViewChangeReason::ViewProbeUnanswered),

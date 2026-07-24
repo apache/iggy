@@ -611,6 +611,29 @@ commit_broadcast_interval = "500ms"
 # more replica traffic; must be nonzero. Drives the consensus Prepare timer.
 prepare_retransmit_interval = "250ms"
 
+# How often a replica retransmits its StartViewChange / DoViewChange while a
+# view change is in progress (duration). Lower values converge a healthy
+# election faster at the cost of more replica traffic; must be nonzero. Drives
+# both consensus view-change retransmit timers.
+view_change_retransmit_interval = "500ms"
+
+# Backstop for a stalled view change (duration): one that does not conclude
+# within this window escalates to a fresh cluster-wide election. Must be nonzero
+# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# messages retransmit rather than prematurely escalate.
+view_change_status_timeout = "5s"
+
+# How often a recovering or view-change backup re-requests the current view's
+# StartView from its primary (duration); must be nonzero. Drives the consensus
+# RequestStartView timer.
+request_start_view_retransmit_interval = "1s"
+
+# How many consecutive unanswered RequestStartView probes a recovering replica
+# tolerates before falling back to an election (integer). A full-cluster restart
+# leaves nobody settled to answer, so the replica elects on its recovered log.
+# Must be between 1 and 100.
+view_probe_attempts_max = 5
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be
