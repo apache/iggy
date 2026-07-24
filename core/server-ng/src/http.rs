@@ -25,6 +25,7 @@
 mod admission;
 mod error;
 mod extractor;
+mod forward;
 mod handlers;
 mod jwks;
 mod jwt;
@@ -48,16 +49,16 @@ use std::sync::atomic::AtomicU64;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{HeaderName, HeaderValue, Method};
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::routing::{delete, get, post, put};
 use configs::http::{HttpConfig, HttpCorsConfig};
-use configs::ng_cluster::{ClusterConfig, TransportPorts};
+use configs::ng_cluster::{ClusterConfig, TransportPorts, http_forwarding_key_material};
 use configs::server_ng::NgSystemConfig;
 use iggy_common::IggyError;
 use message_bus::client_listener;
 use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::bootstrap::ServerNgShard;
 use crate::cluster_meta::ClusterRoster;
@@ -97,7 +98,28 @@ pub async fn start(
     system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
 ) -> Result<(), ServerNgError> {
-    let jwt = JwtManager::build(&http_config.jwt)?;
+    // In cluster mode with no configured JWT secret the signing key derives
+    // from the cluster PSK, so a bearer minted on any node verifies on every
+    // node - the invariant follower-to-primary forwarding depends on.
+    let cluster_psk =
+        (cluster.enabled && cluster.auth.enabled && !cluster.auth.shared_secret.is_empty())
+            .then_some(cluster.auth.shared_secret.as_str());
+    let jwt = JwtManager::build(&http_config.jwt, cluster_psk)?;
+    // Forwarding needs a bearer every node can verify; without key material it
+    // degrades to off (followers answer the transient 503) instead of failing
+    // the boot, so keyless clusters still serve HTTP node-locally.
+    let forwarding_active = http_forwarding_key_material(&http_config.jwt, cluster);
+    if cluster.enabled && !forwarding_active {
+        warn!(
+            "cluster mode with http enabled but no http.jwt secrets and no cluster.auth: bearers are node-local and follower-to-primary forwarding is disabled - control-plane writes on followers answer a transient 503; configure http.jwt encoding/decoding secrets or enable cluster.auth (identical on every node) to activate forwarding"
+        );
+    }
+    // Saturating: a configured limit past the pointer width (32-bit target,
+    // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
+    let max_request_size =
+        usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
+    let forward =
+        forward::build_forward_state(&http_config.tls, max_request_size, forwarding_active)?;
     // Validated before bind so a bad [http.cors] fails boot before the socket
     // opens and the "started" log prints.
     let cors = http_config
@@ -130,11 +152,8 @@ pub async fn start(
             metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
         in_flight_writes: Cell::new(0),
+        forward,
     }));
-    // Saturating: a configured limit past the pointer width (32-bit target,
-    // >4 GiB value) clamps to the largest enforceable cap instead of wrapping.
-    let max_request_size =
-        usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
     let router = router(state, max_request_size, cors, http_config.web_ui);
 
     if http_config.tls.enabled {
@@ -163,12 +182,20 @@ pub async fn start(
 }
 
 /// Health-probe path. Public and pre-auth, and the one success route reached
-/// without proving a credential, so the `X-Iggy-View` layer withholds the
+/// without proving a credential, so the `Iggy-View` layer withholds the
 /// cluster-internal view number here (see the response layer below).
 const PING_PATH: &str = "/ping";
 
 /// Assemble the shard-0 router: unauthenticated health + login routes plus the
 /// authenticated REST surface.
+///
+/// The surface is split by consensus dependency. The control-plane routes -
+/// whose writes all commit through the metadata consensus group - carry the
+/// `forward_to_primary` route layer, so on a follower they are relayed to the
+/// primary instead of failing with a transient 503 (reads under that layer
+/// still serve locally unless `?consistency=linearizable`). The local routes
+/// never need the metadata primary: health, the login/refresh flows (STM read
+/// + JWT mint), node-local reads, and the partition-plane routes.
 ///
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
@@ -181,24 +208,17 @@ const PING_PATH: &str = "/ping";
 /// `Authorization` header and matches none of the method routes - would 401 or
 /// 405 if it reached the router; the outermost `CorsLayer` answers it first
 /// instead, and stamps the CORS response headers over every reply, including
-/// the inner layer's `x-iggy-view`.
+/// the inner layer's `iggy-view`.
 fn router(
     state: HttpState,
     max_request_size: usize,
     cors: Option<CorsLayer>,
     web_ui: bool,
 ) -> Router {
-    // Cloned for the response layer so `X-Iggy-View` reads the live view per
+    // Cloned for the response layer so `Iggy-View` reads the live view per
     // response; the original `state` is moved into `with_state` below.
     let view_source = state.clone();
-    let router = Router::new()
-        .route(PING_PATH, get(ping))
-        .route("/users/login", post(login_user))
-        .route("/users/refresh-token", post(refresh_token))
-        .route(
-            "/personal-access-tokens/login",
-            post(login_with_personal_access_token),
-        )
+    let forwardable = Router::new()
         .route("/users", get(get_users).post(create_user))
         .route(
             "/users/{user_id}",
@@ -236,6 +256,35 @@ fn router(
             delete(delete_segments),
         )
         .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
+            get(get_cgs).post(create_cg),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
+            get(get_cg).delete(delete_cg),
+        )
+        .route("/personal-access-tokens", get(get_pats).post(create_pat))
+        .route("/personal-access-tokens/{name}", delete(delete_pat))
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            forward::forward_to_primary,
+        ));
+    // The partition-plane routes (produce, consumer-offset writes) stay local:
+    // each partition is its own consensus group whose primary can diverge from
+    // the metadata primary, so forwarding them to the metadata primary would
+    // livelock whenever the two disagree.
+    // TODO: forward partition-plane writes to their own partition group's
+    // primary (requires resolving the target partition from the request before
+    // dispatch, and rewriting balanced partitioning to an explicit partition).
+    let local = Router::new()
+        .route(PING_PATH, get(ping))
+        .route("/users/login", post(login_user))
+        .route("/users/refresh-token", post(refresh_token))
+        .route(
+            "/personal-access-tokens/login",
+            post(login_with_personal_access_token),
+        )
+        .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
             get(poll_messages).post(send_messages),
         )
@@ -247,21 +296,14 @@ fn router(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
             delete(delete_consumer_offset),
         )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-groups",
-            get(get_cgs).post(create_cg),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}",
-            get(get_cg).delete(delete_cg),
-        )
-        .route("/personal-access-tokens", get(get_pats).post(create_pat))
-        .route("/personal-access-tokens/{name}", delete(delete_pat))
         .route("/stats", get(get_stats))
         .route("/snapshot", post(get_snapshot))
         .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
-        .route("/clients/{client_id}", get(get_client))
+        .route("/clients/{client_id}", get(get_client));
+    let router = Router::new()
+        .merge(forwardable)
+        .merge(local)
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_request_size))
         .layer(from_fn(move |request: Request, next: Next| {
@@ -452,7 +494,7 @@ mod tests {
             allowed_methods: vec!["GET".to_owned(), "POST".to_owned()],
             allowed_origins: vec!["*".to_owned()],
             allowed_headers: vec!["content-type".to_owned(), "authorization".to_owned()],
-            exposed_headers: vec!["x-iggy-view".to_owned()],
+            exposed_headers: vec!["iggy-view".to_owned()],
             allow_credentials: false,
             allow_private_network: false,
         }

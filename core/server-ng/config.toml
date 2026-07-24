@@ -34,6 +34,12 @@ interval = "1 m"
 # Determines if the HTTP server is active.
 # `true` enables the server, allowing it to handle HTTP requests.
 # `false` disables the server, preventing it from handling HTTP requests.
+# In cluster mode, followers forward control-plane requests (streams, topics,
+# users, ...) to the current primary when a cluster-wide JWT key exists (see
+# http.jwt / cluster.auth below).
+# TODO: forwarding does not cover the partition-plane APIs yet - message
+# produce and consumer-offset writes are never forwarded and must reach the
+# partition's primary node directly (message polls read locally on any node).
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
@@ -75,9 +81,9 @@ allowed_origins = ["*"]
 allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
-# `x-iggy-view` carries the current VSR view number; exposing it lets browser
+# `iggy-view` carries the current VSR view number; exposing it lets browser
 # clients read it on cross-origin responses.
-exposed_headers = ["x-iggy-view"]
+exposed_headers = ["iggy-view"]
 
 # Determines if credentials like cookies or HTTP auth can be included in CORS requests.
 # `true` allows credentials to be included, useful for authenticated sessions;
@@ -120,6 +126,10 @@ not_before = "0 s"
 
 # Secret key for encoding JWTs.
 # If left empty, a secure random secret will be generated on each server start.
+# In cluster mode a configured secret (identical on every node) makes bearers
+# valid cluster-wide and activates follower-to-primary HTTP forwarding; with
+# cluster.auth enabled the key is instead derived from the shared PSK. Without
+# either, tokens are node-local and forwarding stays disabled.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -589,6 +599,9 @@ heartbeat_timeout = "5s"
 # When true, every replica peer must complete the authenticated handshake or be
 # rejected, and shared_secret becomes mandatory. Off by default = legacy
 # unauthenticated replica traffic. Enabling it is a coordinated-restart change.
+# With http enabled and no http.jwt secrets configured, the PSK also becomes
+# the JWT key source, making bearers valid cluster-wide and activating
+# follower-to-primary HTTP forwarding.
 enabled = false
 
 # Cluster-wide pre-shared key, >= 32 bytes of CSPRNG output, byte-identical on

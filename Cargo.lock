@@ -11823,6 +11823,7 @@ dependencies = [
  "async_zip",
  "axum",
  "axum-server",
+ "blake3",
  "bytemuck",
  "bytes",
  "chrono",

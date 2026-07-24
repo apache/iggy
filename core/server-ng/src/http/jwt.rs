@@ -38,7 +38,7 @@ use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use server_common::crypto;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::jwks::JwksClient;
@@ -46,6 +46,15 @@ use super::jwks::JwksClient;
 /// Length window for the random secret minted when no secret is configured.
 /// Matches the legacy server so both behave identically on an empty secret.
 const GENERATED_SECRET_LEN: Range<usize> = 32..64;
+
+/// BLAKE3 `derive_key` context for turning the cluster PSK into the HS256
+/// signing key when no JWT secret is configured in cluster mode. A distinct
+/// context string keeps this key cryptographically independent from the
+/// replica-auth MAC subkey derived from the same PSK. Deliberate coupling:
+/// with this fallback a PSK compromise also yields the token-signing key, and
+/// rotating the PSK invalidates all bearers; operators who want the domains
+/// decoupled configure an explicit `http.jwt` secret, which always wins.
+const JWT_KEY_CONTEXT: &str = "apache-iggy server-ng http-jwt v1 psk->hs256-key";
 
 /// Expiry stamp used for a non-expiring token: far enough out to never trip
 /// `exp` validation, small enough to fit `u32`. Mirrors the legacy server.
@@ -74,12 +83,17 @@ impl JwtManager {
     /// ephemeral secret, or mirror whichever half is set) and loading any
     /// configured trusted issuers (keyed by normalized issuer URL).
     ///
+    /// `cluster_psk`, when present, replaces the random-mint fallback with a
+    /// key derived from the cluster shared secret, so every node verifies
+    /// every node's bearers - the invariant follower-to-primary forwarding
+    /// depends on. A configured secret always wins over it.
+    ///
     /// # Errors
     ///
     /// Returns [`IggyError`] if the configured algorithm is unsupported or a
     /// secret cannot be turned into an encoding/decoding key.
-    pub fn build(config: &HttpJwtConfig) -> Result<Self, IggyError> {
-        let config = normalize_secrets(config.clone());
+    pub fn build(config: &HttpJwtConfig, cluster_psk: Option<&str>) -> Result<Self, IggyError> {
+        let config = normalize_secrets(config.clone(), cluster_psk);
         let algorithm = config.get_algorithm()?;
         let encoding_key = config.get_encoding_key()?;
         let decoding_key = config.get_decoding_key()?;
@@ -330,12 +344,27 @@ fn normalize_issuer_url(url: &str) -> String {
 /// Fill in an unconfigured JWT secret exactly like the legacy HTTP server:
 /// both empty -> one random ephemeral secret; one empty -> mirror the other;
 /// both set but different under an HMAC algorithm -> warn (they must match).
-fn normalize_secrets(mut config: HttpJwtConfig) -> HttpJwtConfig {
+fn normalize_secrets(mut config: HttpJwtConfig, cluster_psk: Option<&str>) -> HttpJwtConfig {
     match (
         config.encoding_secret.is_empty(),
         config.decoding_secret.is_empty(),
     ) {
         (true, true) => {
+            if let Some(psk) = cluster_psk {
+                // Cluster-wide deterministic key: hex of the derived 256-bit
+                // subkey, so every node signs and verifies identically and a
+                // follower-forwarded bearer is valid on the primary. Hex (not
+                // raw bytes) because the secret travels the same String path
+                // a configured secret does.
+                let derived = blake3::derive_key(JWT_KEY_CONTEXT, psk.as_bytes());
+                let secret = blake3::Hash::from_bytes(derived).to_hex().to_string();
+                info!(
+                    "JWT secrets are not configured - derived a cluster-wide secret from cluster.auth.shared_secret; tokens are valid on every node and rotate with the PSK"
+                );
+                config.encoding_secret.clone_from(&secret);
+                config.decoding_secret = secret;
+                return config;
+            }
             let secret = crypto::generate_secret(GENERATED_SECRET_LEN);
             let redacted: String = secret.chars().take(3).collect();
             warn!(
@@ -477,7 +506,7 @@ mod tests {
     async fn token_presented_before_its_nbf_is_rejected() {
         // not_before well past the leeway window, so the freshly issued token
         // is not yet valid and decode must reject it.
-        let manager = JwtManager::build(&config("3600 s", "5 s")).expect("builds");
+        let manager = JwtManager::build(&config("3600 s", "5 s"), None).expect("builds");
         let token = manager.generate(7).expect("issues");
         assert!(
             manager.decode(&token.access_token).await.is_err(),
@@ -489,7 +518,7 @@ mod tests {
     async fn token_at_its_nbf_is_accepted() {
         // Default not_before (0s) => nbf == iat, so the token is valid now and
         // enabling nbf validation does not reject a normally issued token.
-        let manager = JwtManager::build(&config("0 s", "5 s")).expect("builds");
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
         let token = manager.generate(7).expect("issues");
         let claims = manager
             .decode(&token.access_token)
@@ -509,7 +538,7 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt) {
+        match JwtManager::build(&jwt, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer mapping to the root user"),
@@ -527,7 +556,7 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt) {
+        match JwtManager::build(&jwt, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer with an empty issuer"),
@@ -545,7 +574,7 @@ mod tests {
             }]),
             ..HttpJwtConfig::default()
         };
-        match JwtManager::build(&jwt) {
+        match JwtManager::build(&jwt, None) {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer with an empty jwks_url"),

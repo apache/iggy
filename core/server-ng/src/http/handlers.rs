@@ -151,7 +151,7 @@ const HTTP_READ_CLIENT_ID: u128 = 0;
 /// Response header attesting what durability a produce response proves:
 /// [`DURABILITY_REPLICATED_MEMORY`] after an awaited quorum commit,
 /// [`DURABILITY_NONE`] for a `?ack=none` fire-and-forget.
-const DURABILITY_HEADER: HeaderName = HeaderName::from_static("x-iggy-durability");
+const DURABILITY_HEADER: HeaderName = HeaderName::from_static("iggy-durability");
 
 const DURABILITY_REPLICATED_MEMORY: &str = "replicated-memory";
 
@@ -1116,8 +1116,8 @@ pub(in crate::http) async fn get_consumer_offset(
 /// consensus (at-least-once, no dedup, no session gate - concurrent produces
 /// on one credential are legal), and the committed reply comes back through
 /// the session's in-process reply slot rather than a submit return value.
-/// The default answers 201 + `X-Iggy-Durability: replicated-memory` only
-/// after the quorum commit; `?ack=none` answers 202 + `X-Iggy-Durability:
+/// The default answers 201 + `Iggy-Durability: replicated-memory` only
+/// after the quorum commit; `?ack=none` answers 202 + `Iggy-Durability:
 /// none` immediately after dispatch.
 pub(in crate::http) async fn send_messages(
     State(state): State<HttpState>,
