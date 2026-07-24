@@ -53,6 +53,13 @@ fields = ["email", "created_at"]
 
 [plugin_config]
 url = "http://localhost:7280"
+verbose_logging = false
+# max_retries = 3
+# retry_delay = "200ms"
+# max_retry_delay = "5s"
+# max_open_retries = 5
+# open_retry_max_delay = "30s"
+# request_timeout = "30s"
 index = """
 version: 0.9
 

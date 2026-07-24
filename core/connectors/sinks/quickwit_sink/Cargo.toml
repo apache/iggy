@@ -31,15 +31,15 @@ publish = false
 
 [package.metadata.cargo-machete]
 ignored = ["dashmap"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
-dashmap = { workspace = true }
+base64 = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 simd-json = { workspace = true }
