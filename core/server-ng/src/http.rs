@@ -90,11 +90,13 @@ use crate::server_error::ServerNgError;
 /// Returns [`ServerNgError`] if the JWT manager cannot be built from
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
 /// credentials cannot be loaded, or the listener cannot bind to `addr`.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     shard: &Rc<ServerNgShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
     admission: &HttpAdmissionConfig,
+    clients_table_max: usize,
     cluster: &ClusterConfig,
     system_config: Arc<NgSystemConfig>,
     self_ports: TransportPorts,
@@ -131,6 +133,7 @@ pub async fn start(
             // never consulted here.
             metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
         },
+        max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
         max_in_flight_writes: admission.max_in_flight_writes,
         max_in_flight_writes_per_session: admission.max_in_flight_writes_per_session,
         in_flight_writes: Cell::new(0),

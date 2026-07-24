@@ -160,9 +160,9 @@ impl IntoResponse for AuthError {
             Self::Unauthenticated(error) => CustomError::from(error).into_response(),
             // A fresh session could not be established: the Register did not
             // commit (no caught-up primary, pipeline full, or a view-change
-            // cancel), or the session table is at `MAX_HTTP_SESSIONS` and
-            // refused the fresh registration. Transient server condition -> 503,
-            // retryable.
+            // cancel), or the session table is at its cap (half `[metadata]
+            // clients_table_max`) and refused the fresh registration. Transient
+            // server condition -> 503, retryable.
             Self::SessionUnavailable => service_unavailable(),
         }
     }

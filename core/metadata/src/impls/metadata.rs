@@ -563,6 +563,14 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
         }
     }
 
+    /// Size the VSR client table to `[metadata] clients_table_max`
+    /// (see [`ClientTable::set_capacity`]). Boot-only, before any client
+    /// registers; server-ng bootstrap applies it alongside
+    /// [`Self::set_checkpoint_margin`].
+    pub fn set_clients_table_max(&self, max_clients: usize) {
+        self.client_table.borrow_mut().set_capacity(max_clients);
+    }
+
     /// Resolved byte value for `MaxTopicSize::ServerDefault`.
     #[must_use]
     pub const fn default_max_topic_size(&self) -> u64 {

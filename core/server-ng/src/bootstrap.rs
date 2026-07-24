@@ -988,6 +988,10 @@ async fn shard_main(
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
+    // Size the VSR client table before listeners bind and any client registers.
+    // The table is empty here on both fresh boot and restart (its slots are not
+    // restored from snapshot), which the setter's empty-table contract requires.
+    metadata.set_clients_table_max(config.metadata.clients_table_max);
 
     let shard_metrics = ShardMetrics::for_shard();
     // Notifier install deferred until after tick handler wires below.
@@ -1704,6 +1708,9 @@ const _: () = assert!(
     configs::ng_partition::DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH
         == consensus::PIPELINE_PREPARE_QUEUE_MAX
 );
+const _: () = assert!(
+    configs::ng_metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX
+);
 const _: () =
     assert!(configs::ng_cluster::DEFAULT_VIEW_PROBE_ATTEMPTS_MAX == consensus::PROBE_ATTEMPTS_MAX);
 /// Convert a consensus-timer interval to whole ticks, floored at one tick so a
@@ -2349,6 +2356,7 @@ async fn start_tcp_runtime(
             http_addr,
             &config.http,
             &config.http_admission,
+            config.metadata.clients_table_max,
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,

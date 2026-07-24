@@ -772,6 +772,13 @@ prepare_queue_depth = 32
 # rewrites per checkpoint.
 journal_slots = 1024
 
+# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
+# virtual clients and HTTP sessions together) hold live session state at once.
+# When full, the client whose last commit is oldest is evicted and its next
+# request re-registers. The HTTP session cap tracks this at half, so raising
+# it lifts both. Must be between 2 and 65536.
+clients_table_max = 8192
+
 # Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
 # plane), a pipeline exists per partition, so raising this multiplies pinned
 # request-buffer memory by the partition count. Keep it modest.
