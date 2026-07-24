@@ -77,6 +77,16 @@ impl Default for ClusterConfig {
             enabled: SERVER_NG_CONFIG.cluster.enabled,
             name: SERVER_NG_CONFIG.cluster.name.parse().unwrap(),
             heartbeat_timeout: SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
+            commit_broadcast_interval: SERVER_NG_CONFIG
+                .cluster
+                .commit_broadcast_interval
+                .parse()
+                .unwrap(),
+            prepare_retransmit_interval: SERVER_NG_CONFIG
+                .cluster
+                .prepare_retransmit_interval
+                .parse()
+                .unwrap(),
             nodes: SERVER_NG_CONFIG
                 .cluster
                 .nodes

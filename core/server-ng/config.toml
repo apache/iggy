@@ -580,9 +580,22 @@ name = "iggy-cluster"
 # Backup-side liveness window for a consensus plane's primary (duration).
 # A replica that sees no primary traffic for this long starts a view change.
 # Raise it on oversubscribed hosts where scheduling stalls fake primary
-# death. Must be at least "2s": the primary heartbeats every second, and a
-# window at or below one ping interval would elect on every hiccup.
+# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
+# primary signals liveness through its commit broadcast, and the window must
+# span several broadcasts so one delayed broadcast never trips an election.
 heartbeat_timeout = "5s"
+
+# How often the primary broadcasts its commit point to every backup (duration).
+# This is the cluster's liveness signal: each broadcast resets every backup's
+# heartbeat_timeout window and carries the latest commit point forward. Must be
+# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
+# value. Drives the consensus CommitMessage timer.
+commit_broadcast_interval = "500ms"
+
+# How often the primary retransmits prepares that backups have not yet acked
+# (duration). Lower values recover faster from a dropped prepare at the cost of
+# more replica traffic; must be nonzero. Drives the consensus Prepare timer.
+prepare_retransmit_interval = "250ms"
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]

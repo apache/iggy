@@ -99,7 +99,6 @@ impl Timeout {
 #[allow(unused)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimeoutKind {
-    Ping,
     Prepare,
     CommitMessage,
     NormalHeartbeat,
@@ -115,7 +114,6 @@ pub enum TimeoutKind {
 #[allow(unused)]
 #[derive(Debug)]
 pub struct TimeoutManager {
-    ping: Timeout,
     prepare: Timeout,
     commit_message: Timeout,
     normal_heartbeat: Timeout,
@@ -130,9 +128,12 @@ pub struct TimeoutManager {
 impl TimeoutManager {
     // Timeout durations in ticks (10ms per tick).
     // TODO define 10ms per tick in a separate constant.
-    const PING_TICKS: u64 = 100;
-    const PREPARE_TICKS: u64 = 25;
-    const COMMIT_MESSAGE_TICKS: u64 = 50;
+    /// Public so the runtime can pin its `[cluster] prepare_retransmit_interval`
+    /// config default against this built-in.
+    pub const PREPARE_TICKS: u64 = 25;
+    /// Public so the runtime can pin its `[cluster] commit_broadcast_interval`
+    /// config default against this built-in.
+    pub const COMMIT_MESSAGE_TICKS: u64 = 50;
     /// Public so the runtime can pin its config default (`[cluster]
     /// heartbeat_timeout`) against this built-in with a static assert.
     pub const NORMAL_HEARTBEAT_TICKS: u64 = 500;
@@ -144,7 +145,6 @@ impl TimeoutManager {
     #[must_use]
     pub fn new(replica_id: u128) -> Self {
         Self {
-            ping: Timeout::new(replica_id, Self::PING_TICKS),
             prepare: Timeout::new(replica_id, Self::PREPARE_TICKS),
             commit_message: Timeout::new(replica_id, Self::COMMIT_MESSAGE_TICKS),
             normal_heartbeat: Timeout::new(replica_id, Self::NORMAL_HEARTBEAT_TICKS),
@@ -172,11 +172,26 @@ impl TimeoutManager {
         self.normal_heartbeat = Timeout::new(self.normal_heartbeat.id, ticks);
     }
 
+    /// Override the primary's commit-broadcast interval (`[cluster]
+    /// commit_broadcast_interval`). Replaces the timeout object, so any
+    /// countdown already in flight is discarded: call before the replica
+    /// starts ticking (i.e. before `init`).
+    pub const fn set_commit_message_ticks(&mut self, ticks: u64) {
+        self.commit_message = Timeout::new(self.commit_message.id, ticks);
+    }
+
+    /// Override the primary's prepare-retransmit interval (`[cluster]
+    /// prepare_retransmit_interval`). Replaces the timeout object, so any
+    /// countdown already in flight is discarded: call before the replica
+    /// starts ticking (i.e. before `init`).
+    pub const fn set_prepare_ticks(&mut self, ticks: u64) {
+        self.prepare = Timeout::new(self.prepare.id, ticks);
+    }
+
     /// Tick all timeouts
     /// This is the first phase of the two-phase tick-based timeout mechanism.
     /// 2nd phase is checking which timeouts have fired and calling the appropriate handlers.
     pub const fn tick(&mut self) {
-        self.ping.tick();
         self.prepare.tick();
         self.commit_message.tick();
         self.normal_heartbeat.tick();
@@ -194,7 +209,6 @@ impl TimeoutManager {
     #[must_use]
     pub const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
-            TimeoutKind::Ping => &self.ping,
             TimeoutKind::Prepare => &self.prepare,
             TimeoutKind::CommitMessage => &self.commit_message,
             TimeoutKind::NormalHeartbeat => &self.normal_heartbeat,
@@ -207,7 +221,6 @@ impl TimeoutManager {
 
     pub const fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
         match kind {
-            TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,
@@ -232,7 +245,6 @@ impl TimeoutManager {
 
     pub fn backoff(&mut self, kind: TimeoutKind) {
         let timeout = match kind {
-            TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
             TimeoutKind::CommitMessage => &mut self.commit_message,
             TimeoutKind::NormalHeartbeat => &mut self.normal_heartbeat,

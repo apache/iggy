@@ -946,6 +946,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.timeouts.borrow_mut().set_normal_heartbeat_ticks(ticks);
     }
 
+    /// Override the primary's commit-broadcast interval, in consensus ticks.
+    /// Sized from `[cluster] commit_broadcast_interval` by the runtime. Must
+    /// run before `init` / `init_as_backup`: the override discards any
+    /// countdown already in flight.
+    pub fn set_commit_message_ticks(&self, ticks: u64) {
+        self.timeouts.borrow_mut().set_commit_message_ticks(ticks);
+    }
+
+    /// Override the primary's prepare-retransmit interval, in consensus ticks.
+    /// Sized from `[cluster] prepare_retransmit_interval` by the runtime. Must
+    /// run before `init` / `init_as_backup`: the override discards any
+    /// countdown already in flight.
+    pub fn set_prepare_ticks(&self, ticks: u64) {
+        self.timeouts.borrow_mut().set_prepare_ticks(ticks);
+    }
+
     pub fn init(&self) {
         self.status.set(Status::Normal);
         let mut timeouts = self.timeouts.borrow_mut();

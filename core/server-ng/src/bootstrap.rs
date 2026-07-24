@@ -958,6 +958,8 @@ async fn shard_main(
                 Rc::clone(&bus),
                 config.metadata.prepare_queue_depth,
                 cluster_heartbeat_ticks(config),
+                commit_broadcast_ticks(config),
+                prepare_retransmit_ticks(config),
             );
             (Some(consensus), Some(journal), snapshot)
         } else {
@@ -1690,13 +1692,33 @@ const _: () = assert!(
     configs::ng_metadata::DEFAULT_METADATA_JOURNAL_SLOTS
         == journal::prepare_journal::DEFAULT_SLOT_COUNT
 );
-/// `[cluster] heartbeat_timeout` in consensus ticks, floored at one tick.
-/// Every consensus group (metadata and per-partition planes alike) gets the
-/// same window: the failure it guards against - a primary that stopped
-/// heartbeating - is host-level, not per-plane.
+/// Convert a consensus-timer interval to whole ticks, floored at one tick so a
+/// sub-tick value still fires and saturated on overflow.
+fn duration_to_ticks(interval: Duration) -> u64 {
+    let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
+    u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
+}
+
+/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
+/// (metadata and per-partition planes alike) gets the same window: the failure
+/// it guards against - a primary that stopped heartbeating - is host-level, not
+/// per-plane.
 pub(crate) fn cluster_heartbeat_ticks(config: &ServerNgConfig) -> u64 {
-    let window = config.cluster.heartbeat_timeout.get_duration().as_millis();
-    u64::try_from((window / shard::CONSENSUS_TICK_INTERVAL.as_millis()).max(1)).unwrap_or(u64::MAX)
+    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
+}
+
+/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
+/// primary broadcasts its commit point, the cluster's liveness feed. Applied
+/// to every consensus group, matching `cluster_heartbeat_ticks`.
+pub(crate) fn commit_broadcast_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
+}
+
+/// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
+/// primary retransmits un-acked prepares. Applied to every consensus group,
+/// matching `cluster_heartbeat_ticks`.
+pub(crate) fn prepare_retransmit_ticks(config: &ServerNgConfig) -> u64 {
+    duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1710,6 +1732,8 @@ fn restore_metadata_consensus(
     bus: Rc<IggyMessageBus>,
     prepare_queue_depth: usize,
     normal_heartbeat_ticks: u64,
+    commit_message_ticks: u64,
+    prepare_ticks: u64,
 ) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         cluster_id,
@@ -1723,6 +1747,8 @@ fn restore_metadata_consensus(
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
     );
     consensus.set_normal_heartbeat_ticks(normal_heartbeat_ticks);
+    consensus.set_commit_message_ticks(commit_message_ticks);
+    consensus.set_prepare_ticks(prepare_ticks);
 
     let last_header = journal
         .last_op()
@@ -1847,6 +1873,8 @@ async fn load_partition(
         LocalPipeline::new(),
     );
     consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
+    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
+    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
     // A recovered partition lost its consensus state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
     // this replica cannot know the group's (op, commit). In a cluster it
@@ -3080,6 +3108,42 @@ mod tests {
             config_default, built_in,
             "[cluster] heartbeat_timeout default drifted from \
              TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_commit_broadcast_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .commit_broadcast_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::COMMIT_MESSAGE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] commit_broadcast_interval default drifted from \
+             TimeoutManager::COMMIT_MESSAGE_TICKS"
+        );
+    }
+
+    #[test]
+    fn default_prepare_retransmit_interval_matches_consensus_constant() {
+        // The config default lives in core/server-ng/config.toml (a string,
+        // so no static assert can pin it); keep it in lockstep with the
+        // built-in the simulator and un-configured replicas run on.
+        let config_default = configs::ng_cluster::ClusterConfig::default()
+            .prepare_retransmit_interval
+            .get_duration()
+            .as_millis();
+        let built_in = u128::from(consensus::TimeoutManager::PREPARE_TICKS)
+            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] prepare_retransmit_interval default drifted from \
+             TimeoutManager::PREPARE_TICKS"
         );
     }
 

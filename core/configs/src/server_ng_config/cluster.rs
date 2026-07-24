@@ -30,9 +30,18 @@ use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::time::Duration;
 
-/// The primary heartbeats roughly every second (`PING_TICKS`); a window at
-/// or below one ping interval would elect on every scheduling hiccup.
+/// Absolute floor for the backup liveness window, independent of the
+/// commit-broadcast rate. The primary signals liveness through its commit
+/// broadcast (`commit_broadcast_interval`, 500ms by default); 2s spans several
+/// broadcasts, so a single delayed one never elects. The per-config
+/// `MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO` check scales the same headroom
+/// when the broadcast interval is retuned.
 pub const MIN_CLUSTER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The backup liveness window (`heartbeat_timeout`) must span at least this
+/// many commit broadcasts (`commit_broadcast_interval`), so one dropped or
+/// delayed broadcast never trips a view change on a healthy primary.
+const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
 
 /// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
 /// is KDF-derived from these bytes at use-site, so any encoding clearing this
@@ -43,6 +52,26 @@ const MIN_SHARED_SECRET_LEN: usize = 32;
 /// itself lives in `core/server-ng/config.toml` like every other default.
 fn default_heartbeat_timeout() -> IggyDuration {
     SERVER_NG_CONFIG.cluster.heartbeat_timeout.parse().unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_commit_broadcast_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .commit_broadcast_interval
+        .parse()
+        .unwrap()
+}
+
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server-ng/config.toml` like every other default.
+fn default_prepare_retransmit_interval() -> IggyDuration {
+    SERVER_NG_CONFIG
+        .cluster
+        .prepare_retransmit_interval
+        .parse()
+        .unwrap()
 }
 
 #[serde_as]
@@ -61,6 +90,26 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub heartbeat_timeout: IggyDuration,
+    /// How often the primary broadcasts its commit point to every backup, the
+    /// cluster's primary-liveness signal. Each broadcast resets the backups'
+    /// `heartbeat_timeout` window, so that window must span several broadcasts:
+    /// boot rejects `heartbeat_timeout < MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO
+    /// * commit_broadcast_interval`. Sizes the consensus `CommitMessage` timer.
+    /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
+    /// to zero) is rejected at boot.
+    #[serde(default = "default_commit_broadcast_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub commit_broadcast_interval: IggyDuration,
+    /// How often the primary retransmits prepares a backup has not yet acked.
+    /// Lower recovers faster from a dropped prepare at the cost of replica
+    /// traffic. Sizes the consensus `Prepare` timer. Zero (and the `0` /
+    /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
+    /// at boot.
+    #[serde(default = "default_prepare_retransmit_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub prepare_retransmit_interval: IggyDuration,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -180,9 +229,47 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         if self.heartbeat_timeout.get_duration() < MIN_CLUSTER_HEARTBEAT_TIMEOUT {
             eprintln!(
                 "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least {}s \
-                 (the primary heartbeats every second; a shorter window elects on every hiccup)",
+                 (the primary signals liveness through its commit broadcast; a shorter window \
+                 elects on every scheduling hiccup)",
                 self.heartbeat_timeout,
                 MIN_CLUSTER_HEARTBEAT_TIMEOUT.as_secs()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The commit broadcast is the cluster's liveness feed and the prepare
+        // retransmit its recovery timer; both size consensus timers that have
+        // to advance. `0` / `disabled` / `unlimited` all collapse to a zero
+        // duration, which would stall the timer - reject them.
+        if self.commit_broadcast_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.commit_broadcast_interval must be nonzero \
+                 (it drives the primary's liveness broadcast)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.prepare_retransmit_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.prepare_retransmit_interval must be \
+                 nonzero (it drives prepare retransmission)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The liveness window must span several commit broadcasts so a single
+        // delayed broadcast never trips a view change on a healthy primary.
+        let min_heartbeat = self
+            .commit_broadcast_interval
+            .get_duration()
+            .saturating_mul(MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO);
+        if self.heartbeat_timeout.get_duration() < min_heartbeat {
+            eprintln!(
+                "Invalid cluster configuration: cluster.heartbeat_timeout '{}' must be at least \
+                 {}x cluster.commit_broadcast_interval '{}' so the liveness window spans several \
+                 broadcasts",
+                self.heartbeat_timeout,
+                MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO,
+                self.commit_broadcast_interval
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -344,6 +431,8 @@ mod tests {
             enabled: true,
             name: "iggy-cluster".to_owned(),
             heartbeat_timeout: default_heartbeat_timeout(),
+            commit_broadcast_interval: default_commit_broadcast_interval(),
+            prepare_retransmit_interval: default_prepare_retransmit_interval(),
             nodes: Vec::new(),
             auth: ClusterAuthConfig {
                 enabled: true,
@@ -381,6 +470,8 @@ mod cluster_validate_tests {
             enabled: true,
             name: "iggy-cluster".to_string(),
             heartbeat_timeout: default_heartbeat_timeout(),
+            commit_broadcast_interval: default_commit_broadcast_interval(),
+            prepare_retransmit_interval: default_prepare_retransmit_interval(),
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
@@ -396,6 +487,41 @@ mod cluster_validate_tests {
         // be rejected the same way.
         c.heartbeat_timeout = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_commit_broadcast_interval() {
+        // `0` / `disabled` / `unlimited` all collapse to zero and stall the
+        // liveness broadcast.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.commit_broadcast_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_prepare_retransmit_interval() {
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.prepare_retransmit_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_heartbeat_below_commit_broadcast_ratio() {
+        // 3s clears the absolute 2s floor but is still < 4x the 1s broadcast,
+        // so the ratio rule is what rejects here, not the floor.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(3));
+        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_heartbeat_at_commit_broadcast_ratio() {
+        // Exactly 4x the broadcast (and above the 2s floor) must pass.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.heartbeat_timeout = IggyDuration::new(Duration::from_secs(4));
+        c.commit_broadcast_interval = IggyDuration::new(Duration::from_secs(1));
+        assert!(c.validate().is_ok());
     }
 
     #[test]
