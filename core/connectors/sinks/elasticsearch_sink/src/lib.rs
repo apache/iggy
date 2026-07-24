@@ -31,10 +31,13 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use simd_json::{OwnedValue, prelude::*};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 sink_connector!(ElasticsearchSink);
+
+const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug)]
 struct State {
@@ -51,6 +54,11 @@ pub struct ElasticsearchSinkConfig {
     #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
     pub password: Option<SecretString>,
     pub batch_size: Option<usize>,
+    /// Client-wide HTTP timeout for open() and bulk consume(). Values of `0`
+    /// are clamped to 1s (a zero duration would fail every request immediately).
+    /// Raise this for slow bulk workloads; until runtime ack/retry (#2927/#2928),
+    /// a timeout on consume drops the batch after the poll offset is already
+    /// committed.
     pub timeout_seconds: Option<u64>,
     pub create_index_if_not_exists: Option<bool>,
     pub index_mapping: Option<serde_json::Value>,
@@ -83,7 +91,17 @@ impl ElasticsearchSink {
             .map_err(|error| Error::Connection(format!("Invalid Elasticsearch URL: {error}")))?;
 
         let conn_pool = elasticsearch::http::transport::SingleNodeConnectionPool::new(url);
-        let mut transport_builder = TransportBuilder::new(conn_pool);
+        // elasticsearch-rs defaults to no timeout. This client-global timeout is
+        // an infinite-hang backstop for open() and for bulk consume() — not the
+        // primary #3728 flake fix (that is the harness readiness gate, which
+        // expires sooner than the 30s default). Values of 0 clamp to 1s.
+        let timeout_seconds = self
+            .config
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .max(1);
+        let mut transport_builder =
+            TransportBuilder::new(conn_pool).timeout(Duration::from_secs(timeout_seconds));
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
             let credentials =
