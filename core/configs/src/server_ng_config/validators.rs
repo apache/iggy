@@ -137,6 +137,37 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
+        // Follower-to-primary HTTP forwarding relies on a bearer any node can
+        // verify: a configured JWT secret, or the key derived from the cluster
+        // PSK. Without either, every node mints a random per-node secret and
+        // forwarded requests 401 cross-node.
+        if self.http.enabled
+            && self.cluster.enabled
+            && !self.cluster.auth.enabled
+            && self.http.jwt.encoding_secret.is_empty()
+            && self.http.jwt.decoding_secret.is_empty()
+        {
+            eprintln!(
+                "http.enabled with cluster.enabled requires http.jwt encoding/decoding secrets or cluster.auth.enabled (the JWT key is then derived from cluster.auth.shared_secret)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The same forwarding resolves the primary's HTTP address from the
+        // roster; a node listed without an http port would silently degrade
+        // every forward through it to a fail-closed 503.
+        if self.http.enabled && self.cluster.enabled {
+            for node in &self.cluster.nodes {
+                if node.ports.http.is_none() {
+                    eprintln!(
+                        "cluster node '{}' has no ports.http; every node needs one when http.enabled so followers can forward to the primary",
+                        node.name
+                    );
+                    return Err(ConfigurationError::InvalidConfigurationValue);
+                }
+            }
+        }
+
         if topic_size < self.system.segment.size.as_bytes_u64() {
             eprintln!(
                 "system.topic.max_size ({} B) must be >= system.segment.size ({} B)",

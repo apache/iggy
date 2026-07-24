@@ -140,6 +140,13 @@ impl ErrorResponse {
 /// masquerade as an auth failure.
 pub enum AuthError {
     Unauthenticated(IggyError),
+    /// The Register provably never entered the consensus pipeline (not
+    /// primary, not caught up, or the prepare queue was full), so the request
+    /// is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
+    /// body so a forwarding follower recognizes it as retryable against a
+    /// re-resolved primary; a plain client sees the same retryable 503 either
+    /// way.
+    SessionNotAccepted,
     SessionUnavailable,
 }
 
@@ -158,11 +165,15 @@ impl IntoResponse for AuthError {
             // JWT middleware (empty body), so this is deliberately richer, not
             // byte-identical to legacy.
             Self::Unauthenticated(error) => CustomError::from(error).into_response(),
-            // A fresh session could not be established: the Register did not
-            // commit (no caught-up primary, pipeline full, or a view-change
-            // cancel), or the session table is at `MAX_HTTP_SESSIONS` and
-            // refused the fresh registration. Transient server condition -> 503,
-            // retryable.
+            Self::SessionNotAccepted => {
+                with_retry_after(CustomError::from(IggyError::TransientNotAccepted).into_response())
+            }
+            // A fresh session could not be established: the Register was
+            // canceled with its commit outcome unknown, or the session table
+            // is at `MAX_HTTP_SESSIONS` and refused the fresh registration.
+            // Transient server condition -> 503, retryable by the CLIENT only
+            // (a forwarder must not re-issue an unknown-outcome Register under
+            // this node's session budget on the caller's behalf).
             Self::SessionUnavailable => service_unavailable(),
         }
     }
@@ -276,7 +287,7 @@ fn partition_write_timeout_response(operation: Operation) -> Response {
 const RETRY_AFTER_SECONDS: u64 = 1;
 
 /// Attach the advisory [`RETRY_AFTER_SECONDS`] hint to a retryable 429/503.
-fn with_retry_after(mut response: Response) -> Response {
+pub(in crate::http) fn with_retry_after(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
@@ -286,7 +297,7 @@ fn with_retry_after(mut response: Response) -> Response {
 /// Render an `ErrorResponse` body for `status`, tagged with `code` / `reason`
 /// and no field, so every hand-built HTTP error the routes return parses as the
 /// one error schema clients already handle.
-fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
+pub(in crate::http) fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -301,9 +312,9 @@ fn error_response(status: StatusCode, code: &str, reason: &str) -> Response {
 
 /// Shared 504 rendering for an in-band request the partition plane did not
 /// answer in time, shaped like every other HTTP error (`ErrorResponse`) so
-/// clients parse one error schema. Consumed by the partition-write reply wait
-/// and the partition reads ([`ReadError::Timeout`]).
-fn gateway_timeout_response(code: &str, reason: &str) -> Response {
+/// clients parse one error schema. Consumed by the partition-write reply wait,
+/// the partition reads ([`ReadError::Timeout`]), and the forward attempt bound.
+pub(in crate::http) fn gateway_timeout_response(code: &str, reason: &str) -> Response {
     error_response(StatusCode::GATEWAY_TIMEOUT, code, reason)
 }
 

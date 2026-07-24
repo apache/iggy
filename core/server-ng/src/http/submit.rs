@@ -38,7 +38,7 @@ use crate::dispatch::{
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{
-    classify_partition_reply, committed_payload, eviction_error, is_transient_not_committed,
+    classify_partition_reply, committed_payload, eviction_error, transient_code,
 };
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
@@ -197,22 +197,27 @@ async fn submit_gated(
         let Some(reply) = submit_client_request_on_owner(shard, request).await else {
             return Err(WriteError::Unavailable);
         };
-        if reply.header().command != Command2::Reply || !is_transient_not_committed(&reply) {
+        let transient = (reply.header().command == Command2::Reply)
+            .then(|| transient_code(&reply))
+            .flatten();
+        let Some(transient) = transient else {
             break reply;
-        }
-        // Pre-consensus `TransientNotCommitted`: replay the SAME request id,
-        // mirroring the binary SDKs' in-client loop. Safe to replay - the
-        // dominant emissions never entered the pipeline, and the view-change
-        // cancel is dedup-idempotent (the client table serves the cached
-        // reply). The gate stays held across the replay on purpose: the
-        // request keeps its serialization turn, and a queued same-session
-        // write would only hit the same transient.
+        };
+        // Pre-consensus transient frame: replay the SAME request id, mirroring
+        // the binary SDKs' in-client loop. Safe to replay - the dominant
+        // emissions never entered the pipeline, and the view-change cancel is
+        // dedup-idempotent (the client table serves the cached reply). The
+        // gate stays held across the replay on purpose: the request keeps its
+        // serialization turn, and a queued same-session write would only hit
+        // the same transient.
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Budget exhausted with the op still not committed: surface the
-            // transient code, which renders as a retryable 503, never the
-            // catch-all 400.
-            return Err(WriteError::Rejected(IggyError::TransientNotCommitted));
+            // Budget exhausted: surface the LAST frame's own transient code (a
+            // retryable 503, never the catch-all 400). The distinction is
+            // load-bearing for a forwarding follower: `TransientNotAccepted`
+            // never entered the pipeline and may be re-issued anywhere, while
+            // `TransientNotCommitted` may still commit and must not be.
+            return Err(WriteError::Rejected(transient));
         }
         compio::time::sleep(TRANSIENT_RETRY_INTERVAL.min(remaining)).await;
         request = retry_request;

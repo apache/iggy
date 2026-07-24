@@ -31,6 +31,7 @@ use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyTimestamp};
 use message_bus::InstanceToken;
+use metadata::MetadataSubmitError;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -39,6 +40,7 @@ use crate::bootstrap::ServerNgShard;
 use crate::cluster_meta::ClusterRoster;
 use crate::dispatch::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
+use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, HttpSession, MAX_HTTP_SESSIONS, RegistrationBarrier,
@@ -48,8 +50,10 @@ use crate::http::session::{
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
 /// errors, and the router suppresses it on `/ping`) while this node has live
-/// consensus.
-const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
+/// consensus. Fill-if-absent: a response relayed from the primary already
+/// carries the SERVING node's view, which must win over the relaying
+/// follower's possibly-stale one.
+pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("x-iggy-view");
 
 /// Axum router state: shard-0's [`HttpInner`] behind an `Rc`, `!Send` yet
 /// bridged into axum's `Send + Sync` requirement by `SendWrapper`. Sound
@@ -82,6 +86,9 @@ pub(in crate::http) struct HttpInner {
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
+    /// Follower-to-primary forwarding context: outbound client, scheme, body
+    /// bound, and its own in-flight budget (see `http::forward`).
+    pub(in crate::http) forward: ForwardState,
 }
 
 impl HttpInner {
@@ -228,7 +235,17 @@ impl HttpInner {
             .map_err(|_| AuthError::SessionUnavailable)?
             .map_err(|error| {
                 warn!(?error, "server-ng HTTP: VSR Register submit failed");
-                AuthError::SessionUnavailable
+                match error {
+                    // The Register never entered the pipeline, so re-issuing
+                    // it anywhere is safe; the transient-not-accepted body
+                    // tells a forwarding peer to retry against the current
+                    // primary. `Canceled` / `InProgress` mean a prepare may
+                    // still commit, so they stay the plain unavailable 503.
+                    MetadataSubmitError::NotPrimary
+                    | MetadataSubmitError::NotCaughtUp
+                    | MetadataSubmitError::PipelineFull => AuthError::SessionNotAccepted,
+                    _ => AuthError::SessionUnavailable,
+                }
             })?;
         Ok(Rc::new(HttpSession {
             key,
@@ -294,9 +311,12 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
         return response;
     }
     if let Some(consensus) = state.shard.plane.metadata().consensus.as_ref() {
+        // Fill-if-absent: a relayed response already carries the serving
+        // primary's view, which must not be overwritten with this follower's.
         response
             .headers_mut()
-            .insert(VIEW_HEADER, HeaderValue::from(consensus.view()));
+            .entry(VIEW_HEADER)
+            .or_insert(HeaderValue::from(consensus.view()));
     }
     response
 }
