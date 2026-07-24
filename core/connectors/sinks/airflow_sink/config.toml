@@ -1,0 +1,78 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "airflow"
+enabled = true
+version = 0
+name = "Airflow trigger"
+path = "../../target/release/libiggy_connector_airflow_sink"
+verbose = false
+
+[[streams]]
+stream = "my_stream"
+topics = ["my_topic"]
+schema = "json"
+batch_length = 50
+poll_interval = "100ms"
+consumer_group = "airflow_sink_group"
+
+[plugin_config]
+# Required — Airflow webserver base URL (no trailing slash required).
+base_url = "http://localhost:8080"
+
+# Required — default DAG to trigger. One DAG run per poll batch (see batch_length).
+dag_id = "example_dag"
+
+# API path prefix (default: /api/v1). Use for Airflow version path differences.
+api_prefix = "/api/v1"
+
+# Auth: "none" | "basic" | "bearer" (default: none).
+auth = "basic"
+username = "admin"
+password = "admin"
+# token = "eyJ..."  # when auth = "bearer"
+
+# Optional message header that overrides dag_id. Different values split the poll
+# into one batch run per DAG id (still not one run per message).
+# dag_id_header = "airflow_dag_id"
+
+# How each message body is placed under conf.messages[].payload (default: payload).
+conf_mode = "payload"
+
+# Nest batch stream/topic/partition/offset range under conf.iggy (default: false).
+include_iggy_metadata_in_conf = false
+
+# Health check on open (default: true). Path is relative to base_url.
+health_check_enabled = true
+health_path = "/api/v1/version"
+
+# Retry configuration (max_retries = total attempts including first try).
+timeout = "30s"
+max_retries = 3
+retry_delay = "1s"
+retry_backoff_multiplier = 2
+max_retry_delay = "30s"
+
+# TLS — accept invalid certs (default: false). Use only for development.
+tls_danger_accept_invalid_certs = false
+
+# Connection pool — max idle connections per host (default: 10).
+max_connections = 10
+
+# Verbose request/response logging (default: false).
+verbose_logging = false

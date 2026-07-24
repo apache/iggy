@@ -6868,6 +6868,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_airflow_sink"
+version = "0.4.1-edge.1"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "reqwest 0.13.4",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "reqwest-tracing",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_clickhouse_sink"
 version = "0.1.0"
 dependencies = [
