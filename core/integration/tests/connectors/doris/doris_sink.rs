@@ -17,8 +17,8 @@
 
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
-    DorisSinkPreCreatedFixture,
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
+    DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -520,4 +520,86 @@ async fn given_columns_config_should_apply_derived_expression(
         delta, message_count as i64,
         "expected calculated = count + 1 per row (delta sum = {message_count}), got {delta}"
     );
+}
+
+/// Drives the connector end-to-end with `format = "csv"`: messages flow through
+/// Iggy, the connector serializes each batch as CSV (control-char framing,
+/// `enclose`/`escape` quoting, positional columns) and Stream Loads it into
+/// Doris. Both the row count AND the materialized values are checked, so a
+/// column-order or escaping regression in the CSV encoder fails this test
+/// rather than silently loading garbage. The `name` value below carries a comma,
+/// a double-quote, and a backslash — the bytes a naive CSV encoder would
+/// corrupt — to exercise the enclose/escape path against a real Doris.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/doris/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_csv_format_should_store_with_values(
+    harness: &TestHarness,
+    fixture: DorisSinkCsvFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let message_count = 10;
+    let mut test_messages = create_test_messages(message_count);
+    // Make the id=1 row's name a CSV hazard: separator-adjacent comma, an
+    // enclose char, and an escape char. After round-trip it must come back byte
+    // for byte, proving enclose+escape protects the field.
+    let hazardous_name = r#"a,b"c\d"#.to_string();
+    test_messages[0].name = hazardous_name.clone();
+
+    let mut messages: Vec<IggyMessage> = test_messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let payload = Bytes::from(serde_json::to_vec(m).expect("serialize"));
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(payload)
+                .build()
+                .expect("build message")
+        })
+        .collect();
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    let db = fixture.database();
+    let count = fixture
+        .wait_for_rows(db, TEST_TABLE, message_count as i64)
+        .await
+        .expect("rows");
+    assert_eq!(count, message_count as i64);
+
+    // Values must round-trip, not just the count: a column-order or escaping bug
+    // would land rows with the wrong/garbled fields.
+    let pool = fixture.pool().await.expect("pool");
+    use sqlx::Row;
+    let row = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SELECT name, `count`, amount, active FROM {db}.{TEST_TABLE} WHERE id = 1"
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("select row id=1");
+    // create_test_messages: id=1 -> count=0, amount=0.0, active=true (name overridden above).
+    let name: String = row.try_get("name").expect("name");
+    let count_val: i32 = row.try_get("count").expect("count");
+    let amount: f64 = row.try_get("amount").expect("amount");
+    let active: bool = row.try_get("active").expect("active");
+    assert_eq!(
+        name, hazardous_name,
+        "enclose/escape must round-trip exactly"
+    );
+    assert_eq!(count_val, 0);
+    assert_eq!(amount, 0.0);
+    assert!(active);
 }
