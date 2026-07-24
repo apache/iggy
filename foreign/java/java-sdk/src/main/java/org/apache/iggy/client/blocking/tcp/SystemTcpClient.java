@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import org.apache.iggy.client.blocking.SystemClient;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
@@ -37,6 +38,11 @@ final class SystemTcpClient implements SystemClient {
     @Override
     public Stats getStats() {
         return FutureUtil.resolve(delegate.getStats());
+    }
+
+    @Override
+    public ClusterMetadata getClusterMetadata() {
+        return FutureUtil.resolve(delegate.getClusterMetadata());
     }
 
     @Override

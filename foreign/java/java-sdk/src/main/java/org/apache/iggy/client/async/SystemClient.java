@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
@@ -37,6 +38,13 @@ public interface SystemClient {
      * @return A CompletableFuture containing server statistics
      */
     CompletableFuture<Stats> getStats();
+
+    /**
+     * Gets cluster metadata asynchronously.
+     *
+     * @return A CompletableFuture containing the cluster roster
+     */
+    CompletableFuture<ClusterMetadata> getClusterMetadata();
 
     /**
      * Gets information about the current client asynchronously.

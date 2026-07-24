@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.client.blocking.SystemClient;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.exception.IggyOperationNotSupportedException;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
@@ -31,6 +32,7 @@ import java.util.List;
 class SystemHttpClient implements SystemClient {
 
     private static final String STATS = "/stats";
+    private static final String CLUSTER_METADATA = "/cluster/metadata";
     private static final String CLIENTS = "/clients";
     private static final String PING = "/ping";
     private final InternalHttpClient httpClient;
@@ -43,6 +45,12 @@ class SystemHttpClient implements SystemClient {
     public Stats getStats() {
         var request = httpClient.prepareGetRequest(STATS);
         return httpClient.execute(request, Stats.class);
+    }
+
+    @Override
+    public ClusterMetadata getClusterMetadata() {
+        var request = httpClient.prepareGetRequest(CLUSTER_METADATA);
+        return httpClient.execute(request, ClusterMetadata.class);
     }
 
     @Override

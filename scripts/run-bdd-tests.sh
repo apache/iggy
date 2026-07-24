@@ -119,7 +119,7 @@ run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
-      rust-bdd|go-bdd|csharp-bdd) ;;
+      rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
         if [ "$SDK" = "all" ]; then
           log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"

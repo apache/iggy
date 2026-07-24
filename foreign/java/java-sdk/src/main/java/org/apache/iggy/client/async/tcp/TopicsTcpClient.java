@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
 import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
@@ -44,10 +45,14 @@ import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
  */
 public class TopicsTcpClient implements TopicsClient {
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public TopicsTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public TopicsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -56,7 +61,7 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection.send(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
             try {
                 if (response.isReadable()) {
                     return Optional.of(BytesDeserializer.readTopicDetails(response));
@@ -72,7 +77,7 @@ public class TopicsTcpClient implements TopicsClient {
     public CompletableFuture<List<Topic>> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.send(CommandCode.Topic.GET_ALL.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Topic.GET_ALL.getValue(), payload).thenApply(response -> {
             try {
                 List<Topic> topics = new ArrayList<>();
                 while (response.isReadable()) {
@@ -106,7 +111,7 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection.send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
             try {
                 return BytesDeserializer.readTopicDetails(response);
             } finally {
@@ -134,7 +139,9 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection.send(CommandCode.Topic.UPDATE.getValue(), payload).thenAccept(response -> response.release());
+        return connection()
+                .send(CommandCode.Topic.UPDATE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 
     @Override
@@ -143,6 +150,8 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection.send(CommandCode.Topic.DELETE.getValue(), payload).thenAccept(response -> response.release());
+        return connection()
+                .send(CommandCode.Topic.DELETE.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 }
