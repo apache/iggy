@@ -22,32 +22,35 @@ package org.apache.iggy.connector.flink.sink;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.connector.config.IggyConnectionConfig;
+import org.apache.iggy.connector.config.TcpEndpoint;
 import org.apache.iggy.connector.serialization.SerializationSchema;
 
 import java.io.IOException;
 import java.io.Serializable;
-import java.net.URISyntaxException;
 import java.time.Duration;
 
 /**
  * Flink Sink implementation for writing to Iggy streams.
  * Implements the Flink Sink V2 API for integration with DataStream API.
  *
- * <p>Example usage:
+ * <p>
+ * Example usage:
+ *
  * <pre>{@code
  * events.sinkTo(
- *     IggySink.<Event>builder()
- *         .setConnectionConfig(connectionConfig)
- *         .setStreamId("my-stream")
- *         .setTopicId("my-topic")
- *         .setSerializer(new JsonSerializationSchema<>())
- *         .setBatchSize(100)
- *         .setFlushInterval(Duration.ofSeconds(5))
- *         .withBalancedPartitioning()
- *         .build()
- * ).name("Iggy Sink");
+ *         IggySink.<Event>builder()
+ *                 .setConnectionConfig(connectionConfig)
+ *                 .setStreamId("my-stream")
+ *                 .setTopicId("my-topic")
+ *                 .setSerializer(new JsonSerializationSchema<>())
+ *                 .setBatchSize(100)
+ *                 .setFlushInterval(Duration.ofSeconds(5))
+ *                 .withBalancedPartitioning()
+ *                 .build())
+ *         .name("Iggy Sink");
  * }</pre>
  *
  * @param <T> the type of records to write
@@ -68,12 +71,12 @@ public class IggySink<T> implements Sink<T>, Serializable {
      * Creates a new Iggy sink.
      * Use {@link #builder()} to construct instances.
      *
-     * @param connectionConfig the connection configuration
-     * @param streamId the stream identifier
-     * @param topicId the topic identifier
-     * @param serializer the serialization schema
-     * @param batchSize the batch size for buffering
-     * @param flushInterval the maximum flush interval
+     * @param connectionConfig     the connection configuration
+     * @param streamId             the stream identifier
+     * @param topicId              the topic identifier
+     * @param serializer           the serialization schema
+     * @param batchSize            the batch size for buffering
+     * @param flushInterval        the maximum flush interval
      * @param partitioningStrategy the partitioning strategy
      */
     public IggySink(
@@ -106,46 +109,32 @@ public class IggySink<T> implements Sink<T>, Serializable {
 
     @Override
     public SinkWriter<T> createWriter(WriterInitContext context) throws IOException {
-        IggyHttpClient httpClient = createHttpClient();
+        IggyTcpClient tcpClient = createTcpClient();
         return new IggySinkWriter<>(
-                httpClient, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
+                tcpClient, streamId, topicId, serializer, batchSize, flushInterval, partitioningStrategy);
     }
 
     /**
-     * Creates an HTTP Iggy client based on connection configuration.
+     * Creates a TCP Iggy client based on connection configuration.
      *
-     * @return configured HTTP Iggy client
+     * @return configured TCP Iggy client
      */
-    private IggyHttpClient createHttpClient() {
+    private IggyTcpClient createTcpClient() {
         try {
-            // Build HTTP URL from server address using URI for proper parsing
-            String serverAddress = connectionConfig.getServerAddress();
+            TcpEndpoint endpoint = TcpEndpoint.parse(connectionConfig.getServerAddress());
 
-            // Parse server address to extract host
-            java.net.URI uri = serverAddress.contains("://")
-                    ? new java.net.URI(serverAddress)
-                    : new java.net.URI("tcp://" + serverAddress);
-
-            String host = uri.getHost();
-            if (host == null) {
-                throw new IllegalArgumentException("Cannot extract host from: " + serverAddress);
-            }
-
-            // Build HTTP URL with port 3000 (Iggy HTTP API default port)
-            String httpUrl = "http://" + host + ":3000";
-
-            // Create HTTP client
-            IggyHttpClient httpClient = new IggyHttpClient(httpUrl);
-
-            // Login
-            httpClient.users().login(connectionConfig.getUsername(), connectionConfig.getPassword());
-
-            return httpClient;
-
-        } catch (URISyntaxException e) {
-            throw new RuntimeException("Invalid server address format: " + connectionConfig.getServerAddress(), e);
+            return IggyTcpClient.builder()
+                    .host(endpoint.host())
+                    .port(endpoint.port())
+                    .credentials(connectionConfig.getUsername(), connectionConfig.getPassword())
+                    .connectionTimeout(connectionConfig.getConnectionTimeout())
+                    .requestTimeout(connectionConfig.getRequestTimeout())
+                    .retryPolicy(RetryPolicy.fixedDelay(
+                            connectionConfig.getMaxRetries(), connectionConfig.getRetryBackoff()))
+                    .tls(connectionConfig.isEnableTls())
+                    .buildAndLogin();
         } catch (RuntimeException e) {
-            throw new RuntimeException("Failed to create HTTP Iggy client", e);
+            throw new RuntimeException("Failed to create TCP Iggy client", e);
         }
     }
 
